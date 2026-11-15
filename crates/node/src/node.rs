@@ -2208,10 +2208,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(())
             }
             Event::Refused {
-                exchange, refusal, ..
+                exchange,
+                refusal,
+                by_peer,
             } => {
                 crate::diag_trace::note(format!(
-                    "exchange-refused {refusal:?} chunk_out {} receiving {} job {} asking {}",
+                    "exchange-refused {refusal:?} by_peer {by_peer} chunk_out {} receiving {} job {} asking {}",
                     self.chunks_out.iter().any(|c| c.exchange == exchange),
                     self.receiving.iter().any(|r| r.exchange == exchange),
                     self.job_on(exchange).is_some(),
@@ -2820,6 +2822,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(_) => {}
                 Err(refusal) => {
                     let lost = self.receiving.swap_remove(at);
+                    crate::diag_trace::note(format!(
+                        "receive-refused {refusal:?} put {} read {}/{}",
+                        matches!(lost.what, Arriving::ChunkPut { .. }),
+                        lost.read,
+                        lost.body
+                    ));
                     match lost.what {
                         Arriving::ChunkPut { .. } => {
                             self.chunks_unkept = self.chunks_unkept.saturating_add(lost.read);
@@ -3231,6 +3239,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         status: chunk::Status,
         body: Option<Vec<u8>>,
     ) -> Result<(), NodeError> {
+        if !matches!(status, chunk::Status::Stored | chunk::Status::Read) {
+            crate::diag_trace::note(format!(
+                "answer-chunk {status:?} receiving {}",
+                self.receiving
+                    .iter()
+                    .find(|r| r.exchange == exchange)
+                    .map_or_else(|| "none".to_owned(), |r| format!("{}/{}", r.read, r.body))
+            ));
+        }
         let head = chunk::reply_head(status);
         let endpoint = self.driver.endpoint();
         let Some(bytes) = body else {

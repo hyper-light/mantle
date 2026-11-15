@@ -128,10 +128,12 @@ principal's own (91 §3).
 An operation on more than one object is judged on each, as S3 judges it (91 §6). A CopyObject or
 an UploadPartCopy asks `s3:PutObject` on its destination and `s3:GetObject` on its source,
 `s3:GetObjectVersion` where it names the source's version (`request::asks`), so a copy reads
-nothing its principal may not read. A DeleteObjects asks nothing of its own: once its document is
-read, each object is judged as a delete of its own (`request::Judge::deletes`), and the host answers
-those its principal may not delete `AccessDenied` in their places, as S3's own example does, and
-deletes the rest (`door::Request::denied`).
+nothing its principal may not read. A delete asks `s3:DeleteObject` always, and
+`s3:DeleteObjectVersion` too where it names a version (`request::deleting`), as S3's pages for
+DeleteObject and DeleteObjects both state. A DeleteObjects asks nothing of its own: once its document
+is read, each object is judged as a delete of its own (`request::Judge::deletes`), and the host
+answers those its principal may not delete `AccessDenied` in their places, as S3's own example does,
+and deletes the rest (`door::Request::denied`).
 
 Bucket policies are not yet served, so none combines with a principal's identity policy; a bucket
 policy names no user yet (s3-protocol.md §10).
@@ -165,7 +167,8 @@ issued key's reply travels as a listing of its own kind (8), so no earlier reply
 ## 7. Tests
 
 - A copy's asks (`crates/node/src/listener/request.rs`): both its objects, the version form where
-  its source names a version, and none of a batch delete's own.
+  its source names a version, and none of a batch delete's own; a delete's `s3:DeleteObject`, and
+  `s3:DeleteObjectVersion` too where it names a version.
 - Policies (`crates/s3/src/policy`): AWS's own identity policies read; what IAM refuses refused, a
   principal, another service, an action S3 does not define, IAM's bounds to the character; a
   prefix grant admitting exactly its prefix; a deny over an allow; a variable standing for the
@@ -180,6 +183,8 @@ issued key's reply travels as a listing of its own kind (8), so no earlier reply
   refused `AccessDenied` otherwise, through every node; a copy, by CopyObject and by
   UploadPartCopy, refused whose source its principal may not read; a batch delete answering a key
   its principal may not delete `AccessDenied` in its place, verbose and quiet, and deleting the rest;
+  in a versioned bucket, a named version's copy refused without `s3:GetObjectVersion` and its delete,
+  by DeleteObject and DeleteObjects, without `s3:DeleteObject`, both let once the policy grants them;
   the operator's refusals; a policy replaced judged by every node from its answer on; a revoked
   key, and keys the cell never made, refused `InvalidAccessKeyId` by every node from the revoke's
   answer on, nothing waited for; and a key rotated under a boto3 client asking all along, through

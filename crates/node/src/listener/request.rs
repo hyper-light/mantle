@@ -296,16 +296,13 @@ impl Judge {
     }
 
     /// Whether the principal may delete `target` of `bucket`, one of a DeleteObjects' objects,
-    /// each judged as a delete of its own: `s3:DeleteObjectVersion` where it names a version,
-    /// `s3:DeleteObject` otherwise (research/91 §6).
+    /// each judged as a delete of its own ([`deleting`]): `s3:DeleteObject` always, and
+    /// `s3:DeleteObjectVersion` too where it names a version (research/91 §6).
     fn deletes(&self, bucket: &str, target: &Target) -> bool {
-        let action = if target.version.is_some() {
-            "s3:DeleteObjectVersion"
-        } else {
-            "s3:DeleteObject"
-        };
         let resource = policy::resource(bucket, Some(&target.key));
-        self.lets(action, &resource, &self.context)
+        deleting(target.version.is_some())
+            .iter()
+            .all(|action| self.lets(action, &resource, &self.context))
     }
 }
 
@@ -369,10 +366,10 @@ fn judge(
 /// What a principal's request asks, each action on its resource, as S3 authorizes its operation
 /// (research/91 §6): ListBuckets's `s3:ListAllMyBuckets` on S3's whole namespace; a CopyObject's
 /// or an UploadPartCopy's `s3:PutObject` on its destination and `s3:GetObject` on its source,
-/// `s3:GetObjectVersion` where it names the source's version; none for a DeleteObjects, whose
-/// objects are each judged as a delete once its document is read ([`Judge::deletes`]); and any
-/// other operation's action on its bucket's or object's ARN. An operation S3 names no action for
-/// asks what no policy grants: `AccessDenied`.
+/// `s3:GetObjectVersion` where it names the source's version; a DeleteObject's [`deleting`] on
+/// its object; none for a DeleteObjects, whose objects are each judged as a delete once its
+/// document is read ([`Judge::deletes`]); and any other operation's action on its bucket's or
+/// object's ARN. An operation S3 names no action for asks what no policy grants: `AccessDenied`.
 fn asks(
     parts: &Parts<'_>,
     route: &Route,
@@ -385,6 +382,19 @@ fn asks(
     asked(route, query.has("versionId"), source.as_ref())
 }
 
+/// The actions a delete asks, a DeleteObject's or one of a DeleteObjects' objects': S3's pages for
+/// both say "you must always have the `s3:DeleteObject` permission" and "To delete a specific
+/// version ... you must have the `s3:DeleteObjectVersion` permission", the permissions table either
+/// one by whether a version is named; both where a version is named satisfies all three
+/// (research/91 §6).
+fn deleting(versioned: bool) -> &'static [&'static str] {
+    if versioned {
+        &["s3:DeleteObject", "s3:DeleteObjectVersion"]
+    } else {
+        &["s3:DeleteObject"]
+    }
+}
+
 /// [`asks`] of `route`, `versioned` where its query names a version, and a copy's `source`; a
 /// copy with no source asks what no policy grants.
 fn asked(
@@ -395,6 +405,13 @@ fn asked(
     let denied = || Refused::new("AccessDenied", 403, "Access Denied");
     match (route.operation, source) {
         (Operation::DeleteObjects, _) => Ok(Vec::new()),
+        (Operation::DeleteObject, _) => {
+            let resource = policy::resource(&bucket(route)?, Some(&key(route)?));
+            Ok(deleting(versioned)
+                .iter()
+                .map(|action| (*action, resource.clone()))
+                .collect())
+        }
         (Operation::CopyObject | Operation::UploadPartCopy, None) => Err(denied()),
         (Operation::CopyObject | Operation::UploadPartCopy, Some(source)) => {
             let read = if source.version.is_some() {
@@ -1269,6 +1286,20 @@ mod tests {
         assert_eq!(
             asked(&route(Operation::GetObject, Some("k")), true, None).unwrap(),
             [("s3:GetObjectVersion", "arn:aws:s3:::dst/k".to_owned())]
+        );
+        // A delete asks `s3:DeleteObject` always, and `s3:DeleteObjectVersion` too where it names a
+        // version.
+        let delete = route(Operation::DeleteObject, Some("k"));
+        assert_eq!(
+            asked(&delete, false, None).unwrap(),
+            [("s3:DeleteObject", "arn:aws:s3:::dst/k".to_owned())]
+        );
+        assert_eq!(
+            asked(&delete, true, None).unwrap(),
+            [
+                ("s3:DeleteObject", "arn:aws:s3:::dst/k".to_owned()),
+                ("s3:DeleteObjectVersion", "arn:aws:s3:::dst/k".to_owned()),
+            ]
         );
         let buckets = Route {
             operation: Operation::ListBuckets,

@@ -190,24 +190,30 @@ standard input (one running), the steps a supervisor runs without a person:
 5. With no volume of it left in the table and no range having it vote, the root range's leader
    asks `Remove { node }`: removed. The leaving node, still a learner of the root range, applies
    it, says `left`, stops in order and exits 0. The leader then drops it from the root range's
-   configuration and, once no range names it, asks `Delist { node }`: its rows go.
+   configuration, once the leaving node has said its storage holds the commit that removed it (a
+   learner dropped sooner would never hear of its own removal), and, once no range names it, asks
+   `Delist { node }`: its rows go.
 
 A leave never completes while its volumes hold a chunk the cell needs: until repair has retired
 them, the node waits in step 4, which keeps every acknowledged object as whole as it was.
 
 ## 5. Away for a while, or gone
 
-**The facts.** A member's absence is recorded by the root range's leader from its node-pair
-liveness stream (node.md §2.4): when the stream suspects the member, or takes the member's
-announced stop, the leader asks `Absent { node }`, applied at the entry's time (the leader's clock,
-`Entry::at_ns`) unless already absent; when the stream trusts the member again, or takes a heartbeat
-of its next run, it asks `Returned { node }`, which clears it (repair's `Seen` and `Presence`
-keep the same fact, §8). A leader the table holds absent, a former leader's stream having
-suspected it, asks its own return: it is present by leading; and a member's `Join` at each start,
-which restates where it listens, clears it, as repair's enlistment says a node seen. A new leader whose stream judges
-otherwise than the table asks the same, so the record follows the cell's liveness whoever leads.
-Silence alone cannot tell a laptop asleep from a machine dead; what the cell knows is how long the
-member has been silent, and what its own durability allows.
+**The facts.** A member's absence is recorded by the root range's leader from two of the cell's own
+facts together, as repair.md §2.1 judges a node away: its node-pair liveness stream (node.md §2.4)
+suspects the member or took its announced stop, and the transport holds no keyed connection to it,
+which QUIC's idle timeout, derived from the path, ends once the member falls silent. The leader then
+asks `Absent { node }`, applied at the entry's time (the leader's clock, `Entry::at_ns`) unless
+already absent. A suspicion alone, its connection live, records nothing: on a loaded host a stream's
+detector suspects live peers at its stated mistake rate, and each such record would pass a member
+over. A connection keyed again is the member seen: the leader asks `Returned { node }`, which clears
+it (repair's `Seen` and `Presence` keep the same fact, §8). A leader the table holds absent, a
+former leader's stream having suspected it, asks its own return: it is present by leading; and a
+member's `Join` at each start, which restates where it listens, clears it, as repair's enlistment
+says a node seen. A new leader whose stream judges otherwise than the table asks the same, so the
+record follows the cell's liveness whoever leads. Silence alone cannot tell a laptop asleep from a
+machine dead; what the cell knows is how long the member has been silent, and what its own
+durability allows.
 
 **Away** is a `Serving` member whose absence is recorded. Away has two consequences, each priced
 by a model and neither by a timeout:
@@ -390,3 +396,5 @@ refusal; `crate::directory`'s, each admission rule.
 - APFS volumes of one container share its free space under different device names, which
   `Device::may_be` tells apart, so two volumes there each stated to take what it spares are not
   refused; the container's identity is the fact to compare.
+- A member removed while leaving that stops for good before it says it holds its removal stays a
+  learner of the root range, its row kept: the gone rule judges members serving or leaving only.

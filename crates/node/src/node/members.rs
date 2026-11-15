@@ -44,6 +44,11 @@ pub struct Cell {
     members: Vec<(u64, Membership)>,
     /// The nodes the volume table holds a volume of, sorted: at most the table's volumes.
     holding: Vec<u64>,
+    /// Each member removed and the entry this node's member of the root range had applied when it
+    /// first read it so, at or past the removal's: the commit a removed member must say it holds
+    /// before it is dropped from the root range, so it applies its own removal (membership.md §4
+    /// step 5). At most the table's nodes.
+    removed: Vec<(u64, u64)>,
 }
 
 impl Cell {
@@ -171,10 +176,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .refuse(clock, peer, Refusal::Identity);
             self.unkey(peer);
         }
+        let removed = members
+            .iter()
+            .filter(|(_, row)| row.state == MemberState::Removed)
+            .map(|(id, _)| {
+                let seen = self
+                    .cell
+                    .as_ref()
+                    .and_then(|c| c.removed.iter().find(|(was, _)| was == id))
+                    .map_or(applied, |(_, at)| *at);
+                (*id, seen)
+            })
+            .collect();
         self.cell = Some(Cell {
             applied,
             members,
             holding,
+            removed,
         });
         self.keep_peers()
     }
@@ -244,10 +262,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// What `group`'s configuration should be, `conf` its member's: each member the root range
     /// holds serving a voter, but absent ones where dropping them lets the range survive more
-    /// failures, which then learn; in the root range, each one leaving a learner; a member gone or
-    /// removed nowhere; and each member of `conf` the root range holds no row of as it is, a
-    /// founder yet to join (membership.md §6).
-    fn target(&self, conf: &ConfState, layer: Layer) -> Option<Toward> {
+    /// failures, which then learn; in the root range, each one leaving a learner, and each one
+    /// removed until it has said it holds the commit that removed it (`told`); a member gone
+    /// nowhere; and each member of `conf` the root range holds no row of as it is, a founder yet to
+    /// join (membership.md §6).
+    fn target(
+        &self,
+        conf: &ConfState,
+        layer: Layer,
+        told: impl Fn(u64, u64) -> bool,
+    ) -> Option<Toward> {
         let cell = self.cell.as_ref()?;
         let mut voters: Vec<u64> = Vec::new();
         let mut learners: Vec<u64> = Vec::new();
@@ -264,6 +288,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 None => {}
                 Some(MemberState::Serving) => voters.push(id),
                 Some(MemberState::Leaving) if layer == Layer::Root => learners.push(id),
+                Some(MemberState::Removed)
+                    if layer == Layer::Root
+                        && conf.learners.contains(&id)
+                        && cell
+                            .removed
+                            .iter()
+                            .find(|(was, _)| *was == id)
+                            .is_none_or(|(_, at)| !told(id, *at)) =>
+                {
+                    learners.push(id);
+                }
                 Some(MemberState::Leaving | MemberState::Gone | MemberState::Removed) => {}
             }
         }
@@ -313,7 +348,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             }
             let conf = shell.configuration().clone();
-            let Some(target) = self.target(&conf, layer) else {
+            // Whether a member has said its storage holds the commit at `at`.
+            let tracker = shell.core().raft.tracker();
+            let told =
+                |member: u64, at: u64| tracker.get(member).is_some_and(|p| p.committed_index >= at);
+            let Some(target) = self.target(&conf, layer, told) else {
                 continue;
             };
             let Some(shell) = self.owner.get_mut(handle) else {
@@ -351,8 +390,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The root range's leader's records and judgments (membership.md §4, §5): for each member, at
     /// most one command out, of the first that applies: its absence, where this node's stream
-    /// suspects it or took its stop and the table holds it present; its return, where the stream
-    /// trusts it, or it is this node, and the table holds it absent; gone, where its absence passes the time the cell's
+    /// suspects it or took its stop, no keyed connection to it is left, and the table holds it
+    /// present; its return, where a keyed connection to it is, or it is this node, and the table
+    /// holds it absent; gone, where its absence passes the time the cell's
     /// durability model takes a lost chunk to be whole again ([`Node::repair_ns`]); removed, where
     /// it leaves or is gone, holds no volume and no range has it vote; delisted, where it is
     /// removed and no range names it.
@@ -388,9 +428,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 continue;
             }
+            // Away by both the cell's facts: its stream suspects it or took its stop, and the
+            // transport holds no keyed connection to it, which QUIC's idle timeout ends once the
+            // member falls silent (docs/design/repair.md §2.1); a connection keyed again is the
+            // member seen. A suspicion alone, its connection live, records nothing.
             let trust = self.liveness.trust(*id);
-            let away = trust == Some(Trust::Suspected) || self.liveness.stopped(*id);
-            let back = matches!(trust, Some(Trust::Trusted { .. })) && !self.liveness.stopped(*id);
+            let stopped = self.liveness.stopped(*id);
+            let keyed = self.remotes.iter().any(|r| r.id == *id && r.keyed);
+            let away = (trust == Some(Trust::Suspected) || stopped) && !keyed;
+            let back = keyed && !stopped;
             let holds = cell.holding.binary_search(id).is_ok();
             let command = match row.state {
                 MemberState::Serving | MemberState::Leaving if away && row.absent_since_ns == 0 => {

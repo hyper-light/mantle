@@ -215,9 +215,9 @@ pub fn cell_blocks(fragments: u64, spread: Spread) -> Result<u64, DeriveError> {
         .ok_or(DeriveError::Overflow("the cell's blocks"))
 }
 
-/// Each volume's bytes (docs/design/membership.md §3.1): a volume laid out already keeps its
-/// layout's (`Geometry::end`); one stated `volume = DIR SIZE` takes `SIZE`; and one stated to take
-/// what its file system spares takes the bytes the OS states this process may still write there,
+/// Each volume's bytes (docs/design/membership.md §3.1): one stated `volume = DIR SIZE` takes
+/// `SIZE`; one stated to take what its file system spares keeps its layout's once laid out
+/// (`Geometry::end`), and before takes the bytes the OS states this process may still write there,
 /// less what its operator states the machine's other work keeps, less what the node writes there
 /// besides: the volumes stated on that file system and not laid out yet, and where it is the node
 /// directory's, the log's file of `log_file` bytes and the stores of each of its `ranges` ranges,
@@ -243,13 +243,13 @@ pub fn volume_sizes(
     let mut sizes = Vec::with_capacity(volumes.len());
     for ((_, bytes), facts) in &volumes {
         sizes.push(match (&facts.formatted, bytes) {
-            (Some(formatted), _) => Some(
+            (_, VolumeBytes::Stated(size)) => Some(*size),
+            (Some(formatted), VolumeBytes::Spare { .. }) => Some(
                 formatted
                     .geometry
                     .end()
                     .ok_or(overflow("a laid-out volume's bytes"))?,
             ),
-            (None, VolumeBytes::Stated(size)) => Some(*size),
             (None, VolumeBytes::Spare { .. }) => None,
         });
     }

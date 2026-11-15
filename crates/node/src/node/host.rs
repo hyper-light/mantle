@@ -29,17 +29,19 @@ use mantle_gateway::layout::Layout;
 use mantle_gateway::put::{self, Body, Commit, Expected, Holding, Keys, Put, PutError, Random};
 use mantle_meta::apply::Layer;
 use mantle_meta::coordinator::{self, Coordinator, Settled};
-use mantle_meta::name::{self, Match, Preconditions};
+use mantle_meta::key::{NULL_VERSION, parse_version_id};
+use mantle_meta::name::{self, Match, Named, Preconditions};
 use mantle_meta::record::{
-    self, BucketState, Descriptor, LISTING, Part, RunMd5, Runs, Upload, Version, Versioning,
-    WrappedKey, Wrapper,
+    self, Bucket, BucketState, Descriptor, How, LISTING, Part, RunMd5, Runs, Upload, Version,
+    Versioning, WrappedKey, Wrapper,
 };
 use mantle_meta::root::{self, Placed};
 use mantle_meta::wire::{Answer, Command};
 use mantle_meta::{bucket, engine::Engine};
 use mantle_s3::checksum::{self, Algorithm};
 use mantle_s3::conditional::{self, Current};
-use mantle_s3::range::{self, Span};
+use mantle_s3::copy::Directive;
+use mantle_s3::range::{self, CopyRangeError, Span};
 use mantle_s3::seal::{DataKey, WrappingKey};
 
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
@@ -51,8 +53,8 @@ use crate::read::{Query, Read};
 use mantle_protocol::bounds;
 use mantle_protocol::classes::Class;
 use mantle_protocol::object::{
-    self, Head, Headers, List, Listing, MAX_PAGE_PARTS, Op, PartListed, Parts, Progress, Reply,
-    Status, Stored,
+    self, Deleted, Head, Headers, List, Listing, MAX_PAGE_PARTS, Metadata, Op, PartListed, Parts,
+    Progress, Reply, Status, Stored, Target,
 };
 
 /// What the gateway host is given (docs/design/node.md §4.6, §5).
@@ -120,10 +122,21 @@ impl Job {
     /// for room at a volume or in the transport toward it.
     fn held(&self) -> bool {
         !self.pending.is_empty()
-            || matches!(
-                &self.work,
-                Work::Put(putting) if putting.put.as_ref().is_some_and(Put::waits_for_room)
-            )
+            || match &self.work {
+                Work::Put(putting) => putting.put.as_ref().is_some_and(Put::waits_for_room),
+                Work::Copy(copying) => copying.put.as_ref().is_some_and(Put::waits_for_room),
+                _ => false,
+            }
+    }
+
+    /// The host's operations it counts as (`GatewaySettings::objects`): a copy two, holding a
+    /// get's window and a put's at once, so the bytes and asks the host's operations are given
+    /// hold (`crate::derive::objects`, research/89 §3.7); any other one.
+    pub(super) fn weight(&self) -> usize {
+        match &self.work {
+            Work::Copy(_) => 2,
+            _ => 1,
+        }
     }
 
     /// What to do while its work is held: vouch within its patience, answer a refusal past it,
@@ -253,6 +266,128 @@ enum Work {
     Complete(Box<Completing>),
     /// An operation one read answers.
     Read(Box<Single>),
+    /// DeleteObjects: its bucket's row read, then each object's delete (research/89 §5).
+    Deletes(Box<Deleting>),
+    /// CopyObject or UploadPartCopy: the source read by a `Get`, written by a `Put` (research/89
+    /// §3–§4).
+    Copy(Box<Copying>),
+}
+
+/// The host's operations an op counts as once taken: a copy two, any other one (`Job::weight`).
+pub(super) fn weight(op: &Op) -> usize {
+    match op {
+        Op::Copy(_) | Op::CopyPart(_) => 2,
+        _ => 1,
+    }
+}
+
+/// The version a request's `versionId` names: `null`, or one of mantle's 13-character IDs
+/// (`mantle_meta::key::version_id`); `InvalidVersion` for any other text, S3's `400
+/// InvalidArgument`, "Invalid version id specified" (research/89 §2.1).
+fn named(version: Option<&str>) -> Result<Option<Named>, Status> {
+    match version {
+        None => Ok(None),
+        Some(NULL_VERSION) => Ok(Some(Named::Null)),
+        Some(id) => parse_version_id(id)
+            .map(|order| Some(Named::Order(order)))
+            .ok_or(Status::InvalidVersion),
+    }
+}
+
+/// A DeleteObjects: its objects, each one's delete asked in order, at most the commands an
+/// operation is given out at once, and each one's result in its place (research/89 §5).
+pub(crate) struct Deleting {
+    bucket: String,
+    objects: Vec<Target>,
+    quiet: bool,
+    /// The bucket's incarnation and versioning, once its row is read.
+    row: Option<(u64, Versioning)>,
+    /// The first object not yet asked.
+    next: usize,
+    /// Deletes asked and not yet answered.
+    out: usize,
+    results: Vec<Option<Deleted>>,
+}
+
+/// Where a copy is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyStage {
+    /// The destination bucket's row to read.
+    Bucket,
+    /// An UploadPartCopy's upload row to read, for its checksum's algorithm.
+    Upload,
+    /// The source's version to read.
+    Source,
+    /// The source read by a `Get` and written by a `Put`.
+    Run,
+    /// CopyObject's version committed as its key's null version: its mark read for the time the
+    /// range gave it (research/89 §3.6).
+    Mark,
+}
+
+/// A CopyObject or an UploadPartCopy (research/89 §3–§4).
+pub(crate) struct Copying {
+    bucket: String,
+    key: String,
+    /// UploadPartCopy's upload and part number; CopyObject's none.
+    part: Option<(String, u16)>,
+    id: u128,
+    source: (String, String, Option<Named>),
+    /// `x-amz-copy-source-if-*`, and a part's `x-amz-copy-source-range`.
+    conditions: Headers,
+    /// The destination's `If-Match` and `If-None-Match`.
+    preconditions: Preconditions,
+    directive: Directive,
+    metadata: Metadata,
+    checksum: Option<Algorithm>,
+    stage: CopyStage,
+    /// The destination bucket's row, and an UploadPartCopy's upload's.
+    row: Option<Bucket>,
+    upload: Option<Upload>,
+    get: Option<Get>,
+    put: Option<Put>,
+    /// What the put checks at its end: the source's own MD5 and checksum, where it copies the
+    /// whole source and the source keeps them.
+    expected: Expected,
+    /// Plaintext the get gave and the put has not yet taken, and how much of it the put took.
+    carry: Option<(Bytes, usize)>,
+    /// The put's body ended.
+    ended: bool,
+    get_waiting: VecDeque<(u64, get::Request)>,
+    put_waiting: VecDeque<(u64, put::Request)>,
+    /// The source version's ID.
+    source_version: String,
+    /// The put's file, whose mark names the version a null version's copy made.
+    file: u128,
+    /// The put's outcome, while the version's time is read.
+    stored: Option<put::Stored>,
+}
+
+/// Which of a copy's drivers a request of its job is for: its ask's request ID carries it in its
+/// lowest bit, the driver's own ID above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Driver {
+    Get,
+    Put,
+}
+
+/// The request ID a copy's ask is kept under: the driver's ID shifted past a bit naming the
+/// driver; none past what a u64 holds, a driver's IDs counting its requests from zero.
+fn tagged(driver: Driver, id: u64) -> Option<u64> {
+    let bit = match driver {
+        Driver::Get => 0,
+        Driver::Put => 1,
+    };
+    id.checked_mul(2)?.checked_add(bit)
+}
+
+fn untagged(tag: u64) -> (Driver, u64) {
+    let driver = if tag & 1 == 0 {
+        Driver::Get
+    } else {
+        Driver::Put
+    };
+    (driver, tag >> 1)
 }
 
 /// A bucket's create or delete, run by its coordinator.
@@ -290,6 +425,9 @@ struct Putting {
     waiting: VecDeque<(u64, put::Request)>,
     /// A native upload's run (an Append): its upload's row read after its bucket's.
     run: Option<Appending>,
+    /// A PutObject's content headers and user-defined metadata, which its version keeps
+    /// (research/89 §1).
+    metadata: Metadata,
 }
 
 /// A native upload's run as its Append names it, and its upload's runs once read: where the run
@@ -305,6 +443,8 @@ struct Getting {
     bucket: String,
     key: String,
     headers: Headers,
+    /// The version `versionId` names; none for the key's current one (research/89 §2.1).
+    version: Option<Named>,
     /// A HeadObject: the version's facts, and no bytes.
     head: bool,
     get: Option<Get>,
@@ -327,25 +467,31 @@ struct Commanding {
 
 /// The command a bucket's row is read for.
 enum Then {
-    /// DeleteObject: the Name range's delete (05 §7.3).
+    /// DeleteObject: the Name range's delete (05 §7.3), of the version `versionId` names where
+    /// it names one (research/89 §2.2).
     Delete {
         key: String,
         if_match: Option<Match>,
+        named: Option<Named>,
     },
     /// PutBucketVersioning, by the bucket's owner (05 §7.1).
     Versioning(Versioning),
-    /// CreateMultipartUpload, with the checksum its parts carry (05 §4.2).
+    /// CreateMultipartUpload, with the checksum its parts carry (05 §4.2) and the metadata its
+    /// completed version keeps (research/89 §1).
     CreateUpload {
         key: String,
         checksum: Option<(Algorithm, bool)>,
+        metadata: Metadata,
     },
     /// A native upload's Open (gateway.md §2.1): its object's length where stated, its
-    /// full-object checksum's algorithm, and the length of its runs (`name::run_length`).
+    /// full-object checksum's algorithm, the length of its runs (`name::run_length`) and its
+    /// object's metadata.
     Open {
         key: String,
         length: Option<u64>,
         checksum: Algorithm,
         run: u64,
+        metadata: Metadata,
     },
     /// AbortMultipartUpload (05 §4.8).
     Abort { key: String, upload: String },
@@ -398,6 +544,8 @@ enum Single {
         key: String,
         upload: String,
     },
+    /// ListObjectVersions: a page of the bucket's versions, its query made from the request.
+    Versions(Query),
 }
 
 /// The volume table as this node's member of the root range held it after an entry it applied,
@@ -510,6 +658,25 @@ fn name_status(outcome: &name::Outcome) -> Status {
     }
 }
 
+/// What one object's delete came to (research/89 §5.2): done, with the delete marker it made or
+/// removed, or the refusal its Name range's answer earns.
+fn deleted(target: &Target, outcome: name::Outcome) -> Deleted {
+    let (status, marker) = match outcome {
+        // "When a multi-object Delete request results in Amazon S3 either adding a delete marker
+        // or removing a delete marker, the response returns" the marker's version ID.
+        name::Outcome::Deleted { marker, version } => {
+            (Status::Done, if marker { version } else { None })
+        }
+        refused => (name_status(&refused), None),
+    };
+    Deleted {
+        key: target.key.clone(),
+        version: target.version.clone(),
+        status,
+        marker,
+    }
+}
+
 /// The status a completion's failure is answered with (05 §4.4).
 fn complete_status(error: &CompleteError) -> Status {
     match error {
@@ -603,7 +770,8 @@ fn answered(versioning: Versioning) -> Option<mantle_s3::body::Versioning> {
     }
 }
 
-/// The reply that states a version's facts, `status` its answer.
+/// The reply that states a version's facts, `status` its answer: its metadata among them
+/// (research/89 §1).
 fn facts(status: Status, order: u64, version: &Version) -> Reply {
     Reply {
         status,
@@ -613,11 +781,8 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
         modified: object::seconds(version.modified_ns),
         checksum: version.checksum.as_ref().map(shown),
         marker: version.marker,
-        range: None,
-        versioning: None,
-        upload: String::new(),
-        listing: None,
-        progress: None,
+        metadata: version.headers.clone(),
+        ..Reply::status(status)
     }
 }
 
@@ -649,7 +814,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             (_, None) => Work::Draining(Box::new(Reply::status(Status::Failed))),
             (Err(_), Some(_)) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7): its client asks another.
-            (Ok(_), Some(g)) if self.stopping() || self.jobs.len() >= g.objects => {
+            (Ok(_), Some(g)) if self.stopping() || self.occupancy() >= g.objects => {
                 Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             (Ok(head), Some(_)) => {
@@ -678,7 +843,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } = request;
         let work = match self.gateway.as_ref() {
             None => Work::Draining(Box::new(Reply::status(Status::Failed))),
-            Some(g) if self.stopping() || self.jobs.len() >= g.objects => {
+            Some(g)
+                if self.stopping() || self.occupancy().saturating_add(weight(&op)) > g.objects =>
+            {
                 Work::Draining(Box::new(Reply::status(Status::SlowDown)))
             }
             Some(_) => {
@@ -738,13 +905,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let carry = fields.split_off(wanted.min(fields.len()));
         let op = head.op(fields);
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
+        // A copy counts as two of the host's operations, this job one of them already: one with
+        // no room for its second is answered as one past the host's operations is.
+        let objects = self.gateway.as_ref().map_or(0, |g| g.objects);
+        let crowded = op.as_ref().is_ok_and(|op| {
+            self.occupancy()
+                .saturating_add(weight(op))
+                .saturating_sub(1)
+                > objects
+        });
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = match op {
                 Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
+                Ok(_) if crowded => Work::Draining(Box::new(Reply::status(Status::SlowDown))),
                 Ok(op) => work(op, carry, block),
             };
         }
         Ok(false)
+    }
+
+    /// The host's operations its jobs count as (`Job::weight`).
+    pub(super) fn occupancy(&self) -> usize {
+        self.jobs
+            .iter()
+            .map(Job::weight)
+            .fold(0, usize::saturating_add)
     }
 
     /// For a native upload's Open, the plaintext bytes of a whole block of the layout new blocks
@@ -854,14 +1039,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// transport's; a driver that fails doing so ends its job as its failed answers do.
     fn offer_room(&mut self) -> Result<(), NodeError> {
         for at in 0..self.jobs.len() {
-            let Some(Job {
-                work: Work::Put(putting),
-                ..
-            }) = self.jobs.get_mut(at)
-            else {
-                continue;
+            let put = match self.jobs.get_mut(at).map(|job| &mut job.work) {
+                Some(Work::Put(putting)) => putting.put.as_mut(),
+                Some(Work::Copy(copying)) => copying.put.as_mut(),
+                _ => None,
             };
-            let Some(put) = putting.put.as_mut() else {
+            let Some(put) = put else {
                 continue;
             };
             // A driver that fails keeps its error as its outcome, which its job answers.
@@ -917,6 +1100,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Work::Command(_) => self.step_command(at),
             Work::Complete(_) => self.step_complete(at),
             Work::Read(_) => self.step_single(at),
+            Work::Deletes(_) => self.step_deletes(at),
+            Work::Copy(_) => self.step_copy(at),
         }
     }
 
@@ -1126,6 +1311,54 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     _ => self.fail_job(at, Status::Failed),
                 };
             }
+            Work::Deletes(deleting) => match (request, outcome) {
+                (None, Outcome::Read(ReadOutcome::Read(read))) => {
+                    return self.deletes_read(at, *read);
+                }
+                (None, _) => return self.fail_job(at, Status::Failed),
+                (Some(index), outcome) => {
+                    let index = usize::try_from(index).unwrap_or(usize::MAX);
+                    deleting.out = deleting.out.saturating_sub(1);
+                    let (Some(target), Some(slot)) =
+                        (deleting.objects.get(index), deleting.results.get_mut(index))
+                    else {
+                        return self.fail_job(at, Status::Failed);
+                    };
+                    *slot = Some(match outcome {
+                        Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => {
+                            deleted(target, o)
+                        }
+                        // A command its range answered with another kind: S3's `500`, which
+                        // its client asks again.
+                        _ => Deleted {
+                            key: target.key.clone(),
+                            version: target.version.clone(),
+                            status: Status::Failed,
+                            marker: None,
+                        },
+                    });
+                }
+            },
+            Work::Copy(copying) => match (request, outcome) {
+                (None, Outcome::Read(ReadOutcome::Read(read))) => {
+                    return self.copy_read(at, *read);
+                }
+                (None, _) => return self.fail_job(at, Status::Failed),
+                (Some(tag), outcome) => match untagged(tag) {
+                    // An answer the driver refuses ends it with that outcome, which its next
+                    // turn replies.
+                    (Driver::Get, id) => {
+                        if let Some(get) = copying.get.as_mut() {
+                            let _ = get.answer(id, get_answer(outcome));
+                        }
+                    }
+                    (Driver::Put, id) => {
+                        if let Some(put) = copying.put.as_mut() {
+                            let _ = put.answer(id, put_answer(outcome));
+                        }
+                    }
+                },
+            },
         }
         Ok(())
     }
@@ -1380,7 +1613,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     checksum: None,
                     file: None,
                     owner: principal.clone(),
-                    headers: Vec::new(),
+                    headers: std::mem::take(&mut putting.metadata),
                     retention: None,
                     legal_hold: None,
                     listing: None,
@@ -1822,17 +2055,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         id: u64,
         request: put::Request,
     ) -> Result<Option<put::Request>, NodeError> {
+        let Some(kept) = self.kept_id(at, Driver::Put, id) else {
+            self.fail_job(at, Status::Failed)?;
+            return Ok(None);
+        };
         // A command goes to its range as the driver made it, moved, once the node has room
         // for it; without room it waits whole for the next turn.
         let request = match request {
             put::Request::Block(command) if self.command_room() => {
-                return self.ask_command(at, id, Layer::Block, Command::Block(command));
+                return self.ask_command(at, kept, Layer::Block, Command::Block(command));
             }
             put::Request::File(command) if self.command_room() => {
-                return self.ask_command(at, id, Layer::File, Command::File(command));
+                return self.ask_command(at, kept, Layer::File, Command::File(command));
             }
             put::Request::Name(command) if self.command_room() => {
-                return self.ask_command(at, id, Layer::Name, Command::Name(command));
+                return self.ask_command(at, kept, Layer::Name, Command::Name(command));
             }
             request => request,
         };
@@ -1843,12 +2080,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Ok(None);
                 };
                 // Refused, the driver ends with that outcome, which its next turn replies.
-                if let Some(Job {
-                    work: Work::Put(putting),
-                    ..
-                }) = self.jobs.get_mut(at)
-                    && let Some(put) = putting.put.as_mut()
-                {
+                if let Some(put) = self.put_of(at) {
                     let _ = put.answer(id, put::Answer::Volumes(volumes));
                 }
                 return Ok(None);
@@ -1865,12 +2097,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 };
                 let Some(node) = node else {
                     // A volume the table no longer holds refuses it: the next is asked.
-                    if let Some(Job {
-                        work: Work::Put(putting),
-                        ..
-                    }) = self.jobs.get_mut(at)
-                        && let Some(put) = putting.put.as_mut()
-                    {
+                    if let Some(put) = self.put_of(at) {
                         let _ = put.answer(id, put::Answer::Refused { full: false });
                     }
                     return Ok(None);
@@ -1888,7 +2115,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, Some(id)));
+                    job.pending.push((pending, Some(kept)));
                 }
                 Ok(None)
             }
@@ -1934,6 +2161,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Read::NoBucket => return self.fail_job(at, Status::NoSuchBucket),
             Read::Current(None) => return self.fail_job(at, Status::NoSuchKey),
             Read::Current(Some(found)) => found,
+            Read::Version(None) => return self.fail_job(at, Status::NoSuchVersion),
+            // A named version that is a delete marker: "the response returns a `405 Method Not
+            // Allowed` error and the `Last-Modified: timestamp` response header" (research/89
+            // §2.1), the marker's facts with it.
+            Read::Version(Some((order, marker))) if marker.marker => {
+                let reply = facts(Status::MethodNotAllowed, order, &marker);
+                return self.reply_job(at, reply);
+            }
+            Read::Version(Some(found)) => found,
             _ => return self.fail_job(at, Status::Failed),
         };
         let Some(gateway) = self.gateway.as_ref() else {
@@ -2046,9 +2282,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if !job.pending.is_empty() {
                 return Ok(false);
             }
-            let query = Query::Current {
-                bucket: getting.bucket.clone(),
-                key: getting.key.clone(),
+            let query = match getting.version {
+                None => Query::Current {
+                    bucket: getting.bucket.clone(),
+                    key: getting.key.clone(),
+                },
+                Some(named) => Query::Version {
+                    bucket: getting.bucket.clone(),
+                    key: getting.key.clone(),
+                    named,
+                },
             };
             let Some(group) = name else {
                 self.fail_job(at, Status::Failed)?;
@@ -2229,12 +2472,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 let Some(node) = node else {
                     // A volume the table no longer holds: another copy is read, or the driver
                     // ends with its outcome.
-                    if let Some(Job {
-                        work: Work::Get(getting),
-                        ..
-                    }) = self.jobs.get_mut(at)
-                        && let Some(get) = getting.get.as_mut()
-                    {
+                    if let Some(get) = self.get_of(at) {
                         let _ = get.answer(id, get::Answer::Unreadable);
                     }
                     return Ok(None);
@@ -2244,10 +2482,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     .map(Pending::Chunk)
             }
         };
+        let Some(kept) = self.kept_id(at, Driver::Get, id) else {
+            self.fail_job(at, Status::Failed)?;
+            return Ok(None);
+        };
         match asked {
             Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, Some(id)));
+                    job.pending.push((pending, Some(kept)));
                 }
                 Ok(None)
             }
@@ -2256,6 +2498,33 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.fail_job(at, Status::Failed)?;
                 Ok(None)
             }
+        }
+    }
+
+    /// The request ID job `at` keeps its driver's request `id` under: the ID itself, or, for a
+    /// copy, the ID tagged with its driver (`tagged`); none past what a u64 holds.
+    fn kept_id(&self, at: usize, driver: Driver, id: u64) -> Option<u64> {
+        match self.jobs.get(at).map(|job| &job.work) {
+            Some(Work::Copy(_)) => tagged(driver, id),
+            _ => Some(id),
+        }
+    }
+
+    /// Job `at`'s get driver: its get's, or its copy's.
+    fn get_of(&mut self, at: usize) -> Option<&mut Get> {
+        match self.jobs.get_mut(at).map(|job| &mut job.work) {
+            Some(Work::Get(getting)) => getting.get.as_mut(),
+            Some(Work::Copy(copying)) => copying.get.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// Job `at`'s put driver: its put's, or its copy's.
+    fn put_of(&mut self, at: usize) -> Option<&mut Put> {
+        match self.jobs.get_mut(at).map(|job| &mut job.work) {
+            Some(Work::Put(putting)) => putting.put.as_mut(),
+            Some(Work::Copy(copying)) => copying.put.as_mut(),
+            _ => None,
         }
     }
 
@@ -2310,14 +2579,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let (group, command) = match &mut commanding.then {
-            Then::Delete { key, if_match } => (
+            Then::Delete {
+                key,
+                if_match,
+                named,
+            } => (
                 name_group,
                 Command::Name(Box::new(name::Command::Delete(name::Delete {
                     bucket: commanding.bucket.clone(),
                     incarnation: row.created_ns,
                     key: key.clone(),
                     versioning: row.versioning,
-                    named: None,
+                    named: *named,
                     if_match: if_match.take(),
                     at_ns: 0,
                     bypass: false,
@@ -2336,7 +2609,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     versioning: *versioning,
                 }),
             ),
-            Then::CreateUpload { key, checksum } => (
+            Then::CreateUpload {
+                key,
+                checksum,
+                metadata,
+            } => (
                 name_group,
                 Command::Name(Box::new(name::Command::CreateUpload(name::CreateUpload {
                     bucket: commanding.bucket.clone(),
@@ -2346,7 +2623,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     upload: Upload {
                         initiated_ns: 0,
                         owner: principal.clone(),
-                        headers: Vec::new(),
+                        headers: std::mem::take(metadata),
                         checksum: checksum.map(|(algorithm, full)| (algorithm.code(), full)),
                         retention: None,
                         legal_hold: None,
@@ -2359,6 +2636,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 length,
                 checksum,
                 run,
+                metadata,
             } => {
                 // The MD5 across the runs is kept while the object may be one PUT's bytes, its
                 // ETag then (gateway.md §2.1), begun from MD5's initial state.
@@ -2384,7 +2662,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         upload: Upload {
                             initiated_ns: 0,
                             owner: principal.clone(),
-                            headers: Vec::new(),
+                            headers: std::mem::take(metadata),
                             checksum: Some((checksum.code(), true)),
                             retention: None,
                             legal_hold: None,
@@ -2633,6 +2911,669 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
+    /// A DeleteObjects' turn (research/89 §5): its bucket's row read first; then each object's
+    /// delete asked in the order named, at most an operation's share of the node's commands out
+    /// at once (`crate::derive::asks`); once every one is answered, the results, the failures
+    /// alone where it is quiet.
+    fn step_deletes(&mut self, at: usize) -> Result<bool, NodeError> {
+        let objects = self.gateway.as_ref().map_or(1, |g| g.objects).max(1);
+        // An operation's share of the commands the node holds, past its own enlistment's one.
+        let share = self
+            .command_asks
+            .saturating_sub(1)
+            .checked_div(objects)
+            .unwrap_or(1)
+            .max(1);
+        let Some(Job {
+            work: Work::Deletes(deleting),
+            pending,
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(true);
+        };
+        let Some((incarnation, versioning)) = deleting.row else {
+            if !pending.is_empty() {
+                return Ok(false);
+            }
+            let query = Query::Bucket {
+                bucket: deleting.bucket.clone(),
+            };
+            let Some(group) = self.group_of(Layer::Bucket) else {
+                self.fail_job(at, Status::Failed)?;
+                return self.drain_job(at);
+            };
+            let asked = self
+                .read(group, query, u64::MAX, Wait::Request)
+                .map(Pending::Read);
+            return self.asked(at, asked, None);
+        };
+        let Some(group) = self.group_of(Layer::Name) else {
+            self.fail_job(at, Status::Failed)?;
+            return self.drain_job(at);
+        };
+        let principal = self.jobs.get(at).map(|j| j.principal.clone());
+        loop {
+            let Some(Job {
+                work: Work::Deletes(deleting),
+                ..
+            }) = self.jobs.get_mut(at)
+            else {
+                return Ok(true);
+            };
+            if deleting.out >= share {
+                break;
+            }
+            let index = deleting.next;
+            let Some(target) = deleting.objects.get(index) else {
+                break;
+            };
+            // A version ID no version is named by is answered here, its delete not asked.
+            let named = match named(target.version.as_deref()) {
+                Ok(named) => named,
+                Err(status) => {
+                    let result = Deleted {
+                        key: target.key.clone(),
+                        version: target.version.clone(),
+                        status,
+                        marker: None,
+                    };
+                    if let Some(slot) = deleting.results.get_mut(index) {
+                        *slot = Some(result);
+                    }
+                    deleting.next = index.saturating_add(1);
+                    continue;
+                }
+            };
+            // The ETag a delete is conditioned on, as `If-Match` conditions a DeleteObject's
+            // (research/89 §5.1).
+            let if_match =
+                target
+                    .etag
+                    .as_deref()
+                    .map(|etag| match conditional::named(etag, true) {
+                        None => Match::Any,
+                        Some(tags) => Match::Tags(tags),
+                    });
+            let command = Command::Name(Box::new(name::Command::Delete(name::Delete {
+                bucket: deleting.bucket.clone(),
+                incarnation,
+                key: target.key.clone(),
+                versioning,
+                named,
+                if_match,
+                at_ns: 0,
+                bypass: false,
+                owner: principal.clone().unwrap_or_default(),
+            })));
+            match self.command(group, command, u64::MAX, Wait::Request) {
+                Ok(ask) => {
+                    if let Some(Job {
+                        work: Work::Deletes(deleting),
+                        pending,
+                        ..
+                    }) = self.jobs.get_mut(at)
+                    {
+                        pending.push((
+                            Pending::Command(ask),
+                            Some(u64::try_from(index).unwrap_or(u64::MAX)),
+                        ));
+                        deleting.out = deleting.out.saturating_add(1);
+                        deleting.next = index.saturating_add(1);
+                    }
+                }
+                // The node holds as many commands as it keeps: the rest are asked at a later turn.
+                Err(NodeError::Asks) => break,
+                Err(_) => {
+                    self.fail_job(at, Status::Failed)?;
+                    return self.drain_job(at);
+                }
+            }
+        }
+        let Some(Job {
+            work: Work::Deletes(deleting),
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(true);
+        };
+        if deleting.out > 0 || deleting.results.iter().any(Option::is_none) {
+            return Ok(false);
+        }
+        let quiet = deleting.quiet;
+        let results = std::mem::take(&mut deleting.results)
+            .into_iter()
+            .flatten()
+            // "In quiet mode the response includes only keys where the delete operation
+            // encountered an error" (research/89 §5.2).
+            .filter(|d| !quiet || d.status != Status::Done)
+            .collect();
+        let reply = Reply {
+            listing: Some(Listing::Deleted(results)),
+            ..Reply::status(Status::Done)
+        };
+        self.reply_job(at, reply)?;
+        self.drain_job(at)
+    }
+
+    /// A DeleteObjects' bucket row, read: the incarnation and versioning its deletes are made
+    /// under, or the reply `NoSuchBucket`.
+    fn deletes_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+        let Read::Bucket(Some(row)) = read else {
+            return self.fail_job(at, Status::NoSuchBucket);
+        };
+        if row.state != BucketState::Active {
+            return self.fail_job(at, Status::NoSuchBucket);
+        }
+        if let Some(Job {
+            work: Work::Deletes(deleting),
+            ..
+        }) = self.jobs.get_mut(at)
+        {
+            deleting.row = Some((row.created_ns, row.versioning));
+        }
+        Ok(())
+    }
+
+    /// A copy's turn (research/89 §3–§4): its destination bucket's row read first, an
+    /// UploadPartCopy's upload's row next, then the source's version; then its drivers, the
+    /// get's plaintext fed to the put as the put takes it, each one's requests asked; once the
+    /// put commits, its reply, a null version's time read from its mark first.
+    fn step_copy(&mut self, at: usize) -> Result<bool, NodeError> {
+        let wall = self.wall.now_ns();
+        let Some(Job {
+            work: Work::Copy(copying),
+            pending,
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(true);
+        };
+        let read = match copying.stage {
+            CopyStage::Bucket => Some((
+                Layer::Bucket,
+                Query::Bucket {
+                    bucket: copying.bucket.clone(),
+                },
+            )),
+            CopyStage::Upload => Some((
+                Layer::Name,
+                Query::Upload {
+                    bucket: copying.bucket.clone(),
+                    key: copying.key.clone(),
+                    upload: copying
+                        .part
+                        .as_ref()
+                        .map(|(upload, _)| upload.clone())
+                        .unwrap_or_default(),
+                },
+            )),
+            CopyStage::Source => {
+                let (bucket, key, named) = copying.source.clone();
+                Some((
+                    Layer::Name,
+                    match named {
+                        None => Query::Current { bucket, key },
+                        Some(named) => Query::Version { bucket, key, named },
+                    },
+                ))
+            }
+            CopyStage::Mark => Some((
+                Layer::Name,
+                Query::Mark {
+                    bucket: copying.bucket.clone(),
+                    key: copying.key.clone(),
+                    id: copying.file,
+                },
+            )),
+            CopyStage::Run => None,
+        };
+        if let Some((layer, query)) = read {
+            if !pending.is_empty() {
+                return Ok(false);
+            }
+            let Some(group) = self.group_of(layer) else {
+                self.fail_job(at, Status::Failed)?;
+                return self.drain_job(at);
+            };
+            let asked = self
+                .read(group, query, u64::MAX, Wait::Request)
+                .map(Pending::Read);
+            return self.asked(at, asked, None);
+        }
+        // The put's outcome ends the copy: its reply, or its version's time to read first.
+        let over = match (
+            copying.put.as_ref().and_then(Put::outcome),
+            copying.get.as_ref().and_then(Get::outcome),
+        ) {
+            (Some(Ok(stored)), _) => Some(Ok(stored.clone())),
+            // The digests a copy is held to are its source's own, never a client's: bytes that
+            // miss them are the store's failure, not the request's `400 BadDigest`.
+            (Some(Err(PutError::BadDigest | PutError::BadChecksum)), _) => {
+                Some(Err(Status::Failed))
+            }
+            (Some(Err(error)), _) => Some(Err(put_status(error))),
+            (None, Some(Err(error))) => Some(Err(get_status(error))),
+            _ => None,
+        };
+        match over {
+            Some(Err(status)) => {
+                self.fail_job(at, status)?;
+                return self.drain_job(at);
+            }
+            Some(Ok(stored)) => {
+                let made = stored.version.clone();
+                let reply = match (copying.part.is_some(), made.as_deref()) {
+                    // A part's row records the time its put committed it.
+                    (true, _) => stored
+                        .modified_ns
+                        .map(|ns| copied(&stored, ns, &copying.source_version)),
+                    // A version's order is its time inverted (`mantle_meta::name::put`).
+                    (false, Some(id)) if id != NULL_VERSION => parse_version_id(id)
+                        .map(|order| copied(&stored, !order, &copying.source_version)),
+                    // A null version's ID names no order: its mark does.
+                    (false, _) => {
+                        copying.stored = Some(stored);
+                        copying.stage = CopyStage::Mark;
+                        return Ok(false);
+                    }
+                };
+                let reply = reply.unwrap_or_else(|| Reply::status(Status::Failed));
+                self.reply_job(at, reply)?;
+                return self.drain_job(at);
+            }
+            None => {}
+        }
+        if let Some(put) = copying.put.as_mut()
+            && put.tick(wall).is_err()
+            && put.outcome().is_none()
+        {
+            self.fail_job(at, Status::Failed)?;
+            return self.drain_job(at);
+        }
+        self.feed_copy(at);
+        // Each driver's requests, each asked of what serves it.
+        for driver in [Driver::Get, Driver::Put] {
+            loop {
+                let Some(job) = self.jobs.get_mut(at) else {
+                    return Ok(true);
+                };
+                let Work::Copy(copying) = &mut job.work else {
+                    return self.moved_on(at);
+                };
+                match driver {
+                    Driver::Get => {
+                        let next = match copying.get_waiting.pop_front() {
+                            Some(request) => Some(request),
+                            None => copying.get.as_mut().and_then(Get::poll),
+                        };
+                        let Some((id, request)) = next else {
+                            break;
+                        };
+                        if let Some(request) = self.ask_get(at, id, request)? {
+                            if let Some(Job {
+                                work: Work::Copy(copying),
+                                ..
+                            }) = self.jobs.get_mut(at)
+                            {
+                                copying.get_waiting.push_front((id, request));
+                            }
+                            break;
+                        }
+                    }
+                    Driver::Put => {
+                        let next = match copying.put_waiting.pop_front() {
+                            Some(request) => Some(request),
+                            None => copying.put.as_mut().and_then(Put::poll),
+                        };
+                        let Some((id, request)) = next else {
+                            break;
+                        };
+                        if let Some(request) = self.ask_put(at, id, request)? {
+                            if let Some(Job {
+                                work: Work::Copy(copying),
+                                ..
+                            }) = self.jobs.get_mut(at)
+                            {
+                                copying.put_waiting.push_front((id, request));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// A copy's plaintext, from its get to its put as far as the put takes it; once the get has
+    /// given every byte, the put's body ended, held to the source's own MD5 and checksum where the
+    /// copy is of the whole source (research/89 §3.4). A driver that fails keeps its error as its
+    /// outcome, which the copy's next turn replies.
+    fn feed_copy(&mut self, at: usize) {
+        let Some(Job {
+            work: Work::Copy(copying),
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return;
+        };
+        let (Some(get), Some(put)) = (copying.get.as_mut(), copying.put.as_mut()) else {
+            return;
+        };
+        loop {
+            if copying.carry.is_none() {
+                copying.carry = get.take().map(|bytes| (bytes, 0));
+            }
+            let Some((bytes, took)) = copying.carry.as_mut() else {
+                break;
+            };
+            let rest = bytes.get(*took..).unwrap_or_default();
+            if rest.is_empty() {
+                copying.carry = None;
+                continue;
+            }
+            if !put.wants_body() {
+                return;
+            }
+            // A feed or an end that fails ends the put with its error, which its outcome holds
+            // and the copy's step answers (`Put::guard`).
+            match put.feed(rest) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => *took = took.saturating_add(n),
+            }
+        }
+        if !copying.ended && matches!(get.outcome(), Some(Ok(()))) {
+            copying.ended = true;
+            let _ = put.end(&copying.expected);
+        }
+    }
+
+    /// What a copy read: its destination bucket's row, an UploadPartCopy's upload's, its
+    /// source's version, or a null version's mark.
+    fn copy_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+        let Some(Job {
+            work: Work::Copy(copying),
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(());
+        };
+        match (copying.stage, read) {
+            (CopyStage::Bucket, Read::Bucket(Some(row))) if row.state == BucketState::Active => {
+                copying.stage = if copying.part.is_some() {
+                    CopyStage::Upload
+                } else {
+                    CopyStage::Source
+                };
+                copying.row = Some(row);
+                Ok(())
+            }
+            (CopyStage::Bucket, _) | (CopyStage::Upload, Read::NoBucket) => {
+                self.fail_job(at, Status::NoSuchBucket)
+            }
+            (CopyStage::Upload, Read::Upload(Some(upload))) if upload.runs.is_none() => {
+                copying.upload = Some(upload);
+                copying.stage = CopyStage::Source;
+                Ok(())
+            }
+            // A native upload's parts are its runs, which no copy makes.
+            (CopyStage::Upload, Read::Upload(Some(_))) => self.fail_job(at, Status::InvalidRequest),
+            (CopyStage::Upload, Read::Upload(None)) => self.fail_job(at, Status::NoSuchUpload),
+            (CopyStage::Source, read) => self.copy_source_read(at, read),
+            (
+                CopyStage::Mark,
+                Read::Mark(Some(record::Mark {
+                    how: How::Version { order, .. },
+                    ..
+                })),
+            ) => {
+                let reply = match &copying.stored {
+                    Some(stored) => copied(stored, !order, &copying.source_version),
+                    None => Reply::status(Status::Failed),
+                };
+                self.reply_job(at, reply)
+            }
+            _ => self.fail_job(at, Status::Failed),
+        }
+    }
+
+    /// A copy's source version, read: judged by its copy-source conditions (research/89 §3.3),
+    /// what may be copied and how much, then the copy's drivers made, a get of the source's span
+    /// and a put of the destination's object or part, its metadata the source's or the request's
+    /// by the directive (research/89 §3.2).
+    fn copy_source_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+        let (order, version) = match read {
+            Read::NoBucket => return self.fail_job(at, Status::NoSuchBucket),
+            Read::Current(None) => return self.fail_job(at, Status::NoSuchKey),
+            // "If the current version is a delete marker, Amazon S3 behaves as if the object was
+            // deleted" (research/89 §3.1).
+            Read::Current(Some((_, current))) if current.marker => {
+                return self.fail_job(at, Status::NoSuchKey);
+            }
+            Read::Current(Some(found)) => found,
+            Read::Version(None) => return self.fail_job(at, Status::NoSuchVersion),
+            Read::Version(Some((_, named))) if named.marker => {
+                return self.fail_job(at, Status::CopyMarker);
+            }
+            Read::Version(Some(found)) => found,
+            _ => return self.fail_job(at, Status::Failed),
+        };
+        let now = self.wall.now_ns();
+        let Ok(Some(scheme)) = self.table().map(|t| t.scheme) else {
+            return self.fail_job(at, Status::Failed);
+        };
+        let Some(gateway) = self.gateway.as_ref() else {
+            return self.fail_job(at, Status::Failed);
+        };
+        let Some((generation, root)) = gateway.keys.last() else {
+            return self.fail_job(at, Status::Failed);
+        };
+        let holding = Holding {
+            handover_ns: gateway.handover_ns,
+            window: gateway.window,
+        };
+        let window = gateway.window;
+        let keyring = RootKeys {
+            keys: gateway
+                .keys
+                .iter()
+                .map(|(g, key)| (*g, *key.bytes()))
+                .collect(),
+        };
+        let made = (|| {
+            let data = DataKey::generate().ok()?;
+            let wrapped = WrappedKey {
+                by: Wrapper::Root(*generation),
+                bytes: data.wrap(root).ok()?,
+            };
+            let mut file = [0u8; 16];
+            getrandom::fill(&mut file).ok()?;
+            let keys = Keys {
+                file: u128::from_be_bytes(file),
+                data,
+                wrapped,
+            };
+            Some((keys, Layout::new(scheme).ok()?))
+        })();
+        let Some((keys, layout)) = made else {
+            return self.fail_job(at, Status::Failed);
+        };
+        let Some(Job {
+            work: Work::Copy(copying),
+            principal,
+            ..
+        }) = self.jobs.get_mut(at)
+        else {
+            return Ok(());
+        };
+        let modified = i64::try_from(object::seconds(version.modified_ns)).unwrap_or(i64::MAX);
+        let current = Current::Present {
+            etag: &version.etag,
+            modified,
+        };
+        match conditional::copy_source(&copying.conditions.conditions(), &current) {
+            conditional::Outcome::Proceed => {}
+            conditional::Outcome::NotFound => return self.fail_job(at, Status::NoSuchKey),
+            conditional::Outcome::Failed | conditional::Outcome::NotModified => {
+                return self.fail_job(at, Status::PreconditionFailed);
+            }
+        }
+        let size = version.size;
+        let span = match &copying.part {
+            None => {
+                // "This copy request is illegal because it is trying to copy an object to itself
+                // without changing the object's metadata" (research/89 §3.5).
+                let (source_bucket, source_key, named) = &copying.source;
+                if *source_bucket == copying.bucket
+                    && *source_key == copying.key
+                    && named.is_none()
+                    && copying.directive == Directive::Copy
+                {
+                    return self.fail_job(at, Status::CopyToItself);
+                }
+                if size > mantle_s3::body::MAX_UPLOAD {
+                    return self.fail_job(at, Status::CopySourceTooLarge);
+                }
+                0..size
+            }
+            Some(_) => match copying.conditions.range.as_deref() {
+                None if size > name::MAX_PART => {
+                    return self.fail_job(at, Status::CopySourceTooLarge);
+                }
+                None => 0..size,
+                Some(text) => match range::copy_range(text, size) {
+                    Err(CopyRangeError::Malformed) => {
+                        return self.fail_job(at, Status::InvalidCopyRange);
+                    }
+                    Err(CopyRangeError::Outside) => return self.fail_job(at, Status::InvalidRange),
+                    // "You can copy a range only if the source object is greater than 5 MB"
+                    // (research/89 §4.1).
+                    Ok(_) if size <= mantle_s3::body::MIN_PART => {
+                        return self.fail_job(at, Status::CopyRangeSource);
+                    }
+                    Ok((first, last)) => {
+                        let end = last.saturating_add(1);
+                        if end.saturating_sub(first) > name::MAX_PART {
+                            return self.fail_job(at, Status::EntityTooLarge);
+                        }
+                        first..end
+                    }
+                },
+            },
+        };
+        let whole = span.start == 0 && span.end == size;
+        let length = span.end.saturating_sub(span.start);
+        // The checksum the copy keeps: a part's its upload's; an object's the request's, else the
+        // source's algorithm, else CRC-64/NVME, as S3 gives a copy a full-object value (research/89
+        // §3.4).
+        let source_algorithm = version
+            .checksum
+            .as_ref()
+            .and_then(|c| Algorithm::from_code(c.algorithm));
+        let algorithm = match (&copying.part, &copying.upload) {
+            (Some(_), upload) => upload
+                .as_ref()
+                .and_then(|u| u.checksum)
+                .and_then(|(code, _)| Algorithm::from_code(code)),
+            (None, _) => Some(
+                copying
+                    .checksum
+                    .or(source_algorithm)
+                    .unwrap_or(Algorithm::Crc64Nvme),
+            ),
+        };
+        // A copy of the whole source is held to the source's own digests: its ETag where that is
+        // its bytes' MD5, and its checksum where that is a full-object value of the algorithm
+        // the copy keeps.
+        copying.expected = Expected {
+            md5: if whole {
+                md5_of_etag(&version.etag)
+            } else {
+                None
+            },
+            checksum: match (&version.checksum, algorithm) {
+                (Some(c), Some(algorithm))
+                    if whole
+                        && c.parts == 0
+                        && Algorithm::from_code(c.algorithm) == Some(algorithm) =>
+                {
+                    Some(checksum::Checksum {
+                        algorithm,
+                        bytes: c.value.clone(),
+                    })
+                }
+                _ => None,
+            },
+        };
+        let Some(row) = copying.row.as_ref() else {
+            return self.fail_job(at, Status::Failed);
+        };
+        let commit = match &copying.part {
+            Some((upload, number)) => Commit::Part(name::PutPart {
+                bucket: copying.bucket.clone(),
+                incarnation: row.created_ns,
+                key: copying.key.clone(),
+                upload: upload.clone(),
+                number: *number,
+                part: unfilled_part(),
+                at_ns: 0,
+                run: None,
+            }),
+            None => Commit::Object(name::Put {
+                bucket: copying.bucket.clone(),
+                incarnation: row.created_ns,
+                key: copying.key.clone(),
+                versioning: row.versioning,
+                preconditions: std::mem::take(&mut copying.preconditions),
+                at_ns: 0,
+                ordered_ns: None,
+                version: Version {
+                    marker: false,
+                    null: false,
+                    modified_ns: 0,
+                    etag: String::new(),
+                    size: 0,
+                    checksum: None,
+                    file: None,
+                    owner: principal.clone(),
+                    headers: match copying.directive {
+                        Directive::Copy => version.headers.clone(),
+                        Directive::Replace => std::mem::take(&mut copying.metadata),
+                    },
+                    retention: None,
+                    legal_hold: None,
+                    listing: None,
+                },
+                default: row.lock.and_then(|lock| lock.default),
+                id: copying.id,
+                deadline_ns: 0,
+            }),
+        };
+        let body = Body {
+            length,
+            checksum: algorithm,
+            content_md5: copying.expected.md5.is_some(),
+        };
+        copying.source_version = name::shown_id(version.null, order);
+        copying.file = keys.file;
+        let get = Get::new(version.file, size, span, Box::new(keyring), window);
+        let put = Put::new(commit, body, keys, layout, holding, Box::new(Random), now);
+        match (get, put) {
+            (Ok(get), Ok(put)) => {
+                copying.get = Some(get);
+                copying.put = Some(put);
+                copying.stage = CopyStage::Run;
+                Ok(())
+            }
+            (_, Err(error)) => {
+                let status = put_status(&error);
+                self.fail_job(at, status)
+            }
+            (Err(_), _) => self.fail_job(at, Status::Failed),
+        }
+    }
+
     /// An operation one read answers, at its turn: its read asked once.
     fn step_single(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get(at) else {
@@ -2683,7 +3624,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     max: *max,
                 },
             ),
-            Single::Uploads(query) => (Layer::Name, query.clone()),
+            Single::Uploads(query) | Single::Versions(query) => (Layer::Name, query.clone()),
             Single::Offset {
                 bucket,
                 key,
@@ -2765,6 +3706,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             (_, Read::Uploads(page)) => Reply {
                 listing: Some(Listing::Uploads(page)),
+                ..Reply::status(Status::Done)
+            },
+            (_, Read::Versions(page)) => Reply {
+                listing: Some(Listing::Versions(page)),
                 ..Reply::status(Status::Done)
             },
             // A native upload's progress, which a resuming client appends from; an upload
@@ -2997,6 +3942,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .iter()
             .filter_map(|j| match &j.work {
                 Work::Put(putting) => putting.put.as_ref()?.due_ns(),
+                Work::Copy(copying) => copying.put.as_ref()?.due_ns(),
                 _ => None,
             })
             .min()
@@ -3029,6 +3975,15 @@ fn directory() -> Vec<Descriptor> {
 /// The work an operation's request names, the bytes read past its fields the start of a put's
 /// body; a native upload's Open cuts its runs in `block`'s whole blocks (`Host::open_block`).
 fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
+    // Metadata past S3's 2 KB, or that no HTTP field could carry, is refused before anything is
+    // written (research/89 §1.4): judged once, its refusal taken in its place below.
+    let metadata = match &op {
+        Op::Put { metadata, .. }
+        | Op::CreateUpload { metadata, .. }
+        | Op::Open { metadata, .. } => mantle_s3::metadata::check(metadata).err(),
+        Op::Copy(copy) => mantle_s3::metadata::check(&copy.metadata).err(),
+        _ => None,
+    };
     match op {
         Op::Create { bucket, .. } => Work::Bucket(Box::new(Coordinating {
             bucket,
@@ -3056,6 +4011,11 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             trailing: Some(_),
             ..
         } => Work::Draining(Box::new(Reply::status(Status::InvalidRequest))),
+        Op::Put { .. } | Op::CreateUpload { .. } | Op::Open { .. } | Op::Copy(_)
+            if metadata.is_some() =>
+        {
+            Work::Draining(Box::new(Reply::status(metadata_status(metadata.as_ref()))))
+        }
         Op::Put {
             bucket,
             key,
@@ -3065,6 +4025,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             checksum,
             md5,
             trailing,
+            metadata,
         } => Work::Put(Box::new(Putting {
             bucket,
             key,
@@ -3083,30 +4044,38 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             carry,
             waiting: VecDeque::new(),
             run: None,
+            metadata,
         })),
         Op::Get {
             bucket,
             key,
             headers,
-        } => getting(bucket, key, headers, false),
+            version,
+        } => getting(bucket, key, headers, version.as_deref(), false),
         Op::Head {
             bucket,
             key,
             headers,
-        } => getting(bucket, key, headers, true),
+            version,
+        } => getting(bucket, key, headers, version.as_deref(), true),
         Op::Delete {
             bucket,
             key,
             headers,
+            version,
             ..
-        } => Work::Command(Box::new(Commanding {
-            bucket,
-            then: Then::Delete {
-                key,
-                if_match: matched(headers.if_match.as_deref(), true),
-            },
-            asked: false,
-        })),
+        } => match named(version.as_deref()) {
+            Err(status) => Work::Draining(Box::new(Reply::status(status))),
+            Ok(named) => Work::Command(Box::new(Commanding {
+                bucket,
+                then: Then::Delete {
+                    key,
+                    if_match: matched(headers.if_match.as_deref(), true),
+                    named,
+                },
+                asked: false,
+            })),
+        },
         Op::PutVersioning {
             bucket, versioning, ..
         } => Work::Command(Box::new(Commanding {
@@ -3135,10 +4104,15 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             bucket,
             key,
             checksum,
+            metadata,
             ..
         } => Work::Command(Box::new(Commanding {
             bucket,
-            then: Then::CreateUpload { key, checksum },
+            then: Then::CreateUpload {
+                key,
+                checksum,
+                metadata,
+            },
             asked: false,
         })),
         Op::UploadPart { length, .. } if length > name::MAX_PART => {
@@ -3169,6 +4143,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             carry,
             waiting: VecDeque::new(),
             run: None,
+            metadata: Vec::new(),
         })),
         Op::Complete {
             bucket,
@@ -3210,6 +4185,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             length,
             buffer,
             checksum,
+            metadata,
             ..
         } => {
             // No scheme to lay its blocks out by: nothing can be put.
@@ -3224,6 +4200,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
                         length,
                         checksum,
                         run,
+                        metadata,
                     },
                     asked: false,
                 })),
@@ -3275,6 +4252,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
                 incarnation: None,
                 runs: None,
             }),
+            metadata: Vec::new(),
         })),
         Op::Offset {
             bucket,
@@ -3351,14 +4329,148 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
         Op::ListBuckets { prefix, after, max } => {
             Work::Read(Box::new(Single::Buckets { prefix, after, max }))
         }
+        // No version asked: an empty page, the range not read (research/89 §2.3).
+        Op::ListVersions(list) if list.max == 0 => Work::Draining(Box::new(Reply {
+            listing: Some(Listing::Versions(object::Versions::default())),
+            ..Reply::status(Status::Done)
+        })),
+        Op::ListVersions(mut list) => {
+            list.max = list
+                .max
+                .min(u32::try_from(mantle_s3::list::MAX_KEYS).unwrap_or(u32::MAX));
+            Work::Read(Box::new(Single::Versions(Query::Versions(list))))
+        }
+        Op::DeleteObjects {
+            bucket,
+            objects,
+            quiet,
+            ..
+        } => {
+            let results = vec![None; objects.len()];
+            Work::Deletes(Box::new(Deleting {
+                bucket,
+                objects,
+                quiet,
+                row: None,
+                next: 0,
+                out: 0,
+                results,
+            }))
+        }
+        Op::Copy(copy) => {
+            let object::Copy {
+                bucket,
+                key,
+                id,
+                source,
+                conditions,
+                headers,
+                directive,
+                metadata,
+                checksum,
+            } = *copy;
+            let preconditions = Preconditions {
+                if_match: matched(headers.if_match.as_deref(), true),
+                if_none_match: matched(headers.if_none_match.as_deref(), false),
+            };
+            copying(
+                (bucket, key, None, id),
+                source,
+                conditions,
+                (preconditions, directive, metadata, checksum),
+            )
+        }
+        Op::CopyPart(part) => {
+            let object::CopyPart {
+                bucket,
+                key,
+                upload,
+                number,
+                id,
+                source,
+                conditions,
+            } = *part;
+            if !(1..=name::MAX_PART_NUMBER).contains(&number) {
+                return Work::Draining(Box::new(Reply::status(Status::InvalidArgument)));
+            }
+            copying(
+                (bucket, key, Some((upload, number)), id),
+                source,
+                conditions,
+                (Preconditions::default(), Directive::Copy, Vec::new(), None),
+            )
+        }
     }
 }
 
-fn getting(bucket: String, key: String, headers: Headers, head: bool) -> Work {
+/// The refusal `mantle_s3::metadata::check`'s error earns: past S3's 2 KB `MetadataTooLarge`, any
+/// other `InvalidArgument`.
+fn metadata_status(error: Option<&mantle_s3::metadata::MetadataError>) -> Status {
+    match error {
+        Some(mantle_s3::metadata::MetadataError::TooLarge) => Status::MetadataTooLarge,
+        _ => Status::InvalidArgument,
+    }
+}
+
+/// A copy's job, its source's version parsed; `InvalidVersion` for one no version is named by.
+fn copying(
+    (bucket, key, part, id): (String, String, Option<(String, u16)>, u128),
+    source: mantle_s3::copy::Source,
+    conditions: Headers,
+    (preconditions, directive, metadata, checksum): (
+        Preconditions,
+        Directive,
+        Metadata,
+        Option<Algorithm>,
+    ),
+) -> Work {
+    let named = match named(source.version.as_deref()) {
+        Ok(named) => named,
+        Err(status) => return Work::Draining(Box::new(Reply::status(status))),
+    };
+    Work::Copy(Box::new(Copying {
+        bucket,
+        key,
+        part,
+        id,
+        source: (source.bucket, source.key, named),
+        conditions,
+        preconditions,
+        directive,
+        metadata,
+        checksum,
+        stage: CopyStage::Bucket,
+        row: None,
+        upload: None,
+        get: None,
+        put: None,
+        expected: Expected::default(),
+        carry: None,
+        ended: false,
+        get_waiting: VecDeque::new(),
+        put_waiting: VecDeque::new(),
+        source_version: String::new(),
+        file: 0,
+        stored: None,
+    }))
+}
+
+fn getting(
+    bucket: String,
+    key: String,
+    headers: Headers,
+    version: Option<&str>,
+    head: bool,
+) -> Work {
+    let version = match named(version) {
+        Ok(version) => version,
+        Err(status) => return Work::Draining(Box::new(Reply::status(status))),
+    };
     Work::Get(Box::new(Getting {
         bucket,
         key,
         headers,
+        version,
         head,
         get: None,
         out: None,
@@ -3388,6 +4500,44 @@ enum Step {
     Go,
     /// Over, with its reply.
     Over(Box<Reply>),
+}
+
+/// The reply a copy earns once its put committed (research/89 §3.6): the new version's or part's
+/// ETag, checksum and time, the destination's version ID and the source's.
+fn copied(stored: &put::Stored, modified_ns: u64, source_version: &str) -> Reply {
+    Reply {
+        version: stored.version.clone().unwrap_or_default(),
+        etag: stored.etag.clone(),
+        size: stored.size,
+        modified: object::seconds(modified_ns),
+        checksum: stored.checksum.as_ref().map(kept),
+        source_version: source_version.to_owned(),
+        ..Reply::status(Status::Done)
+    }
+}
+
+/// The MD5 an ETag is, where it is one: 32 hexadecimal digits, a single PUT's of plaintext
+/// under SSE-S3 (research/05 §5.1); a multipart object's has its parts' count after it.
+fn md5_of_etag(etag: &str) -> Option<[u8; 16]> {
+    let digits = etag.as_bytes();
+    if digits.len() != 32 {
+        return None;
+    }
+    let mut md5 = [0u8; 16];
+    for (byte, pair) in md5.iter_mut().zip(digits.as_chunks::<2>().0) {
+        let hex = std::str::from_utf8(pair).ok()?;
+        *byte = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(md5)
+}
+
+/// The status a get's failure is answered with: too few of a block's chunks read is a cause
+/// that passes, `503 SlowDown`, which clients ask again; any other `500`.
+fn get_status(error: &GetError) -> Status {
+    match error {
+        GetError::Unreadable(_) => Status::SlowDown,
+        _ => Status::Failed,
+    }
 }
 
 /// What a job's ask came to.
@@ -3547,7 +4697,7 @@ mod tests {
                 ready: false,
             })),
             principal: "client".into(),
-            work: getting("b".into(), "k".into(), Headers::default(), false),
+            work: getting("b".into(), "k".into(), Headers::default(), None, false),
             pending: vec![(Pending::Read(1), None)],
             deadline_ns: Some(10),
             moved_ns: 1,
@@ -3619,6 +4769,7 @@ mod tests {
             checksum: None,
             md5: None,
             trailing: None,
+            metadata: Vec::new(),
         };
         assert_eq!(
             refused(&work(put, Vec::new(), None)),
@@ -3637,6 +4788,7 @@ mod tests {
             }),
             md5: None,
             trailing: Some(checksum::Algorithm::Crc32),
+            metadata: Vec::new(),
         };
         assert_eq!(
             refused(&work(twice, Vec::new(), None)),
@@ -3647,6 +4799,7 @@ mod tests {
             key: "k".into(),
             id: 1,
             checksum: Some((algorithm, full)),
+            metadata: Vec::new(),
         };
         for (algorithm, full, ok) in [
             (Algorithm::Crc64Nvme, true, true),
@@ -3667,5 +4820,111 @@ mod tests {
                 "{algorithm:?} full {full}"
             );
         }
+    }
+
+    /// What research/89 adds is refused from its request alone, before anything is read: a
+    /// version ID mantle never makes (InvalidArgument), metadata past S3's 2 KB
+    /// (MetadataTooLarge) or that no HTTP field carries, a part copy's number past 10,000; and a
+    /// copy counts as two of the host's operations.
+    #[test]
+    fn what_a_version_metadata_or_a_copy_names_is_refused_before_anything_is_read() {
+        let get = |version: &str| Op::Get {
+            bucket: "b".into(),
+            key: "k".into(),
+            headers: Headers::default(),
+            version: Some(version.into()),
+        };
+        for named in ["null", "0123456789ABC"] {
+            assert_eq!(
+                refused(&work(get(named), Vec::new(), None)),
+                None,
+                "{named}"
+            );
+        }
+        for invalid in ["", "nul", "0123456789AB", "0123456789ABCD", "0123456789ABU"] {
+            assert_eq!(
+                refused(&work(get(invalid), Vec::new(), None)),
+                Some(Status::InvalidVersion),
+                "{invalid:?}"
+            );
+        }
+        let delete = Op::Delete {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            headers: Headers::default(),
+            version: Some("not one".into()),
+        };
+        assert_eq!(
+            refused(&work(delete, Vec::new(), None)),
+            Some(Status::InvalidVersion)
+        );
+        let put = |metadata: Metadata| Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: 1,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+            trailing: None,
+            metadata,
+        };
+        let at = vec![(
+            "x-amz-meta-k".to_owned(),
+            "v".repeat(mantle_s3::metadata::MAX_USER - 1),
+        )];
+        assert_eq!(refused(&work(put(at), Vec::new(), None)), None);
+        let past = vec![(
+            "x-amz-meta-k".to_owned(),
+            "v".repeat(mantle_s3::metadata::MAX_USER),
+        )];
+        assert_eq!(
+            refused(&work(put(past), Vec::new(), None)),
+            Some(Status::MetadataTooLarge)
+        );
+        let control = vec![("x-amz-meta-k".to_owned(), "a\nb".to_owned())];
+        assert_eq!(
+            refused(&work(put(control), Vec::new(), None)),
+            Some(Status::InvalidArgument)
+        );
+        let source = mantle_s3::copy::Source {
+            bucket: "b".into(),
+            key: "k".into(),
+            version: None,
+        };
+        let part = Op::CopyPart(Box::new(object::CopyPart {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload: "0123456789ABC".into(),
+            number: name::MAX_PART_NUMBER + 1,
+            id: 1,
+            source: source.clone(),
+            conditions: Headers::default(),
+        }));
+        assert_eq!(
+            refused(&work(part, Vec::new(), None)),
+            Some(Status::InvalidArgument)
+        );
+        let copy = Op::Copy(Box::new(object::Copy {
+            bucket: "b".into(),
+            key: "k2".into(),
+            id: 1,
+            source: mantle_s3::copy::Source {
+                version: Some("bad".into()),
+                ..source
+            },
+            conditions: Headers::default(),
+            headers: Headers::default(),
+            directive: Directive::Copy,
+            metadata: Vec::new(),
+            checksum: None,
+        }));
+        assert_eq!(weight(&copy), 2);
+        assert_eq!(
+            refused(&work(copy, Vec::new(), None)),
+            Some(Status::InvalidVersion)
+        );
+        assert_eq!(weight(&get("null")), 1);
     }
 }

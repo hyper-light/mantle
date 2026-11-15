@@ -2506,6 +2506,7 @@ pub(crate) fn put_op(bucket: &str, key: &str, id: u128, length: u64) -> Op {
         checksum: None,
         md5: None,
         trailing: None,
+        metadata: Vec::new(),
     }
 }
 
@@ -2518,5 +2519,6 @@ pub(crate) fn get_op(bucket: &str, key: &str, range: Option<String>) -> Op {
             range,
             ..Headers::default()
         },
+        version: None,
     }
 }

@@ -1962,9 +1962,13 @@ every byte it had sent, in 4 of 12 runs of `tests/s3.rs` with each process on on
 Served: CreateBucket, HeadBucket, GetBucketLocation, DeleteBucket, ListBuckets, Put and Get
 BucketVersioning, PutObject, GetObject whole and by range, HeadObject, DeleteObject, ListObjectsV2,
 CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts and
-ListMultipartUploads; every other operation `mantle_s3::route` names, and DeleteObject of a version
-by its ID, is `501 NotImplemented` on this path, and an object's stored headers (`Content-Type`,
-`x-amz-meta-*`) are not kept yet, so a get answers `binary/octet-stream`. Tested in
+ListMultipartUploads; since 2026-11-14 an object's content headers and `x-amz-meta-*` metadata,
+kept and returned, GetObject, HeadObject and DeleteObject of a version by its ID,
+ListObjectVersions, CopyObject, UploadPartCopy, DeleteObjects, and GetObjectTagging, a version's
+empty tag set read as a head reads the version (s3-protocol.md §14, research/89); every other
+operation `mantle_s3::route` names, and a write naming tags, is `501 NotImplemented` on this
+path. DeleteObjects' document is read whole, as CompleteMultipartUpload's is, before its
+integrity header is checked. Tested in
 `crates/mantle/tests/s3.rs` on a cell of three made by `mantle init`, every request signed with the
 operator's key through each node's listener: a bucket made, listed, headed and refused again;
 objects put through each listener read back whole, by range and by head through the others; every
@@ -2218,7 +2222,17 @@ or gateway asks it on an exchange of the transfer class (`crate::object`) for S3
 CreateBucket, HeadBucket, ListBuckets, DeleteBucket, PutBucketVersioning and GetBucketVersioning;
 PutObject with its bytes on the exchange, GetObject with them on the reply, HeadObject,
 DeleteObject and ListObjectsV2; CreateMultipartUpload, UploadPart with its bytes on the exchange,
-CompleteMultipartUpload, AbortMultipartUpload, ListParts and ListMultipartUploads. A request's head is a few fixed fields, held for the exchange's
+CompleteMultipartUpload, AbortMultipartUpload, ListParts and ListMultipartUploads; and since
+2026-11-14 CopyObject, UploadPartCopy, DeleteObjects and ListObjectVersions, a version named on
+GetObject, HeadObject and DeleteObject, and a version's metadata on PutObject,
+CreateMultipartUpload and a native upload's Open, returned on every reply that states a version
+(s3-protocol.md §14). Each new operation is a kind of its own and the older operations' fields
+were extended only at their end, so every earlier golden vector keeps its bytes but for the
+appended field and its fields' length (`tests/golden/object.txt`). The protocol names no version
+of its own yet, and its decoders take a message only when its fields end where its length says,
+so a client and a node a release apart refuse each other's extended messages as malformed rather
+than misread them; the versions a connection's first exchange names (§1.7) are what will let them
+differ. A request's head is a few fixed fields, held for the exchange's
 life: its kind, its fields' length, the operation's identity, which every mutation carries
 (gateway.md §2.1; the Name range records none yet, STATUS item 9), and a put's length; its fields
 ride in the body ahead of a put's bytes, each bounded by S3's own bound on what it names. A
@@ -2274,6 +2288,28 @@ retry, never the `404` an upload not found would be. ListParts reads a page of a
 at most S3's 1,000 and as many as the reply has room for, and ListMultipartUploads a page of the
 bucket's uploads through the S3 layer's paging over the Name layer's scan of uploads, ended early at
 the first upload its reply has no room for.
+
+*As built (2026-11-14), versions, copies and batch deletes* (s3-protocol.md §14; research/89). A
+get, head or delete naming a version reads that version (`Query::Version`, read kind 13) where it
+would read the current one: text that is neither `null` nor 13 characters of mantle's alphabet is
+refused before anything is read, and a delete marker named is `MethodNotAllowed` with the marker's
+facts. ListObjectVersions is one read of the Name range (`Query::Versions`, kind 14) over the Name
+layer's scan of versions, ended early at the first version its reply has no room for. A copy is a
+job that reads its destination's bucket row, a part copy its upload's row, and then its source's
+version, current or named; judges the source's conditions and S3's refusals against that version;
+draws the new file's data key; and then drives a `Get` over the source version's file and a `Put`
+of the new file together, each piece the get yields fed to the put as the put takes body, so a copy
+holds at most the get's window of blocks and one piece, and a slow put holds the get back. The put commits a version or
+a part as a PUT's does; a copy whose new version is the null version reads the mark its write left
+(`Query::Mark`, kind 15) for the version's time. A copy takes two of the host's
+`gateway.objects` operations, one for each driver: the local door holds a copy while fewer are
+free, the requests behind it waiting so the door keeps its order, and the native door answers it
+`SlowDown`. DeleteObjects reads its bucket's row once and then asks each object's delete as a Name
+command of its own, as many at once as its share of the node's command asks,
+`(command asks - 1) / gateway.objects`, the one held back being its enlistment's; each delete's
+outcome is that object's result, in the document's order. Tested at both doors against a cell of
+three (`crates/mantle/tests/s3.rs`, `native.rs`, `stock_clients.rs`) and in
+`node::host`'s `what_a_version_metadata_or_a_copy_names_is_refused_before_anything_is_read`.
 
 The host serves each driver's requests as the table above routes them: `Place` from the node's
 replica of the volume table (§6.6), read from the root range's rows once for each entry that

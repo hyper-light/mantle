@@ -22,6 +22,9 @@
 //! | a multipart upload's row, of a Name range | kind 10; the bucket, the key and the upload's ID | 0 for none; 1, then the upload (`Upload`); 2 when the bucket has no gate here, or a condemned one |
 //! | an upload's parts after a number, of a Name range | kind 11; the bucket, the key and the upload's ID; the number (u16); the most parts (u32) | 0 when the upload is not there; 1, whether more follow (u8), the count (u32), each part's number (u16) and its row (`Part`) behind its length; 2 when the bucket has no gate here, or a condemned one |
 //! | a page of ListMultipartUploads, of a Name range | kind 12; the bucket, the prefix and the delimiter; the key marker and the upload ID marker, each optional; the most uploads (u32) | 1, then the page as an object's reply carries it; 2 when the bucket has no gate here, or a condemned one |
+//! | a version of a key a request names, of a Name range (research/89 §2.1) | kind 13; the bucket's and the key's lengths (u32) each before its bytes; 0 for the null version, or 1 and the version's order (u64) | as the current version's answer |
+//! | a page of ListObjectVersions, of a Name range (research/89 §2.3) | kind 14; the listing's request as an object's request carries it (`mantle_protocol::object`) | 1, then the page as an object's reply carries it; 2 when the bucket has no gate here, or a condemned one |
+//! | the mark of a write, of a Name range (research/89 §3.6) | kind 15; the bucket's and the key's lengths (u32) each before its bytes; the write's file or ID (u128) | 0 for none; 1, then the mark (`mantle_meta::record::Mark`); 2 when the bucket has no gate here, or a condemned one |
 //!
 //! A read is answered only by a range of the layer whose rows it reads (`Query::layer`). A page
 //! holds as many volumes as a reply carries, each counted at the longest domain, so it fits
@@ -38,10 +41,10 @@ use mantle_codec::{Reader, Writer};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Rows;
 use mantle_meta::error::MetaError;
-use mantle_meta::name::{self, Probe, Routed, Scan};
+use mantle_meta::name::{self, Named, Probe, Routed, Scan};
 use mantle_meta::record::{
-    BlockHeader, Bucket, ChunkPlace, Extent, FileHeader, Gate, GateState, Lineage, Part, Upload,
-    Version,
+    BlockHeader, Bucket, ChunkPlace, Extent, FileHeader, Gate, GateState, Lineage, Mark, Part,
+    Upload, Version,
 };
 use mantle_meta::root::{self, MAX_DOMAIN, Placed};
 use mantle_meta::wire::{MAX_BUCKET, MAX_KEY, MAX_OWNER};
@@ -49,7 +52,10 @@ use mantle_meta::{block, bucket, file};
 use mantle_s3::checksum::Algorithm;
 use mantle_s3::list::{self, EntryFrom, Paging, Resume, Step};
 
-use mantle_protocol::object::{self, Buckets, List, Listed, MAX_TAG, Page, UploadListed, Uploads};
+use mantle_protocol::object::{
+    self, Buckets, List, ListVersions, Listed, MAX_TAG, Page, UploadListed, Uploads, VersionListed,
+    Versions,
+};
 
 /// The query's kind: the current version of a key, or a page of the volume table.
 const CURRENT: u8 = 0;
@@ -65,6 +71,9 @@ const PROBE: u8 = 9;
 const UPLOAD: u8 = 10;
 const PARTS: u8 = 11;
 const UPLOADS: u8 = 12;
+const VERSION: u8 = 13;
+const VERSIONS: u8 = 14;
+const MARK: u8 = 15;
 /// An extent's bytes in an answer, at most: its first byte's offset, its record's length and the
 /// record (`Extent::encode`: the format, the length, the target's kind and id, the CRC-32C).
 const EXTENT_BYTES: usize = 8 + 4 + (1 + 8 + 1 + 16 + 4);
@@ -170,6 +179,22 @@ pub enum Query {
         id_marker: Option<String>,
         max: u32,
     },
+    /// The version of `key` a request names: what a GET or HEAD with `versionId` reads first,
+    /// and a copy of a named version (research/89 §2.1).
+    Version {
+        bucket: String,
+        key: String,
+        named: Named,
+    },
+    /// A page of ListObjectVersions (research/89 §2.3; s3-protocol.md §3).
+    Versions(ListVersions),
+    /// The mark of the write that carried file or ID `id` under `key`: the version a copy made,
+    /// found from the copy alone (research/89 §3.6).
+    Mark {
+        bucket: String,
+        key: String,
+        id: u128,
+    },
 }
 
 /// What a range answered a read.
@@ -203,6 +228,12 @@ pub enum Read {
     Parts(Option<(Vec<(u16, Part)>, bool)>),
     /// A page of the bucket's uploads.
     Uploads(Uploads),
+    /// The version named and its order, or none.
+    Version(Option<(u64, Version)>),
+    /// A page of the bucket's versions and delete markers.
+    Versions(Versions),
+    /// The write's mark, or none.
+    Mark(Option<Mark>),
 }
 
 /// Why a read's message was refused.
@@ -376,6 +407,28 @@ impl Query {
                 }
                 w.u32(*max);
             }
+            Self::Version { bucket, key, named } => {
+                w.u8(VERSION);
+                put_text(&mut w, bucket);
+                put_text(&mut w, key);
+                match named {
+                    Named::Null => w.u8(0),
+                    Named::Order(order) => {
+                        w.u8(1);
+                        w.u64(*order);
+                    }
+                }
+            }
+            Self::Versions(list) => {
+                w.u8(VERSIONS);
+                object::put_list_versions(&mut w, list).map_err(|_| ReadError::Query)?;
+            }
+            Self::Mark { bucket, key, id } => {
+                w.u8(MARK);
+                put_text(&mut w, bucket);
+                put_text(&mut w, key);
+                w.u128(*id);
+            }
         }
         Ok(w.into_vec())
     }
@@ -470,6 +523,21 @@ impl Query {
                     max: r.u32()?,
                 })
             }
+            VERSION => Some(Self::Version {
+                bucket: take_text(&mut r, MAX_BUCKET)?,
+                key: take_text(&mut r, MAX_KEY)?,
+                named: match r.u8()? {
+                    0 => Named::Null,
+                    1 => Named::Order(r.u64()?),
+                    _ => return None,
+                },
+            }),
+            VERSIONS => Some(Self::Versions(object::take_list_versions(&mut r)?)),
+            MARK => Some(Self::Mark {
+                bucket: take_text(&mut r, MAX_BUCKET)?,
+                key: take_text(&mut r, MAX_KEY)?,
+                id: r.u128()?,
+            }),
             _ => None,
         })();
         query.filter(|_| r.remaining() == 0).ok_or(ReadError::Query)
@@ -488,7 +556,10 @@ impl Query {
             | Self::Probe { .. }
             | Self::Upload { .. }
             | Self::Parts { .. }
-            | Self::Uploads { .. } => Layer::Name,
+            | Self::Uploads { .. }
+            | Self::Version { .. }
+            | Self::Versions(_)
+            | Self::Mark { .. } => Layer::Name,
         }
     }
 
@@ -701,6 +772,130 @@ impl Query {
                     next: page.next,
                 }))
             }
+            Self::Version { bucket, key, named } => {
+                if !gated(engine, bucket).map_err(meta)? {
+                    return Ok(Read::NoBucket);
+                }
+                name::version(engine, bucket, key, *named)
+                    .map(Read::Version)
+                    .map_err(meta)
+            }
+            Self::Versions(versions) => {
+                if !gated(engine, &versions.bucket).map_err(meta)? {
+                    return Ok(Read::NoBucket);
+                }
+                // The reply's room past the page's own bytes; the longest version must fit, so a
+                // page lists at least one item.
+                let room = max_bytes
+                    .checked_sub(1 + object::VERSIONS_HEAD_BYTES)
+                    .filter(|room| *room >= object::VERSION_BYTES)
+                    .ok_or(ReadError::Page(max_bytes))?;
+                let mut index = VersionIndex {
+                    engine,
+                    bucket: &versions.bucket,
+                    room,
+                };
+                let request = list::EntryRequest {
+                    prefix: &versions.prefix,
+                    delimiter: Some(versions.delimiter.as_str()),
+                    key_marker: versions.key_marker.as_deref(),
+                    id_marker: versions.id_marker.as_deref(),
+                    max: usize::try_from(versions.max).unwrap_or(usize::MAX),
+                };
+                let page = list::entries(&request, &mut index).map_err(meta)?;
+                Ok(Read::Versions(Versions {
+                    versions: page.entries.into_iter().map(|e| e.value).collect(),
+                    common_prefixes: page.common_prefixes,
+                    truncated: page.truncated,
+                    next: page.next,
+                }))
+            }
+            Self::Mark { bucket, key, id } => {
+                if !gated(engine, bucket).map_err(meta)? {
+                    return Ok(Read::NoBucket);
+                }
+                name::mark_of(engine, bucket, key, *id)
+                    .map(Read::Mark)
+                    .map_err(meta)
+            }
+        }
+    }
+}
+
+/// A bucket's versions and delete markers in a Name range, as ListObjectVersions pages them,
+/// within a reply's room.
+struct VersionIndex<'a, E> {
+    engine: &'a mut E,
+    bucket: &'a str,
+    /// The bytes of the reply left for the page's items.
+    room: usize,
+}
+
+impl<E: Rows> list::Entries for VersionIndex<'_, E> {
+    type Value = VersionListed;
+    type Error = MetaError;
+
+    fn seek(
+        &mut self,
+        from: &EntryFrom,
+        to: &[u8],
+        budget: &mut usize,
+    ) -> Result<Step<list::Listed<VersionListed>>, MetaError> {
+        let from = match from {
+            EntryFrom::Key(key) => name::VersionFrom::Key(key),
+            EntryFrom::After { key, id } => name::VersionFrom::After {
+                key,
+                version_id: id,
+            },
+        };
+        Ok(
+            match name::next_version(self.engine, self.bucket, from, to, budget)? {
+                Scan::End => Step::End,
+                Scan::Paused(key) => Step::Paused(key),
+                Scan::Found(found) => {
+                    let id = found.version_id();
+                    let version = found.version;
+                    let checksum = match version.checksum {
+                        None => None,
+                        Some(c) => Some((
+                            Algorithm::from_code(c.algorithm).ok_or(MetaError::Corrupt)?,
+                            c.parts,
+                        )),
+                    };
+                    Step::Found(list::Listed {
+                        key: found.key.clone(),
+                        id: id.clone(),
+                        value: VersionListed {
+                            key: found.key,
+                            id,
+                            latest: found.latest,
+                            marker: version.marker,
+                            etag: version.etag,
+                            size: version.size,
+                            modified: object::seconds(version.modified_ns),
+                            checksum,
+                            owner: version.owner,
+                        },
+                    })
+                }
+            },
+        )
+    }
+
+    fn room(&mut self, item: Result<&list::Listed<VersionListed>, &str>) -> bool {
+        let bytes = match item {
+            Ok(entry) => {
+                let v = &entry.value;
+                object::version_bytes(&v.key, &v.id, &v.etag, v.checksum.is_some(), &v.owner)
+            }
+            Err(prefix) => object::prefix_bytes(prefix),
+        };
+        match self.room.checked_sub(bytes) {
+            Some(left) => {
+                self.room = left;
+                true
+            }
+            None => false,
         }
     }
 }
@@ -891,7 +1086,22 @@ impl Read {
                 w.u8(3);
                 w.bytes(&lineage.encode()?);
             }
-            Self::Upload(None) | Self::Parts(None) => w.u8(0),
+            Self::Upload(None) | Self::Parts(None) | Self::Version(None) | Self::Mark(None) => {
+                w.u8(0)
+            }
+            Self::Version(Some((order, version))) => {
+                w.u8(1);
+                w.u64(*order);
+                w.bytes(&version.encode()?);
+            }
+            Self::Versions(page) => {
+                w.u8(1);
+                object::put_versions(&mut w, page).map_err(|_| ReadError::Answer)?;
+            }
+            Self::Mark(Some(mark)) => {
+                w.u8(1);
+                w.bytes(&mark.encode());
+            }
             Self::Upload(Some(upload)) => {
                 w.u8(1);
                 w.bytes(&upload.encode()?);
@@ -964,6 +1174,33 @@ impl Read {
                     .filter(|_| r.remaining() == 0)
                     .map(Self::Keys)
                     .ok_or(ReadError::Answer),
+                _ => Err(ReadError::Answer),
+            },
+            Query::Version { .. } => match r.u8() {
+                Some(0) if r.remaining() == 0 => Ok(Self::Version(None)),
+                Some(1) => {
+                    let order = r.u64().ok_or(ReadError::Answer)?;
+                    let rest = r.take(r.remaining()).ok_or(ReadError::Answer)?;
+                    Ok(Self::Version(Some((order, Version::decode(rest)?))))
+                }
+                Some(2) if r.remaining() == 0 => Ok(Self::NoBucket),
+                _ => Err(ReadError::Answer),
+            },
+            Query::Versions(_) => match r.u8() {
+                Some(2) if r.remaining() == 0 => Ok(Self::NoBucket),
+                Some(1) => object::take_versions(&mut r)
+                    .filter(|_| r.remaining() == 0)
+                    .map(Self::Versions)
+                    .ok_or(ReadError::Answer),
+                _ => Err(ReadError::Answer),
+            },
+            Query::Mark { .. } => match r.u8() {
+                Some(0) if r.remaining() == 0 => Ok(Self::Mark(None)),
+                Some(1) => {
+                    let rest = r.take(r.remaining()).ok_or(ReadError::Answer)?;
+                    Ok(Self::Mark(Some(Mark::decode(rest)?)))
+                }
+                Some(2) if r.remaining() == 0 => Ok(Self::NoBucket),
                 _ => Err(ReadError::Answer),
             },
             Query::Owned { .. } => object::take_buckets(&mut r)
@@ -1235,6 +1472,194 @@ mod tests {
             panic!("no version");
         };
         assert_eq!(version.size, 0);
+    }
+
+    /// Puts an empty object at `key` under `versioning`, as entry `index`: its version's ID, and
+    /// the ID its write is marked under.
+    fn put_versioned(
+        m: &mut Model,
+        index: u64,
+        key: &str,
+        versioning: mantle_meta::record::Versioning,
+    ) -> (String, u128) {
+        let id = u128::from(index) << 1;
+        let put = name::Command::Put(name::Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: key.into(),
+            versioning,
+            preconditions: name::Preconditions::default(),
+            at_ns: index * 1_000_000_000,
+            ordered_ns: None,
+            version: Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".into(),
+                headers: vec![("content-type".into(), "text/plain".into())],
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            },
+            default: None,
+            id,
+            deadline_ns: u64::MAX,
+        });
+        let name::Outcome::Put { version } = name::apply(m, index, &put).unwrap() else {
+            panic!("not put");
+        };
+        (version, id)
+    }
+
+    /// A version named by its ID or as `null` reads back with its metadata, one no version has
+    /// reads as none, and a write's mark names the version it made: research/89's reads
+    /// (§2.1, §3.6).
+    #[test]
+    fn a_named_version_and_a_writes_mark_read_back() {
+        use mantle_meta::record::{How, Versioning};
+        let (mut m, index) = name_range();
+        let (null, null_id) = put_versioned(&mut m, index + 1, "k", Versioning::Unversioned);
+        assert_eq!(null, "null");
+        let (older, _) = put_versioned(&mut m, index + 2, "k", Versioning::Enabled);
+        let (newer, _) = put_versioned(&mut m, index + 3, "k", Versioning::Enabled);
+        let order = |id: &str| mantle_meta::key::parse_version_id(id).unwrap();
+        for (named, id) in [
+            (Named::Null, None),
+            (Named::Order(order(&older)), Some(&older)),
+            (Named::Order(order(&newer)), Some(&newer)),
+        ] {
+            let query = Query::Version {
+                bucket: "b".into(),
+                key: "k".into(),
+                named,
+            };
+            let Read::Version(Some((found, version))) = round_trip(&query, &mut m, 1 << 12) else {
+                panic!("{named:?} not found");
+            };
+            if let Some(id) = id {
+                assert_eq!(found, order(id));
+            }
+            assert_eq!(
+                version.headers,
+                [("content-type".into(), "text/plain".into())]
+            );
+            assert_eq!(query.layer(), Layer::Name);
+        }
+        let absent = Query::Version {
+            bucket: "b".into(),
+            key: "k".into(),
+            named: Named::Order(order(&older) + 1),
+        };
+        assert_eq!(round_trip(&absent, &mut m, 1 << 12), Read::Version(None));
+        // The null version's write is marked with the order it made, and its time is that
+        // order inverted, as a copy reads it.
+        let mark = Query::Mark {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: null_id,
+        };
+        let Read::Mark(Some(found)) = round_trip(&mark, &mut m, 1 << 12) else {
+            panic!("no mark");
+        };
+        let How::Version { order: made, null } = found.how else {
+            panic!("{found:?}");
+        };
+        assert!(null);
+        let Read::Version(Some((_, version))) = round_trip(
+            &Query::Version {
+                bucket: "b".into(),
+                key: "k".into(),
+                named: Named::Null,
+            },
+            &mut m,
+            1 << 12,
+        ) else {
+            panic!("no null version");
+        };
+        assert_eq!(version.modified_ns, !made);
+        let unwritten = Query::Mark {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 7,
+        };
+        assert_eq!(round_trip(&unwritten, &mut m, 1 << 12), Read::Mark(None));
+        assert_eq!(
+            round_trip(&mark, &mut Model::default(), 1 << 10),
+            Read::NoBucket
+        );
+    }
+
+    /// ListObjectVersions' pages, each within its reply's room, list every version of every key
+    /// once, newest first within a key and the first its latest, resumed by the markers each page
+    /// names (research/89 §2.3).
+    #[test]
+    fn a_listing_of_versions_pages_within_its_room_and_resumes_exactly() {
+        use mantle_meta::record::Versioning;
+        let (mut m, mut index) = name_range();
+        let mut made: Vec<(String, String)> = Vec::new();
+        for key in ["a", "b", "c"] {
+            for _ in 0..3 {
+                index += 1;
+                let (id, _) = put_versioned(&mut m, index, key, Versioning::Enabled);
+                made.push((key.to_owned(), id));
+            }
+        }
+        // Newest first within a key: a version's ID sorts as its order, its time inverted.
+        let mut expected = made.clone();
+        expected.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+        let least = 1 + object::VERSIONS_HEAD_BYTES + object::VERSION_BYTES;
+        for room in [least, least + 300, 1 << 20] {
+            let (mut key_marker, mut id_marker) = (None, None);
+            let mut seen = Vec::new();
+            let mut latest = Vec::new();
+            loop {
+                let query = Query::Versions(ListVersions {
+                    bucket: "b".into(),
+                    prefix: String::new(),
+                    delimiter: String::new(),
+                    key_marker: key_marker.take(),
+                    id_marker: id_marker.take(),
+                    max: 1000,
+                });
+                let Read::Versions(page) = round_trip(&query, &mut m, room) else {
+                    panic!("no page");
+                };
+                for v in page.versions {
+                    if v.latest {
+                        latest.push(v.key.clone());
+                    }
+                    seen.push((v.key, v.id));
+                }
+                if !page.truncated {
+                    break;
+                }
+                let (key, id) = page.next.unwrap();
+                key_marker = Some(key);
+                id_marker = Some(id);
+            }
+            assert_eq!(seen, expected, "room {room}");
+            assert_eq!(latest, ["a", "b", "c"], "room {room}");
+        }
+        let query = Query::Versions(ListVersions {
+            bucket: "b".into(),
+            prefix: String::new(),
+            delimiter: String::new(),
+            key_marker: None,
+            id_marker: None,
+            max: 1000,
+        });
+        assert_eq!(
+            query.answer(&mut m, least - 1),
+            Err(ReadError::Page(least - 1))
+        );
+        assert_eq!(
+            round_trip(&query, &mut Model::default(), 1 << 10),
+            Read::NoBucket
+        );
     }
 
     /// A listing's pages, each within its reply's room, list every key and common prefix once

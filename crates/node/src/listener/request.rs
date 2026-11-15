@@ -13,7 +13,11 @@ use mantle_s3::route::{self, Operation, Query, Route};
 use mantle_s3::sigv4::{self, Body, Verified};
 
 use super::Endpoint;
-use mantle_protocol::object::{Headers, List, Op};
+use mantle_protocol::object::{
+    self as native, Copy, CopyPart, Headers, List, ListVersions, MAX_CONDITION_TAG, Op, Target,
+};
+use mantle_s3::copy::{self, Directive};
+use mantle_s3::metadata;
 
 /// The largest object a single PUT or part carries: 5 GiB (05 §4.3).
 const MAX_OBJECT: u64 = mantle_s3::body::MAX_UPLOAD;
@@ -116,6 +120,14 @@ pub enum Make {
         upload: String,
         id: u128,
         headers: Headers,
+    },
+    /// DeleteObjects (research/89 §5): its document held to the `Content-MD5` or checksum its
+    /// headers state, one of which it must carry.
+    Deletes {
+        bucket: String,
+        id: u128,
+        md5: Option<[u8; 16]>,
+        checksum: Option<Checksum>,
     },
 }
 
@@ -229,6 +241,53 @@ fn has_body(framing: Framing) -> bool {
     !matches!(framing, Framing::None | Framing::Length(0))
 }
 
+/// A copy's `x-amz-copy-source-if-*`, in the preconditions' slots, and an UploadPartCopy's
+/// `x-amz-copy-source-range` in the range's (research/89 §3.3, §4.1).
+fn copy_conditions(parts: &Parts<'_>, range: bool) -> Headers {
+    let take = |name: &str| parts.header(name).map(str::to_owned);
+    Headers {
+        if_match: take("x-amz-copy-source-if-match"),
+        if_none_match: take("x-amz-copy-source-if-none-match"),
+        if_modified_since: take("x-amz-copy-source-if-modified-since"),
+        if_unmodified_since: take("x-amz-copy-source-if-unmodified-since"),
+        range: if range {
+            take("x-amz-copy-source-range")
+        } else {
+            None
+        },
+    }
+}
+
+/// The content headers and user-defined metadata a request's headers name, as a version keeps
+/// them (research/89 §1).
+fn stored(parts: &Parts<'_>) -> Result<native::Metadata, Refused> {
+    metadata::of_request(parts.headers.iter().copied()).map_err(|e| Refused::of(e.code(), e))
+}
+
+/// The source `x-amz-copy-source` names (research/89 §3.1).
+fn source(parts: &Parts<'_>) -> Result<copy::Source, Refused> {
+    copy::source(parts.header("x-amz-copy-source").unwrap_or_default())
+        .map_err(|e| Refused::of(e.code(), e))
+}
+
+/// The version `versionId` names, as sent.
+fn version_id(query: &Query) -> Option<String> {
+    query.value("versionId").map(str::to_owned)
+}
+
+/// A write's tag set, of which mantle keeps none yet (research/89 §3.8): one named, in the
+/// `x-amz-tagging` header or in a presigned URL's query where SDK presigners move it
+/// (s3-protocol.md §5), is refused rather than dropped; the empty one names none, and is taken.
+fn untagged(parts: &Parts<'_>, query: &Query) -> Result<(), Refused> {
+    match parts
+        .header("x-amz-tagging")
+        .or_else(|| query.value("x-amz-tagging"))
+    {
+        Some(tags) if !tags.trim().is_empty() => Err(not_implemented("Object tagging")),
+        _ => Ok(()),
+    }
+}
+
 /// The preconditions and range a request sends (05 §2, §12), as the host judges them.
 fn headers(parts: &Parts<'_>, range: bool) -> Headers {
     let take = |name: &str| parts.header(name).map(str::to_owned);
@@ -294,6 +353,8 @@ fn plan(
         }),
         Operation::ListObjectsV2 => host(Op::List(list(route, query)?)),
         Operation::PutObject => {
+            untagged(parts, query)?;
+            let metadata = stored(parts)?;
             let (body, trailing) = upload(parts, verified, framing)?;
             let (checksum, md5) = digests(parts)?;
             single(checksum.as_ref(), trailing)?;
@@ -307,6 +368,7 @@ fn plan(
                     checksum,
                     md5,
                     trailing,
+                    metadata,
                 },
                 body: Some(body),
             })
@@ -315,27 +377,103 @@ fn plan(
             bucket: bucket(route)?,
             key: key(route)?,
             headers: headers(parts, true),
+            version: version_id(query),
         }),
         Operation::HeadObject => host(Op::Head {
             bucket: bucket(route)?,
             key: key(route)?,
             headers: headers(parts, true),
+            version: version_id(query),
         }),
-        Operation::DeleteObject if query.has("versionId") => Err(not_implemented(
-            "DeleteObject of a version by its ID on the S3 listener",
-        )),
+        // A version's tag set, the empty one while mantle keeps none (research/89 §3.8): the
+        // version a head reads, current or named, its absence answered as a head's is. Stock
+        // clients ask it of every source they copy in parts.
+        Operation::GetObjectTagging => host(Op::Head {
+            bucket: bucket(route)?,
+            key: key(route)?,
+            headers: Headers::default(),
+            version: version_id(query),
+        }),
         Operation::DeleteObject => host(Op::Delete {
             bucket: bucket(route)?,
             key: key(route)?,
             id,
             headers: headers(parts, false),
+            version: version_id(query),
         }),
-        Operation::CreateMultipartUpload => host(Op::CreateUpload {
+        Operation::CreateMultipartUpload => {
+            untagged(parts, query)?;
+            host(Op::CreateUpload {
+                bucket: bucket(route)?,
+                key: key(route)?,
+                id,
+                checksum: upload_checksum(parts)?,
+                metadata: stored(parts)?,
+            })
+        }
+        Operation::CopyObject => {
+            let directive =
+                copy::directive(parts.header("x-amz-metadata-directive")).ok_or_else(|| {
+                    Refused::new("InvalidArgument", 400, "Unknown metadata directive.")
+                })?;
+            // Under `x-amz-tagging-directive: COPY`, the default, the copy takes its source's tag
+            // set, which is empty; a set replacing it is refused as a PUT's is (research/89 §3.8).
+            if parts
+                .header("x-amz-tagging-directive")
+                .is_some_and(|d| d.trim() == "REPLACE")
+            {
+                untagged(parts, query)?;
+            }
+            let checksum = parts
+                .header("x-amz-checksum-algorithm")
+                .map(|name| {
+                    Algorithm::from_name(name).ok_or_else(|| {
+                        Refused::new(
+                            "InvalidRequest",
+                            400,
+                            "Checksum algorithm provided is unsupported.",
+                        )
+                    })
+                })
+                .transpose()?;
+            host(Op::Copy(Box::new(Copy {
+                bucket: bucket(route)?,
+                key: key(route)?,
+                id,
+                source: source(parts)?,
+                conditions: copy_conditions(parts, false),
+                headers: headers(parts, false),
+                directive,
+                metadata: match directive {
+                    Directive::Copy => Vec::new(),
+                    Directive::Replace => stored(parts)?,
+                },
+                checksum,
+            })))
+        }
+        Operation::UploadPartCopy => host(Op::CopyPart(Box::new(CopyPart {
             bucket: bucket(route)?,
             key: key(route)?,
+            upload: upload_id(query)?,
+            number: part_number(query)?,
             id,
-            checksum: upload_checksum(parts)?,
-        }),
+            source: source(parts)?,
+            conditions: copy_conditions(parts, true),
+        }))),
+        Operation::DeleteObjects => {
+            let (checksum, md5) = digests(parts)?;
+            Ok(Plan::Document {
+                limit: mantle_s3::body::DELETE_LIMIT,
+                upload: upload(parts, verified, framing)?.0,
+                make: Make::Deletes {
+                    bucket: bucket(route)?,
+                    id,
+                    md5,
+                    checksum,
+                },
+            })
+        }
+        Operation::ListObjectVersions => host(Op::ListVersions(list_versions(route, query)?)),
         Operation::UploadPart => {
             let (body, trailing) = upload(parts, verified, framing)?;
             let (checksum, md5) = digests(parts)?;
@@ -447,6 +585,38 @@ fn list(route: &Route, query: &Query) -> Result<List, Refused> {
         max_keys: u32::try_from(max_keys)
             .map_err(|_| Refused::new("InvalidArgument", 400, "max-keys past u32"))?,
         fetch_owner: query.value("fetch-owner") == Some("true"),
+    })
+}
+
+/// ListObjectVersions' request (research/89 §2.3): its markers, the version ID marker only with
+/// a key marker, and its page's size.
+fn list_versions(route: &Route, query: &Query) -> Result<ListVersions, Refused> {
+    let key_marker = query
+        .value("key-marker")
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned);
+    let id_marker = query
+        .value("version-id-marker")
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned);
+    if id_marker.is_some() && key_marker.is_none() {
+        return Err(Refused::new(
+            "InvalidArgument",
+            400,
+            "A version-id marker cannot be specified without a key marker.",
+        ));
+    }
+    let max = s3list::max_keys(query.value("max-keys"))
+        .map_err(|e| Refused::of(e.code(), e))?
+        .min(s3list::MAX_KEYS);
+    Ok(ListVersions {
+        bucket: bucket(route)?,
+        prefix: query.value("prefix").unwrap_or_default().to_owned(),
+        delimiter: query.value("delimiter").unwrap_or_default().to_owned(),
+        key_marker,
+        id_marker,
+        max: u32::try_from(max)
+            .map_err(|_| Refused::new("InvalidArgument", 400, "max-keys past u32"))?,
     })
 }
 
@@ -652,8 +822,13 @@ fn decoded(parts: &Parts<'_>) -> Option<Result<u64, Refused>> {
     })
 }
 
-/// The operation a document makes, once read whole.
-pub fn made(make: Make, document: &[u8], region: &str) -> Result<Op, Refused> {
+/// The operation a document makes, once read whole, the checksum its trailer carried with it.
+pub fn made(
+    make: Make,
+    document: &[u8],
+    trailer: Option<Checksum>,
+    region: &str,
+) -> Result<Op, Refused> {
     let malformed = |e: mantle_s3::body::BodyError| Refused::of(e.code(), &e);
     match make {
         Make::CreateBucket { bucket, id } => {
@@ -721,5 +896,76 @@ pub fn made(make: Make, document: &[u8], region: &str) -> Result<Op, Refused> {
                 parts,
             })
         }
+        Make::Deletes {
+            bucket,
+            id,
+            md5,
+            checksum,
+        } => {
+            held(document, md5, checksum.or(trailer))?;
+            let delete = mantle_s3::body::delete(document).map_err(malformed)?;
+            let objects = delete
+                .objects
+                .into_iter()
+                .map(|object| Target {
+                    key: object.key,
+                    version: object.version_id,
+                    // An ETag longer than any mantle makes names no version, as the empty one
+                    // names none (`object::MAX_CONDITION_TAG`).
+                    etag: object.etag.map(|etag| {
+                        if etag.len() > MAX_CONDITION_TAG {
+                            String::new()
+                        } else {
+                            etag
+                        }
+                    }),
+                })
+                .collect();
+            Ok(Op::DeleteObjects {
+                bucket,
+                id,
+                objects,
+                quiet: delete.quiet,
+            })
+        }
     }
+}
+
+/// A DeleteObjects document held to its integrity header (research/89 §5.1): its `Content-MD5`,
+/// and a checksum its headers or trailer state; one of them it must carry, "Missing required
+/// header for this request: Content-MD5 OR x-amz-checksum-*" otherwise.
+fn held(document: &[u8], md5: Option<[u8; 16]>, checksum: Option<Checksum>) -> Result<(), Refused> {
+    if md5.is_none() && checksum.is_none() {
+        return Err(Refused::new(
+            "InvalidRequest",
+            400,
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        ));
+    }
+    let digest = |algorithm| {
+        checksum::checksum(algorithm, document)
+            .map_err(|_| Refused::new("InternalError", 500, "a document's digest"))
+    };
+    if let Some(md5) = md5
+        && digest(Algorithm::Md5)?.bytes.as_slice() != md5.as_slice()
+    {
+        return Err(Refused::new(
+            "BadDigest",
+            400,
+            "The Content-MD5 you specified did not match what we received.",
+        ));
+    }
+    if let Some(stated) = checksum
+        && digest(stated.algorithm)? != stated
+    {
+        return Err(Refused::new(
+            "BadDigest",
+            400,
+            format!(
+                "The {} you specified did not match the calculated checksum.",
+                stated.algorithm.name()
+            ),
+        ));
+    }
+    Ok(())
 }

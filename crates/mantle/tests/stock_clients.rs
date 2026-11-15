@@ -492,3 +492,393 @@ keys = [o["Key"] for o in s3.list_objects_v2(Bucket="stock", Prefix="boto/")["Co
 assert keys == ["boto/large.bin"], keys
 print("boto3 passed")
 "#;
+
+/// research/89 by the stock clients against a cell of three: the AWS CLI's `aws s3 cp` with
+/// content headers and metadata, its server-side copies (one CopyObject below its 8 MiB threshold,
+/// UploadPartCopy past it), `s3api` copy-object under REPLACE, get-object and delete-object of a
+/// version, list-object-versions and delete-objects; boto3's put and head of every metadata field,
+/// its copy_object under each directive and the source's conditions, its managed copy, its
+/// versions and its delete_objects, quiet and not, every error code as S3's. Every object read
+/// back byte-identical.
+#[test]
+fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let (_cell, env) = started(dir);
+    aws(&["s3", "mb", "s3://kept"], &env);
+    aws(&["s3", "mb", "s3://copies"], &env);
+
+    // aws s3 cp with content headers and metadata, kept and returned.
+    let small = bytes(40, 123_457);
+    let small_file = write(dir, "small.blob", &small);
+    aws(
+        &[
+            "s3",
+            "cp",
+            small_file.to_str().unwrap(),
+            "s3://kept/blobs/small",
+            "--content-type",
+            "application/vnd.oci.image.layer.v1.tar",
+            "--cache-control",
+            "max-age=60",
+            "--content-disposition",
+            "attachment",
+            "--content-language",
+            "en",
+            "--metadata",
+            "digest=sha256:abc,kind=layer",
+        ],
+        &env,
+    );
+    let head = [
+        "s3api",
+        "head-object",
+        "--bucket",
+        "kept",
+        "--key",
+        "blobs/small",
+    ];
+    assert_eq!(
+        query(&head, "ContentType", &env),
+        "application/vnd.oci.image.layer.v1.tar"
+    );
+    assert_eq!(query(&head, "CacheControl", &env), "max-age=60");
+    assert_eq!(query(&head, "ContentDisposition", &env), "attachment");
+    assert_eq!(query(&head, "ContentLanguage", &env), "en");
+    assert_eq!(query(&head, "Metadata.digest", &env), "sha256:abc");
+    assert_eq!(query(&head, "Metadata.kind", &env), "layer");
+
+    // A server-side copy across buckets below the CLI's multipart threshold (one CopyObject) and
+    // one past it (UploadPartCopy), each read back whole with the source's metadata.
+    let large = bytes(41, THRESHOLD * 2 + 4_321);
+    let large_file = write(dir, "large.blob", &large);
+    aws(
+        &[
+            "s3",
+            "cp",
+            large_file.to_str().unwrap(),
+            "s3://kept/blobs/large",
+            "--content-type",
+            "application/octet-stream",
+            "--metadata",
+            "digest=sha256:def",
+        ],
+        &env,
+    );
+    for (key, data) in [("small", &small), ("large", &large)] {
+        aws(
+            &[
+                "s3",
+                "cp",
+                &format!("s3://kept/blobs/{key}"),
+                &format!("s3://copies/{key}"),
+            ],
+            &env,
+        );
+        let back = dir.join(format!("back-{key}"));
+        aws(
+            &[
+                "s3",
+                "cp",
+                &format!("s3://copies/{key}"),
+                back.to_str().unwrap(),
+            ],
+            &env,
+        );
+        assert!(
+            std::fs::read(&back).unwrap() == *data,
+            "copies/{key} read back"
+        );
+        let head = ["s3api", "head-object", "--bucket", "copies", "--key", key];
+        assert!(
+            query(&head, "Metadata.digest", &env).starts_with("sha256:"),
+            "copies/{key} kept the source's metadata"
+        );
+    }
+    // s3api copy-object under REPLACE.
+    aws(
+        &[
+            "s3api",
+            "copy-object",
+            "--bucket",
+            "copies",
+            "--key",
+            "replaced",
+            "--copy-source",
+            "kept/blobs/small",
+            "--metadata-directive",
+            "REPLACE",
+            "--content-type",
+            "text/plain",
+            "--metadata",
+            "fresh=yes",
+        ],
+        &env,
+    );
+    let head = [
+        "s3api",
+        "head-object",
+        "--bucket",
+        "copies",
+        "--key",
+        "replaced",
+    ];
+    assert_eq!(query(&head, "ContentType", &env), "text/plain");
+    assert_eq!(query(&head, "Metadata.fresh", &env), "yes");
+    assert_eq!(query(&head, "Metadata.digest", &env), "None");
+
+    // Versions by s3api: put twice, each read by its ID, one removed by its ID, all listed.
+    aws(
+        &[
+            "s3api",
+            "put-bucket-versioning",
+            "--bucket",
+            "kept",
+            "--versioning-configuration",
+            "Status=Enabled",
+        ],
+        &env,
+    );
+    let first = bytes(42, 9_001);
+    let second = bytes(43, 9_002);
+    let mut ids = Vec::new();
+    for (n, data) in [&first, &second].into_iter().enumerate() {
+        let file = write(dir, &format!("v{n}"), data);
+        let put = [
+            "s3api",
+            "put-object",
+            "--bucket",
+            "kept",
+            "--key",
+            "versioned",
+            "--body",
+            file.to_str().unwrap(),
+        ];
+        ids.push(query(&put, "VersionId", &env));
+    }
+    let got = dir.join("got-first");
+    aws(
+        &[
+            "s3api",
+            "get-object",
+            "--bucket",
+            "kept",
+            "--key",
+            "versioned",
+            "--version-id",
+            &ids[0],
+            got.to_str().unwrap(),
+        ],
+        &env,
+    );
+    assert!(
+        std::fs::read(&got).unwrap() == first,
+        "the first version by its ID"
+    );
+    let listed = query(
+        &[
+            "s3api",
+            "list-object-versions",
+            "--bucket",
+            "kept",
+            "--prefix",
+            "versioned",
+        ],
+        "Versions[].VersionId",
+        &env,
+    );
+    assert_eq!(
+        listed.split_whitespace().collect::<Vec<_>>(),
+        [ids[1].as_str(), ids[0].as_str()],
+        "{listed}"
+    );
+    aws(
+        &[
+            "s3api",
+            "delete-object",
+            "--bucket",
+            "kept",
+            "--key",
+            "versioned",
+            "--version-id",
+            &ids[1],
+        ],
+        &env,
+    );
+    let back = dir.join("got-current");
+    aws(
+        &["s3", "cp", "s3://kept/versioned", back.to_str().unwrap()],
+        &env,
+    );
+    assert!(
+        std::fs::read(&back).unwrap() == first,
+        "the older version is current again"
+    );
+
+    // delete-objects: present and missing keys, each deleted; then `aws s3 rm --recursive`,
+    // which deletes in batches.
+    for key in ["batch/1", "batch/2"] {
+        aws(
+            &[
+                "s3",
+                "cp",
+                small_file.to_str().unwrap(),
+                &format!("s3://copies/{key}"),
+            ],
+            &env,
+        );
+    }
+    let delete = write(
+        dir,
+        "delete.json",
+        br#"{"Objects":[{"Key":"batch/1"},{"Key":"batch/2"},{"Key":"batch/missing"}]}"#,
+    );
+    let deleted = query(
+        &[
+            "s3api",
+            "delete-objects",
+            "--bucket",
+            "copies",
+            "--delete",
+            &format!("file://{}", delete.display()),
+        ],
+        "Deleted[].Key",
+        &env,
+    );
+    assert_eq!(
+        deleted.split_whitespace().collect::<Vec<_>>(),
+        ["batch/1", "batch/2", "batch/missing"],
+        "{deleted}"
+    );
+    aws(&["s3", "rm", "--recursive", "s3://copies/"], &env);
+    let left = text(&aws(&["s3", "ls", "s3://copies/"], &env));
+    assert!(left.is_empty(), "{left}");
+
+    // boto3's half.
+    let script = write(dir, "boto89.py", BOTO_89.as_bytes());
+    let said = run(
+        PYTHON,
+        &["-I", script.to_str().unwrap(), dir.to_str().unwrap()],
+        &env,
+        None,
+    );
+    println!("{}", text(&said));
+    assert!(
+        text(&said).ends_with("boto3 research/89 passed"),
+        "{}",
+        text(&said)
+    );
+}
+
+/// boto3 against research/89: every metadata field round-tripped, copies under each directive and
+/// condition and across buckets, the managed copy past its threshold, versions by ID, and
+/// delete_objects, each error code as S3's.
+const BOTO_89: &str = r#"
+import io
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+s3 = boto3.Session(profile_name="mantle").client("s3", config=Config(s3={"addressing_style": "path"}))
+
+def body(n, size):
+    return bytes(((i * 0x2545F491 + n * 7) >> 8) & 0xFF for i in range(size))
+
+def code(call, **kwargs):
+    try:
+        call(**kwargs)
+    except ClientError as e:
+        return e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"]
+    raise AssertionError(f"{call.__name__} {kwargs} succeeded")
+
+s3.create_bucket(Bucket="boto89")
+s3.create_bucket(Bucket="boto89b")
+
+# Every metadata field round-tripped by put_object and head_object and get_object.
+data = body(50, 77_777)
+s3.put_object(
+    Bucket="boto89", Key="m", Body=data,
+    ContentType="application/json", ContentEncoding="identity",
+    ContentDisposition='attachment; filename="m.json"', ContentLanguage="fr",
+    CacheControl="no-cache", Expires="Wed, 01 Dec 2094 16:00:00 GMT",
+    Metadata={"Owner": "kiln", "empty": "", "list": "a,b"},
+)
+for read in (s3.head_object(Bucket="boto89", Key="m"), s3.get_object(Bucket="boto89", Key="m")):
+    assert read["ContentType"] == "application/json", read
+    assert read["ContentEncoding"] == "identity", read
+    assert read["ContentDisposition"] == 'attachment; filename="m.json"', read
+    assert read["ContentLanguage"] == "fr", read
+    assert read["CacheControl"] == "no-cache", read
+    assert read["ResponseMetadata"]["HTTPHeaders"]["expires"] == "Wed, 01 Dec 2094 16:00:00 GMT", read
+    assert read["Metadata"] == {"owner": "kiln", "empty": "", "list": "a,b"}, read
+assert s3.get_object(Bucket="boto89", Key="m")["Body"].read() == data
+overridden = s3.get_object(Bucket="boto89", Key="m", ResponseContentType="text/plain")
+assert overridden["ContentType"] == "text/plain", overridden
+assert code(s3.put_object, Bucket="boto89", Key="big-meta", Body=b"x", Metadata={"k": "v" * 2048}) == ("MetadataTooLarge", 400)
+# A version's tag set is the empty one; a write naming tags is refused, not dropped (research/89 §3.8).
+assert s3.get_object_tagging(Bucket="boto89", Key="m")["TagSet"] == []
+assert code(s3.put_object, Bucket="boto89", Key="tagged", Body=b"x", Tagging="k=v") == ("NotImplemented", 501)
+
+# CopyObject: COPY keeps the metadata, REPLACE takes the request's, across buckets; the source's
+# conditions; a copy onto itself; a missing source.
+etag = s3.head_object(Bucket="boto89", Key="m")["ETag"]
+copied = s3.copy_object(Bucket="boto89b", Key="c", CopySource={"Bucket": "boto89", "Key": "m"})
+assert copied["CopyObjectResult"]["ETag"] == etag, copied
+assert s3.get_object(Bucket="boto89b", Key="c")["Body"].read() == data
+assert s3.head_object(Bucket="boto89b", Key="c")["Metadata"]["owner"] == "kiln"
+s3.copy_object(Bucket="boto89b", Key="r", CopySource="boto89/m", MetadataDirective="REPLACE",
+               ContentType="image/gif", Metadata={"fresh": "1"})
+replaced = s3.head_object(Bucket="boto89b", Key="r")
+assert replaced["ContentType"] == "image/gif" and replaced["Metadata"] == {"fresh": "1"}, replaced
+s3.copy_object(Bucket="boto89b", Key="ok", CopySource="boto89/m", CopySourceIfMatch=etag)
+assert code(s3.copy_object, Bucket="boto89b", Key="no", CopySource="boto89/m", CopySourceIfMatch='"0123"') == ("PreconditionFailed", 412)
+assert code(s3.copy_object, Bucket="boto89b", Key="no", CopySource="boto89/m", CopySourceIfNoneMatch=etag) == ("PreconditionFailed", 412)
+assert code(s3.copy_object, Bucket="boto89", Key="m", CopySource="boto89/m") == ("InvalidRequest", 400)
+s3.copy_object(Bucket="boto89", Key="m", CopySource="boto89/m", MetadataDirective="REPLACE", Metadata={"again": "yes"})
+assert s3.head_object(Bucket="boto89", Key="m")["Metadata"] == {"again": "yes"}
+assert code(s3.copy_object, Bucket="boto89b", Key="no", CopySource="boto89/none") == ("NoSuchKey", 404)
+assert code(s3.copy_object, Bucket="boto89b", Key="no", CopySource="nobucket89/m") == ("NoSuchBucket", 404)
+
+# The managed copy past its multipart threshold: UploadPartCopy of ranges.
+large = body(51, 9 * 1024 * 1024 + 11)
+s3.put_object(Bucket="boto89", Key="large", Body=large, Metadata={"size": "large"})
+s3.copy({"Bucket": "boto89", "Key": "large"}, "boto89b", "large")
+assert s3.get_object(Bucket="boto89b", Key="large")["Body"].read() == large
+assert s3.head_object(Bucket="boto89b", Key="large")["Metadata"] == {"size": "large"}
+
+# Versions: by ID, a delete marker named is 405, an ID no version has 404, one mantle never makes
+# 400; a version removed by its ID.
+s3.put_bucket_versioning(Bucket="boto89", VersioningConfiguration={"Status": "Enabled"})
+v1 = s3.put_object(Bucket="boto89", Key="v", Body=b"one")["VersionId"]
+v2 = s3.put_object(Bucket="boto89", Key="v", Body=b"two")["VersionId"]
+assert s3.get_object(Bucket="boto89", Key="v", VersionId=v1)["Body"].read() == b"one"
+assert s3.head_object(Bucket="boto89", Key="v", VersionId=v2)["VersionId"] == v2
+marker = s3.delete_object(Bucket="boto89", Key="v")
+assert marker["DeleteMarker"] is True, marker
+assert code(s3.get_object, Bucket="boto89", Key="v", VersionId=marker["VersionId"]) == ("MethodNotAllowed", 405)
+assert code(s3.get_object, Bucket="boto89", Key="v", VersionId="0000000000001") == ("NoSuchVersion", 404)
+assert code(s3.get_object, Bucket="boto89", Key="v", VersionId="not-a-version") == ("InvalidArgument", 400)
+listed = s3.list_object_versions(Bucket="boto89", Prefix="v")
+assert [v["VersionId"] for v in listed["Versions"]] == [v2, v1], listed
+assert [m["VersionId"] for m in listed["DeleteMarkers"]] == [marker["VersionId"]], listed
+assert listed["DeleteMarkers"][0]["IsLatest"] is True, listed
+removed = s3.delete_object(Bucket="boto89", Key="v", VersionId=marker["VersionId"])
+assert removed["DeleteMarker"] is True and removed["VersionId"] == marker["VersionId"], removed
+assert s3.get_object(Bucket="boto89", Key="v")["Body"].read() == b"two"
+s3.copy_object(Bucket="boto89b", Key="old", CopySource={"Bucket": "boto89", "Key": "v", "VersionId": v1})
+assert s3.get_object(Bucket="boto89b", Key="old")["Body"].read() == b"one"
+
+# DeleteObjects, with the SDK's default checksum in Content-MD5's place: present, missing and a
+# version, verbose and quiet.
+for key in ("d1", "d2"):
+    s3.put_object(Bucket="boto89b", Key=key, Body=b"x")
+result = s3.delete_objects(Bucket="boto89b", Delete={"Objects": [{"Key": "d1"}, {"Key": "d2"}, {"Key": "missing"}]})
+assert sorted(d["Key"] for d in result["Deleted"]) == ["d1", "d2", "missing"], result
+assert "Errors" not in result, result
+quiet = s3.delete_objects(Bucket="boto89", Delete={"Objects": [{"Key": "v", "VersionId": v1}], "Quiet": True})
+assert "Deleted" not in quiet and "Errors" not in quiet, quiet
+assert code(s3.get_object, Bucket="boto89", Key="v", VersionId=v1) == ("NoSuchVersion", 404)
+failed = s3.delete_objects(Bucket="boto89", Delete={"Objects": [{"Key": "v", "VersionId": "bad"}], "Quiet": True})
+assert [e["Code"] for e in failed["Errors"]] == ["InvalidArgument"], failed
+print("boto3 research/89 passed")
+"#;

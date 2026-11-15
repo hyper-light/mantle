@@ -53,7 +53,7 @@ pub const MAX_OBJECTS: usize = 1000;
 
 /// "Version IDs are ... URL-ready, opaque strings that are no more than 1,024 bytes long"
 /// (13 §6.4); URL-ready text needs no XML escape.
-const MAX_VERSION_ID: usize = 1024;
+pub const MAX_VERSION_ID: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BodyError {

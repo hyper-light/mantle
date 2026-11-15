@@ -63,6 +63,7 @@ fn a_put_its_node_holds_within_its_serve_period_is_answered() {
                 checksum: None,
                 md5: None,
                 trailing: Some(TRAILER),
+                metadata: Vec::new(),
             };
             let began = std::time::Instant::now();
             let made = client
@@ -118,6 +119,7 @@ fn a_put_asked_with_no_deadline_is_cut_after_a_stock_patience_unmoved() {
                 checksum: None,
                 md5: None,
                 trailing: Some(TRAILER),
+                metadata: Vec::new(),
             };
             let began = std::time::Instant::now();
             let ended = client
@@ -258,6 +260,7 @@ fn a_get_deadline_also_bounds_a_sink_that_stops_taking_bytes() {
                 bucket: "b".into(),
                 key: "k".into(),
                 headers: Headers::default(),
+                version: None,
             };
             let answer = client.get(&get, &mut Held, deadline).await;
             assert!(matches!(answer, Err(ClientError::Deadline)), "{answer:?}");

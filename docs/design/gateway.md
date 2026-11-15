@@ -720,6 +720,31 @@ the upload's offset through another node and ends `SlowDown`, the cell writing n
 node of three gone (CLAUDE.md §6), its journal and the cell's two runs kept, then, run again once the
 node is back, resumes at that offset and commits the runs after it and none before.
 
+*As built (2026-11-14).* An object's content headers and `x-amz-meta-*` metadata, its versions,
+copies and batch deletes reach the cell through the library and the command line as through the
+listener (s3-protocol.md §14; research/89). The library's `Native` put and upload carry the
+version's metadata; `cp` and `multipart create` take `--content-type`, `--content-encoding`,
+`--content-disposition`, `--content-language`, `--cache-control`, `--expires` and
+`--metadata KEY=VALUE`, and `head` prints what the version keeps. `ls --versions` lists every
+version and delete marker under a prefix; `cp`, `head` and `rm` take `--version-id`. `cp` from one
+`s3://` key to another is the cell's copy: one CopyObject, held by `If-Match` to the ETag it headed,
+up to one copy's 5 GiB, and past it an upload of 5 GiB part copies, S3's largest part and so the
+fewest a copy past one takes, each held to that ETag as s3transfer holds its parts (research/89
+§3.7), the upload made with the source's metadata unless `--metadata-directive REPLACE`. `multipart
+copy` is UploadPartCopy, whole or of `--range FIRST-LAST`. `rm` of several keys of one bucket is
+DeleteObjects a thousand at a time, each failure said, and `--quiet` leaves the successes out.
+Tested against a cell of three `mantle init` made (`crates/mantle/tests/native.rs`). Through the
+library: a version's metadata kept and returned, a version read and headed by its ID,
+`NoSuchVersion` for an ID no version has and `InvalidVersion` for one mantle never makes, a named
+delete marker `MethodNotAllowed`; a named version copied across buckets under `COPY`, its
+metadata, ETag and time checked, and under `REPLACE`; copies refused for a failed `If-Match`, a
+marker as the source's version, a current marker and onto itself; a part copy of a range completed
+and read back; and DeleteObjects of a version, a missing key and a malformed ID, each result in its
+place. Through the command line: `cp` with content headers and metadata and `head` saying them,
+copies within the cell under each directive, `multipart copy` of a range, `ls --versions`, `cp`
+and `rm` by `--version-id`, and `rm` of three keys in one DeleteObjects, a missing one among them.
+Every object is read back byte-identical.
+
 Not yet built: the journal in the library and its power-cut tests, the checkpoint interval's
 measured terms and two runs in flight (§2.1), credits and the admission level, path adaptation and
 migration, per-block GET streams, the validated caches, and the TLS-over-TCP route.

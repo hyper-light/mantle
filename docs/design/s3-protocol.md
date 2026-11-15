@@ -720,3 +720,120 @@ data key, and are checked as S3 was recorded checking them** (`crates/s3/src/sse
   action and the object (20 §3.6). A rule without `BlockedEncryptionTypes` leaves the block as it
   was, as S3 was recorded doing, and DeleteBucketEncryption resets the default and keeps it.
   GetBucketEncryption writes the blocked types on every bucket, as S3 does since April 2026.
+
+## 14. An object's metadata, versions, copies and batch deletes
+
+Status: 2026-11-14. Sources: docs/research/89 (cited as "89 §x"), on S3's API reference and user
+guide and the conformance suites that hold S3 to them.
+
+**Decision: a version keeps the six content headers and its `x-amz-meta-*` entries as its
+request carried them, and GET and HEAD return them as S3 does** (`crates/s3/src/metadata.rs`).
+
+- **What is kept.** `Cache-Control`, `Content-Disposition`, `Content-Encoding`,
+  `Content-Language`, `Content-Type` and `Expires`, and every field named `x-amz-meta-*`: names
+  lowercased, repeats joined by commas, `aws-chunked` taken out of `Content-Encoding` and the
+  header dropped when nothing else is left (89 §1.1, §1.2). PutObject and CreateMultipartUpload
+  carry them through both doors, and a completed upload's object takes its upload's. The Name
+  layer's version already held a header list (metadata.md §1), so no on-disk record changed;
+  the native protocol's Put, CreateUpload and Open gained the list, and its replies return it
+  (node.md §5).
+- **Limits.** User-defined metadata at most 2 KB, each key counted past `x-amz-meta-` with its
+  value; the content headers at most 2 KB, each name with its value; past either
+  `400 MetadataTooLarge` (89 §1.4). A value no HTTP field can carry (RFC 9110 §5.5) is
+  `400 InvalidArgument` at either door, so whatever a version keeps the listener can write.
+- **Returned.** Each kept header on GET and HEAD, `Content-Type: binary/octet-stream` where none
+  was kept, and a `response-*` parameter's value in place of its header on a `200` (89 §1.5). A
+  value holding an octet past US-ASCII is written as RFC 2047's B encoding of its octets read as
+  ISO-8859-1, which reproduces the user guide's example byte for byte (89 §1.3).
+
+**Decision: every door names a version by its ID; text mantle could not have made is
+`400 InvalidArgument` "Invalid version id specified", an ID no version has `404 NoSuchVersion`**
+(89 §2.1). mantle's IDs are 13 characters of Crockford's base 32, or `null` (metadata.md §1).
+
+- **GetObject and HeadObject** read the version named; a delete marker named is
+  `405 MethodNotAllowed` with `x-amz-delete-marker: true` and its `Last-Modified` (89 §2.1).
+- **DeleteObject** with `versionId` removes that version under the Object Lock rules the Name
+  range already applies, answering its ID and, for a marker, `x-amz-delete-marker` (89 §2.2).
+- **ListObjectVersions** pages over `name::next_version` as §3 describes, at most S3's 1,000 a
+  page and within the read's reply room (node.md §5); `version-id-marker` without `key-marker`
+  is `400 InvalidArgument` (89 §2.3).
+
+**Decision: CopyObject and UploadPartCopy move the bytes: the node reads the source through the
+read path and writes a new file through the write path, so a copy never shares its source's
+chunks** (`crates/node/src/node/host.rs`; `crates/s3/src/copy.rs`).
+
+A copy that referenced its source's chunks, as Tectonic's copies take blocks (01 §1.6), would
+break three things. Every file has one referrer, and blocks shared by two would need Tectonic's
+owner rows before the collector could tell when they are free (metadata.md §2). Each file is
+sealed under its own data key (encryption.md §2), which shared blocks would make two files'
+key. And S3's copy needs the bytes anyway: its checksum is a full-object value of the algorithm
+the request names, computed over what is copied, its ETag the MD5 of those bytes, a part copy's
+range falls anywhere in the source, not at its blocks' bounds (89 §3.4, §4.1). The cost is one
+read of the source and one write per copy, inside the cell; no byte crosses to the client.
+
+- **Source.** `x-amz-copy-source` with or without its leading slash, the version split off at
+  `?versionId=` before the rest is percent-decoded once; an access point's ARN
+  `501 NotImplemented` (89 §3.1). A source whose current version is a delete marker is
+  `404 NoSuchKey`; a marker named as the source's version `400 InvalidRequest` (89 §4.1).
+- **Metadata.** `x-amz-metadata-directive` `COPY`, the default, takes the source's content
+  headers and metadata and ignores the request's; `REPLACE` takes the request's; any other value
+  is `400 InvalidArgument` (89 §3.2).
+- **Conditions.** `x-amz-copy-source-if-*` are judged against the source in RFC 9110's order,
+  a condition a read would answer `304` failing the copy `412` (`conditional::copy_source`;
+  89 §3.3). The destination's `If-Match` and `If-None-Match` are conditional writes, judged at
+  commit as a PUT's are.
+- **Onto itself.** The same bucket and key, no version named, under `COPY`, is
+  `400 InvalidRequest` with S3's message; under `REPLACE`, or naming a version, it is taken
+  (89 §3.5).
+- **Sizes.** A CopyObject source past 5 GiB is `400 InvalidRequest`, as is an UploadPartCopy of
+  a whole source past S3's largest part. A copy range is judged by its form, `400
+  InvalidArgument`; then against the source's size, `416 InvalidRange`; then by S3's rule that
+  only a source past 5 MB is copied by range, `400 InvalidRequest`, 5 MB being S3's least part,
+  5 MiB (89 §4.1).
+- **Checksum and ETag.** An object copy keeps the algorithm the request names, else the
+  source's, else CRC-64/NVME, as a full-object value over the copied bytes, and the ETag is
+  their MD5 (89 §3.4); a part copy keeps its upload's algorithm. A copy of a whole source is
+  also held to the source's own digests as the bytes pass: its ETag where that is an MD5, and
+  its full-object checksum where that is of the same algorithm. Bytes that miss them commit
+  nothing and are answered `500 InternalError`, the store's failure and not the request's.
+- **Answer.** `CopyObjectResult` and `CopyPartResult` with the ETag, the new version's or part's
+  `LastModified` and its checksum; `x-amz-version-id` the new version's, and
+  `x-amz-copy-source-version-id` the source's (89 §3.6, §4.2). A version's time is its order
+  inverted; a null version's, which its ID does not name, is read from the mark its write left
+  under the copy's own file; a part's is the gateway's time as its body ended, which ListParts
+  now states too, where it answered 1970.
+- **Its cost to the host.** A copy drives a get and a put at once, so it counts as two of the
+  host's operations at both doors, and a copy waits at the local door, or is answered
+  `503 SlowDown` at the native door, while fewer than two are free.
+
+- **Tags.** mantle keeps no object tags yet and answers as S3 answers a directory bucket, which
+  keeps only the empty tag set (89 §3.8): a version's tag set is the empty one, which
+  GetObjectTagging answers for the version a head would read, and which the AWS CLI asks of
+  every source it copies in parts; a write naming a non-empty set, `x-amz-tagging` on PutObject
+  or CreateMultipartUpload or a CopyObject's under `x-amz-tagging-directive: REPLACE`, is
+  `501 NotImplemented` rather than taken with its tags dropped; the empty set is taken.
+
+mantle answers a copy once it is committed or refused, a standard response S3 allows for an
+error before the copy starts (89 §3.6), rather than S3's early `200 OK` with the result or error
+at its end; 89 §6 holds what that costs a copy that outlasts a client's read timeout.
+
+**Decision: DeleteObjects deletes each named object as a DeleteObject would, and answers each
+key** (89 §5).
+
+- **The request.** Up to 1,000 objects, each with an optional version and ETag, the ETag
+  conditioning its delete as `If-Match` does (05 §2.3); 1,001 is `400 MalformedXML`. The
+  document must carry `Content-MD5` or an `x-amz-checksum-*` value, in its headers or its
+  trailer, and is held to each it carries: neither is `400 InvalidRequest`, "Missing required
+  header for this request: Content-MD5 OR x-amz-checksum-*", a mismatch `400 BadDigest`, as
+  S3 was recorded answering (89 §5.1).
+- **The work.** The node deletes the objects in the document's order, as many at once as its
+  share of the host's asks allows, each a Name range command of its own; one key's refusal is
+  that key's `Error`, never the request's.
+- **The answer.** `Deleted` for each success, a missing key included, with its version and, for
+  a marker made or removed, `DeleteMarker` and `DeleteMarkerVersionId`; `Error` with its code,
+  message, key and version for each failure; quiet mode leaves out the successes (89 §5.2; §4).
+
+The native protocol carries each operation as the listener does: `Copy`, `CopyPart`,
+`DeleteObjects` and `ListVersions`, and a version on Get, Head and Delete, each with the
+statuses above (node.md §5); `mantle cp`, `head`, `rm`, `ls --versions` and
+`mantle multipart copy` drive them (gateway.md §6).

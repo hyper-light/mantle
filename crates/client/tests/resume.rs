@@ -82,6 +82,7 @@ fn a_lost_runs_offset_held_past_the_clients_period_is_asked_again_and_the_upload
                 upload: None,
                 checksum: TRAILER,
                 headers: Headers::default(),
+                metadata: Vec::new(),
             };
             let mut source = Made { at: 0, length };
             let mut watched = Watched::default();
@@ -144,6 +145,7 @@ fn a_run_the_node_answers_after_the_clients_period_is_waited_for_once_it_was_cut
                 upload: None,
                 checksum: TRAILER,
                 headers: Headers::default(),
+                metadata: Vec::new(),
             };
             let mut source = Made { at: 0, length };
             let mut watched = Watched::default();
@@ -196,6 +198,7 @@ fn upload_through(script: Script, length: u64) -> (Status, Vec<u64>, Seen) {
                 upload: None,
                 checksum: TRAILER,
                 headers: Headers::default(),
+                metadata: Vec::new(),
             };
             let mut source = Made { at: 0, length };
             let mut watched = Watched::default();

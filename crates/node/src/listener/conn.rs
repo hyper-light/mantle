@@ -364,8 +364,8 @@ impl Connection {
                 if continues && self.io.write(write::CONTINUE).await.is_err() {
                     return Err(());
                 }
-                let document = match self.document(framing, upload, limit).await {
-                    Ok(document) => document,
+                let (document, trailer) = match self.document(framing, upload, limit).await {
+                    Ok(read) => read,
                     Err(Stopped::Refused(refused)) => {
                         return self
                             .refuse(&refused, resource, &ids, (version, is_head), true)
@@ -373,7 +373,7 @@ impl Connection {
                     }
                     Err(Stopped::Host | Stopped::Broken) => return Err(()),
                 };
-                match request::made(make, &document, &self.endpoint.region) {
+                match request::made(make, &document, trailer, &self.endpoint.region) {
                     Ok(op) => (op, None),
                     Err(refused) => {
                         return self
@@ -760,13 +760,14 @@ impl Connection {
         }
     }
 
-    /// A document's body read whole, at most `limit` octets of it, its digests checked as a put's.
+    /// A document's body read whole, at most `limit` octets of it, its digests checked as a put's,
+    /// with the checksum its trailer carried.
     async fn document(
         &mut self,
         framing: Framing,
         (mut upload, length): Streamed,
         limit: usize,
-    ) -> Result<Vec<u8>, Stopped> {
+    ) -> Result<(Vec<u8>, Option<Checksum>), Stopped> {
         let mut sha256 = Self::hasher(&upload)?;
         let mut body = http::Body::new(framing);
         // The document's length is stated before it comes; one past the limit is refused as it
@@ -796,8 +797,8 @@ impl Connection {
                 )));
             }
         }
-        Self::ended(upload, sha256).map_err(Stopped::Refused)?;
-        Ok(document)
+        let trailer = Self::ended(upload, sha256).map_err(Stopped::Refused)?;
+        Ok((document, trailer))
     }
 
     /// Ends the connection as `ended` says. After a response that said `Connection: close`, its

@@ -1497,6 +1497,7 @@ impl Work {
                     checksum: None,
                     md5: None,
                     trailing: Some(TRAILER),
+                    metadata: Vec::new(),
                 };
                 let reply = match answered(
                     client
@@ -1520,6 +1521,7 @@ impl Work {
                     upload: None,
                     checksum: TRAILER,
                     headers: Headers::default(),
+                    metadata: Vec::new(),
                 };
                 let reply = match answered(
                     client
@@ -1554,6 +1556,7 @@ impl Work {
                     bucket,
                     key: key.to_owned(),
                     headers,
+                    version: None,
                 };
                 let mut sink = Aside(Checked::starting(object, scratch, from));
                 let reply = match answered(client.get(&op, &mut sink, u64::MAX).await)? {
@@ -1575,6 +1578,7 @@ impl Work {
                                 bucket,
                                 key: key.to_owned(),
                                 headers: Headers::default(),
+                                version: None,
                             },
                             u64::MAX,
                         )
@@ -1600,6 +1604,7 @@ impl Work {
                                 key: key.to_owned(),
                                 id,
                                 headers: Headers::default(),
+                                version: None,
                             },
                             u64::MAX,
                         )
@@ -1623,6 +1628,7 @@ impl Work {
                                 key: key.to_owned(),
                                 id,
                                 checksum: None,
+                                metadata: Vec::new(),
                             },
                             u64::MAX,
                         )
@@ -3019,6 +3025,7 @@ impl Opening {
                     bucket: BUCKET.to_owned(),
                     key: NEVER_PUT.to_owned(),
                     headers: Headers::default(),
+                    version: None,
                 };
                 let reply = client.call(&op, u64::MAX).await.map_err(failed)?;
                 if reply.status != Status::NoSuchKey {
@@ -3655,6 +3662,7 @@ async fn read(
                 bucket: BUCKET.to_owned(),
                 key: key.to_owned(),
                 headers: Headers::default(),
+                version: None,
             };
             let reply = client.get(&op, &mut sink, u64::MAX).await.map_err(failed)?;
             match reply.status {
@@ -3695,6 +3703,7 @@ async fn head_etag(conn: &mut Conn, key: &str) -> Result<Read, Error> {
                 bucket: BUCKET.to_owned(),
                 key: key.to_owned(),
                 headers: Headers::default(),
+                version: None,
             };
             let reply = client.call(&op, u64::MAX).await.map_err(failed)?;
             if reply.status == Status::Done {

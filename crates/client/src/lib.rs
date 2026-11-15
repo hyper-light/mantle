@@ -249,6 +249,9 @@ pub struct Native {
     pub checksum: Algorithm,
     /// The preconditions its object commits under.
     pub headers: Headers,
+    /// Its object's content headers and user-defined metadata (research/89 §1), which its Open,
+    /// or a put of an object one run holds, carries.
+    pub metadata: object::Metadata,
 }
 
 /// No body: the source and the sink of an operation that has neither.
@@ -846,6 +849,7 @@ impl Client {
             checksum: None,
             md5: None,
             trailing: Some(native.checksum),
+            metadata: native.metadata.clone(),
         };
         self.put(&op, source, deadline_ns).await
     }
@@ -872,6 +876,7 @@ impl Client {
                     length,
                     buffer,
                     checksum: native.checksum,
+                    metadata: native.metadata.clone(),
                 };
                 let reply = self.call(&open, deadline_ns).await?;
                 if reply.status == Status::Done {
@@ -2386,6 +2391,7 @@ mod tests {
                     bucket: "b".into(),
                     key: "k".into(),
                     headers: object::Headers::default(),
+                    version: None,
                 };
                 let answer = client
                     .get(&get, &mut sink, u64::MAX)
@@ -2441,6 +2447,7 @@ mod tests {
                     bucket: "b".into(),
                     key: "k".into(),
                     headers: object::Headers::default(),
+                    version: None,
                 };
                 {
                     let get = pin!(client.get(&get, &mut held, u64::MAX));
@@ -2464,6 +2471,7 @@ mod tests {
                     checksum: None,
                     md5: None,
                     trailing: Some(TRAILER),
+                    metadata: Vec::new(),
                 };
                 let reply = client
                     .put(

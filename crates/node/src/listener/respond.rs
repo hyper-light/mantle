@@ -233,6 +233,51 @@ pub fn refusal(status: Status) -> Refused {
             507,
             "The cell has no room for the object: every volume offered its chunks is full.",
         ),
+        Status::NoSuchVersion => (
+            "NoSuchVersion",
+            404,
+            "The specified version does not exist.",
+        ),
+        Status::MethodNotAllowed => (
+            "MethodNotAllowed",
+            405,
+            "The specified method is not allowed against this resource.",
+        ),
+        Status::MetadataTooLarge => (
+            "MetadataTooLarge",
+            400,
+            "Your metadata headers exceed the maximum allowed metadata size",
+        ),
+        Status::InvalidVersion => ("InvalidArgument", 400, "Invalid version id specified"),
+        Status::CopyToItself => (
+            "InvalidRequest",
+            400,
+            "This copy request is illegal because it is trying to copy an object to itself \
+             without changing the object's metadata, storage class, website redirect location \
+             or encryption attributes.",
+        ),
+        Status::CopySourceTooLarge => (
+            "InvalidRequest",
+            400,
+            "CopyObject request made on objects larger than 5GB in size.",
+        ),
+        Status::CopyRangeSource => (
+            "InvalidRequest",
+            400,
+            "The specified copy source is not supported as a byte-range copy source.",
+        ),
+        Status::CopyMarker => (
+            "InvalidRequest",
+            400,
+            "You are not allowed to specify a delete marker as a version for the \
+             x-amz-copy-source.",
+        ),
+        Status::InvalidCopyRange => (
+            "InvalidArgument",
+            400,
+            "The range value must use the form bytes=first-last, where the first and last are \
+             the zero-based byte offsets to copy.",
+        ),
     };
     Refused::new(code, http, message)
 }
@@ -359,6 +404,17 @@ pub fn reply(
             version(&reply, &mut response.fields);
             Ok(response)
         }
+        // A get or head naming a delete marker's version: 405, "and the `Last-Modified:
+        // timestamp` response header" (research/89 §2.1), the marker named.
+        Status::MethodNotAllowed => {
+            let refused = refusal(Status::MethodNotAllowed);
+            let mut response = error(&refused, resource, ids, echo.head, fields);
+            response.fields.text("x-amz-delete-marker", b"true");
+            if let Err(why) = object_facts(&reply, &mut response.fields) {
+                return Err((why, response.fields));
+            }
+            Ok(response)
+        }
         // A read past S3's single GET: `EntityTooLarge` in its download form (05 §4.1, §11.2).
         Status::EntityTooLarge if matches!(echo.route.operation, Operation::GetObject) => {
             let refused = Refused::new(
@@ -480,7 +536,7 @@ fn answered(echo: &Echo<'_>, reply: Reply, fields: &mut Fields) -> Result<Answer
         Operation::GetObject | Operation::HeadObject => {
             object_facts(&reply, fields)?;
             fields.text("Accept-Ranges", b"bytes");
-            fields.text("Content-Type", b"binary/octet-stream");
+            stored(echo.query, &reply.metadata, fields);
             if echo.checksums && reply.range.is_none() {
                 checksum(&reply, fields);
             }
@@ -500,13 +556,57 @@ fn answered(echo: &Echo<'_>, reply: Reply, fields: &mut Fields) -> Result<Answer
             };
             Ok(Answered::Object(status, length))
         }
+        // The version's tag set: mantle keeps none yet, so the empty one (research/89 §3.8).
+        Operation::GetObjectTagging => {
+            version(&reply, fields);
+            document(s3::tagging(&[]))
+        }
         Operation::DeleteObject => {
             if reply.marker {
                 fields.text("x-amz-delete-marker", b"true");
             }
-            version(&reply, fields);
+            // A version named is answered with its ID, `null` among them (research/89 §2.2).
+            if echo.query.has("versionId") && !reply.version.is_empty() {
+                fields.text("x-amz-version-id", reply.version.as_bytes());
+            } else {
+                version(&reply, fields);
+            }
             empty(204)
         }
+        Operation::CopyObject => {
+            version(&reply, fields);
+            source_version(&reply, fields);
+            let value = reply.checksum.as_ref().and_then(checksum_value);
+            let object_checksum = match (&reply.checksum, &value) {
+                (Some(kept), Some(value)) => {
+                    Algorithm::from_code(kept.algorithm).map(|algorithm| s3::ObjectChecksum {
+                        algorithm,
+                        kind: kind(kept.parts),
+                        value,
+                    })
+                }
+                _ => None,
+            };
+            document(
+                s3::copy_object(&reply.etag, seconds(reply.modified)?, object_checksum)
+                    .map_err(time)?,
+            )
+        }
+        Operation::UploadPartCopy => {
+            source_version(&reply, fields);
+            let part = reply.checksum.as_ref().and_then(|kept| {
+                Some(Checksum {
+                    algorithm: Algorithm::from_code(kept.algorithm)?,
+                    bytes: kept.value.clone(),
+                })
+            });
+            document(
+                s3::copy_part(&reply.etag, seconds(reply.modified)?, part.as_ref())
+                    .map_err(time)?,
+            )
+        }
+        Operation::DeleteObjects => document(delete_result(&reply)?),
+        Operation::ListObjectVersions => document(list_versions(echo, reply)?),
         Operation::CreateMultipartUpload => {
             document(s3::initiate_multipart_upload(bucket, key, &reply.upload))
         }
@@ -547,6 +647,141 @@ fn version(reply: &Reply, fields: &mut Fields) {
     if !reply.version.is_empty() && reply.version != "null" {
         fields.text("x-amz-version-id", reply.version.as_bytes());
     }
+}
+
+/// The version a copy read of its source, as `version` states its own (research/89 §3.6).
+fn source_version(reply: &Reply, fields: &mut Fields) {
+    if !reply.source_version.is_empty() && reply.source_version != "null" {
+        fields.text(
+            "x-amz-copy-source-version-id",
+            reply.source_version.as_bytes(),
+        );
+    }
+}
+
+/// The content headers S3 returns, as their fields name them, beside the names a version keeps
+/// them under (`mantle_s3::metadata::CONTENT`), and the query parameter that overrides each on a
+/// read: "The response headers that you can override for the `GetObject` response are
+/// `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Content-Type`,
+/// and `Expires`" (research/89 §1.5).
+const CONTENT: [(&str, &str, &str); 6] = [
+    ("cache-control", "Cache-Control", "response-cache-control"),
+    (
+        "content-disposition",
+        "Content-Disposition",
+        "response-content-disposition",
+    ),
+    (
+        "content-encoding",
+        "Content-Encoding",
+        "response-content-encoding",
+    ),
+    (
+        "content-language",
+        "Content-Language",
+        "response-content-language",
+    ),
+    ("content-type", "Content-Type", "response-content-type"),
+    ("expires", "Expires", "response-expires"),
+];
+
+/// A version's metadata as a read's response states it (research/89 §1): each content header it
+/// keeps, or the query's override of it, `Content-Type` S3's `binary/octet-stream` where neither
+/// names one; then each user-defined entry under its `x-amz-meta-` name, its value as S3 returns
+/// it (`mantle_s3::metadata::shown`).
+fn stored(query: &Query, kept: &[(String, String)], fields: &mut Fields) {
+    for (name, field, parameter) in CONTENT {
+        let default = if name == "content-type" {
+            Some(mantle_s3::metadata::DEFAULT_TYPE)
+        } else {
+            None
+        };
+        let value = query
+            .value(parameter)
+            .or_else(|| mantle_s3::metadata::value(kept, name))
+            .or(default);
+        if let Some(value) = value {
+            fields.text(field, mantle_s3::metadata::shown(value).as_bytes());
+        }
+    }
+    for (name, value) in kept {
+        if name.starts_with(mantle_s3::metadata::USER) {
+            fields.text(name, mantle_s3::metadata::shown(value).as_bytes());
+        }
+    }
+}
+
+/// DeleteObjects' `DeleteResult` (research/89 §5.2): each object's result in the order named,
+/// quiet's failures alone, as the host gave them.
+fn delete_result(reply: &Reply) -> Result<String, Refused> {
+    let Some(Listing::Deleted(results)) = &reply.listing else {
+        return Err(internal("a delete's reply without its results"));
+    };
+    let refusals: Vec<Refused> = results.iter().map(|d| refusal(d.status)).collect();
+    let deletions: Vec<s3::Deletion<'_>> = results
+        .iter()
+        .zip(&refusals)
+        .map(|(d, refused)| {
+            if d.status == Status::Done {
+                s3::Deletion::Deleted {
+                    key: &d.key,
+                    version_id: d.version.as_deref(),
+                    delete_marker: d.marker.as_deref(),
+                }
+            } else {
+                s3::Deletion::Failed {
+                    key: &d.key,
+                    version_id: d.version.as_deref(),
+                    code: refused.code,
+                    message: &refused.message,
+                }
+            }
+        })
+        .collect();
+    Ok(s3::delete_result(&deletions, false))
+}
+
+/// ListObjectVersions' `ListVersionsResult` (research/89 §2.3).
+fn list_versions(echo: &Echo<'_>, reply: Reply) -> Result<String, Refused> {
+    let Some(Listing::Versions(page)) = reply.listing else {
+        return Err(internal("a listing reply without its page"));
+    };
+    let mut versions = Vec::with_capacity(page.versions.len());
+    for listed in page.versions {
+        versions.push(s3::Version {
+            key: listed.key,
+            version_id: listed.id,
+            latest: listed.latest,
+            marker: listed.marker,
+            entry: Entry {
+                modified: seconds(listed.modified)?,
+                etag: listed.etag,
+                size: listed.size,
+                owner: listed.owner,
+                checksum: listed
+                    .checksum
+                    .map(|(algorithm, parts)| (algorithm, kind(parts))),
+            },
+        });
+    }
+    let query = echo.query;
+    let max_keys = s3list::max_keys(query.value("max-keys"))
+        .unwrap_or(s3list::MAX_KEYS)
+        .min(s3list::MAX_KEYS);
+    let next = page.next.as_ref().map(|(key, id)| s3::Next { key, id });
+    s3::list_object_versions(&s3::ListVersions {
+        bucket: echo.route.bucket.as_deref().unwrap_or_default(),
+        prefix: query.value("prefix").unwrap_or_default(),
+        delimiter: query.value("delimiter"),
+        max_keys,
+        key_marker: query.value("key-marker"),
+        version_id_marker: query.value("version-id-marker"),
+        url: query.value("encoding-type") == Some("url"),
+        versions: &versions,
+        common_prefixes: &page.common_prefixes,
+        next,
+    })
+    .map_err(time)
 }
 
 /// An object's ETag, Last-Modified and version, as a read's response states them.

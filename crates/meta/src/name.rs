@@ -2090,6 +2090,21 @@ pub fn version<E: Rows>(
     }
 }
 
+/// The mark of the write `id` names under `key`: its file's, or the ID of a write that carried
+/// none. A version's mark says the order it made, so a write's version is found from the write
+/// alone, whatever wrote the key since (docs/research/89 §3.6).
+pub fn mark_of<E: Rows>(
+    engine: &mut E,
+    bucket: &str,
+    key: &str,
+    id: u128,
+) -> Result<Option<Mark>, MetaError> {
+    Ok(engine
+        .get(&key::mark(bucket, key, id))?
+        .map(|b| Mark::decode(&b))
+        .transpose()?)
+}
+
 /// The order of the key's null version.
 fn null_order<E: Rows>(engine: &mut E, bucket: &str, key: &str) -> Result<Option<u64>, MetaError> {
     match engine.get(&key::name(bucket, key, &NameRow::Null))? {

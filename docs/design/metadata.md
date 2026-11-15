@@ -145,7 +145,10 @@ layers removes them, as Tectonic's does [01 §1.6].
     for any retry, never reusing one. Copies must keep the rule: a copy that took the source's
     blocks without moving data, as Tectonic's does (01 §1.6), would give them two referrers,
     and would need Tectonic's owner rows (R2) before the collector could tell when they are
-    free.
+    free. CopyObject and UploadPartCopy keep it by moving the bytes: the node reads the source
+    and writes them into a file the copy's gateway made for it alone, sealed under that file's
+    own data key, which S3's copy needs in any case for the checksum and ETag it computes over
+    the copied bytes (s3-protocol.md §14; research/89 §3.4).
   - *Releasing.* Whatever removes a reference writes, in the same transaction, a row in the
     range's queue of released files, keyed by the range's time and then the file and naming
     the object key the file was held under: a version

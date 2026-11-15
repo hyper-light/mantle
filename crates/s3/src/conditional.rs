@@ -1,6 +1,6 @@
 //! Conditional requests (docs/research/05 §2): reads with `If-Match`, `If-None-Match`,
 //! `If-Modified-Since` and `If-Unmodified-Since`; writes with `If-None-Match` and `If-Match`;
-//! deletes with `If-Match`.
+//! deletes with `If-Match`; a copy's source with `x-amz-copy-source-if-*` (research/89 §3.3).
 //!
 //! Reads follow RFC 9110 §13.2.2's order, which gives exactly the two combinations AWS
 //! documents. Writes and deletes are judged against the object's current version at the moment
@@ -111,6 +111,18 @@ pub fn delete(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
         Current::DeleteMarker => Outcome::Failed,
         Current::Present { etag, .. } if matches_any(list, etag, STRONG) => Outcome::Proceed,
         Current::Present { .. } => Outcome::Failed,
+    }
+}
+
+/// CopyObject's and UploadPartCopy's `x-amz-copy-source-if-*`, against the source's version
+/// (docs/research/89 §3.3): judged in a read's order, which gives the two combinations AWS
+/// documents for copies, `if-match` true with `if-unmodified-since` false copying and
+/// `if-none-match` false with `if-modified-since` true failing; a condition a read answers `304`
+/// fails a copy `412`, "Amazon S3 returns the `412 Precondition Failed` response code".
+pub fn copy_source(c: &Conditions<'_>, current: &Current<'_>) -> Outcome {
+    match read(c, current) {
+        Outcome::NotModified => Outcome::Failed,
+        outcome => outcome,
     }
 }
 
@@ -285,6 +297,47 @@ mod tests {
             read(&c(None, None, Some("not a date"), None), &p),
             Outcome::Proceed
         );
+    }
+
+    /// AWS's two documented combinations for a copy's source, and s3-tests' copy cases: a
+    /// matching `if-match` copies, a mismatched one and a matching `if-none-match` fail `412`
+    /// (89 §3.3; research/05 §9.4).
+    #[test]
+    fn a_copys_source_conditions_fail_where_a_read_would_not_modify() {
+        let c = |im, inm, ims, ius| Conditions {
+            if_match: im,
+            if_none_match: inm,
+            if_modified_since: ims,
+            if_unmodified_since: ius,
+        };
+        let p = present();
+        let before = Some("Sat, 01 Jan 1994 00:00:00 GMT");
+        assert_eq!(
+            copy_source(&c(Some(ETAG), None, None, before), &p),
+            Outcome::Proceed
+        );
+        assert_eq!(
+            copy_source(&c(None, Some(ETAG), before, None), &p),
+            Outcome::Failed
+        );
+        assert_eq!(
+            copy_source(&c(Some("\"bogus\""), None, None, None), &p),
+            Outcome::Failed
+        );
+        assert_eq!(
+            copy_source(&c(None, Some(ETAG), None, None), &p),
+            Outcome::Failed
+        );
+        let later = Some("Tue, 24 Sep 2024 12:00:01 GMT");
+        assert_eq!(
+            copy_source(&c(None, None, later, None), &p),
+            Outcome::Failed
+        );
+        assert_eq!(
+            copy_source(&Conditions::default(), &Current::DeleteMarker),
+            Outcome::NotFound
+        );
+        assert_eq!(copy_source(&Conditions::default(), &p), Outcome::Proceed);
     }
 
     /// s3-tests' conditional-write matrix (05 §2.2).

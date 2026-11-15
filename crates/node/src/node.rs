@@ -886,6 +886,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The S3 listener's door, once opened (`crate::door`; [`Node::open_door`]): the operations it
     /// hands over, each taken into a job at the next turn.
     doorway: Option<crate::door::Doorway>,
+    /// The operation taken from the door that the host had no room for yet: a copy, which counts
+    /// as two (`host::weight`), with one slot free. It is taken before any other.
+    door_held: Option<crate::door::Request>,
     /// The orderly stop, once begun ([`Node::stop`]).
     stopping: Option<Stopping>,
     /// The ranges whose lead the stop began to hand over, and those it handed over, not yet taken
@@ -1216,6 +1219,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             jobs: Vec::new(),
             abandoned: Vec::new(),
             doorway: None,
+            door_held: None,
             stopping: None,
             handing: Vec::new(),
             handed: Vec::new(),
@@ -1638,17 +1642,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
         loop {
-            let room = self.stopping()
-                || self
-                    .gateway
-                    .as_ref()
-                    .is_none_or(|g| self.jobs.len() < g.objects);
-            if !room {
-                return;
-            }
-            let Some(request) = self.doorway.as_mut().and_then(crate::door::Doorway::take) else {
+            let Some(request) = self
+                .door_held
+                .take()
+                .or_else(|| self.doorway.as_mut().and_then(crate::door::Doorway::take))
+            else {
                 return;
             };
+            // A copy counts as two of the host's operations (`host::weight`): one the host has no
+            // room for waits, the next taken behind it, so the door keeps its order.
+            let room = self.stopping()
+                || self.gateway.as_ref().is_none_or(|g| {
+                    self.occupancy().saturating_add(host::weight(&request.op)) <= g.objects
+                });
+            if !room {
+                self.door_held = Some(request);
+                return;
+            }
             self.take_local(request);
         }
     }

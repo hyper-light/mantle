@@ -67,6 +67,7 @@ fn peak_of(windows: u64) -> (u64, u64) {
                 checksum: None,
                 md5: None,
                 trailing: Some(TRAILER),
+                metadata: Vec::new(),
             };
             let made = client
                 .put(&put, &mut Made { at: 0, length }, u64::MAX)
@@ -77,6 +78,7 @@ fn peak_of(windows: u64) -> (u64, u64) {
                 bucket: "b".into(),
                 key: "k".into(),
                 headers: Headers::default(),
+                version: None,
             };
             let mut checked = Checked { at: 0 };
             let got = client.get(&get, &mut checked, u64::MAX).await.unwrap();
@@ -139,6 +141,7 @@ fn put_short(client: Credentials, address: SocketAddr, transport_bytes: u64) {
                 checksum: None,
                 md5: None,
                 trailing: Some(TRAILER),
+                metadata: Vec::new(),
             };
             let short: &[u8] = &[1, 2, 3];
             let refused = client.put(&put, &mut { short }, u64::MAX).await;

@@ -1020,6 +1020,7 @@ fn put_with(bucket: &str, key: &str, id: u128, data: &[u8], headers: Headers) ->
         checksum: None,
         md5: None,
         trailing: None,
+        metadata: Vec::new(),
     }
 }
 
@@ -1028,6 +1029,7 @@ fn get_with(bucket: &str, key: &str, headers: Headers) -> Op {
         bucket: bucket.into(),
         key: key.into(),
         headers,
+        version: None,
     }
 }
 
@@ -1036,6 +1038,7 @@ fn head_with(bucket: &str, key: &str, headers: Headers) -> Op {
         bucket: bucket.into(),
         key: key.into(),
         headers,
+        version: None,
     }
 }
 
@@ -1045,6 +1048,7 @@ fn delete_with(bucket: &str, key: &str, id: u128, if_match: Option<&str>) -> Op 
         key: key.into(),
         id,
         headers: headers(if_match, None, None, None, None),
+        version: None,
     }
 }
 
@@ -1250,6 +1254,7 @@ fn s3s_operations_answer_as_s3_does_through_every_node() {
         checksum: Some(sum),
         md5,
         trailing: None,
+        metadata: Vec::new(),
     };
     let (kept, _) = ask(
         &mut cell,
@@ -1767,6 +1772,7 @@ fn a_multipart_upload_completes_through_another_node_with_one_killed_between_par
         key: key.into(),
         id,
         checksum: Some((Algorithm::Crc64Nvme, true)),
+        metadata: Vec::new(),
     };
     let part = |key: &str, upload: &str, number, id, data: &[u8]| Op::UploadPart {
         bucket: "m".into(),
@@ -1952,6 +1958,7 @@ fn a_multipart_upload_completes_through_another_node_with_one_killed_between_par
         key: "hashed".into(),
         id: 44,
         checksum: Some((Algorithm::Sha256, true)),
+        metadata: Vec::new(),
     };
     assert_eq!(
         status(&mut cell, 2, hashed_whole),

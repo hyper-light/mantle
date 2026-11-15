@@ -213,6 +213,7 @@ fn put(bucket: &str, key: &str, length: u64) -> Op {
         checksum: None,
         md5: None,
         trailing: Some(TRAILER),
+        metadata: Vec::new(),
     }
 }
 
@@ -224,6 +225,7 @@ fn get(bucket: &str, key: &str, range: Option<&str>) -> Op {
             range: range.map(Into::into),
             ..Headers::default()
         },
+        version: None,
     }
 }
 
@@ -341,6 +343,7 @@ async fn through_the_library(mut client: Client, account: String) {
                 bucket: "native".into(),
                 key: "one/object".into(),
                 headers: Headers::default(),
+                version: None,
             },
         )
         .await,
@@ -361,6 +364,7 @@ async fn through_the_library(mut client: Client, account: String) {
                 key: "two/parts".into(),
                 id: mantle_client::identity().unwrap(),
                 checksum: Some((TRAILER, true)),
+                metadata: Vec::new(),
             },
         )
         .await,
@@ -444,6 +448,7 @@ async fn through_the_library(mut client: Client, account: String) {
                 key: "aborted".into(),
                 id: mantle_client::identity().unwrap(),
                 checksum: Some((TRAILER, true)),
+                metadata: Vec::new(),
             },
         )
         .await,
@@ -518,6 +523,7 @@ async fn through_the_library(mut client: Client, account: String) {
                 key: "one/object".into(),
                 id: mantle_client::identity().unwrap(),
                 headers: Headers::default(),
+                version: None,
             },
         )
         .await,
@@ -1260,4 +1266,560 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
     let (done, out, said) = again.finish(&mut cell);
     assert!(done, "{out}{said:?}");
     resumed_whole(&dir, "node", ((2 * run) as u64, 2, 5), &said, &object);
+}
+
+/// research/89 through the library: metadata kept and returned; a version read by its ID, a
+/// delete marker's ID answered `MethodNotAllowed`, an ID no version has `NoSuchVersion`, one mantle
+/// never makes `InvalidVersion`; copies under each directive and condition; a part copy of a range;
+/// DeleteObjects' results in their places. What it made, for the command line's half.
+async fn research_89_by_the_library(mut client: Client) {
+    use mantle_protocol::object::{Copy, CopyPart, Target};
+    use mantle_s3::copy::{Directive, Source};
+    let call = async |client: &mut Client, op: Op| client.call(&op, u64::MAX).await;
+    for bucket in ["kept", "copies"] {
+        done(
+            "CreateBucket",
+            call(
+                &mut client,
+                Op::Create {
+                    bucket: bucket.into(),
+                    id: mantle_client::identity().unwrap(),
+                },
+            )
+            .await,
+        );
+    }
+    done(
+        "PutBucketVersioning",
+        call(
+            &mut client,
+            Op::PutVersioning {
+                bucket: "kept".into(),
+                id: mantle_client::identity().unwrap(),
+                versioning: mantle_s3::body::Versioning::Enabled,
+            },
+        )
+        .await,
+    );
+    let metadata: Vec<(String, String)> = vec![
+        (
+            "content-type".into(),
+            "application/vnd.oci.image.manifest.v1+json".into(),
+        ),
+        ("x-amz-meta-digest".into(), "sha256:feed".into()),
+    ];
+    let first = bytes(60, 6 << 20);
+    let mut op = put("kept", "blob", first.len() as u64);
+    if let Op::Put { metadata: m, .. } = &mut op {
+        m.clone_from(&metadata);
+    }
+    let v1 = done(
+        "PutObject",
+        client.put(&op, &mut Made(&first), u64::MAX).await,
+    )
+    .version;
+    let second = bytes(61, 1_001);
+    let v2 = done(
+        "PutObject",
+        client
+            .put(
+                &put("kept", "blob", second.len() as u64),
+                &mut Made(&second),
+                u64::MAX,
+            )
+            .await,
+    )
+    .version;
+    let head = |version: Option<&str>| Op::Head {
+        bucket: "kept".into(),
+        key: "blob".into(),
+        headers: Headers::default(),
+        version: version.map(Into::into),
+    };
+    let old = done("HeadObject of v1", call(&mut client, head(Some(&v1))).await);
+    assert_eq!(old.metadata, metadata, "the first version's metadata");
+    assert_eq!(old.size, first.len() as u64);
+    let current = done("HeadObject", call(&mut client, head(None)).await);
+    assert!(current.metadata.is_empty(), "{:?}", current.metadata);
+    let mut kept = Kept(Vec::new());
+    let get = Op::Get {
+        bucket: "kept".into(),
+        key: "blob".into(),
+        headers: Headers::default(),
+        version: Some(v1.clone()),
+    };
+    done(
+        "GetObject of v1",
+        client.get(&get, &mut kept, u64::MAX).await,
+    );
+    assert!(kept.0 == first, "the first version by its ID");
+    for (version, status) in [
+        ("0000000000001", Status::NoSuchVersion),
+        ("not-one", Status::InvalidVersion),
+    ] {
+        let reply = call(&mut client, head(Some(version))).await.unwrap();
+        assert_eq!(reply.status, status, "{version}");
+    }
+    let marker = done(
+        "DeleteObject",
+        call(
+            &mut client,
+            Op::Delete {
+                bucket: "kept".into(),
+                key: "blob".into(),
+                id: mantle_client::identity().unwrap(),
+                headers: Headers::default(),
+                version: None,
+            },
+        )
+        .await,
+    );
+    assert!(marker.marker);
+    let named = call(&mut client, head(Some(&marker.version)))
+        .await
+        .unwrap();
+    assert_eq!(named.status, Status::MethodNotAllowed);
+    assert!(named.marker && named.modified > 0, "{named:?}");
+
+    // Copies: of a named version across buckets, its metadata copied; under REPLACE; held to the
+    // source's ETag; onto itself refused.
+    let source = |version: Option<&str>| Source {
+        bucket: "kept".into(),
+        key: "blob".into(),
+        version: version.map(Into::into),
+    };
+    let copy =
+        |key: &str, source: Source, directive, metadata: Vec<(String, String)>, conditions| {
+            Op::Copy(Box::new(Copy {
+                bucket: "copies".into(),
+                key: key.into(),
+                id: mantle_client::identity().unwrap(),
+                source,
+                conditions,
+                headers: Headers::default(),
+                directive,
+                metadata,
+                checksum: None,
+            }))
+        };
+    let copied = done(
+        "CopyObject",
+        call(
+            &mut client,
+            copy(
+                "from-v1",
+                source(Some(&v1)),
+                Directive::Copy,
+                Vec::new(),
+                Headers::default(),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(copied.etag, old.etag, "a copy's ETag is its bytes' MD5");
+    assert_eq!(copied.source_version, v1);
+    assert!(copied.modified > 0);
+    let mut kept = Kept(Vec::new());
+    done(
+        "GetObject of the copy",
+        client
+            .get(&get_versionless("copies", "from-v1"), &mut kept, u64::MAX)
+            .await,
+    );
+    assert!(kept.0 == first, "the copy's bytes");
+    let copy_head = done(
+        "HeadObject of the copy",
+        call(
+            &mut client,
+            Op::Head {
+                bucket: "copies".into(),
+                key: "from-v1".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+        )
+        .await,
+    );
+    assert_eq!(copy_head.metadata, metadata);
+    assert_eq!(
+        copy_head.modified, copied.modified,
+        "its LastModified is its version's"
+    );
+    let fresh: Vec<(String, String)> = vec![("x-amz-meta-fresh".into(), "1".into())];
+    done(
+        "CopyObject under REPLACE",
+        call(
+            &mut client,
+            copy(
+                "replaced",
+                source(Some(&v1)),
+                Directive::Replace,
+                fresh.clone(),
+                Headers::default(),
+            ),
+        )
+        .await,
+    );
+    let replaced = done(
+        "HeadObject of the replaced copy",
+        call(
+            &mut client,
+            Op::Head {
+                bucket: "copies".into(),
+                key: "replaced".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+        )
+        .await,
+    );
+    assert_eq!(replaced.metadata, fresh);
+    let mismatched = Headers {
+        if_match: Some("\"0123\"".into()),
+        ..Headers::default()
+    };
+    let failed = call(
+        &mut client,
+        copy(
+            "no",
+            source(Some(&v1)),
+            Directive::Copy,
+            Vec::new(),
+            mismatched,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed.status, Status::PreconditionFailed);
+    let marked = call(
+        &mut client,
+        copy(
+            "no",
+            source(Some(&marker.version)),
+            Directive::Copy,
+            Vec::new(),
+            Headers::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(marked.status, Status::CopyMarker);
+    let gone = call(
+        &mut client,
+        copy(
+            "no",
+            source(None),
+            Directive::Copy,
+            Vec::new(),
+            Headers::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        gone.status,
+        Status::NoSuchKey,
+        "a current delete marker is no source"
+    );
+    let itself = Op::Copy(Box::new(Copy {
+        bucket: "copies".into(),
+        key: "replaced".into(),
+        id: mantle_client::identity().unwrap(),
+        source: Source {
+            bucket: "copies".into(),
+            key: "replaced".into(),
+            version: None,
+        },
+        conditions: Headers::default(),
+        headers: Headers::default(),
+        directive: Directive::Copy,
+        metadata: Vec::new(),
+        checksum: None,
+    }));
+    assert_eq!(
+        call(&mut client, itself).await.unwrap().status,
+        Status::CopyToItself
+    );
+
+    // A part copy of a range, completed alone.
+    let created = done(
+        "CreateMultipartUpload",
+        call(
+            &mut client,
+            Op::CreateUpload {
+                bucket: "copies".into(),
+                key: "assembled".into(),
+                id: mantle_client::identity().unwrap(),
+                checksum: Some((TRAILER, true)),
+                metadata: Vec::new(),
+            },
+        )
+        .await,
+    );
+    let part = done(
+        "UploadPartCopy",
+        call(
+            &mut client,
+            Op::CopyPart(Box::new(CopyPart {
+                bucket: "copies".into(),
+                key: "assembled".into(),
+                upload: created.upload.clone(),
+                number: 1,
+                id: mantle_client::identity().unwrap(),
+                source: source(Some(&v1)),
+                conditions: Headers {
+                    range: Some("bytes=1000-2999".into()),
+                    ..Headers::default()
+                },
+            })),
+        )
+        .await,
+    );
+    assert!(part.modified > 0 && part.checksum.is_some(), "{part:?}");
+    done(
+        "CompleteMultipartUpload",
+        call(
+            &mut client,
+            Op::Complete {
+                bucket: "copies".into(),
+                key: "assembled".into(),
+                upload: created.upload,
+                id: mantle_client::identity().unwrap(),
+                headers: Headers::default(),
+                parts: vec![(1, part.etag)],
+            },
+        )
+        .await,
+    );
+    let mut kept = Kept(Vec::new());
+    done(
+        "GetObject of the part copy",
+        client
+            .get(&get_versionless("copies", "assembled"), &mut kept, u64::MAX)
+            .await,
+    );
+    assert!(kept.0 == first[1000..3000], "the part copy's bytes");
+
+    // DeleteObjects: present, missing, a version, one no version is named by; each in its place.
+    let results = done(
+        "DeleteObjects",
+        call(
+            &mut client,
+            Op::DeleteObjects {
+                bucket: "kept".into(),
+                id: mantle_client::identity().unwrap(),
+                objects: vec![
+                    Target {
+                        key: "blob".into(),
+                        version: Some(v2.clone()),
+                        etag: None,
+                    },
+                    Target {
+                        key: "missing".into(),
+                        version: None,
+                        etag: None,
+                    },
+                    Target {
+                        key: "blob".into(),
+                        version: Some("bad".into()),
+                        etag: None,
+                    },
+                ],
+                quiet: false,
+            },
+        )
+        .await,
+    );
+    let Some(Listing::Deleted(results)) = results.listing else {
+        panic!("{results:?}");
+    };
+    let statuses: Vec<Status> = results.iter().map(|d| d.status).collect();
+    assert_eq!(
+        statuses,
+        [Status::Done, Status::Done, Status::InvalidVersion],
+        "{results:?}"
+    );
+    assert_eq!(results[0].version.as_deref(), Some(v2.as_str()));
+    assert!(results[1].marker.is_some(), "a missing key's delete marker");
+}
+
+/// A get of `key`'s current version.
+fn get_versionless(bucket: &str, key: &str) -> Op {
+    get(bucket, key, None)
+}
+
+/// research/89 through the library and then `mantle`'s object commands against a cell of three:
+/// `cp` with content headers and metadata, `head` saying them, a copy within the cell under each
+/// directive, `ls --versions`, `cp --version-id`, `rm --version-id`, `rm` of several in one
+/// DeleteObjects, and `multipart copy`. Every object read back byte-identical.
+#[test]
+fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_deletes() {
+    let mut cell = Cell::made_alone(three_founders);
+    pins_nodes_alone(&cell);
+    let dir = made_client(&cell, "client");
+    let bound = cell.bound_quic();
+    let settings = settings(&dir, &bound);
+    let sockets = mantle_client::sockets(bound.len()).unwrap();
+    let library = std::thread::spawn(move || {
+        client_runtime(sockets)
+            .block_on(async move {
+                let client = Client::open(settings).await.unwrap();
+                research_89_by_the_library(client).await;
+            })
+            .unwrap();
+    });
+    cell.until(|_| {
+        if library.is_finished() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    library.join().unwrap();
+
+    let said = |out: Vec<u8>| String::from_utf8(out).unwrap();
+    let root = cell.out().parent().unwrap().to_path_buf();
+    mantle(&dir, &["mb", "s3://cli89"], None);
+    // Past 5 MiB, so a range of it may be copied (research/89 §4.1).
+    let object = bytes(70, (6 << 20) + 9);
+    let file = root.join("blob89.bin");
+    std::fs::write(&file, &object).unwrap();
+    let file_text = file.display().to_string();
+    mantle(
+        &dir,
+        &[
+            "cp",
+            &file_text,
+            "s3://cli89/blob",
+            "--content-type",
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "--cache-control",
+            "immutable",
+            "--metadata",
+            "digest=sha256:cafe",
+            "--metadata",
+            "Kind=layer",
+        ],
+        None,
+    );
+    let head = said(mantle(&dir, &["head", "s3://cli89/blob"], None));
+    for line in [
+        "cache-control immutable",
+        "content-type application/vnd.oci.image.layer.v1.tar+zstd",
+        "x-amz-meta-digest sha256:cafe",
+        "x-amz-meta-kind layer",
+    ] {
+        assert!(head.lines().any(|l| l == line), "{line}: {head}");
+    }
+    // A copy within the cell keeps the source's metadata; under REPLACE it takes the command's.
+    let copied = said(mantle(
+        &dir,
+        &["cp", "s3://cli89/blob", "s3://cli89/copy"],
+        None,
+    ));
+    assert!(copied.contains("-> s3://cli89/copy"), "{copied}");
+    let out = mantle(&dir, &["cp", "s3://cli89/copy", "-"], None);
+    assert!(out == object, "the copy's bytes");
+    let head = said(mantle(&dir, &["head", "s3://cli89/copy"], None));
+    assert!(
+        head.lines().any(|l| l == "x-amz-meta-digest sha256:cafe"),
+        "{head}"
+    );
+    mantle(
+        &dir,
+        &[
+            "cp",
+            "s3://cli89/blob",
+            "s3://cli89/replaced",
+            "--content-type",
+            "text/plain",
+        ],
+        None,
+    );
+    let head = said(mantle(&dir, &["head", "s3://cli89/replaced"], None));
+    assert!(
+        head.lines().any(|l| l == "content-type text/plain"),
+        "{head}"
+    );
+    assert!(!head.contains("x-amz-meta-digest"), "{head}");
+    // A part copy by the command line.
+    let upload = said(mantle(
+        &dir,
+        &["multipart", "create", "s3://cli89/parts"],
+        None,
+    ));
+    let upload = upload.trim();
+    let part = said(mantle(
+        &dir,
+        &[
+            "multipart",
+            "copy",
+            "s3://cli89/parts",
+            upload,
+            "1",
+            "s3://cli89/blob",
+            "--range",
+            "0-99",
+        ],
+        None,
+    ));
+    let tag = part.split_whitespace().nth(1).unwrap().to_owned();
+    mantle(
+        &dir,
+        &[
+            "multipart",
+            "complete",
+            "s3://cli89/parts",
+            upload,
+            &format!("1={tag}"),
+        ],
+        None,
+    );
+    let out = mantle(&dir, &["cp", "s3://cli89/parts", "-"], None);
+    assert!(out == object[..100], "the part copy's bytes");
+    // Versions of the library's bucket: listed, one read and one removed by its ID.
+    let versions = said(mantle(&dir, &["ls", "--versions", "s3://kept/blob"], None));
+    let lines: Vec<&str> = versions.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "the marker the library made and the first version: {versions}"
+    );
+    let first = lines
+        .iter()
+        .find(|l| l.contains(" object "))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_owned();
+    let out = mantle(
+        &dir,
+        &["cp", "s3://kept/blob", "-", "--version-id", &first],
+        None,
+    );
+    assert!(out == bytes(60, 6 << 20), "the first version by its ID");
+    mantle(
+        &dir,
+        &["rm", "s3://kept/blob", "--version-id", &first],
+        None,
+    );
+    let versions = said(mantle(&dir, &["ls", "--versions", "s3://kept/blob"], None));
+    assert!(!versions.contains(&first), "{versions}");
+    // Several removed in one DeleteObjects, a missing one among them.
+    let removed = said(mantle(
+        &dir,
+        &[
+            "rm",
+            "s3://cli89/blob",
+            "s3://cli89/copy",
+            "s3://cli89/never",
+        ],
+        None,
+    ));
+    assert_eq!(removed.lines().count(), 3, "{removed}");
+    for key in ["blob", "copy"] {
+        let (found, _, _) = mantle_status(&dir, &["head", &format!("s3://cli89/{key}")], None);
+        assert!(!found, "{key} removed");
+    }
 }

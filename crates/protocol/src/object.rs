@@ -20,26 +20,35 @@
 //! | Kind | Operation | Fields |
 //! |---|---|---|
 //! | 0 | CreateBucket | the bucket |
-//! | 1 | PutObject | the bucket and the key; the headers; the checksum, optional: its algorithm's code (u8) and its value, its length (u8) before it; `Content-MD5`, optional, 16 bytes |
-//! | 2 | GetObject | the bucket and the key; the headers |
-//! | 3 | HeadObject | the bucket and the key; the headers |
-//! | 4 | DeleteObject | the bucket and the key; the headers |
+//! | 1 | PutObject | the bucket and the key; the headers; the checksum, optional: its algorithm's code (u8) and its value, its length (u8) before it; `Content-MD5`, optional, 16 bytes; the metadata |
+//! | 2 | GetObject | the bucket and the key; the headers; the version, optional, a text |
+//! | 3 | HeadObject | the bucket and the key; the headers; the version, optional, a text |
+//! | 4 | DeleteObject | the bucket and the key; the headers; the version, optional, a text |
 //! | 5 | ListObjectsV2 | the bucket; the prefix; the delimiter, empty for none; where the page starts, optional: 0 after a key or common prefix, 1 just past a key a page passed, then the key; the most keys (u32); whether each key's owner is listed (u8) |
 //! | 6 | HeadBucket | the bucket |
 //! | 7 | ListBuckets | the prefix; the bucket after which the page starts, optional; the most buckets (u32) |
 //! | 8 | DeleteBucket | the bucket |
 //! | 9 | PutBucketVersioning | the bucket; its state (u8): 2 enabled, 3 suspended |
 //! | 10 | GetBucketVersioning | the bucket |
-//! | 11 | CreateMultipartUpload | the bucket and the key; the checksum its parts carry, optional: its algorithm's code (u8) and whether its values combine as one full-object value (u8) |
+//! | 11 | CreateMultipartUpload | the bucket and the key; the checksum its parts carry, optional: its algorithm's code (u8) and whether its values combine as one full-object value (u8); the metadata |
 //! | 12 | UploadPart | the bucket and the key; the upload's ID; the part's number (u16); the checksum, optional, and `Content-MD5`, optional, as a put's |
 //! | 13 | CompleteMultipartUpload | the bucket and the key; the upload's ID; the headers; the parts it lists (a u32 count), each its number (u16) and the ETag its upload answered, bare of quotes, in ascending order |
 //! | 14 | AbortMultipartUpload | the bucket and the key; the upload's ID |
 //! | 15 | ListParts | the bucket and the key; the upload's ID; the part number after which the page starts (u16); the most parts (u32) |
 //! | 16 | ListMultipartUploads | the bucket; the prefix; the delimiter, empty for none; the key marker and the upload ID marker, each optional; the most uploads (u32) |
-//! | 17 | Open, a native upload (gateway.md §2.1) | the bucket and the key; the object's length, optional (u64); the client's buffer, optional (u64); the full-object checksum's algorithm's code (u8) |
+//! | 17 | Open, a native upload (gateway.md §2.1) | the bucket and the key; the object's length, optional (u64); the client's buffer, optional (u64); the full-object checksum's algorithm's code (u8); the metadata |
 //! | 18 | Append, a native upload's run | the bucket and the key; the upload's ID; the offset it begins at (u64); whether it ends the object (u8) |
 //! | 19 | Offset, a native upload's state | the bucket and the key; the upload's ID |
 //! | 20 | Finish, a native upload's end | the bucket and the key; the upload's ID; the headers; the object's length (u64); its full-object checksum: its algorithm's code (u8) and its value, its length (u8) before it |
+//! | 21 | CopyObject (research/89 §3) | the bucket and the key; the source's bucket and key, and its version, optional; the source's conditions, as headers, `x-amz-copy-source-if-*` in the precondition slots and no range; the headers; the metadata directive (u8): 0 COPY, 1 REPLACE; the metadata; the checksum's algorithm, optional, its code (u8) |
+//! | 22 | UploadPartCopy (research/89 §4) | the bucket and the key; the upload's ID; the part's number (u16); the source's bucket and key, and its version, optional; the source's conditions, as headers, `x-amz-copy-source-range` in the range slot |
+//! | 23 | DeleteObjects (research/89 §5) | the bucket; the objects (a u32 count, at most S3's 1,000), each its key, its version, optional, and the ETag its delete is conditioned on, optional; whether the reply is quiet (u8) |
+//! | 24 | ListObjectVersions (research/89 §2.3) | the bucket; the prefix; the delimiter, empty for none; the key marker and the version ID marker, each optional; the most versions (u32) |
+//!
+//! The metadata, a version's content headers and user-defined metadata (`mantle_s3::metadata`): a
+//! count (u32), then each pair, its lowercase name and its value, each a text, together within
+//! S3's 8 KB of headers. A version is a text within S3's 1,024 bytes of a version ID
+//! (`mantle_s3::body::MAX_VERSION_ID`): `null`, or one of mantle's, which the node parses.
 //!
 //! The headers are the values of S3's request headers an object's operation takes as text, each
 //! optional: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` and `Range`,
@@ -58,9 +67,11 @@
 //! each), S3's `206 Partial Content`; the bucket's versioning, GetBucketVersioning's (u8): 0 none,
 //! never set or not asked, 2 enabled, 3 suspended; the upload's ID, CreateMultipartUpload's, a text;
 //! then the listing, behind a byte: 0 none, 1 a page of keys, 2 a page of buckets, 3 a page of
-//! parts, 4 a page of uploads; then a native upload's progress, optional: its durable offset (u64),
-//! its runs (u16), the length of every run but its last (u64), whether its last run committed (u8)
-//! and a run's checksum, optional, its length (u8) before it. A page of keys: whether it is truncated (u8); where the next page starts,
+//! parts, 4 a page of uploads, 5 a page of versions, 6 a delete's results; then a native upload's
+//! progress, optional: its durable offset (u64), its runs (u16), the length of every run but its
+//! last (u64), whether its last run committed (u8) and a run's checksum, optional, its length (u8)
+//! before it; then the version's metadata, a get's or a head's; then the version a copy read of
+//! its source, a text, empty where none applies. A page of keys: whether it is truncated (u8); where the next page starts,
 //! optional, as a request names it; the count of keys (u32), each its key, ETag, size (u64),
 //! Last-Modified (u64), checksum algorithm, optional, its code (u8) and parts (u16), and owner,
 //! optional, a text; the count of common prefixes (u32), each a text. A page of buckets: the
@@ -70,7 +81,14 @@
 //! Last-Modified (u64) and checksum value, optional, its length (u8) before it. A page of uploads:
 //! whether it is truncated (u8); where the next page starts, optional, a key and an upload's ID;
 //! the count of uploads (u32), each its key, ID, initiation (u64, whole seconds) and owner; the
-//! count of common prefixes (u32), each a text.
+//! count of common prefixes (u32), each a text. A page of versions: whether it is truncated (u8);
+//! where the next page starts, optional, a key and a version ID marker; the count of versions
+//! (u32), each its key, version ID, flags (u8: 1 the key's latest, 2 a delete marker), ETag, size
+//! (u64), Last-Modified (u64), checksum algorithm, optional, its code (u8) and parts (u16), and
+//! owner; the count of common prefixes (u32), each a text. A delete's results, in the order the
+//! request named its objects: the count (u32), each the key, the version the request named,
+//! optional, the status of its delete (u8), and the version ID of the delete marker the delete
+//! made or removed, optional.
 //!
 //! Numbers are little-endian. Every text is within S3's bound on what it names, and every count
 //! within S3's page: a message past them is refused whole.
@@ -79,8 +97,10 @@ use std::time::Duration;
 
 use mantle_codec::{Reader, Writer};
 use mantle_s3::account::MAX_OWNER;
+use mantle_s3::body::MAX_VERSION_ID;
 use mantle_s3::body::Versioning;
 use mantle_s3::checksum::{Algorithm, Checksum};
+use mantle_s3::copy::{Directive, Source};
 use mantle_s3::list::{MAX_KEYS, Resume};
 use mantle_s3::route::{MAX_BUCKET, MAX_HEADERS, MAX_KEY};
 
@@ -105,6 +125,10 @@ const OPEN: u8 = 17;
 const APPEND: u8 = 18;
 const OFFSET: u8 = 19;
 const FINISH: u8 = 20;
+const COPY: u8 = 21;
+const COPY_PART: u8 = 22;
+const DELETE_OBJECTS: u8 = 23;
+const LIST_VERSIONS: u8 = 24;
 
 /// The longest version id or ETag a reply carries: a multipart object's ETag, bare of quotes, an
 /// MD5's 32 hex digits, `-` and its count of parts, at most `MAX_PARTS`'s five digits
@@ -124,6 +148,23 @@ pub const MAX_PAGE_PARTS: usize = 1000;
 
 /// The most parts an upload has and a completion lists: S3's 10,000 (05 §4.1).
 const MAX_PARTS: usize = mantle_s3::body::MAX_PARTS as usize;
+
+/// The most objects a DeleteObjects names and its reply's results: "a list of up to 1,000 keys"
+/// (research/89 §5.1).
+pub const MAX_OBJECTS: usize = mantle_s3::body::MAX_OBJECTS;
+
+/// The longest ETag a delete of DeleteObjects is conditioned on: mantle's longest, quoted and
+/// weak (`W/""`). A longer one names no version mantle holds, and is carried as the empty tag,
+/// which names none either, an ETag never being empty (research/89 §5.1).
+pub const MAX_CONDITION_TAG: usize = MAX_TAG + "W/\"\"".len();
+
+/// The bytes of a version's metadata at most, its names and values: within S3's 8 KB of request
+/// headers, which carry them (research/05 §10.2; `mantle_s3::metadata`).
+pub const MAX_METADATA: usize = MAX_HEADERS;
+
+/// A version's metadata in a message at most: its count, and each pair's two lengths beside the
+/// bytes, each pair at least one byte of name.
+const METADATA_BYTES: usize = 4 + MAX_METADATA + 2 * 4 * MAX_METADATA;
 
 /// The bytes of an object's request head: the kind, the fields' length, the identity, the time
 /// its client will still wait, a put's length and its trailer's algorithm.
@@ -160,15 +201,33 @@ pub const MAX_FIELDS: usize = {
     let names = (4 + MAX_BUCKET) + (4 + MAX_KEY);
     // Five optional texts within S3's headers.
     let headers = 5 * (1 + 4) + MAX_HEADERS;
-    let put = names + (4 + MAX_TAG) + 2 + headers + (1 + 1 + 1 + MAX_CHECKSUM) + (1 + 16);
+    let version = 1 + 4 + MAX_VERSION_ID;
+    let put = names
+        + (4 + MAX_TAG)
+        + 2
+        + headers
+        + (1 + 1 + 1 + MAX_CHECKSUM)
+        + (1 + 16)
+        + METADATA_BYTES;
     let list = (4 + MAX_BUCKET) + 2 * (4 + MAX_KEY) + (1 + 1 + 4 + MAX_KEY) + 4 + 1;
     let complete = names + (4 + MAX_TAG) + headers + 4 + MAX_PARTS * (2 + 4 + MAX_TAG);
-    let longest = if put > list { put } else { list };
+    // A copy names its source beside its own, two headers and its metadata.
+    let copy = 2 * names + version + 2 * headers + 1 + METADATA_BYTES + (1 + 1);
+    let deletes = (4 + MAX_BUCKET)
+        + 4
+        + MAX_OBJECTS * ((4 + MAX_KEY) + version + (1 + 4 + MAX_CONDITION_TAG))
+        + 1;
+    let mut longest = if put > list { put } else { list };
     if complete > longest {
-        complete
-    } else {
-        longest
+        longest = complete;
     }
+    if copy > longest {
+        longest = copy;
+    }
+    if deletes > longest {
+        longest = deletes;
+    }
+    longest
 };
 
 /// A key's bytes at most in a page of keys: its key, ETag, size, Last-Modified, checksum
@@ -190,6 +249,8 @@ pub const MAX_REPLY_FIELDS: usize = {
     let buckets = 4 + MAX_BUCKETS * (4 + MAX_BUCKET + 8) + (1 + 4 + MAX_BUCKET);
     let parts = PARTS_HEAD_BYTES + MAX_PAGE_PARTS * PART_BYTES;
     let uploads = UPLOADS_HEAD_BYTES + MAX_PAGE_PARTS * UPLOAD_BYTES;
+    let versions = VERSIONS_HEAD_BYTES + MAX_KEYS * VERSION_BYTES;
+    let deleted = 4 + MAX_OBJECTS * DELETED_BYTES;
     let mut longest = if keys > buckets { keys } else { buckets };
     if parts > longest {
         longest = parts;
@@ -197,7 +258,15 @@ pub const MAX_REPLY_FIELDS: usize = {
     if uploads > longest {
         longest = uploads;
     }
-    facts + 1 + longest
+    if versions > longest {
+        longest = versions;
+    }
+    if deleted > longest {
+        longest = deleted;
+    }
+    // The progress, the metadata and a copy's source version follow the listing.
+    let progress = 1 + 8 + 2 + 8 + 1 + (1 + 1 + MAX_CHECKSUM);
+    facts + 1 + longest + progress + METADATA_BYTES + (4 + MAX_TAG)
 };
 
 /// The values of S3's request headers an object's operation takes as text, as a request sends
@@ -247,6 +316,69 @@ pub struct List {
     pub fetch_owner: bool,
 }
 
+/// A version's metadata: its content headers and user-defined metadata, each a lowercase name and
+/// its value, sorted by name (`mantle_s3::metadata`).
+pub type Metadata = Vec<(String, String)>;
+
+/// CopyObject (research/89 §3): `source`'s version copied to `bucket`'s `key` by the node, no byte
+/// through the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copy {
+    pub bucket: String,
+    pub key: String,
+    pub id: u128,
+    pub source: Source,
+    /// `x-amz-copy-source-if-*`, judged against the source's version (research/89 §3.3), in the
+    /// precondition slots; no range.
+    pub conditions: Headers,
+    /// The destination's `If-Match` and `If-None-Match`, judged as its version commits.
+    pub headers: Headers,
+    /// Where the copy's metadata comes from: the source's, or `metadata`.
+    pub directive: Directive,
+    /// `REPLACE`'s metadata; empty under `COPY`.
+    pub metadata: Metadata,
+    /// `x-amz-checksum-algorithm`: the full-object checksum the copy keeps; none for the source's
+    /// algorithm, or CRC-64/NVME where the source keeps none (research/89 §3.4).
+    pub checksum: Option<Algorithm>,
+}
+
+/// UploadPartCopy (research/89 §4): part `number` of `upload` copied by the node from `source`'s
+/// version, or the range `conditions.range` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyPart {
+    pub bucket: String,
+    pub key: String,
+    pub upload: String,
+    pub number: u16,
+    pub id: u128,
+    pub source: Source,
+    /// `x-amz-copy-source-if-*` in the precondition slots and `x-amz-copy-source-range` in the
+    /// range's.
+    pub conditions: Headers,
+}
+
+/// An object DeleteObjects names (research/89 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub key: String,
+    /// The version to remove; none for the key's simple delete.
+    pub version: Option<String>,
+    /// The ETag its delete is conditioned on, as `If-Match` conditions a DeleteObject's.
+    pub etag: Option<String>,
+}
+
+/// ListObjectVersions' request (research/89 §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListVersions {
+    pub bucket: String,
+    pub prefix: String,
+    /// No delimiter when empty.
+    pub delimiter: String,
+    pub key_marker: Option<String>,
+    pub id_marker: Option<String>,
+    pub max: u32,
+}
+
 /// What an object's request asks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -265,25 +397,33 @@ pub enum Op {
         checksum: Option<Checksum>,
         md5: Option<[u8; 16]>,
         trailing: Option<Algorithm>,
+        /// The version's content headers and user-defined metadata (research/89 §1).
+        metadata: Metadata,
     },
-    /// GetObject: the current version's bytes, or the range its `Range` names.
+    /// GetObject: the current version's bytes, or the named version's, or the range its `Range`
+    /// names.
     Get {
         bucket: String,
         key: String,
         headers: Headers,
+        /// `versionId`, as sent: `null` or one of mantle's (research/89 §2.1).
+        version: Option<String>,
     },
-    /// HeadObject: the current version's facts.
+    /// HeadObject: the current version's facts, or the named version's.
     Head {
         bucket: String,
         key: String,
         headers: Headers,
+        version: Option<String>,
     },
-    /// DeleteObject: the key's object removed, or a delete marker made where versioning is on.
+    /// DeleteObject: the key's object removed, or a delete marker made where versioning is on; or
+    /// the named version removed (research/89 §2.2).
     Delete {
         bucket: String,
         key: String,
         id: u128,
         headers: Headers,
+        version: Option<String>,
     },
     /// ListObjectsV2.
     List(List),
@@ -312,6 +452,8 @@ pub enum Op {
         key: String,
         id: u128,
         checksum: Option<(Algorithm, bool)>,
+        /// The completed version's metadata (research/89 §1).
+        metadata: Metadata,
     },
     /// UploadPart: part `number` of `upload`, `length` bytes following the fields, checked as a
     /// put's are, a trailer's checksum after them as a put's.
@@ -373,6 +515,8 @@ pub enum Op {
         length: Option<u64>,
         buffer: Option<u64>,
         checksum: Algorithm,
+        /// The object's metadata (research/89 §1).
+        metadata: Metadata,
     },
     /// A native upload's next run: `length` bytes from `offset`, the upload's durable offset,
     /// `last` where they end the object; its checksum, in the upload's algorithm, in a trailer
@@ -408,6 +552,20 @@ pub enum Op {
         length: u64,
         checksum: Checksum,
     },
+    /// CopyObject (research/89 §3).
+    Copy(Box<Copy>),
+    /// UploadPartCopy (research/89 §4).
+    CopyPart(Box<CopyPart>),
+    /// DeleteObjects (research/89 §5): each object's delete, its result in its place.
+    DeleteObjects {
+        bucket: String,
+        id: u128,
+        objects: Vec<Target>,
+        /// Report only the deletes that failed.
+        quiet: bool,
+    },
+    /// ListObjectVersions (research/89 §2.3).
+    ListVersions(ListVersions),
 }
 
 /// A versioning state as a message carries it: 2 enabled, 3 suspended.
@@ -589,6 +747,70 @@ fn take_resume(r: &mut Reader<'_>) -> Option<Option<Resume>> {
     }))
 }
 
+/// A version's metadata: its count, then each name and value, together within
+/// [`MAX_METADATA`].
+fn put_metadata(w: &mut Writer, pairs: &[(String, String)]) -> Result<(), ObjectError> {
+    let total = pairs.iter().fold(0usize, |sum, (n, v)| {
+        sum.saturating_add(n.len()).saturating_add(v.len())
+    });
+    if total > MAX_METADATA {
+        return Err(ObjectError::TooLong(total));
+    }
+    put_count(w, pairs.len())?;
+    for (name, value) in pairs {
+        put_text(w, name, MAX_METADATA)?;
+        put_text(w, value, MAX_METADATA)?;
+    }
+    Ok(())
+}
+
+fn take_metadata(r: &mut Reader<'_>) -> Option<Metadata> {
+    // A pair takes 8 bytes at least, its two lengths.
+    let count = take_count(r, MAX_METADATA, 8)?;
+    let mut pairs = Vec::with_capacity(count);
+    let mut total = 0usize;
+    for _ in 0..count {
+        let (name, value) = (take_text(r, MAX_METADATA)?, take_text(r, MAX_METADATA)?);
+        total = total.checked_add(name.len())?.checked_add(value.len())?;
+        if total > MAX_METADATA {
+            return None;
+        }
+        pairs.push((name, value));
+    }
+    Some(pairs)
+}
+
+/// A copy's source: its bucket and key, and its version, optional.
+fn put_source(w: &mut Writer, source: &Source) -> Result<(), ObjectError> {
+    put_text(w, &source.bucket, MAX_BUCKET)?;
+    put_text(w, &source.key, MAX_KEY)?;
+    put_optional_text(w, source.version.as_deref(), MAX_VERSION_ID)
+}
+
+fn take_source(r: &mut Reader<'_>) -> Option<Source> {
+    Some(Source {
+        bucket: take_text(r, MAX_BUCKET)?,
+        key: take_text(r, MAX_KEY)?,
+        version: take_optional_text(r, MAX_VERSION_ID)?,
+    })
+}
+
+/// A copy's metadata directive as a message carries it: 0 COPY, 1 REPLACE.
+fn directive_code(d: Directive) -> u8 {
+    match d {
+        Directive::Copy => 0,
+        Directive::Replace => 1,
+    }
+}
+
+fn directive_of(code: u8) -> Option<Directive> {
+    match code {
+        0 => Some(Directive::Copy),
+        1 => Some(Directive::Replace),
+        _ => None,
+    }
+}
+
 /// A request's head: what it is and how long its fields are, before they are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Head {
@@ -642,6 +864,7 @@ impl Head {
                         checksum,
                         md5,
                         trailing: self.trailing,
+                        metadata: take_metadata(&mut r)?,
                     }
                 }
                 GET => {
@@ -650,6 +873,7 @@ impl Head {
                         bucket,
                         key,
                         headers: take_headers(&mut r)?,
+                        version: take_optional_text(&mut r, MAX_VERSION_ID)?,
                     }
                 }
                 HEAD => {
@@ -658,6 +882,7 @@ impl Head {
                         bucket,
                         key,
                         headers: take_headers(&mut r)?,
+                        version: take_optional_text(&mut r, MAX_VERSION_ID)?,
                     }
                 }
                 DELETE => {
@@ -667,6 +892,7 @@ impl Head {
                         key,
                         id: self.id,
                         headers: take_headers(&mut r)?,
+                        version: take_optional_text(&mut r, MAX_VERSION_ID)?,
                     }
                 }
                 LIST => Op::List(take_list(&mut r)?),
@@ -704,6 +930,7 @@ impl Head {
                         key,
                         id: self.id,
                         checksum,
+                        metadata: take_metadata(&mut r)?,
                     }
                 }
                 UPLOAD_PART => {
@@ -778,6 +1005,7 @@ impl Head {
                         length: take_optional_u64(&mut r)?,
                         buffer: take_optional_u64(&mut r)?,
                         checksum: Algorithm::from_code(r.u8()?)?,
+                        metadata: take_metadata(&mut r)?,
                     }
                 }
                 APPEND => {
@@ -824,6 +1052,56 @@ impl Head {
                         },
                     }
                 }
+                COPY => {
+                    let (bucket, key) = object(&mut r)?;
+                    Op::Copy(Box::new(Copy {
+                        bucket,
+                        key,
+                        id: self.id,
+                        source: take_source(&mut r)?,
+                        conditions: take_headers(&mut r)?,
+                        headers: take_headers(&mut r)?,
+                        directive: directive_of(r.u8()?)?,
+                        metadata: take_metadata(&mut r)?,
+                        checksum: if take_flag(&mut r)? {
+                            Some(Algorithm::from_code(r.u8()?)?)
+                        } else {
+                            None
+                        },
+                    }))
+                }
+                COPY_PART => {
+                    let (bucket, key) = object(&mut r)?;
+                    Op::CopyPart(Box::new(CopyPart {
+                        bucket,
+                        key,
+                        upload: take_text(&mut r, MAX_TAG)?,
+                        number: r.u16()?,
+                        id: self.id,
+                        source: take_source(&mut r)?,
+                        conditions: take_headers(&mut r)?,
+                    }))
+                }
+                DELETE_OBJECTS => {
+                    let bucket = take_text(&mut r, MAX_BUCKET)?;
+                    // An object takes 6 bytes at least: its key's length and two flags.
+                    let count = take_count(&mut r, MAX_OBJECTS, 6)?;
+                    let mut objects = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        objects.push(Target {
+                            key: take_text(&mut r, MAX_KEY)?,
+                            version: take_optional_text(&mut r, MAX_VERSION_ID)?,
+                            etag: take_optional_text(&mut r, MAX_CONDITION_TAG)?,
+                        });
+                    }
+                    Op::DeleteObjects {
+                        bucket,
+                        id: self.id,
+                        objects,
+                        quiet: take_flag(&mut r)?,
+                    }
+                }
+                LIST_VERSIONS => Op::ListVersions(take_list_versions(&mut r)?),
                 _ => return None,
             })
         })();
@@ -853,7 +1131,7 @@ impl Head {
         let decoded = decoded.ok_or_else(head_of)?;
         let puts = matches!(decoded.kind, PUT | UPLOAD_PART | APPEND);
         let within = usize::try_from(decoded.fields).is_ok_and(|f| f <= MAX_FIELDS)
-            && decoded.kind <= FINISH
+            && decoded.kind <= LIST_VERSIONS
             && (puts || (decoded.length == 0 && decoded.trailing.is_none()));
         let trailer = decoded
             .trailing
@@ -932,28 +1210,34 @@ impl Op {
                 checksum,
                 md5,
                 trailing,
+                metadata,
             } => {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
                 put_digests(f, checksum.as_ref(), md5.as_ref())?;
+                put_metadata(f, metadata)?;
                 (PUT, *id, *length, *trailing)
             }
             Self::Get {
                 bucket,
                 key,
                 headers,
+                version,
             } => {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
+                put_optional_text(f, version.as_deref(), MAX_VERSION_ID)?;
                 (GET, 0, 0, None)
             }
             Self::Head {
                 bucket,
                 key,
                 headers,
+                version,
             } => {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
+                put_optional_text(f, version.as_deref(), MAX_VERSION_ID)?;
                 (HEAD, 0, 0, None)
             }
             Self::Delete {
@@ -961,9 +1245,11 @@ impl Op {
                 key,
                 id,
                 headers,
+                version,
             } => {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
+                put_optional_text(f, version.as_deref(), MAX_VERSION_ID)?;
                 (DELETE, *id, 0, None)
             }
             Self::List(list) => {
@@ -1005,6 +1291,7 @@ impl Op {
                 key,
                 id,
                 checksum,
+                metadata,
             } => {
                 object(f, bucket, key)?;
                 put_flag(f, checksum.is_some());
@@ -1012,6 +1299,7 @@ impl Op {
                     f.u8(algorithm.code());
                     put_flag(f, *full_object);
                 }
+                put_metadata(f, metadata)?;
                 (CREATE_UPLOAD, *id, 0, None)
             }
             Self::UploadPart {
@@ -1098,11 +1386,13 @@ impl Op {
                 length,
                 buffer,
                 checksum,
+                metadata,
             } => {
                 object(f, bucket, key)?;
                 put_optional_u64(f, *length);
                 put_optional_u64(f, *buffer);
                 f.u8(checksum.code());
+                put_metadata(f, metadata)?;
                 (OPEN, *id, 0, None)
             }
             Self::Append {
@@ -1150,6 +1440,50 @@ impl Op {
                 f.u8(u8::try_from(checksum.bytes.len()).map_err(|_| ObjectError::TooLong(0))?);
                 f.bytes(&checksum.bytes);
                 (FINISH, *id, 0, None)
+            }
+            Self::Copy(copy) => {
+                object(f, &copy.bucket, &copy.key)?;
+                put_source(f, &copy.source)?;
+                put_headers(f, &copy.conditions)?;
+                put_headers(f, &copy.headers)?;
+                f.u8(directive_code(copy.directive));
+                put_metadata(f, &copy.metadata)?;
+                put_flag(f, copy.checksum.is_some());
+                if let Some(algorithm) = copy.checksum {
+                    f.u8(algorithm.code());
+                }
+                (COPY, copy.id, 0, None)
+            }
+            Self::CopyPart(part) => {
+                object(f, &part.bucket, &part.key)?;
+                put_text(f, &part.upload, MAX_TAG)?;
+                f.u16(part.number);
+                put_source(f, &part.source)?;
+                put_headers(f, &part.conditions)?;
+                (COPY_PART, part.id, 0, None)
+            }
+            Self::DeleteObjects {
+                bucket,
+                id,
+                objects,
+                quiet,
+            } => {
+                put_text(f, bucket, MAX_BUCKET)?;
+                if objects.len() > MAX_OBJECTS {
+                    return Err(ObjectError::TooLong(objects.len()));
+                }
+                put_count(f, objects.len())?;
+                for target in objects {
+                    put_text(f, &target.key, MAX_KEY)?;
+                    put_optional_text(f, target.version.as_deref(), MAX_VERSION_ID)?;
+                    put_optional_text(f, target.etag.as_deref(), MAX_CONDITION_TAG)?;
+                }
+                put_flag(f, *quiet);
+                (DELETE_OBJECTS, *id, 0, None)
+            }
+            Self::ListVersions(list) => {
+                put_list_versions(f, list)?;
+                (LIST_VERSIONS, 0, 0, None)
             }
         })
     }
@@ -1242,9 +1576,34 @@ pub enum Status {
     /// offered refused them as full, so the cell has no room for the object, a condition that
     /// outlasts a client's retries; nothing of the object commits (node.md §4.4, research/75).
     InsufficientStorage,
+    /// S3's `404 NoSuchVersion`: the version named does not exist (research/89 §2.1).
+    NoSuchVersion,
+    /// S3's `405 MethodNotAllowed`: the version a get or head names is a delete marker; the
+    /// reply states the marker's facts, its Last-Modified among them (research/89 §2.1).
+    MethodNotAllowed,
+    /// S3's `400 MetadataTooLarge`: past S3's 2 KB of user-defined or system metadata
+    /// (research/89 §1.4).
+    MetadataTooLarge,
+    /// S3's `400 InvalidArgument`, "Invalid version id specified": a version ID that is neither
+    /// `null` nor one mantle makes (research/89 §2.1).
+    InvalidVersion,
+    /// S3's `400 InvalidRequest`: a copy onto its own source's current version that changes
+    /// nothing (research/89 §3.5).
+    CopyToItself,
+    /// S3's `400 InvalidRequest`: a CopyObject's source past one PUT's 5 GiB (research/89 §3.1).
+    CopySourceTooLarge,
+    /// S3's `400 InvalidRequest`: a byte range of a source of at most 5 MiB, "You can copy a range
+    /// only if the source object is greater than 5 MB" (research/89 §4.1).
+    CopyRangeSource,
+    /// S3's `400 InvalidRequest`: a copy whose named source version is a delete marker
+    /// (research/89 §4.1).
+    CopyMarker,
+    /// S3's `400 InvalidArgument`: an `x-amz-copy-source-range` not of the form
+    /// `bytes=first-last` (research/89 §4.1).
+    InvalidCopyRange,
 }
 
-const STATUSES: [Status; 27] = [
+const STATUSES: [Status; 36] = [
     Status::Done,
     Status::NoSuchBucket,
     Status::NoSuchKey,
@@ -1272,6 +1631,15 @@ const STATUSES: [Status; 27] = [
     Status::InvalidRequest,
     Status::Offset,
     Status::InsufficientStorage,
+    Status::NoSuchVersion,
+    Status::MethodNotAllowed,
+    Status::MetadataTooLarge,
+    Status::InvalidVersion,
+    Status::CopyToItself,
+    Status::CopySourceTooLarge,
+    Status::CopyRangeSource,
+    Status::CopyMarker,
+    Status::InvalidCopyRange,
 ];
 
 impl Status {
@@ -1304,6 +1672,15 @@ impl Status {
             Self::InvalidRequest => 24,
             Self::Offset => 25,
             Self::InsufficientStorage => 26,
+            Self::NoSuchVersion => 27,
+            Self::MethodNotAllowed => 28,
+            Self::MetadataTooLarge => 29,
+            Self::InvalidVersion => 30,
+            Self::CopyToItself => 31,
+            Self::CopySourceTooLarge => 32,
+            Self::CopyRangeSource => 33,
+            Self::CopyMarker => 34,
+            Self::InvalidCopyRange => 35,
         }
     }
 
@@ -1388,6 +1765,47 @@ pub struct Uploads {
     pub next: Option<(String, String)>,
 }
 
+/// A version or delete marker a page of ListObjectVersions lists (research/89 §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionListed {
+    pub key: String,
+    /// Its version ID: `null`, or one of mantle's.
+    pub id: String,
+    /// The key's current version.
+    pub latest: bool,
+    /// A delete marker, which has no ETag, size or checksum.
+    pub marker: bool,
+    /// Bare of quotes.
+    pub etag: String,
+    pub size: u64,
+    /// Last-Modified, whole seconds.
+    pub modified: u64,
+    pub checksum: Option<(Algorithm, u16)>,
+    pub owner: String,
+}
+
+/// A page of ListObjectVersions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Versions {
+    pub versions: Vec<VersionListed>,
+    pub common_prefixes: Vec<String>,
+    pub truncated: bool,
+    /// Where the next page starts, on a truncated page: a key marker and a version ID marker.
+    pub next: Option<(String, String)>,
+}
+
+/// What became of one object a DeleteObjects named (research/89 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deleted {
+    pub key: String,
+    /// The version the request named, as sent.
+    pub version: Option<String>,
+    /// `Done`, or the refusal its delete earned.
+    pub status: Status,
+    /// The version ID of the delete marker its delete made, or of the one it removed.
+    pub marker: Option<String>,
+}
+
 /// What a reply lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Listing {
@@ -1395,6 +1813,8 @@ pub enum Listing {
     Buckets(Buckets),
     Parts(Parts),
     Uploads(Uploads),
+    Versions(Versions),
+    Deleted(Vec<Deleted>),
 }
 
 /// A version's checksum as a reply carries it (05 §3.3): its algorithm's code, as
@@ -1434,6 +1854,11 @@ pub struct Reply {
     /// A native upload's progress: Open's, Offset's, a run's frame, and an append refused
     /// `Offset`. Boxed: few replies carry one, and every reply is moved whole.
     pub progress: Option<Box<Progress>>,
+    /// The version's content headers and user-defined metadata, a get's or a head's
+    /// (research/89 §1).
+    pub metadata: Metadata,
+    /// The version a copy read of its source; empty where none applies (research/89 §3.6).
+    pub source_version: String,
 }
 
 /// A native upload's progress (gateway.md §2.1).
@@ -1516,6 +1941,27 @@ pub fn put_list(w: &mut Writer, list: &List) -> Result<(), ObjectError> {
     w.u32(list.max_keys);
     put_flag(w, list.fetch_owner);
     Ok(())
+}
+
+pub fn put_list_versions(w: &mut Writer, list: &ListVersions) -> Result<(), ObjectError> {
+    put_text(w, &list.bucket, MAX_BUCKET)?;
+    put_text(w, &list.prefix, MAX_KEY)?;
+    put_text(w, &list.delimiter, MAX_KEY)?;
+    put_optional_text(w, list.key_marker.as_deref(), MAX_KEY)?;
+    put_optional_text(w, list.id_marker.as_deref(), MAX_VERSION_ID)?;
+    w.u32(list.max);
+    Ok(())
+}
+
+pub fn take_list_versions(r: &mut Reader<'_>) -> Option<ListVersions> {
+    Some(ListVersions {
+        bucket: take_text(r, MAX_BUCKET)?,
+        prefix: take_text(r, MAX_KEY)?,
+        delimiter: take_text(r, MAX_KEY)?,
+        key_marker: take_optional_text(r, MAX_KEY)?,
+        id_marker: take_optional_text(r, MAX_VERSION_ID)?,
+        max: r.u32()?,
+    })
 }
 
 pub fn take_list(r: &mut Reader<'_>) -> Option<List> {
@@ -1739,6 +2185,153 @@ pub fn take_buckets(r: &mut Reader<'_>) -> Option<Buckets> {
     Some(Buckets { buckets, next })
 }
 
+/// A version in a page of versions at its longest: its key and version ID behind their lengths,
+/// its flags, its ETag behind its length, its size and Last-Modified, its checksum algorithm's
+/// flag, code and parts, and its owner behind its length.
+pub const VERSION_BYTES: usize =
+    (4 + MAX_KEY) + (4 + MAX_TAG) + 1 + (4 + MAX_TAG) + 8 + 8 + (1 + 1 + 2) + (4 + MAX_OWNER);
+
+/// A page of versions' bytes beside its versions and common prefixes, at most: whether it is
+/// truncated, where the next page starts (its flag, a key and a version ID), and the two counts.
+pub const VERSIONS_HEAD_BYTES: usize = 1 + (1 + 4 + MAX_KEY + 4 + MAX_VERSION_ID) + 4 + 4;
+
+/// The bytes a version takes in a page of versions, as [`put_versions`] writes it.
+pub fn version_bytes(key: &str, id: &str, etag: &str, checksum: bool, owner: &str) -> usize {
+    let checksum = if checksum { 1 + 1 + 2 } else { 1 };
+    4usize
+        .saturating_add(key.len())
+        .saturating_add(4)
+        .saturating_add(id.len())
+        .saturating_add(1)
+        .saturating_add(4)
+        .saturating_add(etag.len())
+        .saturating_add(8 + 8)
+        .saturating_add(checksum)
+        .saturating_add(4)
+        .saturating_add(owner.len())
+}
+
+const LATEST: u8 = 1;
+const MARKER: u8 = 2;
+
+pub fn put_versions(w: &mut Writer, page: &Versions) -> Result<(), ObjectError> {
+    if page
+        .versions
+        .len()
+        .saturating_add(page.common_prefixes.len())
+        > MAX_KEYS
+    {
+        return Err(ObjectError::TooLong(page.versions.len()));
+    }
+    put_flag(w, page.truncated);
+    put_flag(w, page.next.is_some());
+    if let Some((key, id)) = &page.next {
+        put_text(w, key, MAX_KEY)?;
+        put_text(w, id, MAX_VERSION_ID)?;
+    }
+    put_count(w, page.versions.len())?;
+    for v in &page.versions {
+        put_text(w, &v.key, MAX_KEY)?;
+        put_text(w, &v.id, MAX_TAG)?;
+        let latest = if v.latest { LATEST } else { 0 };
+        let marker = if v.marker { MARKER } else { 0 };
+        w.u8(latest | marker);
+        put_text(w, &v.etag, MAX_TAG)?;
+        w.u64(v.size);
+        w.u64(v.modified);
+        put_flag(w, v.checksum.is_some());
+        if let Some((algorithm, parts)) = v.checksum {
+            w.u8(algorithm.code());
+            w.u16(parts);
+        }
+        put_text(w, &v.owner, MAX_OWNER)?;
+    }
+    put_count(w, page.common_prefixes.len())?;
+    for prefix in &page.common_prefixes {
+        put_text(w, prefix, MAX_KEY)?;
+    }
+    Ok(())
+}
+
+pub fn take_versions(r: &mut Reader<'_>) -> Option<Versions> {
+    let truncated = take_flag(r)?;
+    let next = if take_flag(r)? {
+        Some((take_text(r, MAX_KEY)?, take_text(r, MAX_VERSION_ID)?))
+    } else {
+        None
+    };
+    // A version takes 38 bytes at least, a common prefix 4.
+    let count = take_count(r, MAX_KEYS, 38)?;
+    let mut versions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key = take_text(r, MAX_KEY)?;
+        let id = take_text(r, MAX_TAG)?;
+        let flags = r.u8()?;
+        if flags & !(LATEST | MARKER) != 0 {
+            return None;
+        }
+        versions.push(VersionListed {
+            key,
+            id,
+            latest: flags & LATEST != 0,
+            marker: flags & MARKER != 0,
+            etag: take_text(r, MAX_TAG)?,
+            size: r.u64()?,
+            modified: r.u64()?,
+            checksum: if take_flag(r)? {
+                Some((Algorithm::from_code(r.u8()?)?, r.u16()?))
+            } else {
+                None
+            },
+            owner: take_text(r, MAX_OWNER)?,
+        });
+    }
+    let prefixes = take_count(r, MAX_KEYS.checked_sub(count)?, 4)?;
+    let mut common_prefixes = Vec::with_capacity(prefixes);
+    for _ in 0..prefixes {
+        common_prefixes.push(take_text(r, MAX_KEY)?);
+    }
+    Some(Versions {
+        versions,
+        common_prefixes,
+        truncated,
+        next,
+    })
+}
+
+/// A delete's result at its longest: its key, the version it named, its status and the delete
+/// marker's version ID, each optional text behind its flag and length.
+pub const DELETED_BYTES: usize = (4 + MAX_KEY) + (1 + 4 + MAX_VERSION_ID) + 1 + (1 + 4 + MAX_TAG);
+
+pub fn put_deleted(w: &mut Writer, results: &[Deleted]) -> Result<(), ObjectError> {
+    if results.len() > MAX_OBJECTS {
+        return Err(ObjectError::TooLong(results.len()));
+    }
+    put_count(w, results.len())?;
+    for d in results {
+        put_text(w, &d.key, MAX_KEY)?;
+        put_optional_text(w, d.version.as_deref(), MAX_VERSION_ID)?;
+        w.u8(d.status.code());
+        put_optional_text(w, d.marker.as_deref(), MAX_TAG)?;
+    }
+    Ok(())
+}
+
+pub fn take_deleted(r: &mut Reader<'_>) -> Option<Vec<Deleted>> {
+    // A result takes 7 bytes at least.
+    let count = take_count(r, MAX_OBJECTS, 7)?;
+    let mut results = Vec::with_capacity(count);
+    for _ in 0..count {
+        results.push(Deleted {
+            key: take_text(r, MAX_KEY)?,
+            version: take_optional_text(r, MAX_VERSION_ID)?,
+            status: Status::of(r.u8()?)?,
+            marker: take_optional_text(r, MAX_TAG)?,
+        });
+    }
+    Some(results)
+}
+
 /// A count within `most`, read as a u32, and no more than the rest holds at `least` bytes each.
 fn take_count(r: &mut Reader<'_>, most: usize, least: usize) -> Option<usize> {
     let count = usize::try_from(r.u32()?).ok()?;
@@ -1771,6 +2364,8 @@ impl Reply {
             upload: String::new(),
             listing: None,
             progress: None,
+            metadata: Vec::new(),
+            source_version: String::new(),
         }
     }
 
@@ -1826,6 +2421,14 @@ impl Reply {
                 f.u8(4);
                 put_uploads(f, page)?;
             }
+            Some(Listing::Versions(page)) => {
+                f.u8(5);
+                put_versions(f, page)?;
+            }
+            Some(Listing::Deleted(results)) => {
+                f.u8(6);
+                put_deleted(f, results)?;
+            }
         }
         put_flag(f, self.progress.is_some());
         if let Some(p) = &self.progress {
@@ -1842,6 +2445,8 @@ impl Reply {
                 f.bytes(value);
             }
         }
+        put_metadata(f, &self.metadata)?;
+        put_text(f, &self.source_version, MAX_TAG)?;
         Ok(())
     }
 }
@@ -1919,6 +2524,8 @@ impl ReplyHead {
                 2 => Some(Listing::Buckets(take_buckets(&mut r)?)),
                 3 => Some(Listing::Parts(take_parts(&mut r)?)),
                 4 => Some(Listing::Uploads(take_uploads(&mut r)?)),
+                5 => Some(Listing::Versions(take_versions(&mut r)?)),
+                6 => Some(Listing::Deleted(take_deleted(&mut r)?)),
                 _ => return None,
             };
             let progress = if take_flag(&mut r)? {
@@ -1945,6 +2552,8 @@ impl ReplyHead {
             } else {
                 None
             };
+            let metadata = take_metadata(&mut r)?;
+            let source_version = take_text(&mut r, MAX_TAG)?;
             Some(Reply {
                 status: self.status,
                 size: self.size,
@@ -1958,6 +2567,8 @@ impl ReplyHead {
                 upload,
                 listing,
                 progress,
+                metadata,
+                source_version,
             })
         })();
         reply.filter(|_| r.remaining() == 0).ok_or_else(bad)
@@ -2009,6 +2620,7 @@ mod tests {
                 }),
                 md5: Some([9; 16]),
                 trailing: None,
+                metadata: Vec::new(),
             },
             Op::Put {
                 bucket: "b".into(),
@@ -2019,22 +2631,26 @@ mod tests {
                 checksum: None,
                 md5: None,
                 trailing: Some(Algorithm::Crc64Nvme),
+                metadata: Vec::new(),
             },
             Op::Get {
                 bucket: "b".into(),
                 key: "k".repeat(MAX_KEY),
                 headers: headers(),
+                version: None,
             },
             Op::Head {
                 bucket: "b".repeat(MAX_BUCKET),
                 key: "k".into(),
                 headers: Headers::default(),
+                version: None,
             },
             Op::Delete {
                 bucket: "b".into(),
                 key: "k".into(),
                 id: 3,
                 headers: headers(),
+                version: None,
             },
             Op::List(List {
                 bucket: "b".into(),
@@ -2073,6 +2689,7 @@ mod tests {
                 key: "k".into(),
                 id: 6,
                 checksum: Some((Algorithm::Crc64Nvme, true)),
+                metadata: Vec::new(),
             },
             Op::UploadPart {
                 bucket: "b".into(),
@@ -2124,6 +2741,7 @@ mod tests {
                 length: Some(12 << 20),
                 buffer: None,
                 checksum: Algorithm::Crc64Nvme,
+                metadata: Vec::new(),
             },
             Op::Open {
                 bucket: "b".into(),
@@ -2132,6 +2750,7 @@ mod tests {
                 length: None,
                 buffer: Some(8 << 20),
                 checksum: Algorithm::Crc32c,
+                metadata: Vec::new(),
             },
             Op::Append {
                 bucket: "b".into(),
@@ -2163,6 +2782,137 @@ mod tests {
                     bytes: vec![7; 8],
                 },
             },
+            // The operations research/89 adds, after every one before them, so those keep
+            // their golden vectors' places.
+            Op::Put {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 11,
+                length: 3,
+                headers: Headers::default(),
+                checksum: None,
+                md5: None,
+                trailing: None,
+                metadata: metadata(),
+            },
+            Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: Some("null".into()),
+            },
+            Op::Head {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: Some("0123456789ABC".into()),
+            },
+            Op::Delete {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 12,
+                headers: Headers::default(),
+                version: Some("v".repeat(MAX_VERSION_ID)),
+            },
+            Op::CreateUpload {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 13,
+                checksum: None,
+                metadata: metadata(),
+            },
+            Op::Open {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 14,
+                length: Some(1),
+                buffer: None,
+                checksum: Algorithm::Crc64Nvme,
+                metadata: metadata(),
+            },
+            Op::Copy(Box::new(Copy {
+                bucket: "b".into(),
+                key: "copy".into(),
+                id: 15,
+                source: Source {
+                    bucket: "src".into(),
+                    key: "k/ü".into(),
+                    version: Some("0123456789ABC".into()),
+                },
+                conditions: Headers {
+                    if_match: Some("\"e\"".into()),
+                    if_unmodified_since: Some("Tue, 24 Sep 2024 12:00:00 GMT".into()),
+                    ..Headers::default()
+                },
+                headers: Headers {
+                    if_none_match: Some("*".into()),
+                    ..Headers::default()
+                },
+                directive: Directive::Replace,
+                metadata: metadata(),
+                checksum: Some(Algorithm::Sha256),
+            })),
+            Op::Copy(Box::new(Copy {
+                bucket: "b".into(),
+                key: "copy".into(),
+                id: 16,
+                source: Source {
+                    bucket: "src".into(),
+                    key: "k".into(),
+                    version: None,
+                },
+                conditions: Headers::default(),
+                headers: Headers::default(),
+                directive: Directive::Copy,
+                metadata: Vec::new(),
+                checksum: None,
+            })),
+            Op::CopyPart(Box::new(CopyPart {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload: "0123456789ABC".into(),
+                number: 10_000,
+                id: 17,
+                source: Source {
+                    bucket: "src".into(),
+                    key: "k".into(),
+                    version: Some("null".into()),
+                },
+                conditions: Headers {
+                    if_none_match: Some("\"e\"".into()),
+                    range: Some("bytes=0-5242879".into()),
+                    ..Headers::default()
+                },
+            })),
+            Op::DeleteObjects {
+                bucket: "b".into(),
+                id: 18,
+                objects: (0..MAX_OBJECTS)
+                    .map(|n| Target {
+                        key: format!("k{n}"),
+                        version: n.is_multiple_of(2).then(|| "0123456789ABC".into()),
+                        etag: n.is_multiple_of(3).then(|| "e".repeat(MAX_CONDITION_TAG)),
+                    })
+                    .collect(),
+                quiet: true,
+            },
+            Op::ListVersions(ListVersions {
+                bucket: "b".into(),
+                prefix: "p/".into(),
+                delimiter: "/".into(),
+                key_marker: Some("p/k".into()),
+                id_marker: Some("passed".into()),
+                max: 1000,
+            }),
+        ]
+    }
+
+    /// Metadata of each kind a version keeps: a content header and a user-defined entry past
+    /// US-ASCII.
+    fn metadata() -> Metadata {
+        vec![
+            ("content-type".into(), "text/plain".into()),
+            ("x-amz-meta-a".into(), "é".into()),
         ]
     }
 
@@ -2268,13 +3018,14 @@ mod tests {
         assert!(Head::decode(&unnamed, Some(body)).is_err());
         // An unknown kind.
         let mut unknown = head.clone();
-        unknown[0] = FINISH + 1;
+        unknown[0] = LIST_VERSIONS + 1;
         assert!(Head::decode(&unknown, Some(put.body(&fields))).is_err());
         // A key past S3's bound, headers past S3's 8 KB, a checksum of the wrong width.
         let long = Op::Head {
             bucket: "b".into(),
             key: "k".repeat(MAX_KEY + 1),
             headers: Headers::default(),
+            version: None,
         };
         assert_eq!(long.encode(), Err(ObjectError::TooLong(MAX_KEY + 1)));
         let crowded = Op::Get {
@@ -2285,6 +3036,7 @@ mod tests {
                 range: Some("r".repeat(MAX_HEADERS / 2 + 1)),
                 ..Headers::default()
             },
+            version: None,
         };
         assert_eq!(crowded.encode(), Err(ObjectError::TooLong(MAX_HEADERS + 1)));
         let narrow = Op::Put {
@@ -2299,6 +3051,7 @@ mod tests {
             }),
             md5: None,
             trailing: None,
+            metadata: Vec::new(),
         };
         assert!(narrow.encode().is_err());
         // ListBuckets asks one bucket at least and S3's 10,000 at most.
@@ -2358,6 +3111,8 @@ mod tests {
                 ended: false,
                 checksum: Some(vec![3; 8]),
             })),
+            metadata: Vec::new(),
+            source_version: String::new(),
         });
         replies.push(Reply {
             progress: Some(Box::new(Progress {
@@ -2421,6 +3176,62 @@ mod tests {
                     .collect(),
                 next: Some("z".into()),
             })),
+            ..Reply::status(Status::Done)
+        });
+        // The replies research/89 adds, after every one before them.
+        replies.push(Reply {
+            size: 3,
+            version: "0123456789ABC".into(),
+            etag: "0".repeat(32),
+            modified: 1_727_179_200,
+            metadata: metadata(),
+            source_version: "null".into(),
+            ..Reply::status(Status::Done)
+        });
+        replies.push(Reply {
+            listing: Some(Listing::Versions(Versions {
+                versions: (0..999u64)
+                    .map(|n| VersionListed {
+                        key: format!("k{}", n / 3),
+                        id: if n % 3 == 2 {
+                            "null".into()
+                        } else {
+                            "0123456789ABC".into()
+                        },
+                        latest: n % 3 == 0,
+                        marker: n % 5 == 0,
+                        etag: if n % 5 == 0 {
+                            String::new()
+                        } else {
+                            "0".repeat(32)
+                        },
+                        size: n,
+                        modified: 1_727_179_200,
+                        checksum: if n.is_multiple_of(2) {
+                            Some((Algorithm::Crc64Nvme, 0))
+                        } else {
+                            None
+                        },
+                        owner: "o".repeat(MAX_OWNER),
+                    })
+                    .collect(),
+                common_prefixes: vec!["p/".into()],
+                truncated: true,
+                next: Some(("p/".into(), String::new())),
+            })),
+            ..Reply::status(Status::Done)
+        });
+        replies.push(Reply {
+            listing: Some(Listing::Deleted(
+                (0..MAX_OBJECTS)
+                    .map(|n| Deleted {
+                        key: format!("k{n}"),
+                        version: n.is_multiple_of(2).then(|| "v".repeat(MAX_VERSION_ID)),
+                        status: STATUSES[n % STATUSES.len()],
+                        marker: n.is_multiple_of(3).then(|| "0123456789ABC".into()),
+                    })
+                    .collect(),
+            )),
             ..Reply::status(Status::Done)
         });
         replies

@@ -40,7 +40,11 @@ use mantle_client::{
     CertificateDer, Client, ClientError, Credentials, Native, PrivateKeyDer, PrivatePkcs8KeyDer,
     Rewind, Settings, Sink, Source, TRAILER, Watch,
 };
-use mantle_protocol::object::{Headers, List, Listing, Op, Progress, Reply, Status};
+use mantle_protocol::object::{
+    self as native, Headers, List, ListVersions, Listing, MAX_OBJECTS, Metadata, Op, Progress,
+    Reply, Status, Target,
+};
+use mantle_s3::copy::{Directive, Source as CopySource};
 
 use crate::journal::{Journal, JournalError, Origin, Record};
 use mantle_s3::checksum::{Algorithm, Hasher};
@@ -63,15 +67,34 @@ pub enum Command {
     RemoveBucket(String),
     /// ListBuckets, or ListObjectsV2 of a bucket's keys under a prefix, a level of `/` at a time.
     List(Option<Location>),
-    /// An object's bytes from one place to another, one of them the cell; standard input's length
-    /// where stated.
-    Copy(Place, Place, Option<u64>),
-    /// DeleteObject.
-    Remove(Location),
-    /// HeadObject.
-    Head(Location),
-    /// CreateMultipartUpload, its parts' checksum the client's trailer's as one full-object value.
-    CreateUpload(Location),
+    /// ListObjectVersions of a bucket's versions under a prefix (docs/research/89 §2.3).
+    Versions(Location),
+    /// An object's bytes from one place to another, one of them the cell, or within the cell.
+    Copy(Box<Copy>),
+    /// DeleteObject of one object or its version, or DeleteObjects of several of one bucket.
+    Remove {
+        at: Vec<Location>,
+        version: Option<String>,
+        quiet: bool,
+    },
+    /// HeadObject, of a version where one is named.
+    Head {
+        at: Location,
+        version: Option<String>,
+    },
+    /// CreateMultipartUpload, its parts' checksum the client's trailer's as one full-object value,
+    /// with the completed object's metadata.
+    CreateUpload { at: Location, metadata: Metadata },
+    /// UploadPartCopy: part `number` of `upload` copied by the cell from `from`'s version, or the
+    /// bytes `range` names of it (docs/research/89 §4).
+    CopyPart {
+        at: Location,
+        upload: String,
+        number: u16,
+        from: Location,
+        range: Option<String>,
+        version: Option<String>,
+    },
     /// UploadPart: part `number` of `upload`, from a file, or `length` bytes of standard input.
     UploadPart {
         at: Location,
@@ -92,6 +115,18 @@ pub enum Command {
     Parts { at: Location, upload: String },
     /// ListMultipartUploads.
     Uploads(String),
+}
+
+/// A copy's places, and what it carries: standard input's length where stated, the version of a
+/// source in the cell, and the metadata a copy into the cell keeps, its directive for a copy
+/// within it (docs/research/89 §1, §3).
+pub struct Copy {
+    pub from: Place,
+    pub to: Place,
+    pub size: Option<u64>,
+    pub version: Option<String>,
+    pub directive: Option<Directive>,
+    pub metadata: Metadata,
 }
 
 /// An object's or a bucket's place in the cell: `s3://BUCKET/KEY`, its key empty for a bucket.
@@ -407,22 +442,15 @@ async fn command_on(
         }
         Command::List(None) => list_buckets(client, out).await,
         Command::List(Some(at)) => list_keys(client, &at, out).await,
-        Command::Copy(from, to, size) => copy(client, dir, (from, to), size, out).await,
-        Command::Remove(at) => {
-            let op = Op::Delete {
-                bucket: at.bucket.clone(),
-                key: at.key.clone(),
-                id: mantle_client::identity()?,
-                headers: Headers::default(),
-            };
-            done("DeleteObject", client.call(&op, NO_DEADLINE).await?)?;
-            line(out, format_args!("removed s3://{}/{}", at.bucket, at.key))
-        }
-        Command::Head(at) => {
+        Command::Versions(at) => list_versions(client, &at, out).await,
+        Command::Copy(copying) => copy(client, dir, *copying, out).await,
+        Command::Remove { at, version, quiet } => remove(client, at, version, quiet, out).await,
+        Command::Head { at, version } => {
             let op = Op::Head {
                 bucket: at.bucket.clone(),
                 key: at.key.clone(),
                 headers: Headers::default(),
+                version,
             };
             let reply = done("HeadObject", client.call(&op, NO_DEADLINE).await?)?;
             line(out, format_args!("size {}", reply.size))?;
@@ -430,6 +458,10 @@ async fn command_on(
             line(out, format_args!("modified {}", date(reply.modified)))?;
             if !reply.version.is_empty() {
                 line(out, format_args!("version {}", reply.version))?;
+            }
+            // Each content header and user-defined entry the version keeps, as it keeps it.
+            for (name, value) in &reply.metadata {
+                line(out, format_args!("{name} {value}"))?;
             }
             if let Some(kept) = &reply.checksum
                 && let Some(algorithm) = Algorithm::from_code(kept.algorithm)
@@ -451,9 +483,36 @@ async fn command_on(
             }
             Ok(())
         }
-        Command::CreateUpload(at) => {
-            let reply = create_upload(client, &at).await?;
+        Command::CreateUpload { at, metadata } => {
+            let reply = create_upload(client, &at, metadata).await?;
             line(out, format_args!("{}", reply.upload))
+        }
+        Command::CopyPart {
+            at,
+            upload,
+            number,
+            from,
+            range,
+            version,
+        } => {
+            let op = Op::CopyPart(Box::new(native::CopyPart {
+                bucket: at.bucket,
+                key: at.key,
+                upload,
+                number,
+                id: mantle_client::identity()?,
+                source: CopySource {
+                    bucket: from.bucket,
+                    key: from.key,
+                    version,
+                },
+                conditions: Headers {
+                    range: range.map(|r| format!("bytes={r}")),
+                    ..Headers::default()
+                },
+            }));
+            let reply = done("UploadPartCopy", client.call(&op, NO_DEADLINE).await?)?;
+            line(out, format_args!("{number} {}", reply.etag))
         }
         Command::UploadPart {
             at,
@@ -552,6 +611,139 @@ async fn list_keys(client: &mut Client, at: &Location, out: &mut impl Write) -> 
     }
 }
 
+/// A bucket's versions and delete markers under a prefix, newest first within a key, a page at a
+/// time (docs/research/89 §2.3): each its date, size, version ID, whether it is the key's latest
+/// and whether it is a delete marker, and its key.
+async fn list_versions(
+    client: &mut Client,
+    at: &Location,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let (mut key_marker, mut id_marker) = (None, None);
+    loop {
+        let op = Op::ListVersions(ListVersions {
+            bucket: at.bucket.clone(),
+            prefix: at.key.clone(),
+            delimiter: String::new(),
+            key_marker: key_marker.take(),
+            id_marker: id_marker.take(),
+            max: u32::try_from(mantle_s3::list::MAX_KEYS).unwrap_or(u32::MAX),
+        });
+        let reply = done("ListObjectVersions", client.call(&op, NO_DEADLINE).await?)?;
+        let Some(Listing::Versions(page)) = reply.listing else {
+            return Err(Error::Answered("ListObjectVersions".into(), reply.status));
+        };
+        for v in &page.versions {
+            let latest = if v.latest { "latest" } else { "-" };
+            let kind = if v.marker { "marker" } else { "object" };
+            line(
+                out,
+                format_args!(
+                    "{} {} {} {latest} {kind} {}",
+                    date(v.modified),
+                    v.size,
+                    v.id,
+                    v.key
+                ),
+            )?;
+        }
+        match (page.truncated, page.next) {
+            (true, Some((key, id))) => {
+                key_marker = Some(key);
+                id_marker = Some(id);
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// One object removed, or its version (DeleteObject); several of one bucket in requests of at
+/// most S3's 1,000 (DeleteObjects, docs/research/89 §5), each one's result said, its failures
+/// alone where `quiet`. A removal that failed fails the command once every result is said.
+async fn remove(
+    client: &mut Client,
+    at: Vec<Location>,
+    version: Option<String>,
+    quiet: bool,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let [one] = at.as_slice() else {
+        if version.is_some() {
+            return Err(Error::Usage(
+                "--version-id names one object's version".into(),
+            ));
+        }
+        let Some(bucket) = at.first().map(|l| l.bucket.clone()) else {
+            return Err(Error::Usage("no object to remove".into()));
+        };
+        if at.iter().any(|l| l.bucket != bucket) {
+            return Err(Error::Usage(
+                "objects removed together are of one bucket".into(),
+            ));
+        }
+        let mut failed = None;
+        for batch in at.chunks(MAX_OBJECTS) {
+            let op = Op::DeleteObjects {
+                bucket: bucket.clone(),
+                id: mantle_client::identity()?,
+                objects: batch
+                    .iter()
+                    .map(|l| Target {
+                        key: l.key.clone(),
+                        version: None,
+                        etag: None,
+                    })
+                    .collect(),
+                quiet,
+            };
+            let reply = done("DeleteObjects", client.call(&op, NO_DEADLINE).await?)?;
+            let Some(Listing::Deleted(results)) = reply.listing else {
+                return Err(Error::Answered("DeleteObjects".into(), reply.status));
+            };
+            for result in &results {
+                match result.status {
+                    Status::Done => {
+                        line(out, format_args!("removed s3://{bucket}/{}", result.key))?;
+                    }
+                    status => {
+                        line(
+                            out,
+                            format_args!("failed s3://{bucket}/{} {status:?}", result.key),
+                        )?;
+                        failed = Some(status);
+                    }
+                }
+            }
+        }
+        return match failed {
+            Some(status) => Err(Error::Answered("DeleteObjects".into(), status)),
+            None => Ok(()),
+        };
+    };
+    let op = Op::Delete {
+        bucket: one.bucket.clone(),
+        key: one.key.clone(),
+        id: mantle_client::identity()?,
+        headers: Headers::default(),
+        version: version.clone(),
+    };
+    let reply = done("DeleteObject", client.call(&op, NO_DEADLINE).await?)?;
+    match (version, reply.marker) {
+        (Some(version), _) => line(
+            out,
+            format_args!("removed s3://{}/{} version {version}", one.bucket, one.key),
+        ),
+        (None, true) => line(
+            out,
+            format_args!(
+                "removed s3://{}/{}: delete marker {}",
+                one.bucket, one.key, reply.version
+            ),
+        ),
+        (None, false) => line(out, format_args!("removed s3://{}/{}", one.bucket, one.key)),
+    }
+}
+
 async fn list_parts(
     client: &mut Client,
     at: &Location,
@@ -620,13 +812,19 @@ async fn list_uploads(
 }
 
 /// A multipart upload at `at`, its parts carrying the client's trailer, combined as one
-/// full-object value (S3: CRC-64/NVME is a full-object type; docs/research/73).
-async fn create_upload(client: &mut Client, at: &Location) -> Result<Reply, Error> {
+/// full-object value (S3: CRC-64/NVME is a full-object type; docs/research/73), its object's
+/// metadata `metadata`.
+async fn create_upload(
+    client: &mut Client,
+    at: &Location,
+    metadata: Metadata,
+) -> Result<Reply, Error> {
     let op = Op::CreateUpload {
         bucket: at.bucket.clone(),
         key: at.key.clone(),
         id: mantle_client::identity()?,
         checksum: Some((TRAILER, true)),
+        metadata,
     };
     done(
         "CreateMultipartUpload",
@@ -675,31 +873,67 @@ async fn complete(
     )
 }
 
-/// An object's bytes from `from` to `to`, one of them the cell's.
+/// An object's bytes from `from` to `to`, one of them the cell's, or within the cell.
 async fn copy(
     client: &mut Client,
     dir: &Path,
-    (from, to): (Place, Place),
-    size: Option<u64>,
+    copying: Copy,
     out: &mut impl Write,
 ) -> Result<(), Error> {
+    let Copy {
+        from,
+        to,
+        size,
+        version,
+        directive,
+        metadata,
+    } = copying;
     if size.is_some() && from != Place::Standard {
         return Err(Error::Usage("--size states standard input's length".into()));
     }
+    if version.is_some() && !matches!(from, Place::Cell(_)) {
+        return Err(Error::Usage(
+            "--version-id names a version of an s3:// source".into(),
+        ));
+    }
+    if directive.is_some() && !matches!((&from, &to), (Place::Cell(_), Place::Cell(_))) {
+        return Err(Error::Usage(
+            "--metadata-directive is a copy's within the cell".into(),
+        ));
+    }
+    if !metadata.is_empty() && !matches!(to, Place::Cell(_)) {
+        return Err(Error::Usage("metadata is an object's in the cell".into()));
+    }
     match (from, to) {
+        (Place::Cell(from), Place::Cell(to)) => {
+            let reply = copy_in_cell(client, (&from, version), &to, directive, metadata).await?;
+            line(
+                out,
+                format_args!(
+                    "s3://{}/{} -> s3://{}/{} etag \"{}\"",
+                    from.bucket, from.key, to.bucket, to.key, reply.etag
+                ),
+            )
+        }
         (Place::File(path), Place::Cell(at)) => {
             let origin = Origin::file(&path)?;
             let Origin::File { length, .. } = origin else {
                 return Err(Error::Usage("a file's copy".into()));
             };
             let mut source = FileSource::open(&path, 0, None)?;
-            let reply = upload(client, dir, &at, origin, |client, native, watch| {
-                Box::pin(async move {
-                    client
-                        .upload(native, (&mut source, length), watch, NO_DEADLINE)
-                        .await
-                })
-            })
+            let reply = upload(
+                client,
+                dir,
+                (&at, metadata),
+                origin,
+                |client, native, watch| {
+                    Box::pin(async move {
+                        client
+                            .upload(native, (&mut source, length), watch, NO_DEADLINE)
+                            .await
+                    })
+                },
+            )
             .await?;
             line(
                 out,
@@ -717,7 +951,7 @@ async fn copy(
             let reply = upload(
                 client,
                 dir,
-                &at,
+                (&at, metadata),
                 Origin::Standard,
                 |client, native, watch| {
                     Box::pin(async move {
@@ -734,7 +968,7 @@ async fn copy(
             )
         }
         (Place::Cell(at), Place::File(path)) => {
-            get_to_file(client, &at, &path).await?;
+            get_to_file(client, (&at, version), &path).await?;
             line(
                 out,
                 format_args!("s3://{}/{} -> {}", at.bucket, at.key, path.display()),
@@ -742,13 +976,105 @@ async fn copy(
         }
         (Place::Cell(at), Place::Standard) => {
             let mut sink = Stdout::take()?;
-            get_object(client, &at, &mut sink).await?;
+            get_object(client, (&at, version), &mut sink).await?;
             sink.flush().await
         }
         _ => Err(Error::Usage(
-            "a copy is from a file or standard input to s3://BUCKET/KEY, or back".into(),
+            "a copy is from a file or standard input to s3://BUCKET/KEY, or back, or from \
+             s3://BUCKET/KEY to another"
+                .into(),
         )),
     }
+}
+
+/// An object copied by the cell itself from `from`'s version to `to` (docs/research/89 §3–§4):
+/// one CopyObject where the source is one copy's 5 GiB or less, else a multipart upload of part
+/// copies, each of S3's largest part, 5 GiB, the fewest a copy past one takes (research/05
+/// §4.1), its object's metadata the source's (as headed) under COPY, as s3transfer carries a
+/// managed copy's (research/89 §3.7); each copy held to the version headed by its ETag, as
+/// s3transfer holds a multipart copy's parts, so a source replaced meanwhile fails it `412`.
+async fn copy_in_cell(
+    client: &mut Client,
+    (from, version): (&Location, Option<String>),
+    to: &Location,
+    directive: Option<Directive>,
+    metadata: Metadata,
+) -> Result<Reply, Error> {
+    let directive = match directive {
+        Some(Directive::Copy) if !metadata.is_empty() => {
+            return Err(Error::Usage(
+                "metadata named under --metadata-directive COPY".into(),
+            ));
+        }
+        Some(directive) => directive,
+        None if metadata.is_empty() => Directive::Copy,
+        None => Directive::Replace,
+    };
+    let head = Op::Head {
+        bucket: from.bucket.clone(),
+        key: from.key.clone(),
+        headers: Headers::default(),
+        version: version.clone(),
+    };
+    let facts = done("HeadObject", client.call(&head, NO_DEADLINE).await?)?;
+    let source = CopySource {
+        bucket: from.bucket.clone(),
+        key: from.key.clone(),
+        version: version.or_else(|| (facts.version != "null").then(|| facts.version.clone())),
+    };
+    let headed = Headers {
+        if_match: Some(format!("\"{}\"", facts.etag)),
+        ..Headers::default()
+    };
+    if facts.size <= mantle_s3::body::MAX_UPLOAD {
+        let op = Op::Copy(Box::new(native::Copy {
+            bucket: to.bucket.clone(),
+            key: to.key.clone(),
+            id: mantle_client::identity()?,
+            source,
+            conditions: headed,
+            headers: Headers::default(),
+            directive,
+            metadata,
+            checksum: None,
+        }));
+        return done("CopyObject", client.call(&op, NO_DEADLINE).await?);
+    }
+    let kept = match directive {
+        Directive::Copy => facts.metadata.clone(),
+        Directive::Replace => metadata,
+    };
+    let upload = create_upload(client, to, kept).await?.upload;
+    let part = mantle_s3::body::MAX_UPLOAD;
+    let mut parts = Vec::new();
+    let mut first = 0u64;
+    let mut number = 0u16;
+    while first < facts.size {
+        number = number
+            .checked_add(1)
+            .ok_or_else(|| Error::Usage("an object past 10,000 parts".into()))?;
+        let last = first.saturating_add(part).min(facts.size).saturating_sub(1);
+        let op = Op::CopyPart(Box::new(native::CopyPart {
+            bucket: to.bucket.clone(),
+            key: to.key.clone(),
+            upload: upload.clone(),
+            number,
+            id: mantle_client::identity()?,
+            source: source.clone(),
+            conditions: Headers {
+                range: Some(format!("bytes={first}-{last}")),
+                ..headed.clone()
+            },
+        }));
+        let reply = client.call(&op, NO_DEADLINE).await?;
+        if reply.status != Status::Done {
+            abort_upload(client, to, &upload).await?;
+            return Err(Error::Answered("UploadPartCopy".into(), reply.status));
+        }
+        parts.push((number, reply.etag));
+        first = last.saturating_add(1);
+    }
+    complete(client, to, &upload, parts).await
 }
 
 /// What a copy's upload runs: the client's resumable upload of its source, given the client, the
@@ -763,7 +1089,7 @@ type Uploading<'a> =
 async fn upload<'c, F>(
     client: &'c mut Client,
     dir: &Path,
-    at: &Location,
+    (at, metadata): (&Location, Metadata),
     origin: Origin,
     go: F,
 ) -> Result<Reply, Error>
@@ -798,6 +1124,7 @@ where
         upload: (!record.upload.is_empty()).then(|| record.upload.clone()),
         checksum: TRAILER,
         headers: Headers::default(),
+        metadata,
     };
     let mut watch = Journaled {
         journal,
@@ -888,13 +1215,14 @@ impl Watch for Journaled {
 /// each byte held to the object's full-object checksum where it keeps one.
 async fn get_object<K: Sink>(
     client: &mut Client,
-    at: &Location,
+    (at, version): (&Location, Option<String>),
     sink: &mut K,
 ) -> Result<(), Error> {
     let head = Op::Head {
         bucket: at.bucket.clone(),
         key: at.key.clone(),
         headers: Headers::default(),
+        version: version.clone(),
     };
     let facts = done("HeadObject", client.call(&head, NO_DEADLINE).await?)?;
     if facts.size <= mantle_s3::body::MAX_UPLOAD {
@@ -902,6 +1230,7 @@ async fn get_object<K: Sink>(
             bucket: at.bucket.clone(),
             key: at.key.clone(),
             headers: Headers::default(),
+            version,
         };
         done("GetObject", client.get(&get, sink, NO_DEADLINE).await?)?;
         return Ok(());
@@ -934,6 +1263,7 @@ async fn get_object<K: Sink>(
                 range: Some(format!("bytes={first}-{last}")),
                 ..Headers::default()
             },
+            version: version.clone(),
         };
         done(
             "GetObject",
@@ -972,7 +1302,11 @@ impl<K: Sink> Sink for Hashed<'_, K> {
 
 /// An object into the file at `path`: written under a temporary name beside it, flushed, renamed
 /// over its place and its directory flushed, so the file is the whole object or untouched.
-async fn get_to_file(client: &mut Client, at: &Location, path: &Path) -> Result<(), Error> {
+async fn get_to_file(
+    client: &mut Client,
+    at: (&Location, Option<String>),
+    path: &Path,
+) -> Result<(), Error> {
     let mut name = path.as_os_str().to_owned();
     name.push(".part");
     let temporary = PathBuf::from(name);

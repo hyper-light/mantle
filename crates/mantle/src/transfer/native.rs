@@ -168,6 +168,7 @@ pub async fn get_flipped(
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         headers: Headers::default(),
+        version: None,
     };
     let mut scratch = vec![0u8; mantle_client::PIECE];
     let mut flipped = Flipped::new(object, &mut scratch, flip);
@@ -220,6 +221,7 @@ pub async fn put(
         upload: None,
         checksum: TRAILER,
         headers: Headers::default(),
+        metadata: Vec::new(),
     };
     let mut again = 0u32;
     let reply = loop {
@@ -295,6 +297,7 @@ pub async fn put_parts(
             key: key.to_owned(),
             id: mantle_client::identity()?,
             checksum: Some((TRAILER, true)),
+            metadata: Vec::new(),
         },
     )
     .await?;
@@ -379,6 +382,7 @@ pub async fn get(
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         headers: Headers::default(),
+        version: None,
     };
     let mut again = 0u32;
     let mut scratch = vec![0u8; mantle_client::PIECE];

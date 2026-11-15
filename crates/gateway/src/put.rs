@@ -246,6 +246,9 @@ pub struct Stored {
     pub etag: String,
     pub size: u64,
     pub checksum: Option<checksum::Checksum>,
+    /// A part's time, its row's `Last-Modified`, the caller's when it committed; `None` for a
+    /// version, whose time the Name range gives it.
+    pub modified_ns: Option<u64>,
 }
 
 /// The 16 bytes of a finished MD5.
@@ -400,6 +403,8 @@ pub struct Put {
     next_id: Id,
     phase: Phase,
     outcome: Option<Result<Stored, PutError>>,
+    /// A part's time as its commit was asked.
+    part_ns: Option<u64>,
 }
 
 impl Put {
@@ -513,6 +518,7 @@ impl Put {
             next_id: 0,
             phase: Phase::Body,
             outcome: None,
+            part_ns: None,
         })
     }
 
@@ -1115,6 +1121,11 @@ impl Put {
                 p.part.etag = etag;
                 p.part.checksum = self.checked.as_ref().map(|c| c.bytes.clone());
                 p.part.deadline_ns = deadline_ns;
+                // "Date and time at which the part was uploaded" (ListParts; research/89 §4.2):
+                // the caller's time as its body ended, which the row keeps and ListParts and
+                // UploadPartCopy's answer both state.
+                p.part.modified_ns = self.now_ns;
+                self.part_ns = Some(self.now_ns);
                 if let Some(run) = p.run.as_mut() {
                     run.md5 = self.across_after(run.offset, run.last)?;
                 }
@@ -1167,6 +1178,7 @@ impl Put {
             etag: self.etag.clone().ok_or(PutError::Over)?,
             size: self.body.length,
             checksum: self.checked.clone(),
+            modified_ns: self.part_ns,
         }));
         Ok(())
     }

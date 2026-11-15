@@ -466,3 +466,709 @@ fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
     );
     assert!(!forged.closes());
 }
+
+/// The XML text `element` holds, its entities read.
+fn unescaped(text: Option<String>) -> Option<String> {
+    text.map(|t| {
+        t.replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    })
+}
+
+/// Every `<element>` of a document, in order.
+fn elements(text: &str, element: &str) -> Vec<String> {
+    let (open, close) = (format!("<{element}>"), format!("</{element}>"));
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&open) {
+        let after = rest.get(start + open.len()..).unwrap();
+        let end = after.find(&close).unwrap();
+        found.push(after.get(..end).unwrap().to_owned());
+        rest = after.get(end + close.len()..).unwrap();
+    }
+    found
+}
+
+/// A DeleteObjects document of `objects`, each its key and version, and its `Content-MD5`.
+fn delete_document(objects: &[(&str, Option<&str>)], quiet: bool) -> (String, String) {
+    let listed: String = objects
+        .iter()
+        .map(|(key, version)| match version {
+            Some(v) => format!("<Object><Key>{key}</Key><VersionId>{v}</VersionId></Object>"),
+            None => format!("<Object><Key>{key}</Key></Object>"),
+        })
+        .collect();
+    let quiet = if quiet { "<Quiet>true</Quiet>" } else { "" };
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{listed}{quiet}</Delete>"
+    );
+    let md5 = checksum::checksum(Algorithm::Md5, document.as_bytes())
+        .unwrap()
+        .to_base64();
+    (document, md5)
+}
+
+/// What research/89 builds, through a cell of three's listeners, each answered as S3 answers it:
+/// an object's content headers and user-defined metadata kept at PutObject and
+/// CreateMultipartUpload and returned on GET and HEAD, overridden by a read's `response-*`, held to
+/// S3's 2 KB; versions read, headed and removed by ID and listed; CopyObject within and across
+/// buckets, of a version, under each directive and the source's conditions, onto itself; part
+/// copies of a range and whole; DeleteObjects of keys present, missing and versioned, quiet, and
+/// refused without its integrity header. Every read back byte-identical.
+#[test]
+fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
+    let (_cell, _ids, mut clients) = started();
+    let n = clients.len();
+    assert_eq!(clients[0].send("PUT", "/meta", &[], b"").status, 200);
+    assert_eq!(clients[1].send("PUT", "/other", &[], b"").status, 200);
+
+    // Metadata kept at PutObject, returned as S3 returns it: names lowercase, a name sent twice
+    // joined, a value past US-ASCII in RFC 2047's form, an empty one kept (research/89 §1).
+    let data = bytes(300, 70_001);
+    let sent = [
+        (
+            "content-type",
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        ),
+        ("content-encoding", "gzip"),
+        (
+            "content-disposition",
+            "attachment; filename=\"layer.tar.gz\"",
+        ),
+        ("content-language", "en-US"),
+        ("cache-control", "max-age=3600, immutable"),
+        ("expires", "Wed, 01 Dec 2094 16:00:00 GMT"),
+        ("x-amz-meta-Digest", "sha256:0123"),
+        ("x-amz-meta-tag", "first"),
+        ("X-Amz-Meta-Tag", "second"),
+        ("x-amz-meta-empty", ""),
+        ("x-amz-meta-nonascii", "ÄMÄZÕÑ S3"),
+    ];
+    let put = clients[0].send("PUT", "/meta/layer", &sent, &data);
+    assert_eq!(put.status, 200, "{}", put.text());
+    let expected = [
+        (
+            "content-type",
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        ),
+        ("content-encoding", "gzip"),
+        (
+            "content-disposition",
+            "attachment; filename=\"layer.tar.gz\"",
+        ),
+        ("content-language", "en-US"),
+        ("cache-control", "max-age=3600, immutable"),
+        ("expires", "Wed, 01 Dec 2094 16:00:00 GMT"),
+        ("x-amz-meta-digest", "sha256:0123"),
+        ("x-amz-meta-tag", "first,second"),
+        ("x-amz-meta-empty", ""),
+        (
+            "x-amz-meta-nonascii",
+            "=?UTF-8?B?w4PChE3Dg8KEWsODwpXDg8KRIFMz?=",
+        ),
+    ];
+    for (i, method) in ["GET", "HEAD"].into_iter().enumerate() {
+        let read = clients[(i + 1) % n].send(method, "/meta/layer", &[], b"");
+        assert_eq!(read.status, 200, "{method}: {}", read.text());
+        for (name, value) in expected {
+            assert_eq!(read.header(name), Some(value), "{method} {name}");
+        }
+        if method == "GET" {
+            assert!(read.body == data, "the object read back");
+        }
+    }
+    // A read's overrides, on a successful read alone (research/89 §1.5).
+    let overridden = clients[2].send(
+        "GET",
+        "/meta/layer?response-content-type=text%2Fplain&response-cache-control=no-store&response-content-disposition=inline",
+        &[],
+        b"",
+    );
+    assert_eq!(overridden.status, 200, "{}", overridden.text());
+    assert_eq!(overridden.header("content-type"), Some("text/plain"));
+    assert_eq!(overridden.header("cache-control"), Some("no-store"));
+    assert_eq!(overridden.header("content-disposition"), Some("inline"));
+    assert_eq!(overridden.header("content-encoding"), Some("gzip"));
+    // An object put with none is served as S3's binary/octet-stream; a later PUT's metadata
+    // replaces an earlier one's.
+    let plain = clients[0].send("PUT", "/meta/plain", &[("x-amz-meta-a", "1")], b"abc");
+    assert_eq!(plain.status, 200);
+    let replaced = clients[1].send("PUT", "/meta/plain", &[], b"abcd");
+    assert_eq!(replaced.status, 200);
+    let head = clients[2].send("HEAD", "/meta/plain", &[], b"");
+    assert_eq!(head.header("content-type"), Some("binary/octet-stream"));
+    assert_eq!(head.header("x-amz-meta-a"), None);
+    // S3's 2 KB of user-defined metadata, a key counted past its prefix: at it kept, past it
+    // refused, nothing written.
+    let at_bound = "v".repeat(2048 - 1);
+    let fits = clients[0].send("PUT", "/meta/bound", &[("x-amz-meta-k", &at_bound)], b"x");
+    assert_eq!(fits.status, 200, "{}", fits.text());
+    let past = "v".repeat(2048);
+    let refused = clients[0].send("PUT", "/meta/past", &[("x-amz-meta-k", &past)], b"x");
+    assert_eq!(
+        (refused.status, refused.element("Code").as_deref()),
+        (400, Some("MetadataTooLarge")),
+        "{}",
+        refused.text()
+    );
+    assert_eq!(clients[1].send("HEAD", "/meta/past", &[], b"").status, 404);
+    // A streamed body's `aws-chunked` is no coding of the object (research/05 §1.8).
+    let streamed = bytes(301, 90_001);
+    let crc = checksum::checksum(Algorithm::Crc32, &streamed)
+        .unwrap()
+        .to_base64();
+    let decoded = streamed.len().to_string();
+    let chunked = [
+        ("content-encoding", "aws-chunked,gzip"),
+        ("x-amz-decoded-content-length", decoded.as_str()),
+        ("x-amz-trailer", "x-amz-checksum-crc32"),
+    ];
+    let body = s3::aws_chunked(&streamed, 64 << 10, ("x-amz-checksum-crc32", &crc));
+    let put = clients[1].send_as(
+        "PUT",
+        "/meta/streamed",
+        &chunked,
+        &body,
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+    );
+    assert_eq!(put.status, 200, "{}", put.text());
+    let got = clients[2].send("GET", "/meta/streamed", &[], b"");
+    assert_eq!(got.header("content-encoding"), Some("gzip"));
+    assert!(got.body == streamed);
+    // A multipart upload's metadata, named at its creation, is its completed object's.
+    let created = clients[0].send(
+        "POST",
+        "/meta/parts?uploads",
+        &[
+            ("content-type", "text/csv"),
+            ("x-amz-meta-origin", "upload"),
+        ],
+        b"",
+    );
+    assert_eq!(created.status, 200, "{}", created.text());
+    let upload = created.element("UploadId").unwrap();
+    let part = bytes(302, 1_234);
+    let sent = clients[1].send(
+        "PUT",
+        &format!("/meta/parts?partNumber=1&uploadId={upload}"),
+        &[],
+        &part,
+    );
+    assert_eq!(sent.status, 200, "{}", sent.text());
+    let document = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        sent.header("etag").unwrap()
+    );
+    let completed = clients[2].send(
+        "POST",
+        &format!("/meta/parts?uploadId={upload}"),
+        &[],
+        document.as_bytes(),
+    );
+    assert_eq!(completed.status, 200, "{}", completed.text());
+    let head = clients[0].send("HEAD", "/meta/parts", &[], b"");
+    assert_eq!(head.header("content-type"), Some("text/csv"));
+    assert_eq!(head.header("x-amz-meta-origin"), Some("upload"));
+
+    // Tags (research/89 §3.8): a version's tag set is the empty one, which stock clients ask of
+    // every source they copy in parts; a missing key's is 404; a write naming tags is refused, not
+    // dropped, nothing written, and one naming the empty set is taken.
+    let tags = clients[1].send("GET", "/meta/layer?tagging", &[], b"");
+    assert_eq!(tags.status, 200, "{}", tags.text());
+    assert_eq!(elements(&tags.text(), "TagSet"), [""], "{}", tags.text());
+    let missing = clients[2].send("GET", "/meta/none?tagging", &[], b"");
+    assert_eq!(
+        (missing.status, missing.element("Code").as_deref()),
+        (404, Some("NoSuchKey")),
+        "{}",
+        missing.text()
+    );
+    let tagged = clients[0].send("PUT", "/meta/tagged", &[("x-amz-tagging", "k=v")], b"x");
+    assert_eq!(
+        (tagged.status, tagged.element("Code").as_deref()),
+        (501, Some("NotImplemented")),
+        "{}",
+        tagged.text()
+    );
+    assert_eq!(
+        clients[1].send("HEAD", "/meta/tagged", &[], b"").status,
+        404
+    );
+    let created = clients[2].send(
+        "POST",
+        "/meta/tagged?uploads",
+        &[("x-amz-tagging", "k=v")],
+        b"",
+    );
+    assert_eq!(created.status, 501, "{}", created.text());
+    let untagged = clients[0].send("PUT", "/meta/untagged", &[("x-amz-tagging", "")], b"x");
+    assert_eq!(untagged.status, 200, "{}", untagged.text());
+
+    // Versions (research/89 §2): each read and headed by its ID, one no version has 404
+    // NoSuchVersion, one mantle never makes 400 InvalidArgument; a delete marker named 405 with
+    // its Last-Modified; a version removed by its ID; every version listed.
+    let enable = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let versioned = clients[0].send("PUT", "/meta?versioning", &[], enable);
+    assert_eq!(versioned.status, 200, "{}", versioned.text());
+    let first = bytes(310, 5_001);
+    let second = bytes(311, 6_002);
+    let v1 = clients[0].send("PUT", "/meta/v", &[("x-amz-meta-n", "1")], &first);
+    let v2 = clients[1].send("PUT", "/meta/v", &[("x-amz-meta-n", "2")], &second);
+    let (v1, v2) = (
+        v1.header("x-amz-version-id").unwrap().to_owned(),
+        v2.header("x-amz-version-id").unwrap().to_owned(),
+    );
+    assert_ne!(v1, v2);
+    let old = clients[2].send("GET", &format!("/meta/v?versionId={v1}"), &[], b"");
+    assert_eq!(old.status, 200, "{}", old.text());
+    assert!(old.body == first, "the first version read by its ID");
+    assert_eq!(old.header("x-amz-version-id"), Some(v1.as_str()));
+    assert_eq!(old.header("x-amz-meta-n"), Some("1"));
+    let current = clients[0].send("GET", "/meta/v", &[], b"");
+    assert!(current.body == second);
+    let headed = clients[1].send("HEAD", &format!("/meta/v?versionId={v2}"), &[], b"");
+    assert_eq!(headed.status, 200);
+    assert_eq!(headed.header("x-amz-meta-n"), Some("2"));
+    let tags = clients[2].send("GET", &format!("/meta/v?tagging&versionId={v1}"), &[], b"");
+    assert_eq!(tags.status, 200, "{}", tags.text());
+    assert_eq!(tags.header("x-amz-version-id"), Some(v1.as_str()));
+    let absent = clients[2].send("GET", "/meta/v?versionId=0000000000001", &[], b"");
+    assert_eq!(
+        (absent.status, absent.element("Code").as_deref()),
+        (404, Some("NoSuchVersion")),
+        "{}",
+        absent.text()
+    );
+    let invalid = clients[0].send("GET", "/meta/v?versionId=not-one", &[], b"");
+    assert_eq!(
+        (invalid.status, invalid.element("Code").as_deref()),
+        (400, Some("InvalidArgument")),
+        "{}",
+        invalid.text()
+    );
+    let marked = clients[1].send("DELETE", "/meta/v", &[], b"");
+    assert_eq!(marked.status, 204);
+    assert_eq!(marked.header("x-amz-delete-marker"), Some("true"));
+    let marker = marked.header("x-amz-version-id").unwrap().to_owned();
+    let gone = clients[2].send("GET", "/meta/v", &[], b"");
+    assert_eq!(gone.status, 404);
+    assert_eq!(gone.header("x-amz-delete-marker"), Some("true"));
+    let named = clients[0].send("GET", &format!("/meta/v?versionId={marker}"), &[], b"");
+    assert_eq!(
+        (named.status, named.element("Code").as_deref()),
+        (405, Some("MethodNotAllowed")),
+        "{}",
+        named.text()
+    );
+    assert_eq!(named.header("x-amz-delete-marker"), Some("true"));
+    assert!(named.header("last-modified").is_some());
+    let listed = clients[1].send("GET", "/meta?versions&prefix=v", &[], b"");
+    assert_eq!(listed.status, 200, "{}", listed.text());
+    let ids = elements(&listed.text(), "VersionId");
+    assert_eq!(
+        ids,
+        [marker.clone(), v2.clone(), v1.clone()],
+        "{}",
+        listed.text()
+    );
+    assert_eq!(listed.text().matches("<DeleteMarker>").count(), 1);
+    assert_eq!(
+        elements(&listed.text(), "IsLatest"),
+        ["true", "false", "false"]
+    );
+    // The delete marker removed by its ID undeletes the key; a version removed by its ID goes.
+    let unmarked = clients[2].send("DELETE", &format!("/meta/v?versionId={marker}"), &[], b"");
+    assert_eq!(unmarked.status, 204);
+    assert_eq!(unmarked.header("x-amz-delete-marker"), Some("true"));
+    assert_eq!(unmarked.header("x-amz-version-id"), Some(marker.as_str()));
+    assert!(clients[0].send("GET", "/meta/v", &[], b"").body == second);
+    let removed = clients[0].send("DELETE", &format!("/meta/v?versionId={v1}"), &[], b"");
+    assert_eq!(removed.status, 204);
+    assert_eq!(removed.header("x-amz-version-id"), Some(v1.as_str()));
+    let lost = clients[1].send("GET", &format!("/meta/v?versionId={v1}"), &[], b"");
+    assert_eq!(lost.status, 404, "{}", lost.text());
+
+    // CopyObject (research/89 §3): within the bucket and across, its metadata the source's under
+    // COPY and the request's under REPLACE, of a named version, held to the source's conditions;
+    // the copy's ETag its bytes' MD5, every byte the source's.
+    let source = bytes(320, 3 << 20);
+    let made = clients[0].send(
+        "PUT",
+        "/meta/src",
+        &[("content-type", "image/png"), ("x-amz-meta-from", "source")],
+        &source,
+    );
+    assert_eq!(made.status, 200);
+    let source_version = made.header("x-amz-version-id").unwrap().to_owned();
+    let copied = clients[1].send(
+        "PUT",
+        "/other/copy",
+        &[("x-amz-copy-source", "/meta/src")],
+        b"",
+    );
+    assert_eq!(copied.status, 200, "{}", copied.text());
+    assert_eq!(
+        unescaped(copied.element("ETag")),
+        Some(etag(&source)),
+        "{}",
+        copied.text()
+    );
+    assert!(copied.element("LastModified").is_some());
+    assert_eq!(
+        copied.header("x-amz-copy-source-version-id"),
+        Some(source_version.as_str())
+    );
+    let read = clients[2].send("GET", "/other/copy", &[], b"");
+    assert!(read.body == source, "a copy across buckets read back");
+    assert_eq!(read.header("content-type"), Some("image/png"));
+    assert_eq!(read.header("x-amz-meta-from"), Some("source"));
+    assert_eq!(read.header("etag"), Some(etag(&source).as_str()));
+    // Its LastModified is the version's own.
+    let stated = mantle_s3::time::parse_iso8601(&copied.element("LastModified").unwrap())
+        .and_then(|(seconds, _)| mantle_s3::time::http_date(seconds));
+    assert_eq!(read.header("last-modified"), stated.as_deref());
+    let replaced = clients[0].send(
+        "PUT",
+        "/meta/replaced",
+        &[
+            ("x-amz-copy-source", "meta/src"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("content-type", "text/plain"),
+            ("x-amz-meta-new", "yes"),
+        ],
+        b"",
+    );
+    assert_eq!(replaced.status, 200, "{}", replaced.text());
+    let head = clients[1].send("HEAD", "/meta/replaced", &[], b"");
+    assert_eq!(head.header("content-type"), Some("text/plain"));
+    assert_eq!(head.header("x-amz-meta-new"), Some("yes"));
+    assert_eq!(head.header("x-amz-meta-from"), None);
+    // A version copied by its ID.
+    let restored = clients[2].send(
+        "PUT",
+        "/other/restored",
+        &[("x-amz-copy-source", &format!("meta/v?versionId={v2}"))],
+        b"",
+    );
+    assert_eq!(restored.status, 200, "{}", restored.text());
+    assert_eq!(
+        restored.header("x-amz-copy-source-version-id"),
+        Some(v2.as_str())
+    );
+    assert!(clients[0].send("GET", "/other/restored", &[], b"").body == second);
+    // The source's conditions: a matching if-match copies, a mismatched one and a matching
+    // if-none-match fail 412, an if-modified-since after the source fails 412 (research/89 §3.3).
+    let tag = etag(&source);
+    let held = clients[1].send(
+        "PUT",
+        "/other/held",
+        &[
+            ("x-amz-copy-source", "meta/src"),
+            ("x-amz-copy-source-if-match", &tag),
+            (
+                "x-amz-copy-source-if-unmodified-since",
+                "Sat, 01 Jan 1994 00:00:00 GMT",
+            ),
+        ],
+        b"",
+    );
+    assert_eq!(held.status, 200, "{}", held.text());
+    for condition in [
+        ("x-amz-copy-source-if-match", "\"0123\""),
+        ("x-amz-copy-source-if-none-match", tag.as_str()),
+        (
+            "x-amz-copy-source-if-modified-since",
+            "Fri, 01 Jan 2100 00:00:00 GMT",
+        ),
+    ] {
+        let failed = clients[2].send(
+            "PUT",
+            "/other/failed",
+            &[("x-amz-copy-source", "meta/src"), condition],
+            b"",
+        );
+        assert_eq!(
+            (failed.status, failed.element("Code").as_deref()),
+            (412, Some("PreconditionFailed")),
+            "{condition:?}: {}",
+            failed.text()
+        );
+    }
+    assert_eq!(
+        clients[0].send("HEAD", "/other/failed", &[], b"").status,
+        404
+    );
+    // Onto itself: refused under COPY, taken under REPLACE, which changes its metadata.
+    let itself = clients[0].send(
+        "PUT",
+        "/meta/src",
+        &[("x-amz-copy-source", "meta/src")],
+        b"",
+    );
+    assert_eq!(
+        (itself.status, itself.element("Code").as_deref()),
+        (400, Some("InvalidRequest")),
+        "{}",
+        itself.text()
+    );
+    let renamed = clients[1].send(
+        "PUT",
+        "/meta/src",
+        &[
+            ("x-amz-copy-source", "meta/src"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("x-amz-meta-from", "itself"),
+        ],
+        b"",
+    );
+    assert_eq!(renamed.status, 200, "{}", renamed.text());
+    let head = clients[2].send("HEAD", "/meta/src", &[], b"");
+    assert_eq!(head.header("x-amz-meta-from"), Some("itself"));
+    assert_eq!(head.header("etag"), Some(tag.as_str()));
+    // What names no source: a missing key, a missing bucket, a source not encoded as one.
+    for (copy_source, status, code) in [
+        ("meta/none", 404, "NoSuchKey"),
+        ("nobucket/k", 404, "NoSuchBucket"),
+        ("meta", 400, "InvalidArgument"),
+        ("meta/src?versionId=0000000000001", 404, "NoSuchVersion"),
+    ] {
+        let failed = clients[0].send(
+            "PUT",
+            "/other/none",
+            &[("x-amz-copy-source", copy_source)],
+            b"",
+        );
+        assert_eq!(
+            (failed.status, failed.element("Code").as_deref()),
+            (status, Some(code)),
+            "{copy_source}: {}",
+            failed.text()
+        );
+    }
+    let directive = clients[1].send(
+        "PUT",
+        "/other/none",
+        &[
+            ("x-amz-copy-source", "meta/src"),
+            ("x-amz-metadata-directive", "MOVE"),
+        ],
+        b"",
+    );
+    assert_eq!(directive.status, 400, "{}", directive.text());
+
+    // UploadPartCopy (research/89 §4): a range of a source past 5 MiB and a whole source as two
+    // parts, completed and read back as their bytes; a malformed range, one past the source, and
+    // a range of a source of 5 MiB or less refused.
+    let big = bytes(330, (5 << 20) + 12_345);
+    assert_eq!(clients[0].send("PUT", "/meta/big", &[], &big).status, 200);
+    let created = clients[1].send("POST", "/other/assembled?uploads", &[], b"");
+    let upload = created.element("UploadId").unwrap();
+    let ranged = clients[2].send(
+        "PUT",
+        &format!("/other/assembled?partNumber=1&uploadId={upload}"),
+        &[
+            ("x-amz-copy-source", "meta/big"),
+            ("x-amz-copy-source-range", "bytes=0-5242879"),
+        ],
+        b"",
+    );
+    assert_eq!(ranged.status, 200, "{}", ranged.text());
+    assert_eq!(
+        unescaped(ranged.element("ETag")),
+        Some(etag(&big[..5 << 20]))
+    );
+    assert!(ranged.element("LastModified").is_some());
+    let whole = clients[0].send(
+        "PUT",
+        &format!("/other/assembled?partNumber=2&uploadId={upload}"),
+        &[("x-amz-copy-source", "meta/plain")],
+        b"",
+    );
+    assert_eq!(whole.status, 200, "{}", whole.text());
+    let parts = clients[1].send(
+        "GET",
+        &format!("/other/assembled?uploadId={upload}"),
+        &[],
+        b"",
+    );
+    assert!(
+        !parts.text().contains("1970-01-01"),
+        "a part's time is its upload's: {}",
+        parts.text()
+    );
+    for (range, status, code) in [
+        ("0-2", 400, "InvalidArgument"),
+        ("bytes=0-bar", 400, "InvalidArgument"),
+        ("bytes=0-99999999", 416, "InvalidRange"),
+    ] {
+        let failed = clients[2].send(
+            "PUT",
+            &format!("/other/assembled?partNumber=3&uploadId={upload}"),
+            &[
+                ("x-amz-copy-source", "meta/big"),
+                ("x-amz-copy-source-range", range),
+            ],
+            b"",
+        );
+        assert_eq!(
+            (failed.status, failed.element("Code").as_deref()),
+            (status, Some(code)),
+            "{range}: {}",
+            failed.text()
+        );
+    }
+    let small_range = clients[0].send(
+        "PUT",
+        &format!("/other/assembled?partNumber=3&uploadId={upload}"),
+        &[
+            ("x-amz-copy-source", "meta/plain"),
+            ("x-amz-copy-source-range", "bytes=0-1"),
+        ],
+        b"",
+    );
+    assert_eq!(
+        (small_range.status, small_range.element("Code").as_deref()),
+        (400, Some("InvalidRequest")),
+        "{}",
+        small_range.text()
+    );
+    let document = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        unescaped(ranged.element("ETag")).unwrap(),
+        unescaped(whole.element("ETag")).unwrap()
+    );
+    let completed = clients[1].send(
+        "POST",
+        &format!("/other/assembled?uploadId={upload}"),
+        &[],
+        document.as_bytes(),
+    );
+    assert_eq!(completed.status, 200, "{}", completed.text());
+    let assembled = clients[2].send("GET", "/other/assembled", &[], b"");
+    let mut expected = big[..5 << 20].to_vec();
+    expected.extend_from_slice(b"abcd");
+    assert!(assembled.body == expected, "the part copies read back");
+
+    // DeleteObjects (research/89 §5): keys present and missing each reported deleted; a version
+    // removed by its ID; quiet reporting failures alone; a document without its integrity header
+    // refused, and one whose MD5 is another's; 1,001 keys refused.
+    for key in ["d/1", "d/2", "d/3"] {
+        assert_eq!(
+            clients[0]
+                .send("PUT", &format!("/other/{key}"), &[], b"x")
+                .status,
+            200
+        );
+    }
+    let (document, md5) =
+        delete_document(&[("d/1", None), ("d/2", None), ("d/missing", None)], false);
+    let deleted = clients[1].send(
+        "POST",
+        "/other?delete",
+        &[("content-md5", &md5)],
+        document.as_bytes(),
+    );
+    assert_eq!(deleted.status, 200, "{}", deleted.text());
+    assert_eq!(
+        elements(&deleted.text(), "Key"),
+        ["d/1", "d/2", "d/missing"],
+        "{}",
+        deleted.text()
+    );
+    assert!(!deleted.text().contains("<Error>"));
+    assert_eq!(clients[2].send("HEAD", "/other/d/1", &[], b"").status, 404);
+    // Under versioning a simple delete makes a marker, which the result names; a version named
+    // goes; quiet says nothing of either.
+    let made = clients[0].send("PUT", "/meta/m", &[], b"one");
+    let m1 = made.header("x-amz-version-id").unwrap().to_owned();
+    let (document, md5) = delete_document(&[("m", None)], false);
+    let marked = clients[1].send(
+        "POST",
+        "/meta?delete",
+        &[("content-md5", &md5)],
+        document.as_bytes(),
+    );
+    assert_eq!(
+        marked.element("DeleteMarker").as_deref(),
+        Some("true"),
+        "{}",
+        marked.text()
+    );
+    assert!(marked.element("DeleteMarkerVersionId").is_some());
+    let (document, md5) = delete_document(&[("m", Some(&m1)), ("d/never", None)], true);
+    let quiet = clients[2].send(
+        "POST",
+        "/meta?delete",
+        &[("content-md5", &md5)],
+        document.as_bytes(),
+    );
+    assert_eq!(quiet.status, 200, "{}", quiet.text());
+    assert!(!quiet.text().contains("<Deleted>"), "{}", quiet.text());
+    assert!(!quiet.text().contains("<Error>"), "{}", quiet.text());
+    let lost = clients[0].send("GET", &format!("/meta/m?versionId={m1}"), &[], b"");
+    assert_eq!(lost.status, 404);
+    // A version ID mantle never makes fails its key alone, quiet or not.
+    let (document, md5) = delete_document(&[("d/3", None), ("d/3", Some("bad"))], true);
+    let mixed = clients[1].send(
+        "POST",
+        "/other?delete",
+        &[("content-md5", &md5)],
+        document.as_bytes(),
+    );
+    assert_eq!(mixed.status, 200, "{}", mixed.text());
+    assert_eq!(
+        elements(&mixed.text(), "Code"),
+        ["InvalidArgument"],
+        "{}",
+        mixed.text()
+    );
+    assert_eq!(clients[2].send("HEAD", "/other/d/3", &[], b"").status, 404);
+    // A checksum header in Content-MD5's place serves; neither is refused; one of another body
+    // is BadDigest.
+    let (document, _) = delete_document(&[("d/2", None)], false);
+    let crc = checksum::checksum(Algorithm::Crc32, document.as_bytes())
+        .unwrap()
+        .to_base64();
+    let by_crc = clients[0].send(
+        "POST",
+        "/other?delete",
+        &[("x-amz-checksum-crc32", &crc)],
+        document.as_bytes(),
+    );
+    assert_eq!(by_crc.status, 200, "{}", by_crc.text());
+    let bare = clients[1].send("POST", "/other?delete", &[], document.as_bytes());
+    assert_eq!(
+        (bare.status, bare.element("Code").as_deref()),
+        (400, Some("InvalidRequest")),
+        "{}",
+        bare.text()
+    );
+    let other_md5 = checksum::checksum(Algorithm::Md5, b"another document")
+        .unwrap()
+        .to_base64();
+    let wrong = clients[2].send(
+        "POST",
+        "/other?delete",
+        &[("content-md5", &other_md5)],
+        document.as_bytes(),
+    );
+    assert_eq!(
+        (wrong.status, wrong.element("Code").as_deref()),
+        (400, Some("BadDigest")),
+        "{}",
+        wrong.text()
+    );
+    let keys: Vec<String> = (0..1001).map(|i| format!("k{i}")).collect();
+    let listed: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), None)).collect();
+    let (document, md5) = delete_document(&listed, true);
+    let crowded = clients[0].send(
+        "POST",
+        "/other?delete",
+        &[("content-md5", &md5)],
+        document.as_bytes(),
+    );
+    assert_eq!(crowded.status, 400, "{}", crowded.text());
+}

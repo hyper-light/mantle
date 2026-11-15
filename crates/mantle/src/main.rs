@@ -157,10 +157,18 @@ enum Command {
     Rb { bucket: String },
     /// List the buckets, or a bucket's keys under a prefix a level of `/` at a time:
     /// [s3://BUCKET[/PREFIX]].
-    Ls { at: Option<String> },
+    Ls {
+        at: Option<String>,
+        /// Every version and delete marker under the prefix, newest first within a key
+        /// (ListObjectVersions).
+        #[arg(long)]
+        versions: bool,
+    },
     /// Copy an object's bytes from a file or standard input (-) to s3://BUCKET/KEY, or back to a
-    /// file or standard output (-). A file is the whole object or untouched. A copy into the cell
-    /// is resumed by running it again, from where the cell holds it.
+    /// file or standard output (-), or from one s3://BUCKET/KEY to another, which the cell copies
+    /// itself (CopyObject, or UploadPartCopy past one copy's 5 GiB). A file is the whole object or
+    /// untouched. A copy into the cell is resumed by running it again, from where the cell holds
+    /// it.
     Cp {
         from: String,
         to: String,
@@ -168,11 +176,35 @@ enum Command {
         /// rather than read whole first.
         #[arg(long)]
         size: Option<u64>,
+        /// The version of the s3:// source to read or copy, `null` for the null version.
+        #[arg(long)]
+        version_id: Option<String>,
+        /// A copy within the cell: the source's metadata (COPY) or this command's (REPLACE);
+        /// REPLACE where this command names any, else COPY.
+        #[arg(long)]
+        metadata_directive: Option<String>,
+        #[command(flatten)]
+        metadata: MetadataArgs,
     },
-    /// Remove an object, s3://BUCKET/KEY.
-    Rm { at: String },
-    /// An object's facts, s3://BUCKET/KEY: its size, ETag, date, version and checksum.
-    Head { at: String },
+    /// Remove an object, s3://BUCKET/KEY, or its version; several of one bucket in one request
+    /// (DeleteObjects) a thousand at a time.
+    Rm {
+        #[arg(required = true)]
+        at: Vec<String>,
+        /// The version to remove, `null` for the null version: one object's.
+        #[arg(long)]
+        version_id: Option<String>,
+        /// Of several, say only those whose removal failed.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// An object's facts, s3://BUCKET/KEY: its size, ETag, date, version, checksum and metadata.
+    Head {
+        at: String,
+        /// The version to head, `null` for the null version.
+        #[arg(long)]
+        version_id: Option<String>,
+    },
     /// A multipart upload's steps, each one of S3's operations.
     Multipart {
         #[command(subcommand)]
@@ -232,10 +264,83 @@ enum InitCommand {
     },
 }
 
+/// An object's content headers and user-defined metadata, as a copy into the cell or a
+/// multipart upload's creation names them (docs/research/89 §1).
+#[derive(clap::Args, Default)]
+struct MetadataArgs {
+    /// Its `Content-Type`.
+    #[arg(long)]
+    content_type: Option<String>,
+    /// Its `Content-Encoding`.
+    #[arg(long)]
+    content_encoding: Option<String>,
+    /// Its `Content-Disposition`.
+    #[arg(long)]
+    content_disposition: Option<String>,
+    /// Its `Content-Language`.
+    #[arg(long)]
+    content_language: Option<String>,
+    /// Its `Cache-Control`.
+    #[arg(long)]
+    cache_control: Option<String>,
+    /// Its `Expires`.
+    #[arg(long)]
+    expires: Option<String>,
+    /// User-defined metadata, KEY=VALUE, kept as `x-amz-meta-KEY`. Repeatable.
+    #[arg(long = "metadata")]
+    entries: Vec<String>,
+}
+
+impl MetadataArgs {
+    /// The metadata as a version keeps it (`mantle_s3::metadata`), held to S3's bounds.
+    fn kept(&self) -> Result<Vec<(String, String)>, String> {
+        let mut named: Vec<(String, String)> = [
+            ("content-type", &self.content_type),
+            ("content-encoding", &self.content_encoding),
+            ("content-disposition", &self.content_disposition),
+            ("content-language", &self.content_language),
+            ("cache-control", &self.cache_control),
+            ("expires", &self.expires),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.to_owned(), value.clone()?)))
+        .collect();
+        for entry in &self.entries {
+            let (key, value) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("{entry}: not KEY=VALUE"))?;
+            named.push((
+                format!("{}{key}", mantle_s3::metadata::USER),
+                value.to_owned(),
+            ));
+        }
+        mantle_s3::metadata::of_request(named.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Subcommand)]
 enum MultipartCommand {
     /// CreateMultipartUpload of s3://BUCKET/KEY; says the upload's ID.
-    Create { at: String },
+    Create {
+        at: String,
+        #[command(flatten)]
+        metadata: MetadataArgs,
+    },
+    /// UploadPartCopy: part NUMBER of UPLOAD copied by the cell from s3://BUCKET/KEY, or the
+    /// bytes FIRST-LAST of it; says the number and the part's ETag.
+    Copy {
+        at: String,
+        upload: String,
+        number: u16,
+        from: String,
+        /// The source's bytes, FIRST-LAST, zero-based and inclusive.
+        #[arg(long)]
+        range: Option<String>,
+        /// The source's version, `null` for the null version.
+        #[arg(long)]
+        version_id: Option<String>,
+    },
     /// UploadPart: part NUMBER of UPLOAD from a file, or from standard input (-) with its
     /// --length; says the number and the part's ETag.
     Put {
@@ -664,19 +769,92 @@ fn object_command(command: &Command) -> Option<Result<client::Command, String>> 
     Some(match command {
         Command::Mb { bucket: b } => bucket(b).map(client::Command::MakeBucket),
         Command::Rb { bucket: b } => bucket(b).map(client::Command::RemoveBucket),
-        Command::Ls { at: None } => Ok(client::Command::List(None)),
-        Command::Ls { at: Some(text) } => at(text).map(|l| client::Command::List(Some(l))),
-        Command::Cp { from, to, size } => Ok(client::Command::Copy(
-            client::place(from),
-            client::place(to),
-            *size,
-        )),
-        Command::Rm { at: text } => object(text).map(client::Command::Remove),
-        Command::Head { at: text } => object(text).map(client::Command::Head),
-        Command::Multipart { step } => match step {
-            MultipartCommand::Create { at: text } => {
-                object(text).map(client::Command::CreateUpload)
+        Command::Ls {
+            at: None,
+            versions: false,
+        } => Ok(client::Command::List(None)),
+        Command::Ls {
+            at: None,
+            versions: true,
+        } => Err("--versions lists a bucket's versions: s3://BUCKET[/PREFIX]".into()),
+        Command::Ls {
+            at: Some(text),
+            versions,
+        } => at(text).map(|l| {
+            if *versions {
+                client::Command::Versions(l)
+            } else {
+                client::Command::List(Some(l))
             }
+        }),
+        Command::Cp {
+            from,
+            to,
+            size,
+            version_id,
+            metadata_directive,
+            metadata,
+        } => metadata.kept().and_then(|kept| {
+            let directive = match metadata_directive.as_deref() {
+                None => None,
+                Some(text) => Some(
+                    mantle_s3::copy::directive(Some(text))
+                        .ok_or_else(|| format!("{text}: a directive is COPY or REPLACE"))?,
+                ),
+            };
+            Ok(client::Command::Copy(Box::new(client::Copy {
+                from: client::place(from),
+                to: client::place(to),
+                size: *size,
+                version: version_id.clone(),
+                directive,
+                metadata: kept,
+            })))
+        }),
+        Command::Rm {
+            at: texts,
+            version_id,
+            quiet,
+        } => texts
+            .iter()
+            .map(|text| object(text))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|at| client::Command::Remove {
+                at,
+                version: version_id.clone(),
+                quiet: *quiet,
+            }),
+        Command::Head {
+            at: text,
+            version_id,
+        } => object(text).map(|at| client::Command::Head {
+            at,
+            version: version_id.clone(),
+        }),
+        Command::Multipart { step } => match step {
+            MultipartCommand::Create { at: text, metadata } => object(text).and_then(|at| {
+                Ok(client::Command::CreateUpload {
+                    at,
+                    metadata: metadata.kept()?,
+                })
+            }),
+            MultipartCommand::Copy {
+                at: text,
+                upload,
+                number,
+                from,
+                range,
+                version_id,
+            } => object(text).and_then(|at| {
+                Ok(client::Command::CopyPart {
+                    at,
+                    upload: upload.clone(),
+                    number: *number,
+                    from: object(from)?,
+                    range: range.clone(),
+                    version: version_id.clone(),
+                })
+            }),
             MultipartCommand::Put {
                 at: text,
                 upload,

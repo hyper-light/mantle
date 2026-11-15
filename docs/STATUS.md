@@ -382,6 +382,33 @@ it commits; against a cell of three whose stated volumes fill through both doors
 refused so on each and every object acknowledged before reads back whole (node design §4.4,
 research/75; `crates/mantle/tests/serve.rs`).
 
+An object's metadata, its versions, copies and batch deletes reach the cell through both doors
+(s3-protocol design §14; research/89). A version keeps the six content headers and its
+`x-amz-meta-*` entries as PutObject, CreateMultipartUpload or a native upload's Open carried them,
+held to S3's 2 KB of each, and GET and HEAD return them as S3 does, `binary/octet-stream` where no
+type was kept, values past US-ASCII in RFC 2047's form, a read's `response-*` overrides in place.
+GetObject, HeadObject and DeleteObject name a version by its ID, answering `NoSuchVersion`,
+`InvalidArgument` and, for a named delete marker, `405 MethodNotAllowed` as S3 does;
+ListObjectVersions pages over the Name layer's scan of versions. CopyObject and UploadPartCopy are
+the cell's own: the node reads the source and writes a new file of it, never sharing the source's
+chunks (one referrer a file, metadata design §2), under each metadata directive, the source's
+`x-amz-copy-source-if-*` conditions, a version named as the source, a part copy's range, and S3's
+refusals of a copy onto itself, past 5 GiB, of a delete marker and of a range of a small source;
+the copy's ETag is its bytes' MD5 and its checksum a full-object value, and a whole copy is held
+to the source's own digests. A copy counts as two of the host's operations at both doors.
+DeleteObjects deletes up to 1,000 objects, each as DeleteObject would, its document held to its
+`Content-MD5` or checksum, quiet or not. mantle keeps no object tags yet and answers as S3 answers
+a directory bucket: GetObjectTagging gives a version's empty set, which the AWS CLI asks of every
+source it copies in parts, and a write naming tags is `501 NotImplemented`, where it was taken
+with its tags dropped (research/89 §3.8). The native protocol carries each, the older operations'
+fields extended at their end and their golden vectors otherwise unchanged; `mantle cp`, `head`,
+`rm`, `ls --versions` and `multipart copy` drive them. Tested against a cell of three through each
+node's listener with exact codes, headers and bytes (`crates/mantle/tests/s3.rs`,
+`metadata_versions_copies_and_batch_deletes_answer_as_s3_does`), through the library and the
+command line (`crates/mantle/tests/native.rs`), and with the AWS CLI v2 and boto3, s3transfer's
+managed copies among them (`crates/mantle/tests/stock_clients.rs`,
+`the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes`).
+
 Clients of mantle's own protocol reach the same operations over QUIC through the native client
 library, `mantle-client`, and `mantle`'s object commands, its command line (gateway design §6). The
 native protocol's messages, classes and transport bounds are a crate of their own,
@@ -726,10 +753,10 @@ Remaining before it is done:
 - The native upload's checkpoint interval from its measured terms, two runs in flight, the
   operation identity's record (item 9), and the journal in the library with its power-cut tests
   (gateway design §2.1, §6); the rest of planned items 12 and 13.
-- The HTTP/1.1 listener's remaining parts: the operations beyond the node's own set (copies, tags, ACLs, CORS, lifecycle, policies, object
-  lock, encryption settings, DeleteObjects, ListObjects v1 and ListObjectVersions answer `501`
-  there), an object's stored headers (`Content-Type`, `x-amz-meta-*`), bucket policies judged on
-  each request, the connection budget growing past its floor of ten with the node's memory (the
+- The HTTP/1.1 listener's remaining parts: the operations beyond the node's own set (tags, ACLs,
+  CORS, lifecycle, policies, object lock, encryption settings, object tags beyond the empty set
+  and ListObjects v1 answer `501` there), a copy that outlasts a client's read timeout answered as S3's early `200` with its
+  result at the end (research/89 §6), bucket policies judged on each request, the connection budget growing past its floor of ten with the node's memory (the
   AWS CLI's CRT transfers open at least ten and twenty-five at their 10 Gb/s target, research/72)
   and reading the descriptor limit, the reclaim of the slowest connection when the node needs the
   room, TLS session resumption, and the endpoint certificate's issue again before 825 days

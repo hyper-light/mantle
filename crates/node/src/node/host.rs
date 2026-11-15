@@ -1184,6 +1184,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some(outcome) => {
                     let (kind, ask) = diag_pending(pending);
                     crate::diag_trace::ev(crate::diag_trace::ANSWER, diag, kind, ask);
+                    if let Outcome::Chunk(chunk) = &outcome
+                        && !matches!(chunk, ChunkOutcome::Stored | ChunkOutcome::Read(_))
+                    {
+                        crate::diag_trace::note(format!("chunk-outcome {diag} {chunk:?}"));
+                    }
                     answered.push((*request, outcome));
                     false
                 }
@@ -1823,7 +1828,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             }),
                             ..Reply::status(Status::Offset)
                         },
-                        Err(error) => Reply::status(put_status(error)),
+                        Err(error) => {
+                            crate::diag_trace::note(format!(
+                                "put-failed {} {error:?}",
+                                self.jobs.get(at).map_or(0, |j| j.diag)
+                            ));
+                            Reply::status(put_status(error))
+                        }
                     });
                     // What its blocks took to be recorded and its body to come, for the windows the
                     // node's next puts hold (`crate::window`).
@@ -3082,6 +3093,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Ends job `at` with `status` alone.
     fn fail_job(&mut self, at: usize, status: Status) -> Result<(), NodeError> {
+        crate::diag_trace::note(format!(
+            "fail-job {} {status:?}",
+            self.jobs.get(at).map_or(0, |j| j.diag)
+        ));
         self.reply_job(at, Reply::status(status))
     }
 

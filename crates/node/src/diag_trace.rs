@@ -118,7 +118,16 @@ pub fn note(line: String) {
 }
 
 fn status() -> String {
-    std::fs::read_to_string("/proc/self/status")
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // utime and stime, fields 14 and 15, past the command's closing parenthesis.
+    let cpu = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| {
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            format!("utime {} stime {}", f.get(11).unwrap_or(&"-"), f.get(12).unwrap_or(&"-"))
+        })
+        .unwrap_or_default();
+    cpu + " | " + &std::fs::read_to_string("/proc/self/status")
         .map(|s| {
             s.lines()
                 .filter(|l| {

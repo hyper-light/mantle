@@ -87,8 +87,27 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `c97fb1a` (hyper-raft branch `doors-step8`: `doors-wire-bytes`'s `33733b5` and
-one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its commit changes
+**Every crate at `97b2a21` (hyper-raft branch `log-full`: `doors-step8-2`'s `294678c` and three
+commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. Its three commits
+change hyper-log alone: a full log always has room for the frame that frees a segment
+(docs/measurements/2026-11-14-log-full-wedge.md, docs/design/raft-log.md §5). The first, the sweep
+half of branch `log-retention-counts-frames`' `277dd17`, weighs a tail against the slot it frees,
+where it weighed it against its frames and left a tail of one block's frame unswept for good; the
+second keeps the room the log keeps for making room for frames that free a segment, takes a
+compaction into it only where the frame that then frees one still fits, and lays a frame no
+segment takes again with what may take that room, the rest waiting for the next frame; the third
+puts off a sweep that does not fit even alone, a frame of nothing freeing the segments emptied
+since the last frame. The on-disk format and recovery are unchanged. Its tests are
+`tests/least_file.rs` and `tests/full.rs`, generated histories driven to `Full`: 927 of 2,304
+wedged at `294678c`, none of 36,864 at `97b2a21`. Main takes them once Ada says; `277dd17`'s
+retention half, each group's bounds held to what the file holds of it as stored
+(`Config::derive`, `Config::disk_for`), is not here: mantle's `derive::log` reads the least file's
+segment as a quarter of it, which that half changes. Before it, every crate
+was at `294678c` (hyper-raft branch `doors-step8-2`: `doors-step8`'s `c97fb1a` and one commit),
+with no local delta, which changes hyper-tls's certificate decoding (its VENDORED.md §11): Brotli
+certificates decoded by brotli-decompressor 6.1.1, bounded to the certificate and behind an
+unwind boundary. Before it, every crate was at `c97fb1a` (hyper-raft branch `doors-step8`:
+`doors-wire-bytes`'s `33733b5` and one commit), with no local delta. Its commit changes
 hyper-transport alone: no endpoint offers to take QUIC DATAGRAM frames (`Limits::transport` sets
 `datagram_receive_buffer_size` to `None`, so no connection sends `max_datagram_frame_size`, RFC
 9221 §3), where hyper-quic's default offered every peer 1,250,000 bytes of them; hyper-raft

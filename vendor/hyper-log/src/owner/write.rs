@@ -28,7 +28,7 @@ use crate::device::{Answering, Frame, Job, Swept};
 use crate::format::{self, SegmentHeader};
 use crate::stats::Timing;
 use crate::ticket::Answer;
-use crate::writer::{self, Placement, Submission, Sweep, SweepRead, Target};
+use crate::writer::{self, Placement, Room, Submission, Sweep, SweepRead, Target};
 use crate::{LogError, Waits};
 
 /// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's. Its
@@ -112,6 +112,10 @@ struct Laid<F> {
     records: u32,
     sweep: Option<Sweep>,
     taken: Vec<(Submission<F>, Placement)>,
+    /// The sweep's copies at the front of the payload: their bytes and records.
+    copies: (usize, u32),
+    /// Whether the frame is the restore at open, which goes whole or not at all.
+    whole: bool,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -591,6 +595,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             records,
             sweep,
             taken: self.buffers.taken.pop().unwrap_or_default(),
+            copies: (payload.len(), records),
+            whole,
         };
         let refused = match self.take_batch(&mut batch, &mut payload, &mut laid) {
             Ok(refused) => refused,
@@ -720,25 +726,63 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Places the frame and hands it, with its persist record, to the device; or, when no
-    /// segment can take it, refuses its updates `Full`.
-    fn place(&mut self, payload: Payload, laid: Laid<F>) {
-        let tail = match &laid.sweep {
+    /// segment can take it, refuses its updates `Full`. A frame no segment takes is laid again
+    /// with what may take the room the log keeps for making room (`writer::target`): its sweep's
+    /// copies and the updates that only free what their groups held, the rest waiting for the
+    /// next frame; a frame that frees a segment, if that does not fit either, goes with its
+    /// copies alone, its updates waiting for the room it frees; and where even its copies do not
+    /// fit, its sweep waits too, and a frame of nothing names the tail past the segments emptied
+    /// since the last frame, if any were, which frees them. Before, a frame was refused whole:
+    /// a compaction laid beside another group's entries, a sweep that made room, or the frame
+    /// naming the tail past segments a compaction emptied, did not fit for the updates beside it
+    /// while no segment was usable, and every write after was refused `Full` (found by mantle,
+    /// 2026-11-14).
+    fn place(&mut self, mut payload: Payload, mut laid: Laid<F>) {
+        let mut tail = match &laid.sweep {
             Some(s) => s.next_tail,
             None => self.state.tail_incarnation(),
         };
+        // A frame frees a segment if it names a later tail, whose durability frees what lies
+        // before it.
         let advances = tail > self.state.durable_tail;
-        // A frame makes room if it names a later tail, whose durability frees a segment, or if
-        // its every update only frees what its group held: a compaction, a removal, a fence.
-        let frees = |taken: &[(Submission<F>, Placement)]| {
-            !taken.is_empty() && taken.iter().all(|(s, _)| writer::frees(&s.update, s.marks))
-        };
-        let makes_room = advances || frees(&laid.taken);
         // Slots past the file's end as its owner admits them, before the writer reads how many
         // segments it may use (`crate::growth`).
         if let Some(gate) = self.gate.as_mut() {
             gate.refill(&mut self.state, self.p.config.max_segments);
         }
-        let target = self.target_for(payload.len(), makes_room);
+        let mut target = self.target_of(payload.len(), &laid.taken, advances);
+        let freeing = |s: &Submission<F>| writer::frees(&s.update, s.marks);
+        if matches!(target, Ok(None))
+            && !laid.whole
+            && laid.taken.iter().any(|(s, _)| !freeing(s))
+            && (advances || laid.taken.iter().any(|(s, _)| freeing(s)))
+        {
+            target = self
+                .keep_freeing(&mut payload, &mut laid)
+                .and_then(|()| self.target_of(payload.len(), &laid.taken, advances));
+        }
+        if matches!(target, Ok(None)) && !laid.whole && advances && !laid.taken.is_empty() {
+            let taken = std::mem::take(&mut laid.taken);
+            self.hold(taken);
+            payload.truncate(laid.copies.0);
+            laid.records = laid.copies.1;
+            target = self.target_for(payload.len(), Room::Advances);
+        }
+        // A sweep that does not fit even alone waits where the frame names a later tail without
+        // it, past the segments emptied since the last frame, which that frame frees.
+        let emptied = self.state.tail_incarnation();
+        if matches!(target, Ok(None))
+            && !laid.whole
+            && laid.sweep.is_some()
+            && emptied > self.state.durable_tail
+        {
+            let taken = std::mem::take(&mut laid.taken);
+            self.hold(taken);
+            self.put_off_sweep(&mut laid);
+            payload.clear();
+            tail = emptied;
+            target = self.target_for(payload.len(), Room::Advances);
+        }
         match target {
             Ok(Some(target)) => self.write(payload, laid, target, tail),
             Ok(None) => {
@@ -752,38 +796,135 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
     }
 
+    /// Where a frame of `payload_len` bytes carrying `taken` goes: one that frees a segment may
+    /// take the room the log keeps; one whose every update only frees what its group held (a
+    /// compaction, a removal, a fence) may where the frame that then frees a segment still fits
+    /// what it leaves; any other may not (`writer::target`).
+    fn target_of(
+        &self,
+        payload_len: usize,
+        taken: &[(Submission<F>, Placement)],
+        advances: bool,
+    ) -> Result<Option<Target>, LogError> {
+        let frees =
+            !taken.is_empty() && taken.iter().all(|(s, _)| writer::frees(&s.update, s.marks));
+        let room = match (advances, frees) {
+            (true, _) => Room::Advances,
+            (false, true) => {
+                let progress = writer::progress_payload(&self.state, &self.p, taken)?;
+                Room::Frees {
+                    progress: progress.map(|len| self.frame_bytes_for(len)).transpose()?,
+                }
+            }
+            (false, false) => Room::Takes,
+        };
+        self.target_for(payload_len, room)
+    }
+
+    /// The frame laid again with its sweep's copies and the updates that only free what their
+    /// groups held, each encoded where it now goes; the rest wait for the next frame.
+    fn keep_freeing(&mut self, payload: &mut Payload, laid: &mut Laid<F>) -> Result<(), LogError> {
+        payload.truncate(laid.copies.0);
+        laid.records = laid.copies.1;
+        let mut waiting = self.buffers.taken.pop().unwrap_or_default();
+        waiting.clear();
+        let taken = std::mem::replace(&mut laid.taken, waiting);
+        let mut back = Vec::new();
+        for (s, _) in taken {
+            if !writer::frees(&s.update, s.marks) {
+                back.push((s, Placement::default()));
+                continue;
+            }
+            match writer::encode(
+                payload,
+                &mut laid.records,
+                s.group,
+                &s.update,
+                s.marks,
+                self.p.tag,
+            ) {
+                Some(placement) => laid.taken.push((s, placement)),
+                None => {
+                    back.push((s, Placement::default()));
+                    self.hold(back);
+                    return Err(LogError::Damaged(
+                        "an update laid once does not encode again",
+                    ));
+                }
+            }
+        }
+        self.hold(back);
+        Ok(())
+    }
+
+    /// The frame's sweep is not written: its tail stays where it is, swept by a later frame, and
+    /// the sweep and its copies are not counted.
+    fn put_off_sweep(&mut self, laid: &mut Laid<F>) {
+        if laid.sweep.take().is_some() {
+            let tally = &mut self.tally;
+            tally.sweeps = tally.sweeps.saturating_sub(1);
+            let copied = u64::try_from(laid.copies.0).unwrap_or(u64::MAX);
+            tally.swept_bytes = tally.swept_bytes.saturating_sub(copied);
+        }
+        laid.copies = (0, 0);
+        laid.records = 0;
+    }
+
+    /// `taken`, updates laid into a frame, go back to wait for the next, ahead of everything held
+    /// and in the order they were laid, each passed over for room: it goes ahead of every class
+    /// from the next frame on (mantle docs/design/raft-log.md §3.2).
+    fn hold(&mut self, mut taken: Vec<(Submission<F>, Placement)>) {
+        while let Some((mut s, _)) = taken.pop() {
+            s.tags.passed.get_or_insert(self.schedule.walks);
+            self.schedule.held.push_front(s);
+        }
+        self.keep_list(taken);
+    }
+
+    /// The bytes of a frame whose records take `payload_len` bytes, as [`Self::target_for`] sizes
+    /// it at most: in a sealed log with its MAC, and a key record where it begins a session.
+    fn frame_bytes_for(&self, payload_len: usize) -> Result<u64, LogError> {
+        let len = if self.seal.is_some() {
+            payload_len
+                .checked_add(format::MAC_LEN)
+                .and_then(|len| len.checked_add(format::KEY_RECORD_LEN))
+                .ok_or(LogError::TooLarge(payload_len))?
+        } else {
+            payload_len
+        };
+        writer::frame_len(&self.p, len)
+    }
+
     /// Where a frame of `payload_len` bytes goes. A sealed log's frame also holds its MAC, and a
     /// frame that continues a segment the writer has no session for begins with a key record; one
     /// that opens a segment carries its session's key in the segment's header instead.
     fn target_for(
         &self,
         payload_len: usize,
-        makes_room: bool,
+        room: Room,
     ) -> Result<Option<writer::Target>, LogError> {
         let Some(seal) = &self.seal else {
-            return writer::target(&self.state, &self.p, payload_len, makes_room);
+            return writer::target(&self.state, &self.p, payload_len, room);
         };
         let sealed = payload_len
             .checked_add(format::MAC_LEN)
             .ok_or(LogError::TooLarge(payload_len))?;
         if seal.writes(self.state.head.incarnation) {
-            return writer::target(&self.state, &self.p, sealed, makes_room);
+            return writer::target(&self.state, &self.p, sealed, room);
         }
         let keyed = sealed
             .checked_add(format::KEY_RECORD_LEN)
             .ok_or(LogError::TooLarge(payload_len))?;
         let prefix =
             u64::try_from(format::KEY_RECORD_LEN).map_err(|_| LogError::Config("a key record"))?;
-        Ok(
-            match writer::target(&self.state, &self.p, keyed, makes_room)? {
-                Some(t) if t.opens => Some(writer::Target {
-                    frame_len: writer::frame_len(&self.p, sealed)?,
-                    ..t
-                }),
-                Some(t) => Some(writer::Target { prefix, ..t }),
-                None => None,
-            },
-        )
+        Ok(match writer::target(&self.state, &self.p, keyed, room)? {
+            Some(t) if t.opens => Some(writer::Target {
+                frame_len: writer::frame_len(&self.p, sealed)?,
+                ..t
+            }),
+            Some(t) => Some(writer::Target { prefix, ..t }),
+            None => None,
+        })
     }
 
     /// Lays the frame, its persist record and its own confirmation into aligned buffers and hands

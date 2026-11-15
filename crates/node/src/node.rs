@@ -399,6 +399,10 @@ pub struct Status {
     /// The liveness stream's writes the log refused for room since the node started, each owed
     /// and asked again once the log made a range's write durable (node.md §6.2).
     pub liveness_waits: u64,
+    /// The node's rounds of compaction since it started, each compacting every range that had
+    /// applied entries to free (`Node::compact_if_stalled`): the node compacts only when its log
+    /// refuses a write for room, so each is the log full and the node making room (node.md §6.2).
+    pub compactions: u64,
     pub in_flight: usize,
     pub writes: hyper_durable::Writes,
     /// Whether the member is fenced.
@@ -794,6 +798,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     stall_tried: Option<(u64, u64)>,
     /// The stream's writes the log refused for room since the node started.
     liveness_waits: u64,
+    /// The rounds of compaction the log's refusals for room asked ([`Status::compactions`]).
+    compactions: u64,
     driver: Driver<NodeClasses, Fixed, Peers>,
     plane: Plane,
     plane_socket: PlaneSocket,
@@ -1177,6 +1183,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             log_durables: 0,
             stall_tried: None,
             liveness_waits: 0,
+            compactions: 0,
             driver,
             plane,
             plane_socket,
@@ -1373,6 +1380,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             snapshots_taken: self.snapshots_taken,
             stalled: replica.is_stalled(),
             liveness_waits: self.liveness_waits,
+            compactions: self.compactions,
             in_flight: replica.in_flight(),
             writes: replica.writes(),
             fenced: replica.fenced().is_some(),
@@ -2456,6 +2464,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !(wanted || retry) {
             return Ok(());
         }
+        let mut made_room = false;
         for kept in &self.ranges {
             let Some(shell) = self.owner.get_mut(kept.handle) else {
                 continue;
@@ -2470,6 +2479,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let compacted = shell
                 .compact(0, now, &self.waker)
                 .map_err(mantle_range::ReplicaError::from)?;
+            made_room |= compacted;
             if stalled && !compacted {
                 shell.resume();
             }
@@ -2479,6 +2489,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if any_stalled || compacted {
                 self.owner.schedule(kept.handle);
             }
+        }
+        if made_room {
+            self.compactions = self.compactions.saturating_add(1);
         }
         Ok(())
     }

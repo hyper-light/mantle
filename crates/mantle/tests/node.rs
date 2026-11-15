@@ -662,3 +662,137 @@ fn objects_round_trip_through_any_node_and_read_back_after_one_is_killed() {
         check(got, &format!("through node {killed} started again"));
     }
 }
+
+/// The rounds of compaction every node makes for its log's refusals for room before the writes
+/// stop: past the first, a node fills its log again after it compacted, as it does for as long as
+/// it serves.
+const FILLS: u64 = 3;
+
+/// A cell whose every node runs on hyper-log's least file, three segments, its groups bound by
+/// nothing the file does not fill first (support/cell.rs `LEAST_LOG`), under sustained writes:
+/// objects put through each node in turn until every node has compacted its ranges `FILLS` times
+/// for its log's refusals of writes for room (its `room` line), a put the cell refused typed not
+/// an acknowledged one. After each round every node applies what the others did: a node whose log
+/// wedged holds its ranges still while the others serve on, and the cell's watch fails there.
+/// Every acknowledged object reads back whole, through another node than its put's; and a node,
+/// killed with its log as the writes left it and started again on it, serves every one.
+/// The log's three-segment wedge, a log refusing every write for good once its groups compacted,
+/// stalled a node so (docs/measurements/2026-11-14-log-full-wedge.md).
+#[test]
+fn a_cell_whose_logs_fill_under_sustained_writes_goes_on_and_reads_back_every_acknowledged_object()
+{
+    let mut cell = Cell::gateways_on(NODES, LEAST_LOG);
+    for id in 1..=NODES {
+        cell.enlisted(id);
+    }
+    let made = cell.objects(vec![(
+        1,
+        Op::Create {
+            bucket: "b".into(),
+            id: 1,
+        },
+        Vec::new(),
+    )]);
+    done(&made[0], "the bucket");
+    // Lengths from none to a page, and one past a sealed segment's 64 KiB: puts of names alone, and
+    // of names with their files' and blocks' rows.
+    let lens = [0usize, 1, 700, 4_096, 65_537];
+    let filled = |c: &Cell| (1..=NODES).all(|id| c.room.get(&id).is_some_and(|r| r.0 >= FILLS));
+    let mut acknowledged: Vec<(u64, String, Vec<u8>)> = Vec::new();
+    let mut refused = 0usize;
+    // Each round a put through each node, bounded by the rounds whose puts fill every node's file
+    // `FILLS` times over: a put's name is an entry of its range at least, which takes its header's
+    // bytes at least of each node's log (hyper-log's `ENTRY_HEADER_BYTES`), and the file is the
+    // persist area's segment and its segments.
+    let file = (LEAST_LOG.max_segments + 1) * LOG_SEGMENT;
+    let rounds = FILLS * file / hyper_log::format::ENTRY_HEADER_BYTES;
+    for round in 0..rounds {
+        if filled(&cell) {
+            break;
+        }
+        // Object `n` is put with identity `n + 1`, past the bucket's.
+        let puts: Vec<(u64, String, Vec<u8>)> = (1..=NODES)
+            .map(|through| {
+                let n = round * NODES + through;
+                let len = lens[(n as usize) % lens.len()];
+                (through, format!("o{n}"), object_bytes(n, len))
+            })
+            .collect();
+        let ops = puts
+            .iter()
+            .map(|(through, key, data)| {
+                let n: u64 = key[1..].parse().unwrap();
+                let op = put_op("b", key, u128::from(n) + 1, data.len() as u64);
+                (*through, op, data.clone())
+            })
+            .collect();
+        for (outcome, put) in cell.objects(ops).into_iter().zip(puts) {
+            match &outcome {
+                ObjectOutcome::Replied { reply, .. } if reply.status == ObjectStatus::Done => {
+                    acknowledged.push(put);
+                }
+                // Refused, typed: nothing acknowledged, and nothing read back.
+                ObjectOutcome::Replied { reply, .. } => {
+                    assert!(
+                        matches!(reply.status, ObjectStatus::SlowDown | ObjectStatus::Failed),
+                        "round {round}, the put of {}: {outcome:?}",
+                        put.1
+                    );
+                    refused += 1;
+                }
+                ObjectOutcome::Lost(_) => refused += 1,
+            }
+        }
+        // Every node applies what the others did before the next round: a node whose log refuses
+        // every write for good never does, while its cell serves on around it.
+        for (group, _) in EVERY_LAYER {
+            cell.converged(*group);
+        }
+    }
+    let room: Vec<(u64, (u64, u64))> = cell.room.iter().map(|(id, r)| (*id, *r)).collect();
+    assert!(
+        filled(&cell),
+        "the nodes did not compact {FILLS} times in {rounds} rounds: {room:?}"
+    );
+    eprintln!(
+        "{} puts acknowledged, {refused} refused; each node's rounds of compaction and liveness \
+         waits: {room:?}",
+        acknowledged.len()
+    );
+    assert!(!acknowledged.is_empty());
+    let reads = |through: &dyn Fn(u64) -> u64| -> Vec<(u64, Op, Vec<u8>)> {
+        acknowledged
+            .iter()
+            .map(|(put, key, _)| (through(*put), get_op("b", key, None), Vec::new()))
+            .collect()
+    };
+    let check = |cell: &mut Cell, got: Vec<ObjectOutcome>, how: &str| {
+        for (outcome, (_, key, data)) in got.iter().zip(&acknowledged) {
+            assert!(
+                done(outcome, &format!("{key} {how}")) == *data,
+                "{key} {how}: other bytes"
+            );
+        }
+        for (group, _) in EVERY_LAYER {
+            cell.converged(*group);
+        }
+    };
+    let got = cell.objects(reads(&|put| 1 + put % NODES));
+    check(&mut cell, got, "through another node than its put's");
+    // A node killed with its log as the writes left it, full again since its last compaction, and
+    // started again on it. One node: a node started again measures its links anew before the cell
+    // judges them, which on a loaded host once took past the cell's quiet period before a second
+    // kill (docs/measurements/2026-11-14-log-full-wedge.md), a wait of the kill's and not the log's.
+    let killed = 1;
+    cell.judging();
+    cell.kill(killed);
+    cell.start(killed);
+    cell.introduce();
+    cell.enlisted(killed);
+    let got = cell.objects(reads(&|_| killed));
+    check(
+        &mut cell,
+        got,
+        &format!("through node {killed} started again"),
+    );
+}

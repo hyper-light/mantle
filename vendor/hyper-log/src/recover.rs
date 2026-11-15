@@ -780,13 +780,10 @@ fn lost_headers<F: BlockFile>(
     Ok(())
 }
 
-/// What replaying the live segments rebuilt: each group, the frames replayed, and the bytes
-/// each live segment's frames take, padded, by slot: one entry for each of the log's
-/// segments at most.
+/// What replaying the live segments rebuilt: each group, and the frames replayed.
 struct Replay {
     groups: HashMap<u128, Replayed>,
     frames: u64,
-    used: HashMap<u32, u64>,
 }
 
 /// 3. Replays the live segments, the tail to the highest, in sequence order.
@@ -800,7 +797,6 @@ fn replay_live<F: BlockFile>(
     let mut replay = Replay {
         groups: HashMap::new(),
         frames: 0,
-        used: HashMap::new(),
     };
     let mut expected: Option<u64> = None;
     for inc in last.tail..=heads.highest {
@@ -811,7 +807,7 @@ fn replay_live<F: BlockFile>(
             shape,
             heads,
             inc,
-            &mut |offset, header, bytes, padded| {
+            &mut |offset, header, bytes, _padded| {
                 if expected.is_some_and(|e| e != header.sequence) {
                     return Err(LogError::Damaged("a frame is missing"));
                 }
@@ -821,7 +817,6 @@ fn replay_live<F: BlockFile>(
                     slot,
                     incarnation: inc,
                     offset,
-                    padded,
                 };
                 replay_frame(&mut replay, at, header, bytes, sealer.as_deref_mut())
             },
@@ -847,14 +842,12 @@ fn replay_live<F: BlockFile>(
     Ok(replay)
 }
 
-/// Where a frame being replayed lies: its segment's slot and incarnation, its offset, and its
-/// padded length.
+/// Where a frame being replayed lies: its segment's slot and incarnation, and its offset.
 #[derive(Debug, Clone, Copy)]
 struct Frame {
     slot: u32,
     incarnation: u64,
     offset: u64,
-    padded: u64,
 }
 
 /// Replays one verified frame. In a sealed log its key records are known first, in order, then
@@ -877,8 +870,6 @@ fn replay_frame(
         .offset
         .checked_add(FRAME_HEADER_BYTES)
         .ok_or(LogError::Damaged("an offset past u64"))?;
-    let used = replay.used.entry(at.slot).or_insert(0);
-    *used = used.saturating_add(at.padded);
     let tag = match sealer {
         Some(sealer) => {
             open_records(sealer, at.incarnation, base, &mut records)?;
@@ -956,7 +947,6 @@ fn live_of(
     slots: usize,
     groups: &HashMap<u128, state::Group>,
     fenced: &HashMap<u128, Place>,
-    used: &HashMap<u32, u64>,
 ) -> Live {
     let mut live = Live::with_slots(slots);
     for g in groups.values() {
@@ -966,9 +956,6 @@ fn live_of(
     }
     for &place in fenced.values() {
         live.add(place, state::DAMAGED_BYTES);
-    }
-    for (&slot, &bytes) in used {
-        live.wrote(slot, bytes);
     }
     live
 }
@@ -1074,7 +1061,7 @@ pub(crate) fn open<F: BlockFile>(
         uncertain: None,
         damaged: true,
     }));
-    let live = live_of(heads.incarnation.len(), &groups, &fenced, &replay.used);
+    let live = live_of(heads.incarnation.len(), &groups, &fenced);
     let copy = copy.filter(|_| !restores.is_empty());
     let head_offset = erase(file, &shape, &heads, &last, copy, sealer.as_deref())?;
     let opened = Opened {

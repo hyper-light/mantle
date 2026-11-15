@@ -1078,7 +1078,14 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   refusals. A range stalled for room is tried on the same facts: once for each move of the log's
   durable writes or the ranges' applied entries, as a try with neither moved is refused the same
   way, and a node that tried at every turn never parked, so what it waited for could not arrive
-  (docs/measurements/2026-11-07-full-log-restart.md). Every other refusal stops the node, as a fenced range stops it (§6.2): a log whose
+  (docs/measurements/2026-11-07-full-log-restart.md). Those facts are enough only because a full
+  log takes writes again once its groups compact: the log keeps room for the frame that frees a
+  segment, so a compaction's frame and the sweep or tail's advance it makes due always fit
+  (raft-log.md §5). A file of three segments, hyper-log's least, once answered `Full` for good
+  after its groups compacted, and the leader whose log it was held its range still with nothing
+  left to wait for (docs/measurements/2026-11-14-log-full-wedge.md). `Status::compactions` counts
+  the node's rounds of compaction, each one a refusal for room answered, and `mantle node` says
+  them with the stream's refusals in its `room` line. Every other refusal stops the node, as a fenced range stops it (§6.2): a log whose
   device failed a write makes nothing durable again, so the node could prove no heartbeat and
   serve nothing, and its peers would keep its connections up for nothing. The simulation (§9.1)
   found a node going on that way after its device failed a write. Stopping on a room refusal

@@ -327,39 +327,53 @@ back, by a replacement. So the live part of any record is a single run, and its 
 larger than the record. The copies of a whole segment therefore fit in one frame. A freed
 segment is reused only once a durable frame names a tail past it.
 
-**Room.** A sweep makes room only if the frame of its copies takes less than the tail's
-frames do: it frees one segment and fills that much of another. Each segment counts the
-bytes its frames take, padded, since it opened; recovery counts them as it replays. The
-copies take at most the tail's live bytes and a relocated record's header for each live
-piece, as if no two entries ran together. The tail is swept only when those copies fit one
-frame, and either their padded frame is smaller than the tail's frames or the segment after
-the tail, unless it is the head, holds nothing live. A tail of frames that each held a few
-small pieces is swept, since its copies pack into one frame. So is a tail whose small live
-record holds back a dead segment behind it, since the frame naming the later tail frees both
-(tails are freed oldest first, so a dead segment waits for the tail to pass it). A tail of
-one large live entry with live segments behind it is not swept, since its copy would take a
-frame as large. Before, a group's hard state left alone in the oldest segment, in a frame
-as small as its copy, was never swept. Every dead segment behind it stayed live in the log's
-count, and once the log had answered `Full`, no frame larger than the head's remaining room
-went in again, however much its groups compacted. Before, the writer swept any
-tail whose live bytes were below a frame's room. A tail with nothing to free was copied into
-a segment of its own, freeing one and taking one; the update waiting never fitted beside the
-copies, so the writer swept segment after segment without ever answering it. Where no
-segment could take the sweep's frame, it laid the sweep out again and again without writing
-anything. A log whose segments were all live never answered `Full`.
+**Room.** A sweep makes room only if its frame takes less of the file than freeing the tail
+gives back. Freed, the tail's slot holds a whole segment's frames again, however few it held:
+frames go only at the head, so what a segment left unwritten when a larger frame opened the next
+is room only once its slot is freed. The frame takes its own bytes at the head, and the head's
+unwritten rest besides where it does not fit there and opens a segment. The copies take at most
+the tail's live bytes and a relocated record's header for each live piece, as if no two entries
+ran together. The tail is swept only when those copies fit one frame, and either that frame takes
+less than a segment's room or the segment after the tail, unless it is the head, holds nothing
+live, since the frame naming the later tail frees both (tails are freed oldest first, so a dead
+segment waits for the tail to pass it). A tail of one large live entry is not swept, since its
+copy would take a segment's room. Before, the sweep weighed the tail against its frames, the bytes
+they took padded since the segment opened: a tail of one block's frame, holding a hard state and a
+released mark (66 bytes), left behind when the next frame opened a segment of its own, copied to
+one block, no smaller than its frames, and was never swept. On a file of three segments the next
+held one entry and the head the group's start, 273 bytes live in all with 14 blocks free in the
+head, and the log answered `Full` for good: the node's simulation stalled a leader so on 41 of 100
+seeds (docs/measurements/2026-11-14-log-full-wedge.md; hyper-raft `277dd17`, found by the KIND
+founder's full log of 2026-11-07). Before that, a group's hard state left alone in the oldest
+segment, in a frame as small as its copy, was never swept, and the writer once swept any tail whose
+live bytes were below a frame's room: a tail with nothing to free was copied into a segment of its
+own, freeing one and taking one, and the writer swept segment after segment without ever answering
+the update waiting. A log whose segments were all live never answered `Full`.
 
-The last free segment is kept for a frame that makes room. Such a frame names a later tail,
-whose durability frees a segment in turn, or carries only updates that free what their
-groups hold: a compaction or snapshot's start with no entry or proposal, a removal, or a
-damage fence. While no segment is free, the head's remaining room is kept for those frames
-too. So the compaction a full log waits for always has somewhere to go, and so does the
-frame that names the tail past what it freed. Before, an update frame could fill the head,
-and the compaction that would free the log found no room: once the head filled, the log
-answered `Full` to the very write that frees it.
+The last usable segment, and while none is usable the head's remaining room, are kept for making
+room. A frame that names a later tail, its sweep's or the one past segments emptied since the last
+frame, frees a segment as it becomes durable, and takes that room. A frame whose every update only
+frees what its group holds (a compaction or snapshot's start with no entry or proposal, a removal,
+or a damage fence) takes it only where what it leaves still holds the frame that then frees a
+segment: one block where its updates leave the tail holding nothing live, or else the tail's sweep,
+its copies counted as above less what the updates kill there. A frame that does neither never
+takes it. So the frame a full log waits for always has somewhere to go: while no segment is usable
+the head holds it, and once it is durable a segment is. Before, a compaction that freed no
+segment took that room as one that does. Compactions a little at a time, a block each, filled
+it; the tail's sweep and the frame naming the tail past what they emptied no longer fitted, and
+the log answered `Full` for good to every write, the groups' compactions too: hyper-log's
+generated histories (below, §8) wedged so on 927 of 2,304 at hyper-raft `294678c`. Before that, an
+update frame could fill the head, and the compaction that would free the log found no room.
 
-When no segment can take the frame, its updates are refused `Full` and the groups compact.
-If the frame was only a sweep, the updates it was making room for are refused too, since no
-room can come. The writer also counts frames in a row that swept and carried no update while
+A frame no segment takes is laid again with what may take the room kept: the sweep's copies
+and the updates that only free what their groups held, the rest waiting for the next frame. A
+frame that frees a segment and still does not fit goes with its copies alone, its updates waiting
+for the room it frees. Before, a frame was refused whole: a sweep that made room, or the frame
+naming the tail past segments a compaction emptied, did not fit beside the update waiting while
+no segment was usable, and every write after was refused; and a compaction laid beside another
+group's entries was refused with them. When even that finds no room, its updates are refused
+`Full` and the groups compact. If the frame was only a sweep, the updates it was making room for
+are refused too, since no room can come. The writer also counts frames in a row that swept and carried no update while
 updates waited. Each such sweep reclaims the tail's dead pieces and padding, and its copies
 are packed and live. So after `max_segments` of them every segment has been swept once,
 and the updates still waiting are refused `Full`. This is the loop's counted budget
@@ -535,6 +549,11 @@ multi-sector writes, fails flushes after marking pages clean, and flips bits on 
   and goes on once groups compact; a reopened log sweeps the segments it recovered; once
   its groups compact, a log that answered `Full` takes entries of any size up to a frame's
   room, though a small live record sits in its oldest segment;
+- a log driven to `Full` by generated histories, entries of every size up to a frame's room on
+  files of three to ten segments of four to sixteen blocks, one to three groups compacting part
+  of their logs as they go, takes every group's compaction once it answers `Full`, whether the
+  groups compact one at a time or together beside the write refused, and then that write
+  (hyper-log `tests/full.rs`);
 - reclamation never loses a live record, and a lost frame that swept the tail loses
   nothing unreported when the next frame's opening tears over the segment it freed;
 - a group's state after recovery equals its state before the crash, less what was never

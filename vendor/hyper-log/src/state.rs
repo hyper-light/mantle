@@ -131,28 +131,22 @@ pub(crate) fn entry_bytes(len: u32) -> u64 {
     u64::from(len).saturating_add(crate::format::ENTRY_HEADER_BYTES)
 }
 
-/// The live pieces each segment slot holds and their bytes, and the bytes its frames take,
-/// padded, since it opened: what freeing the slot gives back (docs/design/raft-log.md §5).
+/// The live pieces each segment slot holds and their bytes (docs/design/raft-log.md §5).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Live {
     counts: Vec<(u64, u64)>,
-    used: Vec<u64>,
 }
 
 impl Live {
     pub(crate) fn with_slots(slots: usize) -> Self {
         Self {
             counts: vec![(0, 0); slots],
-            used: vec![0; slots],
         }
     }
 
     pub(crate) fn grow(&mut self, slots: usize) {
         if slots > self.counts.len() {
             self.counts.resize(slots, (0, 0));
-        }
-        if slots > self.used.len() {
-            self.used.resize(slots, 0);
         }
     }
 
@@ -177,35 +171,6 @@ impl Live {
             .and_then(|s| self.counts.get(s))
             .copied()
             .unwrap_or((0, 0))
-    }
-
-    /// The bytes `slot`'s frames take, padded, since it opened.
-    pub(crate) fn used(&self, slot: u32) -> u64 {
-        usize::try_from(slot)
-            .ok()
-            .and_then(|s| self.used.get(s))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// A frame of `bytes`, padded, written in `slot`.
-    pub(crate) fn wrote(&mut self, slot: u32, bytes: u64) {
-        if let Some(used) = usize::try_from(slot)
-            .ok()
-            .and_then(|s| self.used.get_mut(s))
-        {
-            *used = used.saturating_add(bytes);
-        }
-    }
-
-    /// A slot opened afresh: no frame is in it yet.
-    pub(crate) fn open(&mut self, slot: u32) {
-        if let Some(used) = usize::try_from(slot)
-            .ok()
-            .and_then(|s| self.used.get_mut(s))
-        {
-            *used = 0;
-        }
     }
 }
 
@@ -467,11 +432,5 @@ mod tests {
         live.add(Place { slot: 3, offset: 0 }, 7);
         assert_eq!(live.of(3), (1, 7));
         assert_eq!(live.of(9), (0, 0));
-        live.wrote(1, 4096);
-        live.wrote(1, 8192);
-        assert_eq!(live.used(1), 12288);
-        live.open(1);
-        assert_eq!(live.used(1), 0);
-        assert_eq!(live.used(9), 0);
     }
 }

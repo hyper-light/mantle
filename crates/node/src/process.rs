@@ -62,7 +62,9 @@
 //! (`Status::held`, else 0). After each status, `log FLUSHING_NS LONGEST_NS`: how
 //! long the log's flush has been out (0 when none is) and the longest an update has waited for
 //! its commit (hyper-log's `LogStats`), since the node moves only as its writes become durable;
-//! and
+//! `room COMPACTIONS WAITS` as either moves: the node's rounds of compaction, each asked when the
+//! log refused a write for room, the only time the node compacts (`Status::compactions`, node.md
+//! §6.2), and the liveness stream's writes the log refused for room (`Status::liveness_waits`); and
 //! `replaced GROUP FAILED JOINING` once, from the node that led the range then, when a
 //! replacement ended; and
 //! `link PEER KEYED DIALS ENDED SUSPECTED SUSPECT REFUSAL` when a peer's link changes: whether the
@@ -1915,6 +1917,9 @@ async fn serve(
     let mut said_moved: Option<(u64, u64)> = None;
     // Whether the node waits on its own device, as last said, none before the first saying.
     let mut said_held: Option<bool> = None;
+    // The log's refusals for room as last said: the node's rounds of compaction and the liveness
+    // stream's writes it refused for room, none before the first saying.
+    let mut said_room: Option<(u64, u64)> = None;
     let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
     let mut stop = Stop::new(config.stop);
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
@@ -2117,10 +2122,12 @@ async fn serve(
             said_held = Some(held);
         }
         let mut said = false;
+        let mut room = (0u64, 0u64);
         for ((group, _), was) in config.ranges.iter().zip(told.iter_mut()) {
             let Some(now) = node.status(*group) else {
                 continue;
             };
+            room = (now.compactions, now.liveness_waits);
             // While some pair is not yet judged, the node is measuring its links, which moves only
             // the heartbeats it takes from those pairs: said too, so a watcher sees it move before
             // it elects, and sees it stop if a peer it measures goes silent. The reconnect bound
@@ -2138,6 +2145,13 @@ async fn serve(
             status_line(&mut lines, *group, &now).map_err(wrote)?;
             *was = Some(now);
             said = true;
+        }
+        // The log's refusals for room, said as they move: the node compacts its ranges only when
+        // the log refuses a write for room (node.md §6.2), so a watcher sees the log fill and the
+        // node go on.
+        if said_room != Some(room) {
+            writeln!(lines, "room {} {}", room.0, room.1).map_err(wrote)?;
+            said_room = Some(room);
         }
         // The log the ranges share, once after the statuses that moved.
         if said {
@@ -2412,6 +2426,7 @@ mod tests {
             snapshots_taken: 0,
             stalled: false,
             liveness_waits: 0,
+            compactions: 0,
             in_flight: 0,
             writes: hyper_durable::Writes::default(),
             fenced: false,

@@ -1793,6 +1793,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// it, its driver's time moved and its requests asked; once its outcome is known, its answer.
     fn step_put(&mut self, at: usize) -> Result<bool, NodeError> {
         let wall = self.wall.now_ns();
+        let diag_job = self.jobs.get(at).map_or(0, |j| j.diag);
         let state = {
             let Some(Job {
                 work: Work::Put(putting),
@@ -1829,10 +1830,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             ..Reply::status(Status::Offset)
                         },
                         Err(error) => {
-                            crate::diag_trace::note(format!(
-                                "put-failed {} {error:?}",
-                                self.jobs.get(at).map_or(0, |j| j.diag)
-                            ));
+                            crate::diag_trace::note(format!("put-failed {diag_job} {error:?}"));
                             Reply::status(put_status(error))
                         }
                     });

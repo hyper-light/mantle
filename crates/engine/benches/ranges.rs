@@ -214,6 +214,33 @@ struct Mark {
     faults: faults::Faults,
     switches: Option<u64>,
     usage: Option<usage::Usage>,
+    vm: Vec<(String, u64)>,
+}
+
+/// DIAGNOSTIC (never merged): the VM's counters a phase's memory behaviour shows in, from
+/// /proc/vmstat where it exists.
+const VM_KEYS: [&str; 24] = [
+    "pgfault", "pgmajfault", "pswpin", "pswpout", "pgscan_kswapd", "pgscan_direct",
+    "pgsteal_kswapd", "pgsteal_direct", "compact_stall", "compact_fail", "compact_success",
+    "compact_migrate_scanned", "compact_free_scanned", "compact_daemon_wake", "pgmigrate_success",
+    "pgmigrate_fail", "thp_fault_alloc", "thp_fault_fallback", "thp_collapse_alloc",
+    "thp_split_pmd", "thp_deferred_split_page", "workingset_refault_anon",
+    "workingset_refault_file", "allocstall_normal",
+];
+
+fn vmstat() -> Vec<(String, u64)> {
+    let Ok(text) = std::fs::read_to_string("/proc/vmstat") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            VM_KEYS
+                .contains(&k)
+                .then(|| v.trim().parse().ok().map(|v| (k.to_string(), v)))
+                .flatten()
+        })
+        .collect()
 }
 
 impl Mark {
@@ -224,11 +251,21 @@ impl Mark {
             faults: faults::read()?,
             switches: faults::switches().ok(),
             usage: usage::this().ok(),
+            vm: vmstat(),
         })
     }
 }
 
 fn costs(name: &str, ops: u64, from: &Mark, to: &Mark) {
+    let mut vm = String::new();
+    for (k, v) in &to.vm {
+        if let Some((_, before)) = from.vm.iter().find(|(f, _)| f == k) {
+            vm.push_str(&format!(" {k} {}", v.saturating_sub(*before)));
+        }
+    }
+    if !vm.is_empty() {
+        println!("{name} vmstat{vm}");
+    }
     let a = to.alloc.zip(from.alloc).map(|(to, from)| to.less(&from));
     // An allocation count the build did not take is unavailable, never zero.
     let count = |n: Option<u64>, places: usize| {
@@ -698,7 +735,7 @@ fn stats(name: &str, counters: &[RangeStats]) {
     }
     for (range, (f, t, io)) in counters.iter().enumerate() {
         println!(
-            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {} scans {} scan_segments {} scan_sources {} scan_skipped {} scan_opened {} pivot_entries {} settle_entries_seeks {} settle_entries_branches {} settle_entries_size {} settle_inflight_entries {} whole_consolidations {} charged_leaf_sources {} charged_index_sources {} paid_leaves {} paid_index {} paid_below {} consolidations_started {} fullest_flushes {} parted_entries {}",
+            "{name} range {range} flushes {} stalls {} waited_steps {} pivot_compactions {} leaf_compactions {} splits {} entries_written {} consolidations {} merge_units {} merge_ns {} io reads {} pages_read {} submitted {} pages_written {} syncs {} queued {} queued_most {} write_waits {} prefetches {} prefetch_waits {} cache_hits {} span_cache_hits {} device_reads {} resident_reads {} device_read_ns {} resident_probes {} resident_skips {} residency_epochs {} residency_changes {} residency_wrong {} scans {} scan_segments {} scan_sources {} scan_skipped {} scan_opened {} pivot_entries {} settle_entries_seeks {} settle_entries_branches {} settle_entries_size {} settle_inflight_entries {} whole_consolidations {} charged_leaf_sources {} charged_index_sources {} paid_leaves {} paid_index {} paid_below {} consolidations_started {} fullest_flushes {} parted_entries {} diag_jobs {} diag_pages {} diag_cached {} diag_age {:?}",
             f.flushes,
             f.stalls,
             f.waited_steps,
@@ -747,7 +784,11 @@ fn stats(name: &str, counters: &[RangeStats]) {
             t.paid_below,
             t.consolidations_started,
             t.fullest_flushes,
-            t.parted_entries
+            t.parted_entries,
+            t.diag_jobs,
+            t.diag_pages,
+            t.diag_cached,
+            t.diag_age
         );
         let mut shape = String::new();
         for (depth, l) in t.shape.iter().enumerate().filter(|(_, l)| l.nodes > 0) {

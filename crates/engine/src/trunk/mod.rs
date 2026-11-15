@@ -564,6 +564,14 @@ pub struct TrunkStats {
     /// ([`Trunk::add_parts`]): what the root's compactions of one input would have written again
     /// (research/57 §7).
     pub parted_entries: u64,
+    /// DIAGNOSTIC (never merged): the jobs sent out, their inputs' pages in range, those the
+    /// shard's page cache held as each went, and the pages by the bytes the trunk had taken in
+    /// branches since each input's branch was taken: under 2^k half-GiB for k = 0..10, at least
+    /// 512 GiB, and a branch loaded at open (no stamp).
+    pub diag_jobs: u64,
+    pub diag_pages: u64,
+    pub diag_cached: u64,
+    pub diag_age: [u64; 12],
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],

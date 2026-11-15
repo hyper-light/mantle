@@ -1948,6 +1948,41 @@ impl Branch {
         self.index.floor(key).map_or(0, |v| v >> 1)
     }
 
+    /// DIAGNOSTIC (never merged): this branch's leaf pages from the one `from` falls in to the one
+    /// `end` does, and of them those the store's page cache holds.
+    pub fn diag_cached_pages<F: BlockFile>(
+        &self,
+        store: &Store<F>,
+        from: &[u8],
+        end: Option<&[u8]>,
+    ) -> (u64, u64) {
+        let total = self.counts.len();
+        let first = self
+            .leaf_in(from)
+            .ok()
+            .flatten()
+            .and_then(|p| usize::try_from(p).ok())
+            .unwrap_or(0);
+        let last = end
+            .and_then(|e| usize::try_from(self.leaf_most(e)).ok())
+            .unwrap_or(total.saturating_sub(1))
+            .min(total.saturating_sub(1));
+        let (mut pages, mut hits) = (0u64, 0u64);
+        for p in first..=last {
+            if self.counts.get(p).is_none_or(|&c| c == 0) {
+                continue;
+            }
+            pages = pages.saturating_add(1);
+            let Ok(address) = self.page_address(store, u64::try_from(p).unwrap_or(u64::MAX)) else {
+                continue;
+            };
+            if store.diag_cached(address) {
+                hits = hits.saturating_add(1);
+            }
+        }
+        (pages, hits)
+    }
+
     /// The pages a merge of `[from, end)` writes from this branch, at most ([`Self::merge_size`]).
     pub fn pages_between(&self, from: &[u8], end: Option<&[u8]>) -> usize {
         self.merge_size(from, end).0

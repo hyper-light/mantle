@@ -3122,6 +3122,11 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// The payload in cache slot `slot` if it still holds page `address`.
+    /// DIAGNOSTIC (never merged): whether the page cache holds `address`, nothing counted.
+    pub fn diag_cached(&self, address: u64) -> bool {
+        self.cache.as_ref().is_some_and(|c| c.contains(address))
+    }
+
     pub(crate) fn cache_page(&self, slot: usize, address: u64) -> Option<&[u8]> {
         self.cache.as_ref()?.page_at(slot, address)
     }

@@ -1507,6 +1507,20 @@ impl Trunk {
                         continue;
                     }
                 }
+                // DIAGNOSTIC (never merged): where the job's inputs lie as it goes out.
+                let (pages_in, cached_in, age_in) = diag_inputs(
+                    store,
+                    &task.inputs,
+                    &task.from,
+                    task.end.as_deref(),
+                    self.taken,
+                );
+                self.stats.diag_jobs = self.stats.diag_jobs.saturating_add(1);
+                self.stats.diag_pages = self.stats.diag_pages.saturating_add(pages_in);
+                self.stats.diag_cached = self.stats.diag_cached.saturating_add(cached_in);
+                for (sum, add) in self.stats.diag_age.iter_mut().zip(age_in) {
+                    *sum = sum.saturating_add(add);
+                }
                 let given = store.grant(needed)?;
                 let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
                     continue;
@@ -1794,6 +1808,39 @@ fn read_pages<'a>(
         reuse.add(reuse_of(b, read, taken, window));
     }
     (pages, reuse)
+}
+
+/// DIAGNOSTIC (never merged): a job's input pages in `[from, end)` as it goes out: all, those the
+/// shard's page cache holds, and all by the bytes the trunk had taken in branches since each
+/// input's branch was taken, doubling from half a GiB, the last bucket a branch with no stamp.
+fn diag_inputs<F: BlockFile>(
+    store: &Store<F>,
+    inputs: &[Branch],
+    from: &[u8],
+    end: Option<&[u8]>,
+    taken: u64,
+) -> (u64, u64, [u64; 12]) {
+    let extent_bytes = u64::try_from(store.page_size())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(store.extent_pages()));
+    let (mut total, mut cached, mut age) = (0u64, 0u64, [0u64; 12]);
+    for b in inputs {
+        let (pages, hits) = b.diag_cached_pages(store, from, end);
+        total = total.saturating_add(pages);
+        cached = cached.saturating_add(hits);
+        let bucket = if b.taken == 0 {
+            11
+        } else {
+            let bytes = taken.saturating_sub(b.taken).saturating_mul(extent_bytes);
+            (0..11usize)
+                .find(|&k| bytes < (1u64 << 29).checked_shl(u32::try_from(k).unwrap_or(0)).unwrap_or(u64::MAX))
+                .unwrap_or(10)
+        };
+        if let Some(slot) = age.get_mut(bucket) {
+            *slot = slot.saturating_add(pages);
+        }
+    }
+    (total, cached, age)
 }
 
 /// What branch `b`'s `read` pages add to the kernel's page cache's counts ([`Reuse`]): by the

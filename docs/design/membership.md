@@ -383,9 +383,6 @@ refusal; `crate::directory`'s, each admission rule.
   flight.
 - A volume that grows and shrinks with its machine's free space, where §3.1 sizes it once.
 - Gateways known by grants as nodes now are, rather than pinned.
-- A leave's step 4 is repair's (§8): until its drain and `Retire` land, a leaving member with a
-  volume stops there, out of every range's votes and of placement, a learner of the root range
-  serving its chunks; one with no volume leaves whole.
 - §8's one point to settle with repair: whether a member is judged gone at `1 / repair_rate`.
 - On the node directory's file system the stores' bound is still that file system's total less
   the log's file and the volumes there (node.md §1.4); §3.1 leaves the rows of the cell's objects

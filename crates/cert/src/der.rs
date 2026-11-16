@@ -10,6 +10,7 @@ pub(crate) const BIT_STRING: u8 = 0x03;
 pub(crate) const OCTET_STRING: u8 = 0x04;
 pub(crate) const OID: u8 = 0x06;
 pub(crate) const UTF8_STRING: u8 = 0x0c;
+pub(crate) const PRINTABLE_STRING: u8 = 0x13;
 pub(crate) const UTC_TIME: u8 = 0x17;
 pub(crate) const GENERALIZED_TIME: u8 = 0x18;
 pub(crate) const SEQUENCE: u8 = 0x30;
@@ -34,6 +35,8 @@ pub(crate) mod oid {
     pub(crate) const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
     /// id-at-organizationName, 2.5.4.10 (RFC 5280 Appendix A.1).
     pub(crate) const ORGANIZATION_NAME: &[u8] = &[0x55, 0x04, 0x0a];
+    /// id-at-serialNumber, 2.5.4.5 (RFC 5280 Appendix A.1).
+    pub(crate) const SERIAL_NUMBER: &[u8] = &[0x55, 0x04, 0x05];
     /// id-ce-basicConstraints, 2.5.29.19 (RFC 5280 §4.2.1.9).
     pub(crate) const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
     /// id-ce-keyUsage, 2.5.29.15 (RFC 5280 §4.2.1.3).

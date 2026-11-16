@@ -247,6 +247,7 @@ pub fn authority(
             name,
             key: SubjectKey::Ed25519(key.public_key()),
             organization: None,
+            grant: None,
         },
         (validity, serial),
         Role::Authority,
@@ -275,10 +276,89 @@ pub fn node(
             name: dns_name,
             key: SubjectKey::Ed25519(public_key),
             organization: None,
+            grant: None,
         },
         (validity, serial),
         Role::Node { dns_name },
     )
+}
+
+/// A granted node's certificate (docs/design/membership.md §2): as [`node`]'s, its subject naming
+/// the grant it was issued under after its common name, X.520's serialNumber (id-at-serialNumber,
+/// a PrintableString of at most 64 characters, which RFC 5280 §4.1.2.4 has every implementation
+/// take in a subject) holding the grant's number in decimal. Grant 0 names no grant.
+pub fn granted_node(
+    authority_key: &KeyPair,
+    authority_name: &str,
+    public_key: &[u8],
+    (dns_name, grant): (&str, u64),
+    (validity, serial): (Validity, Serial),
+) -> Result<Vec<u8>, CertError> {
+    check_name(authority_name)?;
+    check_dns_name(dns_name)?;
+    if public_key.len() != 32 {
+        return Err(CertError::Key);
+    }
+    if grant == 0 {
+        return Err(CertError::Name);
+    }
+    issue(
+        Signer::Ed25519(authority_key),
+        authority_name,
+        &Subject {
+            name: dns_name,
+            key: SubjectKey::Ed25519(public_key),
+            organization: None,
+            grant: Some(grant),
+        },
+        (validity, serial),
+        Role::Node { dns_name },
+    )
+}
+
+/// What a node's certificate names ([`node`], [`granted_node`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeNames<'a> {
+    /// Its subject's common name, which its one `subjectAltName` names too.
+    pub name: &'a str,
+    /// The grant it was issued under, where its subject names one.
+    pub grant: Option<u64>,
+}
+
+/// The names a node's certificate gives, where `certificate` is one of exactly a node's profile:
+/// its subject a common name, and after it a grant where it was granted, and its extensions a
+/// node's for that name alone (no CA, a signer of handshakes, `extKeyUsage` serverAuth and
+/// clientAuth, the one DNS name), so a client's certificate names no node. Who issued it is not
+/// checked here: the TLS stack verified the chain at the handshake that presented it.
+pub fn node_names(certificate: &[u8]) -> Result<NodeNames<'_>, CertError> {
+    let read = read(certificate)?;
+    let mut subject = der::expect(&mut &*read.subject, der::SEQUENCE)?.content;
+    let name = attribute(&mut subject, oid::COMMON_NAME)?;
+    let grant = if subject.is_empty() {
+        None
+    } else {
+        let grant = printable(&mut subject, oid::SERIAL_NUMBER)?;
+        // One spelling a grant: decimal digits, no sign or leading zero, nonzero.
+        let number: u64 = grant.parse().map_err(|_| CertError::Malformed)?;
+        if number == 0 || number.to_string() != grant || !subject.is_empty() {
+            return Err(CertError::Malformed);
+        }
+        Some(number)
+    };
+    let mut profile = Vec::new();
+    extensions(&mut profile, &Role::Node { dns_name: name })?;
+    if read.extensions != profile.as_slice() {
+        return Err(CertError::Malformed);
+    }
+    Ok(NodeNames { name, grant })
+}
+
+/// A certificate's fingerprint: the SHA-256 of its DER (FIPS 180-4), what the cell's root range
+/// keeps of a member's certificate (docs/design/membership.md §1).
+pub fn fingerprint(certificate: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest(&SHA256, certificate).as_ref());
+    out
 }
 
 /// A client's certificate: issued by the authority holding `authority_key` and named
@@ -305,6 +385,7 @@ pub fn client(
             name,
             key: SubjectKey::Ed25519(public_key),
             organization: Some(account),
+            grant: None,
         },
         (validity, serial),
         Role::Client,
@@ -356,6 +437,21 @@ fn attribute<'a>(rdns: &mut &'a [u8], id: &[u8]) -> Result<&'a str, CertError> {
     std::str::from_utf8(value).map_err(|_| CertError::Malformed)
 }
 
+/// A relative distinguished name of one attribute at the front of `rdns`, the attribute `id` as a
+/// PrintableString (X.520's serialNumber), its value.
+fn printable<'a>(rdns: &mut &'a [u8], id: &[u8]) -> Result<&'a str, CertError> {
+    let mut rdn = der::expect(rdns, der::SET)?.content;
+    let mut atv = der::expect(&mut rdn, der::SEQUENCE)?.content;
+    if !rdn.is_empty() || der::expect(&mut atv, der::OID)?.content != id {
+        return Err(CertError::Malformed);
+    }
+    let value = der::expect(&mut atv, der::PRINTABLE_STRING)?.content;
+    if !atv.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    std::str::from_utf8(value).map_err(|_| CertError::Malformed)
+}
+
 /// The longest an S3 endpoint's certificate is valid, in seconds: 825 days of 86,400, past which
 /// Apple's platforms refuse a TLS server's certificate ("TLS server certificates must have a
 /// validity period of 825 days or fewer", support.apple.com/103769; research/84).
@@ -386,6 +482,7 @@ pub fn endpoint_authority(
             name,
             key: SubjectKey::P256(public_key),
             organization: None,
+            grant: None,
         },
         (validity, serial),
         Role::EndpointAuthority {
@@ -434,6 +531,7 @@ pub fn endpoint(
             name: common,
             key: SubjectKey::P256(public_key),
             organization: None,
+            grant: None,
         },
         (validity, serial),
         Role::Endpoint {
@@ -531,6 +629,9 @@ struct Subject<'a> {
     key: SubjectKey<'a>,
     /// The organization a client's subject names before its common name.
     organization: Option<&'a str>,
+    /// The grant a granted node's subject names after its common name, as X.520's serialNumber
+    /// in decimal (docs/design/membership.md §2).
+    grant: Option<u64>,
 }
 
 /// A subject's public key, as its certificate states it (RFC 5280 §4.1.2.7).
@@ -637,9 +738,10 @@ fn tbs_certificate(
             time::encode(v, validity.not_before)?;
             time::encode(v, validity.not_after)
         })?;
-        match subject.organization {
-            Some(organization) => client_name(t, organization, subject.name)?,
-            None => name(t, subject.name)?,
+        match (subject.organization, subject.grant) {
+            (Some(organization), _) => client_name(t, organization, subject.name)?,
+            (None, Some(grant)) => granted_name(t, subject.name, grant)?,
+            (None, None) => name(t, subject.name)?,
         }
         nested(t, der::SEQUENCE, |k| match subject.key {
             SubjectKey::Ed25519(key) => {
@@ -676,6 +778,26 @@ fn name(out: &mut Vec<u8>, common_name: &str) -> Result<(), CertError> {
             nested(rdn, der::SEQUENCE, |atv| {
                 tlv(atv, der::OID, oid::COMMON_NAME)?;
                 tlv(atv, der::UTF8_STRING, common_name.as_bytes())
+            })
+        })
+    })
+}
+
+/// A granted node's subject: its common name as a UTF8String, then its grant in decimal as a
+/// PrintableString serialNumber (RFC 5280 Appendix A.1's X520SerialNumber), each a relative
+/// distinguished name of one attribute.
+fn granted_name(out: &mut Vec<u8>, common_name: &str, grant: u64) -> Result<(), CertError> {
+    nested(out, der::SEQUENCE, |n| {
+        nested(n, der::SET, |rdn| {
+            nested(rdn, der::SEQUENCE, |atv| {
+                tlv(atv, der::OID, oid::COMMON_NAME)?;
+                tlv(atv, der::UTF8_STRING, common_name.as_bytes())
+            })
+        })?;
+        nested(n, der::SET, |rdn| {
+            nested(rdn, der::SEQUENCE, |atv| {
+                tlv(atv, der::OID, oid::SERIAL_NUMBER)?;
+                tlv(atv, der::PRINTABLE_STRING, grant.to_string().as_bytes())
             })
         })
     })
@@ -1026,6 +1148,80 @@ mod tests {
                 "verified under another node's name"
             );
         }
+    }
+
+    /// A granted node's certificate verifies under its authority at both ends of a connection as
+    /// a node's does, names its node and its grant, and reads back from nothing else: a node's of
+    /// no grant names none, a client's names no node, and its authority's issue check holds.
+    #[test]
+    fn a_granted_node_certificate_names_its_grant_and_serves_both_ends() {
+        let authority_key = KeyPair::generate().unwrap();
+        let ca = authority(
+            &authority_key,
+            "mantle cell authority",
+            day_around_now(),
+            Serial::draw().unwrap(),
+        )
+        .unwrap();
+        let node_key = KeyPair::generate().unwrap();
+        for grant in [1u64, 7, u64::MAX] {
+            let cert = granted_node(
+                &authority_key,
+                "mantle cell authority",
+                node_key.public_key(),
+                ("node-42", grant),
+                (day_around_now(), Serial::draw().unwrap()),
+            )
+            .unwrap();
+            as_server(&ca, &cert, "node-42").unwrap();
+            as_client(&ca, &cert).unwrap();
+            issued_by(&cert, &ca, now()).unwrap();
+            assert_eq!(
+                node_names(&cert).unwrap(),
+                NodeNames {
+                    name: "node-42",
+                    grant: Some(grant)
+                }
+            );
+            assert_eq!(fingerprint(&cert), fingerprint(&cert.clone()));
+            assert_eq!(client_names(&cert), Err(CertError::Malformed));
+        }
+        assert_eq!(
+            granted_node(
+                &authority_key,
+                "mantle cell authority",
+                node_key.public_key(),
+                ("node-42", 0),
+                (day_around_now(), Serial::draw().unwrap()),
+            ),
+            Err(CertError::Name)
+        );
+        let plain = node(
+            &authority_key,
+            "mantle cell authority",
+            node_key.public_key(),
+            "node-42",
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            node_names(&plain).unwrap(),
+            NodeNames {
+                name: "node-42",
+                grant: None
+            }
+        );
+        assert_ne!(fingerprint(&plain), fingerprint(&ca));
+        let client = client(
+            &authority_key,
+            "mantle cell authority",
+            node_key.public_key(),
+            ("client-9", "111111111111"),
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(node_names(&client), Err(CertError::Malformed));
+        assert_eq!(node_names(&ca), Err(CertError::Malformed));
     }
 
     /// A client's certificate verifies under its authority at a connection's client end and at no

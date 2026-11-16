@@ -601,6 +601,7 @@ pub fn range(voters: u64, learners: u64) -> Range {
             ..ConfState::default()
         },
         settings,
+        members: 0,
     }
 }
 

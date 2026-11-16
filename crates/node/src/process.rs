@@ -128,14 +128,15 @@ use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::name;
 use mantle_meta::record::History;
-use mantle_meta::root::{self, Enlist, Lived, MAX_DOMAIN};
+use mantle_meta::record::MemberState;
+use mantle_meta::root::{self, Enlist, Join, Lived, MAX_DOMAIN};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command};
 use mantle_range::{ConfState, Range, Settings, Stored};
 use mantle_s3::seal::WrappingKey;
 
-use crate::ask::{CommandOutcome, Wait};
-use crate::derive::{Derived, Device, Formatted, Measured, Stated, VolumeFacts};
+use crate::ask::{CommandAsk, CommandOutcome, Wait};
+use crate::derive::{Derived, Device, Formatted, Measured, Stated, VolumeBytes, VolumeFacts};
 use crate::directory::Peer;
 use crate::history;
 use crate::layout::{Layout, LayoutError, Live, Stopped};
@@ -256,6 +257,10 @@ struct Identity {
     credentials: Credentials,
     peers: Vec<Peer>,
     keys: Vec<(u32, WrappingKey)>,
+    /// The grant the node's certificate names, if it was granted, and that certificate's
+    /// fingerprint: what its join states (docs/design/membership.md §2, §3).
+    grant: Option<u64>,
+    fingerprint: [u8; mantle_meta::record::FINGERPRINT],
 }
 
 /// Reads the identity the configuration names: the node's `certificate` and `key`, the cell's
@@ -280,7 +285,12 @@ fn identity(
             .map_err(|e| ProcessError::Certificate(path.to_path_buf(), e))?;
         Ok(der)
     };
-    let chain = vec![CertificateDer::from(issued(certificate)?)];
+    let own = issued(certificate)?;
+    let grant = mantle_cert::node_names(&own)
+        .map_err(|e| ProcessError::Certificate(certificate.to_path_buf(), e))?
+        .grant;
+    let fingerprint = mantle_cert::fingerprint(&own);
+    let chain = vec![CertificateDer::from(own)];
     let mut known = Vec::with_capacity(peers.len());
     for peer in peers {
         known.push(Peer {
@@ -301,6 +311,8 @@ fn identity(
         },
         peers: known,
         keys: root,
+        grant,
+        fingerprint,
     })
 }
 
@@ -366,6 +378,16 @@ pub struct PeerLine {
     pub at: Option<(Endpoint, Endpoint)>,
 }
 
+/// A seed as its `seed` line names it (docs/design/membership.md §3 step 2): a member a granted
+/// node dials first, known by its name under the authority rather than a pin, and where it listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedLine {
+    pub id: u64,
+    /// Where it listens, QUIC's endpoint and the plane's, when the line names them: a member bound
+    /// at a port of its own choosing is told on standard input, as a peer that moved is.
+    pub at: Option<(Endpoint, Endpoint)>,
+}
+
 /// What the file states.
 pub struct ProcessConfig {
     pub id: u64,
@@ -376,6 +398,11 @@ pub struct ProcessConfig {
     pub certificate: PathBuf,
     pub key: PathBuf,
     pub peers: Vec<PeerLine>,
+    /// The members a granted node dials first (`seed` lines), none for a founder.
+    pub seeds: Vec<SeedLine>,
+    /// The host its peers dial it at on its QUIC and plane ports where it differs from the address
+    /// it binds (`reach`), which its join states (membership.md §3).
+    pub reach: Option<String>,
     /// The ranges the node hosts (`range` lines): each one's group and layer, every one founded
     /// by `voters`.
     pub ranges: Vec<(u128, Layer)>,
@@ -548,7 +575,14 @@ pub const KEYS: &[&str] = &[
 
 /// The lines `mantle node`'s file repeats: its peers, ranges and volumes, its root key's
 /// generations and the durability model's bursts.
-pub const REPEATED: &[&str] = &["peer", "range", "volume", "root_key", "durability.burst"];
+pub const REPEATED: &[&str] = &[
+    "peer",
+    "seed",
+    "range",
+    "volume",
+    "root_key",
+    "durability.burst",
+];
 
 /// The keys `mantle serve`'s file states once each, its operator's alone (node.md §1.4's first
 /// column): every other value is measured or derived, and a key of those is refused. `memory`
@@ -565,6 +599,7 @@ pub const STATED_KEYS: &[&str] = &[
     "key",
     "voters",
     "domain",
+    "reach",
     "root.max_nodes",
     "root.max_volumes",
     "memory",
@@ -581,6 +616,7 @@ pub const STATED_KEYS: &[&str] = &[
 /// SIZE`, its root key's generations, and the cell's access keys, each `access_key = ID FILE`.
 pub const STATED_REPEATED: &[&str] = &[
     "peer",
+    "seed",
     "range",
     "volume",
     "root_key",
@@ -737,6 +773,53 @@ fn peers(lines: &Lines) -> Result<Vec<PeerLine>, ProcessError> {
     Ok(peers)
 }
 
+/// The `seed` lines, each `seed = ID QUIC PLANE`, or `seed = ID` for one told where it listens on
+/// standard input: a member a granted node dials first, by its id and where it listens, each
+/// `HOST:PORT` (docs/design/membership.md §3 step 2).
+fn seeds(lines: &Lines) -> Result<Vec<SeedLine>, ProcessError> {
+    let mut seeds = Vec::with_capacity(lines.all("seed").len());
+    for (number, value) in lines.all("seed") {
+        let form = || ProcessError::Line(*number, "seed = ID QUIC PLANE, or seed = ID".into());
+        let fields: Vec<&str> = value.split_whitespace().collect();
+        let (id, at) = match fields.as_slice() {
+            [id] => (id, None),
+            [id, quic, plane] => (id, Some((quic, plane))),
+            _ => return Err(form()),
+        };
+        let endpoint = |text: &str| {
+            Endpoint::parse(text).ok_or_else(|| {
+                ProcessError::Line(
+                    *number,
+                    format!("{text}: HOST:PORT, an IPv6 address in brackets"),
+                )
+            })
+        };
+        let at = match at {
+            Some((quic, plane)) => Some((endpoint(quic)?, endpoint(plane)?)),
+            None => None,
+        };
+        seeds.push(SeedLine {
+            id: id.parse().map_err(|_| form())?,
+            at,
+        });
+    }
+    Ok(seeds)
+}
+
+/// The `reach` key: a host its peers dial it at, an IP address or a DNS name, where stated.
+fn reach(lines: &Lines) -> Result<Option<String>, ProcessError> {
+    let Some(host) = lines.maybe::<String>("reach")? else {
+        return Ok(None);
+    };
+    if host.parse::<std::net::IpAddr>().is_err() && mantle_cert::check_dns_name(&host).is_err() {
+        return Err(ProcessError::Value(
+            "reach",
+            format!("{host:?} is neither an IP address nor a DNS name"),
+        ));
+    }
+    Ok(Some(host))
+}
+
 /// The peers' addresses as the node starts (node.md §1.7 step 5), and the peers its lines name by a
 /// host name, which the node looks up again as it runs (`crate::names`).
 pub struct Resolved {
@@ -763,33 +846,40 @@ pub fn resolve(config: &ProcessConfig) -> Result<Resolved, ProcessError> {
         named: Vec::new(),
         unresolved: Vec::new(),
     };
-    for peer in &config.peers {
-        let Some((quic, plane)) = &peer.at else {
-            continue;
-        };
+    let named = config
+        .peers
+        .iter()
+        .filter_map(|peer| peer.at.as_ref().map(|at| (peer.id, at)))
+        .chain(
+            config
+                .seeds
+                .iter()
+                .filter_map(|seed| seed.at.as_ref().map(|at| (seed.id, at))),
+        );
+    for (id, (quic, plane)) in named {
         let is_address = |at: &Endpoint| at.host.parse::<std::net::IpAddr>().is_ok();
         if is_address(quic) && is_address(plane) {
             resolved.addresses.push((
-                peer.id,
-                lookup(peer.id, quic, config.quic)?,
-                lookup(peer.id, plane, config.plane)?,
+                id,
+                lookup(id, quic, config.quic)?,
+                lookup(id, plane, config.plane)?,
             ));
             continue;
         }
-        let found = lookup(peer.id, quic, config.quic)
-            .and_then(|q| lookup(peer.id, plane, config.plane).map(|p| (q, p)));
+        let found = lookup(id, quic, config.quic)
+            .and_then(|q| lookup(id, plane, config.plane).map(|p| (q, p)));
         match found {
             Ok((q, p)) => {
-                resolved.addresses.push((peer.id, q, p));
+                resolved.addresses.push((id, q, p));
                 resolved.named.push(crate::names::Start {
-                    id: peer.id,
+                    id,
                     at: (quic.clone(), plane.clone()),
                     known: Some((q, p)),
                 });
             }
             Err(e) => {
                 resolved.named.push(crate::names::Start {
-                    id: peer.id,
+                    id,
                     at: (quic.clone(), plane.clone()),
                     known: None,
                 });
@@ -797,7 +887,7 @@ pub fn resolve(config: &ProcessConfig) -> Result<Resolved, ProcessError> {
                     ProcessError::Resolve(_, at, why) => (at, why),
                     other => (quic.to_string(), other.to_string()),
                 };
-                resolved.unresolved.push((peer.id, at, why));
+                resolved.unresolved.push((id, at, why));
             }
         }
     }
@@ -915,6 +1005,8 @@ impl ProcessConfig {
             certificate: lines.path(lines.text("certificate")?),
             key: lines.path(lines.text("key")?),
             peers,
+            seeds: seeds(&lines)?,
+            reach: None,
             ranges: ranges(&lines)?,
             voters,
             settings: Settings {
@@ -1101,10 +1193,11 @@ fn gateway_settings(
     })
 }
 
-/// How a node with `volume` lines enlists them: the root range its `range` lines name, its
-/// `domain`, and the table's `root.` bounds, each required of it; none for a node without volumes.
+/// How a node with `volume` lines, or one that states the cell's bound on its nodes, enlists or
+/// joins (docs/design/membership.md §3): the root range its `range` lines name, its `domain`, and
+/// the table's `root.` bounds, each required of it; none for a node with neither.
 fn enlisting(lines: &Lines) -> Result<Option<Enlisting>, ProcessError> {
-    if lines.all("volume").is_empty() {
+    if lines.all("volume").is_empty() && lines.maybe::<u32>("root.max_nodes")?.is_none() {
         return Ok(None);
     }
     let root = ranges(lines)?
@@ -1206,7 +1299,16 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     let node = Locks::node(&config.dir).map_err(step(Step::Locks))?;
     let locks =
         Locks::take(config.volumes.iter().map(|v| v.dir.as_path())).map_err(step(Step::Locks))?;
-    start(config, (node, locks), identity, None, true)
+    start(
+        config,
+        (node, locks),
+        identity,
+        None,
+        Asked {
+            ends_with_input: true,
+            leave: false,
+        },
+    )
 }
 
 /// What a node answers `counts` on its standard input with: the binary's account of its own
@@ -1225,7 +1327,7 @@ pub fn answer_counts(with: fn() -> String) -> bool {
 /// node directory's device and the host's memory, cores and page measured; every other value
 /// derived from those (`derive::derive`) and said on standard output, a `basis` line each, before
 /// anything opens; then the node, as `mantle node` runs it, until it stops in order.
-pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
+pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
     mantle_engine::port::mmap::return_freed_blocks();
     let stated = read_stated(config).map_err(step(Step::Configuration))?;
     let identity = identity(
@@ -1251,7 +1353,25 @@ pub fn serve_stated(config: &Path) -> Result<(), ProcessError> {
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
     // The runtime's writer says the rest: this thread holds no lock on standard output for it.
     drop(out);
-    start(derived.config, (node, locks), identity, s3, false)
+    start(
+        derived.config,
+        (node, locks),
+        identity,
+        s3,
+        Asked {
+            ends_with_input: false,
+            leave,
+        },
+    )
+}
+
+/// What the process is asked of the node as it starts: whether it ends when its standard input
+/// closes (`mantle node`, its harness's child), and whether it leaves the cell in order and then
+/// ends (`mantle serve --leave`, docs/design/membership.md §4).
+#[derive(Clone, Copy)]
+struct Asked {
+    ends_with_input: bool,
+    leave: bool,
 }
 
 /// What `mantle serve` derives from the statements the file at `config` holds, said as it says
@@ -1322,7 +1442,7 @@ fn start(
     held: (NodeLock, Locks),
     identity: Identity,
     s3: Option<S3Keys>,
-    ends_with_input: bool,
+    asked: Asked,
 ) -> Result<(), ProcessError> {
     // Room for both: a stop at once, and the node's end after its teardown, which no one hears.
     let (tell, heard) = sync_channel::<Ended>(2);
@@ -1330,7 +1450,7 @@ fn start(
     let thread = std::thread::Builder::new()
         .name("node".into())
         .spawn(move || {
-            let ran = run_node(config, held, identity, (s3, ends_with_input), at_once);
+            let ran = run_node(config, held, identity, (s3, asked), at_once);
             let _ = tell.send(Ended::Ran(ran));
         })
         .map_err(|e| ProcessError::Runtime(format!("the node's thread: {e}")))?;
@@ -1354,7 +1474,7 @@ fn run_node(
     mut config: ProcessConfig,
     held: (NodeLock, Locks),
     identity: Identity,
-    (s3, ends_with_input): (Option<S3Keys>, bool),
+    (s3, asked): (Option<S3Keys>, Asked),
     at_once: SyncSender<Ended>,
 ) -> Result<(), ProcessError> {
     let (node, locks) = held;
@@ -1365,6 +1485,8 @@ fn run_node(
         credentials,
         peers,
         keys,
+        grant,
+        fingerprint,
     } = identity;
     let gateway = config
         .gateway
@@ -1373,8 +1495,9 @@ fn run_node(
         .transpose()?;
     let resolved = resolve(&config).map_err(step(Step::Network))?;
     // A named peer is looked up again as the node runs, on hyper-rt's blocking pool, off its shards:
-    // one lookup at a time (`crate::names`), so one place and no line.
-    if !resolved.named.is_empty() {
+    // one lookup at a time (`crate::names`), so one place and no line; a granted node's members
+    // name the hosts they are reached at in the root range's rows, any of which may be a name.
+    if !resolved.named.is_empty() || grant.is_some() {
         hyper_rt::blocking::start(hyper_rt::blocking::Config {
             workers: 1,
             shares: vec![hyper_rt::blocking::Share::new(hyper_rt::dns::SHARE, 1)],
@@ -1395,9 +1518,9 @@ fn run_node(
             config,
             storage,
             gateway,
-            (credentials, peers),
+            (credentials, peers, (grant, fingerprint)),
             (resolved, s3),
-            (ends_with_input, at_once),
+            (asked, at_once),
         ))
         .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
     drop(node);
@@ -1455,14 +1578,13 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
     let lines = Lines::parse(&text, STATED_KEYS, STATED_REPEATED)?.of_file(path);
     let mut volumes = Vec::with_capacity(lines.all("volume").len());
     for (number, value) in lines.all("volume") {
-        let bad = || ProcessError::Line(*number, "volume = DIR SIZE".into());
-        // The size after the last space, so a directory with a space in it reads.
-        let (dir, size) = value.rsplit_once(char::is_whitespace).ok_or_else(bad)?;
-        let dir = dir.trim();
-        if dir.is_empty() {
-            return Err(bad());
-        }
-        volumes.push((lines.path(dir), size.parse().map_err(|_| bad())?));
+        let (dir, bytes) = volume_line(value).ok_or_else(|| {
+            ProcessError::Line(
+                *number,
+                "volume = DIR SIZE, or volume = DIR spare KEEP".into(),
+            )
+        })?;
+        volumes.push((lines.path(dir), bytes));
     }
     let target = lines.maybe::<f64>("durability.target")?;
     if target.is_some_and(|t| !(t.is_finite() && t > 0.0 && t < 1.0)) {
@@ -1487,6 +1609,8 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         certificate: lines.path(lines.text("certificate")?),
         key: lines.path(lines.text("key")?),
         peers: peers(&lines)?,
+        seeds: seeds(&lines)?,
+        reach: reach(&lines)?,
         ranges: ranges(&lines)?,
         voters: voters(&lines)?,
         volumes,
@@ -1498,6 +1622,29 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         repair,
         s3: s3_stated(&lines)?,
     })
+}
+
+/// A `volume` line's directory and bytes (docs/design/membership.md §3.1): `DIR SIZE`; or `DIR spare
+/// KEEP`, a volume of what its file system spares less the `KEEP` bytes the machine's other work
+/// keeps there, `DIR spare` where it keeps none. Its words are read from the end, so a directory
+/// with a space in it reads; one whose last word is `spare` is stated with a `/` after it.
+fn volume_line(value: &str) -> Option<(&str, VolumeBytes)> {
+    let (rest, last) = value.rsplit_once(char::is_whitespace)?;
+    let (dir, bytes) = if last == "spare" {
+        (rest, VolumeBytes::Spare { keep: 0 })
+    } else {
+        let last = last.parse().ok()?;
+        match rest.trim_end().rsplit_once(char::is_whitespace) {
+            Some((dir, "spare")) => (dir, VolumeBytes::Spare { keep: last }),
+            _ => (rest, VolumeBytes::Stated(last)),
+        }
+    };
+    let dir = dir.trim();
+    if dir.is_empty() {
+        None
+    } else {
+        Some((dir, bytes))
+    }
 }
 
 /// The shortest and longest access key ids IAM takes, word characters each (IAM API Reference,
@@ -1670,6 +1817,7 @@ fn device(identity: &mantle_disk::identity::Identity) -> Device {
             .file_system
             .total_bytes
             .or(identity.file_system.available_bytes),
+        available: identity.file_system.available_bytes,
     }
 }
 
@@ -1803,10 +1951,18 @@ async fn serve(
     config: ProcessConfig,
     storage: Storage,
     gateway: Option<GatewaySettings>,
-    (credentials, peers): (Credentials, Vec<Peer>),
+    (credentials, peers, (grant, fingerprint)): (
+        Credentials,
+        Vec<Peer>,
+        (Option<u64>, [u8; mantle_meta::record::FINGERPRINT]),
+    ),
     (resolved, s3): (Resolved, Option<S3Keys>),
-    (ends_with_input, at_once): (bool, SyncSender<Ended>),
+    (asked, at_once): (Asked, SyncSender<Ended>),
 ) -> Result<(), ProcessError> {
+    let Asked {
+        ends_with_input,
+        leave,
+    } = asked;
     let Resolved {
         addresses,
         named,
@@ -1823,6 +1979,13 @@ async fn serve(
     let kept = |e: LayoutError| step(Step::Storage)(ProcessError::History(e.to_string()));
     let (last_run, last_stop) = (layout.run().map_err(kept)?, layout.stopped().map_err(kept)?);
     let mut held = (History::default(), History::default());
+    // A node of a cell that states its bound on nodes keeps peers, pairs and keys for as many, and
+    // every range it hosts may name as many members (docs/design/membership.md §9); a granted one
+    // joins the cell under its grant (§3).
+    let max_nodes = config.enlist.as_ref().map_or(0, |e| e.max_nodes);
+    let members = usize::try_from(max_nodes).map_err(|e| {
+        step(Step::Configuration)(ProcessError::Value("root.max_nodes", e.to_string()))
+    })?;
     let mut ranges = Vec::with_capacity(config.ranges.len());
     for (group, layer) in &config.ranges {
         let mut engine = engine(&config, *group, *layer).map_err(step(Step::Storage))?;
@@ -1839,6 +2002,7 @@ async fn serve(
                     ..ConfState::default()
                 },
                 settings: config.settings,
+                members,
             },
             engine,
         });
@@ -1882,6 +2046,8 @@ async fn serve(
         wall: Wall::System,
         gateway,
         history,
+        max_nodes,
+        seeds: config.seeds.iter().map(|s| s.id).collect(),
     };
     let mut node = Node::open(settings).await.map_err(opened)?;
     let run = layout
@@ -1943,21 +2109,47 @@ async fn serve(
     // Whether the root range enlisted the node in this run, and the readiness lock a supervisor's
     // check asks for (`mantle status`), held from then until the process ends.
     let (mut enlisted, mut live): (bool, Option<Live>) = (false, None);
+    // A granted node of a cell whose members come and go joins under its grant, stating where its
+    // peers dial it (docs/design/membership.md §3); any other enlists. The entry that carries
+    // either gives it its time.
     let mut enlisting = match &config.enlist {
         Some(e) => {
-            let enlist = Command::Root(root::Command::Enlist(Enlist {
-                node: config.id,
-                domain: e.domain.clone(),
-                volumes,
-                max_nodes: e.max_nodes,
-                max_volumes: e.max_volumes,
-                // The entry that carries it gives it its time.
-                at_ns: 0,
-            }));
-            Some(node.command(e.root, enlist, u64::MAX, Wait::Answered)?)
+            let command = match grant.filter(|_| max_nodes > 0) {
+                Some(grant) => Command::Root(root::Command::Join(Join {
+                    node: config.id,
+                    grant,
+                    fingerprint,
+                    quic: reached_at(config.reach.as_deref(), quic).map_err(step(Step::Network))?,
+                    plane: reached_at(config.reach.as_deref(), plane)
+                        .map_err(step(Step::Network))?,
+                    domain: e.domain.clone(),
+                    volumes,
+                    max_nodes: e.max_nodes,
+                    max_volumes: e.max_volumes,
+                    at_ns: 0,
+                })),
+                None => Command::Root(root::Command::Enlist(Enlist {
+                    node: config.id,
+                    domain: e.domain.clone(),
+                    volumes,
+                    max_nodes: e.max_nodes,
+                    max_volumes: e.max_volumes,
+                    at_ns: 0,
+                })),
+            };
+            Some(node.command(e.root, command, u64::MAX, Wait::Answered)?)
         }
         None => None,
     };
+    // The node's leave (membership.md §4): asked at its start or on its standard input, answered,
+    // and done once the root range removed it; and an operator's statements that another node is
+    // gone, each out until answered.
+    let mut departure = Departure::Staying;
+    let mut stated_gone: Vec<(CommandAsk, u64)> = Vec::new();
+    // Each member's standing as last said, and each range's configuration, a range a slot in the
+    // configuration's order.
+    let mut said_standing: Vec<(u64, MemberState, u64)> = Vec::new();
+    let mut said_config: Vec<Option<(Vec<u64>, Vec<u64>)>> = vec![None; config.ranges.len()];
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
     // Each range's status as last said, a range a slot in the configuration's order.
@@ -1983,8 +2175,6 @@ async fn serve(
     let mut said_room: Option<(u64, u64)> = None;
     // The cell's repair on this node as last said, none before the first saying.
     let mut said_repair: Option<crate::node::RepairStatus> = None;
-    // The node's leave asked of the root range, not yet answered.
-    let mut leaving: Option<crate::ask::CommandAsk> = None;
     let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
     let mut stop = Stop::new(config.stop);
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
@@ -2061,20 +2251,23 @@ async fn serve(
                             .map_or_else(|| "counts uncounted\n".to_owned(), |counts| counts());
                         say(&mut output, &line).await?;
                     } else if line.trim_ascii() == b"leave" {
-                        // The node leaves the cell's storage: its volumes take no new chunk, and
-                        // the cell's repair moves what they hold (docs/design/repair.md §4).
-                        let Some(e) = &config.enlist else {
-                            return Err(ProcessError::Input(
-                                "leave".into(),
-                                "a node with no volumes holds nothing to leave",
-                            ));
-                        };
-                        let word = Command::Root(root::Command::Leave {
-                            node: config.id,
+                        departure.ask(&mut node, config.enlist.as_ref(), enlisted)?;
+                    } else if let Some(id) = gone_line(&line)? {
+                        let root =
+                            config
+                                .enlist
+                                .as_ref()
+                                .map(|e| e.root)
+                                .ok_or(ProcessError::Input(
+                                    format!("gone {id}"),
+                                    "a node that hosts no root range states no member gone",
+                                ))?;
+                        let gone = Command::Root(root::Command::Gone {
+                            node: id,
                             // The entry that carries it gives it its time.
                             at_ns: 0,
                         });
-                        leaving = Some(node.command(e.root, word, u64::MAX, Wait::Answered)?);
+                        stated_gone.push((node.command(root, gone, u64::MAX, Wait::Answered)?, id));
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;
                     }
@@ -2132,8 +2325,14 @@ async fn serve(
             && let Some(outcome) = node.take_command(asked)
         {
             enlisting = None;
+            let resumed = matches!(
+                outcome,
+                CommandOutcome::Answered(Answer::Root(root::Outcome::Leaving))
+            );
             match outcome {
-                CommandOutcome::Answered(Answer::Root(root::Outcome::Enlisted)) => {
+                CommandOutcome::Answered(Answer::Root(
+                    root::Outcome::Enlisted | root::Outcome::Joined | root::Outcome::Leaving,
+                )) => {
                     // Ready before it says so: a check asked once `enlisted` is said finds the
                     // lock held.
                     enlisted = true;
@@ -2144,6 +2343,52 @@ async fn serve(
                     }
                 }
                 other => return Err(ProcessError::Enlist(format!("{other:?}"))),
+            }
+            // A node that was leaving when it stopped leaves on; one started to leave asks it now.
+            if resumed {
+                departure = Departure::Leaving;
+                say(&mut output, "leaving\n").await?;
+            } else if leave {
+                departure.ask(&mut node, config.enlist.as_ref(), enlisted)?;
+            }
+        }
+        if let Some(said) = departure.step(&mut node)? {
+            say(&mut output, said).await?;
+        }
+        for at in (0..stated_gone.len()).rev() {
+            let Some(&(ask, id)) = stated_gone.get(at) else {
+                continue;
+            };
+            if let Some(outcome) = node.take_command(ask) {
+                stated_gone.swap_remove(at);
+                say(&mut output, &format!("gone {id} {outcome:?}\n")).await?;
+            }
+        }
+        // The members whose reach names a host: looked up as a peer's name is; those the cell no
+        // longer admits, and that no line names, looked up no more.
+        if let Some(cell) = node.cell() {
+            let configured = |id: u64| {
+                config.peers.iter().any(|p| p.id == id) || config.seeds.iter().any(|s| s.id == id)
+            };
+            names.retain(|id| {
+                configured(id)
+                    || cell.member(id).is_some_and(|row| {
+                        matches!(row.state, MemberState::Serving | MemberState::Leaving)
+                    })
+            });
+        }
+        for (id, quic, plane) in node.take_reached() {
+            match (Endpoint::parse(&quic), Endpoint::parse(&plane)) {
+                (Some(quic), Some(plane)) => {
+                    names.add(id, (quic, plane), hyper_rt::futures::now_ns());
+                }
+                _ => {
+                    say(
+                        &mut output,
+                        &format!("unresolved {id} {quic} not HOST:PORT\n"),
+                    )
+                    .await?
+                }
             }
         }
         // A readiness check holds the lock shared for the moment it looks: a take it refused is
@@ -2163,21 +2408,22 @@ async fn serve(
             )
             .map_err(wrote)?;
         }
-        if let Some(asked) = leaving
-            && let Some(outcome) = node.take_command(asked)
-        {
-            leaving = None;
-            match outcome {
-                CommandOutcome::Answered(Answer::Root(root::Outcome::Kept)) => {
-                    writeln!(lines, "leaving").map_err(wrote)?;
-                }
-                other => return Err(ProcessError::Enlist(format!("leave: {other:?}"))),
-            }
-        }
         let repair = node.repair_status();
         if said_repair != Some(repair) {
             repair_line(&mut lines, &repair).map_err(wrote)?;
             said_repair = Some(repair);
+        }
+        standing_lines(&mut lines, &node, &mut said_standing).map_err(wrote)?;
+        for ((group, _), was) in config.ranges.iter().zip(said_config.iter_mut()) {
+            let Some(conf) = node.configuration(*group) else {
+                continue;
+            };
+            let now = (conf.voters.clone(), conf.learners.clone());
+            if was.as_ref() != Some(&now) {
+                writeln!(lines, "config {group:x} {} {}", ids(&now.0), ids(&now.1))
+                    .map_err(wrote)?;
+                *was = Some(now);
+            }
         }
         for (at, now) in node.links().enumerate() {
             if links.get(at) == Some(&now) {
@@ -2301,6 +2547,166 @@ async fn serve(
             return Ok(());
         }
     }
+}
+
+/// Where a node's leave stands (docs/design/membership.md §4).
+enum Departure {
+    Staying,
+    /// Asked of the root range, not yet answered.
+    Asking(CommandAsk),
+    /// The root range holds it leaving: it waits until its volumes are retired and it is removed.
+    Leaving,
+    /// Removed: its orderly stop runs, and the process ends with it.
+    Left,
+    /// A node with no standing whose volumes are leaving: repair drains them while it serves.
+    Draining,
+}
+
+impl Departure {
+    /// Asks the node's leave of the root range of `enlist`, once the node is enlisted: asked
+    /// before that, at the enlistment's answer.
+    fn ask<E: Engine + 'static>(
+        &mut self,
+        node: &mut Node<E>,
+        enlist: Option<&Enlisting>,
+        enlisted: bool,
+    ) -> Result<(), ProcessError> {
+        let Some(e) = enlist else {
+            return Err(ProcessError::Input(
+                "leave".into(),
+                "a node that hosts no root range is a member of no cell",
+            ));
+        };
+        if !enlisted || !matches!(self, Self::Staying) {
+            return Ok(());
+        }
+        let leave = Command::Root(root::Command::Leave {
+            node: node.id(),
+            // The entry that carries it gives it its time.
+            at_ns: 0,
+        });
+        *self = Self::Asking(node.command(e.root, leave, u64::MAX, Wait::Answered)?);
+        Ok(())
+    }
+
+    /// A turn's step: the leave's answer taken, and the node's removal seen in its own replica of
+    /// the root range, which begins its orderly stop. What to say, if anything.
+    fn step<E: Engine + 'static>(
+        &mut self,
+        node: &mut Node<E>,
+    ) -> Result<Option<&'static str>, ProcessError> {
+        match self {
+            Self::Asking(ask) => match node.take_command(*ask) {
+                Some(CommandOutcome::Answered(Answer::Root(root::Outcome::Leaving))) => {
+                    *self = Self::Leaving;
+                    Ok(Some("leaving\n"))
+                }
+                // A node enlisted with no standing, a cell made before grants: its volumes are
+                // leaving and repair drains them, and it serves on, no removal to wait for.
+                Some(CommandOutcome::Answered(Answer::Root(root::Outcome::Kept))) => {
+                    *self = Self::Draining;
+                    Ok(Some("leaving\n"))
+                }
+                Some(other) => Err(ProcessError::Enlist(format!("the leave: {other:?}"))),
+                None => Ok(None),
+            },
+            Self::Leaving => {
+                let removed = node
+                    .cell()
+                    .and_then(|cell| cell.member(node.id()))
+                    .is_none_or(|row| row.state == MemberState::Removed);
+                if removed {
+                    *self = Self::Left;
+                    node.stop();
+                    Ok(Some("left\nstopping\n"))
+                } else {
+                    Ok(None)
+                }
+            }
+            Self::Staying | Self::Left | Self::Draining => Ok(None),
+        }
+    }
+}
+
+/// Where a node's peers dial its endpoint bound at `bound`, `HOST:PORT`: its stated reach on the
+/// bound port, else the bound address where its peers can dial it (membership.md §3 step 2).
+fn reached_at(reach: Option<&str>, bound: SocketAddr) -> Result<String, ProcessError> {
+    match reach {
+        Some(host) if host.contains(':') => Ok(format!("[{host}]:{}", bound.port())),
+        Some(host) => Ok(format!("{host}:{}", bound.port())),
+        None if !bound.ip().is_unspecified() => Ok(bound.to_string()),
+        None => Err(ProcessError::Value(
+            "reach",
+            format!("the node binds {bound}, every address, and states no host its peers dial"),
+        )),
+    }
+}
+
+/// The member a `gone ID` line names, an operator's statement that it is gone for good
+/// (membership.md §5); none for another line.
+fn gone_line(line: &[u8]) -> Result<Option<u64>, ProcessError> {
+    let text = String::from_utf8_lossy(line).trim().to_owned();
+    let mut words = text.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (Some("gone"), Some(id), None) => id
+            .parse()
+            .map(Some)
+            .map_err(|_| ProcessError::Input(text.clone(), "gone ID: a member's id")),
+        _ => Ok(None),
+    }
+}
+
+/// Each member's `standing ID STATE ABSENT_NS` line, written onto `lines`, for each whose state or
+/// recorded absence moved since `said`, as this node's member of the root range holds it.
+fn standing_lines<E: Engine + 'static>(
+    lines: &mut String,
+    node: &Node<E>,
+    said: &mut Vec<(u64, MemberState, u64)>,
+) -> std::fmt::Result {
+    let Some(cell) = node.cell() else {
+        return Ok(());
+    };
+    // Away since when, as the cell's presence keeps it (membership.md §8): 0 while it is seen.
+    let away = |id: u64| {
+        cell.presence(id)
+            .filter(|p| !p.present)
+            .map_or(0, |p| p.since_ns)
+    };
+    for (id, row) in cell.members() {
+        let now = (*id, row.state, away(*id));
+        if said.contains(&now) {
+            continue;
+        }
+        let state = match row.state {
+            MemberState::Serving => "serving",
+            MemberState::Leaving => "leaving",
+            MemberState::Gone => "gone",
+            MemberState::Removed => "removed",
+        };
+        writeln!(lines, "standing {id} {state} {}", now.2)?;
+    }
+    // Members delisted: said once, as no state.
+    for (id, ..) in said.iter() {
+        if cell.member(*id).is_none() {
+            writeln!(lines, "standing {id} delisted 0")?;
+        }
+    }
+    said.clear();
+    said.extend(
+        cell.members()
+            .iter()
+            .map(|(id, row)| (*id, row.state, away(*id))),
+    );
+    Ok(())
+}
+
+/// Ids, comma-separated, `-` for none.
+fn ids(members: &[u64]) -> String {
+    if members.is_empty() {
+        return "-".to_owned();
+    }
+    let ids: Vec<String> = members.iter().map(u64::to_string).collect();
+    ids.join(",")
 }
 
 /// What the root range's replica holds of the cell's history, and of node `id`'s own: the sum over
@@ -2787,7 +3193,8 @@ mod tests {
             format!(
                 "id = 1\ndir = .\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = a.der\n\
                  certificate = n.der\nkey = n.key\nvoters = 1\nrange = 1 root\n\
-                 volume = {disks} 1073741824\nvolume = data 4096\ndomain = a\n\
+                 volume = {disks} 1073741824\nvolume = data 4096\nvolume = {disks} spare\n\
+                 volume = spare data spare 2048\nvolume = my spare/ 512\ndomain = a\n\
                  root.max_nodes = 1\nroot.max_volumes = 2\n"
             ),
         )
@@ -2796,11 +3203,23 @@ mod tests {
         assert_eq!(
             stated.volumes,
             vec![
-                (PathBuf::from(disks), 1 << 30),
-                (dir.path().join("data"), 4096)
+                (PathBuf::from(disks), VolumeBytes::Stated(1 << 30)),
+                (dir.path().join("data"), VolumeBytes::Stated(4096)),
+                (PathBuf::from(disks), VolumeBytes::Spare { keep: 0 }),
+                (
+                    dir.path().join("spare data"),
+                    VolumeBytes::Spare { keep: 2048 }
+                ),
+                (dir.path().join("my spare"), VolumeBytes::Stated(512)),
             ]
         );
-        for bad in ["volume = 1024", "volume = /d", "volume = /d big"] {
+        for bad in [
+            "volume = 1024",
+            "volume = /d",
+            "volume = /d big",
+            "volume = spare",
+            "volume = /d spare big",
+        ] {
             let text = std::fs::read_to_string(&config)
                 .unwrap()
                 .replace("volume = data 4096", bad);

@@ -130,6 +130,24 @@ directory and, with `--measure`, benchmarks the device. It is built on:
 
 ## In progress
 
+**Membership: a cell whose machines come and go** ([design](design/membership.md), branch
+`fleet-cell`). Implemented: grants from the cell's authority, numbered and each spent once in a
+window of `root.max_nodes` (`mantle init grant`), the grant in the certificate's subject; a granted
+node's `Join` to the root range under its grant, stating its certificate's fingerprint, where it
+listens, its domain and its volumes, restated at each start; the directory admitting members by the
+root range's rows and its seeds, and refusing withdrawn identities; each range's configuration
+stepped toward the members one single-server change at a time, a joiner a learner until caught up
+and then a voter; an orderly leave (`leave` on standard input, `mantle serve --leave`): `Leaving`,
+its leadership handed on, its votes out of every range, a learner of the root range until no volume
+of it is left, then `Remove`, `left`, exit 0, and `Delist`; absences recorded by the root range's
+leader from its liveness stream and cleared at a return, a member's next start or its own
+leadership, placement passing over an absent member's volumes, and absent voters made learners
+where that lets a range survive more failures; a member judged gone once its absence passes the
+durability model's mean repair time, or stated gone (`gone ID`), its identity refused from then;
+and a volume of what its file system spares (`volume = DIR spare KEEP`). Open: draining and
+retiring a leaving member's volumes (the `repair` branch, membership.md §8), a range's voters a
+subset of the cell, certificates' rotation, and the owner's decisions in membership.md §10.
+
 **Chunk store** ([design](design/chunk-store.md)). Implemented: the volume layout with
 two superblocks, self-describing data records with a CRC-32C per checksum block, the
 index log with a second copy of every record's identity, the group-commit writer that

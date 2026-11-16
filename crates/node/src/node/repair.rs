@@ -344,39 +344,61 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             else {
                 break;
             };
-            let seen = if node == self.id {
-                Some(true)
-            } else {
-                self.remotes.iter().find(|r| r.id == node).and_then(|r| {
-                    if r.suspect {
-                        Some(false)
-                    } else if r.keyed {
-                        Some(true)
-                    } else if r.ended > 0 {
-                        Some(false)
-                    } else {
-                        None
-                    }
-                })
-            };
-            let Some(present) = seen else {
-                continue;
-            };
-            if present == recorded
-                || self.seeing.iter().any(|(n, _)| *n == node)
-                || !self.command_room()
-            {
-                continue;
-            }
-            let word = Command::Root(root::Command::Seen(Seen {
-                node,
-                present,
-                // The entry that carries it gives it its time.
-                at_ns: 0,
-            }));
-            let ask = self.command(root, word, u64::MAX, Wait::Request)?;
-            self.seeing.push((node, ask));
+            self.state_presence(root, node, recorded)?;
         }
+        // A member holding no volume is no volume's node, and its presence is the cell's fact all
+        // the same: the record membership judges a member gone by (docs/design/membership.md §8).
+        let members = self.cell.as_ref().map_or(0, |c| c.members().len());
+        for at in 0..members {
+            let Some((node, recorded)) = self.cell.as_ref().and_then(|c| {
+                let (id, _) = c.members().get(at)?;
+                if c.holds(*id) {
+                    return None;
+                }
+                Some((*id, c.presence(*id)?.present))
+            }) else {
+                continue;
+            };
+            self.state_presence(root, node, recorded)?;
+        }
+        Ok(())
+    }
+
+    /// Asks the root range of `root` the word that `node` is seen or not, where this node's links
+    /// say otherwise than `recorded` and none is out for it.
+    fn state_presence(&mut self, root: u128, node: u64, recorded: bool) -> Result<(), NodeError> {
+        let seen = if node == self.id {
+            Some(true)
+        } else {
+            self.remotes.iter().find(|r| r.id == node).and_then(|r| {
+                if r.suspect {
+                    Some(false)
+                } else if r.keyed {
+                    Some(true)
+                } else if r.ended > 0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        };
+        let Some(present) = seen else {
+            return Ok(());
+        };
+        if present == recorded
+            || self.seeing.iter().any(|(n, _)| *n == node)
+            || !self.command_room()
+        {
+            return Ok(());
+        }
+        let word = Command::Root(root::Command::Seen(Seen {
+            node,
+            present,
+            // The entry that carries it gives it its time.
+            at_ns: 0,
+        }));
+        let ask = self.command(root, word, u64::MAX, Wait::Request)?;
+        self.seeing.push((node, ask));
         Ok(())
     }
 

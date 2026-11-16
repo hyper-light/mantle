@@ -201,6 +201,7 @@ fn range(nodes: u64) -> Range {
             ..ConfState::default()
         },
         settings: SETTINGS,
+        members: 0,
     }
 }
 
@@ -455,6 +456,8 @@ impl Pki {
             // These nodes enlist nothing, so the cell keeps no history of them: every start's
             // detectors begin from what they watch.
             history: mantle_meta::record::History::default(),
+            max_nodes: 0,
+            seeds: Vec::new(),
         }
     }
 }

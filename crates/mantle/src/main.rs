@@ -94,8 +94,9 @@ enum Command {
         out: Option<PathBuf>,
         /// A founder: quic=ADDR,plane=ADDR,s3=ADDR,name=HOST,domain=NAME,volume=DIR:SIZE,
         /// memory=SIZE (s3 its S3 endpoint's address, its QUIC address unless stated; a name, a
-        /// DNS name its S3 clients dial, and a volume repeatable; sizes in bytes or with a K, M, G
-        /// or T suffix). Repeatable, one a founder.
+        /// DNS name its S3 clients dial, and a volume repeatable, DIR:spare:KEEP a volume of what
+        /// its file system spares less KEEP; sizes in bytes or with a K, M, G or T suffix).
+        /// Repeatable, one a founder.
         #[arg(long = "node")]
         nodes: Vec<String>,
         /// A machines file: the cell's statements (max_nodes, max_volumes, durability.target,
@@ -127,6 +128,10 @@ enum Command {
     Serve {
         /// The node's configuration: the operator's keys only, one `key = value` a line.
         config: PathBuf,
+        /// Leave the cell in order, then exit: hand over what the node leads, wait until repair has
+        /// moved its chunks and the cell removed it (docs/design/membership.md §4).
+        #[arg(long)]
+        leave: bool,
     },
     /// Say what `mantle serve` derives for the node, a `basis` line each, without serving it
     /// (mantle_node::process::derive_stated): its devices measured, or their kept profiles taken
@@ -286,6 +291,22 @@ enum InitCommand {
         /// The directory `mantle init` made the cell in, which holds its authority and founders.
         #[arg(long)]
         cell: PathBuf,
+    },
+    /// A node that joins the running cell (docs/design/membership.md §2, §7): its id and a grant
+    /// numbered past the authority's last, its certificate naming the grant, its S3 endpoint's,
+    /// the cell's keys, and its directory NAME with its configuration, the cell's ranges and the
+    /// nodes it dials first. Nothing is sent to the cell: the node joins at its first `mantle
+    /// serve`. Says `granted ID GRANT NAME`.
+    Grant {
+        /// An empty or missing directory to make the node in, to move to its host whole.
+        name: PathBuf,
+        /// The directory `mantle init` made the cell in, which holds its authority.
+        #[arg(long)]
+        cell: PathBuf,
+        /// The node: quic=ADDR,plane=ADDR,domain=NAME,volume=DIR:SIZE,reach=HOST,s3=ADDR,
+        /// name=HOST,memory=SIZE, as `--node` states a founder.
+        #[arg(long = "node")]
+        node: String,
     },
 }
 
@@ -1017,12 +1038,14 @@ fn main() -> ExitCode {
         Command::Node { config } => {
             return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
         }
-        Command::Serve { config } => {
+        Command::Serve { config, leave } => {
             if cfg!(feature = "count-allocs") {
                 hyper_measure::alloc::begin_process();
             }
             mantle_node::process::answer_counts(bench_doors::counts_line);
-            return exit(mantle_node::process::serve_stated(config).map_err(|e| e.to_string()));
+            return exit(
+                mantle_node::process::serve_stated(config, *leave).map_err(|e| e.to_string()),
+            );
         }
         Command::Derive { config } => {
             return exit(mantle_node::process::derive_stated(config).map_err(|e| e.to_string()));
@@ -1077,6 +1100,13 @@ fn main() -> ExitCode {
             what: Some(InitCommand::Gateway { name, cell }),
             ..
         } => init::pin_gateway(&mut out, &name, &cell)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Command::Init {
+            what: Some(InitCommand::Grant { name, cell, node }),
+            ..
+        } => init::parse_node(&node)
+            .and_then(|founder| init::grant(&mut out, &name, &cell, &founder))
             .map(|_| ())
             .map_err(|e| e.to_string()),
         Command::Init {

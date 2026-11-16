@@ -608,7 +608,8 @@ pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
 
 /// After `DATA` in the root range: its census, a node's row, a volume's, a node's history, a
 /// principal's row, an access key's row, how many principals the account holds, a node's
-/// presence as the cell has seen it, or a volume's state where it is not active.
+/// presence as the cell has seen it, a volume's state where it is not active, a node's
+/// standing, the grant window, and the removed nodes' history (docs/design/membership.md §1).
 const CENSUS: u8 = 0;
 const MEMBER: u8 = 1;
 const VOLUME: u8 = 2;
@@ -661,6 +662,9 @@ pub fn principals() -> Vec<u8> {
 }
 const PRESENCE: u8 = 7;
 const STATE: u8 = 8;
+const STANDING: u8 = 9;
+const GRANTS: u8 = 10;
+const RETIRED: u8 = 11;
 
 /// The key of the root range's census: how many nodes and volumes its table holds.
 pub fn census() -> Vec<u8> {
@@ -701,6 +705,33 @@ pub fn presence(node: u64) -> Vec<u8> {
 /// is active (docs/design/repair.md §2).
 pub fn volume_state(volume: u128) -> Vec<u8> {
     numbered(STATE, &volume.to_be_bytes())
+}
+
+/// The key of node `node`'s standing in the root range: its state, grant, certificate and where
+/// it is dialed (docs/design/membership.md §1).
+pub fn standing(node: u64) -> Vec<u8> {
+    numbered(STANDING, &node.to_be_bytes())
+}
+
+/// The first key of the standings and a key past the last.
+pub fn standing_rows() -> (Vec<u8>, Vec<u8>) {
+    (vec![DATA, STANDING], vec![DATA, STANDING.saturating_add(1)])
+}
+
+/// The node a standing row's key names.
+pub fn decode_standing(k: &[u8]) -> Option<u64> {
+    let rest = k.strip_prefix(&[DATA, STANDING])?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// The key of the root range's grant window (docs/design/membership.md §2).
+pub fn grants() -> Vec<u8> {
+    vec![DATA, GRANTS]
+}
+
+/// The key of the removed nodes' history, their totals added together.
+pub fn retired() -> Vec<u8> {
+    vec![DATA, RETIRED]
 }
 
 /// The key of volume `volume`'s row in the root range's table: volumes sort by id.

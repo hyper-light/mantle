@@ -48,15 +48,17 @@ pub(crate) const STOCK_CLIENT: u64 = 10;
 /// transfers default. A stock client's connections each carry one at once.
 pub(crate) const STOCK_PART: u64 = 8 << 20;
 
-/// What one connection holds with a request in flight, the host holding the pieces of its body it
-/// took: measured by a counting allocator on the listener's thread (`tests/listener_memory.rs`),
-/// 346,212 bytes at the most over plain HTTP, at one connection on Windows aarch64 (CI run
-/// 43762797164; 346,132 on macOS arm64, Mac Studio, n 3, and on Linux x86_64), and 300,208 over
-/// TLS 1.3 (macOS arm64), at one, two and four connections, each within 400 bytes of the others,
-/// 2026-11-15, with the principals' key lookups and S3's copies in the listener; 341,668 and
-/// 295,744 before them (2026-11-12). Mostly pieces of 64 KiB (`PIECE`): two the host took, two
-/// waiting in the body's channel, one being read.
-pub const CONNECTION_BYTES: u64 = 346_212;
+/// What one connection holds with a request in flight, the host holding the pieces of its body:
+/// measured by a counting allocator on the listener's thread with the whole body taken
+/// (`tests/listener_memory.rs`), 382,028 bytes at the most, over TLS 1.3 at one connection on
+/// Windows x86_64 (Jupiter, 2026-11-16); a connection over TLS adds 381,964 from one connection to
+/// four and one over plain HTTP 346,132, the same on macOS arm64 and Windows x86_64 at every count,
+/// whose single-connection counts hold 80 bytes more there. Mostly pieces of 64 KiB (`PIECE`): the
+/// four of the test's body, and the connection's own buffer, which each read reuses; TLS 1.3 adds
+/// its session's buffers. Counted with only what a connection reads ahead taken, the count read
+/// however far each connection had read: 300,208 over TLS, and on one CPU 101 KB less at one
+/// connection (CI run 43762797164).
+pub const CONNECTION_BYTES: u64 = 382_028;
 
 /// The connections past those it serves ([`Settings::connections`]) the listener answers `503
 /// SlowDown`, `Connection: close`, rather than closes: as many as one more stock client opens at

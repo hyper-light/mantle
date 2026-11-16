@@ -3,9 +3,10 @@
 //! as the door holds it and the pieces of its body the connection read ahead of the host, counted
 //! by hyper-measure's counting allocator on the listener's thread, which the clients' threads do
 //! not touch. Each client sends a signed PUT whose body is longer than the pieces a connection
-//! reads ahead; the test takes each request from the door and holds the pieces it is sent, as the
-//! host holds them while it writes, so every connection stands at its most. What one connection
-//! adds is the difference between counts of connections, and it is the same for each.
+//! reads ahead; the test takes each request from the door and holds every piece of its body, as
+//! the host holds them while it writes, so every connection stands at its most whatever order the
+//! threads ran in. What one connection adds is the difference between counts of connections, and
+//! it is the same for each.
 
 #![allow(
     clippy::unwrap_used,
@@ -209,9 +210,13 @@ fn held(connections: usize, tls: bool) -> i64 {
                 })
                 .collect();
             alloc::resume();
-            // The host's side: each request taken from the door as it comes and its body's pieces
-            // taken as the connection sends them, until each connection has sent what it reads
-            // ahead; then the count is read.
+            // The host's side: each request taken from the door as it comes and its whole body
+            // taken as the connection sends it, held as the host holds pieces while it writes;
+            // then the count is read. Every octet the client sent has then passed through the
+            // connection's buffer into pieces the host holds, whatever order the connections and
+            // their clients ran in. Taking only what a connection reads ahead, the count read
+            // whatever it had read by then: on one CPU a lone connection had not read its last
+            // pieces off the socket, and held 101 KB less (CI run 43762797164).
             let hold = async {
                 while requests.len() < connections {
                     match doorway.waiting() {
@@ -226,13 +231,16 @@ fn held(connections: usize, tls: bool) -> i64 {
                 for request in &mut requests {
                     // A put's driver wants its body: the connection reads it from here on.
                     request.reply.try_send(door::Answer::Ready).unwrap();
-                    let mut taken = 0;
-                    while taken < 2 * PIECE {
+                    loop {
                         match request.body.recv().await.unwrap() {
                             Piece::Bytes(bytes) => {
-                                taken += bytes.len();
+                                // The piece is the connection's copy; the list the test keeps
+                                // it in is the test's, uncounted.
+                                alloc::pause();
                                 pieces.push(bytes);
+                                alloc::resume();
                             }
+                            Piece::End(_) => break,
                             other => panic!("{other:?}"),
                         }
                     }

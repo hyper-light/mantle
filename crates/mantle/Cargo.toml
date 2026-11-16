@@ -69,5 +69,9 @@ hyper-transport = { path = "../../vendor/hyper-transport" }
 mantle-range = { path = "../range" }
 tempfile.workspace = true
 
+# A node's process held still on Windows, which has no stopping signal (tests/support/hold.rs).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true
+
 [lints]
 workspace = true

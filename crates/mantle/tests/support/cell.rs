@@ -1914,17 +1914,6 @@ impl Cell {
         self.ended()
     }
 
-    /// Sends node `id`'s process `signal` by the system's `kill` (`STOP` holds it still, as a host
-    /// that sleeps does, `CONT` lets it go on).
-    pub(crate) fn signal(&self, id: u64, signal: &str) {
-        let pid = self.running[&id].child.id().to_string();
-        let sent = Command::new("kill")
-            .args([format!("-{signal}"), pid.clone()])
-            .status()
-            .unwrap();
-        assert!(sent.success(), "kill -{signal} {pid}: {sent}");
-    }
-
     /// Waits until each of `observers` says each range's configuration is what `wanted` takes:
     /// its voters and its learners as that node's member applied them, each range one a node said
     /// a configuration of (a cell `mantle init` made draws its ranges' groups).

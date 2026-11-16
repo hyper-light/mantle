@@ -27,6 +27,8 @@ mod cell;
 #[allow(dead_code)]
 #[path = "../../node/tests/support/history.rs"]
 mod history;
+#[path = "support/hold.rs"]
+mod hold;
 #[allow(dead_code)]
 #[path = "../../range/tests/support/linear.rs"]
 mod linear;
@@ -542,7 +544,7 @@ fn a_cell_grows_from_one_to_five_and_back_to_two_voters_under_load() {
     let held = members[1];
     let others: Vec<u64> = members.iter().copied().filter(|m| *m != held).collect();
     lead(&mut cell, &mut load, &others);
-    cell.signal(held, "STOP");
+    hold::still(cell.running[&held].child.id());
     // Its absence recorded by the root range's leader, from its liveness stream.
     cell.until(|c| {
         holds(others.iter().all(|o| {
@@ -551,7 +553,7 @@ fn a_cell_grows_from_one_to_five_and_back_to_two_voters_under_load() {
                 .is_some_and(|(_, since)| *since != 0)
         }))
     });
-    cell.signal(held, "CONT");
+    hold::go_on(cell.running[&held].child.id());
     // Back: its return recorded.
     cell.until(|c| {
         holds(members.iter().all(|o| {
@@ -568,14 +570,14 @@ fn a_cell_grows_from_one_to_five_and_back_to_two_voters_under_load() {
     let away = members[2];
     let present: Vec<u64> = members.iter().copied().filter(|m| *m != away).collect();
     lead(&mut cell, &mut load, &present);
-    cell.signal(away, "STOP");
+    hold::still(cell.running[&away].child.id());
     let fourth = joins(&mut cell, 4);
     let mut observers = present.clone();
     observers.push(fourth);
     cell.configured(&observers, |voters, _| {
         observers.iter().all(|m| votes(voters, *m))
     });
-    cell.signal(away, "CONT");
+    hold::go_on(cell.running[&away].child.id());
     members.push(fourth);
     let all = members.clone();
     cell.configured(&members, |voters, _| all.iter().all(|m| votes(voters, *m)));

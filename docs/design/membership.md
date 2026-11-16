@@ -44,7 +44,7 @@ A member's states and what moves it between them:
 | (none) | `Serving` | `Join`, from the node itself, its grant in the window | a member: it votes, its volumes take chunks |
 | `Serving` | `Leaving` | `Leave`, from the node itself | it asked to leave in order: it serves its chunks until repair has moved them, takes no new one, and votes in no range |
 | `Serving`, `Leaving` | `Gone` | `Gone`, judged by §5's rule, or stated by an operator, a supervisor or repair | its identity is refused from now on; its chunks are rebuilt elsewhere |
-| `Leaving`, `Gone` | `Removed` | `Remove`, once no volume of it is left in the table | its identity refused; its row kept until no range's configuration names it |
+| `Leaving`, `Gone` | `Removed` | `Remove`, once no volume of it is left in the table | its row kept until no range's configuration names it; its identity refused once the root range keeps it as a learner no more (§4 step 5) |
 | `Removed` | (delisted) | `Delist`, once no range names it | its rows go; its grant stays spent, so it can never join again |
 
 Every transition is a command of the root range, applied the same on every member (node.md §6.6);
@@ -81,12 +81,13 @@ handshake verifies the chain, node.md §3.6) as the node it names when (`crate::
 
 1. it is a pinned peer (a gateway, or a founder of a cell made before grants), byte for byte, as
    before, unless its grant is spent and the root range holds no member of its id: removed;
-2. its id is a member the root range holds `Serving` or `Leaving`, and its certificate's SHA-256 is
-   the member's fingerprint; or
+2. its id is a member the root range holds `Serving` or `Leaving`, or `Removed` while the root
+   range's configuration, as this node applied it, keeps it as a learner (§4 step 5), and its
+   certificate's SHA-256 is the member's fingerprint; or
 3. it names no member and its grant is new by the window: a node granted and not yet joined.
 
-A `Gone` member, a removed one (its grant spent, its rows gone) and a certificate that is neither
-are refused at the handshake, charged to no identity (hyper-transport `Directory::identify`). A
+A `Gone` member, a removed one the root range keeps as a learner no more, a delisted one (its grant
+spent, its rows gone) and a certificate that is neither are refused at the handshake, charged to no identity (hyper-transport `Directory::identify`). A
 node applies its root range's entries to its directory at each turn that applied any, and closes
 the connections of an identity it refuses from then (`Endpoint::refuse` with `Refusal::Identity`),
 so a removal reaches connections already open (node.md §3.6).
@@ -191,10 +192,15 @@ standard input (one running), the steps a supervisor runs without a person:
    leaving node stays up through this, serving the reads repair copies from.
 5. With no volume of it left in the table and no range having it vote, the root range's leader
    asks `Remove { node }`: removed. The leaving node, still a learner of the root range, applies
-   it, says `left`, stops in order and exits 0. The leader then drops it from the root range's
-   configuration, once the leaving node has said its storage holds the commit that removed it (a
-   learner dropped sooner would never hear of its own removal), and, once no range names it, asks
-   `Delist { node }`: its rows go.
+   it and says `left`. It stays admitted while the root range keeps it as a learner (§2 rule 2),
+   and serves on, so the leader hears that its storage holds the commit that removed it: a member's
+   answers carry its durable commit (hyper-raft core step R-6), and a leader elected meanwhile,
+   whose tracker starts empty, hears it again. The leader then drops it from the root range's
+   configuration (a learner dropped sooner would never hear of its own removal), and, once no range
+   names it, asks `Delist { node }`: its rows go. Each member refuses its identity once it applies
+   the drop, and the leaving node, at the first refusal since its removal, stops in order and exits
+   0. Refused at the removal itself, as the members first did, it could not answer: it either never
+   heard its removal or was never heard, and the leader kept it as a learner for good.
 
 A leave never completes while its volumes hold a chunk the cell needs: until repair has retired
 them, the node waits in step 4, which keeps every acknowledged object as whole as it was.

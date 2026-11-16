@@ -120,6 +120,7 @@ use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::signal::Signal;
+use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_ec::durability::{Burst, Rates};
 use mantle_engine::store::{Config as StoreConfig, Shape, Store};
@@ -2556,7 +2557,14 @@ enum Departure {
     Asking(CommandAsk),
     /// The root range holds it leaving: it waits until its volumes are retired and it is removed.
     Leaving,
-    /// Removed: its orderly stop runs, and the process ends with it.
+    /// Removed, as its own replica of the root range applied it: it said `left`, and serves on,
+    /// admitted as the root range's learner, so the root range's leader hears that its storage
+    /// holds the commit that removed it, which the leader waits for before it drops the learner
+    /// (membership.md §4 step 5); a leader elected meanwhile hears it from it again. A peer's
+    /// refusal of its identity says the cell has dropped it, the leader having heard: each
+    /// peer's link endings as counted at its removal, so a refusal from before does not count.
+    Removed(Vec<(u64, u64)>),
+    /// Removed and dropped: its orderly stop runs, and the process ends with it.
     Left,
     /// A node with no standing whose volumes are leaving: repair drains them while it serves.
     Draining,
@@ -2616,9 +2624,24 @@ impl Departure {
                     .and_then(|cell| cell.member(node.id()))
                     .is_none_or(|row| row.state == MemberState::Removed);
                 if removed {
+                    *self = Self::Removed(node.links().map(|l| (l.peer, l.ended)).collect());
+                    Ok(Some("left\n"))
+                } else {
+                    Ok(None)
+                }
+            }
+            Self::Removed(ended) => {
+                let refused = node.links().any(|l| {
+                    l.refusal == Some(Refusal::Identity)
+                        && ended
+                            .iter()
+                            .find(|(peer, _)| *peer == l.peer)
+                            .is_none_or(|(_, then)| l.ended > *then)
+                });
+                if refused {
                     *self = Self::Left;
                     node.stop();
-                    Ok(Some("left\nstopping\n"))
+                    Ok(Some("stopping\n"))
                 } else {
                     Ok(None)
                 }

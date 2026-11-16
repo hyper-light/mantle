@@ -616,8 +616,9 @@ pub enum MemberState {
     Leaving,
     /// Judged or stated gone: its identity is refused, and its chunks are rebuilt elsewhere.
     Gone,
-    /// Leaving or gone, with no volume left: its identity is refused, and its row is kept until no
-    /// range's configuration names it.
+    /// Leaving or gone, with no volume left: its row is kept until no range's configuration names
+    /// it, and its identity is refused once the root range keeps it as a learner no more
+    /// (docs/design/membership.md §4 step 5).
     Removed,
 }
 

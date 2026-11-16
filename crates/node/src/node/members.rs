@@ -82,9 +82,17 @@ impl Cell {
     }
 }
 
-/// Whether a member's identity is admitted: serving or leaving.
-fn admitted(state: MemberState) -> bool {
-    matches!(state, MemberState::Serving | MemberState::Leaving)
+/// Whether a member's identity is admitted: serving or leaving, or removed while the root range
+/// keeps it as a learner (`root_learner`), so it can be heard saying its storage holds the commit
+/// that removed it, which the root range's leader waits for before it drops it (membership.md §4
+/// step 5). Refused at its removal, it could say nothing more: it would never hear its removal
+/// either, or, hearing it, never be heard, and the leader would keep it as a learner for good.
+fn admitted(state: MemberState, root_learner: bool) -> bool {
+    match state {
+        MemberState::Serving | MemberState::Leaving => true,
+        MemberState::Removed => root_learner,
+        MemberState::Gone => false,
+    }
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
@@ -100,7 +108,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.cell
             .as_ref()
             .and_then(|c| c.member(self.id))
-            .is_some_and(|row| admitted(row.state))
+            .is_some_and(|row| matches!(row.state, MemberState::Serving | MemberState::Leaving))
+    }
+
+    /// Whether the root range's configuration, as this node's member of it applied it, keeps `id`
+    /// as a learner.
+    fn root_learner(&self, id: u64) -> bool {
+        self.root_range()
+            .and_then(|(handle, _)| self.owner.get(handle))
+            .is_some_and(|shell| {
+                let c = shell.configuration();
+                c.learners.contains(&id) || c.learners_next.contains(&id)
+            })
     }
 
     /// The configuration this node's member of `group` applied.
@@ -181,7 +200,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|(id, row)| Admitted {
                 id: *id,
                 fingerprint: row.fingerprint,
-                admitted: admitted(row.state),
+                admitted: admitted(row.state, self.root_learner(*id)),
             })
             .collect();
         let withdrawn = self.driver.endpoint().directory_mut().set_members(
@@ -231,7 +250,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if *id == self.id {
                 continue;
             }
-            if !admitted(row.state) {
+            if !admitted(row.state, self.root_learner(*id)) {
                 gone.push(*id);
                 continue;
             }

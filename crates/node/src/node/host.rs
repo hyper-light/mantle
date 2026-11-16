@@ -300,7 +300,7 @@ enum Work {
 /// §3.7); any other one.
 pub(super) fn weight(op: &Op) -> usize {
     match op {
-        Op::Copy(_) | Op::CopyPart(_) => 2,
+        Op::Copy(_) | Op::CopyPart(_) => crate::derive::COPY_WEIGHT,
         _ => 1,
     }
 }
@@ -891,13 +891,34 @@ pub(super) fn sized(
     };
     match written {
         Some(length) => {
-            let window = learned
+            let learned = learned
                 .blocks(length, gateway.charges.largest_block())
                 .max(gateway.window);
+            let window = fitting(gateway, length, learned);
             (gateway.charges.write(window, length), window)
         }
         None => (gateway.charges.of(None), gateway.window),
     }
+}
+
+/// The widest window from the floor's to the one learned whose write of `length` bytes the
+/// operations' bytes hold (`gateway.objects_bytes`), the floor's where none past it does: a write
+/// charged past them would never be admitted, and the door, which takes its requests in the order
+/// they came, would hold every request behind it (CLAUDE.md §2). The floor's always fits, as the
+/// operations' bytes are at least the most one operation is charged (`derive::most_charged`). A
+/// write's charge grows with the blocks it holds going down (`derive::Charges::write`), so the
+/// widest is found by halving the range.
+fn fitting(gateway: &GatewaySettings, length: u64, learned: usize) -> usize {
+    let (mut low, mut high) = (gateway.window, learned.max(gateway.window));
+    while low < high {
+        let mid = low.saturating_add(high.saturating_sub(low).div_ceil(2));
+        if gateway.charges.write(mid, length) <= gateway.objects_bytes {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    low
 }
 
 /// A bucket's versioning as GetBucketVersioning answers it: none for a bucket never versioned.
@@ -5440,6 +5461,42 @@ mod tests {
         let counts = hyper_measure::alloc::end();
         assert_eq!(again, scheme(&gateway, &fewer));
         assert_eq!((counts.allocations, counts.reallocations), (1_833, 3));
+    }
+
+    /// A write is charged at the widest window from the floor's to the one learned whose charge
+    /// the operations' bytes hold: one learned past them is held to what they hold, so the write
+    /// is admitted alone and never waits at the door for good; with room, the learned one stands.
+    #[test]
+    fn a_writes_window_is_held_to_what_the_operations_bytes_hold() {
+        let charges = || crate::derive::Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap();
+        let length = 64u64 << 20;
+        let learned = usize::try_from(length.div_ceil(charges().largest_block())).unwrap();
+        let mut gateway = GatewaySettings {
+            keys: Vec::new(),
+            handover_ns: 1,
+            window: 1,
+            objects: 1,
+            objects_bytes: crate::derive::most_charged(&charges()),
+            charges: charges(),
+            clients: 1,
+            bucket_quota: 1,
+            scan_rows: 1,
+            rates: Rates {
+                chunk: 0.000_001_552_511_415_525_114_2,
+                domains: None,
+                bursts: Vec::new(),
+                repair: 0.041_666_666_666_666_664,
+            },
+            target: 1e-11,
+        };
+        let charge = |window| charges().write(window, length);
+        assert!(charge(learned) > gateway.objects_bytes);
+        let window = fitting(&gateway, length, learned);
+        assert!((1..learned).contains(&window), "{window} of {learned}");
+        assert!(charge(window) <= gateway.objects_bytes);
+        assert!(charge(window + 1) > gateway.objects_bytes);
+        gateway.objects_bytes = charge(learned);
+        assert_eq!(fitting(&gateway, length, learned), learned);
     }
 
     /// A get blocked before reading its version must still be refused at its own deadline;

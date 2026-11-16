@@ -171,20 +171,84 @@ pub struct Gateway {
 
 /// How many operations `share` bytes hold, and the bytes left for what they hold at their own
 /// sizes, where each operation costs its charge and `beside` bytes of the node's other classes
-/// (its exchanges, its client's connections, its read's state): one operation of the largest
-/// blocks, and as many more at the least an operation holds as the share then holds. At least
-/// one, at the most an operation holds, where the share holds less.
-pub fn operations(share: u64, beside: u64, charges: &Charges) -> (usize, u64) {
-    let most = charges.most();
+/// (its exchanges, its client's connections, its read's state): the bytes for what the node
+/// serves first ([`served`]), and as many operations more at the least one holds as the share
+/// then holds; never fewer than the operations served where the share holds them at the least,
+/// the bytes past them its parts', and at least one, its bytes at least the most one operation is
+/// charged ([`most_charged`]), where the share holds less: every operation is admitted alone.
+pub fn operations(share: u64, beside: u64, charges: &Charges, serving: Served) -> (usize, u64) {
+    let floor = most_charged(charges);
+    let held = serving.bytes.max(floor);
     let each = charges.least().saturating_add(beside).max(1);
     let by_least = share.checked_div(each).unwrap_or(0);
-    let by_most = share
-        .checked_sub(most)
-        .and_then(|rest| rest.checked_div(beside.max(1)))
-        .unwrap_or(0);
-    let count = by_least.min(by_most).max(1);
-    let bytes = share.saturating_sub(count.saturating_mul(beside)).max(most);
+    let past = |bytes: u64| {
+        share
+            .checked_sub(bytes)
+            .and_then(|rest| rest.checked_div(beside.max(1)))
+            .unwrap_or(0)
+    };
+    let (by_held, by_floor) = (past(held), past(floor));
+    let count = by_least
+        .min(by_held)
+        .max(serving.operations.min(by_least).min(by_floor))
+        .max(1);
+    let bytes = share
+        .saturating_sub(count.saturating_mul(beside))
+        .max(floor);
     (usize::try_from(count).unwrap_or(usize::MAX), bytes)
+}
+
+/// The operations a copy holds at once once taken, its get and its put (research/89 §3.7): a
+/// copy is charged each at the most an operation holds (`host::charged`).
+pub(crate) const COPY_WEIGHT: usize = 2;
+
+/// The most bytes one operation is charged: a copy's, its get's and its put's at once, each at
+/// the most a get or a put holds ([`COPY_WEIGHT`], `host::charged`). The operations' bytes are
+/// never less, so every operation is admitted alone, and the door, which takes its requests in
+/// the order they came, never holds one that can never be taken.
+pub fn most_charged(charges: &Charges) -> u64 {
+    u64::try_from(COPY_WEIGHT)
+        .ok()
+        .and_then(|weight| charges.most().checked_mul(weight))
+        .unwrap_or(u64::MAX)
+}
+
+/// What one stock client's part holds going down (`listener::STOCK_PART`), charged as the host
+/// charges a write of it (`host::sized`): every block of it at once, the most any window the node
+/// learns gives a body of that length (`crate::window::Window::blocks`).
+pub fn stock_part(charges: &Charges) -> u64 {
+    let part = crate::listener::STOCK_PART;
+    let blocks = part.div_ceil(charges.largest_block().max(1)).max(1);
+    charges.write(usize::try_from(blocks).unwrap_or(usize::MAX), part)
+}
+
+/// What a node's operations serve at least: their count and the bytes they hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Served {
+    pub operations: u64,
+    pub bytes: u64,
+}
+
+/// What a node's operations serve at least ([`Served`]): one operation at the most one is charged
+/// ([`most_charged`]); where it serves S3, as many as one stock client asks of its endpoint at
+/// once (`listener::STOCK_CLIENT`), each a part of its own at the most a part is charged
+/// ([`stock_part`]), so a default AWS CLI's or boto3's connections are each served and their parts
+/// admitted at once, none waiting at the door past its client's patience.
+pub fn served(charges: &Charges, s3: bool) -> Served {
+    let floor = most_charged(charges);
+    if !s3 {
+        return Served {
+            operations: 1,
+            bytes: floor,
+        };
+    }
+    let operations = crate::listener::STOCK_CLIENT;
+    Served {
+        operations,
+        // A product past a u64 is past any memory: the floor that holds it refuses every
+        // allowance.
+        bytes: operations.saturating_mul(stock_part(charges)).max(floor),
+    }
 }
 
 /// The gateway of a node that runs `objects` operations at once at most, their bytes at their own
@@ -1881,13 +1945,16 @@ pub fn derive(
     let classes_at = |held: &Held, objects_bytes: u64| {
         classes_of(held, objects_bytes, volume_bytes, stacks_held)
     };
-    // The operations' first, one of the largest blocks ([`operations`]); none where the node
+    // The operations' first, at the most one is charged ([`operations`]); none where the node
     // hosts no objects.
     let first = if hosts {
-        crate::derive::objects(&gateway(1, charges.most())?, &schemes)?
+        crate::derive::objects(&gateway(1, most_charged(&charges))?, &schemes)?
     } else {
         0
     };
+    // What its operations serve at least: a stock client's connections and their parts where the
+    // node serves S3 ([`served`]).
+    let serving = served(&charges, hosts && stated.s3.is_some());
     // What an orchestrator gives the node: its floor at the most its devices can be measured to
     // take, with as many operations as one stock client asks of an S3 endpoint at once
     // (`listener::STOCK_CLIENT`), the least that never leaves a default client's transfers
@@ -1905,20 +1972,17 @@ pub fn derive(
         .map(|(_, depth)| depth)
         .collect();
         let deep_threads = threads(&deep_depths, &scrubs).ok_or(overflow("the node's threads"))?;
-        let served = if hosts && stated.s3.is_some() {
-            usize::try_from(crate::listener::STOCK_CLIENT)
-                .map_err(|_| overflow("a stock client"))?
+        let served = if hosts {
+            usize::try_from(serving.operations).map_err(|_| overflow("a stock client"))?
         } else {
-            usize::from(hosts)
+            0
         };
-        // One operation of the largest blocks and the rest at the least one holds (`operations`).
+        // The bytes for what the node serves ([`served`]): with one operation of the largest
+        // blocks and the rest at the least one holds, a pod given its need admitted one of
+        // boto3's ten 8 MiB parts at a time, and the last waited at the door past its client's
+        // patience (kind-cell, CI run 43790965629).
         let served_bytes = if hosts {
-            let rest = u64::try_from(served.saturating_sub(1))
-                .ok()
-                .and_then(|rest| rest.checked_mul(charges.least()))
-                .and_then(|rest| rest.checked_add(charges.most()))
-                .ok_or(overflow("the operations' bytes"))?;
-            crate::derive::objects(&gateway(served, rest)?, &schemes)?
+            crate::derive::objects(&gateway(served, serving.bytes)?, &schemes)?
         } else {
             0
         };
@@ -1964,20 +2028,19 @@ pub fn derive(
             .zip(total(&one))
             .and_then(|(two, one)| two.checked_sub(one))
             .ok_or(overflow("an operation's state"))?;
-        // The data first (research/87 §4, rule D): the floor with one operation of the largest
-        // blocks, and the indexes' and engines' wants beside it; what the memory holds past both
-        // is the operations', with the one, its state and its charge.
+        // The data first (research/87 §4, rule D): the floor with one operation at the most one
+        // is charged, and the indexes' and engines' wants beside it; what the memory holds past
+        // both is the operations', with the one, its state and its charge.
         let floor_one = classes_at(&one, first)?
             .iter()
             .try_fold(0u64, |sum, &(_, bytes)| sum.checked_add(bytes))
             .ok_or(overflow("the floor"))?;
         let slack = allowed.saturating_sub(floor_one).saturating_sub(wanted);
-        let share = charges
-            .most()
+        let share = most_charged(&charges)
             .checked_add(each)
             .and_then(|share| share.checked_add(slack))
             .ok_or(overflow("the operations' share"))?;
-        operations(share, each, &charges)
+        operations(share, each, &charges, serving)
     } else {
         (0, 0)
     };
@@ -3345,12 +3408,36 @@ mod tests {
         let charges = Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap();
         let share = 1u64 << 30;
         let beside = 300_000;
-        let (count, bytes) = operations(share, beside, &charges);
+        let most = most_charged(&charges);
+        let one = Served {
+            operations: 1,
+            bytes: most,
+        };
+        let (count, bytes) = operations(share, beside, &charges, one);
         let count = u64::try_from(count).unwrap();
         assert_eq!(count, share / (charges.least() + beside));
         assert_eq!(bytes, share - count * beside);
-        assert!(bytes >= charges.most() && bytes >= count * charges.least());
-        assert_eq!(operations(1, beside, &charges), (1, charges.most()));
+        assert!(bytes >= most && bytes >= count * charges.least());
+        assert_eq!(operations(1, beside, &charges, one), (1, most));
+        // Bytes held for what the node serves come first, the operations past them each at the
+        // least.
+        let held = Served {
+            operations: 10,
+            bytes: share / 2,
+        };
+        let (count, bytes) = operations(share, beside, &charges, held);
+        let count = u64::try_from(count).unwrap();
+        assert!(bytes >= held.bytes, "{bytes} of {}", held.bytes);
+        assert_eq!(count, (share - held.bytes) / beside);
+        // A share short of those bytes still serves the operations it holds at the least, the
+        // bytes past them theirs.
+        let short = Served {
+            operations: 10,
+            bytes: share * 2,
+        };
+        let (count, bytes) = operations(share, beside, &charges, short);
+        assert_eq!(count, 10);
+        assert_eq!(bytes, share - 10 * beside);
         let g = gateway(7, 9).unwrap();
         assert_eq!(
             (g.objects, g.objects_bytes, g.clients, g.window),
@@ -4075,11 +4162,14 @@ mod tests {
     }
 
     /// A node with an S3 endpoint needs as many operations as one stock client asks at once
-    /// (`listener::STOCK_CLIENT`): given its need, at its device's queue it runs at least that many,
-    /// so its listener serves every connection a default AWS CLI or boto3 opens, and its index
-    /// holds its whole want; a byte short, the index stays whole, the data first (research/87 §4
-    /// rule D). Given the first operation alone, a pod at its device's queue served one connection
-    /// and boto3's parts timed out (kind-cell).
+    /// (`listener::STOCK_CLIENT`), each a part of its own (`listener::STOCK_PART`): given its need,
+    /// at its device's queue it runs at least that many, so its listener serves every connection a
+    /// default AWS CLI or boto3 opens, its admission takes all of their parts at once at the most
+    /// a part is charged, and its index holds its whole want; a byte short, the index stays whole,
+    /// the data first (research/87 §4 rule D). Given the first operation alone, a pod at its
+    /// device's queue served one connection and boto3's parts timed out (kind-cell); given one
+    /// part's bytes and nine operations' least, it admitted one part at a time and the last timed
+    /// out (kind-cell, CI run 43790965629).
     #[test]
     fn a_node_given_its_need_serves_one_stock_clients_connections() {
         let s3 = |ceiling| Stated {
@@ -4106,6 +4196,28 @@ mod tests {
         let given = derive(s3(Some(need)), &deep(316, 316), &mut fresh).unwrap();
         assert!(said_bytes(&given, "gateway.objects") >= stock);
         assert_eq!(said_bytes(&given, "volume.1.index_bytes"), index_want);
+        // The charges the node's process reckons from its file (`process::gateway_settings`).
+        let gateway = given.config.gateway.as_ref().unwrap();
+        let rates = Rates {
+            chunk: gateway.chunk_rate,
+            domains: None,
+            bursts: gateway.bursts.clone(),
+            repair: gateway.repair_rate,
+        };
+        let charges = charges(
+            gateway.window,
+            given.config.enlist.as_ref(),
+            &rates,
+            gateway.target,
+        )
+        .unwrap();
+        let part = stock_part(&charges);
+        assert!(part > charges.least());
+        let mut admission = crate::admit::Admission::new(gateway.objects, gateway.objects_bytes, 0);
+        for n in 0..stock {
+            assert_eq!(admission.admits(part), Ok(()), "part {n} of {stock}");
+            admission.admitted(part);
+        }
         let short = derive(s3(Some(need - 1)), &deep(316, 316), &mut fresh).unwrap();
         assert_eq!(said_bytes(&short, "volume.1.index_bytes"), index_want);
     }

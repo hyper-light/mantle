@@ -93,10 +93,13 @@ it, and the operator gives the pod that (`resources.memory`, which the chart req
 the node's floor at the most its devices can be measured to take, each one's reported queue, where
 calibration's ladder stops (`derive::deepest`), with as many operations as one stock client asks
 of its S3 endpoint at once (ten, the AWS CLI's `max_concurrent_requests` and botocore's
-`max_pool_connections`; the first alone where it serves no S3), and every volume's index and
-engine's resident metadata whole for the objects the cell's volumes hold (`derive::need`). With the
-first operation alone, a pod at its device's queue served one connection, and boto3's other parts
-timed out writing their bodies (kind-cell, CI run 43760462414). A floor at the measured
+`max_pool_connections`; the first alone where it serves no S3), each holding a part of its own,
+the AWS CLI's and boto3's 8 MiB, at the most a part is charged (`derive::served`), and every
+volume's index and engine's resident metadata whole for the objects the cell's volumes hold
+(`derive::need`). With the first operation alone, a pod at its device's queue served one
+connection, and boto3's other parts timed out writing their bodies (kind-cell, CI run
+43760462414); with ten operations but bytes for one part, it admitted one part at a time and the
+last timed out (kind-cell, CI run 43790965629). A floor at the measured
 depth would not do: calibration's knee moves with the host's load, and the KIND cell's pods on one
 CI runner's disk measured depths of 1, 4, 16, 64 and 316 from one to the next (diag runs
 43675803389 and 43676924862, 2026-11-14); the floor grows with the depth, so a pod given the floor

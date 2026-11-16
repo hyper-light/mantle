@@ -1334,17 +1334,30 @@ becomes:
   is known only once its row is read. A request turned away for bytes says nothing of the limit;
   one turned away by the limit tells it its clients ask more. The data comes first (research/87
   §4, rule D): the memory past every class's floor is the indexes' and engines' wants first, each
-  taken whole, and what the memory holds past those is the operations', with at least one of the
-  largest blocks. Which of the derived rules (A, B, D) stays is §4's experiment. That share holds
-  one operation of the largest blocks, and as many more as fit at what one costs:
-  the least it is charged, a write of no bytes, and what one more operation adds to the node's
-  other classes, its native client's connections and kept exchange, its pooled exchange, its
-  chunk asks' exchanges and each range's state for its read, the derivation's own difference
-  between one operation and two (`derive::operations`). That count is the limit's ceiling `C`
-  (`gateway.objects`), and the node admits as many native clients. What remains of the share is
-  `gateway.objects_bytes`. Where a fixed ceiling of 8 operations each charged 42 MB stood, a node
-  now holds thousands of small writes at once, and the learned limit, not the ceiling, decides how
-  many run.
+  taken whole, and what the memory holds past those is the operations', with at least one at the
+  most one is charged, a copy's get and put at once (`derive::most_charged`). Which of the derived
+  rules (A, B, D) stays is §4's experiment. That share holds first the bytes for what the node
+  serves (`derive::served`): the most one operation is charged, and, where it serves S3, each
+  of one stock client's ten connections a part of its own, the AWS CLI's and boto3's 8 MiB
+  (`listener::STOCK_PART`), at the most a part is charged, every block of it going down at once
+  (`derive::stock_part`); then as many operations more as fit at what one costs: the least it is
+  charged, a write of no bytes, and what one more operation adds to the node's other classes, its
+  native client's connections and kept exchange, its pooled exchange, its chunk asks' exchanges
+  and each range's state for its read, the derivation's own difference between one operation and
+  two (`derive::operations`). A share short of the bytes for what the node serves still serves as
+  many operations as one stock client asks where it holds them at the least, the bytes past them
+  its parts'. That count is the limit's ceiling `C` (`gateway.objects`), and the node admits as
+  many native clients. What remains of the share is `gateway.objects_bytes`. Where
+  a fixed ceiling of 8 operations each charged 42 MB stood, a node now holds thousands of small
+  writes at once, and the learned limit, not the ceiling, decides how many run. With only one
+  operation of the largest blocks held and the rest at the least, a pod given its need admitted
+  one of boto3's 8 MiB parts at a time, its last part waiting at the door past botocore's 60 s
+  (kind-cell, CI run 43790965629).
+- **No request waits at the door for good.** The door takes its requests in the order they came,
+  so one that could never be admitted would hold every request behind it. A write is charged at
+  the widest window from the floor's to the one learned whose charge the operations' bytes hold
+  (`host::fitting`): the floor's always fits, since those bytes are at least the most one
+  operation is charged, so every request is admitted once the operations before it end.
 - **Native clients draw their exchanges from a pool.** A client's connection keeps one exchange of
   its own, as mantle-client asks one at a time, and the rest it opens come from a pool the node
   sizes to its learned limit (hyper-transport's `StreamCredit::Pooled`, Breakwater's credit, Cho

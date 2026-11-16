@@ -42,6 +42,12 @@ pub use conn::PIECE;
 /// configuration reference; botocore's `Config`).
 pub(crate) const STOCK_CLIENT: u64 = 10;
 
+/// The part one stock client cuts an upload into, and the size past which it cuts one: the AWS
+/// CLI's default `multipart_chunksize` and `multipart_threshold`, `8MB` each, a megabyte 1024²
+/// octets to it (the AWS CLI's S3 configuration reference; research/73 [10]), as boto3's
+/// transfers default. A stock client's connections each carry one at once.
+pub(crate) const STOCK_PART: u64 = 8 << 20;
+
 /// What one connection holds with a request in flight, the host holding the pieces of its body it
 /// took: measured by a counting allocator on the listener's thread (`tests/listener_memory.rs`),
 /// 346,212 bytes at the most over plain HTTP, at one connection on Windows aarch64 (CI run

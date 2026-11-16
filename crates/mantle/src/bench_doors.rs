@@ -32,7 +32,9 @@
 //! clients are tasks on one hyper-rt shard, each holding one connection and the buffers its
 //! operations work in ([`Logical`]), an HTTP connection carrying one request at a time; open loop,
 //! their requests arrive as a Poisson process and each waits for a free client; closed, a ladder
-//! of clients doubles while throughput grows by [`GROWTH`], up to `--clients`. Each phase says the
+//! of clients doubles while throughput grows, up to `--clients`, each step judged in rounds as a
+//! benchmark point is (measurement.md §5, [`ROUNDS`]) and its growth told by their intervals, the
+//! ladder ending three steps after the last that grew ([`FLAT`]). Each phase says the
 //! threads the process ran as the OS counts them, read as its clients' requests were out, and what
 //! the harness's own work held at its peak: a phase's operations allocate nothing of the
 //! harness's, so neither grows with the clients or the objects.
@@ -57,7 +59,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel as watch_channel};
+use std::time::{Duration, Instant};
 
 use hyper_measure::alloc::{self, Counts};
 use hyper_measure::open_loop::Arrivals;
@@ -70,6 +74,7 @@ use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::tcp::TcpStream;
 use mantle_client::{Client, Native, Rewind, Settings, Sink, Source, TRAILER, Wire};
 use mantle_disk::histogram::Histogram;
+use mantle_disk::rounds::{self, Judgment, Policy};
 use mantle_http::write::Length;
 use mantle_protocol::object::{Headers, List, Listing, Op, Reply, Status};
 use mantle_s3::checksum::{self, Algorithm, Hasher};
@@ -89,10 +94,60 @@ const BUCKET: &str = "doors";
 /// before the phase from the generator, so the check holds no table that grows with the phase.
 const ETAGS: u64 = 16;
 
-/// Throughput a closed ladder's step must add to the last's for the ladder to double again: a
-/// tenth, as measurement.md §10's ladder "doubles while appends a second grow", above the run to
-/// run spread its repeated runs resolve (research/11 §16).
-const GROWTH: f64 = 0.1;
+/// How a closed ladder's step is judged: in rounds, ten at least and thirty at most, ending once
+/// they are independent and their median lies within ±5% at 95% (measurement.md §5,
+/// `Policy::STANDARD`), as a benchmark point's are. A step's growth over the best before it is told
+/// by their intervals, not by one throughput each: a single step's rate moved 13–30% from run to
+/// run on the doors (research/71), so a ladder that stopped at the first step not a tenth above
+/// the last ended where one noisy step fell.
+const ROUNDS: Policy = Policy::STANDARD;
+
+/// The steps in a row a closed ladder takes without growth before it ends: BBR's estimate that
+/// the pipe is full, "after 3 rounds w/o significant bw growth" (Linux v6.12
+/// `net/ipv4/tcp_bbr.c`, `bbr_full_bw_cnt`; research/87 [6]), so one step a stall slowed does not
+/// end the ladder below its knee, and the steps past it are measured.
+const FLAT: u32 = 3;
+
+/// The wait the harness's watch asks at a time ([`Watch`]): long enough that Linux's default timer
+/// slack, 50 µs a wait (prctl(2), `PR_SET_TIMERSLACK`), adds under a tenth of [`ROUNDS`]'s ±5% to
+/// what it counts as paused, `50 µs / (5% / 10)`.
+const TICK: Duration = Duration::from_millis(10);
+
+/// How long the harness's process went without running past the waits it asked: a thread that
+/// waits for the run's end a tick at a time and counts by how much each wait overran. A process
+/// stopped whole (its cgroup frozen, SIGSTOP, or a machine's pacer duty-cycling the work it runs
+/// while its disks fall behind) stops the cell this program runs and its clients alike, and every
+/// operation out meanwhile counts the stop in its latency. A phase says how long its process was
+/// stopped, so a stop is not read as the cell's.
+#[derive(Default)]
+struct Watch {
+    paused_ns: AtomicU64,
+    longest_ns: AtomicU64,
+}
+
+impl Watch {
+    /// Waits a tick at a time for `ended` to be sent or dropped, counting each wait's overrun.
+    fn run(&self, ended: &Receiver<()>) {
+        loop {
+            let began = Instant::now();
+            if !matches!(ended.recv_timeout(TICK), Err(RecvTimeoutError::Timeout)) {
+                return;
+            }
+            let over = began.elapsed().saturating_sub(TICK);
+            let over = u64::try_from(over.as_nanos()).unwrap_or(u64::MAX);
+            self.paused_ns.fetch_add(over, Ordering::Relaxed);
+            self.longest_ns.fetch_max(over, Ordering::Relaxed);
+        }
+    }
+
+    /// The time paused since the last take, and the longest pause in it, in nanoseconds.
+    fn take(&self) -> (u64, u64) {
+        (
+            self.paused_ns.swap(0, Ordering::Relaxed),
+            self.longest_ns.swap(0, Ordering::Relaxed),
+        )
+    }
+}
 
 /// A ListObjectsV2 page's keys at most: S3's 1,000 (`mantle_s3::body::MAX_OBJECTS`).
 const PAGE: u32 = 1000;
@@ -164,14 +219,6 @@ pub fn load_arg(text: &str) -> Result<Load, String> {
     Ok(Load::Open(rate))
 }
 
-/// A load as `--load` and `--write-load` take it: `open:RATE` or `closed`.
-fn load_name(load: Load) -> String {
-    match load {
-        Load::Open(rate) => format!("open:{rate}"),
-        Load::Closed => "closed".to_owned(),
-    }
-}
-
 /// `--sizes`: a byte count as `init::parse_bytes` reads one, or 0.
 pub fn size_arg(text: &str) -> Result<u64, String> {
     if text.trim() == "0" {
@@ -186,9 +233,6 @@ pub struct Options {
     pub sizes: Vec<u64>,
     pub objects: Vec<u64>,
     pub load: Load,
-    /// The writes' load where it differs from the reads' (`--write-load`): a PUT, a stream, a
-    /// part, a delete and a multipart upload's create, completion and abort; none, `load`.
-    pub write_load: Option<Load>,
     pub clients: usize,
     pub ops: u64,
     pub bytes: u64,
@@ -201,17 +245,9 @@ pub struct Options {
     /// The operations whose phases run; every one when empty. A phase reads the objects the
     /// phases before it made, so a read or a delete is asked beside the put it reads.
     pub kinds: Vec<Kind>,
-}
-
-impl Options {
-    /// The load `kind`'s phases run under: the writes' where `--write-load` states one, else
-    /// `--load`.
-    pub fn load_of(&self, kind: Kind) -> Load {
-        match self.write_load {
-            Some(load) if kind.writes() => load,
-            _ => self.load,
-        }
-    }
+    /// The native door's clients reach the nodes through the relay condition's path
+    /// (`crate::relay`), and only the native door runs.
+    pub relay: bool,
 }
 
 /// An S3 server this program did not start (`--endpoint`): the HTTP door's phases, controls and
@@ -283,21 +319,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Whether the operation changes what the server holds, as a PUT, a stream, a part, a delete
-    /// and a multipart upload's create, completion and abort do, which `--write-load` paces.
-    fn writes(self) -> bool {
-        matches!(
-            self,
-            Self::Put
-                | Self::Stream
-                | Self::Delete
-                | Self::Create
-                | Self::Part
-                | Self::Complete
-                | Self::Abort
-        )
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::Put => "PUT",
@@ -787,7 +808,8 @@ fn chunked_length(length: u64, scratch: &mut Vec<u8>) -> Result<u64, Error> {
         left = left.saturating_sub(n);
     }
     scratch.clear();
-    mantle_s3::chunked::last(scratch, Algorithm::Crc32, "AAAAAAAA");
+    mantle_http::write::last(scratch, &[(Algorithm::Crc32.header(), b"AAAAAAAA")])
+        .map_err(failed)?;
     total
         .checked_add(u64::try_from(scratch.len()).map_err(failed)?)
         .ok_or_else(|| failed("a body past u64"))
@@ -1035,7 +1057,8 @@ impl Http {
                 }
                 let value = crc.finish().map_err(failed)?.to_base64();
                 piece.clear();
-                mantle_s3::chunked::last(piece, Algorithm::Crc32, &value);
+                mantle_http::write::last(piece, &[(Algorithm::Crc32.header(), value.as_bytes())])
+                    .map_err(failed)?;
                 self.write(piece).await
             }
         }
@@ -1147,6 +1170,11 @@ impl Schedule {
         })
     }
 
+    /// Asks no more operations past those taken.
+    fn stop(&mut self) {
+        self.end = self.next;
+    }
+
     fn take(&mut self, now: u64) -> Result<Option<(u64, u64)>, Error> {
         if self.next >= self.end {
             return Ok(None);
@@ -1161,13 +1189,135 @@ impl Schedule {
     }
 }
 
-/// What a phase's tasks share: its schedule, its tally and the requests out now.
+/// What a phase's tasks share: its schedule, its tally, the requests out now and, for a closed
+/// step, its rounds.
 struct Shared {
     schedule: Schedule,
     tally: Tally,
     out: usize,
     error: Option<Error>,
     done: Vec<Logical>,
+    rounds: Option<Rounds>,
+}
+
+/// A closed step's rounds as its operations complete (measurement.md §5a): each round `size`
+/// operations, its throughput their count over the time since the round before it ended. The
+/// first, in which the step's clients ramp up from none, is not kept, as a benchmark's first
+/// iteration is not (Georges et al., OOPSLA 2007, §4.1; measurement.md §5a). Once [`ROUNDS`] finds
+/// the kept rounds enough, the step asks no more.
+struct Rounds {
+    size: u64,
+    counted: u64,
+    began_ns: u64,
+    warm: bool,
+    rates: Vec<f64>,
+}
+
+impl Rounds {
+    fn new(size: u64, now: u64) -> Self {
+        Self {
+            size: size.max(1),
+            counted: 0,
+            began_ns: now,
+            warm: false,
+            rates: Vec::with_capacity(ROUNDS.limit()),
+        }
+    }
+
+    /// One more of the step's operations completed at `now`: whether its rounds are enough.
+    fn completed(&mut self, now: u64) -> bool {
+        self.counted = self.counted.saturating_add(1);
+        if self.counted < self.size {
+            return false;
+        }
+        let took = now.saturating_sub(self.began_ns).max(1);
+        self.began_ns = now;
+        self.counted = 0;
+        if !std::mem::replace(&mut self.warm, true) {
+            return false;
+        }
+        if self.rates.len() < ROUNDS.limit() {
+            self.rates.push(self.size as f64 * 1e9 / took as f64);
+        }
+        ROUNDS.enough(&rounds::judge(&self.rates))
+    }
+}
+
+/// The operations a closed step's round counts at `clients`, measurement.md §5a's round: enough
+/// that the p99 the step reports has its 95% interval within ten rounds, and that the operations
+/// at a round's edges, which ran with fewer than `clients` in it, cost its throughput at most
+/// [`ROUNDS`]'s precision: `max(⌈368 / 10⌉, ⌈clients / (2 · 5%)⌉)`.
+fn round_ops(clients: usize) -> Result<u64, Error> {
+    let p99 = Level::new(99, 100).map_err(failed)?;
+    let quantile = samples_for(p99, coverage().ok_or_else(|| failed("a coverage"))?)
+        .map_err(failed)?
+        .div_ceil(10);
+    let clients = u64::try_from(clients).map_err(failed)?;
+    // Rounded up as seconds are, which checks the value finite, not negative and within u64.
+    let edges = Duration::try_from_secs_f64((clients as f64 / (2.0 * ROUNDS.precision)).ceil())
+        .map_err(failed)?
+        .as_secs();
+    Ok(quantile.max(edges))
+}
+
+/// The operations a closed step at `clients` asks at most: its ramp's round and [`ROUNDS`]'s
+/// limit of rounds after it, and those its clients still have out when the rounds are enough.
+fn step_ops(clients: usize) -> Result<u64, Error> {
+    let rounds = u64::try_from(ROUNDS.limit())
+        .map_err(failed)?
+        .saturating_add(1);
+    Ok(round_ops(clients)?
+        .saturating_mul(rounds)
+        .saturating_add(u64::try_from(clients).map_err(failed)?))
+}
+
+/// A closed step's throughput as its rounds judged it: the median of its state of most rounds,
+/// and the bounds its growth is told by, its median's 95% interval, or the least and most its
+/// rounds measured where they carry none (rounds ordered in time, or too few).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stepped {
+    clients: usize,
+    median: f64,
+    low: f64,
+    high: f64,
+}
+
+impl Stepped {
+    /// The step its rounds judged, none where it kept none.
+    fn of(clients: usize, judged: &Judgment) -> Option<Self> {
+        let state = judged
+            .states
+            .iter()
+            .filter(|s| !s.rounds.is_empty())
+            .max_by_key(|s| s.rounds.len())?;
+        let (low, high) = state.interval.unwrap_or((state.min, state.max));
+        Some(Self {
+            clients,
+            median: state.median,
+            low,
+            high,
+        })
+    }
+}
+
+/// Where a closed ladder stands after a step: the best step so far, of the greatest median; the
+/// steps in a row since one grew, its interval wholly above the best's; and whether it ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Climb {
+    best: Option<Stepped>,
+    flat: u32,
+}
+
+impl Climb {
+    /// The ladder after `step`: whether it goes on.
+    fn after(&mut self, step: Stepped) -> bool {
+        let grew = self.best.is_none_or(|best| step.low > best.high);
+        if self.best.is_none_or(|best| step.median > best.median) {
+            self.best = Some(step);
+        }
+        self.flat = if grew { 0 } else { self.flat.saturating_add(1) };
+        self.flat < FLAT
+    }
 }
 
 /// The threads this process runs as the OS counts them, read with this thread's counting paused:
@@ -1214,9 +1364,19 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
         }
         let came = work.run(&mut logical, j).await;
         let took = now_ns().saturating_sub(intended);
+        let ended = now_ns();
         let stop = harness(|| {
             let mut shared = shared.borrow_mut();
+            let shared = &mut *shared;
             shared.out = shared.out.saturating_sub(1);
+            // A closed step's round ends with its operations, an operation not asked counting in
+            // none; once the rounds are enough, the step asks no more.
+            if !matches!(came, Ok(Came::Skipped))
+                && let Some(rounds) = shared.rounds.as_mut()
+                && rounds.completed(ended)
+            {
+                shared.schedule.stop();
+            }
             let tally = &mut shared.tally;
             tally.ops = tally.ops.saturating_add(1);
             if !matches!(came, Ok(Came::Skipped)) {
@@ -1271,16 +1431,19 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
     harness(|| shared.borrow_mut().done.push(logical));
 }
 
-/// A phase's operations `from..end` on `clients`, a task each: the clients back, and the tally.
+/// A phase's operations `from..end` on `clients`, a task each, a closed step's in rounds of
+/// `round` operations until they are enough: the clients back, the tally and the rounds' rates.
 async fn phase(
     clients: Vec<Logical>,
     work: Rc<Work>,
     schedule: (Load, u64, u64, u64),
-) -> Result<(Vec<Logical>, Tally), Error> {
+    round: Option<u64>,
+) -> Result<(Vec<Logical>, Tally, Vec<f64>), Error> {
     let (load, seed, from, end) = schedule;
     let count = clients.len();
     let shared = harness(|| {
         Ok::<_, Error>(Rc::new(RefCell::new(Shared {
+            rounds: round.map(|size| Rounds::new(size, now_ns())),
             schedule: Schedule::new(load, seed, (from, end), now_ns())?,
             tally: Tally {
                 latency: Histogram::new(),
@@ -1314,7 +1477,11 @@ async fn phase(
         .into_inner();
     match shared.error {
         Some(e) => Err(e),
-        None => Ok((shared.done, shared.tally)),
+        None => Ok((
+            shared.done,
+            shared.tally,
+            shared.rounds.map(|r| r.rates).unwrap_or_default(),
+        )),
     }
 }
 
@@ -2263,15 +2430,19 @@ fn decimal(v: u64, into: &mut [u8; 20]) -> Option<&[u8]> {
 /// The cell, its doors, and the connections each door holds between phases.
 struct Bench<'o> {
     options: &'o Options,
+    /// The harness's process's pauses ([`Watch`]).
+    watch: &'o Watch,
     /// The cell this program runs, none against an `--endpoint`.
     cell: Option<Cell>,
     rt: LocalRuntime,
+    /// The relay condition's path the native clients dial through, when `--relay` asks for it.
+    relay: Option<crate::relay::Relay>,
     client_dir: PathBuf,
     listeners: Vec<SocketAddr>,
     signer: Rc<Signer>,
     generator: Rc<Generator>,
-    /// Each door's clients between the steps that use them, each with when it was put back.
-    pools: [Vec<(Logical, Instant)>; 2],
+    /// Each door's clients between the steps that use them.
+    pools: [Vec<Logical>; 2],
     /// The native clients the cell admits at once: each node's `gateway.clients` identities.
     native_most: usize,
     /// Connections each door opened: its handshakes.
@@ -2372,6 +2543,11 @@ struct Measured<'a> {
     /// `perf stat`'s counts across the phase, where `--perf` counted them.
     perf: Option<Counters>,
     excluded: bool,
+    /// A closed step's rounds as `ROUNDS` judged them.
+    judged: Option<&'a Judgment>,
+    /// The time the harness's process was paused over the phase, and its longest pause, in
+    /// nanoseconds ([`Watch`]).
+    paused: (u64, u64),
 }
 
 impl<'o> Bench<'o> {
@@ -2414,10 +2590,11 @@ impl<'o> Bench<'o> {
 
     /// The doors measured: both through a cell, the HTTP door alone against an endpoint.
     fn doors(&self) -> &'static [Door] {
-        if self.cell.is_some() {
-            &DOORS
-        } else {
-            &[Door::Http]
+        match (&self.cell, &self.relay) {
+            // The relay condition is the native door's (research/70, "Conditions").
+            (Some(_), Some(_)) => &[Door::Native],
+            (Some(_), None) => &DOORS,
+            (None, _) => &[Door::Http],
         }
     }
 
@@ -2435,25 +2612,10 @@ impl<'o> Bench<'o> {
             .pools
             .get_mut(door.at())
             .ok_or_else(|| failed("a door's pool"))?;
-        // A native client is driven only within its own calls (mantle-client runs no task of its
-        // own), so one held in the pool through another door's phases sends no keep-alive, and
-        // the node closes it once it has said nothing for the idle timeout: its next request then
-        // ends unanswered (`ClientError::Lost`, `Closed`), as a control's put did, at random, when
-        // the HTTP door's phases took about the idle timeout (3.07 s). One held past its
-        // keep-alive interval, after which a driven connection would have spoken, is closed here
-        // and another opened. An HTTP connection the server closed is opened again by `Http`.
-        let idle = mantle_protocol::bounds::idle_timeout();
-        let stale = idle.checked_div(2).unwrap_or(idle);
-        let mut held = Vec::new();
-        let mut closing = Vec::new();
-        for (logical, put_back) in pool.drain(..want.min(pool.len())) {
-            if matches!(logical.conn, Conn::Native(_)) && put_back.elapsed() >= stale {
-                closing.push(logical);
-            } else {
-                held.push(logical);
-            }
-        }
-        self.release(closing)?;
+        // A native client held here past its node's idle timeout dials anew itself
+        // (`mantle_client`'s `forget_quiet`); an HTTP connection the server closed is opened again
+        // by `Http`.
+        let mut held: Vec<Logical> = pool.drain(..want.min(pool.len())).collect();
         let more = want.saturating_sub(held.len());
         if more > 0 {
             let opened = self.open(door, more)?;
@@ -2512,10 +2674,20 @@ impl<'o> Bench<'o> {
     fn settings(&self, dir: &Path, first: usize) -> Result<Settings, Error> {
         let configured = crate::client::configured(dir).map_err(failed)?;
         let cell = self.cell()?;
-        let mut nodes = cell.quic();
-        let names = cell.names();
-        let first = first.min(nodes.len());
-        nodes.rotate_left(first);
+        // Under the relay condition each client dials the nodes at a link set of its own, and
+        // knows no name to look a node up by again, which would reach it past the relay.
+        let (nodes, names) = match &self.relay {
+            Some(relay) => (
+                relay.take(first).map_err(|e| failed(e.to_string()))?,
+                Vec::new(),
+            ),
+            None => {
+                let mut nodes = cell.quic();
+                let first = first.min(nodes.len());
+                nodes.rotate_left(first);
+                (nodes, cell.names())
+            }
+        };
         Ok(Settings {
             id: configured.id,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2526,14 +2698,19 @@ impl<'o> Bench<'o> {
         })
     }
 
-    /// One phase on `clients` connections, operations `from..end`, and its line.
+    /// One phase on `clients` connections, operations `from..end`, and its line: the operations it
+    /// asked, and its throughput, a closed step's in rounds (`in_rounds`) as they judged it.
     fn step(
         &mut self,
         out: &mut impl Write,
         work: &Rc<Work>,
         (size, clients): (&str, usize),
-        (from, end): (u64, u64),
-    ) -> Result<(u64, f64), Error> {
+        (from, end, in_rounds): (u64, u64, bool),
+    ) -> Result<(u64, Stepped), Error> {
+        let round = match (in_rounds, self.options.load) {
+            (true, Load::Closed) => Some(round_ops(clients)?),
+            _ => None,
+        };
         let held = self.hold(work.door, clients)?;
         let wire_before = wired(&held);
         let opened_before = reopened(&held);
@@ -2550,19 +2727,23 @@ impl<'o> Bench<'o> {
         };
         let began = Instant::now();
         let cpu = drive::cpu();
+        self.watch.take();
         alloc::begin();
         let ran = self.rt.block_on(phase(
             held,
             Rc::clone(work),
-            (self.options.load_of(work.kind), seed, from, end),
+            (self.options.load, seed, from, end),
+            round,
         ));
         let total = alloc::end();
+        let paused = self.watch.take();
         let aside = alloc::read_aside();
         let generator_ns =
             u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let perf = perf.map(Perf::end).transpose()?;
-        let (held, tally) = ran.map_err(|e| failed(format!("{e:?}")))??;
+        let (held, tally, rates) = ran.map_err(|e| failed(format!("{e:?}")))??;
+        let judged = round.map(|_| harness(|| rounds::judge(&rates)));
         let after = self.servers()?;
         let wire_after = wired(&held);
         let wire = Wire {
@@ -2574,8 +2755,7 @@ impl<'o> Bench<'o> {
             *count = count.saturating_add(reopened);
         }
         if let Some(pool) = self.pools.get_mut(work.door.at()) {
-            let now = Instant::now();
-            pool.extend(held.into_iter().map(|logical| (logical, now)));
+            pool.extend(held);
         }
         let ops = tally.ops;
         let rate = ops as f64 / (elapsed_ns.max(1) as f64 / 1e9);
@@ -2609,9 +2789,24 @@ impl<'o> Bench<'o> {
             again: work.again.replace(0),
             perf,
             excluded,
+            judged: judged.as_ref(),
+            paused,
         };
         self.line(out, &measured, (&before, &after))?;
-        Ok((ops, rate))
+        // A step not judged in rounds, or whose rounds kept none, is its one throughput.
+        let point = Stepped {
+            clients,
+            median: rate,
+            low: rate,
+            high: rate,
+        };
+        Ok((
+            ops,
+            judged
+                .as_ref()
+                .and_then(|j| Stepped::of(clients, j))
+                .unwrap_or(point),
+        ))
     }
 
     fn line(
@@ -2661,7 +2856,7 @@ impl<'o> Bench<'o> {
                 .as_ref()
                 .map_or_else(|| "-".to_owned(), |(_, own)| f(own).max(0).to_string())
         };
-        let open = matches!(self.options.load_of(m.kind), Load::Open(_));
+        let open = matches!(self.options.load, Load::Open(_));
         let t = &m.tally;
         writeln!(
             out,
@@ -2729,6 +2924,7 @@ impl<'o> Bench<'o> {
             m.again,
             t.failed,
         )?;
+        self.step_line(out, m)?;
         for kind in Failure::ALL {
             let Some(why) = t.first.get(kind.at()).and_then(Option::as_ref) else {
                 continue;
@@ -2750,11 +2946,58 @@ impl<'o> Bench<'o> {
         Ok(())
     }
 
+    /// A phase's step, a line after its phase's: how long the harness's process was paused over
+    /// it ([`Watch`]), and a closed step's rounds: how many were kept and how they are ordered in
+    /// time (measurement.md §2), and each state's median throughput, its 95% interval where it
+    /// has one, and its rounds, the state of most rounds first.
+    fn step_line(&self, out: &mut impl Write, m: &Measured<'_>) -> Result<(), Error> {
+        write!(
+            out,
+            "doors {} {} {} {} step clients {} paused_ms {} longest_pause_ms {}",
+            self.named(m.door),
+            m.kind.name(),
+            m.size,
+            self.options.condition,
+            m.clients,
+            m.paused.0.checked_div(1_000_000).unwrap_or(0),
+            m.paused.1.checked_div(1_000_000).unwrap_or(0),
+        )?;
+        let Some(judged) = m.judged else {
+            writeln!(out)?;
+            return Ok(());
+        };
+        write!(
+            out,
+            " rounds kept {} order {:?} lag1 {:.2}",
+            judged.rounds, judged.order, judged.lag1,
+        )?;
+        let mut states: Vec<&rounds::State> = judged.states.iter().collect();
+        states.sort_by_key(|s| std::cmp::Reverse(s.rounds.len()));
+        for state in states {
+            let (low, high) = state.interval.map_or_else(
+                || ("-".to_owned(), "-".to_owned()),
+                |(l, h)| (format!("{l:.1}"), format!("{h:.1}")),
+            );
+            write!(
+                out,
+                " state rounds {} ops/s median {:.1} interval {low} {high} min {:.1} max {:.1}",
+                state.rounds.len(),
+                state.median,
+                state.min,
+                state.max,
+            )?;
+        }
+        writeln!(out)?;
+        Ok(())
+    }
+
     /// A phase's steps: open loop, one of `n` operations from `from` on `--clients` clients;
-    /// closed, a ladder from one client doubling while throughput grows by [`GROWTH`], each step
-    /// `n` operations further on, up to `--clients`. Operations end at `end` where the phase's
-    /// keys end; `finish` runs what the ladder left of them at its best step's clients. Says how
-    /// far the steps went.
+    /// closed, a ladder from one client doubling up to `--clients`, each step judged in rounds
+    /// ([`ROUNDS`]) where `n` holds them and asking at most `n` operations further on, and ending
+    /// [`FLAT`] steps after the last whose interval lay wholly above the best's before it. A step
+    /// whose `n` holds no judged rounds (a large object's, its bytes capped) is its one throughput.
+    /// Operations end at `end` where the phase's keys end; `finish` runs what the ladder left of
+    /// them at its best step's clients. Says how far the steps went.
     fn ladder(
         &mut self,
         out: &mut impl Write,
@@ -2763,30 +3006,68 @@ impl<'o> Bench<'o> {
         (from, n, end, finish): (u64, u64, u64, bool),
     ) -> Result<u64, Error> {
         let budget = self.clients(work.door);
-        if let Load::Open(_) = self.options.load_of(work.kind) {
+        if let Load::Open(_) = self.options.load {
             let end = from.saturating_add(n).min(end);
-            self.step(out, work, (size, budget), (from, end))?;
+            self.step(out, work, (size, budget), (from, end, false))?;
             return Ok(end);
         }
-        let (mut at, mut clients, mut best) = (from, 1usize, (1usize, 0.0f64));
+        let judged = |clients: usize| -> Result<bool, Error> {
+            let least = round_ops(clients)?
+                .saturating_mul(u64::try_from(ROUNDS.min).map_err(failed)?.saturating_add(1));
+            Ok(n >= least)
+        };
+        let mut climb = Climb {
+            best: None,
+            flat: 0,
+        };
+        let (mut at, mut clients) = (from, 1usize);
         while at < end {
-            let to = at.saturating_add(n).min(end);
-            let (_, rate) = self.step(out, work, (size, clients), (at, to))?;
-            at = to;
-            let grew = rate > best.1 * (1.0 + GROWTH);
-            if rate > best.1 {
-                best = (clients, rate);
-            }
-            if !grew || clients >= budget {
+            let to = at.saturating_add(n.min(step_ops(clients)?)).min(end);
+            let (asked, stepped) =
+                self.step(out, work, (size, clients), (at, to, judged(clients)?))?;
+            at = at.saturating_add(asked).min(to);
+            if !climb.after(stepped) || clients >= budget {
                 break;
             }
             clients = clients.saturating_mul(2).min(budget);
         }
+        if let Some(best) = climb.best {
+            writeln!(
+                out,
+                "doors {} {} {size} {} ladder best clients {} ops/s median {:.1} low {:.1} high {:.1}",
+                self.named(work.door),
+                work.kind.name(),
+                self.options.condition,
+                best.clients,
+                best.median,
+                best.low,
+                best.high,
+            )?;
+        }
         if finish && at < end {
-            self.step(out, work, (size, best.0), (at, end))?;
+            let clients = climb.best.map_or(1, |best| best.clients);
+            self.step(out, work, (size, clients), (at, end, false))?;
             at = end;
         }
         Ok(at)
+    }
+
+    /// The operations a phase through `door`'s steps ask at most, each at most `n`: open loop, one
+    /// step's; closed, each step's of a ladder doubling from one client to the door's, as many as
+    /// its rounds may ask ([`step_ops`]).
+    fn ladder_most(&self, door: Door, n: u64) -> Result<u64, Error> {
+        if let Load::Open(_) = self.options.load {
+            return Ok(n);
+        }
+        let budget = self.clients(door);
+        let (mut most, mut clients) = (0u64, 1usize);
+        loop {
+            most = most.saturating_add(n.min(step_ops(clients)?));
+            if clients >= budget {
+                return Ok(most);
+            }
+            clients = clients.saturating_mul(2).min(budget);
+        }
     }
 
     /// The clients a phase through `door` runs at most: `--clients`, and through the native door
@@ -2898,12 +3179,8 @@ impl<'o> Bench<'o> {
         };
         let uploads = Rc::new(RefCell::new(Vec::new()));
         // The most objects a phase's steps make: one step open loop; closed, a ladder's steps, its
-        // clients doubling up to `--clients`.
-        let steps = match self.options.load_of(Kind::Put) {
-            Load::Open(_) => 1,
-            Load::Closed => u64::from(self.options.clients.max(1).ilog2()).saturating_add(1),
-        };
-        let most = n.saturating_mul(steps);
+        // clients doubling up to the door's, each asking what its rounds may within `n`.
+        let most = self.ladder_most(door, n)?;
         // The objects the reads read whose puts were acknowledged, a bit each, which the put that
         // made them keeps and the reads ask of; every other phase keeps none.
         let put = Rc::new(RefCell::new(Oracle::new(most).map_err(failed)?));
@@ -3017,7 +3294,7 @@ impl<'o> Bench<'o> {
                         .checked_div(u64::from(PAGE))
                         .unwrap_or(0)
                         .saturating_add(1);
-                    self.step(out, &work, (&name, 1), (0, pages))?;
+                    self.step(out, &work, (&name, 1), (0, pages, false))?;
                     continue;
                 }
                 // Each door's half of the set, every object of it: open loop in one step, closed
@@ -3025,7 +3302,7 @@ impl<'o> Bench<'o> {
                 let half = count
                     .saturating_sub(u64::try_from(own.at()).map_err(failed)?)
                     .div_ceil(2);
-                let n = match self.options.load_of(kind) {
+                let n = match self.options.load {
                     Load::Open(_) => half,
                     Load::Closed => self.options.ops.max(1),
                 };
@@ -3174,11 +3451,13 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     let counting = alloc::installed();
     writeln!(
         out,
-        "doors run seed {} condition {} load {} write_load {} clients {} ops {} counting {}",
+        "doors run seed {} condition {} load {} clients {} ops {} counting {}",
         options.seed,
         options.condition,
-        load_name(options.load),
-        options.write_load.map_or_else(|| "-".to_owned(), load_name),
+        match options.load {
+            Load::Open(rate) => format!("open:{rate}"),
+            Load::Closed => "closed".to_owned(),
+        },
         options.clients,
         options.ops,
         if counting {
@@ -3223,26 +3502,88 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             (Some(cell), listeners, signer)
         }
     };
+    let watch = Watch::default();
+    let (end, ended) = watch_channel::<()>();
+    std::thread::scope(|scope| {
+        let watching = &watch;
+        let watching = std::thread::Builder::new()
+            .name("doors-watch".to_owned())
+            .spawn_scoped(scope, move || watching.run(&ended))?;
+        let ran = run(
+            out,
+            options,
+            &watch,
+            (cell, listeners, signer, client_dir, counting),
+        );
+        drop(end);
+        watching
+            .join()
+            .map_err(|_| failed("the harness's watch ended unwound"))?;
+        ran
+    })
+}
+
+/// The phases, controls and slope of `doors`, on its cell or endpoint, its process watched by
+/// `watch`.
+fn run(
+    out: &mut impl Write,
+    options: &Options,
+    watch: &Watch,
+    (cell, listeners, signer, client_dir, counting): (
+        Option<Cell>,
+        Vec<SocketAddr>,
+        Signer,
+        PathBuf,
+        bool,
+    ),
+) -> Result<bool, Error> {
     let most = options
         .clients
         .saturating_mul(2)
         .saturating_add(SLOPE_HIGH)
         .saturating_add(1);
-    // Each node admits as many native clients at once as its gateway's floor states, so a client
-    // past them is refused at admission (node.md §3.6): the native door's clients stay within.
-    let native_most = mantle_node::derive::gateway()
-        .map_err(failed)?
-        .clients
-        .saturating_mul(cell::FOUNDERS);
+    // Each node admits as many native clients at once as it derived (`gateway.clients`), so a
+    // client past them is refused at admission (node.md §3.6): the native door's clients stay
+    // within. An endpoint this program did not start has no native door.
+    let native_most = cell.as_ref().map_or(0, Cell::native_clients);
     writeln!(
         out,
         "doors native clients at most {native_most}: each node admits gateway.clients identities at once"
     )?;
+    // The relay condition: a link set for each client the harness holds at most, each direction
+    // holding what one client's transport may have unacknowledged or unread.
+    let relay = match (options.relay, &cell) {
+        (false, _) => None,
+        (true, None) => {
+            return Err(failed(
+                "--relay asks the cell's own nodes, which an --endpoint has none of",
+            ));
+        }
+        (true, Some(cell)) => {
+            let nodes = cell.quic();
+            let held = mantle_client::least_transport(nodes.len()).map_err(failed)?;
+            let relay = crate::relay::Relay::start(&client_dir, &nodes, most, (held, options.seed))
+                .map_err(|e| failed(e.to_string()))?;
+            writeln!(
+                out,
+                "doors relay one_way_ns {} jitter_ns {} loss {}/{} in runs of {}/{} link_sets {most} held_bytes {held}",
+                crate::relay::ONE_WAY_NS,
+                crate::relay::JITTER_NS,
+                crate::relay::LOST,
+                crate::relay::SENT,
+                crate::relay::LOST,
+                crate::relay::RUNS,
+            )?;
+            Some(relay)
+        }
+    };
     let mut bench = Bench {
         options,
+        watch,
         listeners,
         cell,
         rt: runtime(most)?,
+        relay,
         client_dir,
         signer: Rc::new(signer),
         generator: Rc::new(Generator::new(options.seed).map_err(failed)?),
@@ -3284,6 +3625,21 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         "doors handshakes native {} http {}",
         bench.opened[0], bench.opened[1]
     )?;
+    // The relay's own count: what its chain lost, what passed a direction's bytes, and how late it
+    // sent what it held, so its cost is not charged to the stack (research/70 [12]).
+    if let Some(relay) = bench.relay.take() {
+        let said = relay.stop().map_err(|e| failed(e.to_string()))?;
+        writeln!(
+            out,
+            "doors relay taken {} lost {} over {} sent {} late_mean_ns {} late_max_ns {}",
+            said.taken,
+            said.lost,
+            said.over,
+            said.sent,
+            said.late_ns.checked_div(said.sent).unwrap_or(0),
+            said.latest_ns,
+        )?;
+    }
     writeln!(
         out,
         "doors harness peak_live_bytes {} threads {} idle_threads {idle}",
@@ -3425,7 +3781,7 @@ impl Bench<'_> {
             })
             .map_err(|e| failed(format!("{e:?}")))??;
         if let Some(pool) = self.pools.get_mut(door.at()) {
-            pool.push((logical, Instant::now()));
+            pool.push(logical);
         }
         // Unrun, none of this door's controls is caught, so the run is not exact.
         let [flipped, missing, etag] = match said {
@@ -3475,8 +3831,8 @@ impl Bench<'_> {
 
     /// Each connection's cost through `door` (measurement.md §10): what the servers and this
     /// thread hold at two connection counts, over the difference ([`SLOPE_LOW`] and
-    /// [`SLOPE_HIGH`] through the S3 listener; a client a node and as many as the cell admits
-    /// through the native door), and the handshake's counts, each connection opened and its first
+    /// [`SLOPE_HIGH`] through the S3 listener; a client a node and [`SLOPE_HIGH`] within what the
+    /// cell admits through the native door), and the handshake's counts, each connection opened and its first
     /// request answered.
     fn slope(&mut self, out: &mut impl Write, door: Door) -> Result<(), Error> {
         let held = self
@@ -3484,10 +3840,12 @@ impl Bench<'_> {
             .get_mut(door.at())
             .map(std::mem::take)
             .unwrap_or_default();
-        self.release(held.into_iter().map(|(logical, _)| logical).collect())?;
-        // The native door's points: a client on each node, and as many as the cell admits.
+        self.release(held)?;
+        // The native door's points: a client on each node, and the S3 door's higher point within
+        // what the cell admits, which the nodes derive from their memory and may be thousands, past
+        // the clients this harness's runtime holds.
         let (low_count, high_count) = match door {
-            Door::Native => (cell::FOUNDERS, self.native_most),
+            Door::Native => (cell::FOUNDERS, SLOPE_HIGH.min(self.native_most)),
             Door::Http => (SLOPE_LOW, SLOPE_HIGH),
         };
         if high_count <= low_count {
@@ -3944,6 +4302,67 @@ mod tests {
         assert_eq!(closed.take(99).unwrap(), Some((0, 99)));
     }
 
+    /// A closed ladder doubles while each step's interval lies wholly above the best's before it,
+    /// and ends three steps after the last that grew: one step that did not grow does not end it,
+    /// and the best is the step of greatest median.
+    #[test]
+    fn a_ladder_ends_three_steps_after_its_last_growth() {
+        let step = |clients, median: f64, half: f64| Stepped {
+            clients,
+            median,
+            low: median - half,
+            high: median + half,
+        };
+        let mut climb = Climb {
+            best: None,
+            flat: 0,
+        };
+        assert!(climb.after(step(1, 30.0, 1.0)));
+        assert!(climb.after(step(2, 60.0, 2.0)));
+        assert!(climb.after(step(4, 59.0, 3.0)));
+        assert!(climb.after(step(8, 120.0, 5.0)));
+        assert_eq!(climb.flat, 0);
+        assert!(climb.after(step(16, 125.0, 6.0)));
+        assert!(climb.after(step(32, 118.0, 6.0)));
+        assert!(!climb.after(step(64, 121.0, 6.0)));
+        assert_eq!(climb.best.unwrap().clients, 16);
+    }
+
+    /// A step whose rounds kept none is judged by none, so it falls back to its one throughput.
+    #[test]
+    fn a_step_that_kept_no_rounds_is_not_judged() {
+        assert_eq!(Stepped::of(4, &rounds::judge(&[])), None);
+        let judged = rounds::judge(&[10.0; 12]);
+        let step = Stepped::of(4, &judged).unwrap();
+        assert_eq!(
+            (step.clients, step.median, step.low, step.high),
+            (4, 10.0, 10.0, 10.0)
+        );
+    }
+
+    /// A step's rounds keep none of its ramp, each after it its operations over the time since the
+    /// last ended; they are enough only from ten kept, and then once their median's interval is
+    /// within the precision.
+    #[test]
+    fn a_steps_rounds_keep_all_but_the_ramp_and_end_once_enough() {
+        let size = round_ops(1).unwrap();
+        assert_eq!(size, 37);
+        assert_eq!(round_ops(32).unwrap(), 320);
+        let mut rounds = Rounds::new(size, 0);
+        let mut now = 0u64;
+        let mut enough = false;
+        let mut completions = 0u64;
+        while !enough {
+            now += 1_000_000;
+            completions += 1;
+            enough = rounds.completed(now);
+        }
+        // The ramp's round and ten kept, each a thousand a second.
+        assert_eq!(completions, size * 11);
+        assert_eq!(rounds.rates.len(), 10);
+        assert!(rounds.rates.iter().all(|r| (r - 1000.0).abs() < 1e-6));
+    }
+
     /// A `--load` is open at a positive rate or closed; a `--sizes` entry may be zero.
     #[test]
     fn loads_and_sizes_parse() {
@@ -3955,51 +4374,6 @@ mod tests {
         assert_eq!(size_arg("128K").unwrap(), 128 << 10);
         assert_eq!(Work::range(1), (0, 0));
         assert_eq!(Work::range(65_537), (21_845, 43_689));
-    }
-
-    /// `--write-load` paces the writes, a PUT, a stream, a part, a delete and a multipart upload's
-    /// create, completion and abort, and `--load` the reads; without it every phase runs under
-    /// `--load`.
-    #[test]
-    fn a_write_load_paces_the_writes_and_the_reads_keep_theirs() {
-        let mut options = Options {
-            dir: PathBuf::new(),
-            seed: 1,
-            sizes: Vec::new(),
-            objects: Vec::new(),
-            load: load_arg("open:100").unwrap(),
-            write_load: None,
-            clients: 1,
-            ops: 1,
-            bytes: 1,
-            volume: 1,
-            condition: String::new(),
-            endpoint: None,
-            perf: false,
-            kinds: Vec::new(),
-        };
-        let writes = [
-            Kind::Put,
-            Kind::Stream,
-            Kind::Delete,
-            Kind::Create,
-            Kind::Part,
-            Kind::Complete,
-            Kind::Abort,
-        ];
-        let reads = [Kind::Get, Kind::Range, Kind::Head, Kind::List, Kind::Parts];
-        for kind in writes.iter().chain(&reads) {
-            assert_eq!(options.load_of(*kind), Load::Open(100.0), "{}", kind.name());
-        }
-        options.write_load = Some(load_arg("closed").unwrap());
-        for kind in writes {
-            assert_eq!(options.load_of(kind), Load::Closed, "{}", kind.name());
-        }
-        for kind in reads {
-            assert_eq!(options.load_of(kind), Load::Open(100.0), "{}", kind.name());
-        }
-        assert_eq!(load_name(Load::Open(50.0)), "open:50");
-        assert_eq!(load_name(Load::Closed), "closed");
     }
 
     /// A listing's keys are its set's, each after the one before it as S3 orders keys, byte by

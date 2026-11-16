@@ -35,6 +35,7 @@ mod files;
 mod init;
 mod journal;
 mod pack;
+mod relay;
 mod transfer;
 
 // The allocation counts of `mantle serve`'s `counts` and of `mantle bench doors` are a diagnostic:
@@ -462,19 +463,16 @@ enum BenchCommand {
         #[arg(long, value_delimiter = ',')]
         objects: Vec<u64>,
         /// open:RATE, requests a second arriving as a Poisson process, latency from each one's
-        /// intended start; or closed, a ladder of clients doubling while throughput grows.
+        /// intended start; or closed, a ladder of clients doubling while throughput grows, each
+        /// step judged in rounds, ending three steps after the last that grew.
         #[arg(long, value_parser = bench_doors::load_arg, default_value = "open:100")]
         load: bench_doors::Load,
-        /// The writes' load where it differs from --load's, as --load takes it: a PUT, a stream,
-        /// a part, a delete and a multipart upload's create, completion and abort. --load's by
-        /// default.
-        #[arg(long, value_parser = bench_doors::load_arg)]
-        write_load: Option<bench_doors::Load>,
         /// Logical clients at most, each a task on one thread holding one connection: open loop's
         /// clients, and the closed ladder's top.
         #[arg(long)]
         clients: Option<usize>,
-        /// Operations a phase's step asks at most: 368 by default, a p99's samples.
+        /// Operations a phase's step asks at most: open loop's step 368 by default, a p99's
+        /// samples; a closed step as many as its rounds ask (measurement.md §5) by default.
         #[arg(long)]
         ops: Option<u64>,
         /// Object bytes a phase's step moves at most, in bytes or with a suffix: 256M by default.
@@ -503,6 +501,11 @@ enum BenchCommand {
         /// put before it made, so it is asked beside that put.
         #[arg(long, value_delimiter = ',', value_parser = bench_doors::kind_arg)]
         kinds: Vec<bench_doors::Kind>,
+        /// The native door's clients reach the nodes through the relay condition's path: each
+        /// datagram held 500 ± 100 ms one way, reordered, and lost as a measured intercontinental
+        /// path lost them (src/relay.rs; docs/research/70, "Conditions"). Only the native door runs.
+        #[arg(long)]
+        relay: bool,
     },
 }
 
@@ -1045,7 +1048,6 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         sizes,
         objects,
         load,
-        write_load,
         clients,
         ops,
         bytes,
@@ -1055,6 +1057,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         perf,
         smoke,
         kinds,
+        relay,
     } = command
     else {
         return Err("not mantle bench doors".to_owned());
@@ -1099,15 +1102,18 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
             objects
         },
         load,
-        write_load,
         clients: clients.unwrap_or(pick(smoke, FULL_CLIENTS, SMOKE_CLIENTS)),
-        ops: ops.unwrap_or(pick(smoke, FULL_OPS, SMOKE_OPS)),
+        ops: ops.unwrap_or(match load {
+            bench_doors::Load::Closed if !smoke => u64::MAX,
+            _ => pick(smoke, FULL_OPS, SMOKE_OPS),
+        }),
         bytes: bytes.unwrap_or(STEP_BYTES),
         volume: volume.unwrap_or(pick(smoke, FULL_VOLUME, SMOKE_VOLUME)),
         condition,
         endpoint,
         perf,
         kinds,
+        relay,
     })
 }
 

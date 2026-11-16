@@ -118,6 +118,8 @@ enum Said {
     Counts(Counted),
     /// A range's leader as the node knows it now, none while it knows of none.
     Status(u128, u64),
+    /// The native clients it admits at once, as it derived them (`basis gateway.clients`).
+    Clients(usize),
     /// Its output ended: the process is gone.
     Ended,
 }
@@ -129,6 +131,7 @@ fn said(line: &str) -> Option<Said> {
         ["s3-bound", at, _connections] => at.parse().ok().map(Said::S3),
         ["s3", _listen, region, _ids] => Some(Said::Region((*region).to_owned())),
         ["enlisted"] => Some(Said::Enlisted),
+        ["basis", "gateway.clients", "=", clients, ..] => clients.parse().ok().map(Said::Clients),
         ["counts", _counting, rest @ ..] => Counted::parse(rest).map(Said::Counts),
         ["status", group, _term, leader, ..] => Some(Said::Status(
             u128::from_str_radix(group, 16).ok()?,
@@ -174,6 +177,8 @@ struct Node {
     counts: Option<Counted>,
     /// Each range's leader as its process last said, zero for none.
     leaders: BTreeMap<u128, u64>,
+    /// The native clients it admits at once, as it last said.
+    clients: Option<usize>,
 }
 
 /// Where the harness's clients of a cell on loopback bind.
@@ -197,6 +202,17 @@ pub trait Reach {
     /// whose nodes are dialed at the addresses they say.
     fn names(&self) -> Vec<(u64, String)> {
         Vec::new()
+    }
+}
+
+impl Cell {
+    /// The native clients the cell's nodes admit at once, as each said it derived them: a client
+    /// past them is refused at its node's admission (node.md §3.6).
+    pub fn native_clients(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|n| n.clients.unwrap_or(0))
+            .fold(0usize, usize::saturating_add)
     }
 }
 
@@ -298,6 +314,7 @@ impl Cell {
                 chunks: None,
                 counts: None,
                 leaders: BTreeMap::new(),
+                clients: None,
             });
         }
         if nodes.len() != FOUNDERS {
@@ -538,6 +555,7 @@ impl Cell {
             Said::S3(s3) => node.s3 = Some(s3),
             Said::Region(region) => node.region = Some(region),
             Said::Enlisted => node.enlisted = true,
+            Said::Clients(clients) => node.clients = Some(clients),
             Said::Chunks(chunks) => node.chunks = Some(chunks),
             Said::Counts(counts) => node.counts = Some(counts),
             Said::Status(group, leader) => {

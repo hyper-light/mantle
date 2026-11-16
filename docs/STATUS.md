@@ -25,7 +25,10 @@ back through both:
   door is S3's own operations over mantle's codec, SigV4-signed with the S3 profile `mantle init
   client` gives the client, TLS off loopback, listings paged, errors typed by S3's 94 codes, copies
   streamed `aws-chunked` with a trailing CRC-64/NVME and resumed from a journal of their multipart
-  uploads (docs/design/doors.md; research/86).
+  uploads (docs/design/doors.md; research/86). Since 2026-11-15 the S3 door also asks research/89's
+  commands, versions, removals by version and in batches, heads by version, copies within the cell
+  and part copies, and an object's metadata, and both doors print `head`'s metadata as S3 serves it,
+  so their lines match (native.rs runs the research-89 commands through both doors).
 - *The release* (docs/design/release.md): one archive a supported target of the one binary, built
   and checked on its own runner on every push and pull request, every object command through both
   doors and the AWS CLI against a cell of three, each object read back through the other door byte
@@ -1110,7 +1113,10 @@ founder's pod is deleted mid-transfer. Its proof is the CI job `kind-cell`
 (2026-11-03): helm lint and the golden render under helm v4.3.0; in a kind cluster of three workers
 the cell elected with each founder on a kind node of its own and every founder ready within 65 s of
 the install; the harness's CI scale from a Job, founder pod mantle-1 deleted halfway through the
-small set's native puts:
+small set's native puts. On 2026-11-15 the large case timed out (CI run 43790965629): a pod given its
+`memory.need` admitted one of boto3's ten 8 MiB parts at a time under byte-charge admission; the need
+now holds one stock client's ten parts at once (`derive::served`), and no write is charged past the
+operations' bytes (`host::fitting`), green again on `1bdd8125`:
 
 | Case | Objects | Bytes acknowledged | Refused | Wrong | Missing | Each block's chunks on distinct nodes | Read through each node after |
 |---|---|---|---|---|---|---|---|
@@ -1153,7 +1159,7 @@ measurements. Their `ready` phase means ready to execute, not that their steps p
 | Serve roles, 4 steps | met | Implemented; Windows rolling-stop stress passed. |
 | Three-node serve cell, 5 steps | met | Implemented; Scale adds larger transfer and restart coverage. |
 | Data storage/transfer, 13 steps | pending | Steps 1–9 built; Scale active; image, Helm and localkind pending. Main landing alone does not close the parent. |
-| Lean doors, 11 steps | pending | Per-operation allocation counts, open-loop latency comparisons and attributed optimizations remain to be built and measured. Transfer throughput is not that proof. |
+| Lean doors, 11 steps | pending | Steps 1 and 2 met: `mantle bench doors` drives and counts both doors per operation, and its `--smoke` passes through both doors with all six controls caught. Step 3's baseline runs on the box (2026-11-16): the baseline's product with lean-doors' harness (doors-baseline-graft-2), every condition, including the native door's relay (`--relay`: 500 ± 100 ms one way, reordered, lost as a measured Switzerland–Japan path, 0.36% in runs of 1.49; research/70). The Mac and its VM lane are still to run it. Steps 4 to 11 remain, their timed matrices at step 10. Transfer throughput is not that proof. |
 
 Their research records contain 203 graded findings (123 A, 69 B, 8 C, 3 D), as graded by kiln,
 not regraded here. A verified quotation about old code remains historical. In particular Lean

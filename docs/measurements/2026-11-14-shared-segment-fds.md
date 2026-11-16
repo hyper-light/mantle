@@ -2,7 +2,7 @@
 
 2026-11-14 and 15. mantle branch `shared-fds` over lean-doors `40a4f84e`, every hyper-raft crate
 vendored from branch `shared-segment-fds-doors` (lean-doors' `294678c` and the commits of hyper-raft
-branch `shared-segment-fds`; vendor/UPSTREAM.md). Design and sources: research/91.
+branch `shared-segment-fds`; vendor/UPSTREAM.md). Design and sources: research/93.
 
 **Question.** A range's store, kept as segments, held about 188 descriptors a segment on a 32-core
 host, each maintenance worker's handle and each of the issuer's duplicates of it opening every
@@ -22,7 +22,7 @@ the A/A's spread does not hold, and the fill's CPU a put is lean-doors' (1.01x; 
 The earlier patch's 12% did not come back, for it or for this change: in ten interleaved rounds at
 10M on Linux the earlier patch filled at 1.006x lean-doors (A/A 0.936x). Sharing an open file
 description among threads does cost positioned reads (5-13% at 4 to 32 threads in a
-microbenchmark of nothing but cached reads, research/91), but this change shares one among more
+microbenchmark of nothing but cached reads, research/93), but this change shares one among more
 threads than the earlier patch did and its fills cost no more CPU a put than lean-doors' (0.97x on
 both platforms at 10M), so that is not what a fill pays.
 
@@ -187,7 +187,7 @@ on adacachy in a container with the limit raised; its A/A 1.03, 0.98-1.12), caus
 - The mechanism a shared open file has: every positioned read takes and gives back the open file
   description's reference and writes its read-ahead state, from every thread that shares it. In
   nothing but cached reads that costs 5-13% at 4 to 32 threads on Linux, and nothing on macOS
-  (research/91). A duplicate shares the description too: the issuer's duplicates always did.
+  (research/93). A duplicate shares the description too: the issuer's duplicates always did.
 - That patch here, ten rounds at 10M on Linux: fills 1.006x lean-doors (A/A 0.936x), gets 1.010x,
   seeks 0.979x; CPU a put 1.045x (0.575-1.370), within what the A/A's spread allows.
 - This change shares each segment's description among every handle of the file, more threads than

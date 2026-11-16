@@ -223,7 +223,7 @@ under load, at moderate load and saturated.
   workers transfer through handles of it, which take no descriptor of their own: a store holds
   one descriptor a segment whatever its workers, where each handle opening every segment again
   held about 188 a segment on 32 cores; a flush through any handle covers every handle's writes
-  (research/91).
+  (research/93).
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

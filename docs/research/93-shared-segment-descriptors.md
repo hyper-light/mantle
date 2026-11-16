@@ -1,4 +1,4 @@
-# 91. One descriptor a segment: sharing a store's open files among its handles
+# 93. One descriptor a segment: sharing a store's open files among its handles
 
 **Question.** A range's store, kept as segments (hyper-block's `SegmentedFile`, research/48), is
 read and written by the shard, by each of its maintenance workers and by each of the device

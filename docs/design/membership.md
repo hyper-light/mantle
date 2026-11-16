@@ -60,17 +60,17 @@ A node is named, as before, by a 64-bit id drawn from the OS, a key pair it keep
 from the cell's authority naming it `node-ID` (node.md §1.5). The certificate now also carries the
 grant's number, `G`, in its subject (X.520's `serialNumber` attribute, a printable string of at
 most 64 characters, which every RFC 5280 implementation must take in a subject: §4.1.2.4,
-research/91 [2]). The authority numbers its grants in order, keeping the
+research/92 [2]). The authority numbers its grants in order, keeping the
 last number beside its key (`OUT/authority/grants`, written whole and durable before the identity
 it numbers leaves the granter), so no two grants of one authority share a number.
 
 *Why numbered.* An identity must stop working once its node is removed, and the certificates do
 not expire (node.md §1.5: their notAfter is RFC 5280's "no well-defined expiration" until rotation
 is built). A revocation list may drop a certificate only once it has expired (RFC 5280 §3.3,
-research/91 [2]), so revoking certificates that never expire would grow a list without bound,
+research/92 [2]), so revoking certificates that never expire would grow a list without bound,
 which CLAUDE.md §2 forbids. A grant spent once, in order, needs no list: the root range keeps the
 highest grant it has spent and which of the `W` below it are spent, IPsec's anti-replay window
-over sequence numbers (RFC 4303 §3.4.3, research/91 [1]). A grant above the window's top is new;
+over sequence numbers (RFC 4303 §3.4.3, research/92 [1]). A grant above the window's top is new;
 one inside it is new if its bit is clear; one at or below the window's bottom is refused. The
 window is `W = root.max_nodes` wide, the most identities the cell holds: a granter issuing grants
 for every slot of the cell at once has each still joinable, in any order. State: one number and
@@ -146,7 +146,7 @@ system states this process may still write there, less what its operator or supe
 machine's other work keeps, less what the node itself will write there.** No fraction is chosen
 (`derive::volume_sizes`):
 
-- *The OS's statement* (research/91 [5]–[8]): `statvfs`'s `f_bavail`, "number of free blocks
+- *The OS's statement* (research/92 [5]–[8]): `statvfs`'s `f_bavail`, "number of free blocks
   available to non-privileged process", times `f_frsize` on Linux, and `statfs`'s same count in
   `f_bsize` units on macOS, which leave out the blocks a file system reserves for the system
   (mke2fs reserves them "to allow root-owned daemons ... to continue to function correctly after

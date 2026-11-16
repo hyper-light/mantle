@@ -1,4 +1,4 @@
-# 91. A cell whose members come and go: grants, revocation, absence and spare space
+# 92. A cell whose members come and go: grants, revocation, absence and spare space
 
 Status: research note, 2026-11-14. For docs/design/membership.md (branch `fleet-cell`): how a node
 gets an identity from the cell's authority and loses it, how the cell tells a member away for a

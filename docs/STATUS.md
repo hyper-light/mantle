@@ -572,7 +572,7 @@ as did Windows rolling-stop stress run `41353171174`. The separate box workspace
 three engine `ranges_room` tests when their writers ran out of file descriptors; that gate did
 not reach the vendored suite. Descriptor limits were left unchanged. Since branch `shared-fds`
 (2026-11-15), a store's handles, the shard's, each maintenance worker's and each of the issuer's,
-transfer through one open file a segment (hyper-raft branch `shared-segment-fds`, research/91):
+transfer through one open file a segment (hyper-raft branch `shared-segment-fds`, research/93):
 those tests pass on the box at its container default of 2,048, `tests/shard_db_descriptors.rs`
 holds a store at one descriptor a segment whatever its workers, and a 100M fill completes at
 macOS's 10,240 and a Linux container's 2,048 (docs/measurements/2026-11-14-shared-segment-fds.md).

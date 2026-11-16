@@ -17,8 +17,9 @@ use hyper_transport::{
 use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_client::{Sink, Source, TRAILER};
 use mantle_protocol::bounds;
-use mantle_protocol::classes::{Class, NodeClasses, Role};
+use mantle_protocol::classes::{Class, NodeClasses, Party, Role};
 use mantle_protocol::object::{Head, Op, Progress, Reply, Status, Stored};
+use mantle_protocol::wire::Profile;
 use mantle_s3::checksum::Hasher;
 
 pub(crate) const NODE: PeerId = 1;
@@ -143,14 +144,21 @@ pub(crate) fn credentials() -> (Credentials, Credentials) {
 struct Clients;
 
 impl Directory for Clients {
-    type Role = Role;
+    type Role = Party;
 
-    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Role)> {
+    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Party)> {
         if authenticated.dialed.is_some() {
             return None;
         }
+        let profile = Profile::of(authenticated.protocol)?;
         let names = mantle_cert::client_names(authenticated.certificate?).ok()?;
-        Some((mantle_protocol::client_id(names.name)?, Role::Client))
+        Some((
+            mantle_protocol::client_id(names.name)?,
+            Party {
+                role: Role::Client,
+                profile,
+            },
+        ))
     }
 
     fn server_name(&self, _: PeerId) -> Option<&str> {
@@ -386,9 +394,17 @@ fn run(
     let stated = mantle_client::stated(1, transport_bytes);
     runtime(8)
         .block_on(async move {
+            // The stub speaks every profile a node does, newest first, and its client's in turn.
+            let mut tls = Tls::mutual(&credentials, true).unwrap();
+            tls.server.as_mut().unwrap().alpn_protocols = Profile::offered(Profile::NEWEST);
+            tls.client.alpn_protocols = Profile::offered(Profile::NEWEST);
+            let mut profile = Profile::NEWEST;
             let config = Config {
-                tls: Tls::mutual(&credentials, true).unwrap(),
-                role: Role::Node,
+                tls,
+                role: Party {
+                    role: Role::Node,
+                    profile,
+                },
                 limits: bounds::limits(&stated).unwrap(),
                 congestion: Default::default(),
             };
@@ -435,7 +451,10 @@ fn run(
                 };
                 if let Some(event) = event {
                     match event {
-                        Event::Connected { .. } => connected = true,
+                        Event::Connected { role, .. } => {
+                            connected = true;
+                            profile = role.profile;
+                        }
                         Event::Refused {
                             exchange,
                             by_peer: true,
@@ -458,9 +477,12 @@ fn run(
                             }
                         }
                         Event::Request { exchange, body, .. } => {
-                            let head =
-                                Head::decode(driver.endpoint().head(exchange).unwrap(), body)
-                                    .unwrap();
+                            let head = Head::decode(
+                                driver.endpoint().head(exchange).unwrap(),
+                                body,
+                                profile,
+                            )
+                            .unwrap();
                             serving = Some(Serving::Reading {
                                 exchange,
                                 head,
@@ -521,7 +543,7 @@ fn run(
                         bytes = &bytes[front..];
                         let mut pause_now = false;
                         if !bytes.is_empty() {
-                            let op = head.op(fields).unwrap();
+                            let op = head.op(fields, profile).unwrap();
                             let (length, from) = match op {
                                 Op::Put { length, .. } => (length, None),
                                 Op::Append { length, offset, .. } => (length, Some(offset)),
@@ -556,7 +578,7 @@ fn run(
                         driver.flush().unwrap();
                         continue;
                     }
-                    let op = head.op(fields).unwrap();
+                    let op = head.op(fields, profile).unwrap();
                     let exchange = *exchange;
                     if matches!(op, Op::Append { .. })
                         && script.late_append == Some(seen.appends + 1)
@@ -698,7 +720,7 @@ fn run(
                         driver.flush().unwrap();
                         continue;
                     };
-                    let (reply_head, reply_fields) = reply.encode().unwrap();
+                    let (reply_head, reply_fields) = reply.encode(profile).unwrap();
                     endpoint
                         .reply(
                             exchange,

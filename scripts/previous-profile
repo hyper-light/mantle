@@ -1,0 +1,4 @@
+# The commit whose mantle speaks the wire profile before this binary's newest (docs/research/91):
+# lean-doors before research/89's formats, the last to speak profile one alone. tests/upgrade.rs
+# runs a cell's other release on it (scripts/previous-binary.sh builds it).
+40a4f84efb57b9827f13b4d6e46f9dfd44cfdee0

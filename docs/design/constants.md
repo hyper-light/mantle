@@ -594,6 +594,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/key.rs` `GATE` | format | `b'g'` | Marker byte `g` after `LOCAL` for gate rows. |
 | `crates/meta/src/key.rs` `GATES_END` | format | `[LOCAL, marker::GATE, 0xFF]` | A key past every gate. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/meta/src/key.rs` `HEADER` | format | `1` | File-layer row tag 1 for a file's header. |
+| `crates/meta/src/key.rs` `FENCE` | format | `4` | Root-range row tag 4 after `DATA` for the cell's upgrade fence: the wire profile every member has been seen to speak (docs/research/91 §4). |
 | `crates/meta/src/key.rs` `HISTORY` | format | `3` | Root-range row tag 3 after `DATA` for a node's history: its time run and its crashes (docs/design/node.md §2.4, item 7). |
 | `crates/meta/src/key.rs` `LINEAGE` | format | `b'l'` | Marker byte `l` after `LOCAL` for the Name range's lineage row. |
 | `crates/meta/src/key.rs` `LOCAL` | format | `0x00` | Key-space prefix byte 0x00 for a range's own rows (docs/design/metadata.md §1). |
@@ -627,6 +628,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/record.rs` `SESSION_FIXED` | format | `25` | Bytes of a session's row besides its answers: its format, last use, low serial, count of answers and checksum, as `Session::encode` writes them; `Session::row_bytes` is checked against the encoding. |
 | `crates/meta/src/record.rs` `SWEPT` | format | `Self { how: How::Refused, deadline_ns: 0, }` | The mark the sweep writes for every file it releases, never handed over and past its deadline at the range's time: it has no value, and reads as a deadline already passed. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/meta/src/root.rs` `MAX_DOMAIN` | external | `255` | The longest failure domain a node names, 255 bytes: a label such as a rack's or a zone's name, which DNS bounds at 63 bytes a label and 255 a name (RFC 1035 §2.3.4); an enlistment past it is a conflict. |
+| `crates/meta/src/root.rs` `UNFENCED` | format | `1` | The fence a cell holds before any was raised: wire profile one's number, the formats every mantle speaks (`mantle_protocol::wire::Profile::One`; docs/research/91 §4). |
 | `crates/meta/src/session.rs` `COUNT` | format | `&[LOCAL, SESSIONS]` | The markers of the rows a session count is kept in. |
 | `crates/meta/src/session.rs` `OWNED_BYTES` | format | `24` | Bytes of an owner's row: the session its last registration opened, that registration's run and its place in the run, each a big-endian word (docs/design/node.md §1.4). |
 | `crates/meta/src/wire.rs` `ETAG_HEX` | external | `32` | A part's ETag, the hex of its 16-byte MD5 (research/05 §4.5). |

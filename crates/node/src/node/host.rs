@@ -56,6 +56,7 @@ use mantle_protocol::object::{
     self, Deleted, Head, Headers, List, Listing, MAX_PAGE_PARTS, Metadata, Op, PartListed, Parts,
     Progress, Reply, Status, Stored, Target,
 };
+use mantle_protocol::wire::Profile;
 
 /// What the gateway host is given (docs/design/node.md §4.6, §5).
 pub struct GatewaySettings {
@@ -161,7 +162,7 @@ impl Job {
         }
         let bound = self.bound_ns();
         Some(match self.door {
-            Door::Exchange(_) => bound.min(now.saturating_add(beat)),
+            Door::Exchange(..) => bound.min(now.saturating_add(beat)),
             Door::Local(_) => bound,
         })
     }
@@ -189,8 +190,9 @@ enum Bounded {
 
 /// Where a job's operation came in: its body is read and its reply written there.
 enum Door {
-    /// A native exchange, the operation's fields at its body's start (`mantle_protocol::object`).
-    Exchange(ExchangeId),
+    /// A native exchange, the operation's fields at its body's start (`mantle_protocol::object`),
+    /// in the wire profile its connection's handshake agreed on, which its reply is written in.
+    Exchange(ExchangeId, Profile),
     /// The S3 listener's, in-process (`crate::door`).
     Local(Box<Local>),
 }
@@ -320,8 +322,13 @@ enum CopyStage {
     Source,
     /// The source read by a `Get` and written by a `Put`.
     Run,
-    /// CopyObject's version committed as its key's null version: its mark read for the time the
-    /// range gave it (research/89 §3.6).
+    /// CopyObject's version committed as its key's null version, whose ID names no time: the
+    /// key's current version read, the copy's own where it holds the copy's file, and its time
+    /// the range gave it (research/89 §3.6).
+    Current,
+    /// The null version the copy made since overwritten or removed: its mark read for the time,
+    /// which names the version by the copy's file whatever wrote the key since (research/89 §3.6).
+    /// A read profile two brought, which a leader of profile one cannot answer (research/91).
     Mark,
 }
 
@@ -789,7 +796,20 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// An object's request arrived on `exchange` from `peer`, its body `body` bytes: a job that
     /// reads its fields first, or the reply it gets at once.
-    pub(super) fn take_object(&mut self, exchange: ExchangeId, peer: PeerId, body: Option<u64>) {
+    pub(super) fn take_object(
+        &mut self,
+        exchange: ExchangeId,
+        (peer, profile): (PeerId, Option<Profile>),
+        body: Option<u64>,
+    ) {
+        // An exchange arrives on a connection the node holds the `Connected` of, so its profile is
+        // known; one that is not is refused, as one from no known peer is.
+        let Some(profile) = profile else {
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::Identity);
+            return;
+        };
         // A client's operations act for the account its certificate names; one whose
         // connections have all gone since asking is no longer known, and nothing is taken.
         let Some(principal) = self.driver.endpoint().directory().principal(peer) else {
@@ -801,6 +821,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let head = Head::decode(
             self.driver.endpoint().head(exchange).unwrap_or_default(),
             body,
+            profile,
         );
         let now = hyper_rt::futures::now_ns();
         let deadline_ns = head
@@ -823,7 +844,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         };
         self.jobs.push(Job {
-            door: Door::Exchange(exchange),
+            door: Door::Exchange(exchange, profile),
             principal,
             work,
             pending: Vec::new(),
@@ -877,7 +898,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(true);
         };
         // A local operation comes typed, never as fields to read.
-        let Door::Exchange(exchange) = job.door else {
+        let Door::Exchange(exchange, profile) = job.door else {
             return Ok(true);
         };
         let Work::Fields(head, fields) = &mut job.work else {
@@ -903,7 +924,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         let carry = fields.split_off(wanted.min(fields.len()));
-        let op = head.op(fields);
+        let op = head.op(fields, profile);
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
         // A copy counts as two of the host's operations, this job one of them already: one with
         // no room for its second is answered as one past the host's operations is.
@@ -1074,7 +1095,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             match job.bounded(now) {
                 Bounded::SlowDown => self.fail_job(at, Status::SlowDown)?,
                 Bounded::Held => {
-                    if let Door::Exchange(exchange) = job.door {
+                    if let Door::Exchange(exchange, _) = job.door {
                         self.driver.endpoint().working(exchange);
                     }
                 }
@@ -1152,6 +1173,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         );
         if leaderless && self.jobs.get(at).is_some_and(Job::working) {
             return self.fail_job(at, Status::SlowDown);
+        }
+        // A read whose range's leader speaks an older profile than it: the operation is answered
+        // `Unavailable`, which clients ask again once that leader is upgraded or another leads.
+        if matches!(outcome, Outcome::Read(ReadOutcome::Unavailable))
+            && self.jobs.get(at).is_some_and(Job::working)
+        {
+            return self.fail_job(at, Status::Unavailable);
         }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
@@ -1886,7 +1914,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
-        let Door::Exchange(exchange) = job.door else {
+        let Door::Exchange(exchange, _) = job.door else {
             return Ok(());
         };
         let Work::Put(putting) = &mut job.work else {
@@ -2240,8 +2268,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Ok(get) => getting.get = Some(get),
             Err(_) => return self.fail_job(at, Status::Failed),
         }
-        let exchange = match door {
-            Door::Exchange(exchange) => *exchange,
+        let (exchange, profile) = match door {
+            Door::Exchange(exchange, profile) => (*exchange, *profile),
             // The reply goes first, its bytes after it as the driver gives them (`write_get`).
             Door::Local(local) => {
                 getting.total = length;
@@ -2251,7 +2279,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(());
             }
         };
-        let Ok((head, fields)) = reply.encode() else {
+        let Ok((head, fields)) = reply.encode(profile) else {
             return self.fail_job(at, Status::Failed);
         };
         // The fields open the body, ahead of the range's bytes.
@@ -2347,7 +2375,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(false);
         };
         let exchange = match &mut job.door {
-            Door::Exchange(exchange) => *exchange,
+            Door::Exchange(exchange, _) => *exchange,
             Door::Local(local) => {
                 // A piece is taken from the driver only once the last is sent, so the channel holds
                 // what the client has yet to read and the driver the rest of its window.
@@ -3118,6 +3146,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     },
                 ))
             }
+            CopyStage::Current => Some((
+                Layer::Name,
+                Query::Current {
+                    bucket: copying.bucket.clone(),
+                    key: copying.key.clone(),
+                },
+            )),
             CopyStage::Mark => Some((
                 Layer::Name,
                 Query::Mark {
@@ -3171,10 +3206,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     // A version's order is its time inverted (`mantle_meta::name::put`).
                     (false, Some(id)) if id != NULL_VERSION => parse_version_id(id)
                         .map(|order| copied(&stored, !order, &copying.source_version)),
-                    // A null version's ID names no order: its mark does.
+                    // A null version's ID names no order: the key's current version does while it
+                    // is the copy's, its mark otherwise.
                     (false, _) => {
                         copying.stored = Some(stored);
-                        copying.stage = CopyStage::Mark;
+                        copying.stage = CopyStage::Current;
                         return Ok(false);
                     }
                 };
@@ -3321,6 +3357,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             (CopyStage::Upload, Read::Upload(Some(_))) => self.fail_job(at, Status::InvalidRequest),
             (CopyStage::Upload, Read::Upload(None)) => self.fail_job(at, Status::NoSuchUpload),
             (CopyStage::Source, read) => self.copy_source_read(at, read),
+            (CopyStage::Current, Read::Current(Some((order, current))))
+                if current.file == Some(copying.file) =>
+            {
+                let reply = match &copying.stored {
+                    Some(stored) => copied(stored, !order, &copying.source_version),
+                    None => Reply::status(Status::Failed),
+                };
+                self.reply_job(at, reply)
+            }
+            // Written over or removed since: the mark the copy's write left names its version.
+            (CopyStage::Current, Read::Current(_)) => {
+                copying.stage = CopyStage::Mark;
+                Ok(())
+            }
             (
                 CopyStage::Mark,
                 Read::Mark(Some(record::Mark {
@@ -3787,8 +3837,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let exchange = match job.door {
-            Door::Exchange(exchange) => exchange,
+        let (exchange, profile) = match job.door {
+            Door::Exchange(exchange, profile) => (exchange, profile),
             // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
             // and its end go now.
             Door::Local(_) => {
@@ -3831,7 +3881,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(false);
             }
         }
-        let Ok((head, fields)) = reply.encode() else {
+        // A reply its connection's profile cannot carry answers that the operation failed, which
+        // every profile can say; none arises from a request the profile can ask.
+        let Ok((head, fields)) = reply
+            .encode(profile)
+            .or_else(|_| Reply::status(Status::Failed).encode(profile))
+        else {
             return Ok(true);
         };
         let length = u64::try_from(fields.len()).unwrap_or(u64::MAX);
@@ -3850,7 +3905,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let Door::Exchange(exchange) = job.door else {
+        let Door::Exchange(exchange, _) = job.door else {
             return Ok(true);
         };
         let Work::Replying(fields, written) = &mut job.work else {
@@ -3892,7 +3947,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub(super) fn job_on(&self, exchange: ExchangeId) -> Option<usize> {
         self.jobs
             .iter()
-            .position(|j| matches!(j.door, Door::Exchange(e) if e == exchange))
+            .position(|j| matches!(j.door, Door::Exchange(e, _) if e == exchange))
     }
 
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
@@ -3901,7 +3956,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             jobs, abandoned, ..
         } = self;
         jobs.retain_mut(|j| {
-            if !matches!(j.door, Door::Exchange(e) if e == exchange) {
+            if !matches!(j.door, Door::Exchange(e, _) if e == exchange) {
                 return true;
             }
             abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));

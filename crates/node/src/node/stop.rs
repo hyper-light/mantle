@@ -142,8 +142,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Begins handing the lead of the range at `handle`, which this node leads, to a voter whose
     /// log holds everything committed, or, with none such, the voter whose log holds the most,
     /// which the core brings up to its own before it hands over (Raft §3.10); once a transfer to
-    /// `failed` was given up, to another voter where there is one. The voter it goes to, or `None`
-    /// where the core refuses, after which the range elects as after a crash.
+    /// `failed` was given up, to another voter where there is one. Of voters alike, one whose
+    /// connection speaks this node's wire profile is taken first, so a rolling upgrade's stops
+    /// hand the lead among the upgraded nodes, whose reads every operation can ask (research/91).
+    /// The voter it goes to, or `None` where the core refuses, after which the range elects as
+    /// after a crash.
     fn transfer_lead(&mut self, handle: Handle, failed: Option<u64>) -> Option<u64> {
         let replica = self.owner.get(handle)?;
         let tracker = replica.core().raft.tracker();
@@ -157,6 +160,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 (
                     Some(*voter) != failed,
                     replica.caught_up(*voter),
+                    self.speaks(*voter).is_some_and(|p| p >= self.profile),
                     tracker.get(*voter).map_or(0, |p| p.matched),
                 )
             })?;

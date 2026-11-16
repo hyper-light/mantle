@@ -13,8 +13,9 @@ use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_node::derive;
 use mantle_node::directory::{Peer, Peers};
 use mantle_protocol::bounds::{self, Stated};
-use mantle_protocol::classes::{Bounds, NodeClasses, Role};
+use mantle_protocol::classes::{Bounds, NodeClasses, Party, Role};
 use mantle_protocol::node_name;
+use mantle_protocol::wire::Profile;
 
 const AUTHORITY: &str = "mantle transport test";
 
@@ -71,7 +72,10 @@ pub fn endpoint(
     };
     let config = Config {
         tls: Tls::mutual(&credentials, true).unwrap(),
-        role: Role::Node,
+        role: Party {
+            role: Role::Node,
+            profile: Profile::One,
+        },
         limits: bounds::limits(stated).unwrap(),
         congestion: Default::default(),
     };

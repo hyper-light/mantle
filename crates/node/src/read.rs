@@ -56,6 +56,7 @@ use mantle_protocol::object::{
     self, Buckets, List, ListVersions, Listed, MAX_TAG, Page, UploadListed, Uploads, VersionListed,
     Versions,
 };
+use mantle_protocol::wire::Profile;
 
 /// The query's kind: the current version of a key, or a page of the volume table.
 const CURRENT: u8 = 0;
@@ -279,6 +280,28 @@ fn take_text(r: &mut Reader<'_>, most: usize) -> Option<String> {
 }
 
 impl Query {
+    /// The wire profile the read came in (`mantle_protocol::wire`): profile two's are the reads of a
+    /// named version, of a page of versions and of a write's mark (kinds 13 to 15), which a node of
+    /// profile one cannot decode and is never asked.
+    pub fn profile(&self) -> Profile {
+        match self {
+            Self::Current { .. }
+            | Self::Volumes { .. }
+            | Self::Header { .. }
+            | Self::Extents { .. }
+            | Self::Block { .. }
+            | Self::Bucket { .. }
+            | Self::Gate { .. }
+            | Self::List(_)
+            | Self::Owned { .. }
+            | Self::Probe { .. }
+            | Self::Upload { .. }
+            | Self::Parts { .. }
+            | Self::Uploads { .. } => Profile::One,
+            Self::Version { .. } | Self::Versions(_) | Self::Mark { .. } => Profile::Two,
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, ReadError> {
         let mut w = Writer::default();
         match self {

@@ -799,9 +799,10 @@ read of the source and one write per copy, inside the cell; no byte crosses to t
 - **Answer.** `CopyObjectResult` and `CopyPartResult` with the ETag, the new version's or part's
   `LastModified` and its checksum; `x-amz-version-id` the new version's, and
   `x-amz-copy-source-version-id` the source's (89 §3.6, §4.2). A version's time is its order
-  inverted; a null version's, which its ID does not name, is read from the mark its write left
-  under the copy's own file; a part's is the gateway's time as its body ended, which ListParts
-  now states too, where it answered 1970.
+  inverted; a null version's, which its ID does not name, is the key's current version's where
+  that still holds the copy's own file, else read from the mark its write left under that file; a
+  part's is the gateway's time as its body ended, which ListParts now states too, where it
+  answered 1970.
 - **Its cost to the host.** A copy drives a get and a put at once, so it counts as two of the
   host's operations at both doors, and a copy waits at the local door, or is answered
   `503 SlowDown` at the native door, while fewer than two are free.

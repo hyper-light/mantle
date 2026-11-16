@@ -141,6 +141,7 @@ use crate::node::{
 use crate::secret::{self, SecretError};
 use crate::storage::{Locks, NodeLock, Storage, StorageError, VolumeSettings};
 use mantle_protocol::classes::Role;
+use mantle_protocol::wire::Profile;
 
 /// Why the process stopped.
 #[derive(Debug, thiserror::Error)]
@@ -1771,6 +1772,7 @@ async fn serve(
         let mut engine = engine(&config, *group, *layer).map_err(step(Step::Storage))?;
         if *layer == Layer::Root {
             held = cell_history(&mut engine, config.id).map_err(step(Step::Storage))?;
+            under_fence(&mut engine).map_err(step(Step::Storage))?;
         }
         ranges.push(Hosted {
             group: *group,
@@ -1879,6 +1881,9 @@ async fn serve(
     // laws, not a deadline of the node's, decide when.
     // The node's statements of its history to the root range, once enlisted (node.md §2.4, item 7).
     let mut living = Living::default();
+    // The cell's upgrade fence as the node last said it (research/91 §4): said again once it
+    // rises, `fence PROFILE`.
+    let mut fence = Profile::One;
     // Whether the root range enlisted the node in this run, and the readiness lock a supervisor's
     // check asks for (`mantle status`), held from then until the process ends.
     let (mut enlisted, mut live): (bool, Option<Live>) = (false, None);
@@ -2069,6 +2074,10 @@ async fn serve(
         if let Some(e) = &config.enlist {
             living.take(&mut node, e.root, own, started_ns)?;
         }
+        if node.fence() != fence {
+            fence = node.fence();
+            say(&mut output, &format!("fence {}\n", fence.number())).await?;
+        }
         for (group, replaced) in node.take_replaced() {
             writeln!(
                 lines,
@@ -2195,6 +2204,21 @@ async fn serve(
 
 /// What the root range's replica holds of the cell's history, and of node `id`'s own: the sum over
 /// every node the table holds, and its row (node.md §2.4, item 7).
+/// Refused where the cell's upgrade fence this node's member of the root range keeps is past the
+/// wire profile the node announces, or one its binary has none of: such a node cannot read what
+/// the cell writes, so it does not start (research/91 §4). A fence raised in an entry its member
+/// has yet to apply stops it once applied (`NodeError::Fenced`).
+fn under_fence<E: Engine>(engine: &mut E) -> Result<(), ProcessError> {
+    let fence = root::fence(engine).map_err(|e| ProcessError::Engine(e.to_string()))?;
+    let profile =
+        Profile::announced().map_err(|e| ProcessError::Value("MANTLE_WIRE", e.to_string()))?;
+    if Profile::numbered(fence).is_some_and(|f| f <= profile) {
+        Ok(())
+    } else {
+        Err(ProcessError::Node(NodeError::Fenced { fence, profile }))
+    }
+}
+
 fn cell_history<E: Engine>(engine: &mut E, id: u64) -> Result<(History, History), ProcessError> {
     let meta = |e: mantle_meta::error::MetaError| ProcessError::History(e.to_string());
     let nodes = root::census(engine).map_err(meta)?.nodes;

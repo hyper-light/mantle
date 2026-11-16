@@ -208,6 +208,7 @@ impl Answer {
                         root::Outcome::Full => 2,
                         root::Outcome::Kept => 3,
                         root::Outcome::Unknown => 4,
+                        root::Outcome::Raised => 5,
                     });
                 }
             }
@@ -261,6 +262,7 @@ impl Answer {
                     2 => root::Outcome::Full,
                     3 => root::Outcome::Kept,
                     4 => root::Outcome::Unknown,
+                    5 => root::Outcome::Raised,
                     _ => return None,
                 }),
                 _ => return None,
@@ -418,6 +420,13 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u64(l.exposure_ns);
             w.u64(l.crashes);
         }
+        // Wire profile two's first kept format (docs/research/91 §4): proposed only once every
+        // member speaks profile two, so every member that applies it reads it.
+        Command::Root(root::Command::Fence(f)) => {
+            w.u8(5);
+            w.u8(2);
+            w.u8(f.profile);
+        }
     }
     Ok(())
 }
@@ -539,6 +548,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 exposure_ns: r.u64()?,
                 crashes: r.u64()?,
             }),
+            2 => root::Command::Fence(root::Fence { profile: r.u8()? }),
             _ => return None,
         }),
         _ => return None,
@@ -2349,6 +2359,7 @@ mod tests {
                 exposure_ns: u64::MAX,
                 crashes: u64::MAX,
             })),
+            Command::Root(root::Command::Fence(root::Fence { profile: 2 })),
         ]
     }
 
@@ -2554,6 +2565,7 @@ mod tests {
                 root::Outcome::Full,
                 root::Outcome::Kept,
                 root::Outcome::Unknown,
+                root::Outcome::Raised,
             ]
             .map(Answer::Root),
         );

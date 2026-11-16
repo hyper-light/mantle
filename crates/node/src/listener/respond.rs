@@ -278,6 +278,14 @@ pub fn refusal(status: Status) -> Refused {
             "The range value must use the form bytes=first-last, where the first and last are \
              the zero-based byte offsets to copy.",
         ),
+        // S3's "Service is unable to handle request." (research/05 §11.2): a range's leader runs
+        // an older mantle than the read this request needs (research/91); stock clients ask a
+        // `503` again.
+        Status::Unavailable => (
+            "ServiceUnavailable",
+            503,
+            "Service is unable to handle request: a node it needs runs an older mantle.",
+        ),
     };
     Refused::new(code, http, message)
 }

@@ -62,6 +62,9 @@ pub enum ReadOutcome {
     /// The range refused it for what it is: malformed, of another layer's rows (`WrongLayer`), its
     /// answer past what a reply carries (`TooLarge`), or its engine failed it (`Refused`).
     Refused(command::Status),
+    /// The range's leader speaks an older wire profile than the read came in: nothing was asked
+    /// (research/91).
+    Unavailable,
 }
 
 /// A read this node asked, and how it is being asked: as an entry is, with the leader the nodes

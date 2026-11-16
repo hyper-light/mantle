@@ -92,6 +92,16 @@
 //!
 //! Numbers are little-endian. Every text is within S3's bound on what it names, and every count
 //! within S3's page: a message past them is refused whole.
+//!
+//! Each message is written in the wire profile its connection's two sides agreed on
+//! ([`crate::wire`]). Profile one's are every mantle's before profiles: kinds 0 to 20, statuses 0
+//! to 26 and listings 0 to 4, with neither the metadata a put, an upload's creation and an Open
+//! carry nor the version a get, a head and a delete name, and a reply that ends after its
+//! progress. Profile two adds what research/89 brought: those fields, kinds 21 to 24, statuses
+//! 27 to 36 and listings 5 and 6, and a reply's metadata and source version after its progress.
+//! A request is refused in a profile that cannot carry all of it ([`ObjectError::Profile`]), never
+//! written without part of it; a reply's metadata and source version, which no request of
+//! profile one asks for, are not stated to a peer of one.
 
 use std::time::Duration;
 
@@ -103,6 +113,8 @@ use mantle_s3::checksum::{Algorithm, Checksum};
 use mantle_s3::copy::{Directive, Source};
 use mantle_s3::list::{MAX_KEYS, Resume};
 use mantle_s3::route::{MAX_BUCKET, MAX_HEADERS, MAX_KEY};
+
+use crate::wire::Profile;
 
 const CREATE: u8 = 0;
 const PUT: u8 = 1;
@@ -780,6 +792,76 @@ fn take_metadata(r: &mut Reader<'_>) -> Option<Metadata> {
     Some(pairs)
 }
 
+/// The last request kind `profile` has.
+const fn last_kind(profile: Profile) -> u8 {
+    match profile {
+        Profile::One => FINISH,
+        Profile::Two => LIST_VERSIONS,
+    }
+}
+
+/// Refused unless `profile` is at least `needs`: what is being written or read came in `needs`.
+fn since(profile: Profile, needs: Profile) -> Result<(), ObjectError> {
+    if profile >= needs {
+        Ok(())
+    } else {
+        Err(ObjectError::Profile(needs))
+    }
+}
+
+/// None unless `profile` is at least `needs`, for a decoder's `?`.
+fn later(profile: Profile, needs: Profile) -> Option<()> {
+    if profile >= needs { Some(()) } else { None }
+}
+
+/// A version's metadata where `profile` carries it; under profile one, where it has no field,
+/// refused unless there is none, so none is ever dropped.
+fn put_metadata_in(
+    f: &mut Writer,
+    pairs: &[(String, String)],
+    profile: Profile,
+) -> Result<(), ObjectError> {
+    if profile >= Profile::Two {
+        put_metadata(f, pairs)
+    } else if pairs.is_empty() {
+        Ok(())
+    } else {
+        Err(ObjectError::Profile(Profile::Two))
+    }
+}
+
+fn take_metadata_in(r: &mut Reader<'_>, profile: Profile) -> Option<Metadata> {
+    if profile >= Profile::Two {
+        take_metadata(r)
+    } else {
+        Some(Vec::new())
+    }
+}
+
+/// The version a read or a delete names where `profile` carries it; under profile one, which
+/// names none, refused unless it names none.
+fn put_version_in(
+    f: &mut Writer,
+    version: Option<&str>,
+    profile: Profile,
+) -> Result<(), ObjectError> {
+    if profile >= Profile::Two {
+        put_optional_text(f, version, MAX_VERSION_ID)
+    } else if version.is_none() {
+        Ok(())
+    } else {
+        Err(ObjectError::Profile(Profile::Two))
+    }
+}
+
+fn take_version_in(r: &mut Reader<'_>, profile: Profile) -> Option<Option<String>> {
+    if profile >= Profile::Two {
+        take_optional_text(r, MAX_VERSION_ID)
+    } else {
+        Some(None)
+    }
+}
+
 /// A copy's source: its bucket and key, and its version, optional.
 fn put_source(w: &mut Writer, source: &Source) -> Result<(), ObjectError> {
     put_text(w, &source.bucket, MAX_BUCKET)?;
@@ -838,7 +920,7 @@ impl Head {
     }
 
     /// The request, once its fields are read.
-    pub fn op(&self, fields: &[u8]) -> Result<Op, ObjectError> {
+    pub fn op(&self, fields: &[u8], profile: Profile) -> Result<Op, ObjectError> {
         let bad = || ObjectError::Fields(fields.len());
         if u64::try_from(fields.len()).ok() != Some(self.fields()) {
             return Err(bad());
@@ -864,7 +946,7 @@ impl Head {
                         checksum,
                         md5,
                         trailing: self.trailing,
-                        metadata: take_metadata(&mut r)?,
+                        metadata: take_metadata_in(&mut r, profile)?,
                     }
                 }
                 GET => {
@@ -873,7 +955,7 @@ impl Head {
                         bucket,
                         key,
                         headers: take_headers(&mut r)?,
-                        version: take_optional_text(&mut r, MAX_VERSION_ID)?,
+                        version: take_version_in(&mut r, profile)?,
                     }
                 }
                 HEAD => {
@@ -882,7 +964,7 @@ impl Head {
                         bucket,
                         key,
                         headers: take_headers(&mut r)?,
-                        version: take_optional_text(&mut r, MAX_VERSION_ID)?,
+                        version: take_version_in(&mut r, profile)?,
                     }
                 }
                 DELETE => {
@@ -892,7 +974,7 @@ impl Head {
                         key,
                         id: self.id,
                         headers: take_headers(&mut r)?,
-                        version: take_optional_text(&mut r, MAX_VERSION_ID)?,
+                        version: take_version_in(&mut r, profile)?,
                     }
                 }
                 LIST => Op::List(take_list(&mut r)?),
@@ -930,7 +1012,7 @@ impl Head {
                         key,
                         id: self.id,
                         checksum,
-                        metadata: take_metadata(&mut r)?,
+                        metadata: take_metadata_in(&mut r, profile)?,
                     }
                 }
                 UPLOAD_PART => {
@@ -1005,7 +1087,7 @@ impl Head {
                         length: take_optional_u64(&mut r)?,
                         buffer: take_optional_u64(&mut r)?,
                         checksum: Algorithm::from_code(r.u8()?)?,
-                        metadata: take_metadata(&mut r)?,
+                        metadata: take_metadata_in(&mut r, profile)?,
                     }
                 }
                 APPEND => {
@@ -1053,6 +1135,7 @@ impl Head {
                     }
                 }
                 COPY => {
+                    later(profile, Profile::Two)?;
                     let (bucket, key) = object(&mut r)?;
                     Op::Copy(Box::new(Copy {
                         bucket,
@@ -1071,6 +1154,7 @@ impl Head {
                     }))
                 }
                 COPY_PART => {
+                    later(profile, Profile::Two)?;
                     let (bucket, key) = object(&mut r)?;
                     Op::CopyPart(Box::new(CopyPart {
                         bucket,
@@ -1083,6 +1167,7 @@ impl Head {
                     }))
                 }
                 DELETE_OBJECTS => {
+                    later(profile, Profile::Two)?;
                     let bucket = take_text(&mut r, MAX_BUCKET)?;
                     // An object takes 6 bytes at least: its key's length and two flags.
                     let count = take_count(&mut r, MAX_OBJECTS, 6)?;
@@ -1101,17 +1186,20 @@ impl Head {
                         quiet: take_flag(&mut r)?,
                     }
                 }
-                LIST_VERSIONS => Op::ListVersions(take_list_versions(&mut r)?),
+                LIST_VERSIONS => {
+                    later(profile, Profile::Two)?;
+                    Op::ListVersions(take_list_versions(&mut r)?)
+                }
                 _ => return None,
             })
         })();
         op.filter(|_| r.remaining() == 0).ok_or_else(bad)
     }
 
-    /// The head an exchange carries, its body `body` bytes: refused for an unknown kind, fields
-    /// past their bound, a length on any but a put, or a body that is not the fields and a put's
-    /// length.
-    pub fn decode(head: &[u8], body: Option<u64>) -> Result<Self, ObjectError> {
+    /// The head an exchange carries, its body `body` bytes, on a connection of `profile`: refused
+    /// for a kind the profile does not have, fields past their bound, a length on any but a put,
+    /// or a body that is not the fields and a put's length.
+    pub fn decode(head: &[u8], body: Option<u64>, profile: Profile) -> Result<Self, ObjectError> {
         let mut r = Reader::new(head);
         let decoded = (|| {
             Some(Self {
@@ -1131,7 +1219,7 @@ impl Head {
         let decoded = decoded.ok_or_else(head_of)?;
         let puts = matches!(decoded.kind, PUT | UPLOAD_PART | APPEND);
         let within = usize::try_from(decoded.fields).is_ok_and(|f| f <= MAX_FIELDS)
-            && decoded.kind <= LIST_VERSIONS
+            && decoded.kind <= last_kind(profile)
             && (puts || (decoded.length == 0 && decoded.trailing.is_none()));
         let trailer = decoded
             .trailing
@@ -1165,16 +1253,19 @@ pub fn within(head: &mut [u8], remaining: Option<Duration>) -> Result<(), Object
 }
 
 impl Op {
-    /// The request's head and the fields that open its body: the fields counted first, then
-    /// written into one buffer at their length (`mantle_codec::encode`'s rule), so it never grows.
-    pub fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
+    /// The request's head and the fields that open its body in `profile`'s formats: the fields
+    /// counted first, then written into one buffer at their length (`mantle_codec::encode`'s
+    /// rule), so it never grows. An operation or a field a later profile brought is refused
+    /// ([`ObjectError::Profile`]), never left out: a put's metadata dropped would commit an object
+    /// other than the one asked for.
+    pub fn encode(&self, profile: Profile) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
         let mut count = Writer::counting();
-        self.put_fields(&mut count)?;
+        self.put_fields(&mut count, profile)?;
         if count.len() > MAX_FIELDS {
             return Err(ObjectError::TooLong(count.len()));
         }
         let mut f = Writer::with_capacity(count.len());
-        let (kind, id, length, trailing) = self.put_fields(&mut f)?;
+        let (kind, id, length, trailing) = self.put_fields(&mut f, profile)?;
         let fields = f.into_vec();
         let mut w = Writer::with_capacity(HEAD_BYTES);
         w.u8(kind);
@@ -1186,11 +1277,12 @@ impl Op {
         Ok((w.into_vec(), fields))
     }
 
-    /// Writes the request's fields into `f`, and gives its kind, its identity, its body's length
-    /// and its trailer's algorithm.
+    /// Writes the request's fields into `f` in `profile`'s formats, and gives its kind, its
+    /// identity, its body's length and its trailer's algorithm.
     fn put_fields(
         &self,
         f: &mut Writer,
+        profile: Profile,
     ) -> Result<(u8, u128, u64, Option<Algorithm>), ObjectError> {
         let object = |f: &mut Writer, bucket: &str, key: &str| -> Result<(), ObjectError> {
             put_text(f, bucket, MAX_BUCKET)?;
@@ -1215,7 +1307,7 @@ impl Op {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
                 put_digests(f, checksum.as_ref(), md5.as_ref())?;
-                put_metadata(f, metadata)?;
+                put_metadata_in(f, metadata, profile)?;
                 (PUT, *id, *length, *trailing)
             }
             Self::Get {
@@ -1226,7 +1318,7 @@ impl Op {
             } => {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
-                put_optional_text(f, version.as_deref(), MAX_VERSION_ID)?;
+                put_version_in(f, version.as_deref(), profile)?;
                 (GET, 0, 0, None)
             }
             Self::Head {
@@ -1237,7 +1329,7 @@ impl Op {
             } => {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
-                put_optional_text(f, version.as_deref(), MAX_VERSION_ID)?;
+                put_version_in(f, version.as_deref(), profile)?;
                 (HEAD, 0, 0, None)
             }
             Self::Delete {
@@ -1249,7 +1341,7 @@ impl Op {
             } => {
                 object(f, bucket, key)?;
                 put_headers(f, headers)?;
-                put_optional_text(f, version.as_deref(), MAX_VERSION_ID)?;
+                put_version_in(f, version.as_deref(), profile)?;
                 (DELETE, *id, 0, None)
             }
             Self::List(list) => {
@@ -1299,7 +1391,7 @@ impl Op {
                     f.u8(algorithm.code());
                     put_flag(f, *full_object);
                 }
-                put_metadata(f, metadata)?;
+                put_metadata_in(f, metadata, profile)?;
                 (CREATE_UPLOAD, *id, 0, None)
             }
             Self::UploadPart {
@@ -1392,7 +1484,7 @@ impl Op {
                 put_optional_u64(f, *length);
                 put_optional_u64(f, *buffer);
                 f.u8(checksum.code());
-                put_metadata(f, metadata)?;
+                put_metadata_in(f, metadata, profile)?;
                 (OPEN, *id, 0, None)
             }
             Self::Append {
@@ -1442,6 +1534,7 @@ impl Op {
                 (FINISH, *id, 0, None)
             }
             Self::Copy(copy) => {
+                since(profile, Profile::Two)?;
                 object(f, &copy.bucket, &copy.key)?;
                 put_source(f, &copy.source)?;
                 put_headers(f, &copy.conditions)?;
@@ -1455,6 +1548,7 @@ impl Op {
                 (COPY, copy.id, 0, None)
             }
             Self::CopyPart(part) => {
+                since(profile, Profile::Two)?;
                 object(f, &part.bucket, &part.key)?;
                 put_text(f, &part.upload, MAX_TAG)?;
                 f.u16(part.number);
@@ -1468,6 +1562,7 @@ impl Op {
                 objects,
                 quiet,
             } => {
+                since(profile, Profile::Two)?;
                 put_text(f, bucket, MAX_BUCKET)?;
                 if objects.len() > MAX_OBJECTS {
                     return Err(ObjectError::TooLong(objects.len()));
@@ -1482,6 +1577,7 @@ impl Op {
                 (DELETE_OBJECTS, *id, 0, None)
             }
             Self::ListVersions(list) => {
+                since(profile, Profile::Two)?;
                 put_list_versions(f, list)?;
                 (LIST_VERSIONS, 0, 0, None)
             }
@@ -1601,9 +1697,13 @@ pub enum Status {
     /// S3's `400 InvalidArgument`: an `x-amz-copy-source-range` not of the form
     /// `bytes=first-last` (research/89 §4.1).
     InvalidCopyRange,
+    /// S3's `503 ServiceUnavailable`: a node the operation needs, the leader of a range it reads,
+    /// speaks an older wire profile than the read; nothing was done, and the operation is taken
+    /// once that node is upgraded or another leads (research/91).
+    Unavailable,
 }
 
-const STATUSES: [Status; 36] = [
+const STATUSES: [Status; 37] = [
     Status::Done,
     Status::NoSuchBucket,
     Status::NoSuchKey,
@@ -1640,6 +1740,7 @@ const STATUSES: [Status; 36] = [
     Status::CopyRangeSource,
     Status::CopyMarker,
     Status::InvalidCopyRange,
+    Status::Unavailable,
 ];
 
 impl Status {
@@ -1681,11 +1782,22 @@ impl Status {
             Self::CopyRangeSource => 33,
             Self::CopyMarker => 34,
             Self::InvalidCopyRange => 35,
+            Self::Unavailable => 36,
         }
     }
 
     fn of(code: u8) -> Option<Self> {
         STATUSES.into_iter().find(|s| s.code() == code)
+    }
+
+    /// The profile the status came in: profile one's are those every mantle before profiles
+    /// answered.
+    pub fn profile(self) -> Profile {
+        if self.code() < Self::NoSuchVersion.code() {
+            Profile::One
+        } else {
+            Profile::Two
+        }
     }
 }
 
@@ -2369,10 +2481,15 @@ impl Reply {
         }
     }
 
-    /// The reply's head and the fields that open its body: the fields counted first, then
-    /// written into one buffer at their length (`mantle_codec::encode`'s rule), so it never grows.
-    pub fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
-        let fields = mantle_codec::encode(0, |f| self.put_fields(f))?.into_vec();
+    /// The reply's head and the fields that open its body in `profile`'s formats: the fields
+    /// counted first, then written into one buffer at their length (`mantle_codec::encode`'s
+    /// rule), so it never grows. A status or a listing a later profile brought is refused
+    /// ([`ObjectError::Profile`]); none answers a request profile one can ask. The version's
+    /// metadata and a copy's source version are profile two's facts, which profile one's replies
+    /// have no field for and its requests never ask: they are stated only to a peer of two.
+    pub fn encode(&self, profile: Profile) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
+        since(profile, self.status.profile())?;
+        let fields = mantle_codec::encode(0, |f| self.put_fields(f, profile))?.into_vec();
         let mut w = Writer::with_capacity(REPLY_HEAD_BYTES);
         w.u8(self.status.code());
         w.u64(self.size);
@@ -2380,8 +2497,8 @@ impl Reply {
         Ok((w.into_vec(), fields))
     }
 
-    /// Writes the reply's fields into `f`.
-    fn put_fields(&self, f: &mut Writer) -> Result<(), ObjectError> {
+    /// Writes the reply's fields into `f` in `profile`'s formats.
+    fn put_fields(&self, f: &mut Writer, profile: Profile) -> Result<(), ObjectError> {
         put_text(f, &self.version, MAX_TAG)?;
         put_text(f, &self.etag, MAX_TAG)?;
         f.u64(self.modified);
@@ -2422,10 +2539,12 @@ impl Reply {
                 put_uploads(f, page)?;
             }
             Some(Listing::Versions(page)) => {
+                since(profile, Profile::Two)?;
                 f.u8(5);
                 put_versions(f, page)?;
             }
             Some(Listing::Deleted(results)) => {
+                since(profile, Profile::Two)?;
                 f.u8(6);
                 put_deleted(f, results)?;
             }
@@ -2445,8 +2564,10 @@ impl Reply {
                 f.bytes(value);
             }
         }
-        put_metadata(f, &self.metadata)?;
-        put_text(f, &self.source_version, MAX_TAG)?;
+        if profile >= Profile::Two {
+            put_metadata(f, &self.metadata)?;
+            put_text(f, &self.source_version, MAX_TAG)?;
+        }
         Ok(())
     }
 }
@@ -2465,11 +2586,13 @@ impl ReplyHead {
         u64::from(self.fields)
     }
 
-    pub fn decode(head: &[u8]) -> Result<Self, ObjectError> {
+    /// The reply head an exchange carries, on a connection of `profile`: refused for a status the
+    /// profile does not have, or fields past their bound.
+    pub fn decode(head: &[u8], profile: Profile) -> Result<Self, ObjectError> {
         let mut r = Reader::new(head);
         let reply = (|| {
             Some(Self {
-                status: Status::of(r.u8()?)?,
+                status: Status::of(r.u8()?).filter(|s| s.profile() <= profile)?,
                 size: r.u64()?,
                 fields: r.u32()?,
             })
@@ -2481,8 +2604,8 @@ impl ReplyHead {
             .ok_or(ObjectError::Reply(head.len()))
     }
 
-    /// The reply, once its fields are read.
-    pub fn reply(&self, fields: &[u8]) -> Result<Reply, ObjectError> {
+    /// The reply, once its fields are read, in `profile`'s formats.
+    pub fn reply(&self, fields: &[u8], profile: Profile) -> Result<Reply, ObjectError> {
         let bad = || ObjectError::Fields(fields.len());
         if u64::try_from(fields.len()).ok() != Some(self.fields()) {
             return Err(bad());
@@ -2524,8 +2647,8 @@ impl ReplyHead {
                 2 => Some(Listing::Buckets(take_buckets(&mut r)?)),
                 3 => Some(Listing::Parts(take_parts(&mut r)?)),
                 4 => Some(Listing::Uploads(take_uploads(&mut r)?)),
-                5 => Some(Listing::Versions(take_versions(&mut r)?)),
-                6 => Some(Listing::Deleted(take_deleted(&mut r)?)),
+                5 if profile >= Profile::Two => Some(Listing::Versions(take_versions(&mut r)?)),
+                6 if profile >= Profile::Two => Some(Listing::Deleted(take_deleted(&mut r)?)),
                 _ => return None,
             };
             let progress = if take_flag(&mut r)? {
@@ -2552,8 +2675,11 @@ impl ReplyHead {
             } else {
                 None
             };
-            let metadata = take_metadata(&mut r)?;
-            let source_version = take_text(&mut r, MAX_TAG)?;
+            let (metadata, source_version) = if profile >= Profile::Two {
+                (take_metadata(&mut r)?, take_text(&mut r, MAX_TAG)?)
+            } else {
+                (Vec::new(), String::new())
+            };
             Some(Reply {
                 status: self.status,
                 size: self.size,
@@ -2586,6 +2712,10 @@ pub enum ObjectError {
     Fields(usize),
     #[error("a field of {0} bytes, past its bound")]
     TooLong(usize),
+    /// What the message carries came in a later wire profile than the connection's: an operation,
+    /// a field or a status its peer cannot read (crate::wire).
+    #[error("what the message carries needs wire profile {0:?}, past the connection's")]
+    Profile(Profile),
 }
 
 #[cfg(test)]
@@ -2936,14 +3066,14 @@ mod tests {
         let ops = every_op().into_iter().chain([complete]);
         for op in ops {
             alloc::begin();
-            let encoded = op.encode();
+            let encoded = op.encode(Profile::Two);
             let c = alloc::end();
             assert!(encoded.is_ok(), "{op:?}");
             assert_eq!((c.allocations, c.reallocations), (2, 0), "{op:?}");
         }
         for reply in every_reply() {
             alloc::begin();
-            let encoded = reply.encode();
+            let encoded = reply.encode(Profile::Two);
             let c = alloc::end();
             assert!(encoded.is_ok(), "{reply:?}");
             assert_eq!((c.allocations, c.reallocations), (2, 0), "{reply:?}");
@@ -2953,37 +3083,43 @@ mod tests {
     #[test]
     fn every_request_reads_back_within_its_bounds() {
         for op in every_op() {
-            let (head, fields) = op.encode().unwrap();
+            let (head, fields) = op.encode(Profile::Two).unwrap();
             assert_eq!(head.len(), HEAD_BYTES);
             assert!(fields.len() <= MAX_FIELDS, "{op:?}");
-            let decoded = Head::decode(&head, Some(op.body(&fields))).unwrap();
+            let decoded = Head::decode(&head, Some(op.body(&fields)), Profile::Two).unwrap();
             assert_eq!(decoded.fields(), fields.len() as u64);
-            assert_eq!(decoded.op(&fields), Ok(op));
+            assert_eq!(decoded.op(&fields, Profile::Two), Ok(op));
         }
     }
 
     #[test]
     fn a_requests_time_left_reads_back_as_set_at_each_attempt_and_none_as_none() {
         let put = every_op().swap_remove(1);
-        let (mut head, fields) = put.encode().unwrap();
+        let (mut head, fields) = put.encode(Profile::Two).unwrap();
         let body = Some(put.body(&fields));
-        assert_eq!(Head::decode(&head, body).unwrap().remaining(), None);
+        assert_eq!(
+            Head::decode(&head, body, Profile::Two).unwrap().remaining(),
+            None
+        );
         within(&mut head, Some(Duration::from_millis(1500))).unwrap();
-        let decoded = Head::decode(&head, body).unwrap();
+        let decoded = Head::decode(&head, body, Profile::Two).unwrap();
         assert_eq!(decoded.remaining(), Some(Duration::from_millis(1500)));
-        assert_eq!(decoded.op(&fields), Ok(put.clone()));
+        assert_eq!(decoded.op(&fields, Profile::Two), Ok(put.clone()));
         // Set again for the next attempt, less; and none again.
         within(&mut head, Some(Duration::from_millis(400))).unwrap();
         assert_eq!(
-            Head::decode(&head, body).unwrap().remaining(),
+            Head::decode(&head, body, Profile::Two).unwrap().remaining(),
             Some(Duration::from_millis(400))
         );
         within(&mut head, None).unwrap();
-        assert_eq!(Head::decode(&head, body).unwrap().remaining(), None);
+        assert_eq!(
+            Head::decode(&head, body, Profile::Two).unwrap().remaining(),
+            None
+        );
         // A time past what nanoseconds count waits for as long as any; no head but a request's.
         within(&mut head, Some(Duration::MAX)).unwrap();
         assert_eq!(
-            Head::decode(&head, body).unwrap().remaining(),
+            Head::decode(&head, body, Profile::Two).unwrap().remaining(),
             Some(Duration::from_nanos(u64::MAX))
         );
         assert!(within(&mut head[1..], None).is_err());
@@ -2992,34 +3128,34 @@ mod tests {
     #[test]
     fn a_request_past_its_bounds_or_not_its_heads_is_refused() {
         let put = every_op().swap_remove(1);
-        let (head, fields) = put.encode().unwrap();
+        let (head, fields) = put.encode(Profile::Two).unwrap();
         // A body that is not the fields and the put's length; fields cut short; a head cut short.
-        assert!(Head::decode(&head, Some(put.body(&fields) - 1)).is_err());
-        let decoded = Head::decode(&head, Some(put.body(&fields))).unwrap();
-        assert!(decoded.op(&fields[1..]).is_err());
-        assert!(Head::decode(&head[1..], Some(put.body(&fields))).is_err());
+        assert!(Head::decode(&head, Some(put.body(&fields) - 1), Profile::Two).is_err());
+        let decoded = Head::decode(&head, Some(put.body(&fields)), Profile::Two).unwrap();
+        assert!(decoded.op(&fields[1..], Profile::Two).is_err());
+        assert!(Head::decode(&head[1..], Some(put.body(&fields)), Profile::Two).is_err());
         // A length or a trailer on any kind but a put's.
-        let (get_head, get_fields) = every_op().swap_remove(3).encode().unwrap();
+        let (get_head, get_fields) = every_op().swap_remove(3).encode(Profile::Two).unwrap();
         let mut lengthy = get_head.clone();
         lengthy[HEAD_BYTES - 9..HEAD_BYTES - 1].copy_from_slice(&5u64.to_le_bytes());
-        assert!(Head::decode(&lengthy, Some(get_fields.len() as u64 + 5)).is_err());
+        assert!(Head::decode(&lengthy, Some(get_fields.len() as u64 + 5), Profile::Two).is_err());
         let mut trailed = get_head.clone();
         trailed[HEAD_BYTES - 1] = Algorithm::Crc32.code() + 1;
-        assert!(Head::decode(&trailed, Some(get_fields.len() as u64 + 4)).is_err());
+        assert!(Head::decode(&trailed, Some(get_fields.len() as u64 + 4), Profile::Two).is_err());
         // A put's trailer: its value's width past the put's bytes, and no code past the
         // algorithms'.
         let trailing = every_op().swap_remove(2);
-        let (trailing_head, trailing_fields) = trailing.encode().unwrap();
+        let (trailing_head, trailing_fields) = trailing.encode(Profile::Two).unwrap();
         let body = trailing.body(&trailing_fields);
         assert_eq!(body, trailing_fields.len() as u64 + 8);
-        assert!(Head::decode(&trailing_head, Some(body - 8)).is_err());
+        assert!(Head::decode(&trailing_head, Some(body - 8), Profile::Two).is_err());
         let mut unnamed = trailing_head.clone();
         unnamed[HEAD_BYTES - 1] = u8::try_from(Algorithm::ALL.len()).unwrap() + 1;
-        assert!(Head::decode(&unnamed, Some(body)).is_err());
+        assert!(Head::decode(&unnamed, Some(body), Profile::Two).is_err());
         // An unknown kind.
         let mut unknown = head.clone();
         unknown[0] = LIST_VERSIONS + 1;
-        assert!(Head::decode(&unknown, Some(put.body(&fields))).is_err());
+        assert!(Head::decode(&unknown, Some(put.body(&fields)), Profile::Two).is_err());
         // A key past S3's bound, headers past S3's 8 KB, a checksum of the wrong width.
         let long = Op::Head {
             bucket: "b".into(),
@@ -3027,7 +3163,10 @@ mod tests {
             headers: Headers::default(),
             version: None,
         };
-        assert_eq!(long.encode(), Err(ObjectError::TooLong(MAX_KEY + 1)));
+        assert_eq!(
+            long.encode(Profile::Two),
+            Err(ObjectError::TooLong(MAX_KEY + 1))
+        );
         let crowded = Op::Get {
             bucket: "b".into(),
             key: "k".into(),
@@ -3038,7 +3177,10 @@ mod tests {
             },
             version: None,
         };
-        assert_eq!(crowded.encode(), Err(ObjectError::TooLong(MAX_HEADERS + 1)));
+        assert_eq!(
+            crowded.encode(Profile::Two),
+            Err(ObjectError::TooLong(MAX_HEADERS + 1))
+        );
         let narrow = Op::Put {
             bucket: "b".into(),
             key: "k".into(),
@@ -3053,7 +3195,7 @@ mod tests {
             trailing: None,
             metadata: Vec::new(),
         };
-        assert!(narrow.encode().is_err());
+        assert!(narrow.encode(Profile::Two).is_err());
         // ListBuckets asks one bucket at least and S3's 10,000 at most.
         for max in [0, u32::try_from(MAX_BUCKETS).unwrap() + 1] {
             let op = Op::ListBuckets {
@@ -3061,7 +3203,7 @@ mod tests {
                 after: None,
                 max,
             };
-            assert!(op.encode().is_err(), "{max}");
+            assert!(op.encode(Profile::Two).is_err(), "{max}");
         }
     }
 
@@ -3242,14 +3384,138 @@ mod tests {
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let mut lines = Vec::new();
         for op in every_op() {
-            let (head, fields) = op.encode().unwrap();
+            let (head, fields) = op.encode(Profile::Two).unwrap();
             lines.push(format!("{} {}", hex(&head), hex(&fields)));
         }
         for reply in every_reply() {
-            let (head, fields) = reply.encode().unwrap();
+            let (head, fields) = reply.encode(Profile::Two).unwrap();
             lines.push(format!("{} {}", hex(&head), hex(&fields)));
         }
         lines
+    }
+
+    /// The operations and replies this suite wrote before wire profiles: profile one's. Its
+    /// operations are the first ones; its replies a reply of each of profile one's statuses, the
+    /// first ones, and those written after every status's reply, before profile two's.
+    const PROFILE_ONE_OPS: usize = 24;
+    const PROFILE_ONE_REPLIES: usize = 33;
+
+    /// [`every_reply`]'s replies of profile one, in the order this suite wrote them before profiles.
+    fn profile_one_replies() -> Vec<Reply> {
+        let replies = every_reply();
+        let statuses = STATUSES
+            .iter()
+            .filter(|s| s.profile() == Profile::One)
+            .count();
+        let rest = PROFILE_ONE_REPLIES - statuses;
+        replies[..statuses]
+            .iter()
+            .chain(&replies[STATUSES.len()..STATUSES.len() + rest])
+            .cloned()
+            .collect()
+    }
+
+    /// In profile one, each message this suite wrote before profiles is, byte for byte, what every
+    /// mantle before profiles wrote (tests/golden/object.v1.txt, from 40a4f84e): a binary that
+    /// speaks profiles meets one that does not on the older's formats.
+    #[test]
+    fn profile_one_writes_what_every_mantle_before_profiles_wrote() {
+        let golden: Vec<&str> = include_str!("../tests/golden/object.v1.txt")
+            .lines()
+            .collect();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let ops = every_op();
+        let replies = profile_one_replies();
+        let mut lines = Vec::new();
+        for op in &ops[..PROFILE_ONE_OPS] {
+            let (head, fields) = op.encode(Profile::One).unwrap();
+            lines.push(format!("{} {}", hex(&head), hex(&fields)));
+            let decoded = Head::decode(&head, Some(op.body(&fields)), Profile::One).unwrap();
+            assert_eq!(decoded.op(&fields, Profile::One).as_ref(), Ok(op));
+        }
+        for reply in &replies {
+            let (head, fields) = reply.encode(Profile::One).unwrap();
+            lines.push(format!("{} {}", hex(&head), hex(&fields)));
+            let decoded = ReplyHead::decode(&head, Profile::One).unwrap();
+            assert_eq!(decoded.reply(&fields, Profile::One).as_ref(), Ok(reply));
+        }
+        assert_eq!(lines.len(), golden.len());
+        let differ = lines.iter().zip(&golden).filter(|(l, g)| l != g).count();
+        assert_eq!(differ, 0);
+    }
+
+    /// What profile two brought is refused in profile one, never left out of a request: its
+    /// operations, a put's or an upload's metadata, a version named, its statuses and listings. A
+    /// reply's metadata and source version, facts no profile-one request asks, are not stated to
+    /// a peer of one. Each profile's bytes read back only in their own.
+    #[test]
+    fn profile_one_refuses_what_profile_two_brought_and_each_reads_its_own_bytes_alone() {
+        let needs = Err(ObjectError::Profile(Profile::Two));
+        for op in &every_op()[PROFILE_ONE_OPS..] {
+            assert_eq!(op.encode(Profile::One).map(|_| ()), needs, "{op:?}");
+        }
+        let metadata = || vec![("x-amz-meta-a".to_owned(), "1".to_owned())];
+        let mut put = every_op().swap_remove(1);
+        if let Op::Put { metadata: m, .. } = &mut put {
+            *m = metadata();
+        }
+        assert_eq!(put.encode(Profile::One).map(|_| ()), needs);
+        let named = Op::Get {
+            bucket: "b".into(),
+            key: "k".into(),
+            headers: Headers::default(),
+            version: Some("null".into()),
+        };
+        assert_eq!(named.encode(Profile::One).map(|_| ()), needs);
+        for status in STATUSES.into_iter().filter(|s| s.profile() == Profile::Two) {
+            assert_eq!(
+                Reply::status(status).encode(Profile::One).map(|_| ()),
+                needs,
+                "{status:?}"
+            );
+        }
+        let facts = Reply {
+            metadata: metadata(),
+            source_version: "0123456789ABC".into(),
+            ..Reply::status(Status::Done)
+        };
+        let (head, fields) = facts.encode(Profile::One).unwrap();
+        let read = ReplyHead::decode(&head, Profile::One)
+            .unwrap()
+            .reply(&fields, Profile::One)
+            .unwrap();
+        assert!(read.metadata.is_empty() && read.source_version.is_empty());
+        assert!(
+            ReplyHead::decode(&head, Profile::Two)
+                .unwrap()
+                .reply(&fields, Profile::Two)
+                .is_err()
+        );
+        // A request of profile two read as one's, and one's as two's, is refused.
+        let (head, fields) = named.encode(Profile::Two).unwrap();
+        let body = Some(named.body(&fields));
+        assert!(
+            Head::decode(&head, body, Profile::One)
+                .unwrap()
+                .op(&fields, Profile::One)
+                .is_err()
+        );
+        let plain = every_op().swap_remove(3);
+        let (head, fields) = plain.encode(Profile::One).unwrap();
+        let body = Some(plain.body(&fields));
+        assert!(
+            Head::decode(&head, body, Profile::Two)
+                .unwrap()
+                .op(&fields, Profile::Two)
+                .is_err()
+        );
+        // A kind profile two brought is no head of profile one's.
+        let copy = every_op()
+            .into_iter()
+            .find(|op| matches!(op, Op::Copy(_)))
+            .unwrap();
+        let (head, fields) = copy.encode(Profile::Two).unwrap();
+        assert!(Head::decode(&head, Some(copy.body(&fields)), Profile::One).is_err());
     }
 
     /// Every native message this suite writes is the bytes its golden vector holds, which the
@@ -3283,12 +3549,12 @@ mod tests {
         };
         let replies = every_reply();
         for reply in replies {
-            let (head, fields) = reply.encode().unwrap();
+            let (head, fields) = reply.encode(Profile::Two).unwrap();
             assert_eq!(head.len(), REPLY_HEAD_BYTES);
             assert!(fields.len() <= MAX_REPLY_FIELDS);
-            let decoded = ReplyHead::decode(&head).unwrap();
+            let decoded = ReplyHead::decode(&head, Profile::Two).unwrap();
             assert_eq!(decoded.fields(), fields.len() as u64);
-            assert_eq!(decoded.reply(&fields), Ok(reply));
+            assert_eq!(decoded.reply(&fields, Profile::Two), Ok(reply));
         }
         // A page of more than S3's 1,000 keys and common prefixes, an unknown status, a head
         // naming more fields than any reply holds, and fields cut short: each refused.
@@ -3300,14 +3566,19 @@ mod tests {
             })),
             ..Reply::status(Status::Done)
         };
-        assert!(over.encode().is_err());
+        assert!(over.encode(Profile::Two).is_err());
         let unknown = u8::try_from(STATUSES.len()).unwrap();
-        assert!(ReplyHead::decode(&[unknown, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
-        let mut long = Reply::status(Status::Done).encode().unwrap().0;
+        assert!(
+            ReplyHead::decode(&[unknown, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], Profile::Two)
+                .is_err()
+        );
+        let mut long = Reply::status(Status::Done).encode(Profile::Two).unwrap().0;
         long[9..].copy_from_slice(&(u32::try_from(MAX_REPLY_FIELDS).unwrap() + 1).to_le_bytes());
-        assert!(ReplyHead::decode(&long).is_err());
-        let (head, fields) = Reply::status(Status::NotModified).encode().unwrap();
-        let decoded = ReplyHead::decode(&head).unwrap();
-        assert!(decoded.reply(&fields[1..]).is_err());
+        assert!(ReplyHead::decode(&long, Profile::Two).is_err());
+        let (head, fields) = Reply::status(Status::NotModified)
+            .encode(Profile::Two)
+            .unwrap();
+        let decoded = ReplyHead::decode(&head, Profile::Two).unwrap();
+        assert!(decoded.reply(&fields[1..], Profile::Two).is_err());
     }
 }

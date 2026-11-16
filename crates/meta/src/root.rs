@@ -22,7 +22,19 @@ pub const MAX_DOMAIN: usize = 255;
 pub enum Command {
     Enlist(Enlist),
     Lived(Lived),
+    Fence(Fence),
 }
+
+/// The cell's upgrade fence raised to `profile`, a wire profile's number (mantle-protocol's
+/// `wire`): every node the table holds was seen to speak it, so the cell may write the formats
+/// it keeps (docs/research/91 §4). A fence at or above it is kept as it is: it is never lowered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fence {
+    pub profile: u8,
+}
+
+/// The fence a cell holds before any was raised: profile one, which every mantle speaks.
+pub const UNFENCED: u8 = 1;
 
 /// A node's history as the node states it: the totals over all its runs (node.md §2.4, item 7).
 /// The table keeps the greater of what it holds and what is stated, for each, so a statement
@@ -63,6 +75,8 @@ pub enum Outcome {
     Kept,
     /// The table holds no such node, whose history it would keep: nothing changed.
     Unknown,
+    /// The fence was raised to the profile stated.
+    Raised,
 }
 
 /// A volume as the table holds it, with its node's failure domain.
@@ -79,6 +93,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
     let (outcome, writes) = match command {
         Command::Enlist(e) => enlist(engine, e)?,
         Command::Lived(l) => lived(engine, l)?,
+        Command::Fence(f) => raise(engine, *f)?,
     };
     engine.apply(index, writes)?;
     Ok(outcome)
@@ -154,6 +169,41 @@ fn lived<E: Rows>(engine: &mut E, l: &Lived) -> Result<(Outcome, Vec<Write>), Me
         writes.push(Write::Put(key::history(l.node), kept.encode()));
     }
     Ok((Outcome::Kept, writes))
+}
+
+/// The fence raised to `f.profile` where it is below it; kept otherwise, so a raise applied late or
+/// twice takes nothing back.
+fn raise<E: Rows>(engine: &mut E, f: Fence) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if f.profile <= fence(engine)? {
+        return Ok((Outcome::Kept, Vec::new()));
+    }
+    let mut writes = reserved(1)?;
+    writes.push(Write::Put(key::fence(), vec![f.profile]));
+    Ok((Outcome::Raised, writes))
+}
+
+/// The cell's upgrade fence: the profile last raised to, or [`UNFENCED`] before any.
+pub fn fence<E: Rows>(engine: &mut E) -> Result<u8, MetaError> {
+    match engine.get(&key::fence())?.as_deref() {
+        None => Ok(UNFENCED),
+        Some([profile]) => Ok(*profile),
+        Some(_) => Err(MetaError::Corrupt),
+    }
+}
+
+/// The nodes the table holds, in the order of their ids, at most `max`.
+pub fn members<E: Rows>(engine: &mut E, max: usize) -> Result<Vec<u64>, MetaError> {
+    let (mut from, to) = key::member_rows(None);
+    let mut out = reserved(max)?;
+    while out.len() < max {
+        let Some((k, _)) = engine.next(&from, &to)? else {
+            break;
+        };
+        out.push(key::decode_member(&k).ok_or(MetaError::Corrupt)?);
+        from = k;
+        from.push(0);
+    }
+    Ok(out)
 }
 
 /// The cell's history: every node's time run and crashes, summed, read at most `max` nodes'. Sums
@@ -442,5 +492,29 @@ mod tests {
         );
         assert_eq!(history(&mut m, 0).unwrap(), History::default());
         assert_eq!(history(&mut m, 3).unwrap().crashes, 6);
+    }
+
+    /// The fence rises to what is stated where it is below it and keeps itself otherwise, so a
+    /// raise applied late or twice takes nothing back; the table's nodes list in id order.
+    #[test]
+    fn the_fence_only_rises_and_the_tables_nodes_list_in_order() {
+        let mut engine = Model::default();
+        assert_eq!(fence(&mut engine).unwrap(), UNFENCED);
+        let mut index = 0;
+        let mut applied = |engine: &mut Model, command: &Command| {
+            index += 1;
+            apply(engine, index, command).unwrap()
+        };
+        let raise = |profile| Command::Fence(Fence { profile });
+        assert_eq!(applied(&mut engine, &raise(2)), Outcome::Raised);
+        assert_eq!(fence(&mut engine).unwrap(), 2);
+        assert_eq!(applied(&mut engine, &raise(2)), Outcome::Kept);
+        assert_eq!(applied(&mut engine, &raise(1)), Outcome::Kept);
+        assert_eq!(fence(&mut engine).unwrap(), 2);
+        for node in [9, 3, 7] {
+            applied(&mut engine, &enlist(node, "rack", &[(u128::from(node), 1)]));
+        }
+        assert_eq!(members(&mut engine, 8).unwrap(), [3, 7, 9]);
+        assert_eq!(members(&mut engine, 2).unwrap(), [3, 7]);
     }
 }

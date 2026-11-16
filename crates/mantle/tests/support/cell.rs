@@ -396,6 +396,9 @@ pub(crate) enum Line {
     /// Its orderly stop is done: the process ends. With the sleeps of the node's loop that found
     /// every timer of its shard taken.
     Stopped(u64),
+    /// The cell's upgrade fence as its member of the root range now holds it, a wire profile's
+    /// number (docs/research/91 §4).
+    Fence(u8),
 }
 
 /// A history as a node says it: node time run and crashes.
@@ -455,6 +458,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             leader.parse().ok()?,
         )),
         ["stopped", waits] => Some(Line::Stopped(waits.parse().ok()?)),
+        ["fence", profile] => Some(Line::Fence(profile.parse().ok()?)),
         ["held", held] => Some(Line::Held(match *held {
             "0" => false,
             "1" => true,
@@ -533,7 +537,8 @@ pub(crate) fn movement(line: &Line) -> Option<(u64, u64, u64, u64, Duration, Dur
         | Line::Stopping
         | Line::Handing(..)
         | Line::Handed(..)
-        | Line::Stopped(..) => None,
+        | Line::Stopped(..)
+        | Line::Fence(..) => None,
     }
 }
 
@@ -926,6 +931,13 @@ pub(crate) struct Cell {
     /// The ranges every node hosts, and whether each hosts objects.
     pub(crate) ranges: &'static [(u128, &'static str)],
     pub(crate) gateway: bool,
+    /// The binary each node runs where it is not this one's (`NODE`): a cell of two releases'
+    /// binaries, as a rolling upgrade holds one (tests/upgrade.rs).
+    pub(crate) binaries: BTreeMap<u64, PathBuf>,
+    /// The cell's upgrade fence each running node last said, where it said one (`fence` lines).
+    pub(crate) fences: BTreeMap<u64, u8>,
+    /// The environment each node's next process starts with beside the test's own.
+    pub(crate) envs: BTreeMap<u64, Vec<(String, String)>>,
     /// Whether each node runs as `mantle serve`, and the values its running process said it runs
     /// with, each with its basis, in the order said.
     pub(crate) serving: bool,
@@ -1056,7 +1068,7 @@ impl Cell {
     /// nowhere; init's own output is what the cell is read from: the authority's name and
     /// directory, and each founder's id and directory.
     pub(crate) fn made(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, false, true, Network::Direct)
+        Self::made_started(args, false, true, (Network::Direct, &[]))
     }
 
     /// A cell `mantle init` made, its founders started highest id first, each one's configuration
@@ -1064,20 +1076,38 @@ impl Cell {
     /// names a peer by its host: a founder learns on standard input only where the peers started
     /// after it listen.
     pub(crate) fn made_named(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, true, true, Network::Direct)
+        Self::made_started(args, true, true, (Network::Direct, &[]))
     }
 
     /// A cell `mantle init` made, its founders started as [`Cell::made`] starts them, each
     /// configuration as init wrote it: its nodes pinned and nothing else, so no driver of the
     /// harness's runs, and its clients are the native protocol's, made by `mantle init client`.
     pub(crate) fn made_alone(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, false, false, Network::Direct)
+        Self::made_started(args, false, false, (Network::Direct, &[]))
+    }
+
+    /// A cell [`Cell::made_alone`] makes, the founder at each position of `binaries` in init's
+    /// order (its ids are init's to draw) running that binary rather than this one's: a cell
+    /// mid-upgrade.
+    pub(crate) fn made_alone_running(
+        args: impl FnOnce(&Path) -> Vec<String>,
+        binaries: &[(usize, PathBuf)],
+    ) -> Self {
+        Self::made_started(args, false, false, (Network::Direct, binaries))
+    }
+
+    /// Node `id`'s binary: the one [`Cell::binaries`] names, else this one's.
+    pub(crate) fn binary(&self, id: u64) -> PathBuf {
+        self.binaries
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(NODE))
     }
 
     /// A cell [`Cell::made_alone`] makes, its founders reaching each other through the test's
     /// relay.
     pub(crate) fn made_alone_relayed(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
-        Self::made_started(args, false, false, Network::Relayed)
+        Self::made_started(args, false, false, (Network::Relayed, &[]))
     }
 
     /// The directory the cell was made in, `mantle init`'s OUT.
@@ -1089,7 +1119,7 @@ impl Cell {
         args: impl FnOnce(&Path) -> Vec<String>,
         named: bool,
         drivers: bool,
-        network: Network,
+        (network, binaries): (Network, &[(usize, PathBuf)]),
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let out = root.path().join("cell");
@@ -1225,6 +1255,12 @@ impl Cell {
             leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made,
+            binaries: binaries
+                .iter()
+                .map(|(at, binary)| (founders[*at].0, binary.clone()))
+                .collect(),
+            fences: BTreeMap::new(),
+            envs: BTreeMap::new(),
             _root: root,
         };
         if named {
@@ -1355,6 +1391,9 @@ impl Cell {
             leaderless: BTreeSet::new(),
             stopped: BTreeSet::new(),
             made: BTreeMap::new(),
+            binaries: BTreeMap::new(),
+            fences: BTreeMap::new(),
+            envs: BTreeMap::new(),
             _root: root,
         };
         // One at a time, each listening before the next starts (`Cell::start`).
@@ -1377,7 +1416,8 @@ impl Cell {
         // What its last process said its detectors started from is that process's, not this one's.
         self.histories.remove(&id);
         let config = self.config_of(id);
-        let mut child = Command::new(NODE)
+        let mut child = Command::new(self.binary(id))
+            .envs(self.envs.get(&id).into_iter().flatten().cloned())
             .arg(if self.serving { "serve" } else { "node" })
             .arg(&config)
             .stdin(Stdio::piped())
@@ -1389,6 +1429,7 @@ impl Cell {
         let output = child.stdout.take().unwrap();
         self.volumes.remove(&id);
         self.enlisted.remove(&id);
+        self.fences.remove(&id);
         self.bases.remove(&id);
         let (tell, generation) = (self.tell.clone(), self.generations);
         self.generations += 1;
@@ -1599,7 +1640,8 @@ impl Cell {
                 | Line::Stopping
                 | Line::Handing(..)
                 | Line::Handed(..)
-                | Line::Stopped(..) => None,
+                | Line::Stopped(..)
+                | Line::Fence(..) => None,
             })
             .chain(self.clients.values().copied())
             .chain(self.transfers.values().map(|(_, serve)| *serve))
@@ -1774,6 +1816,9 @@ impl Cell {
                     }
                     Line::Enlisted => {
                         self.enlisted.insert(id);
+                    }
+                    Line::Fence(profile) => {
+                        self.fences.insert(id, profile);
                     }
                     Line::History(cell, own) => {
                         self.histories.insert(id, (cell, own));

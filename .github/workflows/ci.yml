@@ -113,6 +113,27 @@ jobs:
           taskset -c ${{ matrix.cpus }} cargo test --workspace --locked
           taskset -c ${{ matrix.cpus }} cargo test --manifest-path vendor/Cargo.toml --workspace --locked
 
+  # A cell of two releases' binaries (tests/upgrade.rs; docs/research/91): founders of this commit
+  # and of the previous wire profile's, which scripts/previous-binary.sh builds from the commit
+  # scripts/previous-profile names, and the command lines of each, through every operation and the
+  # cell's upgrade. The formats are byte-for-byte the same on every target, so one target runs it.
+  upgrade:
+    name: upgrade
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: upgrade
+          workspaces: |
+            .
+      - name: The previous wire profile's binary
+        run: echo "MANTLE_PREVIOUS=$(bash scripts/previous-binary.sh)" >> "$GITHUB_ENV"
+      - name: A cell of two releases
+        run: cargo test --locked -p mantle --features upgrade --test upgrade
+
   # A cell on Kubernetes (plan step 11; docs/design/kubernetes.md): the chart's gates, helm lint and
   # its golden render, then scripts/kind-cell.sh: the image built, a kind cluster of three workers,
   # a cell of three installed by the chart, one founder to a kind node, and the transfer harness's

@@ -409,6 +409,24 @@ command line (`crates/mantle/tests/native.rs`), and with the AWS CLI v2 and boto
 managed copies among them (`crates/mantle/tests/stock_clients.rs`,
 `the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes`).
 
+A cell of two releases' binaries works through its upgrade (node design §1.7; research/91). Every
+connection speaks the newest wire profile both its sides know, agreed at its handshake by ALPN:
+profile one is the transport's own protocol name, which every mantle before profiles offered alone,
+so a node or a client of this release meets one of the last on the older's formats; profile two
+is research/89's operations and reads. A request a connection's profile cannot carry whole is
+refused before anything is sent, never sent without part of it, and the client asks another node;
+a read of profile two is asked only of a leader that speaks it, and one that does not answers the
+operation `503 ServiceUnavailable` until it is upgraded or another leads, which an orderly stop
+hands the lead to among the upgraded nodes. The root range holds the cell's upgrade fence: its
+leader raises it once every node the volume table holds speaks its profile, never lowers it, and
+past it a node of an older profile is refused, does not start, or stops; `MANTLE_WIRE` holds it
+down. Tested with real processes against the previous profile's binary, built from
+`scripts/previous-profile` (`crates/mantle/tests/upgrade.rs`, CI's `upgrade` job): every
+operation of profile one by both releases' command lines through each founder of a cell of one new
+founder and two old, profile two's answered, refused or `Unavailable` as above at both doors, then
+the old founders upgraded in place, the fence raised, a founder announcing profile one refused at
+its start, and every operation again, the previous command line's among it.
+
 Clients of mantle's own protocol reach the same operations over QUIC through the native client
 library, `mantle-client`, and `mantle`'s object commands, its command line (gateway design §6). The
 native protocol's messages, classes and transport bounds are a crate of their own,

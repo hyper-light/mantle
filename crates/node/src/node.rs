@@ -65,10 +65,12 @@ use crate::layout::Layout;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
 use mantle_protocol::bounds::{self, Stated};
-use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
+use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Party, Role};
 use mantle_protocol::object;
+use mantle_protocol::wire::Profile;
 
 mod answers;
+mod fence;
 mod host;
 mod stop;
 use answers::Answers;
@@ -259,6 +261,12 @@ pub enum NodeError {
     Registrations(u64),
     #[error("the node holds as many commands of its own as it keeps")]
     Asks,
+    /// The cell's upgrade fence is past the wire profile this node announces: it cannot read
+    /// what the cell writes (research/91 §4).
+    #[error(
+        "the cell's upgrade fence is at wire profile {fence}, past the {profile:?} this node announces"
+    )]
+    Fenced { fence: u8, profile: Profile },
 }
 
 impl From<Refusal> for NodeError {
@@ -917,6 +925,26 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// connections it held then, at most its connection bound (`Endpoint::established`).
     generation: u64,
     held: Vec<(PeerId, SocketAddr)>,
+    /// The wire profile this node announces: the newest its binary speaks, or the lower one its
+    /// operator named (`mantle_protocol::wire`).
+    profile: Profile,
+    /// What each live connection's handshake named its peer, role and wire profile, by peer and
+    /// epoch, newest last: a connection's from its `Connected` to its `Closed`, so at most the
+    /// transport's connections.
+    spoken: Vec<(PeerId, u64, Party)>,
+    /// The cell's upgrade fence as this node's member of the root range holds it (`node/fence.rs`).
+    fence: fence::Fence,
+}
+
+/// `tls` offering every wire profile to `most`, newest first, on its server side and its dials
+/// (`mantle_protocol::wire::Profile::offered`): a server takes the first of its own a client
+/// offers (RFC 7301 §3.2), so a pair agrees on the newest both speak.
+pub(crate) fn offering(mut tls: Tls, most: Profile) -> Tls {
+    if let Some(server) = tls.server.as_mut() {
+        server.alpn_protocols = Profile::offered(most);
+    }
+    tls.client.alpn_protocols = Profile::offered(most);
+    tls
 }
 
 /// The longest head of a message the node sends or receives: a command's or a read's and its
@@ -1106,11 +1134,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         })
         .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;
 
-        let tls = Tls::mutual(&settings.credentials, true).map_err(at(Step::Identity))?;
-        let dial_only = Tls::mutual(&settings.credentials, false).map_err(at(Step::Identity))?;
+        // Every profile this node speaks is offered, newest first, on both sides of its
+        // connections: a pair agrees on the newest both know (research/91).
+        let profile = Profile::announced()
+            .map_err(|e| at(Step::Identity)(NodeError::Bounds(e.to_string())))?;
+        let tls = offering(
+            Tls::mutual(&settings.credentials, true).map_err(at(Step::Identity))?,
+            profile,
+        );
+        let dial_only = offering(
+            Tls::mutual(&settings.credentials, false).map_err(at(Step::Identity))?,
+            profile,
+        );
         let config = Config {
             tls,
-            role: Role::Node,
+            role: Party {
+                role: Role::Node,
+                profile,
+            },
             limits,
             congestion: Default::default(),
         };
@@ -1232,6 +1273,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             clients,
             generation: 0,
             held: Vec::new(),
+            profile,
+            spoken: Vec::new(),
+            fence: fence::Fence::unread(),
         };
         for kept in &node.ranges {
             node.owner
@@ -1610,6 +1654,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.schedule_due(now);
         self.drive(now)?;
+        self.step_fence()?;
         self.take_door();
         self.step_host()?;
         self.step_asks(now)?;
@@ -2020,17 +2065,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // again (`end_chunk_gets`), whatever its detectors have yet to hear of its new run.
             Event::Connected {
                 peer,
-                epoch,
-                role: Role::Node,
-            } => {
-                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
-                    remote.suspect = false;
-                }
-                self.key_plane(peer, epoch, now)
-            }
-            Event::Connected {
-                peer,
-                role: Role::Client,
+                role: Party {
+                    role: Role::Client, ..
+                },
                 ..
             } if self.driver.endpoint().directory().clients() > self.clients => {
                 let clock = self.driver.clock()?;
@@ -2039,7 +2076,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     .refuse(clock, peer, Refusal::Identities);
                 Ok(())
             }
-            Event::Connected { .. } => Ok(()),
+            Event::Connected { peer, epoch, role } => {
+                self.spoken.push((peer, epoch, role));
+                if role.role != Role::Node {
+                    return Ok(());
+                }
+                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
+                    remote.suspect = false;
+                }
+                self.key_plane(peer, epoch, now)
+            }
             Event::Frame {
                 peer, kind, frame, ..
             } => {
@@ -2066,12 +2112,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Event::Request {
                 exchange,
                 peer,
+                epoch,
                 kind,
                 body,
                 ..
             } => {
                 if kind == Kind::Object {
-                    self.take_object(exchange, peer, body);
+                    let profile = self.spoken_on(peer, epoch);
+                    self.take_object(exchange, (peer, profile), body);
                     return Ok(());
                 }
                 let what = match kind {
@@ -2158,7 +2206,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.write_exchange(exchange);
                 Ok(())
             }
-            Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
+            Event::Closed {
+                peer,
+                epoch,
+                refusal,
+            } => {
+                self.spoken.retain(|(p, e, _)| (*p, *e) != (peer, epoch));
+                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
+                    remote.ended = remote.ended.saturating_add(1);
+                    remote.refusal = refusal;
+                }
+                self.lost(peer, now);
+                Ok(())
+            }
+            Event::Unreachable { peer, refusal } => {
                 if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
                     remote.ended = remote.ended.saturating_add(1);
                     remote.refusal = refusal;
@@ -2170,6 +2231,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // whether its peer lives the plane's suspicion judges, not the transport's hint.
             Event::Degrading { .. } | Event::Progressing { .. } => Ok(()),
         }
+    }
+
+    /// The profile the connection of `epoch` to `peer` speaks; none for one this node holds no
+    /// `Connected` of, which no exchange arrives on.
+    fn spoken_on(&self, peer: PeerId, epoch: u64) -> Option<Profile> {
+        self.spoken
+            .iter()
+            .find(|(p, e, _)| (*p, *e) == (peer, epoch))
+            .map(|(_, _, party)| party.profile)
+    }
+
+    /// The profile `peer`'s newest connection speaks, which an exchange opened to it takes; none
+    /// before its first `Connected`.
+    fn speaks(&self, peer: PeerId) -> Option<Profile> {
+        self.spoken
+            .iter()
+            .filter(|(p, _, _)| *p == peer)
+            .max_by_key(|(_, epoch, _)| *epoch)
+            .map(|(_, _, party)| party.profile)
     }
 
     /// Forgets the clients whose connections went since the transport's connections last moved, so
@@ -3923,8 +4003,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                     Via::Local | Via::Exchange { .. } => false,
                 };
-                if due {
-                    self.ask_read_out(at, now)?;
+                if due && let Some(outcome) = self.ask_read_out(at, now)? {
+                    let out = self.reads_out.swap_remove(at);
+                    self.reads_done.push((out.ask, outcome));
+                    continue;
                 }
                 at = at.saturating_add(1);
                 continue;
@@ -3945,17 +4027,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Asks read `at`: of this node's own member when it leads the range, which has a quorum
     /// confirm that it still leads; else of the node it or the last reply names as leader, or of
     /// the next node in turn; once every node was asked this round and none answered, after a
-    /// pause.
-    fn ask_read_out(&mut self, at: usize, now: u64) -> Result<(), NodeError> {
+    /// pause. A read a later wire profile brought is asked only of a node whose connection speaks
+    /// that profile: a leader that does not ends it `Unavailable`, the outcome given back.
+    fn ask_read_out(&mut self, at: usize, now: u64) -> Result<Option<ReadOutcome>, NodeError> {
         let Some(group) = self.reads_out.get(at).map(|r| r.group) else {
-            return Ok(());
+            return Ok(None);
         };
         let known = self.leader_of(group);
         if known == self.id {
             let id = self.next_read;
             self.next_read = id.wrapping_add(1);
             let Some(handle) = self.kept(group).map(|k| k.handle) else {
-                return Ok(());
+                return Ok(None);
             };
             let asked = self
                 .owner
@@ -3963,7 +4046,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .map(|shell| shell.read(id.to_le_bytes().to_vec()));
             let local = self.id;
             let Some(out) = self.reads_out.get_mut(at) else {
-                return Ok(());
+                return Ok(None);
             };
             if matches!(asked, Some(Ok(()))) {
                 self.owner.schedule(handle);
@@ -3986,12 +4069,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 };
                 out.leaderless_since.get_or_insert(now);
             }
-            return Ok(());
+            return Ok(None);
         }
         let nodes = self.remotes.len().max(1);
         let local = self.id;
         let Some(out) = self.reads_out.get_mut(at) else {
-            return Ok(());
+            return Ok(None);
         };
         if out.tried >= nodes {
             out.tried = 0;
@@ -4001,7 +4084,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 leaderless: true,
             };
             out.leaderless_since.get_or_insert(now);
-            return Ok(());
+            return Ok(None);
         }
         let next = self
             .remotes
@@ -4021,9 +4104,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 leaderless: true,
             };
             out.leaderless_since.get_or_insert(now);
-            return Ok(());
+            return Ok(None);
         }
         out.tried = out.tried.saturating_add(1);
+        // A read profile one has not is asked only of a node whose newest connection speaks its
+        // profile (research/91): the leader on an older one cannot read it, so the read ends
+        // `Unavailable`, which its operation answers until that leader is upgraded or another
+        // leads; any other node on an older profile, or not yet connected, is passed for the next.
+        let needs = out.query.profile();
+        if needs > Profile::One {
+            let leads = target == known || out.leader == Some(target);
+            match self.speaks(target) {
+                Some(spoken) if spoken >= needs => {}
+                Some(_) if leads => return Ok(Some(ReadOutcome::Unavailable)),
+                _ => return Ok(None),
+            }
+        }
+        let Some(out) = self.reads_out.get_mut(at) else {
+            return Ok(None);
+        };
         let body = out
             .query
             .encode()
@@ -4057,7 +4156,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The read of this node's out on `exchange`.
@@ -4313,6 +4412,8 @@ fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool 
     match command {
         Command::Root(mantle_meta::root::Command::Enlist(e)) => node && e.node == sender,
         Command::Root(mantle_meta::root::Command::Lived(l)) => node && l.node == sender,
+        // The fence is a node's to raise, the root's leader's, once every member speaks it.
+        Command::Root(mantle_meta::root::Command::Fence(_)) => node,
         Command::Register { owner, .. } => *owner == sender,
         _ => true,
     }

@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 
 use hyper_transport::{Classes, Embedded};
 
+use crate::wire::Profile;
+
 /// Where a Raft frame's own checksum lies, and what it covers: its CRC-32C first, of every byte
 /// after it (mantle-node's `frame`), which the transport checks on a lane.
 pub const RAFT_CHECKSUM: Embedded = Embedded {
@@ -58,6 +60,16 @@ pub enum Role {
     Gateway,
     /// A client of mantle's own protocol.
     Client,
+}
+
+/// The other party to a connection, as its handshake named it: its role, by its certificate, and
+/// the wire profile the two sides agreed on, by ALPN ([`crate::wire`]). The transport keeps it for
+/// each connection, so a peer with connections of two profiles at once, a node restarted on a newer
+/// binary while its old connection lingers, is spoken to in each connection's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Party {
+    pub role: Role,
+    pub profile: Profile,
 }
 
 /// The largest message of each class the node's ranges make, in bytes: a frame past its class's
@@ -112,7 +124,7 @@ const KINDS: [Kind; 7] = [
 impl Classes for NodeClasses {
     type Class = Class;
     type Kind = Kind;
-    type Role = Role;
+    type Role = Party;
 
     const RANKS: u8 = 4;
 
@@ -125,8 +137,8 @@ impl Classes for NodeClasses {
         }
     }
 
-    fn class_of(kind: Kind, role: Role) -> Option<Class> {
-        match (kind, role) {
+    fn class_of(kind: Kind, party: Party) -> Option<Class> {
+        match (kind, party.role) {
             (Kind::Raft, Role::Node) => Some(Class::Replication),
             (Kind::Snapshot, Role::Node) => Some(Class::Bulk),
             // A range applies what a command says and answers what a read asks of its rows: a
@@ -186,6 +198,14 @@ impl Classes for NodeClasses {
 mod tests {
     use super::*;
 
+    /// A party of `role` on the newest profile: a class is the role's whatever the profile.
+    fn party(role: Role) -> Party {
+        Party {
+            role,
+            profile: Profile::NEWEST,
+        }
+    }
+
     #[test]
     fn each_kind_reads_back_from_its_code_and_no_other_code_names_one() {
         for kind in KINDS {
@@ -202,13 +222,16 @@ mod tests {
     fn chunks_travel_on_the_transfer_class_from_nodes_and_gateways_only() {
         for kind in [Kind::ChunkPut, Kind::ChunkGet] {
             for role in [Role::Node, Role::Gateway] {
-                assert_eq!(NodeClasses::class_of(kind, role), Some(Class::Transfer));
+                assert_eq!(
+                    NodeClasses::class_of(kind, party(role)),
+                    Some(Class::Transfer)
+                );
             }
-            assert_eq!(NodeClasses::class_of(kind, Role::Client), None);
+            assert_eq!(NodeClasses::class_of(kind, party(Role::Client)), None);
         }
         for role in [Role::Node, Role::Gateway, Role::Client] {
             assert_eq!(
-                NodeClasses::class_of(Kind::Object, role),
+                NodeClasses::class_of(Kind::Object, party(role)),
                 Some(Class::Transfer)
             );
         }
@@ -219,11 +242,11 @@ mod tests {
     #[test]
     fn only_a_node_sends_raft_messages_and_snapshots() {
         for role in [Role::Gateway, Role::Client] {
-            assert_eq!(NodeClasses::class_of(Kind::Raft, role), None);
-            assert_eq!(NodeClasses::class_of(Kind::Snapshot, role), None);
+            assert_eq!(NodeClasses::class_of(Kind::Raft, party(role)), None);
+            assert_eq!(NodeClasses::class_of(Kind::Snapshot, party(role)), None);
         }
         assert_eq!(
-            NodeClasses::class_of(Kind::Raft, Role::Node),
+            NodeClasses::class_of(Kind::Raft, party(Role::Node)),
             Some(Class::Replication)
         );
     }
@@ -233,7 +256,7 @@ mod tests {
     #[test]
     fn a_client_sends_objects_alone() {
         for kind in KINDS {
-            let class = NodeClasses::class_of(kind, Role::Client);
+            let class = NodeClasses::class_of(kind, party(Role::Client));
             if kind == Kind::Object {
                 assert_eq!(class, Some(Class::Transfer));
             } else {
@@ -242,7 +265,10 @@ mod tests {
         }
         for role in [Role::Node, Role::Gateway] {
             for kind in [Kind::Command, Kind::Read] {
-                assert_eq!(NodeClasses::class_of(kind, role), Some(Class::Request));
+                assert_eq!(
+                    NodeClasses::class_of(kind, party(role)),
+                    Some(Class::Request)
+                );
             }
         }
     }

@@ -18,7 +18,8 @@
 use std::net::SocketAddr;
 
 use hyper_transport::{Authenticated, Directory, PeerId};
-use mantle_protocol::classes::Role;
+use mantle_protocol::classes::{Party, Role};
+use mantle_protocol::wire::Profile;
 
 /// A peer as the directory holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +31,7 @@ pub struct Peer {
 }
 
 /// The node's peers.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Peers {
     peers: Vec<(Peer, String)>,
     /// The clients admitted, each its id and the account it acts for, sorted by id.
@@ -38,6 +39,9 @@ pub struct Peers {
     /// The most clients held at once: the identities and handshakes the transport admits, or none
     /// where the node admits no client.
     most_clients: usize,
+    /// The cell's upgrade fence as the node last read it: a node whose connection speaks an older
+    /// profile cannot read what the cell writes, and is refused (research/91 §4).
+    fence: Profile,
 }
 
 impl Peers {
@@ -54,7 +58,13 @@ impl Peers {
                 .collect(),
             clients: Vec::new(),
             most_clients,
+            fence: Profile::One,
         }
+    }
+
+    /// The fence risen to `fence`: a node's connection of an older profile is refused from now on.
+    pub fn fence_at(&mut self, fence: Profile) {
+        self.fence = self.fence.max(fence);
     }
 
     /// The pinned peer named `id`.
@@ -98,13 +108,15 @@ impl Peers {
 }
 
 impl Directory for Peers {
-    type Role = Role;
+    type Role = Party;
 
     /// A pinned peer whose certificate the handshake verified, byte for byte, and for a dial only
     /// the peer dialed; else, for a connection a peer opened, the client the authority's
     /// certificate names, unless its id is a pinned peer's or names another account, or the
-    /// clients held are at their bound.
-    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Role)> {
+    /// clients held are at their bound. Each speaks the wire profile its handshake agreed on, one
+    /// of this node's own (`mantle_protocol::wire`).
+    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Party)> {
+        let profile = Profile::of(authenticated.protocol)?;
         let certificate = authenticated.certificate?;
         if let Some(peer) = self
             .peers
@@ -115,7 +127,16 @@ impl Directory for Peers {
             if authenticated.dialed.is_some_and(|dialed| dialed != peer.id) {
                 return None;
             }
-            return Some((peer.id, peer.role));
+            if peer.role == Role::Node && profile < self.fence {
+                return None;
+            }
+            return Some((
+                peer.id,
+                Party {
+                    role: peer.role,
+                    profile,
+                },
+            ));
         }
         if authenticated.dialed.is_some() {
             return None;
@@ -139,7 +160,13 @@ impl Directory for Peers {
                 self.clients.insert(at, (id, names.account.to_string()));
             }
         }
-        Some((id, Role::Client))
+        Some((
+            id,
+            Party {
+                role: Role::Client,
+                profile,
+            },
+        ))
     }
 
     fn server_name(&self, peer: PeerId) -> Option<&str> {
@@ -166,24 +193,59 @@ mod tests {
     fn seen(certificate: &[u8], dialed: Option<PeerId>) -> Authenticated<'_> {
         Authenticated {
             certificate: Some(certificate),
-            protocol: b"mantle/1",
+            protocol: Profile::NEWEST.protocol(),
             dialed,
         }
+    }
+
+    /// What `identify` names a peer of `role` on the newest profile.
+    fn named(id: PeerId, role: Role) -> Option<(PeerId, Party)> {
+        Some((
+            id,
+            Party {
+                role,
+                profile: Profile::NEWEST,
+            },
+        ))
     }
 
     #[test]
     fn a_peer_is_named_by_its_certificate_and_a_dial_only_by_the_peer_dialed() {
         let mut peers = Peers::new(vec![peer(2, b"two"), peer(3, b"three")], 0);
-        assert_eq!(peers.identify(&seen(b"two", None)), Some((2, Role::Node)));
+        assert_eq!(peers.identify(&seen(b"two", None)), named(2, Role::Node));
         assert_eq!(
             peers.identify(&seen(b"three", Some(3))),
-            Some((3, Role::Node))
+            named(3, Role::Node)
         );
         assert_eq!(peers.identify(&seen(b"three", Some(2))), None);
         assert_eq!(peers.identify(&seen(b"four", None)), None);
         assert_eq!(peers.server_name(3), Some("node-3"));
         assert_eq!(peers.server_name(4), None);
         assert_eq!(peers.principal(2), Some("2".into()));
+        // A connection speaks the profile its handshake agreed on, and none this node has not.
+        let older = Authenticated {
+            protocol: Profile::One.protocol(),
+            ..seen(b"two", None)
+        };
+        assert_eq!(
+            peers.identify(&older),
+            Some((
+                2,
+                Party {
+                    role: Role::Node,
+                    profile: Profile::One,
+                },
+            ))
+        );
+        let unknown = Authenticated {
+            protocol: b"mantle/99",
+            ..seen(b"two", None)
+        };
+        assert_eq!(peers.identify(&unknown), None);
+        // Once the cell's fence passes a node's profile, its connection is refused.
+        peers.fence_at(Profile::Two);
+        assert_eq!(peers.identify(&older), None);
+        assert_eq!(peers.identify(&seen(b"two", None)), named(2, Role::Node));
     }
 
     fn client(id: u64, account: &str) -> Vec<u8> {
@@ -212,7 +274,7 @@ mod tests {
     fn a_client_is_admitted_by_its_names_within_the_bound_and_pruned_as_it_goes() {
         let mut peers = Peers::new(vec![peer(2, b"two")], 2);
         let seven = client(7, "111111111111");
-        assert_eq!(peers.identify(&seen(&seven, None)), Some((7, Role::Client)));
+        assert_eq!(peers.identify(&seen(&seven, None)), named(7, Role::Client));
         assert_eq!(peers.principal(7), Some("111111111111".into()));
         assert_eq!(peers.identify(&seen(&seven, Some(7))), None);
         assert_eq!(peers.identify(&seen(&client(2, "1"), None)), None);
@@ -222,7 +284,7 @@ mod tests {
         );
         assert_eq!(
             peers.identify(&seen(&client(8, "222222222222"), None)),
-            Some((8, Role::Client))
+            named(8, Role::Client)
         );
         assert_eq!(peers.identify(&seen(&client(9, "1"), None)), None);
         assert_eq!(peers.clients(), 2);
@@ -232,7 +294,7 @@ mod tests {
         assert_eq!(peers.principal(8), Some("222222222222".into()));
         assert_eq!(
             peers.identify(&seen(&client(9, "1"), None)),
-            Some((9, Role::Client))
+            named(9, Role::Client)
         );
         let none = Peers::new(Vec::new(), 0).identify(&seen(&seven, None));
         assert_eq!(none, None);

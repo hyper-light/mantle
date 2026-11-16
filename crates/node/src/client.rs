@@ -51,8 +51,9 @@ use crate::directory::{Peer, Peers};
 use crate::node::ChunkOutcome;
 use crate::read::{Query, Read, ReadError};
 use mantle_protocol::bounds::{self, Stated};
-use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
+use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Party, Role};
 use mantle_protocol::object::{self, Op};
+use mantle_protocol::wire::Profile;
 
 /// What a client is given.
 pub struct ClientSettings {
@@ -95,6 +96,10 @@ pub enum ClientError {
     Deadline,
     #[error("the client knows no node")]
     NoNodes,
+    /// What was asked came in a later wire profile than the node that would answer it speaks:
+    /// nothing was sent it (research/91).
+    #[error("the node speaks an older wire profile than what was asked, {0:?}")]
+    Older(Profile),
 }
 
 impl From<Refusal> for ClientError {
@@ -131,8 +136,10 @@ struct Known {
     quic: Option<SocketAddr>,
     connected: bool,
     /// The epoch of the newest connection to it that came up: the transport counts each peer's
-    /// connections, so one dialed since has a newer epoch.
+    /// connections, so one dialed since has a newer epoch. The wire profile that connection's
+    /// handshake agreed on, which what is asked of the node is written in.
     epoch: Epoch,
+    profile: Option<Profile>,
     /// Exchanges with it in a row cut by their period with no reply from it since: each doubles
     /// the next one's period (RFC 6298 §5.5), and its reply, a new measurement of it, sets it back
     /// (§5).
@@ -191,10 +198,15 @@ impl Client {
             u64::try_from(limits.keep_alive.unwrap_or(limits.idle_timeout).as_nanos())
                 .map_err(|_| ClientError::Bounds("the keep-alive interval".into()))?;
         let io = bounds::io(&stated);
-        let tls = Tls::mutual(&settings.credentials, false)?;
+        // Every profile the client speaks is offered, newest first (research/91).
+        let profile = Profile::announced().map_err(|e| ClientError::Bounds(e.to_string()))?;
+        let tls = crate::node::offering(Tls::mutual(&settings.credentials, false)?, profile);
         let config = Config {
             tls,
-            role: settings.role,
+            role: Party {
+                role: settings.role,
+                profile,
+            },
             limits,
             congestion: Default::default(),
         };
@@ -207,6 +219,7 @@ impl Client {
                 quic: None,
                 connected: false,
                 epoch: 0,
+                profile: None,
                 stalled: 0,
                 refused: None,
             })
@@ -268,7 +281,7 @@ impl Client {
         // never cut by a period, only by its connection's loss (the module's rules).
         let guarded = entry.commands.iter().all(|c| c.session != 0);
         let reply = self
-            .request(Kind::Command, group, (deadline_ns, guarded))
+            .request(Kind::Command, group, (deadline_ns, guarded), Profile::One)
             .await?;
         Ok(command::decode_answers(&reply)?)
     }
@@ -283,7 +296,9 @@ impl Client {
     ) -> Result<Read, ClientError> {
         self.body.clear();
         self.body.extend_from_slice(&query.encode()?);
-        let reply = self.request(Kind::Read, group, (deadline_ns, true)).await?;
+        let reply = self
+            .request(Kind::Read, group, (deadline_ns, true), query.profile())
+            .await?;
         Ok(Read::decode(query, &reply)?)
     }
 
@@ -295,6 +310,7 @@ impl Client {
         kind: Kind,
         group: u128,
         (deadline_ns, guarded): (u64, bool),
+        needs: Profile,
     ) -> Result<Vec<u8>, ClientError> {
         let mut target = self.leaders.get(&group).copied();
         // RFC 6298 §5.5: the wait doubles from the current retransmission timeout, the client's
@@ -308,6 +324,9 @@ impl Client {
         // The nodes this command lost an exchange with: one named as the leader since is taken as
         // naming none, since the node naming it has not yet learned what this client found.
         let mut lost: Vec<PeerId> = Vec::new();
+        // The leader the last node asked named, which a read of a later profile than its own
+        // cannot be asked of.
+        let mut named: Option<PeerId> = None;
         loop {
             if tried >= self.nodes.len() {
                 let delay = stated.map_or(backoff, |patience| patience.min(backoff));
@@ -332,6 +351,20 @@ impl Client {
                 target = self.next_node(Some(node));
                 continue;
             }
+            // What a later profile brought is asked only of a node that speaks it: the leader on
+            // an older one cannot read it, and any other node is passed for the next.
+            let speaks = self
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .and_then(|n| n.profile);
+            if needs > Profile::One && speaks.is_none_or(|spoken| spoken < needs) {
+                if self.leaders.get(&group) == Some(&node) || named == Some(node) {
+                    return Err(ClientError::Older(needs));
+                }
+                target = self.next_node(Some(node));
+                continue;
+            }
             let asked = self.ask(node, kind, group, (deadline_ns, guarded)).await?;
             let count = match asked {
                 Asked::Answered(_) => &mut self.asks.answered,
@@ -349,6 +382,7 @@ impl Client {
                     if leader != 0 && leader != node && !lost.contains(&leader) =>
                 {
                     target = Some(leader);
+                    named = Some(leader);
                 }
                 // No node knows a leader yet: the next is asked, and once every node was, the
                 // client waits.
@@ -706,16 +740,6 @@ impl Client {
         data: &[u8],
         deadline_ns: u64,
     ) -> Result<ObjectOutcome, ClientError> {
-        let (mut head, fields) = op
-            .encode()
-            .map_err(|e| ClientError::Bounds(e.to_string()))?;
-        object::within(
-            &mut head,
-            Some(remaining_ns(deadline_ns))
-                .filter(|ns| *ns != 0)
-                .map(Duration::from_nanos),
-        )
-        .map_err(|e| ClientError::Bounds(e.to_string()))?;
         if !self.reach(node, deadline_ns).await? {
             let refused = self
                 .nodes
@@ -726,6 +750,27 @@ impl Client {
                 refused.unwrap_or(Refusal::NotConnected),
             ));
         }
+        // The request is written in the profile the node's connection agreed on: one a later
+        // profile brought is sent no node of an older one.
+        let Some(profile) = self
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .and_then(|n| n.profile)
+        else {
+            return Ok(ObjectOutcome::Lost(Refusal::NotConnected));
+        };
+        let (mut head, fields) = op.encode(profile).map_err(|e| match e {
+            object::ObjectError::Profile(needs) => ClientError::Older(needs),
+            e => ClientError::Bounds(e.to_string()),
+        })?;
+        object::within(
+            &mut head,
+            Some(remaining_ns(deadline_ns))
+                .filter(|ns| *ns != 0)
+                .map(Duration::from_nanos),
+        )
+        .map_err(|e| ClientError::Bounds(e.to_string()))?;
         let clock = self.driver.clock()?;
         let now_ns = hyper_rt::futures::now_ns();
         let period = Progress::new(Duration::from_nanos(self.period_ns(
@@ -787,20 +832,20 @@ impl Client {
                         continue;
                     };
                     replied = Some(
-                        object::ReplyHead::decode(head)
+                        object::ReplyHead::decode(head, profile)
                             .map_err(|e| ClientError::Bounds(e.to_string()))?,
                     );
                     if let Some(done) =
                         self.read_reply(exchange, classes::Class::Transfer, &mut bytes)?
                     {
-                        return reply_of(replied, done);
+                        return reply_of(replied, done, profile);
                     }
                 }
                 Event::BodyReady { exchange: e } if e == exchange && replied.is_some() => {
                     if let Some(done) =
                         self.read_reply(exchange, classes::Class::Transfer, &mut bytes)?
                     {
-                        return reply_of(replied, done);
+                        return reply_of(replied, done, profile);
                     }
                 }
                 // Its connection closed: the transport queues why with the exchange's refusal
@@ -1005,10 +1050,11 @@ impl Client {
     /// Keeps what a connection's event says of it.
     fn keep(&mut self, event: Event<NodeClasses>) -> Event<NodeClasses> {
         match &event {
-            Event::Connected { peer, epoch, .. } => {
+            Event::Connected { peer, epoch, role } => {
                 if let Some(node) = self.nodes.iter_mut().find(|n| n.id == *peer) {
                     node.connected = true;
                     node.epoch = *epoch;
+                    node.profile = Some(role.profile);
                 }
             }
             Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
@@ -1118,15 +1164,19 @@ fn untaken(refusal: Refusal) -> bool {
 fn reply_of(
     head: Option<object::ReplyHead>,
     mut body: Vec<u8>,
+    profile: Profile,
 ) -> Result<ObjectOutcome, ClientError> {
     let head = head.ok_or(ClientError::Bounds(
         "an object's body before its head".into(),
     ))?;
     let fields = usize::try_from(head.fields()).unwrap_or(usize::MAX);
     let reply = head
-        .reply(body.get(..fields).ok_or(ClientError::Bounds(
-            "an object's reply shorter than its fields".into(),
-        ))?)
+        .reply(
+            body.get(..fields).ok_or(ClientError::Bounds(
+                "an object's reply shorter than its fields".into(),
+            ))?,
+            profile,
+        )
         .map_err(|e| ClientError::Bounds(e.to_string()))?;
     body.drain(..fields);
     Ok(ObjectOutcome::Replied {

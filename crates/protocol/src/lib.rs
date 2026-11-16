@@ -5,6 +5,7 @@
 //! - [`bounds`]: every bound of a transport, derived from what its owner states.
 //! - [`classes`]: the kinds of message QUIC carries, their classes and who may send each.
 //! - [`object`]: an object's request and reply, S3's operations on the native protocol.
+//! - [`wire`]: the wire profiles a connection's two sides agree on, and what each one's formats are.
 
 #![cfg_attr(
     test,
@@ -27,6 +28,7 @@ static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Countin
 pub mod bounds;
 pub mod classes;
 pub mod object;
+pub mod wire;
 
 /// The name a node's certificate carries and a dial checks it against (RFC 6125).
 pub fn node_name(id: u64) -> String {

@@ -569,11 +569,13 @@ pub fn decode_reverse(k: &[u8]) -> Option<(u128, u128)> {
     Some((volume, block))
 }
 
-/// After `DATA` in the root range: its census, a node's row, a volume's, or a node's history.
+/// After `DATA` in the root range: its census, a node's row, a volume's, a node's history, or the
+/// cell's upgrade fence.
 const CENSUS: u8 = 0;
 const MEMBER: u8 = 1;
 const VOLUME: u8 = 2;
 const HISTORY: u8 = 3;
+const FENCE: u8 = 4;
 
 /// The key of the root range's census: how many nodes and volumes its table holds.
 pub fn census() -> Vec<u8> {
@@ -583,6 +585,32 @@ pub fn census() -> Vec<u8> {
 /// The key of node `node`'s row in the root range's table.
 pub fn member(node: u64) -> Vec<u8> {
     numbered(MEMBER, &node.to_be_bytes())
+}
+
+/// The first key of the table's node rows after node `after`, or of all of them, and a key past
+/// the last: nodes sort by id.
+pub fn member_rows(after: Option<u64>) -> (Vec<u8>, Vec<u8>) {
+    let from = match after {
+        Some(after) => {
+            let mut from = numbered(MEMBER, &after.to_be_bytes());
+            from.push(0);
+            from
+        }
+        None => vec![DATA, MEMBER],
+    };
+    (from, vec![DATA, MEMBER.saturating_add(1)])
+}
+
+/// The node a node row's key names.
+pub fn decode_member(k: &[u8]) -> Option<u64> {
+    let rest = k.strip_prefix(&[DATA, MEMBER])?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// The key of the cell's upgrade fence in the root range: the wire profile every member has been
+/// seen to speak (docs/research/91 §4).
+pub fn fence() -> Vec<u8> {
+    vec![DATA, FENCE]
 }
 
 /// The root range's row of `kind` under its number's big-endian bytes.

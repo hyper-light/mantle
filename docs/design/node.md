@@ -784,12 +784,53 @@ hyper-rt's change. A test asks a node on Windows to stop by its `stop` line, as 
 reaches only a process group sharing the sender's console.
 
 **Versions.** Every on-disk format already names its version (a volume's superblock, a log
-segment's header, an entry's format byte in `mantle_meta::wire`), and a connection's first
-exchange names the versions each side speaks, as focal's does (07 §4.1). A binary refuses a
-format it does not know rather than guess. A new entry or record format is written only once
-every member of a range has said it can read it, the pattern of focal's decoder fences (07
-§2.5), so a node can be rolled back to its previous binary until that point, and a
-mixed-version cell runs in the meantime (audit §8.7).
+segment's header, an entry's format byte in `mantle_meta::wire`), and a binary refuses a format it
+does not know rather than guess. A cell holds binaries of two releases while its machines are
+upgraded one at a time, and works through it (research/91):
+
+- *Wire profiles.* What travels point to point, the native protocol's messages and a node's reads
+  of a range's leader, is written in the wire profile its connection's two sides agreed on at
+  the handshake, by ALPN: each side offers every profile it speaks newest first, and a server takes
+  the first of its own the client offers (RFC 7301 §3.2), so a pair speaks the newest both know,
+  authenticated by TLS 1.3's Finished like the rest of the handshake (`mantle_protocol::wire`).
+  Profile one is the transport's own protocol name, `hyper-transport/1`, the one every mantle
+  before profiles offered alone, so a binary from before profiles meets one after on the older's
+  formats; profile two, `mantle/2`, carries research/89's operations and reads. The transport keeps
+  each connection's profile with its peer's role (`classes::Party`), so a node restarted on a newer
+  binary while its old connection lingers is spoken to in each connection's own.
+- *What a newer side asks of an older.* A request is written in its connection's profile, and one
+  that profile cannot carry whole is refused before anything is sent, never sent without the part
+  it has no field for (`object::ObjectError::Profile`); the client asks the next node, which may be
+  upgraded, and says the operation needs the later profile if none is. A read profile two brought
+  is asked only of a leader whose newest connection speaks it; a leader of profile one ends the
+  operation `Unavailable`, S3's `503 ServiceUnavailable`, which clients ask again until that leader
+  is upgraded or another leads. An orderly stop hands each range's lead to a caught-up voter whose
+  connection speaks the stopping node's profile where one does, so a rolling upgrade's stops keep
+  the lead among the upgraded nodes. A node serves a client of an older profile on that profile's
+  formats, so the previous release's command line works against a cell of the next.
+- *The upgrade fence.* A new entry or record format, or a new way to apply one, is written only
+  once every member of the cell speaks the profile that brought it, the pattern of focal's
+  decoder fences (07 §2.5) and of etcd's cluster version, which "operates with the protocol of
+  the lowest common version" until every member is upgraded (research/91 §4). The root range
+  holds the fence (`mantle_meta::root::fence`, profile one before any raise): its leader raises
+  it to its own profile once every node the volume table holds speaks that profile on a
+  connection to it, never lowers it, and the entry that raises it (`root::Command::Fence`) is the
+  first of the new profile's kept formats (`node/fence.rs`). Until then a node can be rolled back
+  to its previous binary; once raised, a node refuses and closes a member's connection of an
+  older profile, a node whose profile is below the fence does not start (its root replica's
+  fence read before it binds) or stops once it applies the raise (`NodeError::Fenced`), and each
+  node says `fence PROFILE` as its fence rises. A node announcing an older profile (`MANTLE_WIRE`)
+  holds the fence down, keeping the previous binary able to take its place. Profile two keeps no
+  format of its own beyond the fence's entry; the first that does, an object's tags, waits on it.
+
+Tested with real processes (`crates/mantle/tests/upgrade.rs`, CI's `upgrade` job): a cell of three,
+one founder on this binary and two on the previous profile's (scripts/previous-binary.sh), every
+operation of profile one through each founder by both releases' command lines; profile two's
+refused by the client through a founder of the previous binary, answered through this one's
+except the reads of versions while the Name range is led by a founder of the previous binary,
+which are `Unavailable` at both doors; then both founders upgraded by an orderly stop and a start
+on their directories, the fence raised to profile two and said by every founder, a founder
+announcing profile one refused at its start, and every operation again.
 
 ### 1.8 Power, thermal state and background work
 
@@ -2300,8 +2341,9 @@ version, current or named; judges the source's conditions and S3's refusals agai
 draws the new file's data key; and then drives a `Get` over the source version's file and a `Put`
 of the new file together, each piece the get yields fed to the put as the put takes body, so a copy
 holds at most the get's window of blocks and one piece, and a slow put holds the get back. The put commits a version or
-a part as a PUT's does; a copy whose new version is the null version reads the mark its write left
-(`Query::Mark`, kind 15) for the version's time. A copy takes two of the host's
+a part as a PUT's does; a copy whose new version is the null version reads its key's current
+version for the version's time, and the mark its write left (`Query::Mark`, kind 15) where the key
+holds another file since. A copy takes two of the host's
 `gateway.objects` operations, one for each driver: the local door holds a copy while fewer are
 free, the requests behind it waiting so the door keeps its order, and the native door answers it
 `SlowDown`. DeleteObjects reads its bucket's row once and then asks each object's delete as a Name

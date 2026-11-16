@@ -270,8 +270,10 @@ not its metadata." [4] `CopyObjectResult` holds the ETag, `LastModified`, `Check
 checksum, and the response's `x-amz-version-id` the new version's ID, "always null" where the
 destination is unversioned, and `x-amz-copy-source-version-id` the source's [4]. The new version's
 `LastModified` is its commit's time in the Name range, its order inverted (metadata.md §1); a null
-version's ID names no order, so the time is read from the mark its write left, which names the
-version by the copy's own file whatever wrote the key since.
+version's ID names no order, so the time is the key's current version's where that still holds the
+copy's own file, and otherwise read from the mark its write left, which names the version by the
+copy's file whatever wrote the key since. The first is a read every release answers; the mark's
+came in wire profile two, which a range's leader of an older release cannot answer (research/91).
 
 "A `200 OK` response can contain either a success or an error ... If the error occurs during the
 copy operation, the error response is embedded in the `200 OK` response"; "When the request is an

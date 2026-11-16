@@ -60,8 +60,9 @@ use hyper_transport::{
     Authenticated, Config, Directory, Endpoint, Epoch, Event, ExchangeId, Fixed, Progress,
 };
 use mantle_protocol::bounds::{self, Stated};
-use mantle_protocol::classes::{self, Bounds, Class, Kind, NodeClasses, Role};
+use mantle_protocol::classes::{self, Bounds, Class, Kind, NodeClasses, Party, Role};
 use mantle_protocol::object::{self, Headers, ObjectError, Op, Reply, ReplyHead, Status};
+use mantle_protocol::wire::Profile;
 use mantle_s3::body::MIN_PART;
 use mantle_s3::checksum::{Algorithm, Checksum, Hasher};
 
@@ -165,6 +166,10 @@ pub enum ClientError {
     Deadline,
     #[error("the upload's durable offset is {theirs}, not one the client's runs reach ({ours})")]
     Offset { ours: u64, theirs: u64 },
+    /// The operation came in a later wire profile than every node asked speaks: none of them can
+    /// read it, so none was sent it (research/91).
+    #[error("every node asked speaks an older wire profile than the operation's, {0:?}")]
+    Older(Profile),
 }
 
 impl From<Refusal> for ClientError {
@@ -360,15 +365,23 @@ struct Nodes {
 }
 
 impl Directory for Nodes {
-    type Role = Role;
+    type Role = Party;
 
     /// The node dialed, its certificate verified for its name under the cell's authority at the
-    /// handshake; none for a connection the client did not dial.
-    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Role)> {
+    /// handshake, speaking the wire profile the handshake agreed on; none for a connection the
+    /// client did not dial.
+    fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Party)> {
         let dialed = authenticated.dialed?;
         authenticated.certificate?;
+        let profile = Profile::of(authenticated.protocol)?;
         if self.names.iter().any(|(id, _)| *id == dialed) {
-            Some((dialed, Role::Node))
+            Some((
+                dialed,
+                Party {
+                    role: Role::Node,
+                    profile,
+                },
+            ))
         } else {
             None
         }
@@ -389,8 +402,10 @@ struct Known {
     /// Its host name, where it was given one: looked up again when it cannot be reached.
     name: Option<String>,
     connected: bool,
-    /// The epoch of the newest connection to it that came up.
+    /// The epoch of the newest connection to it that came up, and the wire profile that
+    /// connection's handshake agreed on, which a request to it is written in.
     epoch: Epoch,
+    profile: Option<Profile>,
     /// Exchanges with it in a row cut by their period with no reply from it since: each doubles
     /// the next one's period (RFC 6298 §5.5), and its reply sets it back (§5).
     stalled: u32,
@@ -398,9 +413,19 @@ struct Known {
     refused: Option<Refusal>,
 }
 
+/// A request's head and fields in each wire profile it was written in, or why it could not be.
+type Written = Vec<(Profile, Result<(Vec<u8>, Vec<u8>), ObjectError>)>;
+
+/// What one attempt asks: the operation, its head and fields in each profile written so far, and
+/// the time its asker still gives it.
+type Request<'o, 'w> = (&'o Op, &'w mut Written, Option<Duration>);
+
 /// What one attempt came to.
 enum Attempt {
     Replied(Box<Reply>),
+    /// The node's connection speaks an older wire profile than the operation came in: nothing
+    /// was sent it, and another node is asked.
+    Older(Profile),
     /// Refused before the node took any of it, `Refusal` why: asked again.
     Untaken(Refusal),
     /// The node's connection refused for a reason asking again does not change.
@@ -414,6 +439,8 @@ enum Attempt {
 /// A reply as it is read: its head and its body's length, the body's bytes read so far, the reply
 /// its fields decode to, and the hasher a get's bytes are held to.
 struct Reading {
+    /// The profile the request was written in, and so its reply.
+    profile: Profile,
     head: ReplyHead,
     body: u64,
     got: u64,
@@ -515,9 +542,16 @@ impl Client {
         let mut tls = Tls::mutual(&settings.credentials, false)?;
         tls.client.cert_compressors.clear();
         tls.client.cert_decompressors.clear();
+        // Every profile the client speaks is offered, newest first: a node takes the newest it
+        // speaks too (research/91).
+        let profile = Profile::announced().map_err(|e| ClientError::Bounds(e.to_string()))?;
+        tls.client.alpn_protocols = Profile::offered(profile);
         let config = Config {
             tls,
-            role: Role::Client,
+            role: Party {
+                role: Role::Client,
+                profile,
+            },
             limits,
             congestion: Default::default(),
         };
@@ -558,6 +592,7 @@ impl Client {
                         .map(|(_, name)| name.clone()),
                     connected: false,
                     epoch: 0,
+                    profile: None,
                     stalled: 0,
                     refused: None,
                 })
@@ -1175,11 +1210,14 @@ impl Client {
         mut sink: Option<&mut K>,
         deadline_ns: u64,
     ) -> Result<Reply, ClientError> {
-        let (mut head, fields) = op.encode()?;
-        let body = op.body(&fields);
+        // The request's head and fields in each wire profile a node it is asked of speaks, each
+        // written once (research/91).
+        let mut written = Written::new();
         // RFC 6298 §5.5: the wait doubles from the measured probe timeout.
         let mut backoff = self.measured_pto();
         let mut last = Refusal::NotConnected;
+        // The later profile the operation came in, where a node asked speaks an older one.
+        let mut older: Option<Profile> = None;
         // Retries of a slowed request: their count, the quota's units they took, and whether the
         // last waited its own backoff, past which it is asked again at once.
         let (mut slowed, mut taken, mut waited) = (0u32, 0u32, false);
@@ -1205,11 +1243,10 @@ impl Client {
                         .max(1),
                 )
             });
-            object::within(&mut head, left)?;
             let asked = self
                 .attempt(
                     node,
-                    (&head, &fields, body),
+                    (op, &mut written, left),
                     (upload.as_deref_mut(), sink.as_deref_mut()),
                     deadline_ns,
                 )
@@ -1222,7 +1259,9 @@ impl Client {
                     // retries a throttling error: within the attempts and the retry quota, of the
                     // next node, from which its range's leader may be reached where this one's
                     // could not. A run's body is gone; its upload sends it again (`Ran::Slowed`).
-                    if reply.status == Status::SlowDown
+                    // So is one a range's leader of an older profile could not serve
+                    // (`Unavailable`, research/91), whose lead an upgrade's stop hands on.
+                    if matches!(reply.status, Status::SlowDown | Status::Unavailable)
                         && upload.is_none()
                         && attempt.saturating_add(1) < ATTEMPTS
                         && self.quota.take()
@@ -1251,7 +1290,19 @@ impl Client {
                 }
                 Attempt::Untaken(refusal) => {
                     last = refusal;
+                    older = None;
                     // The next node is asked: this one may be gone or full.
+                    self.at = self
+                        .at
+                        .checked_add(1)
+                        .filter(|at| *at < self.nodes.len())
+                        .unwrap_or(0);
+                }
+                // A node of an older profile was sent nothing: the next is asked at once, which
+                // may be upgraded already, as in a cell mid-upgrade.
+                Attempt::Older(needs) => {
+                    older = Some(needs);
+                    waited = true;
                     self.at = self
                         .at
                         .checked_add(1)
@@ -1264,15 +1315,18 @@ impl Client {
                 }
             }
         }
-        Err(ClientError::Untaken(last))
+        Err(match older {
+            Some(needs) => ClientError::Older(needs),
+            None => ClientError::Untaken(last),
+        })
     }
 
-    /// One attempt of a request whose head, fields and body's length are given, with a put's
-    /// upload or a get's sink, of `node`, on connections that are still the node's.
+    /// One attempt of `op`, its bytes in each profile written so far, and the time its asker gives
+    /// it, with a put's upload or a get's sink, of `node`, on connections that are still the node's.
     async fn attempt<S: Source, K: Sink>(
         &mut self,
         node: PeerId,
-        request: (&[u8], &[u8], u64),
+        request: Request<'_, '_>,
         with: (Option<&mut Upload<'_, S>>, Option<&mut K>),
         deadline_ns: u64,
     ) -> Result<Attempt, ClientError> {
@@ -1304,7 +1358,7 @@ impl Client {
     async fn attempted<S: Source, K: Sink>(
         &mut self,
         node: PeerId,
-        (head, fields, body): (&[u8], &[u8], u64),
+        (op, written, left): Request<'_, '_>,
         (mut upload, mut sink): (Option<&mut Upload<'_, S>>, Option<&mut K>),
         deadline_ns: u64,
     ) -> Result<Attempt, ClientError> {
@@ -1327,6 +1381,31 @@ impl Client {
                 Attempt::Untaken(refused)
             });
         }
+        // The request is written in the profile the node's connection agreed on, once for each
+        // profile: a node of an older one than the operation's is sent nothing of it.
+        let Some(profile) = self
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .and_then(|n| n.profile)
+        else {
+            return Ok(Attempt::Untaken(Refusal::NotConnected));
+        };
+        let at = match written.iter().position(|(p, _)| *p == profile) {
+            Some(at) => at,
+            None => {
+                written.push((profile, op.encode(profile)));
+                written.len().saturating_sub(1)
+            }
+        };
+        let (head, fields) = match written.get_mut(at).map(|(_, bytes)| bytes) {
+            Some(Ok((head, fields))) => (head, &*fields),
+            Some(Err(ObjectError::Profile(needs))) => return Ok(Attempt::Older(*needs)),
+            Some(Err(e)) => return Err(ClientError::Message(*e)),
+            None => return Ok(Attempt::Untaken(Refusal::NotConnected)),
+        };
+        object::within(head, left)?;
+        let (head, body) = (&*head, op.body(fields));
         let clock = self.driver.clock()?;
         let opened_ns = hyper_rt::futures::now_ns();
         if opened_ns >= deadline_ns {
@@ -1421,7 +1500,7 @@ impl Client {
                         // the reply ends it.
                         continue;
                     };
-                    let head = ReplyHead::decode(head)?;
+                    let head = ReplyHead::decode(head, profile)?;
                     let fields = usize::try_from(head.fields())
                         .ok()
                         .filter(|f| *f <= object::MAX_REPLY_FIELDS)
@@ -1434,6 +1513,7 @@ impl Client {
                         body: body.unwrap_or(0),
                         got: 0,
                         decoded: None,
+                        profile,
                         hasher: None,
                     });
                     if let Some(done) = self
@@ -1653,7 +1733,7 @@ impl Client {
         }
         let decoded = match reading.decoded.take() {
             Some(decoded) => decoded,
-            None => reading.head.reply(&self.fields)?,
+            None => reading.head.reply(&self.fields, reading.profile)?,
         };
         if let Some((hasher, what)) = reading.hasher.take()
             && let Some(kept) = &decoded.checksum
@@ -1685,7 +1765,7 @@ impl Client {
             .got
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         if reading.decoded.is_none() && held.len() == fields {
-            let decoded = reading.head.reply(held)?;
+            let decoded = reading.head.reply(held, reading.profile)?;
             // A get's bytes, which its sink takes, are held to the checksum kept.
             if sink.is_some() {
                 reading.hasher = hasher_for(&decoded)?;
@@ -1911,10 +1991,11 @@ impl Client {
     /// Keeps what a connection's event says of it.
     fn keep(nodes: &mut [Known], event: Event<NodeClasses>) -> Event<NodeClasses> {
         match &event {
-            Event::Connected { peer, epoch, .. } => {
+            Event::Connected { peer, epoch, role } => {
                 if let Some(node) = nodes.iter_mut().find(|n| n.id == *peer) {
                     node.connected = true;
                     node.epoch = *epoch;
+                    node.profile = Some(role.profile);
                     node.refused = None;
                 }
             }

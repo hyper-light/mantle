@@ -1836,7 +1836,7 @@ impl Cell {
     }
 
     /// Waits for the process the test expects to end (`refusing`) to end: how it exited.
-    fn ended(&mut self) -> std::process::ExitStatus {
+    pub(crate) fn ended(&mut self) -> std::process::ExitStatus {
         let mut running = self.until(|c| c.refused.take());
         self.refusing = None;
         running.child.wait().unwrap()

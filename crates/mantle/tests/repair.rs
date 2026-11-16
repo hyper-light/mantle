@@ -1,13 +1,15 @@
 //! The cell's repair, rebalancing and multi-machine failures with real `mantle serve` processes on
 //! real disks (docs/design/repair.md §7): cells of three and of five `mantle init` makes, objects put
 //! through the S3 listener and the native door, and then volumes lost while objects are written and
-//! at rest, nodes killed and stopped (SIGKILL, SIGSTOP) for long stretches and brought back, a node
-//! joining and a node leaving while objects are written, a node leaving a cell narrower than its
-//! blocks and another joining, and more volumes lost at once than a block's code spares. After each: every acknowledged object reads back byte-exact through both doors and
-//! every node; every block's places, read from the Block range and the volume table as a gateway
-//! reads them, each hold their chunk on disk, read from its volume and checked against the block's
-//! CRC-32C; and what the cell cannot rebuild it says, typed, never answering with bytes it does not
-//! hold. Every wait is on a fact a node says (`repair`, `enlisted`, `leaving` lines), never a clock.
+//! at rest, a node held still (SIGSTOP, or on Windows each thread suspended) for a long stretch and
+//! brought back, a node killed (SIGKILL) past the repair time and judged gone, a node joining and a
+//! node leaving while objects are written, a node leaving a cell narrower than its blocks and
+//! another joining, and more volumes lost at once than a block's code spares. After each: every
+//! acknowledged object reads back byte-exact through both doors and every node; every block's
+//! places, read from the Block range and the volume table as a gateway reads them, each hold their
+//! chunk on disk, read from its volume and checked against the block's CRC-32C; and what the cell
+//! cannot rebuild it says, typed, never answering with bytes it does not hold. Every wait is on a
+//! fact a node says (`repair`, `enlisted`, `leaving`, `link` lines), never a clock.
 //!
 //! A binary of its own (crates/mantle/tests/support/cell.rs's harness, support/s3.rs's client).
 
@@ -26,6 +28,8 @@ mod cell;
 #[allow(dead_code)]
 #[path = "../../node/tests/support/history.rs"]
 mod history;
+#[path = "support/hold.rs"]
+mod hold;
 #[path = "../../range/tests/support/linear.rs"]
 mod linear;
 #[allow(dead_code)]
@@ -116,13 +120,6 @@ fn volume_dirs(cell: &Cell, id: u64) -> Vec<PathBuf> {
 fn lose_volume(dir: &Path) {
     let volume = dir.join("mantle").join("volume");
     std::fs::remove_file(&volume).unwrap();
-}
-
-/// Sends `signal` to node `id`'s process, by the system's `kill`.
-fn signal(cell: &Cell, id: u64, signal: &str) {
-    let pid = cell.running[&id].child.id().to_string();
-    let sent = Command::new("kill").args([signal, &pid]).status().unwrap();
-    assert!(sent.success(), "kill {signal} {pid}");
 }
 
 /// The repair as the node running it last said, once a node says it leads it.
@@ -745,7 +742,7 @@ fn a_node_asleep_is_waited_for_and_writes_go_around_it() {
     let ids: Vec<u64> = cell.running.keys().copied().collect();
     let asleep = ids[4];
     let volume = cell.volumes[&asleep];
-    signal(&cell, asleep, "-STOP");
+    hold::still(cell.running[&asleep].child.id());
     // The cell judges it away: its blocks wait for it.
     let waiting = settled(&mut cell, |r| r.waiting > 0);
     assert_eq!(waiting.rebuilt, waiting.timing, "{waiting:?}");
@@ -762,7 +759,7 @@ fn a_node_asleep_is_waited_for_and_writes_go_around_it() {
     }
     objects.extend(during);
     read_back_through(&mut cell, &ids[..4], "b", &objects);
-    signal(&cell, asleep, "-CONT");
+    hold::go_on(cell.running[&asleep].child.id());
     let woke = settled(&mut cell, |r| r.waiting == 0 && r.short == 0);
     assert_eq!(woke.rebuilt, woke.timing, "{woke:?}");
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
@@ -770,13 +767,13 @@ fn a_node_asleep_is_waited_for_and_writes_go_around_it() {
     whole_on_disk(&mut cell, g, "b", &keys);
 }
 
-/// A node killed (SIGKILL) for longer than the cell's stated time for a repair: its chunks are
-/// rebuilt on the others and kept where they were, so once it is started again on its volume, each
-/// copy it held counts again rather than being copied anew; and a node that joins while objects are
+/// A node killed (SIGKILL) for longer than the cell's stated time for a repair: the root range's
+/// leader judges it gone (membership.md §5), every volume of it gone with it, so its chunks are
+/// rebuilt on the others, no place on its volumes is kept, and the table forgets them; started
+/// again on its volume, its identity is refused at every node. A node that joins while objects are
 /// written is enlisted and offered new blocks, every object reading back and every block whole.
 #[test]
-fn a_node_gone_past_the_repair_time_is_rebuilt_kept_and_counted_again_and_a_joiner_takes_new_blocks()
- {
+fn a_node_gone_past_the_repair_time_is_written_off_and_refused_and_a_joiner_takes_new_blocks() {
     // A repair in a second (3,600 an hour): the cell does not wait a day. Two volumes a node, so a
     // chunk of the killed node has a volume to be rebuilt on.
     let mut cell = Cell::made_partly(
@@ -786,10 +783,17 @@ fn a_node_gone_past_the_repair_time_is_rebuilt_kept_and_counted_again_and_a_join
     let g = groups(&cell);
     ready(&mut cell, "b");
     let mut objects = put_objects(&mut cell, "b", "before", &SIZES, 7);
-    let ids: Vec<u64> = cell.running.keys().copied().collect();
     let gone = follower(&cell);
+    let others: Vec<u64> = cell
+        .running
+        .keys()
+        .copied()
+        .filter(|id| *id != gone)
+        .collect();
     let theirs = volumes_of(&mut cell, g, gone);
     cell.kill(gone);
+    // Gone, its volumes are written off with it and, once no block names them, forgotten.
+    forgotten(&mut cell, g, gone);
     let rebuilt = settled(&mut cell, |r| {
         r.waiting == 0 && r.short == 0 && r.rebuilt > 0
     });
@@ -799,26 +803,35 @@ fn a_node_gone_past_the_repair_time_is_rebuilt_kept_and_counted_again_and_a_join
         "{rebuilt:?}"
     );
     let keys: Vec<String> = objects.keys().cloned().collect();
-    // Its places are kept, each now beside its chunk's own on another node.
-    let mut kept = 0;
     for key in &keys {
-        for (_, header, places) in blocks_of(&mut cell, g, "b", key) {
-            let width = usize::from(header.data) + usize::from(header.parity);
-            kept += places
-                .iter()
-                .skip(width)
-                .filter(|p| theirs.contains(&p.volume))
-                .count();
+        for (block, _, places) in blocks_of(&mut cell, g, "b", key) {
+            assert!(
+                places.iter().all(|p| !theirs.contains(&p.volume)),
+                "{key} {block:x} keeps a place on the gone node's volume"
+            );
         }
     }
-    assert!(kept > 0, "nothing kept on the killed node's volume");
-    cell.start(gone);
-    cell.introduce();
-    cell.enlisted(gone);
-    let back = settled(&mut cell, |r| r.waiting == 0 && r.short == 0);
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let (_, places) = whole_on_disk(&mut cell, g, "b", &keys);
     assert!(places > 0);
+    // Started again on its volume, it finds its identity refused: each link it keeps to a node
+    // that runs ends refused.
+    cell.start(gone);
+    cell.introduce();
+    cell.until(|c| {
+        let refused = others.iter().all(|peer| {
+            c.links
+                .get(&(gone, *peer))
+                .is_some_and(|link| link.ends_with("Identity"))
+        });
+        if refused { Some(()) } else { None }
+    });
+    let exited = cell.stop(gone);
+    assert!(
+        exited.success(),
+        "the refused node stopped in order exited {exited}"
+    );
+    let back = settled(&mut cell, |r| r.waiting == 0 && r.short == 0);
 
     // The fifth founder joins while objects are written: its volume new to the table.
     let joining = *cell
@@ -831,7 +844,7 @@ fn a_node_gone_past_the_repair_time_is_rebuilt_kept_and_counted_again_and_a_join
             cell.pki.object_settings(object_client(CLIENT + 1)),
             cell.bound_quic(),
         );
-        let first = ids[0];
+        let first = others[0];
         std::thread::spawn(move || tolerant_puts(settings, bound, first, "b", "joining", 12, 8))
     };
     cell.start(joining);
@@ -850,8 +863,9 @@ fn a_node_gone_past_the_repair_time_is_rebuilt_kept_and_counted_again_and_a_join
 
 /// A node that leaves while objects are written: its volumes take no new chunk, every chunk they
 /// held moves to the others, and once they hold nothing the table writes them off and forgets them;
-/// the node then stops, and every object reads back through the rest, every block whole on disk.
-/// Two volumes a node: a block as wide as the cell keeps a chunk to a volume on the four left.
+/// the node, refused once the cell removes it, then ends well, and every object reads back through
+/// the rest, every block whole on disk. Two volumes a node: a block as wide as the cell keeps a
+/// chunk to a volume on the four left.
 #[test]
 fn a_node_leaving_mid_write_moves_everything_off_and_is_forgotten() {
     let mut cell = Cell::made(|root| founders(root, 5, 2, ""));
@@ -869,9 +883,14 @@ fn a_node_leaving_mid_write_moves_everything_off_and_is_forgotten() {
         std::thread::spawn(move || tolerant_puts(settings, bound, first, "b", "leaving", 12, 12))
     };
     leave(&mut cell, leaving);
+    // Its end is the leave's last step (membership.md §4 step 5): once its volumes are forgotten,
+    // the root range removes and delists it, its peers refuse it and it ends. Taken as expected
+    // from here, and waited for once the table has forgotten its volumes.
+    cell.refusing = Some(leaving);
     objects.extend(writer.join().unwrap());
     forgotten(&mut cell, g, leaving);
-    assert!(cell.stop(leaving).success());
+    let exited = cell.ended();
+    assert!(exited.success(), "the node that left exited {exited}");
     let keys: Vec<String> = objects.keys().cloned().collect();
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     whole_on_disk(&mut cell, g, "b", &keys);
@@ -881,8 +900,9 @@ fn a_node_leaving_mid_write_moves_everything_off_and_is_forgotten() {
 /// with two domains left that take chunks, each chunk of a block as wide as the cell it held moves
 /// onto the other volume of a domain holding one of its block's already. Once the fourth joins, the
 /// domain rule moves one of each such pair onto it, and every block's chunks are on distinct nodes.
-/// The node that left keeps running: it still votes in the ranges, whose quorums of the founders
-/// the fourth, not yet started, does not help make.
+/// The node that left keeps running while it still votes in the ranges, whose quorums of the
+/// founders the fourth, not yet started, does not help make; once the fourth has joined it finishes
+/// leaving and ends well.
 #[test]
 fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     let mut cell = Cell::made_partly(|root| founders(root, 4, 2, ""), 3);
@@ -891,6 +911,10 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     let mut objects = put_objects(&mut cell, "b", "before", &SIZES, 12);
     let leaving = follower(&cell);
     leave(&mut cell, leaving);
+    // Its end is the leave's last step (membership.md §4 step 5): once the fourth founder has
+    // joined, the ranges drop it, the root range removes and delists it, its peers refuse it and it
+    // ends; until then it votes on. Taken as expected from here, and waited for at the end.
+    cell.refusing = Some(leaving);
     forgotten(&mut cell, g, leaving);
     let keys: Vec<String> = objects.keys().cloned().collect();
     // Each block as wide as the three domains it was written over now doubles one of the two left.
@@ -930,6 +954,8 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let keys: Vec<String> = objects.keys().cloned().collect();
     whole_on_disk(&mut cell, g, "b", &keys);
+    let exited = cell.ended();
+    assert!(exited.success(), "the node that left exited {exited}");
 }
 
 /// Puts through the S3 listeners of `nodes` alone.

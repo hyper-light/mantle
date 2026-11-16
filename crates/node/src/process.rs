@@ -2146,7 +2146,9 @@ async fn serve(
     // and done once the root range removed it; and an operator's statements that another node is
     // gone, each out until answered.
     let mut departure = Departure::Staying;
-    let mut stated_gone: Vec<(CommandAsk, u64)> = Vec::new();
+    // A member stated gone is asked of the root range once the node's commands have room; each
+    // id is held once, and at most as many as the cell holds nodes.
+    let mut stated_gone: Vec<(Option<CommandAsk>, u64)> = Vec::new();
     // Each member's standing as last said, and each range's configuration, a range a slot in the
     // configuration's order.
     let mut said_standing: Vec<(u64, MemberState, u64)> = Vec::new();
@@ -2254,21 +2256,27 @@ async fn serve(
                     } else if line.trim_ascii() == b"leave" {
                         departure.ask(&mut node, config.enlist.as_ref(), enlisted)?;
                     } else if let Some(id) = gone_line(&line)? {
-                        let root =
-                            config
-                                .enlist
-                                .as_ref()
-                                .map(|e| e.root)
-                                .ok_or(ProcessError::Input(
-                                    format!("gone {id}"),
-                                    "a node that hosts no root range states no member gone",
-                                ))?;
-                        let gone = Command::Root(root::Command::Gone {
-                            node: id,
-                            // The entry that carries it gives it its time.
-                            at_ns: 0,
-                        });
-                        stated_gone.push((node.command(root, gone, u64::MAX, Wait::Answered)?, id));
+                        let most = config.enlist.as_ref().map(|e| e.max_nodes).ok_or(
+                            ProcessError::Input(
+                                format!("gone {id}"),
+                                "a node that hosts no root range states no member gone",
+                            ),
+                        )?;
+                        if stated_gone.iter().any(|(_, held)| *held == id) {
+                            // Stated already: one statement out for each member.
+                        } else if u64::try_from(stated_gone.len()).unwrap_or(u64::MAX)
+                            >= u64::from(most)
+                        {
+                            say(
+                                &mut output,
+                                &format!(
+                                    "gone {id} refused: as many stated gone as the cell's nodes\n"
+                                ),
+                            )
+                            .await?;
+                        } else {
+                            stated_gone.push((None, id));
+                        }
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;
                     }
@@ -2360,9 +2368,26 @@ async fn serve(
             let Some(&(ask, id)) = stated_gone.get(at) else {
                 continue;
             };
-            if let Some(outcome) = node.take_command(ask) {
-                stated_gone.swap_remove(at);
-                say(&mut output, &format!("gone {id} {outcome:?}\n")).await?;
+            match ask {
+                Some(ask) => {
+                    if let Some(outcome) = node.take_command(ask) {
+                        stated_gone.swap_remove(at);
+                        say(&mut output, &format!("gone {id} {outcome:?}\n")).await?;
+                    }
+                }
+                None => {
+                    if let (Some(e), true) = (&config.enlist, node.command_room()) {
+                        let gone = Command::Root(root::Command::Gone {
+                            node: id,
+                            // The entry that carries it gives it its time.
+                            at_ns: 0,
+                        });
+                        let asked = node.command(e.root, gone, u64::MAX, Wait::Answered)?;
+                        if let Some(held) = stated_gone.get_mut(at) {
+                            held.0 = Some(asked);
+                        }
+                    }
+                }
             }
         }
         // The members whose reach names a host: looked up as a peer's name is; those the cell no
@@ -2553,6 +2578,9 @@ async fn serve(
 /// Where a node's leave stands (docs/design/membership.md §4).
 enum Departure {
     Staying,
+    /// Asked of its root range (the group) while the node's commands had no room: asked once
+    /// they have.
+    Wanting(u128),
     /// Asked of the root range, not yet answered.
     Asking(CommandAsk),
     /// The root range holds it leaving: it waits until its volumes are retired and it is removed.
@@ -2588,12 +2616,25 @@ impl Departure {
         if !enlisted || !matches!(self, Self::Staying) {
             return Ok(());
         }
+        *self = Self::Wanting(e.root);
+        self.send(node)
+    }
+
+    /// Asks the root range the leave it wants, once the node's commands have room
+    /// (`Node::command_room`): before then it stays wanted.
+    fn send<E: Engine + 'static>(&mut self, node: &mut Node<E>) -> Result<(), ProcessError> {
+        let Self::Wanting(root) = *self else {
+            return Ok(());
+        };
+        if !node.command_room() {
+            return Ok(());
+        }
         let leave = Command::Root(root::Command::Leave {
             node: node.id(),
             // The entry that carries it gives it its time.
             at_ns: 0,
         });
-        *self = Self::Asking(node.command(e.root, leave, u64::MAX, Wait::Answered)?);
+        *self = Self::Asking(node.command(root, leave, u64::MAX, Wait::Answered)?);
         Ok(())
     }
 
@@ -2604,6 +2645,10 @@ impl Departure {
         node: &mut Node<E>,
     ) -> Result<Option<&'static str>, ProcessError> {
         match self {
+            Self::Wanting(_) => {
+                self.send(node)?;
+                Ok(None)
+            }
             Self::Asking(ask) => match node.take_command(*ask) {
                 Some(CommandOutcome::Answered(Answer::Root(root::Outcome::Leaving))) => {
                     *self = Self::Leaving;
@@ -2747,7 +2792,8 @@ fn cell_history<E: Engine>(engine: &mut E, id: u64) -> Result<(History, History)
 /// The node's statements of its history to the root range (node.md §2.4, item 7): its totals once
 /// it has enlisted, and again each time its run's time has doubled since the last statement was
 /// answered, so a crash loses at most half of a run's time and a run of `t` states about
-/// `log2(t / first)` times, the first statement's own wait the unit; one statement out at a time.
+/// `log2(t / first)` times, the first statement's own wait the unit; one statement out at a time,
+/// asked only while the node's commands have room.
 #[derive(Default)]
 struct Living {
     out: Option<u64>,
@@ -2768,6 +2814,12 @@ impl Living {
             return Ok(());
         }
         let ran_ns = hyper_rt::futures::now_ns().saturating_sub(started_ns);
+        // The node's commands at the most it keeps (`command_room`): the statement stays due,
+        // from now, and a later turn asks it, as the node's other commands wait for room.
+        if !node.command_room() {
+            self.next_ns = Some(self.next_ns.map_or(ran_ns, |next| next.min(ran_ns)));
+            return Ok(());
+        }
         let lived = Command::Root(root::Command::Lived(Lived {
             node: node.id(),
             exposure_ns: own.exposure_ns.saturating_add(ran_ns),

@@ -60,7 +60,7 @@ def phase(tokens):
 
 def read_case(path):
     case = {"phases": [], "notes": [], "slopes": [], "handshakes": [], "verified": None, "controls": [],
-            "harness": {}}
+            "harness": {}, "relay": {}}
     for line in path.read_text(errors="replace").splitlines():
         tokens = line.split()
         if len(tokens) < 3 or tokens[0] != "doors":
@@ -85,6 +85,9 @@ def read_case(path):
             case["verified_counts"] = dict(zip(tokens[2:12:2], tokens[3:13:2]))
         elif tokens[1] == "harness":
             case["harness"] = dict(zip(tokens[2::2], tokens[3::2]))
+        elif tokens[1] == "relay":
+            # The relay condition's path as the harness states it, then what the relay counted.
+            case["relay"].update(dict(zip(tokens[2::2], tokens[3::2])))
         elif tokens[1] == "control":
             case["controls"].append(" ".join(tokens[2:]))
     return case
@@ -341,6 +344,26 @@ def main(top):
         h = run["harness"]
         w(f"| {name} | {h.get('peak_live_bytes', '-')} | {h.get('threads', '-')} | {h.get('idle_threads', '-')} | "
           f"{run['verified'] or '-'} |")
+
+    w("\n## The relay: what it lost, dropped and how late it sent\n")
+    w("The relay condition's path (src/relay.rs; research/70, Conditions): each datagram held 500 ± 100 ms one "
+      "way and lost by a Gilbert–Elliott chain fitted to 219 of 60,489 lost in 147 runs. lost% is of the "
+      "datagrams it took; over counts those dropped past a direction's bytes; lateness is past each "
+      "datagram's due time, the relay's own cost, not the stack's.\n")
+    w("| case | taken | lost | lost % | over | sent | late mean µs | late max µs |")
+    w("|---|---|---|---|---|---|---|---|")
+    for name in sorted(cases):
+        run = cases[name]["run"]
+        r = run["relay"] if run else {}
+        if "taken" not in r:
+            continue
+        taken = number(r["taken"]) or 0
+        lost = number(r["lost"]) or 0
+        share = f"{100 * lost / taken:.3f}" if taken else "-"
+        late = number(r["late_mean_ns"])
+        latest = number(r["late_max_ns"])
+        w(f"| {name} | {r['taken']} | {r['lost']} | {share} | {r['over']} | {r['sent']} | "
+          f"{show(late / 1000) if late is not None else '-'} | {show(latest / 1000) if latest is not None else '-'} |")
 
     w("\n## QUIC: secnetperf, quinn-perf and bare hyper-quic\n")
     w("Loopback, server and client pinned together. secnetperf `-exec:lowlat -rstream:1 -runtime:5s` (latency per "

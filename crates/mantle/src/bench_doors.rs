@@ -245,6 +245,9 @@ pub struct Options {
     /// The operations whose phases run; every one when empty. A phase reads the objects the
     /// phases before it made, so a read or a delete is asked beside the put it reads.
     pub kinds: Vec<Kind>,
+    /// The native door's clients reach the nodes through the relay condition's path
+    /// (`crate::relay`), and only the native door runs.
+    pub relay: bool,
 }
 
 /// An S3 server this program did not start (`--endpoint`): the HTTP door's phases, controls and
@@ -2438,6 +2441,8 @@ struct Bench<'o> {
     /// The cell this program runs, none against an `--endpoint`.
     cell: Option<Cell>,
     rt: LocalRuntime,
+    /// The relay condition's path the native clients dial through, when `--relay` asks for it.
+    relay: Option<crate::relay::Relay>,
     client_dir: PathBuf,
     listeners: Vec<SocketAddr>,
     signer: Rc<Signer>,
@@ -2591,10 +2596,11 @@ impl<'o> Bench<'o> {
 
     /// The doors measured: both through a cell, the HTTP door alone against an endpoint.
     fn doors(&self) -> &'static [Door] {
-        if self.cell.is_some() {
-            &DOORS
-        } else {
-            &[Door::Http]
+        match (&self.cell, &self.relay) {
+            // The relay condition is the native door's (research/70, "Conditions").
+            (Some(_), Some(_)) => &[Door::Native],
+            (Some(_), None) => &DOORS,
+            (None, _) => &[Door::Http],
         }
     }
 
@@ -2674,10 +2680,20 @@ impl<'o> Bench<'o> {
     fn settings(&self, dir: &Path, first: usize) -> Result<Settings, Error> {
         let configured = crate::client::configured(dir).map_err(failed)?;
         let cell = self.cell()?;
-        let mut nodes = cell.quic();
-        let names = cell.names();
-        let first = first.min(nodes.len());
-        nodes.rotate_left(first);
+        // Under the relay condition each client dials the nodes at a link set of its own, and
+        // knows no name to look a node up by again, which would reach it past the relay.
+        let (nodes, names) = match &self.relay {
+            Some(relay) => (
+                relay.take(first).map_err(|e| failed(e.to_string()))?,
+                Vec::new(),
+            ),
+            None => {
+                let mut nodes = cell.quic();
+                let first = first.min(nodes.len());
+                nodes.rotate_left(first);
+                (nodes, cell.names())
+            }
+        };
         Ok(Settings {
             id: configured.id,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -3541,12 +3557,40 @@ fn run(
         out,
         "doors native clients at most {native_most}: each node admits gateway.clients identities at once"
     )?;
+    // The relay condition: a link set for each client the harness holds at most, each direction
+    // holding what one client's transport may have unacknowledged or unread.
+    let relay = match (options.relay, &cell) {
+        (false, _) => None,
+        (true, None) => {
+            return Err(failed(
+                "--relay asks the cell's own nodes, which an --endpoint has none of",
+            ));
+        }
+        (true, Some(cell)) => {
+            let nodes = cell.quic();
+            let held = mantle_client::least_transport(nodes.len()).map_err(failed)?;
+            let relay = crate::relay::Relay::start(&client_dir, &nodes, most, (held, options.seed))
+                .map_err(|e| failed(e.to_string()))?;
+            writeln!(
+                out,
+                "doors relay one_way_ns {} jitter_ns {} loss {}/{} in runs of {}/{} link_sets {most} held_bytes {held}",
+                crate::relay::ONE_WAY_NS,
+                crate::relay::JITTER_NS,
+                crate::relay::LOST,
+                crate::relay::SENT,
+                crate::relay::LOST,
+                crate::relay::RUNS,
+            )?;
+            Some(relay)
+        }
+    };
     let mut bench = Bench {
         options,
         watch,
         listeners,
         cell,
         rt: runtime(most)?,
+        relay,
         client_dir,
         signer: Rc::new(signer),
         generator: Rc::new(Generator::new(options.seed).map_err(failed)?),
@@ -3588,6 +3632,21 @@ fn run(
         "doors handshakes native {} http {}",
         bench.opened[0], bench.opened[1]
     )?;
+    // The relay's own count: what its chain lost, what passed a direction's bytes, and how late it
+    // sent what it held, so its cost is not charged to the stack (research/70 [12]).
+    if let Some(relay) = bench.relay.take() {
+        let said = relay.stop().map_err(|e| failed(e.to_string()))?;
+        writeln!(
+            out,
+            "doors relay taken {} lost {} over {} sent {} late_mean_ns {} late_max_ns {}",
+            said.taken,
+            said.lost,
+            said.over,
+            said.sent,
+            said.late_ns.checked_div(said.sent).unwrap_or(0),
+            said.latest_ns,
+        )?;
+    }
     writeln!(
         out,
         "doors harness peak_live_bytes {} threads {} idle_threads {idle}",

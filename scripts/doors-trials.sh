@@ -49,7 +49,7 @@ case $MACHINE in
 esac
 VM_IMAGE=${VM_IMAGE:-mantle-bench:1.98.1}
 
-CONDITIONS=(quiet busy1x busy2x cpu1 cpu2 memfloor)
+CONDITIONS=(quiet busy1x busy2x cpu1 cpu2 memfloor relay)
 FULL_CONDITIONS=${FULL_CONDITIONS:-"quiet"}
 MID_CONDITIONS=${MID_CONDITIONS:-"busy2x"}
 TAIL_CONDITIONS=${TAIL_CONDITIONS:-"quiet busy2x"}
@@ -61,10 +61,11 @@ case $MACHINE in
   *) S3_COMPARATORS=${S3_COMPARATORS:-"minio garage seaweedfs rustfs"} ;;
 esac
 QUIC_ARMS=(secnetperf quinn hyperquic)
-# Why the native door's 500 ms relay is not run, until the harness carries one (the baseline's
-# "Needs a decision", 4).
-DEFAULT_RELAY_EXCLUDED="the 500 ms one-way relay with loss and reordering between client and nodes is not in the harness: geo_open_loop's relay is an example's threads, not a library the cell's clients can be pointed through"
-RELAY_EXCLUDED=${RELAY_EXCLUDED:-$DEFAULT_RELAY_EXCLUDED}
+# The relay condition is the native door's (research/70, "Conditions"): mantle's arms run with
+# `mantle bench doors --relay`, which takes the native door's clients through the 500 ms one-way
+# relay with loss and reordering (src/relay.rs) and runs no HTTP phase. What it excludes, and why.
+RELAY_S3_EXCLUDED="the relay condition is the native door's alone (research/70, Conditions): an S3 server is reached through the HTTP door, which runs no relay"
+RELAY_QUIC_EXCLUDED="the QUIC comparators carry no relay of the condition's; bare hyper-quic's geo_open_loop runs its 500 ms relay in every QUIC case (its relay500 line)"
 
 # The node's memory floor, summed over the cell's three nodes: each node's `memory.floor.*` basis
 # lines as `mantle serve` of the batch's product says them on the machine, read from a founder of a
@@ -169,8 +170,12 @@ plan() {
           [ "$k" = tail ] && m=tail
           for a in $(row_of s3_rows[@] "$([ "$k" = tail ] && echo 1 || echo 0)"); do
             seq=$((seq + 1))
-            if [ -n "$why" ]; then
-              printf '%s\t%s\texcluded\t%s\t%s\t%s\t%s\t%s\n' "$seq" "$MACHINE" "$cond" "${s3_arms[$a]}$([ "$k" = tail ] && echo -tail)" "$cycle" "$m" "$why"
+            local arm_why=$why
+            if [ -z "$arm_why" ] && [ "$cond" = relay ] && [[ " ${MANTLE_ARMS[*]} " != *" ${s3_arms[$a]} "* ]]; then
+              arm_why=$RELAY_S3_EXCLUDED
+            fi
+            if [ -n "$arm_why" ]; then
+              printf '%s\t%s\texcluded\t%s\t%s\t%s\t%s\t%s\n' "$seq" "$MACHINE" "$cond" "${s3_arms[$a]}$([ "$k" = tail ] && echo -tail)" "$cycle" "$m" "$arm_why"
             else
               printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\n' "$seq" "$MACHINE" "$k" "$cond" "${s3_arms[$a]}" "$cycle" "$m"
             fi
@@ -178,8 +183,10 @@ plan() {
         done
         for a in $(row_of quic_rows[@]); do
           seq=$((seq + 1))
-          if [ -n "$why" ]; then
-            printf '%s\t%s\texcluded\t%s\tquic-%s\t%s\t-\t%s\n' "$seq" "$MACHINE" "$cond" "${QUIC_ARMS[$a]}" "$cycle" "$why"
+          local quic_why=$why
+          [ -z "$quic_why" ] && [ "$cond" = relay ] && quic_why=$RELAY_QUIC_EXCLUDED
+          if [ -n "$quic_why" ]; then
+            printf '%s\t%s\texcluded\t%s\tquic-%s\t%s\t-\t%s\n' "$seq" "$MACHINE" "$cond" "${QUIC_ARMS[$a]}" "$cycle" "$quic_why"
           else
             printf '%s\t%s\tquic\t%s\t%s\t%s\t-\t-\n' "$seq" "$MACHINE" "$cond" "${QUIC_ARMS[$a]}" "$cycle"
           fi
@@ -189,11 +196,6 @@ plan() {
           printf '%s\t%s\texcluded\t%s\tminio\t%s\t-\t%s\n' "$seq" "$MACHINE" "$cond" "$cycle" \
             "MinIO runs on the Mac and its VM lane: its full-sync mode (MINIO_FS_OSYNC, a whole-machine sync(2) a PUT) flushes the shared box (owner's decision, 2026-11-04)"
         fi
-        for a in "${MANTLE_ARMS[@]}"; do
-          seq=$((seq + 1))
-          printf '%s\t%s\texcluded\t%s\t%s-native-relay500\t%s\t-\t%s\n' "$seq" "$MACHINE" "$cond" "$a" "$cycle" \
-            "$RELAY_EXCLUDED"
-        done
       done
     done
   } > "$OUT/plan.tsv"
@@ -457,6 +459,9 @@ run_case() {
     tail:*) seconds=$TAIL_DEADLINE ;; s3:full) seconds=$FULL_DEADLINE ;;
     s3:mid) seconds=$MID_DEADLINE ;; s3:*) seconds=$LEAN_DEADLINE ;;
   esac
+  # A relay case's every operation waits at least a round trip of the path, so it takes the longest
+  # case's bound.
+  [ "$cond" = relay ] && seconds=$TAIL_DEADLINE
   local free
   free=$(free_kib)
   if [ "$kind" != quic ] && [ "$free" -lt "$FREE_FLOOR_KIB" ]; then
@@ -473,7 +478,8 @@ run_case() {
     s3:A1 | s3:A2 | s3:C | tail:A1 | tail:A2 | tail:C)
       # shellcheck disable=SC2046,SC2086
       wrapped "$name" "$cpus" "$memory" "$seconds" "$BIN/mantle-$arm" bench doors "$WORK/$name" \
-        --condition "$cond" $(perf_arg) $(matrix_args "$matrix") $LOAD_ARGS > "$RAW/$name.out" 2> "$RAW/$name.err" || rc=$?
+        --condition "$cond" $([ "$cond" = relay ] && echo --relay) $(perf_arg) $(matrix_args "$matrix") $LOAD_ARGS \
+        > "$RAW/$name.out" 2> "$RAW/$name.err" || rc=$?
       ;;
     s3:* | tail:*)
       wrapped "$name" "$cpus" "$memory" "$seconds" bash "$0" endpoint-case "$name" "$cond" "$arm" "$matrix" \

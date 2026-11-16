@@ -154,6 +154,16 @@ large runs go under a systemd memory scope"; its machines and conditions: "quiet
 and two times the cores, one and two CPUs, and the node's memory floor as a cgroup limit", and
 "Windows performance belongs to the next goal".
 
+[24] N. Hayashibara, X. Défago, T. Katayama, "Flexible failure detection with κ-FD", JAIST research
+report IS-RR-2004-006, §V.A–B (read 2026-11-16 from the JAIST repository): heartbeats over UDP from
+EPFL in Switzerland to JAIST in Japan, one every 30 s for three weeks: "A total of 60,489 heartbeat
+messages were generated. Among those messages, 219 messages were lost; this corresponds to a loss
+rate of about 0.36%. We observed that message losses tended to occur in bursts, the longest of which
+was 13 heartbeats long (i.e., it lasted for about 7 minutes). We observed 27 different bursts of
+consecutively 99 lost messages." Read as 27 bursts holding 99 of the losses, the other 120 alone:
+147 runs, a mean run of 219/147 = 1.49. Research/06 §V cites the same experiment as "~0.4% loss in
+bursts", the figure the owner chose for the relay's loss.
+
 ## Decisions
 
 **Operations: everything a client asks of an object, through both doors.** PUT whole and streamed
@@ -204,7 +214,15 @@ accounted as completed, failed with its reason, or excluded with its reason [9].
 
 **Conditions.** Quiet; busy loops at one and two times the cores; one and two CPUs; the node's
 memory floor as a cgroup limit; and, for the native door, the 500 ms one-way relay with loss and
-reordering [19], its overhead above physics reported [12]. One and two CPUs and a busy loop a core
+reordering [19], its overhead above physics reported [12]. The relay (`src/relay.rs`, `mantle bench
+doors --relay`) holds each datagram, either way, for `500 ms − 100 ms + U[0, 200 ms]`, each drawn
+alone, so one may arrive before one sent earlier: focal-sim's `Path::reordering` at its
+`GEOGRAPHIC` profile [19]. It loses datagrams by a two-state Gilbert–Elliott chain on each
+direction of each link, its bad state losing all it carries, entered with probability 147/60,270 a
+datagram and left with 147/219, so its loss is the trace's 219/60,489 and its mean run the trace's
+219/147 [24]; the trace sampled its path every 30 s, so a run applied a datagram at a time is the
+model's step, not the trace's measure. The relay's lateness past each datagram's due time is said
+beside the phases, so its cost is not the stack's [12]. One and two CPUs and a busy loop a core
 are CI's small hosts [21], twice the cores the plan's harder load [23], and the floor the one
 `mantle serve` derives class by class [22]. A busy host is the norm and never blamed [23].
 

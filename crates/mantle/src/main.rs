@@ -38,6 +38,7 @@ mod journal;
 mod pack;
 mod principals;
 mod profile;
+mod relay;
 mod s3_code;
 mod transfer;
 
@@ -700,6 +701,11 @@ enum BenchCommand {
         /// put before it made, so it is asked beside that put.
         #[arg(long, value_delimiter = ',', value_parser = bench_doors::kind_arg)]
         kinds: Vec<bench_doors::Kind>,
+        /// The native door's clients reach the nodes through the relay condition's path: each
+        /// datagram held 500 ± 100 ms one way, reordered, and lost as a measured intercontinental
+        /// path lost them (src/relay.rs; docs/research/70, "Conditions"). Only the native door runs.
+        #[arg(long)]
+        relay: bool,
     },
 }
 
@@ -1394,6 +1400,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         perf,
         smoke,
         kinds,
+        relay,
     } = command
     else {
         return Err("not mantle bench doors".to_owned());
@@ -1449,6 +1456,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         endpoint,
         perf,
         kinds,
+        relay,
     })
 }
 

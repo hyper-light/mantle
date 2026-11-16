@@ -341,7 +341,9 @@ stock clients stay the correctness suite.
   its reason (70 [9]).
 - **Conditions**: quiet; busy loops at one and two times the cores; one and two CPUs; the node's
   memory floor as a cgroup limit; and for the native door the 500 ms one-way relay with loss and
-  reordering, the owner's condition, its overhead above physics reported; one and two CPUs and a
+  reordering, the owner's condition, its overhead above physics reported (`mantle bench doors
+  --relay`: 500 ± 100 ms one way, each datagram drawn alone, lost by a Gilbert–Elliott chain fitted
+  to a measured Switzerland–Japan path's 0.36% in runs of 1.49; research/70); one and two CPUs and a
   busy loop a core as CI's small hosts, twice the cores the plan's harder load, the floor the one
   `mantle serve` derives (70 [12][19][21][22][23]).
 - **Machines**: the box (CPUSET 8-15, one die's eight cores without their SMT siblings, under a

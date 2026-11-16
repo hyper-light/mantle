@@ -248,17 +248,17 @@ until it woke; the E2E test of a sleeping node found exactly that.
   forgotten; a cell of five losing two volumes at once, and then more than a block's code spares,
   saying exactly how many blocks it lost and refusing their objects through both doors; a node
   stopped (SIGSTOP) as long as the cell takes to judge it and plan every block, waited for and
-  written around, then woken; a node killed past a stated repair time, judged gone (membership.md
-  §5): its chunks rebuilt, nothing kept on its volumes, which are written off and forgotten, and
-  its identity refused once it starts again; a fifth founder joining mid-write and taking new
-  blocks; a node leaving mid-write, drained, retired and forgotten, then ending well once refused;
-  and a node leaving a cell of three, its chunks doubled onto the two domains left, spread onto a
-  fourth founder that joins, then ending well. After
-  each, every acknowledged object reads back byte-exact through both doors and every node, and
-  every block's places are read from their volumes and checked against its CRC-32C. They found the
-  scheme chosen over machines asleep (§5), a block counted once for each lost volume it had a place
-  on, and the root range's answers to retiring never taken, which kept a leave from completing and
-  the service turning at once forever.
+  written around, then woken, its return recorded at every node before reads go through it; a
+  node killed and stated gone (membership.md §5): its chunks rebuilt, nothing kept on its volumes,
+  which are written off and forgotten, and its identity refused once it starts again; a fifth
+  founder joining mid-write and taking new blocks; a node leaving mid-write, drained, retired and
+  forgotten, then ending well once refused; and a node leaving a cell of three, its chunks doubled
+  onto the two domains left, spread onto a fourth founder that joins, the node that left ending
+  well before the join or after. After each, every acknowledged object reads back byte-exact
+  through both doors and every node, and every block's places are read from their volumes and
+  checked against its CRC-32C. They found the scheme chosen over machines asleep (§5), a block
+  counted once for each lost volume it had a place on, and the root range's answers to retiring
+  never taken, which kept a leave from completing and the service turning at once forever.
 
 As built (2026-11-15): the simulation passes 2,000 schedules a run, and 20,000 in one run on Linux
 x86_64; the six end-to-end tests pass on macOS arm64 and Linux x86_64, every scenario in each of
@@ -266,9 +266,13 @@ three runs of the final code but the leaving node's once, stopped on macOS befor
 harness's wait for the cell's links to be judged.
 
 Merged with membership (2026-11-16): a member away past `1/ρ` is judged gone (membership.md §5,
-the point its §8 leaves to settle), so a place an absence left is kept only until then, and the
-killed node's test asserts the judgment rather than its places counted again; the leaving nodes'
-tests wait for their ends, which membership's leave now makes (membership.md §4 step 5).
+the point its §8 leaves to settle), so a place an absence left is kept only until then. The killed
+node's test, which stated a repair in a second and waited for the node's places to count again on
+its return, now states the node gone: under six cells at once on one machine a repair time that
+short judged a running node gone as well, its absence recorded past it, so it was refused at every
+peer and its requests answered `503 SlowDown`; the judgment by time is `members::gone_by`'s unit
+test. The leaving nodes' tests wait for their ends, which membership's leave now makes
+(membership.md §4 step 5).
 
 ## 8. Open
 

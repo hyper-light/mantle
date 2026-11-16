@@ -2,14 +2,14 @@
 //! real disks (docs/design/repair.md §7): cells of three and of five `mantle init` makes, objects put
 //! through the S3 listener and the native door, and then volumes lost while objects are written and
 //! at rest, a node held still (SIGSTOP, or on Windows each thread suspended) for a long stretch and
-//! brought back, a node killed (SIGKILL) past the repair time and judged gone, a node joining and a
-//! node leaving while objects are written, a node leaving a cell narrower than its blocks and
-//! another joining, and more volumes lost at once than a block's code spares. After each: every
-//! acknowledged object reads back byte-exact through both doors and every node; every block's
-//! places, read from the Block range and the volume table as a gateway reads them, each hold their
-//! chunk on disk, read from its volume and checked against the block's CRC-32C; and what the cell
-//! cannot rebuild it says, typed, never answering with bytes it does not hold. Every wait is on a
-//! fact a node says (`repair`, `enlisted`, `leaving`, `link` lines), never a clock.
+//! brought back, a node killed (SIGKILL) and stated gone, a node joining and a node leaving while
+//! objects are written, a node leaving a cell narrower than its blocks and another joining, and
+//! more volumes lost at once than a block's code spares. After each: every acknowledged object
+//! reads back byte-exact through both doors and every node; every block's places, read from the
+//! Block range and the volume table as a gateway reads them, each hold their chunk on disk, read
+//! from its volume and checked against the block's CRC-32C; and what the cell cannot rebuild it
+//! says, typed, never answering with bytes it does not hold. Every wait is on a fact a node says
+//! (`repair`, `enlisted`, `leaving`, `standing`, `gone`, `link` lines), never a clock.
 //!
 //! A binary of its own (crates/mantle/tests/support/cell.rs's harness, support/s3.rs's client).
 
@@ -760,6 +760,16 @@ fn a_node_asleep_is_waited_for_and_writes_go_around_it() {
     objects.extend(during);
     read_back_through(&mut cell, &ids[..4], "b", &objects);
     hold::go_on(cell.running[&asleep].child.id());
+    // Back: its return recorded by every node, itself among them, as each applies the root range's
+    // record of it (membership.md §5), so each reads through it and it through each again.
+    cell.until(|c| {
+        let back = ids.iter().all(|o| {
+            c.standings
+                .get(&(*o, asleep))
+                .is_some_and(|(_, since)| *since == 0)
+        });
+        if back { Some(()) } else { None }
+    });
     let woke = settled(&mut cell, |r| r.waiting == 0 && r.short == 0);
     assert_eq!(woke.rebuilt, woke.timing, "{woke:?}");
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
@@ -767,19 +777,18 @@ fn a_node_asleep_is_waited_for_and_writes_go_around_it() {
     whole_on_disk(&mut cell, g, "b", &keys);
 }
 
-/// A node killed (SIGKILL) for longer than the cell's stated time for a repair: the root range's
-/// leader judges it gone (membership.md §5), every volume of it gone with it, so its chunks are
-/// rebuilt on the others, no place on its volumes is kept, and the table forgets them; started
-/// again on its volume, its identity is refused at every node. A node that joins while objects are
-/// written is enlisted and offered new blocks, every object reading back and every block whole.
+/// A node killed (SIGKILL) and stated gone, as a supervisor states a machine it knows dead
+/// (membership.md §5): every volume of it gone with it, so its chunks are rebuilt on the others, no
+/// place on its volumes is kept, and the table forgets them; started again on its volume, its
+/// identity is refused at every node. A node that joins while objects are written is enlisted and
+/// offered new blocks, every object reading back and every block whole. The cell's own judgment, a
+/// member gone once absent past the durability model's repair time, is `members::gone_by`'s and
+/// tested there: a repair time a test waits out is one a node of a host held that long passes while
+/// it runs, judged gone as well.
 #[test]
-fn a_node_gone_past_the_repair_time_is_written_off_and_refused_and_a_joiner_takes_new_blocks() {
-    // A repair in a second (3,600 an hour): the cell does not wait a day. Two volumes a node, so a
-    // chunk of the killed node has a volume to be rebuilt on.
-    let mut cell = Cell::made_partly(
-        |root| founders(root, 5, 2, "durability.repair_rate = 3600\n"),
-        4,
-    );
+fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks() {
+    // Two volumes a node, so a chunk of the gone node has a volume to be rebuilt on.
+    let mut cell = Cell::made_partly(|root| founders(root, 5, 2, ""), 4);
     let g = groups(&cell);
     ready(&mut cell, "b");
     let mut objects = put_objects(&mut cell, "b", "before", &SIZES, 7);
@@ -792,7 +801,11 @@ fn a_node_gone_past_the_repair_time_is_written_off_and_refused_and_a_joiner_take
         .collect();
     let theirs = volumes_of(&mut cell, g, gone);
     cell.kill(gone);
-    // Gone, its volumes are written off with it and, once no block names them, forgotten.
+    // Stated gone on a member's standard input: its volumes written off with it and, once no block
+    // names them, forgotten.
+    cell.say_to(others[0], format!("gone {gone}\n").as_bytes());
+    let said = cell.until(|c| c.gone.get(&gone).cloned());
+    assert!(said.contains("Gone"), "gone {gone}: {said}");
     forgotten(&mut cell, g, gone);
     let rebuilt = settled(&mut cell, |r| {
         r.waiting == 0 && r.short == 0 && r.rebuilt > 0
@@ -900,9 +913,8 @@ fn a_node_leaving_mid_write_moves_everything_off_and_is_forgotten() {
 /// with two domains left that take chunks, each chunk of a block as wide as the cell it held moves
 /// onto the other volume of a domain holding one of its block's already. Once the fourth joins, the
 /// domain rule moves one of each such pair onto it, and every block's chunks are on distinct nodes.
-/// The node that left keeps running while it still votes in the ranges, whose quorums of the
-/// founders the fourth, not yet started, does not help make; once the fourth has joined it finishes
-/// leaving and ends well.
+/// The node that left ends well once the cell has removed it, before the fourth joins or after, as
+/// its ranges' quorums let them drop its vote.
 #[test]
 fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     let mut cell = Cell::made_partly(|root| founders(root, 4, 2, ""), 3);
@@ -911,9 +923,10 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     let mut objects = put_objects(&mut cell, "b", "before", &SIZES, 12);
     let leaving = follower(&cell);
     leave(&mut cell, leaving);
-    // Its end is the leave's last step (membership.md §4 step 5): once the fourth founder has
-    // joined, the ranges drop it, the root range removes and delists it, its peers refuse it and it
-    // ends; until then it votes on. Taken as expected from here, and waited for at the end.
+    // Its end is the leave's last step (membership.md §4 step 5): the ranges drop it, the root range
+    // removes and delists it, its peers refuse it and it ends, whether or not the fourth founder has
+    // joined by then (of the three voters left, the two running make a quorum). Taken as expected
+    // from here, and waited for at the end.
     cell.refusing = Some(leaving);
     forgotten(&mut cell, g, leaving);
     let keys: Vec<String> = objects.keys().cloned().collect();
@@ -939,17 +952,22 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
         doubled, wide,
         "every block of three over two domains doubles one"
     );
+    // The founder never started: the node that left, ended, runs no more either.
     let joining = *cell
         .made
         .keys()
-        .find(|id| !cell.running.contains_key(id))
+        .find(|id| !cell.running.contains_key(id) && **id != leaving)
         .unwrap();
     cell.start(joining);
     cell.introduce();
     cell.enlisted(joining);
     let mark = root_commit(&cell);
-    settled_after(&mut cell, mark, |r| r.waiting == 0 && r.short == 0);
-    assert_eq!(spread(&mut cell).1, 0, "a block still doubles a domain");
+    let at = settled_after(&mut cell, mark, |r| r.waiting == 0 && r.short == 0);
+    assert_eq!(
+        spread(&mut cell).1,
+        0,
+        "a block still doubles a domain, the pass settled as {at:?}"
+    );
     objects.extend(put_objects(&mut cell, "b", "after", &SIZES, 13));
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let keys: Vec<String> = objects.keys().cloned().collect();

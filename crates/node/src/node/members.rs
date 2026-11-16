@@ -549,3 +549,34 @@ impl Remote {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A presence as the root range keeps it: `present`, or away, since `since_ns`.
+    fn presence(present: bool, since_ns: u64) -> Presence {
+        Presence {
+            present,
+            since_ns,
+            present_ns: 0,
+            away_ns: 0,
+            absences: 0,
+            longest_away_ns: 0,
+        }
+    }
+
+    /// A member is judged gone once its recorded absence passes the durability model's mean repair
+    /// time, and not at it (membership.md §5); a member seen is not, however long ago its presence
+    /// was recorded; a cell that states no model judges none by time; and an absence recorded past
+    /// the judging leader's clock, a leader whose clock is behind the entry's, is none yet.
+    #[test]
+    fn a_member_is_judged_gone_once_its_absence_passes_the_repair_time_and_not_before() {
+        let repair = Some(1_000);
+        assert!(!gone_by(&presence(false, 100), 1_100, repair));
+        assert!(gone_by(&presence(false, 100), 1_101, repair));
+        assert!(!gone_by(&presence(true, 100), u64::MAX, repair));
+        assert!(!gone_by(&presence(false, 100), u64::MAX, None));
+        assert!(!gone_by(&presence(false, 2_000), 1_500, repair));
+    }
+}

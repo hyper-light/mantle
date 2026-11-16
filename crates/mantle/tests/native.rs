@@ -1221,7 +1221,7 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
 
 /// Two nodes of three SIGKILLed while a copy's third run streams through the first: the ranges
 /// have lost their quorum, so the cell commits nothing more, and the copy ends `SlowDown`, its
-/// journal keeping the upload and the cell its two runs. (One node of three gone, the cell writes
+/// journal keeping the upload and the cell its two runs, read once the nodes are back. (One node of three gone, the cell writes
 /// around it, new blocks taking the scheme the two left meet the target with: docs/design/repair.md
 /// §5.) Once the nodes are back, their volumes enlisted and every range caught up on them, the copy
 /// run again resumes from the cell's offset, no committed run sent again, its object the bytes
@@ -1252,7 +1252,6 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
         !done && said.iter().any(|l| l.ends_with("the upload: SlowDown")),
         "{out}{said:?}"
     );
-    assert_eq!(runs_held(&dir, "node"), [run as u64; 2]);
     // Back on ports of their own (node.md §1.7): their peers and the client are told where, their
     // volumes enlist again, and every range catches up on them, so the cell places blocks again.
     let groups: std::collections::BTreeSet<u128> =
@@ -1268,6 +1267,9 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
         cell.converged(*group);
     }
     point_at(&dir, &cell.bound_quic());
+    // The cell kept the upload's two runs through its lost quorum: read once it answers again, as
+    // nothing could answer while two of its three nodes were gone.
+    assert_eq!(runs_held(&dir, "node"), [run as u64; 2]);
     let mut again = Copying::start(&dir, "node", size);
     again.write(&object);
     let (done, out, said) = again.finish(&mut cell);

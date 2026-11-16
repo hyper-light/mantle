@@ -1686,115 +1686,51 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
     });
     library.join().unwrap();
 
-    let said = |out: Vec<u8>| String::from_utf8(out).unwrap();
+    // The command line through each door (docs/design/doors.md), the S3 door at the first node's
+    // listener as the client's profile names it: what each says of the same objects is the same.
     let root = cell.out().parent().unwrap().to_path_buf();
-    mantle(&dir, &["mb", "s3://cli89"], None);
-    // Past 5 MiB, so a range of it may be copied (research/89 §4.1).
+    let first = *cell.s3_bound.keys().next().unwrap();
+    let (at, _) = cell.s3_bound[&first];
+    let (_, region, _) = &cell.s3[&first];
+    std::fs::write(
+        dir.join("s3").join("config"),
+        format!(
+            "[profile mantle]\nregion = {region}\nendpoint_url = http://{at}\ns3 =\n  addressing_style = path\n"
+        ),
+    )
+    .unwrap();
     let object = bytes(70, (6 << 20) + 9);
     let file = root.join("blob89.bin");
     std::fs::write(&file, &object).unwrap();
-    let file_text = file.display().to_string();
-    mantle(
-        &dir,
-        &[
-            "cp",
-            &file_text,
-            "s3://cli89/blob",
-            "--content-type",
-            "application/vnd.oci.image.layer.v1.tar+zstd",
-            "--cache-control",
-            "immutable",
-            "--metadata",
-            "digest=sha256:cafe",
-            "--metadata",
-            "Kind=layer",
-        ],
-        None,
-    );
-    let head = said(mantle(&dir, &["head", "s3://cli89/blob"], None));
-    for line in [
-        "cache-control immutable",
-        "content-type application/vnd.oci.image.layer.v1.tar+zstd",
-        "x-amz-meta-digest sha256:cafe",
-        "x-amz-meta-kind layer",
-    ] {
-        assert!(head.lines().any(|l| l == line), "{line}: {head}");
+    for door in ["native", "s3"] {
+        research_89_by_the_command_line(&dir, door, &file, &object);
     }
-    // A copy within the cell keeps the source's metadata; under REPLACE it takes the command's.
-    let copied = said(mantle(
-        &dir,
-        &["cp", "s3://cli89/blob", "s3://cli89/copy"],
-        None,
-    ));
-    assert!(copied.contains("-> s3://cli89/copy"), "{copied}");
-    let out = mantle(&dir, &["cp", "s3://cli89/copy", "-"], None);
-    assert!(out == object, "the copy's bytes");
-    let head = said(mantle(&dir, &["head", "s3://cli89/copy"], None));
-    assert!(
-        head.lines().any(|l| l == "x-amz-meta-digest sha256:cafe"),
-        "{head}"
+    let through =
+        |door: &str, args: &[&str]| said(mantle(&dir, &[&["--door", door], args].concat(), None));
+    for key in ["blob", "copy", "replaced", "parts"] {
+        let heads: Vec<String> = ["native", "s3"]
+            .iter()
+            .map(|door| through(door, &["head", &format!("s3://cli89-native/{key}")]))
+            .collect();
+        assert_eq!(
+            heads[0], heads[1],
+            "head of {key}: the native door, then the S3 door"
+        );
+    }
+    // Versions of the library's bucket: listed alike, one read and one removed by its ID through
+    // the S3 door, and gone from the native door's listing.
+    let versions = through("native", &["ls", "--versions", "s3://kept/blob"]);
+    assert_eq!(
+        versions,
+        through("s3", &["ls", "--versions", "s3://kept/blob"])
     );
-    mantle(
-        &dir,
-        &[
-            "cp",
-            "s3://cli89/blob",
-            "s3://cli89/replaced",
-            "--content-type",
-            "text/plain",
-        ],
-        None,
-    );
-    let head = said(mantle(&dir, &["head", "s3://cli89/replaced"], None));
-    assert!(
-        head.lines().any(|l| l == "content-type text/plain"),
-        "{head}"
-    );
-    assert!(!head.contains("x-amz-meta-digest"), "{head}");
-    // A part copy by the command line.
-    let upload = said(mantle(
-        &dir,
-        &["multipart", "create", "s3://cli89/parts"],
-        None,
-    ));
-    let upload = upload.trim();
-    let part = said(mantle(
-        &dir,
-        &[
-            "multipart",
-            "copy",
-            "s3://cli89/parts",
-            upload,
-            "1",
-            "s3://cli89/blob",
-            "--range",
-            "0-99",
-        ],
-        None,
-    ));
-    let tag = part.split_whitespace().nth(1).unwrap().to_owned();
-    mantle(
-        &dir,
-        &[
-            "multipart",
-            "complete",
-            "s3://cli89/parts",
-            upload,
-            &format!("1={tag}"),
-        ],
-        None,
-    );
-    let out = mantle(&dir, &["cp", "s3://cli89/parts", "-"], None);
-    assert!(out == object[..100], "the part copy's bytes");
-    // Versions of the library's bucket: listed, one read and one removed by its ID.
-    let versions = said(mantle(&dir, &["ls", "--versions", "s3://kept/blob"], None));
     let lines: Vec<&str> = versions.lines().collect();
     assert_eq!(
         lines.len(),
         2,
         "the marker the library made and the first version: {versions}"
     );
-    let first = lines
+    let version = lines
         .iter()
         .find(|l| l.contains(" object "))
         .unwrap()
@@ -1802,33 +1738,146 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
         .nth(2)
         .unwrap()
         .to_owned();
-    let out = mantle(
-        &dir,
-        &["cp", "s3://kept/blob", "-", "--version-id", &first],
-        None,
-    );
-    assert!(out == bytes(60, 6 << 20), "the first version by its ID");
-    mantle(
-        &dir,
-        &["rm", "s3://kept/blob", "--version-id", &first],
-        None,
-    );
-    let versions = said(mantle(&dir, &["ls", "--versions", "s3://kept/blob"], None));
-    assert!(!versions.contains(&first), "{versions}");
-    // Several removed in one DeleteObjects, a missing one among them.
-    let removed = said(mantle(
-        &dir,
-        &[
-            "rm",
-            "s3://cli89/blob",
-            "s3://cli89/copy",
-            "s3://cli89/never",
-        ],
-        None,
-    ));
-    assert_eq!(removed.lines().count(), 3, "{removed}");
-    for key in ["blob", "copy"] {
-        let (found, _, _) = mantle_status(&dir, &["head", &format!("s3://cli89/{key}")], None);
-        assert!(!found, "{key} removed");
+    for door in ["native", "s3"] {
+        let out = mantle(
+            &dir,
+            &[
+                "--door",
+                door,
+                "cp",
+                "s3://kept/blob",
+                "-",
+                "--version-id",
+                &version,
+            ],
+            None,
+        );
+        assert!(
+            out == bytes(60, 6 << 20),
+            "the first version by its ID through {door}"
+        );
     }
+    let removed = through("s3", &["rm", "s3://kept/blob", "--version-id", &version]);
+    assert_eq!(
+        removed.trim(),
+        format!("removed s3://kept/blob version {version}")
+    );
+    let versions = through("native", &["ls", "--versions", "s3://kept/blob"]);
+    assert!(!versions.contains(&version), "{versions}");
+    // Several removed in one DeleteObjects through each door, a missing one among them, said
+    // alike.
+    let removals: Vec<String> = ["native", "s3"]
+        .iter()
+        .map(|door| {
+            let bucket = format!("s3://cli89-{door}");
+            through(
+                door,
+                &[
+                    "rm",
+                    &format!("{bucket}/blob"),
+                    &format!("{bucket}/copy"),
+                    &format!("{bucket}/never"),
+                ],
+            )
+            .replace(&bucket, "s3://B")
+        })
+        .collect();
+    assert_eq!(
+        removals[0], removals[1],
+        "the native door, then the S3 door"
+    );
+    assert_eq!(removals[0].lines().count(), 3, "{}", removals[0]);
+    for door in ["native", "s3"] {
+        for key in ["blob", "copy"] {
+            let (found, _, _) =
+                mantle_status(&dir, &["head", &format!("s3://cli89-{door}/{key}")], None);
+            assert!(!found, "{door}'s {key} removed");
+        }
+    }
+}
+
+fn said(out: Vec<u8>) -> String {
+    String::from_utf8(out).unwrap()
+}
+
+/// Research/89's object commands through `door` into the bucket `cli89-DOOR`: a file's copy with
+/// its content headers and user-defined metadata, headed; a copy within the cell that keeps them,
+/// and one that replaces them; a part copied by the cell from a range of an object.
+fn research_89_by_the_command_line(dir: &Path, door: &str, file: &Path, object: &[u8]) {
+    let bucket = format!("s3://cli89-{door}");
+    let at = |key: &str| format!("{bucket}/{key}");
+    let through = |args: &[&str]| said(mantle(dir, &[&["--door", door], args].concat(), None));
+    assert_eq!(through(&["mb", &bucket]).trim(), format!("made {bucket}"));
+    let file_text = file.display().to_string();
+    through(&[
+        "cp",
+        &file_text,
+        &at("blob"),
+        "--content-type",
+        "application/vnd.oci.image.layer.v1.tar+zstd",
+        "--cache-control",
+        "immutable",
+        "--metadata",
+        "digest=sha256:cafe",
+        "--metadata",
+        "Kind=layer",
+    ]);
+    let head = through(&["head", &at("blob")]);
+    for line in [
+        "cache-control immutable",
+        "content-type application/vnd.oci.image.layer.v1.tar+zstd",
+        "x-amz-meta-digest sha256:cafe",
+        "x-amz-meta-kind layer",
+    ] {
+        assert!(head.lines().any(|l| l == line), "{door}: {line}: {head}");
+    }
+    // A copy within the cell keeps the source's metadata; under REPLACE it takes the command's.
+    let copied = through(&["cp", &at("blob"), &at("copy")]);
+    assert!(
+        copied.contains(&format!("-> {}", at("copy"))),
+        "{door}: {copied}"
+    );
+    let out = mantle(dir, &["--door", door, "cp", &at("copy"), "-"], None);
+    assert!(out == object, "{door}: the copy's bytes");
+    let head = through(&["head", &at("copy")]);
+    assert!(
+        head.lines().any(|l| l == "x-amz-meta-digest sha256:cafe"),
+        "{door}: {head}"
+    );
+    through(&[
+        "cp",
+        &at("blob"),
+        &at("replaced"),
+        "--content-type",
+        "text/plain",
+    ]);
+    let head = through(&["head", &at("replaced")]);
+    assert!(
+        head.lines().any(|l| l == "content-type text/plain"),
+        "{door}: {head}"
+    );
+    assert!(!head.contains("x-amz-meta-digest"), "{door}: {head}");
+    // A part copy by the command line.
+    let upload = through(&["multipart", "create", &at("parts")]);
+    let upload = upload.trim();
+    let part = through(&[
+        "multipart",
+        "copy",
+        &at("parts"),
+        upload,
+        "1",
+        &at("blob"),
+        "--range",
+        "0-99",
+    ]);
+    let tag = part.split_whitespace().nth(1).unwrap().to_owned();
+    through(&[
+        "multipart",
+        "complete",
+        &at("parts"),
+        upload,
+        &format!("1={tag}"),
+    ]);
+    let out = mantle(dir, &["--door", door, "cp", &at("parts"), "-"], None);
+    assert!(out == object[..100], "{door}: the part copy's bytes");
 }

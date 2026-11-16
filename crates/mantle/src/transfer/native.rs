@@ -14,6 +14,8 @@ pub struct Made<'o, 'g> {
     object: &'o Object<'g>,
     at: u64,
     length: u64,
+    /// Where it gives its bytes from, and from again.
+    from: u64,
 }
 
 impl<'o, 'g> Made<'o, 'g> {
@@ -22,6 +24,7 @@ impl<'o, 'g> Made<'o, 'g> {
             object,
             at: 0,
             length,
+            from: 0,
         }
     }
 
@@ -31,6 +34,7 @@ impl<'o, 'g> Made<'o, 'g> {
             object,
             at: from,
             length: to,
+            from,
         }
     }
 }
@@ -49,6 +53,11 @@ impl Source for Made<'_, '_> {
             .at
             .saturating_add(u64::try_from(n).map_err(|_| io(GenError::Offset))?);
         Ok(n)
+    }
+
+    async fn again(&mut self) -> std::io::Result<bool> {
+        self.at = self.from;
+        Ok(true)
     }
 }
 

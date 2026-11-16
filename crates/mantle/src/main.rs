@@ -29,6 +29,7 @@ mod bench_s3;
 mod client;
 mod disk;
 mod display;
+mod door;
 mod drive;
 mod durability;
 mod files;
@@ -36,6 +37,8 @@ mod init;
 mod journal;
 mod pack;
 mod principals;
+mod profile;
+mod s3_code;
 mod transfer;
 
 // The allocation counts of `mantle serve`'s `counts` and of `mantle bench doors` are a diagnostic:
@@ -59,6 +62,11 @@ struct Cli {
     /// cell as; `MANTLE_CLIENT` where none is given.
     #[arg(long, global = true)]
     client: Option<PathBuf>,
+    /// The door the object commands ask the cell through: `native`, its own protocol over QUIC,
+    /// or `s3`, S3's HTTP API at the endpoint the client's S3 profile names; `MANTLE_DOOR` where
+    /// none is given, else `native` (docs/design/doors.md).
+    #[arg(long, global = true)]
+    door: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1061,7 +1069,26 @@ fn main() -> ExitCode {
                 .clone()
                 .or_else(|| std::env::var_os("MANTLE_CLIENT").map(PathBuf::from))
                 .ok_or_else(|| "no client: --client DIR or MANTLE_CLIENT".to_owned())?;
-            client::run(&dir, command, std::io::stdout()).map_err(|e| e.to_string())
+            // The command line over the environment, as the AWS CLI's own settings rank
+            // (docs/research/86 [1]).
+            let named = match &cli.door {
+                Some(text) => Some((text.clone(), "--door")),
+                None => match std::env::var_os("MANTLE_DOOR") {
+                    Some(value) => Some((
+                        value.into_string().map_err(|value| {
+                            format!("MANTLE_DOOR {}: native or s3", value.to_string_lossy())
+                        })?,
+                        "MANTLE_DOOR",
+                    )),
+                    None => None,
+                },
+            };
+            let door = match named {
+                None => client::Door::Native,
+                Some((text, from)) => client::Door::named(&text)
+                    .ok_or_else(|| format!("{from} {text}: native or s3"))?,
+            };
+            client::run(&dir, door, command, std::io::stdout()).map_err(|e| e.to_string())
         });
         return exit(ran);
     }

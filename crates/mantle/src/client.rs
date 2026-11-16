@@ -47,11 +47,12 @@ use mantle_protocol::object::{
 use mantle_s3::copy::{Directive, Source as CopySource};
 
 use crate::journal::{Journal, JournalError, Origin, Record};
+use crate::s3_code::Code;
 use mantle_s3::checksum::{Algorithm, Hasher};
 
 /// The blocking pool's share a file's reads and writes run in, one at a time: an operation moves
 /// one piece at a time.
-const FILES: &str = "files";
+pub(crate) const FILES: &str = "files";
 
 /// The run a copy from standard input holds, its source read once: the AWS CLI's default
 /// `multipart_chunksize` and `multipart_threshold` of 8 MB, a megabyte 1024² octets to it (AWS CLI
@@ -182,6 +183,18 @@ pub enum Error {
     Runtime(String),
     Output(std::io::Error),
     Journal(JournalError),
+    /// The S3 door answered an error: what was asked, S3's code and its message.
+    S3(String, Code, String),
+    /// The S3 door answered an error whose code S3 does not name: what was asked, the code as it
+    /// came and its message.
+    UnlistedCode(String, String, String),
+    /// The S3 door answered an error with no body to name its code, as a HEAD's response is
+    /// (RFC 9110 §9.3.2): what was asked, and the status.
+    Status(String, u16),
+    /// The S3 door's connection, TLS or HTTP: what failed.
+    Http(String),
+    /// Bytes that are not what their checksum, or the length stated of them, says.
+    Corrupt(String),
 }
 
 impl From<JournalError> for Error {
@@ -201,6 +214,18 @@ impl fmt::Display for Error {
             Self::Runtime(why) => write!(f, "the runtime: {why}"),
             Self::Output(e) => write!(f, "writing output: {e}"),
             Self::Journal(e) => write!(f, "the journal: {e}"),
+            Self::S3(what, code, message) => write!(f, "{what}: {code}: {message}"),
+            Self::UnlistedCode(what, code, message) => {
+                write!(f, "{what}: {code}, a code S3 does not name: {message}")
+            }
+            Self::Status(what, status) => {
+                write!(
+                    f,
+                    "{what}: {status}, an answer with no body to name its code"
+                )
+            }
+            Self::Http(why) => write!(f, "the S3 door: {why}"),
+            Self::Corrupt(what) => write!(f, "{what}: not the bytes their checksum says"),
         }
     }
 }
@@ -343,20 +368,67 @@ pub(crate) fn runtime_of(
     Ok(LocalRuntime::new(&config)?)
 }
 
-/// Runs `command` as the client of the directory `dir`, its lines to `out`.
-pub fn run(dir: &Path, command: Command, mut out: impl Write + 'static) -> Result<(), Error> {
-    let configured = configured(dir)?;
-    let mut rt = runtime(&configured.dir, configured.nodes.len(), 1)?;
-    // A file's reads and writes, and a named node's lookup when it cannot be reached
-    // (`mantle_client::Settings::names`): one place each, and a worker each, so neither waits on
-    // the other.
+/// The door the object commands ask the cell through, as its operator chooses it: `--door`,
+/// else `MANTLE_DOOR`, else the native one, which every client's directory names (docs/research/86
+/// [1]). A command never moves to the other door on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Door {
+    /// The native protocol over QUIC, as the client's certificate (`mantle init client`).
+    Native,
+    /// S3's HTTP API, SigV4-signed with the cell's key, at the endpoint the client's S3 profile
+    /// names (src/door.rs).
+    S3,
+}
+
+impl Door {
+    /// The door `text` names: `native` or `s3`.
+    pub fn named(text: &str) -> Option<Self> {
+        match text {
+            "native" => Some(Self::Native),
+            "s3" => Some(Self::S3),
+            _ => None,
+        }
+    }
+}
+
+/// Runs `command` as the client of the directory `dir` through `door`, its lines to `out`.
+pub fn run(
+    dir: &Path,
+    door: Door,
+    command: Command,
+    out: impl Write + 'static,
+) -> Result<(), Error> {
+    match (door, command) {
+        // An account's principals are mantle's own requests, which S3's API does not carry (IAM
+        // is another service's): the native door asks them whichever door the object commands
+        // take.
+        (Door::S3, Command::Principals(principals)) => {
+            run_native(dir, Command::Principals(principals), out)
+        }
+        (Door::S3, command) => crate::door::run(dir, command, out),
+        (Door::Native, command) => run_native(dir, command, out),
+    }
+}
+
+/// Starts the blocking pool's workers a command's files and name lookups take: one place each,
+/// and a worker each, so neither waits on the other.
+pub(crate) fn start_blocking() -> Result<(), Error> {
     blocking::start(blocking::Config {
         workers: 2,
         shares: vec![
             blocking::Share::new(FILES, 1),
             blocking::Share::new(hyper_rt::dns::SHARE, 1),
         ],
-    })?;
+    })
+    .map_err(Error::from)
+}
+
+fn run_native(dir: &Path, command: Command, mut out: impl Write + 'static) -> Result<(), Error> {
+    let configured = configured(dir)?;
+    let mut rt = runtime(&configured.dir, configured.nodes.len(), 1)?;
+    // A file's reads and writes, and a named node's lookup when it cannot be reached
+    // (`mantle_client::Settings::names`).
+    start_blocking()?;
     let ran = rt
         .block_on(async move {
             let Configured {
@@ -410,6 +482,35 @@ pub(crate) fn line(out: &mut impl Write, text: std::fmt::Arguments<'_>) -> Resul
     out.write_all(b"\n").map_err(Error::Output)
 }
 
+/// A version's metadata as S3 serves it on a read (research/89 §1.1, §1.3), a line `NAME VALUE`
+/// each: each content header it keeps, `content-type` S3's `binary/octet-stream` where it keeps
+/// none, then each user-defined entry under its `x-amz-meta-` name, every value as S3 returns it.
+/// The S3 door reads only what is served, so `head` says this through either door.
+fn served(out: &mut impl Write, kept: &[(String, String)]) -> Result<(), Error> {
+    for name in mantle_s3::metadata::CONTENT {
+        let value = match mantle_s3::metadata::value(kept, name) {
+            Some(value) => Some(value),
+            None if name == "content-type" => Some(mantle_s3::metadata::DEFAULT_TYPE),
+            None => None,
+        };
+        if let Some(value) = value {
+            line(
+                out,
+                format_args!("{name} {}", mantle_s3::metadata::shown(value)),
+            )?;
+        }
+    }
+    for (name, value) in kept {
+        if name.starts_with(mantle_s3::metadata::USER) {
+            line(
+                out,
+                format_args!("{name} {}", mantle_s3::metadata::shown(value)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Whole seconds as ISO 8601, as S3's listings date.
 pub(crate) fn date(seconds: u64) -> String {
     i64::try_from(seconds)
@@ -458,13 +559,12 @@ async fn command_on(
             line(out, format_args!("size {}", reply.size))?;
             line(out, format_args!("etag \"{}\"", reply.etag))?;
             line(out, format_args!("modified {}", date(reply.modified)))?;
-            if !reply.version.is_empty() {
+            // An unversioned bucket's version is `null`, which S3 leaves unsaid (research/89
+            // §2.2), so the S3 door's `head` cannot say it.
+            if !reply.version.is_empty() && reply.version != "null" {
                 line(out, format_args!("version {}", reply.version))?;
             }
-            // Each content header and user-defined entry the version keeps, as it keeps it.
-            for (name, value) in &reply.metadata {
-                line(out, format_args!("{name} {value}"))?;
-            }
+            served(out, &reply.metadata)?;
             if let Some(kept) = &reply.checksum
                 && let Some(algorithm) = Algorithm::from_code(kept.algorithm)
             {
@@ -1310,9 +1410,7 @@ async fn get_to_file(
     at: (&Location, Option<String>),
     path: &Path,
 ) -> Result<(), Error> {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".part");
-    let temporary = PathBuf::from(name);
+    let temporary = temporary(path);
     let file = File::create(&temporary).map_err(|e| Error::File(temporary.clone(), e))?;
     let mut sink = FileSink::new(file);
     let got = get_object(client, at, &mut sink).await;
@@ -1320,11 +1418,24 @@ async fn get_to_file(
         Ok(()) => sink.finish().await,
         Err(e) => Err(e),
     };
+    placed(kept, &temporary, path)
+}
+
+/// Where a copy to the file at `path` is written first: beside it, its name and `.part`.
+pub(crate) fn temporary(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+/// The copy written and flushed at `temporary`, `kept`, put in its place: renamed over `path` and
+/// its directory flushed (CLAUDE.md §6); a copy that failed is removed and `path` left untouched.
+pub(crate) fn placed(kept: Result<(), Error>, temporary: &Path, path: &Path) -> Result<(), Error> {
     if let Err(e) = kept {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(temporary);
         return Err(e);
     }
-    std::fs::rename(&temporary, path).map_err(|e| Error::File(path.to_path_buf(), e))?;
+    std::fs::rename(temporary, path).map_err(|e| Error::File(path.to_path_buf(), e))?;
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
@@ -1337,7 +1448,7 @@ type Job = (File, Vec<u8>, std::io::Result<usize>);
 
 /// `left` bytes of a file from an offset, read a piece at a time on the blocking pool's worker. A
 /// read the client dropped leaves its job out, whose bytes the next read returns.
-struct FileSource {
+pub(crate) struct FileSource {
     path: PathBuf,
     /// The file and its piece, while no read is out.
     idle: Option<(File, Vec<u8>)>,
@@ -1348,11 +1459,13 @@ struct FileSource {
     left: u64,
     /// The bytes it reads at most, from its first offset: what a rewind counts from.
     size: u64,
+    /// Where it was opened at and the bytes it gave from there: where it gives its bytes again.
+    first: (u64, u64),
 }
 
 impl FileSource {
     /// The file at `path` from `offset`, `length` bytes of it or all past it.
-    fn open(path: &Path, offset: u64, length: Option<u64>) -> Result<Self, Error> {
+    pub(crate) fn open(path: &Path, offset: u64, length: Option<u64>) -> Result<Self, Error> {
         let fail = |e| Error::File(path.to_path_buf(), e);
         let mut file = File::open(path).map_err(fail)?;
         let size = file.metadata().map_err(fail)?.len();
@@ -1369,13 +1482,16 @@ impl FileSource {
             end: 0,
             left: length.unwrap_or_else(|| size.saturating_sub(offset)),
             size,
+            first: (
+                offset,
+                length.unwrap_or_else(|| size.saturating_sub(offset)),
+            ),
         })
     }
-}
 
-impl Rewind for FileSource {
-    /// Waits for a read out, which a dropped read left, then seeks: what it read is the past.
-    async fn rewind(&mut self, offset: u64) -> std::io::Result<()> {
+    /// Waits for a read out, which a dropped read left, then seeks to `offset`, `left` bytes to
+    /// give from there: what it read is the past.
+    async fn seek(&mut self, offset: u64, left: u64) -> std::io::Result<()> {
         if let Some(pending) = self.pending.as_mut() {
             let finished = pending.await;
             self.pending = None;
@@ -1388,12 +1504,24 @@ impl Rewind for FileSource {
         file.seek(SeekFrom::Start(offset))?;
         self.start = 0;
         self.end = 0;
-        self.left = self.size.saturating_sub(offset);
+        self.left = left;
         Ok(())
     }
 }
 
+impl Rewind for FileSource {
+    async fn rewind(&mut self, offset: u64) -> std::io::Result<()> {
+        self.seek(offset, self.size.saturating_sub(offset)).await
+    }
+}
+
 impl Source for FileSource {
+    /// From where it was opened, as many bytes as it gave from there.
+    async fn again(&mut self) -> std::io::Result<bool> {
+        let (offset, left) = self.first;
+        self.seek(offset, left).await.map(|()| true)
+    }
+
     async fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if self.start < self.end
@@ -1454,13 +1582,13 @@ impl Source for FileSource {
 /// A file written a piece at a time on the blocking pool's worker. A write the client dropped
 /// leaves its job out, which the write asked again with the same bytes awaits rather than writing
 /// them twice.
-struct FileSink {
+pub(crate) struct FileSink {
     idle: Option<(File, Vec<u8>)>,
     pending: Option<OneshotReceiver<Job>>,
 }
 
 impl FileSink {
-    fn new(file: File) -> Self {
+    pub(crate) fn new(file: File) -> Self {
         Self {
             idle: Some((file, Vec::new())),
             pending: None,
@@ -1469,7 +1597,7 @@ impl FileSink {
 
     /// Waits for a write out, then flushes the file to its device (`sync_data`: the platform's
     /// full flush, `F_FULLFSYNC` on macOS).
-    async fn finish(&mut self) -> Result<(), Error> {
+    pub(crate) async fn finish(&mut self) -> Result<(), Error> {
         self.settle()
             .await
             .map_err(|e| Error::File(PathBuf::from("-"), e))?;
@@ -1524,10 +1652,10 @@ impl Sink for FileSink {
 }
 
 /// Standard input, read on hyper-rt's reader thread, a piece a buffer.
-struct Stdin(hyper_rt::stdio::Stdin);
+pub(crate) struct Stdin(hyper_rt::stdio::Stdin);
 
 impl Stdin {
-    fn take() -> Result<Self, Error> {
+    pub(crate) fn take() -> Result<Self, Error> {
         Ok(Self(hyper_rt::stdio::stdin(2, mantle_client::PIECE)?))
     }
 }
@@ -1543,14 +1671,14 @@ impl Source for Stdin {
 
 /// Standard output, written on hyper-rt's writer thread, a piece a buffer: a write the client
 /// dropped took no buffer and wrote nothing.
-struct Stdout(hyper_rt::stdio::Stdout);
+pub(crate) struct Stdout(hyper_rt::stdio::Stdout);
 
 impl Stdout {
-    fn take() -> Result<Self, Error> {
+    pub(crate) fn take() -> Result<Self, Error> {
         Ok(Self(hyper_rt::stdio::stdout(2, mantle_client::PIECE)?))
     }
 
-    async fn flush(&mut self) -> Result<(), Error> {
+    pub(crate) async fn flush(&mut self) -> Result<(), Error> {
         self.0.flush().await.map_err(Error::from)
     }
 }

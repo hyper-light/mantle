@@ -14,6 +14,8 @@ use crate::display;
 pub enum Error {
     Output(std::io::Error),
     Disk(hyper_block::DiskError),
+    /// No volume can be laid out on the device as it is described.
+    Layout(String),
 }
 
 impl fmt::Display for Error {
@@ -21,6 +23,7 @@ impl fmt::Display for Error {
         match self {
             Self::Output(e) => write!(f, "writing output: {e}"),
             Self::Disk(e) => write!(f, "{e}"),
+            Self::Layout(e) => write!(f, "a volume's layout: {e}"),
         }
     }
 }
@@ -37,6 +40,25 @@ pub fn probe(out: &mut impl Write, path: &Path, measure: bool, verbose: bool) ->
     field(out, "disk", &disk(&id))?;
     field(out, "file system", &file_system(&id))?;
     field(out, "write cache", write_cache(&id))?;
+    // What a volume here is laid out in, as a node derives it at the volume's first start: an
+    // operator sizes a volume in its segments, past its superblocks and its index's log.
+    let (block, _, segment) =
+        mantle_node::derive::blocks(id.transfer_alignment(), mantle_gateway::layout::CHUNK)
+            .map_err(|e| Error::Layout(e.to_string()))?;
+    field(
+        out,
+        "block",
+        &format!("{block} bytes: a volume's here, the device's largest block and 4 KiB at least"),
+    )?;
+    field(
+        out,
+        "segment",
+        &format!(
+            "{segment} bytes: a volume's here, the least that holds the gateway's largest chunk, \
+             {} bytes, in one record",
+            mantle_gateway::layout::CHUNK
+        ),
+    )?;
     if let Some(zones) = zones(id.zoned, &id.file_system.kind) {
         field(out, "zones", zones)?;
     }

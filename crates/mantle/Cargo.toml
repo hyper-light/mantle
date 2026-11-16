@@ -52,6 +52,10 @@ mantle-client = { path = "../client" }
 mantle-protocol = { path = "../protocol" }
 mantle-s3 = { path = "../s3" }
 
+# The cell's S3 profile's endpoint authority, PEM, read back as DER (src/profile.rs), and a secret
+# signed with in `mantle init`'s tests.
+base64.workspace = true
+
 [features]
 # hyper-measure's counting allocator as the global allocator, so `mantle serve` answers `counts`
 # with its process's allocations and `mantle bench doors` counts its own: a diagnostic, off by
@@ -59,8 +63,6 @@ mantle-s3 = { path = "../s3" }
 count-allocs = []
 
 [dev-dependencies]
-# A secret signed with in `mantle init`'s tests, as base64, and its endpoint authority's PEM read back.
-base64.workspace = true
 # The real-process test of `mantle node` (tests/node.rs): the client's transport, the range's
 # settings the nodes are given, and the CRC-32C the gateway states for each chunk it puts.
 hyper-transport = { path = "../../vendor/hyper-transport" }

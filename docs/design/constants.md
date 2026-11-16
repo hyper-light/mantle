@@ -553,6 +553,21 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/mantle/src/bench_s3.rs` `SERVED` | derived | `1` | The connections the bench's listener serves: its one client's, one request at a time (`CONNECTIONS_DOOR`). |
 | `crates/mantle/src/client.rs` `NO_DEADLINE` | derived | `u64::MAX` | No deadline of the command's own: each wait is the transport's to bound, an exchange by its progress period, at most the stock S3 clients' patience (`crates/protocol/src/bounds.rs` `STOCK_PATIENCE`), and a dial by its handshake's idle timeout, and each ask by the client's attempts (`crates/client/src/lib.rs` `ATTEMPTS`). |
 | `crates/mantle/src/client.rs` `PART` | external | `8 << 20` | 8 MiB: the run a copy from standard input holds, its source read once, and so the run a stream of unstated length is cut into: the AWS CLI's default `multipart_chunksize` and `multipart_threshold` of `8MB` (AWS CLI S3 configuration reference; docs/research/73), its minimum for uploads `5MB`, S3's smallest part but the last; 10,000 such runs hold 80 GiB, as the AWS CLI's parts do. |
+| `crates/mantle/src/door.rs` `CONTENTS` | derived | `CONTENTS_TEXT + TAG + OWNER` | A `Contents` listing entry at its widest beside its key: `CONTENTS_TEXT`, its ETag (`TAG`) and its owner's name (`OWNER`), 894 octets, equal octet for octet to `crates/s3/src/response.rs`'s widest (`door.rs` test `the_entry_and_head_bounds_are_the_writers_own`). |
+| `crates/mantle/src/door.rs` `CONTENTS_TEXT` | format | `sha256:226596fde34fbadf` | The text `crates/s3/src/response.rs` writes for a `Contents` at its widest with its ETag, key and owner's name empty, 282 octets: the longest checksum algorithm's name (`CRC64NVME`, as long as `XXHASH128`; `crates/s3/src/checksum.rs` `Algorithm::name`) and type's (`FULL_OBJECT`, `ChecksumType::name`), the last time an S3 time holds (`timestamp`, years to 9999), `u64::MAX`'s twenty digits and `STANDARD`. |
+| `crates/mantle/src/door.rs` `DOCUMENT` | derived | `HEAD + mantle_s3::list::MAX_KEYS *(KEY + ENTRY)` | The most octets the S3 door keeps of a response's document: a listing page's, its head (`HEAD`) and 1,000 entries (`crates/s3/src/list.rs` `MAX_KEYS`), each a key at its widest (`KEY`) and the rest at most `ENTRY`: 8,183,436 octets. The widest ListObjectsV2, ListMultipartUploads, ListObjectVersions, ListParts and ListBuckets pages mantle's writer can write fit it, and a DeleteResult of 1,000 results each naming its delete marker, or each failing with a code and message as wide as a `Version`'s ETag, owner and ID (`door.rs` test `every_widest_page_fits_the_document_bound`); a larger document is refused, typed. |
+| `crates/mantle/src/door.rs` `ENTRY` | derived | `wider(wider(CONTENTS, UPLOAD), VERSION)` | The most octets a listing entry holds beside its key: the widest of `CONTENTS`, `UPLOAD` and `VERSION`, 1,965 octets, the `Version`; a common prefix's is less (`door.rs` test `the_entry_and_head_bounds_are_the_writers_own`). |
+| `crates/mantle/src/door.rs` `ESCAPED` | format | `"&#x1f;".len()` | The most octets `crates/s3/src/xml.rs`'s `escape` writes for one octet of text: a control character's reference, `&#x1f;` (XML 1.0 §2.2, §4.1). |
+| `crates/mantle/src/door.rs` `FIELD_TEXT` | format | `"<NextContinuationToken></NextContinuationToken>".len()` | The tags of the longest-named listing head element, `NextContinuationToken` (`crates/s3/src/response.rs`), 47 octets. |
+| `crates/mantle/src/door.rs` `HEAD` | derived | `ROOT_TEXT + 12 *(FIELD_TEXT + KEY)` | The most octets a listing the door reads holds beside its entries: `ROOT_TEXT` and ListParts' twelve head elements, the most any listing's head holds, each no wider than `FIELD_TEXT` around a key at its widest (`KEY`), as every head element's value is at most that (a key, marker, continuation token of a key's octets and one in base64, version or upload ID, owner, bucket name, count or S3 name): 74,436 octets, holding each listing's widest head (`door.rs` test `the_entry_and_head_bounds_are_the_writers_own`). |
+| `crates/mantle/src/door.rs` `KEY` | derived | `ESCAPED * mantle_s3::route::MAX_KEY` | A key at its widest: 1,024 octets (`crates/s3/src/route.rs` `MAX_KEY`), each escaped (`ESCAPED`), 6,144. |
+| `crates/mantle/src/door.rs` `OWNER` | derived | `ESCAPED * mantle_s3::account::MAX_OWNER` | An owner's name at its widest: 64 octets (`crates/s3/src/account.rs` `MAX_OWNER`), each escaped (`ESCAPED`), 384. |
+| `crates/mantle/src/door.rs` `ROOT_TEXT` | format | `sha256:ec927b74a0e42329` | The XML declaration and the longest listing root, `ListMultipartUploadsResult`, with S3's namespace, as `crates/s3/src/xml.rs` `Writer::document` writes them (`NAMESPACE`), 144 octets. |
+| `crates/mantle/src/door.rs` `TAG` | derived | `ESCAPED * mantle_protocol::object::MAX_TAG` | An ETag or an upload's ID at its widest: 38 octets (`crates/protocol/src/object.rs` `MAX_TAG`), each escaped (`ESCAPED`), 228. |
+| `crates/mantle/src/door.rs` `UPLOAD` | derived | `UPLOAD_TEXT + OWNER + OWNER + TAG` | An `Upload` listing entry at its widest beside its key: `UPLOAD_TEXT`, its initiator's and owner's names (`OWNER`, twice) and its ID (`TAG`), 1,273 octets, equal octet for octet to `crates/s3/src/response.rs`'s widest (`door.rs` test `the_entry_and_head_bounds_are_the_writers_own`). |
+| `crates/mantle/src/door.rs` `UPLOAD_TEXT` | format | `sha256:fd18acca5cc58b63` | The text `crates/s3/src/response.rs` writes for an `Upload` at its widest with its initiator's and owner's names, key and ID empty, 277 octets: the longest checksum names (as `CONTENTS_TEXT`), the last time an S3 time holds and `STANDARD`. |
+| `crates/mantle/src/door.rs` `VERSION` | derived | `VERSION_TEXT + TAG + OWNER + mantle_s3::body::MAX_VERSION_ID` | A `Version` listing entry at its widest beside its key: `VERSION_TEXT`, its ETag (`TAG`), its owner's name (`OWNER`) and its ID, at most 1,024 octets and URL-ready, so never escaped (`crates/s3/src/body.rs` `MAX_VERSION_ID`, the S3 user guide's bound), 1,965 octets, equal octet for octet to `crates/s3/src/response.rs`'s widest (`door.rs` test `the_entry_and_head_bounds_are_the_writers_own`). |
+| `crates/mantle/src/door.rs` `VERSION_TEXT` | format | `sha256:8118b493c04d51ce` | The text `crates/s3/src/response.rs` writes for a `Version` at its widest with its ETag, key, owner's name and ID empty, 329 octets: a `Contents`'s (`CONTENTS_TEXT`) in a `Version`'s tags, with `IsLatest` false and its `VersionId`. |
 | `crates/mantle/src/init.rs` `ACCOUNTS` | external | `1_000_000_000_000` | 10^12: an account's id is twelve decimal digits (research/17 §2.1; `mantle_s3::account::valid_id`). |
 | `crates/mantle/src/init.rs` `NO_EXPIRY` | external | `253_402_300_799` | 253,402,300,799 Unix seconds, 99991231235959Z: RFC 5280 §4.1.2.5's notAfter for a certificate with no well-defined expiration, which init's certificates take until certificates are rotated (node.md §1.5). |
 | `crates/mantle/src/journal.rs` `MAX_OPEN` | external | `MAX_PAGE_PARTS` | Open uploads the command line's journal records at most: S3's 1,000 uploads a page of ListMultipartUploads lists (docs/research/05 §4.7), so one listing shows every upload the journal names (docs/design/gateway.md §6). |
@@ -1149,7 +1164,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/mantle/src/bench_s3.rs` `runtime:timer_tick_ns` | picked | `100_000` | A benchmark's value set by hand (audit 2026-11-12 §4.1–4.2): the bench's points and configurations come from what the node derives. |
 | `crates/mantle/src/bench_s3.rs` `serve:[127, 0, 0, 1]` | external | `[127, 0, 0, 1]` | The IPv4 loopback address (RFC 1122 §3.2.1.3). |
 | `crates/mantle/src/bench_s3.rs` `serve:node` | format | `1` | The first value of an identity or a sequence: they count from one, zero meaning none. |
-| `crates/mantle/src/client.rs` `run:workers` | derived | `2` | Two places, a file's reads and writes and a name's lookup, a worker each so neither waits on the other. |
+| `crates/mantle/src/client.rs` `start_blocking:workers` | derived | `2` | Two places, a file's reads and writes and a name's lookup, a worker each so neither waits on the other. |
 | `crates/mantle/src/client.rs` `runtime_of:shards` | derived | `1` | One task drives the client's commands (the comment above), so one shard. |
 | `crates/mantle/src/client.rs` `unspecified:[0, 0, 0, 0]` | external | `[0, 0, 0, 0]` | The unspecified IPv4 address, any interface (RFC 1122 §3.2.1.3). |
 | `crates/mantle/src/main.rs` `--load` | picked | `"open:100"` | offered load of every open-loop phase. Refused (audit 2026-11-12 §6): a hand-set rate: an open-loop phase can never show more than 100/s. Replace: rates from the run's own measured capacity (the closed ladder's best step): ρ·μ at ρ ∈ fractions where the tail is reported, and the rate where p99.9 meets the objective (Schroeder, Wierman and Harchol-Balter, NSDI 2006) |
@@ -1898,6 +1913,54 @@ Numbers the benches' scripts and the measurement plan state, which the gate does
 | `scripts/doors-trials.sh` `excluded_on` the Mac's cpu1, cpu2 and memfloor | external | macOS binds no thread to a CPU (THREAD_AFFINITY_POLICY is a hint to group threads, xnu `osfmk/kern/thread_policy.c`) and has no cgroups, so no kernel limit on a process tree's memory as Linux's `memory.max` is; those conditions run on the VM lane and the box. |
 | `scripts/doors-trials.sh` CPUSET 8-15 | measured | One die's eight cores without their SMT siblings, sharing one L3 (the box's sysfs, 2026-11-07; research/70 [20]). |
 | measurement.md §12 the comparators' revisions | cited | Garage v2.5.0 (`586726ed`), SeaweedFS 4.52 (`984eac6a`), RustFS 1.0.4 (`46337942`), MinIO RELEASE.2025-10-15T17-29-55Z (`9e49d5e7`), msquic v2.6.3 (`16ca4d8d`) and quinn-proto 0.11.18 (`eaec0db4`, hyper-quic's base): the releases the doors' baseline pinned, each S3 server set to flush before it acknowledges (research/70 [13]). |
+
+### The release check's volume
+
+`scripts/release.py check` (release.md §2) sizes each founder's volume from the bytes the check
+writes, not by hand. The model, `segments` and `volume_bytes` in the script:
+
+- **What is written.** Every file the check puts, by length (`puts`): through each door an object
+  of the most one request carries and one a byte longer, from a file and from standard input; a
+  multipart upload of S3's least part and a last part of a byte; the killed copy's committed run
+  or part and the one in flight then, counted whole, and the copy run again; the AWS CLI's and the
+  plain-HTTP leg's two objects. A native object is put as runs of `RUN`, an S3 one as one
+  PutObject below 8 MiB and parts of 8 MiB past it.
+- **Every attempt.** Each put is counted `ATTEMPTS` times, the clients' three (research/73 [5]):
+  an attempt answered SlowDown may leave its chunks behind (d0d91066).
+- **Nothing removed is freed.** A released chunk returns only after `GRACE_NS`, three days
+  (crates/meta/src/collector.rs), so removed and replaced objects count whole.
+- **Copies per volume.** A block's three copies sit on three nodes, one volume each, so every
+  volume holds one copy of every block.
+- **Whole segments.** A file is cut into blocks of 127 sealed 64 KiB segments; a block's record is
+  its sealed bytes behind a 96-byte header and a CRC-32C word a checksum block, aligned to 8
+  (crates/chunk/src/record.rs). A record longer than half a segment takes a segment of its own;
+  shorter ones share, each taken to its block's end, and a segment sealed because the next did not
+  fit holds at least its room less the longest of them (crates/chunk/src/writer.rs).
+- **The cleaner's reserve.** One free segment more, which new writes never take
+  (`CLEANER_RESERVE`).
+- **The layout.** The volume's block and segment are `mantle disk probe`'s for its directory, as a
+  node derives them (`mantle_node::derive::blocks`). Its segments begin past its two superblocks and
+  its index log, sized at format for one fragment a block (crates/chunk/src/layout.rs,
+  `Geometry::plan`, `log_bytes`); the volume is the least size, found by doubling then halving
+  over a u64's 64 bits, whose segments number the need.
+
+The model is checked on every run: each node says its volume's segment, which must be the probe's,
+and its free segments once it enlisted, which must hold the need; once the doors' writes are done,
+what each volume took must be within the need less the reserve. On a 4 KiB-block device it is 62
+segments of 8,404,992 bytes and 621,772,800 bytes a volume.
+
+| Where | Kind | Basis |
+|---|---|---|
+| `scripts/release.py` `FOUNDERS` 3, `COPIES` 3 | cited | `2f + 1` voters for `f = 1`, the least cell that keeps a majority with one founder lost (architecture.md, decision 2); one domain each, R3 one copy a domain (durability.md; research/76 [4] f34). |
+| `scripts/release.py` `CLI_PART` 8 MiB | external | The AWS CLI's multipart threshold and part size (research/73 [10]); the S3 door's `PART`. |
+| `scripts/release.py` `LEAST_PART` 5 MiB | external | S3's least part but the last (research/05 §4.1). |
+| `scripts/release.py` `PIECE` 65,527 | derived | `mantle_client::PIECE`, the transport's receive chunk: RFC 9000 §18.2's largest datagram payload. |
+| `scripts/release.py` `SEAL`, `TAG`, `CHUNK`, `BLOCK`, `RUN` | derived | `mantle_s3::seal::{SEGMENT, TAG}`, `mantle_gateway::layout::CHUNK`; a block the sealed segments a chunk holds; a run S3's least part rounded up to whole blocks (`mantle_meta::name::run_length`). |
+| `scripts/release.py` `ATTEMPTS` 3 | external | The AWS SDKs' standard retry mode's attempts, which `mantle_client::ATTEMPTS` keeps (research/73 [5]). |
+| `scripts/release.py` `HEADER_LEN`, `RECORD_ALIGN`, `CHECKSUM_SHIFT_MOST`, `OFFSET_B_STANDARD`, `LEAST_LOG`, `FRAME_HEADER`, `PUT_LEN`, `DELETE_LEN`, `SEGMENT_LEN`, `MAX_FRAME_BYTES`, `CLEANER_RESERVE` | format | The chunk store's, each named in the script by its file; a drift fails the run's segment and room checks. |
+| `scripts/release.py` `SIZE_BITS` 64 | format | The bits of the u64 a volume's size is parsed into: the most steps a doubling or a halving of sizes takes. |
+| `scripts/release.py` object sizes | derived | Each the boundary it exercises: the most one request carries (a run, or 8 MiB less a byte), a byte more, S3's least part, a last part of a byte, two units and a byte for the killed copy. |
+| `scripts/release.py` transfer `--small 1000 --large 20M --count 4` | cited | The plan's smoke as CI runs it (crates/mantle/tests/transfer.rs; research/76): the least small set agreed (research/76 [4] f2), three blocks and three CLI parts the last short of the least part (node.md), one object a way (`WAYS`). |
 
 ## What the open ones need
 

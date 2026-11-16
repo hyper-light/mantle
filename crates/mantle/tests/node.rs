@@ -46,9 +46,9 @@
 //! that peer fall silent (`Status::reconnect`), or any client gives an exchange
 //! (`Client::patience`), never less than RFC 6298's initial retransmission timeout, one second (as
 //! `crates/node/tests/cluster.rs` does). A node whose log has a flush out extends the watch, since
-//! its range moves only as its writes become durable, until the flush has been out longer than the
-//! longest any node's log has taken and the quiet period besides (its `log` line;
-//! hyper-durable-e2e's rule, as the cluster's). A cell no majority of whose running nodes is free
+//! its range moves only as its writes become durable, until the flush (its `log` line) has been out
+//! as long as a node waits on its own busy device, its client's patience
+//! (`bounds::STOCK_PATIENCE`, research/77 D2), as the cluster's watch has it. A cell no majority of whose running nodes is free
 //! of its own device holds still for its devices, as its law has it (`Status::held`: a node judges
 //! no peer while its own proof is out, timing.md §2.8, and a range's quorum waits on its members'
 //! devices), and the watch does not count that time, each such stretch up to the same bound, so a

@@ -10,7 +10,7 @@ pub(crate) use std::io::{BufRead, BufReader, Write};
 pub(crate) use std::net::SocketAddr;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::process::{Child, ChildStdin, Command, Stdio};
-pub(crate) use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+pub(crate) use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 pub(crate) use std::thread::JoinHandle;
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -72,6 +72,17 @@ pub(crate) const CLIENT: u64 = MOST_NODES + 1;
 pub(crate) const CLIENTS: u64 = 3;
 /// RFC 6298 §2.1: the retransmission timeout before any round trip is measured, one second.
 pub(crate) const INITIAL_RTO: Duration = Duration::from_secs(1);
+/// How long the cell may hold still for its devices, a stretch at a time, and a node's log flush
+/// may be out, before the watch counts it: as long as a node waits on its own busy device, which
+/// is as long as its client waits (`bounds::STOCK_PATIENCE`, research/77 D2). Past it the product
+/// itself gives up on the device, so the watch does too.
+pub(crate) const DEVICE_PATIENCE: Duration = mantle_protocol::bounds::STOCK_PATIENCE;
+/// How often the watch wakes to measure its own process's holds: each timed wake's lateness
+/// against its scheduled instant on the monotonic clock is time the host did not run the watch,
+/// which it counts against the host, not the cell, so a hold is seen to within one interval. One
+/// millisecond is jHiccup's resolution, the interval its meter thread sleeps and times each wake
+/// over (github.com/giltene/jHiccup, `HiccupMeter.java`, `resolutionMs = 1.0`).
+pub(crate) const HOLD_TICK: Duration = Duration::from_millis(1);
 /// RFC 5280 §4.1.2.5: the notAfter of a certificate with no well-defined expiration.
 pub(crate) const NO_EXPIRY: u64 = 253_402_300_799;
 /// Writes before the leader is killed and after: enough to pass the range's log group's room
@@ -1102,9 +1113,12 @@ pub(crate) struct Cell {
     pub(crate) learns: Vec<Sender<(u64, SocketAddr)>>,
     pub(crate) moved_at: Instant,
     /// Since the last movement, how long the cell held still for its devices, each stretch at
-    /// most `Cell::held_bound`, and when the stretch under way began, if one is.
+    /// most `DEVICE_PATIENCE`, and when the stretch under way began, if one is.
     pub(crate) held_for: Duration,
     pub(crate) held_since: Option<Instant>,
+    /// Since the last movement, how long the host held the watch's own process past the wakes it
+    /// scheduled (`HOLD_TICK`): a test judges the cell, not the host's scheduler.
+    pub(crate) host_held: Duration,
     /// The running nodes whose last word was that they wait on their own device.
     pub(crate) held: BTreeSet<u64>,
     /// Whether each node keeps a volume, the volume each running node said it holds, and the
@@ -1474,6 +1488,7 @@ impl Cell {
             moved_at: Instant::now(),
             held_for: Duration::ZERO,
             held_since: None,
+            host_held: Duration::ZERO,
             held: BTreeSet::new(),
             stored: true,
             volumes: BTreeMap::new(),
@@ -1608,6 +1623,7 @@ impl Cell {
             moved_at: Instant::now(),
             held_for: Duration::ZERO,
             held_since: None,
+            host_held: Duration::ZERO,
             held: BTreeSet::new(),
             stored,
             volumes: BTreeMap::new(),
@@ -1989,18 +2005,6 @@ impl Cell {
             .fold(INITIAL_RTO, Duration::max)
     }
 
-    /// How long one stretch of the cell holding still for its devices goes uncounted: the longest
-    /// any node's log has taken and the quiet period besides.
-    pub(crate) fn held_bound(&self, quiet: Duration) -> Duration {
-        let longest = self
-            .log
-            .values()
-            .map(|(_, _, longest)| *longest)
-            .max()
-            .unwrap_or_default();
-        longest + quiet
-    }
-
     /// Whether no majority of the running nodes is free of its own device: the range's quorum then
     /// waits on the devices of the nodes that wait on theirs.
     pub(crate) fn held_by_devices(&self) -> bool {
@@ -2018,8 +2022,7 @@ impl Cell {
         match (self.held_since, self.held_by_devices()) {
             (None, true) => self.held_since = Some(now),
             (Some(since), false) => {
-                let bound = self.held_bound(self.quiet());
-                self.held_for += now.saturating_duration_since(since).min(bound);
+                self.held_for += now.saturating_duration_since(since).min(DEVICE_PATIENCE);
                 self.held_since = None;
             }
             (None, false) | (Some(_), true) => {}
@@ -2030,6 +2033,7 @@ impl Cell {
     pub(crate) fn moved(&mut self) {
         self.moved_at = Instant::now();
         self.held_for = Duration::ZERO;
+        self.host_held = Duration::ZERO;
         self.held_since = if self.held_by_devices() {
             Some(self.moved_at)
         } else {
@@ -2041,28 +2045,29 @@ impl Cell {
     /// for its devices, the one under way counted to its bound.
     pub(crate) fn deadline(&self, quiet: Duration) -> Instant {
         let holding = if self.held_since.is_some() {
-            self.held_bound(quiet)
+            DEVICE_PATIENCE
         } else {
             Duration::ZERO
         };
         self.moved_at + quiet + self.held_for + holding
     }
 
-    /// When the watch ends for the flushes out: each running node's, as last said, past the
-    /// longest any node's log has taken and `quiet` besides, as the cluster's watch has it.
-    pub(crate) fn flush_deadline(&self, quiet: Duration) -> Instant {
-        let allowed = self.held_bound(quiet);
+    /// When the watch ends for the flushes out: each running node's, as last said, `DEVICE_PATIENCE`
+    /// past the flush's start, as the cluster's watch has it.
+    pub(crate) fn flush_deadline(&self) -> Instant {
         self.log
             .iter()
             .filter(|(id, _)| self.running.contains_key(id))
             .filter_map(|(_, (heard, flushing, _))| {
-                Some(*heard + allowed.saturating_sub(*flushing.as_ref()?))
+                Some(*heard + DEVICE_PATIENCE.saturating_sub(*flushing.as_ref()?))
             })
             .max()
             .unwrap_or_else(Instant::now)
     }
 
-    /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing.
+    /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing, past
+    /// the time the host held the watch: each wait at most `HOLD_TICK`, and a wait that ends late
+    /// moves the watch's end by its lateness, so each spends exactly the span it scheduled.
     pub(crate) fn until<T>(&mut self, mut done: impl FnMut(&mut Self) -> Option<T>) -> T {
         self.moved();
         loop {
@@ -2070,16 +2075,27 @@ impl Cell {
                 return found;
             }
             let quiet = self.quiet();
-            let left = self
-                .deadline(quiet)
-                .max(self.flush_deadline(quiet))
-                .saturating_duration_since(Instant::now());
-            match self.heard.recv_timeout(left) {
+            let now = Instant::now();
+            let left = (self.deadline(quiet).max(self.flush_deadline()) + self.host_held)
+                .saturating_duration_since(now);
+            let wait = left.min(HOLD_TICK);
+            let woke_by = now + wait;
+            match self.heard.recv_timeout(wait) {
                 Ok(heard) => self.take(heard),
-                Err(_) => panic!(
+                Err(RecvTimeoutError::Timeout) if !left.is_zero() => {
+                    self.host_held += Instant::now().saturating_duration_since(woke_by);
+                }
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
                     "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
-                     devices: {:?}, progress {:?}, links {:?}, log {:?}, room {:?}",
-                    self.held_for, self.status, self.progress, self.links, self.log, self.room
+                     devices and {:?} the host held the watch: {:?}, progress {:?}, links {:?}, \
+                     log {:?}, room {:?}",
+                    self.held_for,
+                    self.host_held,
+                    self.status,
+                    self.progress,
+                    self.links,
+                    self.log,
+                    self.room
                 ),
             }
         }

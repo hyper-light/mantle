@@ -36,13 +36,12 @@ pub fn node_name(id: u64) -> String {
 /// The id a node's name gives, [`node_name`]'s form exactly and nonzero; none for any other.
 pub fn node_id(name: &str) -> Option<u64> {
     let digits = name.strip_prefix("node-")?;
-    let id: u64 = digits.parse().ok()?;
-    // One spelling a node: no sign or leading zero, which parse takes.
-    if id != 0 && id.to_string() == digits {
-        Some(id)
-    } else {
-        None
+    // One spelling a node: decimal digits with no leading zero, so nonzero; `parse` alone would
+    // take a sign or zeros before.
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    digits.parse().ok()
 }
 
 /// The name a client's certificate gives it, its subject's common name: `client-` and its id.

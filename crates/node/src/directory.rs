@@ -85,9 +85,7 @@ impl Peers {
                 .map(|peer| {
                     let name = mantle_protocol::node_name(peer.id);
                     let grant = match peer.role {
-                        Role::Node => mantle_cert::node_names(&peer.certificate)
-                            .ok()
-                            .and_then(|names| names.grant),
+                        Role::Node => mantle_cert::node_grant(&peer.certificate).ok().flatten(),
                         Role::Gateway | Role::Client => None,
                     };
                     (peer, name, grant)

@@ -332,25 +332,40 @@ pub struct NodeNames<'a> {
 /// checked here: the TLS stack verified the chain at the handshake that presented it.
 pub fn node_names(certificate: &[u8]) -> Result<NodeNames<'_>, CertError> {
     let read = read(certificate)?;
-    let mut subject = der::expect(&mut &*read.subject, der::SEQUENCE)?.content;
-    let name = attribute(&mut subject, oid::COMMON_NAME)?;
-    let grant = if subject.is_empty() {
-        None
-    } else {
-        let grant = printable(&mut subject, oid::SERIAL_NUMBER)?;
-        // One spelling a grant: decimal digits, no sign or leading zero, nonzero.
-        let number: u64 = grant.parse().map_err(|_| CertError::Malformed)?;
-        if number == 0 || number.to_string() != grant || !subject.is_empty() {
-            return Err(CertError::Malformed);
-        }
-        Some(number)
-    };
+    let (name, grant) = subject_names(read.subject)?;
     let mut profile = Vec::new();
     extensions(&mut profile, &Role::Node { dns_name: name })?;
     if read.extensions != profile.as_slice() {
         return Err(CertError::Malformed);
     }
     Ok(NodeNames { name, grant })
+}
+
+/// The grant a node's certificate was issued under, where its subject names one, read from the
+/// subject alone: for a certificate its holder knows already as a node's, a peer its own
+/// configuration pins, whose profile [`node_names`] would check again at the cost of encoding it.
+pub fn node_grant(certificate: &[u8]) -> Result<Option<u64>, CertError> {
+    subject_names(read(certificate)?.subject).map(|(_, grant)| grant)
+}
+
+/// A node's subject: its common name, and after it the grant it was issued under where it names
+/// one, in one spelling: decimal digits, no sign or leading zero, so nonzero.
+fn subject_names(subject: &[u8]) -> Result<(&str, Option<u64>), CertError> {
+    let mut subject = der::expect(&mut &*subject, der::SEQUENCE)?.content;
+    let name = attribute(&mut subject, oid::COMMON_NAME)?;
+    if subject.is_empty() {
+        return Ok((name, None));
+    }
+    let grant = printable(&mut subject, oid::SERIAL_NUMBER)?;
+    if !subject.is_empty()
+        || grant.starts_with('0')
+        || grant.is_empty()
+        || !grant.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(CertError::Malformed);
+    }
+    let number: u64 = grant.parse().map_err(|_| CertError::Malformed)?;
+    Ok((name, Some(number)))
 }
 
 /// A certificate's fingerprint: the SHA-256 of its DER (FIPS 180-4), what the cell's root range

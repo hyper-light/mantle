@@ -963,11 +963,19 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     cell.enlisted(joining);
     let mark = root_commit(&cell);
     let at = settled_after(&mut cell, mark, |r| r.waiting == 0 && r.short == 0);
-    assert_eq!(
-        spread(&mut cell).1,
-        0,
-        "a block still doubles a domain, the pass settled as {at:?}"
-    );
+    let doubling = spread(&mut cell).1;
+    if doubling != 0 {
+        // Whether each node held the joiner present: a domain takes chunks only while its node is.
+        let joiner: Vec<_> = cell
+            .standings
+            .iter()
+            .filter(|((_, member), _)| *member == joining)
+            .collect();
+        panic!(
+            "{doubling} blocks still double a domain, the pass begun at {mark} or later settled as \
+             {at:?}; the joiner {joining} as each node holds it: {joiner:?}"
+        );
+    }
     objects.extend(put_objects(&mut cell, "b", "after", &SIZES, 13));
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let keys: Vec<String> = objects.keys().cloned().collect();

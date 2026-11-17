@@ -410,6 +410,18 @@ fn every_object_reads_back(cell: &mut Cell, load: &mut Steady, through: &[u64], 
         .collect();
     let read = cell.objects(gets);
     for (outcome, n) in read.iter().zip(&numbers) {
+        // A read refused says what the cell said last: each range's status at each node, each
+        // node's links and its record of the others.
+        if !matches!(outcome, ObjectOutcome::Replied { reply, .. } if reply.status == ObjectStatus::Done)
+        {
+            panic!(
+                "{step}: {} natively: {outcome:?}; status {:?}; links {:?}; standings {:?}",
+                key_of(*n),
+                cell.status,
+                cell.links,
+                cell.standings
+            );
+        }
         assert_eq!(
             done(outcome, &format!("{step}: {} natively", key_of(*n))),
             object_bytes(*n, OBJECT_BYTES),

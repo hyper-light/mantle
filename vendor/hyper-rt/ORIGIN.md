@@ -106,7 +106,11 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   `Incoming::site`, `TaskCell::site`, `SpawnRequest::site`), a task labels itself
   (`futures::label`, `TaskCell::label`), and any thread reads a shard's table
   (`slow::slow_polls`). Taken from Kiln's runtime copy (`kiln-rt`'s `slow.rs`, plan `01a1a87b2cec`
-  step 2) as a design, not as code: Kiln counts polls past a fixed 100 µs; here the threshold is
-  §3.11's, twice the quantum, so every counted poll has a verdict; Kiln's table of 128 entries is
-  here the entries one 4 KiB page holds. Tests: `tests/slow_polls.rs`, three unit tests in
-  `slow.rs`.
+  step 2; the file as Kiln's `84fa1838b` left it, read at Kiln's `28b6c8ca8c4`): the table on the registry entry, its key's
+  comparison and its probe's hash, its unkeyed entry and its reader with no lock, as Kiln wrote
+  them. Changed in the port: Kiln counts polls past a fixed 100 µs, here the threshold is §3.11's,
+  twice the quantum, so every counted poll has a verdict; a poll judged at its step's end has its
+  verdict counted on its entry then, where Kiln's counted it as no host's; a task's label stays on
+  its slot until it sets another, where Kiln clears it as each poll begins; Kiln's table of 128
+  entries is here the entries one 4 KiB page holds; Kiln's readings of the CPU clock (its step 3)
+  are not taken. Tests: `tests/slow_polls.rs`, three unit tests in `slow.rs`.

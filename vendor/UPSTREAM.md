@@ -87,11 +87,12 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `1783231` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
-`17371e2` and one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
-branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its commit
-changes hyper-rt alone (`1783231`; hyper-raft docs/runtime.md §3.12, hyper-rt ORIGIN.md, "what held a
-shard"): each shard counts its long polls, those held past twice its step quantum since it last let
+**Every crate at `41ce087` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
+`17371e2` and two commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its commits
+change hyper-rt alone (`1783231`, and `41ce087`, which corrects hyper-rt ORIGIN.md's record of what
+was taken from Kiln's `slow.rs` as written; hyper-raft docs/runtime.md §3.12, hyper-rt ORIGIN.md,
+"what held a shard"): each shard counts its long polls, those held past twice its step quantum since it last let
 them go on (§3.11), against the task's spawn site, recorded by `#[track_caller]` at every spawn, and
 the label the task set (`futures::label`), with their hold, their longest and the attribution's
 verdict, the task's or the host's, on a table of fixed size (the entries one 4 KiB page holds; a

@@ -171,9 +171,9 @@ CockroachDB's decommissioned node "cannot be recommissioned" and the operator st
 again [11]. Ceph alone keeps something of the old member: a replacement takes the destroyed OSD's
 number and CRUSH entry, "the replaced OSD’s ID and CRUSH map entry must be kept intact after the
 OSD is destroyed for replacement" [11], under new keys on a zapped disk, so the number is a slot in
-its placement map and the credential is new. Raft's reason is the log's: a server's persistent state belongs to its identity, and a
-server without it returns only under a new one [12]; equally, state written under an old identity
-is never presented under a new one.
+its placement map and the credential is new. Raft's reason is the log's: a server's persistent
+state belongs to its identity, and a server without it returns only under a new one [12]; equally,
+state written under an old identity is never presented under a new one.
 
 Ceph's destroy is a cryptographic erase where the OSD is encrypted: its key is the OSD's own, held
 by the monitors, and destroying it leaves "the data on the OSD can never be read again" [11]. That

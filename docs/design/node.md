@@ -2754,9 +2754,11 @@ what the door makes of a head and answers it with, one body segment (`PIECE`) an
 at its largest (`TLS_RECORD`, 2^14 octets and TLS 1.2's 2,048 of expansion, RFC 8446 §5.1–5.2
 and RFC 5246 §6.2.3), 92,156 octets. A TLS connection encrypts a response a record at a time,
 each sent before the next is made, where hyper-tls's default would encrypt 64 KiB ahead of the
-socket. A put whose body is longer than a segment holds `BODY_PIECES` more, read ahead into the
-host's queue, beside the one it holds while that queue is full: the connection copies a piece
-before the queue has room for it, as hyper-rt's channel takes a value only to send it.
+socket. A put whose body is longer than a segment holds `listener::STREAMED_BYTES`: one head and
+one TLS record, and its body's pieces in the host's queue, at most the queue's depth of them
+(`BODY_PIECES`, 2: one the driver takes while the next is read), 157,683 octets. The connection
+waits for the queue's room before it copies a piece (hyper-rt's `Sender::reserve`), so it holds
+none the queue has no room for; at a depth of one a put holds `REQUEST_BYTES`.
 `tests/listener_memory.rs` counts each request from its connection at rest to its answer.
 What the door makes of a head does not grow with its fields' count: they are read where the head
 holds them (`request::Parts`, `mantle_s3::sigv4::Fields`), no table of them made, which at 32

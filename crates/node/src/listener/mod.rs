@@ -102,10 +102,21 @@ pub const TLS_RECORD: usize = 5 + RECORD_PLAINTEXT + 2048;
 /// string to sign, the host's reply and the channels between the two; its fields are read where
 /// the head holds them, no table of them made, so none of this grows with their count), one body
 /// segment ([`PIECE`]), the piece a put's body is copied into, and one TLS record
-/// ([`TLS_RECORD`]). Pinned by `tests/listener_memory.rs`
+/// ([`TLS_RECORD`]). A put whose body is longer than one segment holds [`STREAMED_BYTES`]. Pinned
+/// by `tests/listener_memory.rs`
 /// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`), a head padded to
 /// its 8 KB with the most fields it carries among its cases.
 pub const REQUEST_BYTES: usize = mantle_http::MAX_HEAD + PIECE + TLS_RECORD;
+
+/// The most a put whose body is longer than one segment holds above its connection at rest: one
+/// head and one TLS record, as [`REQUEST_BYTES`], and the pieces of its body in the host's queue,
+/// at most the queue's depth of them ([`BODY_PIECES`]: one the host's driver takes while the
+/// connection reads the next). The connection waits for the queue's room before it copies a piece
+/// (`hyper_rt::sync::Sender::reserve`), so it holds no piece the queue has no room for, and the
+/// one it copies is one of the queue's. At a depth of one this is [`REQUEST_BYTES`]. Pinned by
+/// `tests/listener_memory.rs`
+/// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`).
+pub const STREAMED_BYTES: usize = mantle_http::MAX_HEAD + BODY_PIECES * PIECE + TLS_RECORD;
 
 /// The connections past those it serves ([`Settings::connections`]) the listener answers `503
 /// SlowDown`, `Connection: close`, rather than closes: as many as one more stock client opens at

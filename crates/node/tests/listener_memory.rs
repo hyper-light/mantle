@@ -84,7 +84,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// A body longer than the pieces a connection reads ahead of the host, by one piece.
+/// A body longer than the pieces a connection reads ahead of the host, by two pieces.
 fn body() -> Vec<u8> {
     vec![0x5a; 4 * PIECE]
 }
@@ -689,21 +689,19 @@ fn one_request(
 /// counted is the door's: its request, its pieces, its TLS records, and the host's reply it
 /// answers from.
 ///
-/// A put whose body is longer than a segment also holds the pieces it read ahead into the host's
-/// queue, `listener::BODY_PIECES` of them, beside the one it holds while that queue is full: the
-/// connection copies its next piece before the queue has room for it, as `hyper_rt`'s channel
-/// takes a value only to send it. Those are stated apart here, and counted in what a connection
-/// holds (`listener::CONNECTION_BYTES`).
+/// A put whose body is longer than a segment holds `listener::STREAMED_BYTES`: one head and one
+/// TLS record, and the pieces in the host's queue, at most its depth (`listener::BODY_PIECES`) of
+/// them. The connection waits for the queue's room before it copies a piece, so it holds none
+/// beside them.
 ///
 /// A head padded to S3's 8 KB with empty fields, CRLF-ended (about 1,880 of them) or ended by a
 /// lone LF (the most a head carries, about 2,500), holds no more: the door reads a head's fields
 /// where the head holds them and copies only those a version keeps.
 #[test]
 fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
-    use mantle_node::listener::{BODY_PIECES, REQUEST_BYTES};
+    use mantle_node::listener::{REQUEST_BYTES, STREAMED_BYTES};
     let records = 3 * (1 << 14) + 1;
     let many = 4 * PIECE;
-    let ahead = BODY_PIECES * PIECE;
     for over in [Over::Plain, Over::Tls13, Over::Tls12] {
         for (method, size, padded) in [
             (Method::Put, 1, Padded::No),
@@ -722,7 +720,7 @@ fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
         ] {
             let (counts, status) = one_request(over, (method, size, padded));
             let bound = match method {
-                Method::Put if size > PIECE => REQUEST_BYTES + ahead,
+                Method::Put if size > PIECE => STREAMED_BYTES,
                 _ => REQUEST_BYTES,
             };
             let case = format!("{over:?} {method:?} {size} {padded:?}");

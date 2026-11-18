@@ -811,8 +811,17 @@ impl Connection {
                 let Some(payload) = data.get(payload).filter(|p| !p.is_empty()) else {
                     continue;
                 };
-                let piece = Bytes::copy_from_slice(payload);
-                if pieces.send(Piece::Bytes(piece)).await.is_err() {
+                // The queue's room is waited for before the piece is copied, so the connection
+                // holds no piece the host's queue has no room for: what it holds ahead of the host
+                // is the queue's pieces alone (`super::STREAMED_BYTES`). It is the queue's one
+                // sender, so the room it waited for is there for the piece.
+                let Ok(room) = pieces.reserve().await else {
+                    return Err(Stopped::Host);
+                };
+                if room
+                    .send(Piece::Bytes(Bytes::copy_from_slice(payload)))
+                    .is_err()
+                {
                     return Err(Stopped::Host);
                 }
                 self.door.wake();

@@ -45,6 +45,17 @@ use mantle_meta::record::{BlockHeader, ChunkPlace, Target};
 use mantle_protocol::object::Status as ObjectStatus;
 use s3::{Client as S3, Key};
 
+/// Diagnostic: where the test body is.
+#[track_caller]
+fn step(cell: &Cell, what: &str) {
+    eprintln!(
+        "STEP {} at {} {what} running={:?}",
+        std::thread::current().name().unwrap_or("?"),
+        std::panic::Location::caller(),
+        cell.running.keys().collect::<Vec<_>>()
+    );
+}
+
 /// The ranges' groups `mantle init` drew, as a founder's configuration names them.
 #[derive(Clone, Copy)]
 struct Groups {
@@ -130,6 +141,7 @@ fn leading(cell: &Cell) -> Option<Repairing> {
 /// Waits until the node running the cell's repair says its last pass ended with nothing it could
 /// do, the pass begun at the root range's index `mark` or later, and `done` holds of it: the facts
 /// the test waits on.
+#[track_caller]
 fn settled_after(
     cell: &mut Cell,
     mark: u64,
@@ -142,6 +154,7 @@ fn settled_after(
 
 /// [`settled_after`] at the root range's commit as the running nodes last said it: past every
 /// statement the cell's nodes made to it so far, a lost volume's or a joining node's.
+#[track_caller]
 fn settled(cell: &mut Cell, done: impl FnMut(&Repairing) -> bool) -> Repairing {
     let mark = root_commit(cell);
     settled_after(cell, mark, done)
@@ -162,6 +175,7 @@ fn root_commit(cell: &Cell) -> u64 {
 }
 
 /// The volume table as the root range holds it.
+#[track_caller]
 fn table(cell: &mut Cell, g: Groups) -> Vec<Placed> {
     let mut table = Vec::new();
     let mut after = None;
@@ -179,6 +193,7 @@ fn table(cell: &mut Cell, g: Groups) -> Vec<Placed> {
 }
 
 /// The volumes the table gives node `id`.
+#[track_caller]
 fn volumes_of(cell: &mut Cell, g: Groups, id: u64) -> BTreeSet<u128> {
     table(cell, g)
         .iter()
@@ -206,6 +221,7 @@ fn follower(cell: &Cell) -> u64 {
 }
 
 /// Node `id` asked to leave, waited on until it says it is leaving.
+#[track_caller]
 fn leave(cell: &mut Cell, id: u64) {
     {
         let input = &mut cell.running.get_mut(&id).unwrap().input;
@@ -223,6 +239,7 @@ fn leave(cell: &mut Cell, id: u64) {
 
 /// Waits until the volume table names no volume of node `id`: each drained, written off and
 /// forgotten.
+#[track_caller]
 fn forgotten(cell: &mut Cell, g: Groups, id: u64) {
     cell.until(|c| {
         if table(c, g).iter().any(|p| p.node == id) {
@@ -235,6 +252,7 @@ fn forgotten(cell: &mut Cell, g: Groups, id: u64) {
 
 /// The blocks of `key`'s current version, each its header and places, through its file's
 /// extents and, for an object of parts, each part's file's.
+#[track_caller]
 fn blocks_of(
     cell: &mut Cell,
     g: Groups,
@@ -291,6 +309,7 @@ fn blocks_of(
 /// What a block's places hold on disk: each place's chunk read whole from its volume, which
 /// verifies it, by a client the founders pin as a gateway. Chunks of a gone volume, or one the
 /// table forgot, are none.
+#[track_caller]
 fn on_disk(
     cell: &mut Cell,
     places: &[ChunkPlace],
@@ -362,6 +381,7 @@ fn rebuilds(header: &BlockHeader, chunks: &BTreeMap<u16, Vec<u8>>) -> bool {
 /// each chunk on a volume of its own with one place on each running node at most; each chunk's
 /// places that read giving the chunk, and the chunks the block's own places hold rebuilding it.
 /// Returns how many blocks and places it checked.
+#[track_caller]
 fn whole_on_disk(cell: &mut Cell, g: Groups, bucket: &str, keys: &[String]) -> (usize, usize) {
     let placed = table(cell, g);
     let node_of: BTreeMap<u128, u64> = placed.iter().map(|p| (p.volume, p.node)).collect();
@@ -440,6 +460,7 @@ fn listeners(cell: &Cell) -> BTreeMap<u64, S3> {
 
 /// Puts `n` objects of `sizes` in turn through the S3 listener of each running node and the
 /// native door, half each, into `bucket`, named `prefix-i`; every one acknowledged.
+#[track_caller]
 fn put_objects(cell: &mut Cell, bucket: &str, prefix: &str, sizes: &[usize], seed: u64) -> Objects {
     let mut objects = Objects::new();
     let mut s3 = listeners(cell);
@@ -479,6 +500,7 @@ fn put_objects(cell: &mut Cell, bucket: &str, prefix: &str, sizes: &[usize], see
 /// Every object of `objects` read back whole through each running node's S3 listener and its
 /// native door: byte-exact, or, where `lost` holds of its key, refused typed and never answered
 /// with bytes.
+#[track_caller]
 fn read_back(cell: &mut Cell, bucket: &str, objects: &Objects, lost: &BTreeSet<String>) {
     let mut s3 = listeners(cell);
     let nodes: Vec<u64> = s3.keys().copied().collect();
@@ -537,6 +559,7 @@ fn read_back(cell: &mut Cell, bucket: &str, objects: &Objects, lost: &BTreeSet<S
 /// A cell made and started, every running founder enlisted and, where every founder runs, judging
 /// its links, and a bucket. A range's leader measures its patience toward each voter, a founder not
 /// yet started among them, so a cell started in part is ready once its running founders enlisted.
+#[track_caller]
 fn ready(cell: &mut Cell, bucket: &str) {
     let ids: Vec<u64> = cell.running.keys().copied().collect();
     for id in ids {
@@ -708,6 +731,7 @@ fn five_nodes_survive_two_lost_volumes_and_refuse_what_more_losses_took() {
 }
 
 /// Nodes `ids` killed, each volume of theirs lost, and started again at once.
+#[track_caller]
 fn lose_at_once(cell: &mut Cell, ids: &[u64]) {
     let dirs: Vec<(u64, Vec<PathBuf>)> =
         ids.iter().map(|id| (*id, volume_dirs(cell, *id))).collect();
@@ -789,9 +813,12 @@ fn a_node_asleep_is_waited_for_and_writes_go_around_it() {
 fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks() {
     // Two volumes a node, so a chunk of the gone node has a volume to be rebuilt on.
     let mut cell = Cell::made_partly(|root| founders(root, 5, 2, ""), 4);
+    step(&cell, "made");
     let g = groups(&cell);
     ready(&mut cell, "b");
+    step(&cell, "ready");
     let mut objects = put_objects(&mut cell, "b", "before", &SIZES, 7);
+    step(&cell, "put before");
     let gone = follower(&cell);
     let others: Vec<u64> = cell
         .running
@@ -800,6 +827,7 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
         .filter(|id| *id != gone)
         .collect();
     let theirs = volumes_of(&mut cell, g, gone);
+    step(&cell, &format!("killing gone {gone}"));
     cell.kill(gone);
     // Stated gone on a member's standard input: its volumes written off with it and, once no block
     // names them, forgotten.
@@ -824,9 +852,11 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
             );
         }
     }
+    step(&cell, "read back after gone");
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let (_, places) = whole_on_disk(&mut cell, g, "b", &keys);
     assert!(places > 0);
+    step(&cell, "whole after gone; starting gone again");
     // Started again on its volume, it finds its identity refused: each link it keeps to a node
     // that runs ends refused.
     cell.start(gone);
@@ -839,11 +869,13 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
         });
         if refused { Some(()) } else { None }
     });
+    step(&cell, "refused; stopping gone");
     let exited = cell.stop(gone);
     assert!(
         exited.success(),
         "the refused node stopped in order exited {exited}"
     );
+    step(&cell, "gone stopped");
     let back = settled(&mut cell, |r| r.waiting == 0 && r.short == 0);
 
     // The fifth founder joins while objects are written: its volume new to the table.
@@ -860,18 +892,24 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
         let first = others[0];
         std::thread::spawn(move || tolerant_puts(settings, bound, first, "b", "joining", 12, 8))
     };
+    step(&cell, &format!("starting joiner {joining}"));
     cell.start(joining);
     cell.introduce();
     cell.enlisted(joining);
+    step(&cell, "joiner enlisted; joining writer");
     objects.extend(writer.join().unwrap());
+    step(&cell, "writer joined");
     assert!(!volumes_of(&mut cell, g, joining).is_empty());
     settled(&mut cell, |r| {
         r.waiting == 0 && r.short == 0 && r.root_applied > back.root_applied
     });
+    step(&cell, "settled after join");
     objects.extend(put_objects(&mut cell, "b", "after", &SIZES, 9));
+    step(&cell, "put after");
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let keys: Vec<String> = objects.keys().cloned().collect();
     whole_on_disk(&mut cell, g, "b", &keys);
+    step(&cell, "end");
 }
 
 /// A node that leaves while objects are written: its volumes take no new chunk, every chunk they
@@ -918,6 +956,7 @@ fn a_node_leaving_mid_write_moves_everything_off_and_is_forgotten() {
 #[test]
 fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     let mut cell = Cell::made_partly(|root| founders(root, 4, 2, ""), 3);
+    step(&cell, "made doubled");
     let g = groups(&cell);
     ready(&mut cell, "b");
     let mut objects = put_objects(&mut cell, "b", "before", &SIZES, 12);
@@ -958,12 +997,16 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
         .keys()
         .find(|id| !cell.running.contains_key(id) && **id != leaving)
         .unwrap();
+    step(&cell, &format!("doubled: starting joiner {joining} wide={wide}"));
     cell.start(joining);
     cell.introduce();
     cell.enlisted(joining);
     let mark = root_commit(&cell);
+    step(&cell, &format!("doubled: joiner enlisted mark={mark}"));
     let at = settled_after(&mut cell, mark, |r| r.waiting == 0 && r.short == 0);
+    step(&cell, &format!("doubled: settled {at:?} leading={:?}", cell.repairs.iter().filter(|(_, r)| r.leading).map(|(n, _)| *n).collect::<Vec<_>>()));
     let doubling = spread(&mut cell).1;
+    step(&cell, &format!("doubled: doubling={doubling}"));
     if doubling != 0 {
         // Whether each node held the joiner present: a domain takes chunks only while its node is.
         let joiner: Vec<_> = cell

@@ -1802,6 +1802,7 @@ impl Cell {
     /// console's Ctrl-Break reaches only a process group sharing the sender's console (Microsoft's
     /// `GenerateConsoleCtrlEvent`), which a test's process may not have. The cell's watch goes on
     /// meanwhile, so a stop that holds still past the quiet period fails the test.
+    #[track_caller]
     pub(crate) fn stop(&mut self, id: u64) -> std::process::ExitStatus {
         self.refusing = Some(id);
         if cfg!(unix) {
@@ -1836,6 +1837,7 @@ impl Cell {
     }
 
     /// Waits for the process the test expects to end (`refusing`) to end: how it exited.
+    #[track_caller]
     pub(crate) fn ended(&mut self) -> std::process::ExitStatus {
         let mut running = self.until(|c| c.refused.take());
         self.refusing = None;
@@ -2057,11 +2059,58 @@ impl Cell {
     /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing, past
     /// the time the host held the watch: each wait at most `HOLD_TICK`, and a wait that ends late
     /// moves the watch's end by its lateness, so each spends exactly the span it scheduled.
+    #[track_caller]
     pub(crate) fn until<T>(&mut self, mut done: impl FnMut(&mut Self) -> Option<T>) -> T {
+        let diag_at = std::panic::Location::caller();
+        let diag_name = std::thread::current().name().unwrap_or("?").to_owned();
+        let diag_began = Instant::now();
+        let mut diag_dump = diag_began + Duration::from_secs(60);
+        eprintln!(
+            "UNTIL {diag_name} begins at {diag_at} running={:?}",
+            self.running.keys().collect::<Vec<_>>()
+        );
         self.moved();
         loop {
             if let Some(found) = done(self) {
+                eprintln!(
+                    "UNTIL {diag_name} done after {:?} at {diag_at}",
+                    diag_began.elapsed()
+                );
                 return found;
+            }
+            if Instant::now() >= diag_dump {
+                diag_dump = Instant::now() + Duration::from_secs(60);
+                let status: Vec<String> = self
+                    .status
+                    .iter()
+                    .filter_map(|((n, g), l)| match l {
+                        Line::Status {
+                            term,
+                            leader,
+                            commit,
+                            applied,
+                            ..
+                        } => Some(format!("{n}/{g:x}:t{term} l{leader} c{commit} a{applied}")),
+                        _ => None,
+                    })
+                    .collect();
+                eprintln!(
+                    "UNTIL {diag_name} still waiting at {diag_at} after {:?}: running={:?} \
+                     links={:?} status={status:?} repairs={:?} standings={:?} enlisted={:?} \
+                     gone={:?} leaving={:?} left={:?} configs={:?} progress={:?} refusing={:?}",
+                    diag_began.elapsed(),
+                    self.running.keys().collect::<Vec<_>>(),
+                    self.links,
+                    self.repairs,
+                    self.standings,
+                    self.enlisted,
+                    self.gone,
+                    self.leaving,
+                    self.left,
+                    self.configs,
+                    self.progress,
+                    self.refusing,
+                );
             }
             let quiet = self.quiet();
             let now = Instant::now();
@@ -2467,11 +2516,13 @@ impl Cell {
 
     /// What `ops` came to, each an object's request asked of a node with its data, which the
     /// writer client asks in turn, knowing every node and told where the running ones listen.
+    #[track_caller]
     pub(crate) fn objects(&mut self, ops: Vec<(u64, Op, Vec<u8>)>) -> Vec<ObjectOutcome> {
         self.objects_as(CLIENT, ops)
     }
 
     /// What `ops` came to, asked as [`Cell::objects`] asks them, by client `client`.
+    #[track_caller]
     pub(crate) fn objects_as(
         &mut self,
         client: u64,
@@ -2517,6 +2568,7 @@ impl Cell {
         self.until(|c| c.histories.get(&id).copied())
     }
 
+    #[track_caller]
     pub(crate) fn enlisted(&mut self, id: u64) {
         self.until(|c| {
             if c.enlisted.contains(&id) {
@@ -2532,6 +2584,7 @@ impl Cell {
     /// detectors judge, which a request's steps wait out (node.md §5.4). A node started again
     /// measures its links anew and suspects no peer meanwhile, so a leader killed before it judges
     /// them is not replaced while they are young.
+    #[track_caller]
     pub(crate) fn judging(&mut self) {
         self.until(|c| {
             let groups: BTreeSet<u128> = c.status.keys().map(|&(_, group)| group).collect();
@@ -2550,6 +2603,7 @@ impl Cell {
 
     /// What `reads` read, each a query of a range's group, which the writer client asks in turn,
     /// knowing every node and told where the running ones listen.
+    #[track_caller]
     pub(crate) fn read(&mut self, reads: Vec<(u128, Query)>) -> Vec<Result<Read, ClientError>> {
         self.client_begins(CLIENT);
         let done = reads.len() as u64;

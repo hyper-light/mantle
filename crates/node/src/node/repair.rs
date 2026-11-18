@@ -144,6 +144,7 @@ pub(crate) struct Repair {
     /// takes (none for a change of rows): it goes first once there is room, the walk held there.
     deferred: Option<(u128, usize)>,
     status: RepairStatus,
+    dbg_takers: Vec<String>,
 }
 
 impl Repair {
@@ -160,6 +161,7 @@ impl Repair {
             counts: std::collections::BTreeMap::new(),
             concurrency: 1,
             deferred: None,
+            dbg_takers: Vec::new(),
             status: RepairStatus {
                 leading: true,
                 ..RepairStatus::default()
@@ -471,9 +473,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             && self.group_of(Layer::Root).is_some();
         if !leads {
             if let Some(repair) = self.repair.take() {
+                eprintln!("REPAIRDBG {} service-abandon status={:?}", self.id, repair.status);
                 self.abandon(repair);
             }
             return Ok(());
+        }
+        if self.repair.is_none() {
+            eprintln!("REPAIRDBG {} service-new", self.id);
         }
         let mut repair = self.repair.take().unwrap_or_else(Repair::new);
         let stepped = self.step_service(&mut repair);
@@ -529,6 +535,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let most = u32::try_from(facts.len())
             .map_err(|_| NodeError::Bounds("the table's volumes".into()))?;
         let (judged, takers) = judge(&facts, now, &self.due_of(repair));
+        if takers != repair.dbg_takers {
+            eprintln!(
+                "REPAIRDBG {} takers {:?} -> {:?} root={} block={} pass={}",
+                self.id,
+                repair.dbg_takers,
+                takers,
+                root_applied,
+                block_applied,
+                repair.pass.is_some()
+            );
+            repair.dbg_takers = takers.clone();
+        }
         self.take_repairs(repair, block_group)?;
         self.take_commands(repair);
         self.ask_repairs(repair, block_group, &facts)?;
@@ -542,6 +560,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if moved {
             let grew = takers.iter().any(|d| !repair.takers.contains(d));
             let sweep = !repair.swept || grew;
+            eprintln!(
+                "REPAIRDBG {} pass-begin root={} block={} takers={:?} old={:?} grew={} swept={} sweep={} was_settled={} st=({},{}) fallen={}",
+                self.id,
+                root_applied,
+                block_applied,
+                takers,
+                repair.takers,
+                grew,
+                repair.swept,
+                sweep,
+                repair.status.settled,
+                repair.status.root_applied,
+                repair.status.block_applied,
+                fallen
+            );
             repair.swept |= sweep;
             repair.takers = takers;
             let mut volumes: Vec<u128> = facts
@@ -624,8 +657,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let named = block::on_volume(shell.machine_mut().engine_mut(), volume, None, 1)
                 .map_err(|e| NodeError::Bounds(e.to_string()))?;
             if !named.is_empty() {
+                eprintln!(
+                    "REPAIRDBG {} retire-held volume={volume:x} standing={:?} named={:?}",
+                    self.id, fact.standing, named
+                );
                 continue;
             }
+            eprintln!(
+                "REPAIRDBG {} retire-ask volume={volume:x} standing={:?}",
+                self.id, fact.standing
+            );
             let ask = self.command(root_group, Command::Root(word), u64::MAX, Wait::Request)?;
             repair.retiring.push((ask, volume));
         }
@@ -728,6 +769,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             status.waiting = pass.waiting;
             status.short = pass.short;
             status.lost = pass.lost;
+            eprintln!(
+                "REPAIRDBG {} pass-end settled={} began=({},{}) now=({},{}) waiting={} short={} lost={} rebuilt={} commands={}",
+                self.id,
+                status.settled,
+                pass.root_applied,
+                pass.block_applied,
+                now.0,
+                now.1,
+                pass.waiting,
+                pass.short,
+                pass.lost,
+                status.rebuilt,
+                status.commands
+            );
             repair.pass = None;
             return Ok(None);
         }
@@ -748,6 +803,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if repair.running.iter().any(|r| r.repairer.chunk().0 == block)
             || repair.commanding.iter().any(|(_, b)| *b == block)
         {
+            eprintln!("REPAIRDBG {} busy-skip block={block:x}", self.id);
             return Ok(None);
         }
         let Some((header, places)) = self.block_places(block)? else {
@@ -768,8 +824,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(None);
         }
         let Ok(planned) = fix::plan(block, &header, &places, judged) else {
+            eprintln!("REPAIRDBG {} plan-error block={block:x}", self.id);
             return Ok(None);
         };
+        eprintln!(
+            "REPAIRDBG {} plan block={block:x} level={:?} sweeping={:?} margin={} plan={:?}",
+            self.id,
+            repair.pass.as_ref().map(|p| p.level),
+            repair.pass.as_ref().map(|p| p.sweep.is_some()),
+            planned.margin,
+            planned.plan
+        );
         // A repair holds a chunk from each of the block's places at most, once a decode failed
         // (`repair::most_bytes`): an operation slot for each width of them, the memory of one
         // slot holding a block of its width's (`derive`'s test of it). A block holds at most as
@@ -931,6 +996,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 let _ = running.repairer.answer(id, answer);
             }
             if let Some(outcome) = running.repairer.outcome() {
+                eprintln!(
+                    "REPAIRDBG {} repair-end block={:x} index={} outcome={:?}",
+                    self.id,
+                    running.repairer.chunk().0,
+                    running.repairer.chunk().1,
+                    outcome
+                );
                 // A timing rebuild that named no chunk times none: the next pass begins another.
                 if running.timing && !matches!(outcome, Ok(Repaired::Done { .. })) {
                     repair.timing = false;

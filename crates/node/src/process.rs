@@ -2346,6 +2346,14 @@ async fn serve(
                     // lock held.
                     enlisted = true;
                     live = layout.take_live().map_err(kept)?;
+                    if let Some(e) = &config.enlist {
+                        eprintln!(
+                            "ENLISTDBG {} enlisted root_applied={} outcome={:?}",
+                            node.id(),
+                            node.applied(e.root),
+                            outcome
+                        );
+                    }
                     say(&mut output, "enlisted\n").await?;
                     if let Some(e) = &config.enlist {
                         living.state(&mut node, e.root, own, started_ns)?;

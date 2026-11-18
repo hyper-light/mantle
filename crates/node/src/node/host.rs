@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
+use hyper_rt::slow::Label;
 use hyper_rt::sync::{ChannelReceiver, Sender, SyncError};
 use hyper_transport::{ExchangeId, PeerId, Refusal};
 use mantle_ec::durability::{self, Choice, Rates};
@@ -49,6 +50,7 @@ use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome, Wait};
 use crate::chunk;
 use crate::door::{self, Piece};
+use crate::labels;
 use crate::place;
 use crate::read::{Query, Read};
 use mantle_protocol::bounds;
@@ -135,6 +137,9 @@ pub(crate) struct Job {
     /// The blocks a put of it holds going down at once, as the node learned them when it was
     /// admitted (`crate::window`) and charged for them.
     window: usize,
+    /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
+    /// native request's fields are read, or for one answered without its operation.
+    label: Option<&'static Label>,
 }
 
 impl Job {
@@ -1091,6 +1096,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            label: None,
         });
     }
 
@@ -1107,6 +1113,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let now = hyper_rt::futures::now_ns();
         let mut admitted_ns = None;
         let (charge, window) = charged(self.gateway.as_ref(), &self.put_window, &op);
+        let label = Some(labels::host(&op));
         // The door holds a request while the host has no room (`take_door`): one taken here past
         // the limit is a stopping node's.
         let room = self.gateway.is_some() && !self.stopping() && self.admits(charge);
@@ -1146,6 +1153,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            label,
         });
     }
 
@@ -1480,6 +1488,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         admission.took(more);
                         job.charge = job.charge.saturating_add(more);
                     }
+                    job.label = Some(labels::host(&op));
                     work(op, carry, block)
                 }
             };
@@ -1550,10 +1559,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The host at a turn: each operation's answers taken, its next requests asked, its body read
     /// and its bytes written as far as they go, and each one done answered.
+    ///
+    /// The node's task is labelled, as the turn ends, with the operation whose step held it
+    /// longest, none where it stepped none (`crate::labels`): a long poll of the task is counted
+    /// under the operation that cost it most.
     pub(super) fn step_host(&mut self) -> Result<(), NodeError> {
         self.drop_abandoned();
         self.step_lookups();
         if self.jobs.is_empty() {
+            labels::set(None);
             return Ok(());
         }
         // Every operation's answers taken before any asks again, so each asks with the room
@@ -1577,12 +1591,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.offer_room()?;
         }
         self.bound_jobs()?;
+        // The step that held the turn longest, and its operation's label.
+        let mut slowest: Option<(u64, &'static Label)> = None;
         let mut at = 0;
         while at < self.jobs.len() {
             // Bytes of its own body read or of its reply written are its work moving, as its
             // asks answered are.
             let before = self.moved;
+            let label = self.jobs.get(at).and_then(|job| job.label);
+            let began = hyper_rt::futures::now_ns();
             let over = self.step_job(at)?;
+            let held = hyper_rt::futures::now_ns().saturating_sub(began);
+            if let Some(label) = label
+                && slowest.is_none_or(|(most, _)| held >= most)
+            {
+                slowest = Some((held, label));
+            }
             if self.moved != before
                 && let Some(job) = self.jobs.get_mut(at)
             {
@@ -1598,6 +1622,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 at = at.saturating_add(1);
             }
         }
+        labels::set(slowest.map(|(_, label)| label));
         Ok(())
     }
 
@@ -5523,6 +5548,7 @@ mod tests {
             admitted_ns: Some(1),
             charge: 0,
             window: 1,
+            label: None,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);

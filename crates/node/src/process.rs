@@ -91,8 +91,10 @@
 //! of its own process ([`answer_counts`]: `uncounted` where the binary gives none), then the
 //! write path's counts (`write_path_counts`): the log's frames, their updates and its flushes,
 //! the entries the node proposed and their commands, and its updates' commit waits since it was
-//! last asked. A line it cannot read ends the process
-//! with the line named. Standard input closing ends `mantle node`, its
+//! last asked; then the table of what held its shard (`slow_poll_counts`): each spawn site and
+//! label whose polls held the shard past twice its quantum, with those polls since the shard
+//! began, how long they held it in all and at most, and whose time it was. A line it cannot read
+//! ends the process with the line named. Standard input closing ends `mantle node`, its
 //! harness's child, at once, without the orderly stop's steps; `mantle serve` runs on, as under a
 //! service manager, whose input is empty.
 //!
@@ -1363,6 +1365,56 @@ fn write_path_counts(
     Ok(())
 }
 
+/// The table of what held the node's shard, written after the write path's counts in a `counts`
+/// answer, as names and values (hyper-rt `slow`): `slow_entries`, the entries that follow, then
+/// for each `slow_site`, the file, line and column its tasks were spawned at, `slow_label`, the
+/// label they had as their polls ended (each a word, [`word`]; `-` for none), `slow_polls`, the
+/// polls that held the shard past twice its quantum, `slow_held_ns` and `slow_longest_ns`, how
+/// long they held it in all and at most, and `slow_task` and `slow_host`, those of them that were
+/// the task's time and the host's. Every count is since the shard began, so a reader takes two
+/// answers' difference; the entries are at most the table's ([`hyper_rt::slow::ENTRIES`] and its
+/// one unkeyed entry), so an answer grows no further.
+pub fn slow_poll_counts(said: &mut String, polls: &[hyper_rt::slow::SlowPoll]) -> std::fmt::Result {
+    write!(said, " slow_entries {}", polls.len())?;
+    for poll in polls {
+        said.push_str(" slow_site ");
+        match poll.site {
+            Some(site) => {
+                word(said, site.file())?;
+                write!(said, ":{}:{}", site.line(), site.column())?;
+            }
+            None => said.push('-'),
+        }
+        said.push_str(" slow_label ");
+        match poll.label {
+            Some(label) => word(said, label.name)?,
+            None => said.push('-'),
+        }
+        write!(
+            said,
+            " slow_polls {} slow_held_ns {} slow_longest_ns {} slow_task {} slow_host {}",
+            poll.polls, poll.held_ns, poll.longest_ns, poll.task_polls, poll.host_polls
+        )?;
+    }
+    Ok(())
+}
+
+/// `text` as one word of a line its reader splits at whitespace: each whitespace character, and
+/// each `%`, written as `%` and its octets' two hex digits, as a URI percent-encodes an octet (RFC
+/// 3986 §2.1), so a path with a space in it stays one word.
+fn word(said: &mut String, text: &str) -> std::fmt::Result {
+    for c in text.chars() {
+        if c.is_whitespace() || c == '%' {
+            for octet in c.to_string().bytes() {
+                write!(said, "%{octet:02X}")?;
+            }
+        } else {
+            said.push(c);
+        }
+    }
+    Ok(())
+}
+
 /// The `q_ppm` quantile of the values `now` counted since it stood as `then`, bucket by bucket, as
 /// `Histogram::quantile` reads one histogram (by the nearest rank, the most the bucket holding it
 /// holds): `None` when nothing was counted since. `then` is an earlier state of the one histogram,
@@ -2333,6 +2385,13 @@ async fn serve(
                             &mut asked,
                         )
                         .map_err(wrote)?;
+                        // The table of the shard this task runs on, none where the runtime
+                        // registers no table for it.
+                        let slow = hyper_rt::registry::current_shard()
+                            .and_then(hyper_rt::registry::holder_of)
+                            .map(hyper_rt::slow::slow_polls)
+                            .unwrap_or_default();
+                        slow_poll_counts(&mut line, &slow).map_err(wrote)?;
                         line.push('\n');
                         stats = Some(log);
                         say(&mut output, &line).await?;
@@ -3317,6 +3376,50 @@ mod tests {
             3_072_000_001
         );
         assert_eq!(lines, "longest-poll 4200\nlongest-poll 3072000001\n");
+    }
+
+    /// The table of what held the shard is said entry by entry, each field a name and one word,
+    /// the unkeyed entry's site and label `-`, and a site's or a label's whitespace and `%`
+    /// percent-encoded so each stays one word.
+    #[test]
+    fn the_slow_poll_table_is_said_as_names_and_words() {
+        static OP: hyper_rt::slow::Label = hyper_rt::slow::Label::new("Get Object%");
+        let site = std::panic::Location::caller();
+        let polls = [
+            hyper_rt::slow::SlowPoll {
+                site: Some(site),
+                label: Some(&OP),
+                polls: 3,
+                held_ns: 900,
+                longest_ns: 500,
+                task_polls: 2,
+                host_polls: 1,
+            },
+            hyper_rt::slow::SlowPoll {
+                site: None,
+                label: None,
+                polls: 1,
+                held_ns: 7,
+                longest_ns: 7,
+                task_polls: 0,
+                host_polls: 0,
+            },
+        ];
+        let mut said = String::new();
+        slow_poll_counts(&mut said, &polls).unwrap();
+        let expected = format!(
+            " slow_entries 2 slow_site {}:{}:{} slow_label Get%20Object%25 slow_polls 3 \
+             slow_held_ns 900 slow_longest_ns 500 slow_task 2 slow_host 1 slow_site - slow_label - \
+             slow_polls 1 slow_held_ns 7 slow_longest_ns 7 slow_task 0 slow_host 0",
+            site.file(),
+            site.line(),
+            site.column()
+        );
+        assert_eq!(said, expected);
+        assert_eq!(said.split_whitespace().count() % 2, 0, "names and values");
+        let mut none = String::new();
+        slow_poll_counts(&mut none, &[]).unwrap();
+        assert_eq!(none, " slow_entries 0");
     }
 
     #[test]

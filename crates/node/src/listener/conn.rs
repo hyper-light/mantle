@@ -249,7 +249,10 @@ impl Connection {
             if matches!(self.admitted, Admitted::Refused) {
                 return self.slow_down(&head, &octets).await;
             }
-            match self.request(&head, &octets).await {
+            let served = self.request(&head, &octets).await;
+            // The request ended, its operation's label with it (`crate::labels`).
+            crate::labels::set(None);
+            match served {
                 Ok(true) => {}
                 Ok(false) => return Ended::Close,
                 Err(()) => return Ended::Broken,
@@ -409,6 +412,8 @@ impl Connection {
         framing: Framing,
     ) -> Result<request::Asked, Refused> {
         let route = request::routed(parts, self.endpoint)?;
+        // What the connection's polls hold its shard for from here to the request's end.
+        crate::labels::set(Some(crate::labels::s3(&route.operation)));
         let claimed = request::claimed(parts)?;
         let source = request::Source {
             secure: self.endpoint.certified.is_some(),

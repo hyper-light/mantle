@@ -43,6 +43,7 @@ pub mod directory;
 pub mod door;
 pub mod frame;
 pub mod history;
+mod labels;
 pub mod layout;
 pub mod listener;
 pub mod names;

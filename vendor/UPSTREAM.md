@@ -87,10 +87,20 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `17371e2` (hyper-raft branch `land/mantle-general-4`: `land/mantle-general-3`'s
-`ba33c1e` and four topics, on `main`'s `045cf3f`), with no local delta**, taken by
-`scripts/snapshot-hyper-raft.py`. The branch is in the hyper-raft repository's own objects and not
-yet pushed to its origin. It is the landing candidate of mantle's general changes to the shared
+**Every crate at `1783231` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
+`17371e2` and one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its commit
+changes hyper-rt alone (`1783231`; hyper-raft docs/runtime.md §3.12, hyper-rt ORIGIN.md, "what held a
+shard"): each shard counts its long polls, those held past twice its step quantum since it last let
+them go on (§3.11), against the task's spawn site, recorded by `#[track_caller]` at every spawn, and
+the label the task set (`futures::label`), with their hold, their longest and the attribution's
+verdict, the task's or the host's, on a table of fixed size (the entries one 4 KiB page holds; a
+pair past them counted in one unkeyed entry, nothing evicted) that any thread reads
+(`slow::slow_polls`). The threshold is the long-poll rule's, derived from the quantum, where Kiln's
+runtime copy, whose design this takes, counts polls past a picked 100 µs. Every other crate is as at
+`17371e2`. Before it, every crate was at `17371e2` (hyper-raft branch `land/mantle-general-4`:
+`land/mantle-general-3`'s `ba33c1e` and four topics, on `main`'s `045cf3f`), with no local delta,
+taken by `scripts/snapshot-hyper-raft.py`. That branch is the landing candidate of mantle's general changes to the shared
 crates, which goes to hyper-raft `main` once hyper-raft's gates and every consumer's suite pass on
 it. Over `ba33c1e` it brings hyper-liveness's sender's floor never below the stream's own proof,
 from the poll that asked a liveness write to the poll that takes its durability (`65cdd84`;

@@ -70,8 +70,10 @@ pub fn current_task() -> Option<TaskId> {
 }
 
 /// Spawns a joinable task on the current shard with no parent.
+#[track_caller]
 pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, false))
+    let site = std::panic::Location::caller();
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, (true, false), site))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -80,8 +82,10 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
 /// Cleanup after driver loss must use channel completions, not new native readiness waits.
 /// A service must turn typed failures into cleanup. A panicked future cannot be safely
 /// resumed; this opt-in does not promise recovery from panic or a blocking destructor.
+#[track_caller]
 pub fn spawn_service<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, true))
+    let site = std::panic::Location::caller();
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, (true, true), site))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -142,16 +146,33 @@ impl Future for Cancelled {
 
 /// Spawns a detached task on the current shard: nobody joins it, and its slot is freed when it ends (a
 /// server's per-connection task).
+#[track_caller]
 pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, false, false))
+    let site = std::panic::Location::caller();
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, (false, false), site))
         .ok_or(RtError::NotOnShardThread)?
 }
 
 /// Spawns a joinable child of the current task; a parent's completion cancels and joins it.
+#[track_caller]
 pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+    let site = std::panic::Location::caller();
     registry::with_current(|ctx| {
         let parent = ctx.current_task().map(|t| t.0.slot());
-        ctx.spawn_framed(future, parent, true, false)
+        ctx.spawn_framed(future, parent, (true, false), site)
+    })
+    .ok_or(RtError::NotOnShardThread)?
+}
+
+/// Labels the task being polled with what it is doing (`label`; `None` clears it): its long polls are counted
+/// under the label it has as each ends, beside its spawn site (`crate::slow`), until it sets another. Refused
+/// `NotOnShardThread` when no task is being polled on this thread.
+pub fn label(label: Option<&'static crate::slow::Label>) -> Result<(), RtError> {
+    registry::with_current(|ctx| {
+        let slot = ctx.current_slot().ok_or(RtError::NotOnShardThread)?;
+        let cell = ctx.task(slot).ok_or(RtError::NotOnShardThread)?;
+        cell.label.set(label);
+        Ok(())
     })
     .ok_or(RtError::NotOnShardThread)?
 }

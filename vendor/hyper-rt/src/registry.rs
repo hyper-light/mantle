@@ -93,6 +93,9 @@ pub struct Entry {
     pub parking: Parking,
     /// The shard's forward-progress pulse, for an observer on any thread (see [`Pulse`]).
     pub pulse: Pulse,
+    /// The shard's long polls by spawn site and label, which only the shard writes and any thread reads
+    /// ([`crate::slow`]).
+    pub(crate) slow: crate::slow::SlowTable,
     /// Set by the shard at its loop's exit ([`note_exited`]): its rings will never be drained again, so
     /// a sender that finds one full stops spinning and counts the wake stale instead of waiting for a
     /// consumer that is gone (the livelock the registry stress test found on 2026-09-14).
@@ -489,6 +492,7 @@ pub(crate) fn register_runtime_slot(
             cpu_clock: AtomicU64::new(0),
             parking: Parking::new(),
             pulse: Pulse::default(),
+            slow: crate::slow::SlowTable::default(),
             exited: AtomicBool::new(false),
             abandoned: (0..waits).map(|_| AtomicU64::new(0)).collect(),
             abandoned_summary: (0..waits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),

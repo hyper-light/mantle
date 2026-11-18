@@ -58,10 +58,14 @@ pub struct SpawnRequest {
     pub parent: Option<Encoded>,
     /// The receipt to answer at admission; none for a fire-and-forget submission.
     pub receipt: ReceiptSlot,
+    /// Where it was asked for (`#[track_caller]` through the spawn that made it), which the shard's long
+    /// polls are counted against (`crate::slow`).
+    pub site: Option<&'static std::panic::Location<'static>>,
 }
 
 impl SpawnRequest {
     /// A request whose admission nobody reads.
+    #[track_caller]
     pub fn new(
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
         parent: Option<Encoded>,
@@ -70,10 +74,12 @@ impl SpawnRequest {
             future,
             parent,
             receipt: ReceiptSlot::none(),
+            site: Some(std::panic::Location::caller()),
         }
     }
 
     /// A request whose admission the submitter reads: the request, and the receipt it answers.
+    #[track_caller]
     pub fn with_receipt(
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
         parent: Option<Encoded>,
@@ -84,6 +90,7 @@ impl SpawnRequest {
                 future,
                 parent,
                 receipt: slot,
+                site: Some(std::panic::Location::caller()),
             },
             receipt,
         )
@@ -95,6 +102,7 @@ impl std::fmt::Debug for SpawnRequest {
         f.debug_struct("SpawnRequest")
             .field("parent", &self.parent)
             .field("receipt", &self.receipt.0.is_some())
+            .field("site", &self.site)
             .finish()
     }
 }

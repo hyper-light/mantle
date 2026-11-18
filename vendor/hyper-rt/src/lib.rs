@@ -79,6 +79,7 @@ pub mod signal;
 #[cfg(unix)]
 mod signal_protocol;
 pub mod sim;
+pub mod slow;
 pub mod stdio;
 pub mod sync;
 pub mod task;

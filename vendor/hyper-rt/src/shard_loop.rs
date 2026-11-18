@@ -298,10 +298,12 @@ struct Core {
     completions: Vec<Completion>,
 }
 
-/// A long poll left for the step's end: how far it ran past the quantum by the wall clock.
+/// A long poll left for the step's end: how far it ran past the quantum by the wall clock, and where its
+/// shard's table counted it (`crate::slow`), for its verdict.
 #[derive(Clone, Copy, Debug)]
 struct Deferred {
     overrun_ns: u64,
+    place: Option<crate::slow::Place>,
 }
 
 /// A shard: its desk and its loop, owned together by whoever runs it (a worker thread, a
@@ -630,6 +632,7 @@ impl Shard {
             future,
             parent,
             receipt,
+            site,
         } = request;
         if self.core.shutting_down {
             count(&self.desk.live.refused_at_shutdown, 1);
@@ -647,6 +650,7 @@ impl Shard {
             parent,
             joinable: false,
             service,
+            site,
         });
         if let Ok(task) = &admitted {
             self.install_listed(task.0.slot());
@@ -660,6 +664,7 @@ impl Shard {
     }
 
     /// Spawns a joinable local task from the shard's owner (between runs).
+    #[track_caller]
     pub fn spawn_local(&mut self, future: BoxedFuture) -> Result<TaskId, RtError> {
         if self.core.shutting_down || self.core.exited {
             return Err(RtError::ShardGone {
@@ -673,6 +678,7 @@ impl Shard {
     }
 
     /// Owner-side service admission, before the future can first be polled.
+    #[track_caller]
     pub(crate) fn spawn_service_local(&mut self, future: BoxedFuture) -> Result<TaskId, RtError> {
         if self.core.shutting_down || self.core.exited {
             return Err(RtError::ShardGone {
@@ -799,6 +805,7 @@ impl Shard {
             parent,
             joinable,
             service,
+            site: _,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
         let (generation, cancelled) = self.desk.task(slot).map_or((0, false), |cell| {
@@ -1541,16 +1548,50 @@ impl Shard {
         }
     }
 
+    /// A long poll of the task in `slot`, held from `held_from` (its start or its last go-on) to `ended`, past
+    /// `threshold` (twice the step quantum): counted against the task's spawn site and label on the shard's
+    /// table (`crate::slow`), then attributed ([`Shard::attribute_poll`]), its verdict counted on the same
+    /// entry now or at the step's end.
+    #[cold]
+    fn long_poll(
+        &mut self,
+        slot: u32,
+        held_from: u64,
+        ended: u64,
+        threshold: u64,
+    ) -> Option<Attribution> {
+        let place = self.note_slow(slot, ended.saturating_sub(held_from));
+        let attributed = self.attribute_poll(held_from, ended, threshold, place);
+        if let (Some(attributed), Some(place), Some(entry)) = (attributed, place, self.desk.entry) {
+            entry.slow.attribute(place, attributed);
+        }
+        attributed
+    }
+
+    /// Counts a long poll of the task in `slot` that held the shard `held_ns` against the task's spawn site
+    /// and label (`crate::slow`); where it was counted, none for a shard with no registry entry.
+    fn note_slow(&self, slot: u32, held_ns: u64) -> Option<crate::slow::Place> {
+        let entry = self.desk.entry?;
+        let cell = self.desk.task(slot)?;
+        let key = crate::slow::Key {
+            site: cell.site.get(),
+            label: cell.label.get(),
+        };
+        Some(entry.slow.note(key, held_ns))
+    }
+
     /// Attributes a poll's hold, from `poll_started_ns` (its start or its last go-on, docs/runtime.md §3.11)
     /// to `ended_ns`, against `quantum` (twice the step quantum): within it by the wall clock it is within;
     /// past it, the attribution windows decide whose it was ([`crate::attribution`]), at once or, judging by
-    /// step, at the step's end ([`Shard::judge_deferred`]), for which it returns `None` now.
+    /// step, at the step's end ([`Shard::judge_deferred`]), for which it returns `None` now and keeps `place`,
+    /// where the shard's table counted the poll, for the verdict.
     #[cold]
     fn attribute_poll(
         &mut self,
         poll_started_ns: u64,
         ended_ns: u64,
         quantum: u64,
+        place: Option<crate::slow::Place>,
     ) -> Option<Attribution> {
         let wall_ns = ended_ns.saturating_sub(poll_started_ns);
         if wall_ns <= quantum {
@@ -1564,6 +1605,7 @@ impl Shard {
         {
             self.core.deferred.push(Deferred {
                 overrun_ns: wall_ns.saturating_sub(quantum),
+                place,
             });
             self.core.attribution.long_poll_deferred();
             return None;
@@ -1599,6 +1641,9 @@ impl Shard {
             };
             undecided |= matches!(attributed, Attribution::NoWindow | Attribution::Ambiguous);
             count_long_poll(&self.desk.live, attributed);
+            if let (Some(place), Some(entry)) = (deferred.place, self.desk.entry) {
+                entry.slow.attribute(place, attributed);
+            }
         }
         if undecided {
             self.core.attribution.undecided();
@@ -1858,7 +1903,7 @@ impl Shard {
         let held_from = start.max(self.desk.checked_ns.get());
         let threshold = quantum_ns.saturating_mul(2);
         let attributed = if ended.saturating_sub(held_from) > threshold {
-            self.attribute_poll(held_from, ended, threshold)
+            self.long_poll(slot, held_from, ended, threshold)
         } else {
             None
         };

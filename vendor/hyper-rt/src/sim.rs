@@ -1317,6 +1317,7 @@ impl SimRuntime {
     }
 
     /// Spawns a detached task on a shard.
+    #[track_caller]
     pub fn spawn_on(
         &mut self,
         shard: ShardId,

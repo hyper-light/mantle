@@ -97,3 +97,16 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   retirement), so hyper-block's segmented files share their open files by it: the owner retires
   them, a transfer through any other handle pins them for its call, and the last such closes them
   (hyper-block `ORIGIN.md` change 17). The protocol and its loom model are unchanged.
+
+## Made here: what held a shard, by spawn site and label (2026-11-18)
+
+- Each long poll (docs/runtime.md §3.11) is counted against its task's spawn site and label on a fixed
+  table on the shard's registry entry, with its hold, its longest and the attribution's verdict
+  (`src/slow.rs`, docs/runtime.md §3.12): every spawn records its caller (`#[track_caller]`;
+  `Incoming::site`, `TaskCell::site`, `SpawnRequest::site`), a task labels itself
+  (`futures::label`, `TaskCell::label`), and any thread reads a shard's table
+  (`slow::slow_polls`). Taken from Kiln's runtime copy (`kiln-rt`'s `slow.rs`, plan `01a1a87b2cec`
+  step 2) as a design, not as code: Kiln counts polls past a fixed 100 µs; here the threshold is
+  §3.11's, twice the quantum, so every counted poll has a verdict; Kiln's table of 128 entries is
+  here the entries one 4 KiB page holds. Tests: `tests/slow_polls.rs`, three unit tests in
+  `slow.rs`.

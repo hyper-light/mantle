@@ -85,6 +85,9 @@ pub(crate) struct Incoming {
     pub(crate) parent: Option<u32>,
     pub(crate) joinable: bool,
     pub(crate) service: bool,
+    /// Where it was spawned (`#[track_caller]`), which the shard's long polls are counted against
+    /// (`crate::slow`).
+    pub(crate) site: Option<&'static std::panic::Location<'static>>,
 }
 
 /// A poller's readiness question: a task that owns a ring the loop cannot see (a client's command ring in
@@ -116,6 +119,10 @@ pub(crate) struct TaskCell {
     /// are the loop's, so its install and its reap are asked of the loop; a task with no parent is listed at
     /// its spawn, installed at its first poll, and reaped by its join.
     pub(crate) parented: Cell<bool>,
+    /// Where the task was spawned, set at its claim (`crate::slow`).
+    pub(crate) site: Cell<Option<&'static std::panic::Location<'static>>>,
+    /// What the task says it is doing ([`crate::futures::label`]), none at its claim (`crate::slow`).
+    pub(crate) label: Cell<Option<&'static crate::slow::Label>>,
 }
 
 /// Where a timer slot is in its life.
@@ -469,6 +476,8 @@ impl ShardContext {
                     cancelled: Cell::new(false),
                     cancel_children: Cell::new(false),
                     parented: Cell::new(false),
+                    site: Cell::new(None),
+                    label: Cell::new(None),
                 })
                 .collect(),
             free_tasks: CellStack::full_of(task_ids.into_iter()),
@@ -709,27 +718,32 @@ impl ShardContext {
 
     /// Spawns a joinable task under `parent` (a slot of this shard), answered at once with its id; the loop
     /// installs it before the next poll. Refused `TooManyTasks` when no slot is free.
+    #[track_caller]
     pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
         self.claim(Incoming {
             future: TaskFuture::Boxed(future),
             parent,
             joinable: true,
             service: false,
+            site: Some(std::panic::Location::caller()),
         })
     }
 
     /// Spawns a detached task on this shard: nobody joins it, and its slot is freed when it ends.
+    #[track_caller]
     pub fn spawn_detached(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
         self.claim(Incoming {
             future: TaskFuture::Boxed(future),
             parent: None,
             joinable: false,
             service: false,
+            site: Some(std::panic::Location::caller()),
         })
     }
 
     /// Spawns a joinable service. Cancellation wakes the future; it must await
     /// `futures::cancelled`, retire its external ownership, and return Ready.
+    #[track_caller]
     pub(crate) fn spawn_service_local(
         &self,
         future: BoxedFuture,
@@ -740,18 +754,19 @@ impl ShardContext {
             parent,
             joinable: true,
             service: true,
+            site: Some(std::panic::Location::caller()),
         })
     }
 
     /// Spawns `future` written into a frame of this shard's (`crate::frames`): under `parent` (a slot of this
-    /// shard), joinable or detached, a service or not. The spawns a task makes on its own shard
-    /// (`crate::futures`); refused as a claim is, and `Mem` when no frame could be had.
+    /// shard), joinable or detached, a service or not, spawned at `site`. The spawns a task makes on its own
+    /// shard (`crate::futures`); refused as a claim is, and `Mem` when no frame could be had.
     pub(crate) fn spawn_framed<F: std::future::Future<Output = ()> + 'static>(
         &self,
         future: F,
         parent: Option<u32>,
-        joinable: bool,
-        service: bool,
+        (joinable, service): (bool, bool),
+        site: &'static std::panic::Location<'static>,
     ) -> Result<TaskId, RtError> {
         let future = TaskFuture::Framed(self.frames.put(future)?);
         self.claim(Incoming {
@@ -759,6 +774,7 @@ impl ShardContext {
             parent,
             joinable,
             service,
+            site: Some(site),
         })
     }
 
@@ -796,6 +812,8 @@ impl ShardContext {
         cell.joiner.set(None);
         let parented = incoming.parent.is_some();
         cell.parented.set(parented);
+        cell.site.set(incoming.site);
+        cell.label.set(None);
         cell.incoming.set(Some(incoming));
         if parented {
             self.ask(slot, ask::INSTALL);

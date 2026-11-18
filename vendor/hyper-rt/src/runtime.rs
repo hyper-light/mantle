@@ -26,6 +26,7 @@ use crate::task::{AdmissionReceipt, SpawnRequest};
 /// (a submitter that may outlive the runtime — an observation still pending while its daemon stops),
 /// and returns the receipt of its admission; refused `ShardGone` when the slot is free or held by a
 /// later registration, `ControlFull` when the holder's control queue is full.
+#[track_caller]
 pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
     holder: registry::SlotHolder,
     future: F,
@@ -37,6 +38,7 @@ pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
 
 /// Submits an opt-in service bootstrap to this exact registration. An unadmitted
 /// bootstrap must not own live I/O; transfer that ownership only after `Admitted`.
+#[track_caller]
 pub fn submit_service_to_holder<F: Future<Output = ()> + Send + 'static>(
     holder: registry::SlotHolder,
     future: F,
@@ -652,6 +654,7 @@ impl Runtime {
     /// channel is full (its admission limit) or the shard is gone. `Ok` is a **submission**: the request
     /// is in the shard's control queue, and whether the shard admits it is answered only to a receipt
     /// ([`Self::spawn_on_with_receipt`]).
+    #[track_caller]
     pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(
         &self,
         shard: ShardId,
@@ -665,6 +668,7 @@ impl Runtime {
     /// ([`AdmissionReceipt`]): refused here when the shard's control queue is full or the shard is gone;
     /// otherwise the receipt reports, once the shard drains the request, whether the task was admitted
     /// (and as which task), refused (the arena full), or terminated unadmitted (the shard shutting down).
+    #[track_caller]
     pub fn spawn_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
         &self,
         shard: ShardId,
@@ -677,6 +681,7 @@ impl Runtime {
 
     /// Submits an opt-in service bootstrap and returns its real admission receipt.
     /// Cancellation keeps the admitted future alive until its cleanup returns Ready.
+    #[track_caller]
     pub fn spawn_service_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
         &self,
         shard: ShardId,
@@ -828,6 +833,7 @@ impl LocalRuntime {
     }
 
     /// Spawns a joinable task.
+    #[track_caller]
     pub fn spawn<F: Future<Output = ()> + 'static>(
         &mut self,
         future: F,
@@ -836,6 +842,7 @@ impl LocalRuntime {
     }
 
     /// Spawns a joinable service whose future completes its cancellation cleanup.
+    #[track_caller]
     pub fn spawn_service<F: Future<Output = ()> + 'static>(
         &mut self,
         future: F,
@@ -858,6 +865,7 @@ impl LocalRuntime {
     /// call. Refused when the root cannot be admitted, `ShardGone` when the shard's driver is lost before
     /// the root finishes, and `RootUnwound` when the root's future unwinds: the shard's boundary ends that
     /// task with no output to wait for.
+    #[track_caller]
     pub fn block_on<T: 'static>(
         &mut self,
         future: impl Future<Output = T> + 'static,

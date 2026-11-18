@@ -1604,7 +1604,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     far.seen = seen;
                 }
             }
-            shard::Out::Served(group, id, served) => self.served_far(group, id, served)?,
+            shard::Out::Served(group, id, served) => self.served_far(group, id, served, now)?,
             shard::Out::Compacted => self.compactions = self.compactions.saturating_add(1),
             shard::Out::Flushed(started, durable) => {
                 self.liveness
@@ -1670,8 +1670,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// A read a far range served ([`shard::Served`]): answered to its asker as `serve_reads`
-    /// answers one, and one its replica refused as `ask_read` refuses one.
-    fn served_far(&mut self, group: u128, id: u64, served: shard::Served) -> Result<(), NodeError> {
+    /// answers one, and one its replica refused as `ask_read` refuses one, or, this node's own, as
+    /// `ask_read_out` takes a refusal: after a pause while the range shows this node leading, else
+    /// of the leader there is now.
+    fn served_far(
+        &mut self,
+        group: u128,
+        id: u64,
+        served: shard::Served,
+        now: u64,
+    ) -> Result<(), NodeError> {
         let Some(at) = self
             .reading
             .iter()
@@ -1685,10 +1693,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             shard::Served::Failed => self.answer_read(reading.origin, None),
             shard::Served::Refused => match reading.origin {
                 ReadOrigin::Exchange(exchange) => self.refuse_read(exchange, group),
-                // This node's own: asked again of the leader there is now.
                 ReadOrigin::Own(ask) => {
+                    let (local, leads) = (self.id, self.leader_of(group) == self.id);
                     if let Some(out) = self.reads_out.iter_mut().find(|o| o.ask == ask) {
-                        out.via = Via::Unasked;
+                        out.via = if leads {
+                            let at_ns =
+                                paused_until(local, (&mut out.backoff, &mut out.pauses), now);
+                            out.leaderless_since.get_or_insert(now);
+                            Via::Paused {
+                                at_ns,
+                                leaderless: false,
+                            }
+                        } else {
+                            Via::Unasked
+                        };
                     }
                     Ok(())
                 }
@@ -3363,25 +3381,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // A range another shard drives is asked there, when it leads as last shown; one its lane
         // has no room for is refused, which its asker asks again after its pause (node.md §2.9).
         if let Some(far) = self.far.iter().find(|far| far.group == group) {
-            let asked = if far.seen.leading {
-                let lanes = self
-                    .shards
-                    .iter()
-                    .find(|lanes| lanes.shard() == far.shard)
-                    .ok_or(NodeError::ShardEnded(far.shard))?;
-                match lanes.send(shard::In::Read {
-                    group,
-                    id,
-                    query: query.clone(),
-                }) {
-                    Ok(()) => true,
-                    Err(NodeError::LaneFull(_)) => false,
-                    Err(e) => return Err(e),
-                }
-            } else {
-                false
-            };
-            if !asked {
+            if !shard::ask_read(&self.shards, far, id, &query)? {
                 return self.refuse_read(exchange, group);
             }
             self.reading.push(Reading {
@@ -4531,16 +4531,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some(handle) = self.kept(group).map(|k| k.handle) else {
                 return Ok(());
             };
-            let asked = self
-                .owner
-                .get_mut(handle)
-                .map(|shell| shell.read(id.to_le_bytes().to_vec()));
+            let Some(query) = self.reads_out.get(at).map(|out| out.query.clone()) else {
+                return Ok(());
+            };
+            // A range another shard drives is asked there (node.md §2.9), its read served back
+            // over its lane (`Node::served_far`).
+            let asked = match self.far.iter().find(|far| far.group == group) {
+                Some(far) => shard::ask_read(&self.shards, far, id, &query)?,
+                None => {
+                    let asked = self
+                        .owner
+                        .get_mut(handle)
+                        .is_some_and(|shell| shell.read(id.to_le_bytes().to_vec()).is_ok());
+                    if asked {
+                        self.owner.schedule(handle);
+                    }
+                    asked
+                }
+            };
             let local = self.id;
             let Some(out) = self.reads_out.get_mut(at) else {
                 return Ok(());
             };
-            if matches!(asked, Some(Ok(()))) {
-                self.owner.schedule(handle);
+            if asked {
                 out.via = Via::Local;
                 // Its wait for a quorum's confirmation, counted where nothing here judges (`unled`).
                 out.leaderless_since.get_or_insert(now);
@@ -4548,7 +4561,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     id,
                     origin: ReadOrigin::Own(out.ask),
                     group,
-                    query: out.query.clone(),
+                    query,
                 });
             } else {
                 // The member takes no read now (it is stepping down, or has no room): asked again

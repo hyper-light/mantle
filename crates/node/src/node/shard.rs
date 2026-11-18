@@ -326,6 +326,34 @@ pub(crate) fn movable<E: Engine + 'static, S: LogStore>(
     Ok(())
 }
 
+/// Asks read `id` of `far`'s replica on its shard ([`In::Read`]) when the range leads as its shard
+/// last showed it: whether it was asked. One whose lane has no room is not, as one its replica
+/// would refuse, and its asker asks again (`Node::ask_read`, `Node::ask_read_out`); a shard with no
+/// lanes, or one whose task ended, stops the node, typed.
+pub(crate) fn ask_read<E: Engine + 'static, S: LogStore>(
+    shards: &[Lanes<E, S>],
+    far: &Far,
+    id: u64,
+    query: &Query,
+) -> Result<bool, NodeError> {
+    if !far.seen.leading {
+        return Ok(false);
+    }
+    let lanes = shards
+        .iter()
+        .find(|lanes| lanes.shard() == far.shard)
+        .ok_or(NodeError::ShardEnded(far.shard))?;
+    match lanes.send(In::Read {
+        group: far.group,
+        id,
+        query: query.clone(),
+    }) {
+        Ok(()) => Ok(true),
+        Err(NodeError::LaneFull(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The node's shard's ends of a range's shard's two lanes.
 pub(crate) struct Lanes<E: Engine, S: LogStore> {
     shard: usize,
@@ -446,7 +474,9 @@ struct Shard<E: Engine, S: LogStore> {
     gave: Vec<Out>,
     driven: Vec<(Handle, Driven)>,
     /// The reads the replicas took and have yet to serve, at most `reads_most`: a lane's capacity,
-    /// the exchanges the transport admits at once, each of which asks at most one.
+    /// the exchanges the transport admits at once, each of which asks at most one. The node's own
+    /// reads ask here too; one past the bound is refused ([`Served::Refused`]) and asked again
+    /// after its asker's pause.
     reading: Vec<Reading>,
     reads_most: usize,
     /// The reads' contexts the replicas gave back this turn, each with its range; kept for its
@@ -1451,6 +1481,77 @@ mod tests {
         drop((leader, learner));
         rt.shutdown().unwrap();
         drop((log, learning_log));
+    }
+
+    /// Node 1's view of a far range on shard 1 as it showed `seen`.
+    fn far(seen: Seen) -> Far {
+        Far {
+            group: GROUP,
+            shard: 1,
+            peers: Vec::new(),
+            election: None,
+            seen,
+            reports: Vec::new(),
+        }
+    }
+
+    /// The node's own read of a far range it leads is asked of the range's shard and served back
+    /// by its id (`Node::ask_read_out`), as a peer's is; one of a range shown not leading is not
+    /// asked, and its asker asks again.
+    #[test]
+    fn the_nodes_own_read_of_a_far_range_it_leads_is_served_by_its_shard() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (lanes, moved, _) = leading(&rt, &log, &range);
+        let mut shards = vec![lanes];
+        let mut far = far(moved);
+        let query = Query::Current {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        assert!(!far.seen.leading);
+        assert!(!ask_read(&shards, &far, 9, &query).unwrap());
+        far.seen.leading = true;
+        assert!(ask_read(&shards, &far, 9, &query).unwrap());
+        let Out::Served(group, id, served) =
+            next(&mut shards[0], "the read served", deadline(), |out| {
+                !matches!(out, Out::Served(..))
+            })
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        assert_eq!((group, id), (GROUP, 9));
+        assert!(matches!(served, Served::Read(read) if *read == Read::NoBucket));
+        drop(shards);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// A read asked of a far range's shard whose lane holds all it takes is not asked, which its
+    /// asker takes as its replica's refusal, asked again after a pause; one of a shard the node has
+    /// no lanes to stops the node, typed.
+    #[test]
+    fn a_full_lane_refuses_a_read_as_its_replica_would() {
+        let (lanes, _ends) = unstarted(1);
+        lanes.send(measured()).unwrap();
+        let shards = vec![lanes];
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let mut far = far(Seen::of(&campaigning(&log, &range)));
+        far.seen.leading = true;
+        let query = Query::Current {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        assert!(!ask_read(&shards, &far, 1, &query).unwrap());
+        far.shard = 2;
+        assert!(matches!(
+            ask_read(&shards, &far, 2, &query),
+            Err(NodeError::ShardEnded(2))
+        ));
     }
 
     /// A replica with a write out is refused a move, typed: the write's answer would wake the

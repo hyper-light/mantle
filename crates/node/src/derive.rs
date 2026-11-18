@@ -1264,6 +1264,16 @@ pub const SHARD_INTEREST_BYTES: u64 = 397;
 /// each power of two (+32,984 from 1,024 waiters to 1,025, 1,024 more slots and a waiter's 208).
 pub const SHARD_INTEREST_SLOT_BYTES: u64 = 16;
 
+/// The slots of a shard's table of waiters' handles the floor charges each waiter: the table is the
+/// power of two at or past twice its waiters (hyper-rt `Interests::new`), so it holds fewer than
+/// four slots a waiter at every count, and four bounds it. Charged at its power of two instead, the
+/// runtime grew by nothing from one S3 connection to two and by a doubled table at each power of
+/// two past them, so the operations' count, which charges each operation that difference
+/// (`derive`), passed the floor it was counted for: a node of three shards at 7 GiB counted a floor
+/// 190,464 bytes past its allowance, three tables grown from 128 slots to 4,096 at 16 bytes each
+/// (CI run 44286448798, macOS x86_64).
+pub const SHARD_INTEREST_SLOTS: usize = 4;
+
 /// What each entry of a shard's control queue holds, and the poll of its batch the loop reserves
 /// for it, a batch at most as many polls as entries (hyper-rt `RuntimeConfig::calibrate_batch`):
 /// measured on macOS arm64, 40 an entry and 24 a poll of the batch, from 5 entries to 1,024.
@@ -1358,11 +1368,13 @@ pub fn shard_shape(
 
 /// What the node's runtime holds of its `shards` shards, each of `shape` with `ring` control
 /// entries, beside their threads' stacks ([`stacks`]): its own ([`RUNTIME_BYTES`]); each shard's
-/// fixed bytes, its tasks', timers', waiters', waiters' table's and control entries'; the classes a
-/// shard's queue makes as a task takes Critical there ([`CRITICAL_BYTES`]), on the first for the
-/// node's task and on each of the `ranging` shards past it that run ranges for their task; and
-/// where an S3 listener serves `listening` connections, its lane to each shard past the first, each
-/// holding as many as the listener holds at once (`listener::tasks`).
+/// fixed bytes, its tasks', timers', waiters', waiters' table's at its bound
+/// ([`SHARD_INTEREST_SLOTS`], so the runtime grows by the same bytes with each S3 connection) and
+/// control entries'; the classes a shard's queue makes as a task takes Critical there
+/// ([`CRITICAL_BYTES`]), on the first for the node's task and on each of the `ranging` shards past
+/// it that run ranges for their task; and where an S3 listener serves `listening` connections, its
+/// lane to each shard past the first, each holding as many as the listener holds at once
+/// (`listener::tasks`).
 pub fn runtime_bytes(
     shards: usize,
     shape: &ShardShape,
@@ -1371,11 +1383,7 @@ pub fn runtime_bytes(
     ranging: usize,
 ) -> Option<u64> {
     let count = |n: usize| u64::try_from(n).ok();
-    let slots = shape
-        .interests
-        .max(1)
-        .checked_mul(2)?
-        .checked_next_power_of_two()?;
+    let slots = shape.interests.max(1).checked_mul(SHARD_INTEREST_SLOTS)?;
     let shard = SHARD_BYTES
         .checked_add(SHARD_TASK_BYTES.checked_mul(count(shape.tasks)?)?)?
         .checked_add(SHARD_TIMER_BYTES.checked_mul(count(shape.timers)?)?)?
@@ -3540,9 +3548,9 @@ mod tests {
 
     /// Each shard is sized for the first's role: the node's task and launcher, the timers its task
     /// holds, and with an S3 listener a task, a timer and a socket for each connection it holds at
-    /// once, two waiters a socket; the runtime holds each shard at those, the classes the node's
-    /// Critical task makes on the first, and a lane to each shard past the first holding as many
-    /// connections.
+    /// once, two waiters a socket, their table at four slots a waiter; the runtime holds each shard
+    /// at those, the classes the node's Critical task makes on the first, and a lane to each shard
+    /// past the first holding as many connections.
     #[test]
     fn the_runtime_holds_each_shard_at_the_firsts_shape_and_a_lane_past_the_first() {
         assert_eq!(
@@ -3567,7 +3575,7 @@ mod tests {
             + 268 * SHARD_TASK_BYTES
             + 269 * SHARD_TIMER_BYTES
             + 546 * SHARD_INTEREST_BYTES
-            + 2048 * SHARD_INTEREST_SLOT_BYTES
+            + 4 * 546 * SHARD_INTEREST_SLOT_BYTES
             + 16 * SHARD_RING_BYTES;
         let lane = LANE_BYTES + 266 * LANE_CONNECTION_BYTES;
         // The node's task Critical on the first shard alone.
@@ -3592,7 +3600,7 @@ mod tests {
                         + 2 * SHARD_TASK_BYTES
                         + 3 * SHARD_TIMER_BYTES
                         + 12 * SHARD_INTEREST_BYTES
-                        + 32 * SHARD_INTEREST_SLOT_BYTES
+                        + 4 * 12 * SHARD_INTEREST_SLOT_BYTES
                         + 16 * SHARD_RING_BYTES)
             )
         );
@@ -3624,7 +3632,7 @@ mod tests {
             + 269 * SHARD_TASK_BYTES
             + 269 * SHARD_TIMER_BYTES
             + 546 * SHARD_INTEREST_BYTES
-            + 2048 * SHARD_INTEREST_SLOT_BYTES
+            + 4 * 546 * SHARD_INTEREST_SLOT_BYTES
             + 16 * SHARD_RING_BYTES;
         let lane = LANE_BYTES + 266 * LANE_CONNECTION_BYTES;
         let critical = CRITICAL_BYTES + 269 * CRITICAL_SLOT_BYTES;
@@ -3639,6 +3647,93 @@ mod tests {
             Some(RUNTIME_BYTES + 10 * shard + 4 * critical + 9 * lane)
         );
         assert_eq!(runtime_bytes(10, &shape, 16, Some(256), usize::MAX), None);
+    }
+
+    /// The runtime grows by the same bytes with each S3 connection, at every count, shard and
+    /// placement of the ranges: the operations' count charges each operation the difference from
+    /// one to two (`derive`), so a step past it is a floor the count passes. Charged at its power
+    /// of two, each shard's table of waiters' handles grew by nothing from one connection to two,
+    /// then doubled; a joiner of three shards at 7 GiB counted a floor 190,464 bytes past its
+    /// allowance, three tables grown from 128 slots to 4,096 (CI run 44286448798, macOS x86_64).
+    #[test]
+    fn the_runtime_grows_by_the_same_bytes_with_each_connection() {
+        for shards in [1usize, 3, 4, 10] {
+            for peers in [2usize, 8] {
+                for ranges in [RangeShards::First, RangeShards::Spread] {
+                    let ranging = match ranges {
+                        RangeShards::First => 0,
+                        RangeShards::Spread => shards - 1,
+                    };
+                    let at = |served: u64| {
+                        let shape = shard_shape(Some(served), peers, ranges).unwrap();
+                        runtime_bytes(shards, &shape, 16, Some(served), ranging).unwrap()
+                    };
+                    let each = at(2) - at(1);
+                    // Either side of each power of two the old table doubled at, to past what a
+                    // node of 16 GiB serves.
+                    for served in [3u64, 53, 54, 117, 118, 501, 502, 1013, 1014, 3004, 16_374] {
+                        assert_eq!(
+                            at(served) - at(1),
+                            (served - 1) * each,
+                            "{shards} shards, {peers} peers, {ranges:?}, {served} served"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A node on the runners CI's membership suite runs on, S3 served and no volume of its own as
+    /// that suite's joiner has, at their cores and memory: three on the macOS runner's 7 GiB, four on
+    /// Windows' 16 GiB. Its listener serves thousands of connections, past the two at once that
+    /// suite's load and reads open, so its door answers none of them `503 SlowDown` for want of a
+    /// slot, and its floor, counted at the operations it derived, stays within its allowance.
+    #[test]
+    fn a_joiner_on_a_ci_runner_serves_thousands_of_connections_within_its_allowance() {
+        let joiner = || Stated {
+            s3: Some(crate::process::S3Stated {
+                listen: "127.0.0.1:7480".parse().unwrap(),
+                region: "us-east-1".into(),
+                names: Vec::new(),
+                certificate: at("/node/s3/cert.der"),
+                key: at("/node/s3/key.der"),
+                access: Vec::new(),
+            }),
+            keys: vec![(1, at("/node/keys/1"))],
+            enlist: Some(Enlisting {
+                root: 0x10,
+                domain: "light".into(),
+                max_nodes: 5,
+                max_volumes: 5,
+            }),
+            ..stated(0)
+        };
+        for (cores, memory) in [(3usize, 7u64 << 30), (4, 16 << 30)] {
+            let mut measured = facts(0);
+            measured.cores = cores;
+            measured.memory = machine(memory, None);
+            let derived = derive(joiner(), &measured, &mut fresh).unwrap();
+            let floor: u64 = [
+                "objects",
+                "volumes",
+                "engines",
+                "ranges",
+                "log",
+                "transport",
+                "runtime",
+                "threads",
+            ]
+            .iter()
+            .map(|class| said_bytes(&derived, &format!("memory.floor.{class}")))
+            .sum();
+            let connections = said_bytes(&derived, "gateway.objects");
+            eprintln!(
+                "{cores} cores, {memory} bytes: {connections} connections, floor {floor}, {} past it",
+                memory - floor
+            );
+            assert!(connections >= 1_000, "{cores} cores: {connections}");
+            assert!(floor <= memory, "{cores} cores: {floor}");
+        }
     }
 
     /// A range's member holds more for each read it is asked, up to the core's bound on reads,

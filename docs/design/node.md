@@ -320,14 +320,19 @@ measures the second, and derives the rest by these rules:
   shard's past it that runs ranges, one task more, their task's launcher (`derive::shard_shape`, as
   `process::runtime` sizes them), at 11,875
   bytes, 206 a task slot, 84 a timer, 397 a readiness waiter and 16 a slot of its waiters' table,
-  the power of two at or past twice them, and 64 a control entry, as many as the host's
+  four slots a waiter, the bound of hyper-rt's power of two at or past twice them, so the runtime
+  grows by the same bytes with each connection and the operations' count, which charges each
+  operation the difference from one to two, never passes the floor where a table doubles (CI run
+  44286448798: charged at the power of two, a joiner of three shards at 7 GiB counted a floor
+  190,464 bytes past its allowance, three tables grown from 128 slots to 4,096), and 64 a control
+  entry, as many as the host's
   calibration gives a shard (the `ring` basis line); the classes a shard's queue makes as a task
   takes Critical there, the first's for the node's task and under `spread` each's past it that runs
   ranges for their task (§2.9), 192 bytes and 9 a task slot; and with an S3 listener its lane to each
   shard past the first, 1,576 bytes and 88 for each connection the listener holds at once
   (`listener::tasks`). At ten shards and 256 connections served, 3.6 MB stated against 2.6 MB
-  counted on macOS arm64 (3,605,177 and 2,560,629 bytes; under `spread`, every shard past the first
-  running ranges, 3,630,763 and 2,586,205, 2026-11-18): a waiter's 397 holds Windows' table of its outstanding polls, 188 of
+  counted on macOS arm64 (3,624,377 and 2,560,629 bytes; under `spread`, every shard past the first
+  running ranges, 3,649,963 and 2,586,205, 2026-11-18): a waiter's 397 holds Windows' table of its outstanding polls, 188 of
   them, derived from its sizes; a lane's 88, Windows' socket of 8 octets where a descriptor is 4);
   and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:

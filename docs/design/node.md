@@ -2986,8 +2986,25 @@ the policy itself is the listener's step (§4.2). A put reads its bucket's row a
 driver over it, a data key drawn for the file and wrapped under the root key's current generation
 (encryption.md §2) and the scheme the durability model chooses for the cell's domains
 (`mantle_ec::durability::choose`), chosen once per change of the volume table's volumes or their
-domains and carried across the entries the root range applies otherwise (`host::scheme_over`;
-it ran at every entry, 2,448.5 allocations each time, research/71 step 5). A put's chunks go to
+domains and carried across the entries the root range applies otherwise (it ran at every entry,
+2,448.5 allocations each time, research/71 step 5). The choice runs on hyper-rt's compute pool,
+beside the shards and below them (its runtime.md §3.16; `host::Scheming`), not on the node's
+shard, which it held while it ran, a tail for every request there: the shard asks it with the
+model's inputs owned (the candidates, the count of the domains that take chunks now, the gateway's
+rates and target), tagged with the applied index of the reading whose domains changed, and takes
+its answer at a later look at the table. Meanwhile new blocks take the scheme chosen before
+wherever it still fits the domains, no wider than they are: the model prices a scheme by the scheme
+and the rates alone, the domains only ruling the wider candidates out (durability.md §4), so a
+block placed under it, a chunk to each domain (`place::offer`), is exactly as durable as the
+blocks before the change (within the target, or as near it as the cell came), at most at a cost in
+bytes that a cheaper scheme the new domains allow saves once the answer lands. Where it no longer fits, or none was chosen yet, a block placed
+under it would put two of its chunks in one domain, which the model never priced, so placements
+wait for the choice, made at once on the shard as before the pool; so is one the pool refuses (none
+running, at its bound, or stopping), so no table waits on a choice nobody runs. A node runs one
+choice at a time: an answer for domains the table has left since is dropped and the choice asked
+again for the domains it has, as a per-node task is discarded if its node changed meanwhile
+(CLAUDE.md §10); a choice whose job unwound refuses the scheme, a put failing as it does where no
+candidate fits, until the domains change. A put's chunks go to
 their volumes as one buffer the driver sealed, shared by every copy, the node's own volume
 writing from it as a peer's exchange sends from it.
 

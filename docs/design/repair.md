@@ -209,7 +209,7 @@ quorum writes to "the first N healthy nodes" ([DYN07 §4.6]); each is keyed by h
 (research/63) with its weight its bytes times its node's measured availability, as CRUSH weights a
 device by its capacity (research/04 §A7.1), so a machine often away is given less to serve; one of
 each domain first, then the others. A new block's scheme is chosen over the domains that take
-chunks now (`host::scheme`): a block written while laptops sleep takes the scheme the machines seen
+chunks now (`host::Ask`): a block written while laptops sleep takes the scheme the machines seen
 meet the durability target with, a chunk to each of their domains, and needs nothing when they
 wake. Chosen over every domain not written off instead, as first built, a sleeping machine of a
 cell as wide as its blocks left too few volumes to place a block on, and every write was refused

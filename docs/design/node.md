@@ -1699,9 +1699,18 @@ Tested (`node::shard`): a learner added through a far range's lane is seen in th
 shows, with its progress; a voter is added to a far range and removed from it through its lane,
 node 2 learning, made a voter once caught up, then removed, the test standing in for the node's
 turns; and a far range's replacement, told before the range led, progresses to done and is handed
-back. Left for 2e: the root range's rows where it is far (`Node::read_members`, which reads none
-of a far root range's yet, so the membership's steps wait on its rows; and the host's `table`
-reads), and repair.
+back. The root range's rows the membership reads (its members, their presences, the grants and
+the nodes holding volumes; `members::Rows`) are read once for each entry it applies: by the node
+from the root range's engine where its own task drives it, and, where another shard does, by that
+shard, which hands them over at the range's first drive and after each drive in which it applied
+an entry (`Out::Rows`), kept on `Far` until the node's next read (`Node::read_members`), the latest
+superseding the rest; a shard knows the root range by its machine's layer (`RangeMachine::layer`).
+The read costs what the node's own does, once a drive rather than once a turn, and one lane
+message. Tested too: a far root range hands its rows over at its first drive and as of each entry
+it applies, and a name range hands over none. Left for 2e: the host's volume table of a far root
+range (`Node::table`, which finds no root range here and refuses), the Block range's reads that
+repair makes (`handle_of(Layer::Block)` in `repair.rs`: a volume's blocks, the next block to
+repair, a block's places), and repair's steps.
 
 ## 3. Transport
 

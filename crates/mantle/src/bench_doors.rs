@@ -30,7 +30,12 @@
 //! answer beside their own (`counts`): the cell's commands an entry its leaders proposed, its logs'
 //! updates a frame, and their frames and flushes an operation, every server's summed; and its
 //! logs' commit waits over the phase, each quantile the slowest server's, as quantiles do not sum
-//! ([`log_wait`]). The servers' peak live heap over the
+//! ([`log_wait`]); and what held the servers' shards ([`slow_grown`]): the polls past twice a
+//! shard's quantum an operation, and the label whose polls held the shards longest in all
+//! ([`slow_columns`]), each entry of the servers' tables that grew over the phase said on a line
+//! of its own after the phase's, `doors DOOR OP SIZE CONDITION slow`, then its server, spawn
+//! site, label, polls, how long they held the shard in all and at most and whose time they were,
+//! each a name and a value. The servers' peak live heap over the
 //! phase, above what they held as it began, is given per request, over the most requests the
 //! harness had out at once, and per connection, over the connections the phase held. Logical
 //! clients are tasks on one hyper-rt shard, each holding one connection and the buffers its
@@ -86,7 +91,7 @@ use mantle_s3::list::Resume;
 use mantle_s3::{crypto, sigv4};
 
 use crate::drive;
-use crate::transfer::cell::{self, Cell, Counted, Reach};
+use crate::transfer::cell::{self, Cell, Counted, Reach, Slow};
 use crate::transfer::generate::{Generator, Object};
 use crate::transfer::native::{Checked, Flipped, Made, Unwatched};
 use crate::transfer::{Oracle, size as small_size};
@@ -2518,6 +2523,81 @@ fn write_path(before: &[Counted], after: &[Counted], ops: u64) -> String {
     )
 }
 
+/// What a server's table of what held its shard counted over a phase for one spawn site and label
+/// (`Counted::slow`): the growth of its entry from the server's answer at the phase's start to its
+/// answer at the end, and the phase's longest poll where it passed every one before the phase (the
+/// table keeps one longest since the shard began), else none.
+#[derive(Debug, PartialEq, Eq)]
+struct Grown<'a> {
+    server: usize,
+    site: &'a str,
+    label: &'a str,
+    polls: u64,
+    held_ns: u64,
+    longest_ns: Option<u64>,
+    task: u64,
+    host: u64,
+}
+
+/// Each server's table's growth over a phase, entry by entry, from its answers `before` and `after`
+/// (a server a slot in each): an entry the start's answer had not counted whole, one that grew no
+/// poll left out. At most every server's table's entries, each bounded as its answer is read
+/// (`Counted::parse`). None where a server answered no table (an endpoint's).
+fn slow_grown<'a>(before: &[Counted], after: &'a [Counted]) -> Option<Vec<Grown<'a>>> {
+    let mut grown = Vec::new();
+    for (server, (was, now)) in before.iter().zip(after).enumerate() {
+        let (was, now) = (was.slow.as_ref()?, now.slow.as_ref()?);
+        for entry in now {
+            let then = was
+                .iter()
+                .find(|e| e.site == entry.site && e.label == entry.label);
+            let less =
+                |f: fn(&Slow) -> u64| f(entry).saturating_sub(then.map(f).unwrap_or_default());
+            let polls = less(|e| e.polls);
+            if polls == 0 {
+                continue;
+            }
+            grown.push(Grown {
+                server,
+                site: &entry.site,
+                label: &entry.label,
+                polls,
+                held_ns: less(|e| e.held_ns),
+                longest_ns: Some(entry.longest_ns)
+                    .filter(|longest| then.is_none_or(|t| *longest > t.longest_ns)),
+                task: less(|e| e.task),
+                host: less(|e| e.host),
+            });
+        }
+    }
+    Some(grown)
+}
+
+/// A phase line's columns of what held the servers' shards ([`slow_grown`]): the polls past twice
+/// a shard's quantum an operation, every server's summed, to the hundredth; and the label whose
+/// polls held the shards longest in all, summed over its sites and the servers. A dash where a
+/// server answered no table or the phase ran no operation, and for the label where no labelled
+/// poll grew.
+fn slow_columns(grown: Option<&[Grown<'_>]>, ops: u64) -> String {
+    let polls = grown.map(|g| g.iter().fold(0u64, |sum, e| sum.saturating_add(e.polls)) as f64);
+    // Each label's hold over the phase: at most the entries that grew.
+    let mut held: Vec<(&str, u64)> = Vec::new();
+    for e in grown.unwrap_or_default().iter().filter(|e| e.label != "-") {
+        match held.iter_mut().find(|(label, _)| *label == e.label) {
+            Some((_, ns)) => *ns = ns.saturating_add(e.held_ns),
+            None => held.push((e.label, e.held_ns)),
+        }
+    }
+    let slowest = held
+        .iter()
+        .max_by_key(|(_, ns)| *ns)
+        .map_or("-", |(label, _)| *label);
+    format!(
+        " slow_polls/op {} slowest_label {slowest}",
+        ratio(polls, Some(ops as f64))
+    )
+}
+
 /// `value / ops` to a tenth, or `-` where there is no value or no operation.
 fn per(value: Option<f64>, ops: u64) -> String {
     match value {
@@ -2925,12 +3005,13 @@ impl<'o> Bench<'o> {
         };
         let open = matches!(self.options.load, Load::Open(_));
         let t = &m.tally;
+        let slow = slow_grown(&before.counts, &after.counts);
         writeln!(
             out,
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
-             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}",
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -2991,8 +3072,27 @@ impl<'o> Bench<'o> {
             m.again,
             t.failed,
             write_path(&before.counts, &after.counts, ops),
+            slow_columns(slow.as_deref(), ops),
         )?;
         self.step_line(out, m)?;
+        for e in slow.iter().flatten() {
+            writeln!(
+                out,
+                "doors {} {} {} {} slow server {} site {} label {} polls {} held_us {} longest_us {} task {} host {}",
+                self.named(m.door),
+                m.kind.name(),
+                m.size,
+                self.options.condition,
+                e.server,
+                e.site,
+                e.label,
+                e.polls,
+                micros(e.held_ns),
+                e.longest_ns.map_or_else(|| "-".to_owned(), micros),
+                e.task,
+                e.host,
+            )?;
+        }
         for kind in Failure::ALL {
             let Some(why) = t.first.get(kind.at()).and_then(Option::as_ref) else {
                 continue;
@@ -4507,7 +4607,7 @@ mod tests {
         );
 
         // Ten waits on one server resolve its median, not its 99th percentile.
-        let mut few = after;
+        let mut few = after.clone();
         few[2].waits = Some(10);
         assert_eq!(
             write_path(&before, &few, 40),
@@ -4516,7 +4616,7 @@ mod tests {
         );
 
         // A phase of reads: no entry, frame, flush or wait grew on any server.
-        let idle = before.map(|c| waited(c, 0, None, None, None));
+        let idle = before.clone().map(|c| waited(c, 0, None, None, None));
         assert_eq!(
             write_path(&before, &idle, 40),
             " commands/entry - updates/frame - log_frames/op 0.00 log_flushes/op 0.00 \
@@ -4529,12 +4629,130 @@ mod tests {
         );
 
         // An endpoint's servers, read by pid, answer no write path.
-        let pids = [Counted::default(); 3];
+        let pids: [Counted; 3] = std::array::from_fn(|_| Counted::default());
         assert_eq!(
             write_path(&pids, &pids, 40),
             " commands/entry - updates/frame - log_frames/op - log_flushes/op - log_wait_p50_us - \
              log_wait_p99_us - log_wait_max_us -"
         );
+    }
+
+    /// A phase's long polls are each server's table's growth over it, entry by entry: an entry
+    /// grown is its counts' difference, one new to the phase is counted whole, one that grew no
+    /// poll is left out, and the longest is the phase's only where it passed the one before. The
+    /// columns are the polls an operation, every server's summed, and the label that held the
+    /// shards longest in all over its sites and servers, the unlabelled set aside; a dash where a
+    /// server answered no table, the phase ran no operation, or no labelled poll grew.
+    #[test]
+    fn a_phases_long_polls_are_each_tables_growth() {
+        let slow = |site: &str, label: &str, (polls, held_ns, longest_ns, task, host)| Slow {
+            site: site.to_owned(),
+            label: label.to_owned(),
+            polls,
+            held_ns,
+            longest_ns,
+            task,
+            host,
+        };
+        let table = |entries: Vec<Slow>| Counted {
+            slow: Some(entries),
+            ..Counted::default()
+        };
+        let conn = "crates/node/src/listener/mod.rs:317:17";
+        let node = "vendor/hyper-rt/src/runtime.rs:90:5";
+        let before = [
+            table(vec![
+                slow(conn, "PutObject", (4, 4_000, 2_000, 3, 1)),
+                slow(node, "Put", (2, 9_000, 6_000, 2, 0)),
+                slow(node, "-", (1, 500, 500, 0, 0)),
+            ]),
+            table(vec![slow(conn, "GetObject", (1, 300, 300, 1, 0))]),
+        ];
+        let after = [
+            table(vec![
+                // Grew 6 polls, 50 µs, its longest past the one before.
+                slow(conn, "PutObject", (10, 54_000, 30_000, 8, 2)),
+                // Grew 1 poll, 1 µs, under the longest before.
+                slow(node, "Put", (3, 10_000, 6_000, 3, 0)),
+                // Grew nothing.
+                slow(node, "-", (1, 500, 500, 0, 0)),
+            ]),
+            table(vec![
+                slow(conn, "GetObject", (1, 300, 300, 1, 0)),
+                // New to the phase: 2 polls, 70 µs, unlabelled.
+                slow(conn, "-", (2, 70_000, 40_000, 0, 2)),
+                // New to the phase on this server, though the other's table holds its label.
+                slow(node, "Put", (1, 20_000, 20_000, 1, 0)),
+            ]),
+        ];
+        let grown = slow_grown(&before, &after).unwrap();
+        let expected = [
+            Grown {
+                server: 0,
+                site: conn,
+                label: "PutObject",
+                polls: 6,
+                held_ns: 50_000,
+                longest_ns: Some(30_000),
+                task: 5,
+                host: 1,
+            },
+            Grown {
+                server: 0,
+                site: node,
+                label: "Put",
+                polls: 1,
+                held_ns: 1_000,
+                longest_ns: None,
+                task: 1,
+                host: 0,
+            },
+            Grown {
+                server: 1,
+                site: conn,
+                label: "-",
+                polls: 2,
+                held_ns: 70_000,
+                longest_ns: Some(40_000),
+                task: 0,
+                host: 2,
+            },
+            Grown {
+                server: 1,
+                site: node,
+                label: "Put",
+                polls: 1,
+                held_ns: 20_000,
+                longest_ns: Some(20_000),
+                task: 1,
+                host: 0,
+            },
+        ];
+        assert_eq!(grown, expected);
+        // 10 polls over 40 operations; PutObject held 50 µs, Put 21 µs, and the unlabelled 70 µs
+        // names no label.
+        assert_eq!(
+            slow_columns(Some(&grown), 40),
+            " slow_polls/op 0.25 slowest_label PutObject"
+        );
+        assert_eq!(
+            slow_columns(Some(&grown), 0),
+            " slow_polls/op - slowest_label PutObject"
+        );
+
+        // A phase that grew no labelled poll, or none at all.
+        let quiet = slow_grown(&before, &before).unwrap();
+        assert!(quiet.is_empty());
+        assert_eq!(
+            slow_columns(Some(&quiet), 40),
+            " slow_polls/op 0.00 slowest_label -"
+        );
+
+        // An endpoint's servers, read by pid, answer no table.
+        let pids: [Counted; 2] = std::array::from_fn(|_| Counted::default());
+        assert_eq!(slow_grown(&pids, &pids), None);
+        assert_eq!(slow_grown(&before, &pids), None);
+        assert_eq!(slow_columns(None, 40), " slow_polls/op - slowest_label -");
     }
 
     /// A listing's keys are its set's, each after the one before it as S3 orders keys, byte by

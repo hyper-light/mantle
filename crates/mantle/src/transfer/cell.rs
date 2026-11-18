@@ -66,8 +66,10 @@ pub struct Chunks {
 /// charged since it began, none where the OS does not say them apart; then its write path's
 /// (`mantle_node::process::write_path_counts`): its log's frames, their updates and its flushes,
 /// and the entries it proposed and their commands, since it began, and its log's commit waits
-/// since it was last asked, their count and three quantiles in nanoseconds, none where none ended.
-#[derive(Clone, Copy, Debug, Default)]
+/// since it was last asked, their count and three quantiles in nanoseconds, none where none ended;
+/// then the table of what held its shard (`mantle_node::process::slow_poll_counts`), none where
+/// the answer carries none.
+#[derive(Clone, Debug, Default)]
 pub struct Counted {
     pub allocations: Option<u64>,
     pub reallocations: Option<u64>,
@@ -87,16 +89,60 @@ pub struct Counted {
     pub wait_p50_ns: Option<u64>,
     pub wait_p99_ns: Option<u64>,
     pub wait_max_ns: Option<u64>,
+    pub slow: Option<Vec<Slow>>,
+}
+
+/// An entry of the table of what held a node's shard, as its `counts` answer says it: the spawn
+/// site of the tasks whose polls held the shard past twice its quantum and the label they had as
+/// those polls ended, each `-` for none; the polls, how long they held the shard in all and at
+/// most, in nanoseconds, and of them the task's and the host's. Each count is since the shard
+/// began.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Slow {
+    pub site: String,
+    pub label: String,
+    pub polls: u64,
+    pub held_ns: u64,
+    pub longest_ns: u64,
+    pub task: u64,
+    pub host: u64,
 }
 
 impl Counted {
-    /// A `counts` line's fields past its first two words, each a name and a value or `-`.
+    /// A `counts` line's fields past its first two words, each a name and a value or `-`. The
+    /// table's entries are as many as its `slow_entries` says, each begun by its `slow_site`, and
+    /// at most the table's own entries ([`hyper_rt::slow::ENTRIES`] and its unkeyed one): an
+    /// answer saying more, or an entry's field outside an entry or not a count, is not read.
     fn parse(fields: &[&str]) -> Option<Self> {
         let mut counted = Self::default();
+        let most = hyper_rt::slow::ENTRIES.checked_add(1)?;
+        let mut entries = None;
         for pair in fields.chunks(2) {
             let [name, value] = pair else { return None };
             let unsigned = || value.parse::<u64>().ok();
             let signed = || value.parse::<i64>().ok();
+            if let Some(field) = name.strip_prefix("slow_") {
+                let slow = counted.slow.get_or_insert_with(Vec::new);
+                match field {
+                    "entries" => {
+                        let n = value.parse::<usize>().ok().filter(|n| *n <= most)?;
+                        entries = Some(n);
+                        slow.reserve_exact(n);
+                    }
+                    "site" if slow.len() < entries? => slow.push(Slow {
+                        site: (*value).to_owned(),
+                        ..Slow::default()
+                    }),
+                    "label" => slow.last_mut()?.label = (*value).to_owned(),
+                    "polls" => slow.last_mut()?.polls = unsigned()?,
+                    "held_ns" => slow.last_mut()?.held_ns = unsigned()?,
+                    "longest_ns" => slow.last_mut()?.longest_ns = unsigned()?,
+                    "task" => slow.last_mut()?.task = unsigned()?,
+                    "host" => slow.last_mut()?.host = unsigned()?,
+                    _ => return None,
+                }
+                continue;
+            }
             match *name {
                 "allocs" => counted.allocations = unsigned(),
                 "reallocs" => counted.reallocations = unsigned(),
@@ -118,6 +164,9 @@ impl Counted {
                 "wait_max_ns" => counted.wait_max_ns = unsigned(),
                 _ => {}
             }
+        }
+        if counted.slow.as_ref().map(Vec::len) != entries {
+            return None;
         }
         Some(counted)
     }
@@ -516,7 +565,7 @@ impl Cell {
         self.until(at, |node| node.counts.is_some())?;
         self.nodes
             .get(at)
-            .and_then(|node| node.counts)
+            .and_then(|node| node.counts.clone())
             .ok_or_else(|| CellError::Init(format!("no founder {at}")))
     }
 
@@ -654,5 +703,98 @@ mod tests {
             (c.wait_p50_ns, c.wait_p99_ns, c.wait_max_ns),
             (None, None, None)
         );
+        assert_eq!(c.slow, None, "an answer with no table");
+    }
+
+    /// The table of what held a node's shard, as the node says it in its `counts` answer
+    /// (`mantle_node::process::slow_poll_counts`), is read back entry by entry; an answer whose
+    /// entries are not as many as it says, more than the table holds, or a field outside an entry
+    /// is not read.
+    #[test]
+    fn a_counts_answers_slow_poll_table_is_read_back() {
+        static OP: hyper_rt::slow::Label = hyper_rt::slow::Label::new("GetObject");
+        let site = std::panic::Location::caller();
+        let polls = [
+            hyper_rt::slow::SlowPoll {
+                site: Some(site),
+                label: Some(&OP),
+                polls: 3,
+                held_ns: 900,
+                longest_ns: 500,
+                task_polls: 2,
+                host_polls: 1,
+            },
+            hyper_rt::slow::SlowPoll {
+                site: None,
+                label: None,
+                polls: 1,
+                held_ns: 7,
+                longest_ns: 7,
+                task_polls: 0,
+                host_polls: 1,
+            },
+        ];
+        let mut line =
+            "counts uncounted frames 1 updates 2 flushes 3 entries 4 commands 5 waits 0 \
+                        wait_p50_ns - wait_p99_ns - wait_max_ns -"
+                .to_owned();
+        mantle_node::process::slow_poll_counts(&mut line, &polls).unwrap();
+        let Some(Said::Counts(c)) = said(&line) else {
+            panic!("a counts answer not read: {line}");
+        };
+        assert_eq!((c.frames, c.commands), (Some(1), Some(5)));
+        let at = format!("{}:{}:{}", site.file(), site.line(), site.column());
+        assert_eq!(
+            c.slow,
+            Some(vec![
+                Slow {
+                    site: at,
+                    label: "GetObject".to_owned(),
+                    polls: 3,
+                    held_ns: 900,
+                    longest_ns: 500,
+                    task: 2,
+                    host: 1,
+                },
+                Slow {
+                    site: "-".to_owned(),
+                    label: "-".to_owned(),
+                    polls: 1,
+                    held_ns: 7,
+                    longest_ns: 7,
+                    task: 0,
+                    host: 1,
+                },
+            ])
+        );
+
+        // An empty table is a table, not none.
+        let mut empty = "counts uncounted".to_owned();
+        mantle_node::process::slow_poll_counts(&mut empty, &[]).unwrap();
+        let Some(Said::Counts(c)) = said(&empty) else {
+            panic!("a counts answer not read: {empty}");
+        };
+        assert_eq!(c.slow, Some(Vec::new()));
+
+        // Fewer entries than said, more than a table holds, a field outside an entry, a count that
+        // is not one.
+        let entry = "slow_site a.rs:1:2 slow_label - slow_polls 1 slow_held_ns 1 slow_longest_ns 1 \
+                     slow_task 0 slow_host 0";
+        let most = hyper_rt::slow::ENTRIES + 1;
+        for bad in [
+            format!("counts uncounted slow_entries 2 {entry}"),
+            format!("counts uncounted slow_entries {} {entry}", most + 1),
+            format!("counts uncounted slow_entries 0 {entry}"),
+            format!("counts uncounted slow_label x slow_entries 1 {entry}"),
+            "counts uncounted slow_entries 1 slow_site a.rs:1:2 slow_polls -".to_owned(),
+        ] {
+            assert!(!matches!(said(&bad), Some(Said::Counts(_))), "read: {bad}");
+        }
+        let entries = vec![entry; most].join(" ");
+        let full = format!("counts uncounted slow_entries {most} {entries}");
+        let Some(Said::Counts(c)) = said(&full) else {
+            panic!("a full table not read");
+        };
+        assert_eq!(c.slow.map(|s| s.len()), Some(most));
     }
 }

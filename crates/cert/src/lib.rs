@@ -319,6 +319,12 @@ pub fn granted_node(
     )
 }
 
+/// RFC 5280 §4.1.2.5: "To indicate that a certificate has no well-defined expiration date, the
+/// notAfter SHOULD be assigned the GeneralizedTime value of 99991231235959Z", in Unix seconds.
+/// Certificates are not yet rotated (node.md §1.5): until they are, none expires, whether `mantle
+/// init` issued it or the cell's issuer signed it at a re-grant (membership.md §5.1).
+pub const NO_EXPIRY: u64 = 253_402_300_799;
+
 /// The cell's issuer's certificate (docs/design/membership.md §5.1): issued by the authority
 /// holding `authority_key` and named `authority_name`, for the issuer whose public key is
 /// `public_key`, named `name`, which is not the authority's, so a certificate's issuer says which
@@ -1140,6 +1146,25 @@ pub fn issuer_issued(issuer: &[u8], authority: &[u8], now: u64) -> Result<(), Ce
     issued_by(issuer, authority, now)
 }
 
+/// The name the cell's issuer signs as: its certificate's subject, one common name ([`issuer`]'s
+/// profile), which a certificate it signs names as its issuer (RFC 5280 §4.1.2.4) and
+/// [`granted_node`] takes as the signer's name. Read from the certificate rather than spelled from
+/// the authority's, so a cell whose issuer was named otherwise still signs as it.
+pub fn issuer_name(issuer: &[u8]) -> Result<&str, CertError> {
+    let read = read(issuer)?;
+    let mut profile = Vec::new();
+    extensions(&mut profile, &Role::Issuer)?;
+    if read.extensions != profile.as_slice() {
+        return Err(CertError::Malformed);
+    }
+    let mut subject = der::expect(&mut &*read.subject, der::SEQUENCE)?.content;
+    let name = attribute(&mut subject, oid::COMMON_NAME)?;
+    if !subject.is_empty() {
+        return Err(CertError::Malformed);
+    }
+    Ok(name)
+}
+
 /// Who signed a node's certificate: the cell's authority, or the cell's issuer under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssuedBy {
@@ -1958,6 +1983,11 @@ mod tests {
         );
         issuer_issued(&issuer_cert, &ca, now()).unwrap();
         assert_eq!(public_key(&issuer_cert).unwrap(), issuer_key.public_key());
+        // Its name is read from its subject, and a certificate it signs under that name is its.
+        assert_eq!(issuer_name(&issuer_cert), Ok(ISSUER));
+        assert_eq!(issuer_name(&ca), Err(CertError::Malformed));
+        let leaf = granted_by(&issuer_key, issuer_name(&issuer_cert).unwrap(), 7, 1);
+        assert!(issuer_is(&leaf, &issuer_cert).unwrap());
         assert!(!issuer_is(&issuer_cert, &issuer_cert).unwrap());
         assert!(issuer_is(&issuer_cert, &ca).unwrap());
         // Named as the authority, it could not be told from it.

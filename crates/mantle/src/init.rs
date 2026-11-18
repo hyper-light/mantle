@@ -48,7 +48,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mantle_cert::{
-    EndpointKey, EndpointName, KeyPair, MAX_ENDPOINT_VALIDITY, Serial, Validity, check_dns_name,
+    EndpointKey, EndpointName, KeyPair, MAX_ENDPOINT_VALIDITY, NO_EXPIRY, Serial, Validity,
+    check_dns_name,
 };
 use mantle_meta::apply::Layer;
 use mantle_meta::root::MAX_DOMAIN;
@@ -57,11 +58,6 @@ use mantle_protocol::node_name;
 
 use mantle_node::files;
 use mantle_node::process::ISSUER;
-
-/// RFC 5280 §4.1.2.5: "To indicate that a certificate has no well-defined expiration date, the
-/// notAfter SHOULD be assigned the GeneralizedTime value of 99991231235959Z", in Unix seconds.
-/// Certificates are not yet rotated (node.md §1.5): until they are, none expires.
-const NO_EXPIRY: u64 = 253_402_300_799;
 
 /// The file beside the authority's key that says what a client of the native protocol needs: the
 /// authority's name, the account its clients act for, and each founder's id and QUIC address.

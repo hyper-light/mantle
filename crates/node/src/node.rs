@@ -74,6 +74,7 @@ mod answers;
 mod host;
 mod members;
 mod repair;
+mod shard;
 mod spread;
 mod stop;
 use answers::Answers;
@@ -273,6 +274,12 @@ pub enum NodeError {
     Registrations(u64),
     #[error("the node holds as many commands of its own as it keeps")]
     Asks,
+    #[error("shard {0}'s lane holds as much as it takes")]
+    LaneFull(usize),
+    #[error("shard {0}'s task ended, and its ranges with it: the next start recovers them")]
+    ShardEnded(usize),
+    #[error("range {0:x} has writes out, whose answers would wake the shard it left")]
+    WritesOut(u128),
 }
 
 impl From<Refusal> for NodeError {
@@ -723,6 +730,8 @@ struct Taking<'a, E: Engine + 'static, L: NodeLog> {
     id: u64,
     owner: &'a mut Owner<Answers<L::Store>, RangeMachine<E>, Unbounded>,
     ranges: &'a [Kept],
+    shards: &'a [shard::Lanes<E, L::Store>],
+    far: &'a [shard::Far],
     liveness: &'a mut Liveness,
     asked: &'a mut Asked,
     moved: &'a mut bool,
@@ -767,6 +776,23 @@ impl<E: Engine + 'static, L: NodeLog> Taking<'_, E, L> {
         if message.from != sender || message.to != self.id {
             return false;
         }
+        // A range another shard drives is stepped there; one its lane has no room for is dropped,
+        // as the network may drop it (node.md §2.9).
+        if let Some(far) = self.far.iter().find(|far| far.group == group) {
+            return self
+                .shards
+                .iter()
+                .find(|lanes| lanes.shard() == far.shard)
+                .is_some_and(|lanes| {
+                    lanes
+                        .send(shard::In::Step {
+                            group,
+                            sender,
+                            message,
+                        })
+                        .is_ok()
+                });
+        }
         let Some(handle) = self
             .ranges
             .iter()
@@ -782,11 +808,10 @@ impl<E: Engine + 'static, L: NodeLog> Taking<'_, E, L> {
         // configuration from whichever node leads (docs/design/membership.md §3 step 1; Raft
         // dissertation §4.1: servers take entries from a leader their configuration does not
         // name).
-        let id = self.id;
-        let member = self.owner.get(handle).is_some_and(|r| {
-            let c = r.core().raft.configuration();
-            !c.contains(id) || c.contains(sender)
-        });
+        let member = self
+            .owner
+            .get(handle)
+            .is_some_and(|r| shard::may_act(r, sender));
         if !member {
             return false;
         }
@@ -808,6 +833,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     ranges: Vec<Kept>,
     /// The shard that runs each range, by its place in `ranges` (node.md §2.9).
     spread: spread::Spread,
+    /// The lanes to the shards past the node's that drive its ranges, and the ranges they drive
+    /// (node.md §2.9, `node::shard`): none while the node's own task runs every range.
+    shards: Vec<shard::Lanes<E, L::Store>>,
+    far: Vec<shard::Far>,
     deadlines: BTreeSet<(u64, usize)>,
     liveness: Liveness,
     asked: Asked,
@@ -1271,6 +1300,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             owner,
             ranges,
             spread,
+            shards: Vec::new(),
+            far: Vec::new(),
             deadlines: BTreeSet::new(),
             liveness,
             asked: Asked::default(),
@@ -1445,6 +1476,147 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .filter_map(|place| self.ranges.get(place).map(|k| k.group))
     }
 
+    /// Starts the task of the node's shard `shard` (numbered from the node's first) on the runtime
+    /// shard `holder` names, and moves there each range the table places on it, before its first
+    /// drive (node.md §2.9): its replica leaves this task's owner for that task's, the stream keeps
+    /// its pairs, and each turn hands it Raft messages, proposals and the stream's words over the
+    /// shard's lane and takes back what its ranges gave. A replica with writes out is refused,
+    /// typed, and nothing moves ([`shard::movable`]). Each lane holds the exchanges the transport
+    /// admits at once, and is refused when the shard's ranges are more.
+    pub fn spread_to(&mut self, holder: hyper_rt::SlotHolder, shard: usize) -> Result<(), NodeError>
+    where
+        E: Send,
+        L::Store: Send + 'static,
+    {
+        let places: Vec<usize> = self.spread.on(shard).collect();
+        if places.len() > self.parked_most {
+            return Err(NodeError::LaneFull(shard));
+        }
+        for place in &places {
+            if let Some(kept) = self.ranges.get(*place)
+                && let Some(replica) = self.owner.get(kept.handle)
+            {
+                shard::movable(kept.group, replica)?;
+            }
+        }
+        let lanes = shard::Lanes::start(holder, shard, places.len(), self.parked_most)?;
+        for place in places {
+            let Some(kept) = self.ranges.get_mut(place) else {
+                continue;
+            };
+            let Some(replica) = self.owner.remove(kept.handle) else {
+                continue;
+            };
+            if let Some(old) = kept.wake.take() {
+                self.deadlines.remove(&(old, place));
+            }
+            // The pairs the owner attached for it stay attached, now the far range's.
+            let mut peers: Vec<PeerId> = replica.peers().collect();
+            peers.sort_unstable();
+            peers.dedup();
+            lanes.send(shard::In::Adopt(kept.group, Box::new(replica)))?;
+            self.far.push(shard::Far {
+                group: kept.group,
+                shard,
+                peers,
+                election: None,
+            });
+        }
+        self.shards.push(lanes);
+        Ok(())
+    }
+
+    /// What the shards' ranges gave since the last turn, at most a lane's capacity from each; a
+    /// shard whose task ended stops the node, typed (node.md §2.9).
+    fn take_shards(&mut self, now: u64) -> Result<(), NodeError> {
+        for at in 0..self.shards.len() {
+            let budget = self.shards.get(at).map_or(0, shard::Lanes::capacity);
+            for _ in 0..budget {
+                let Some(out) = self
+                    .shards
+                    .get_mut(at)
+                    .map(shard::Lanes::take)
+                    .transpose()?
+                else {
+                    break;
+                };
+                let Some(out) = out else {
+                    break;
+                };
+                self.took(out, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One thing a shard's ranges gave: as the node's own drive takes it (`Node::drive`).
+    fn took(&mut self, out: shard::Out, now: u64) -> Result<(), NodeError> {
+        match out {
+            shard::Out::Message(group, message) => self.send(group, message, now)?,
+            shard::Out::Applied(group, applied) => self.applied.push((group, applied)),
+            shard::Out::Flushed(started, durable) => {
+                self.liveness
+                    .on_durable(hyper_liveness::Write::Log, started, durable);
+                self.liveness_moved = true;
+                self.log_durables = self.log_durables.saturating_add(1);
+            }
+            shard::Out::Pairs(group, peers) => self.pair_far(group, peers)?,
+            shard::Out::Elected(group, election) => self.elect_far(group, election),
+            shard::Out::Stopped(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// A far range's peers now: the stream keeps a pair with each it came to share its group with,
+    /// told to the range as the stream believes it now, and lets go of each it left
+    /// (hyper-durable's `Owner::pairs`).
+    fn pair_far(&mut self, group: u128, peers: Vec<PeerId>) -> Result<(), NodeError> {
+        let Some(far) = self.far.iter_mut().find(|far| far.group == group) else {
+            return Ok(());
+        };
+        for peer in &peers {
+            if far.peers.binary_search(peer).is_err() {
+                self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
+                let belief = shard::Belief::of(&self.liveness, *peer);
+                if let Some(lanes) = self.shards.iter().find(|lanes| lanes.shard() == far.shard) {
+                    lanes.send(shard::In::Belief(group, belief))?;
+                }
+            }
+        }
+        for peer in &far.peers {
+            if peers.binary_search(peer).is_err() {
+                self.liveness.detach(*peer).map_err(NodeError::Liveness)?;
+            }
+        }
+        far.peers = peers;
+        Ok(())
+    }
+
+    /// A far range's expected election: each of its pairs charged the mean election of the far
+    /// ranges it is kept for (hyper-durable's `Owner::measure`).
+    fn elect_far(&mut self, group: u128, election: Duration) {
+        let Some(far) = self.far.iter_mut().find(|far| far.group == group) else {
+            return;
+        };
+        far.election = Some(election);
+        let Some(far) = self.far.iter().find(|far| far.group == group) else {
+            return;
+        };
+        for peer in &far.peers {
+            let (sum, count) = self
+                .far
+                .iter()
+                .filter(|other| other.peers.binary_search(peer).is_ok())
+                .filter_map(|other| other.election)
+                .fold((Duration::ZERO, 0u32), |(sum, count), election| {
+                    (sum.saturating_add(election), count.saturating_add(1))
+                });
+            let _ = self
+                .liveness
+                .set_election(*peer, sum.checked_div(count).unwrap_or(sum));
+        }
+    }
+
     /// Whether this node's member leads `group`.
     pub fn is_leader(&self, group: u128) -> bool {
         self.kept(group)
@@ -1467,6 +1639,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let (handle, max) = (kept.handle, kept.max_entry_bytes);
         entry.at_ns = self.wall.now_ns();
+        if let Some(far) = self.far.iter().find(|far| far.group == group) {
+            let lanes = self
+                .shards
+                .iter()
+                .find(|lanes| lanes.shard() == far.shard)
+                .ok_or(NodeError::ShardEnded(far.shard))?;
+            lanes.send(shard::In::Propose(group, entry.clone(), max))?;
+            self.proposed_entries = self.proposed_entries.saturating_add(1);
+            self.proposed_commands = self
+                .proposed_commands
+                .saturating_add(u64::try_from(entry.commands.len()).unwrap_or(u64::MAX));
+            return Ok(());
+        }
         let shell = self
             .owner
             .get_mut(handle)
@@ -1772,10 +1957,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.events = events;
         self.take_stored().await?;
+        self.take_shards(now)?;
         self.vouch_held(now);
         self.dial(now);
         if std::mem::take(&mut self.liveness_moved) {
-            self.measure();
+            self.measure()?;
         }
         self.schedule_due(now);
         self.drive(now)?;
@@ -1850,7 +2036,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// election (hyper-durable's `Owner::measure`). A range whose timing moved is driven: its core
     /// draws a campaign's delay, or times a timer, only when driven, so a range given its first
     /// timing with nothing else to drive it never campaigned (its term stayed 0 on one CPU).
-    fn measure(&mut self) {
+    ///
+    /// A range another shard drives is measured there, from what the stream measured
+    /// ([`shard::Measured`]); one its lane has no room for is measured at the next turn, from what
+    /// the stream holds then.
+    fn measure(&mut self) -> Result<(), NodeError> {
         self.timings.clear();
         for kept in &self.ranges {
             let timing = self
@@ -1869,6 +2059,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.owner.schedule(kept.handle);
             }
         }
+        if !self.shards.is_empty()
+            && let Some(measured) =
+                shard::Measured::of(&self.liveness, self.remotes.iter().map(|r| r.id))
+        {
+            for lanes in &self.shards {
+                match lanes.send(shard::In::Measure(Box::new(measured.clone()))) {
+                    Ok(()) => {}
+                    Err(NodeError::LaneFull(_)) => self.liveness_moved = true,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Waits for the first of: the transport's next event, a datagram on the plane, the earliest
@@ -1987,6 +2190,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }) {
             return Ok(true);
         }
+        // What a shard's ranges gave, or its end: each lane looked at, so each wakes the task.
+        if !self.shards.is_empty() {
+            let shards = &mut self.shards;
+            let arrived = poll_fn(|context| {
+                let mut arrived = false;
+                for lanes in shards.iter_mut() {
+                    arrived |= lanes.arrived(context);
+                }
+                Poll::Ready(arrived)
+            })
+            .await;
+            if arrived {
+                return Ok(true);
+            }
+        }
         if self.storage.out() > 0 {
             let Self {
                 storage, stored, ..
@@ -2069,6 +2287,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             id,
             owner,
             ranges,
+            shards,
+            far,
             liveness,
             asked,
             liveness_moved,
@@ -2081,6 +2301,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             id: *id,
             owner,
             ranges,
+            shards,
+            far,
             liveness,
             asked,
             moved: liveness_moved,
@@ -2108,6 +2330,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             id,
             owner,
             ranges,
+            shards,
+            far,
             liveness,
             asked,
             liveness_moved,
@@ -2120,6 +2344,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             id: *id,
             owner,
             ranges,
+            shards,
+            far,
             liveness,
             asked,
             moved: liveness_moved,
@@ -2139,6 +2365,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             id: self.id,
             owner: &mut self.owner,
             ranges: &self.ranges,
+            shards: &self.shards,
+            far: &self.far,
             liveness: &mut self.liveness,
             asked: &mut self.asked,
             moved: &mut self.liveness_moved,
@@ -2192,6 +2420,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
             self.owner.believe(&change);
+            // A change a shard's lane has no room for stops the node: a range that missed it
+            // would believe what the stream no longer does.
+            for lanes in &self.shards {
+                lanes.send(shard::In::Believe(change))?;
+            }
             self.liveness_moved = true;
         }
         Ok(())

@@ -1569,6 +1569,42 @@ taking one where a call is made and keeping it where its wait ends; a range's ca
 end on its shard, so a shard's pool holds its own ranges' calls. So step 2 needs no change in
 hyper-raft.
 
+*As built (2026-11-18), step 2a: a shard's task* (`crates/node/src/node/shard.rs`).
+`Node::spread_to` starts the task of one of the node's shards on the runtime shard a holder names,
+through its control queue (`hyper_rt::runtime::submit_to_holder`, as the S3 listener's lanes start
+their takers), and moves there each range the table places on it before its first drive. A
+replica with a write out is refused, `NodeError::WritesOut`, and nothing moves: each write records
+the waker of the task that submitted it (`GroupLog::submit_waking`), so its answer would wake the
+shard it left. The task holds its shard's replicas in an `Owner` of its own, made with the task's
+waker, one slot a range, and that shard's deadlines; it drives each queued replica once a turn as
+`Node::drive` does, and waits for the first of its lane, its earliest deadline (at most the idle
+timeout) and any wake, a log's answer among them. The two talk over two bounded hyper-rt channels
+(`hyper_rt::sync::channel`), each holding the exchanges the transport admits at once (the node's
+`parked_most`). Into the shard: a replica moved; a Raft message (`Taking::checked`), dropped and
+counted when the lane is full, as the network may drop it; a proposal (`Node::propose`); a change
+of the stream (`act_on_liveness`), whose lane full stops the node, `NodeError::LaneFull`, as a range
+that missed it believes what the stream no longer does; what the stream believes of a peer a range
+came to share its group with; and what it measured (`Node::measure`: its granularity, its log's
+mean flush, each peer's echoed round trip), from which the shard derives each range's timing by
+hyper-durable's `Replica::measure` over those values, and which a full lane leaves to the next
+turn's measurement. Out of it: Raft messages, sent by `Node::send`; applied answers; flushes, for
+the stream's `on_durable`; a range's peers when they change, which the stream attaches and
+detaches, telling the range its belief of each new one, as `Owner::pairs` does; a range's expected
+election, each pair charged the mean of its ranges', as `Owner::measure` does; and why the shard
+stopped (a fenced range). The node's shard sends without waiting; the shard waits for room out,
+its next turn held. `Node::turn` takes at most a lane's capacity from each lane
+(`Node::take_shards`), and its wait's look (`Node::answered`) polls each lane's receive, so what a
+shard gives, or its end, wakes the node's task; a lane whose shard's task ended stops the node,
+`NodeError::ShardEnded`, and its next start recovers the ranges from the log. A proposal a far
+range refuses is lost as one its leader drops, its asker's patience ending it, until step 4 answers
+each ask in its slot. Production starts no shard's task: the table places every range on the
+node's own shard until step 5, so a turn does what it did. Tested (`node::shard`): a one-member
+range moved before its first drive to the second shard of a two-shard runtime is driven by that
+shard's task and answers a proposal; a replica with a write out is refused a move; a full lane
+refuses, typed; and a shard whose task ended, its lane's end dropped or its runtime shut down, is
+reported ended once what it gave is taken. Left: a far range's reads, snapshots and status (2b),
+and its membership, stop, repair and the host's reads of it (2c).
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

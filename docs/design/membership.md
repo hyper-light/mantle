@@ -250,8 +250,9 @@ al.: "The vast majority of such unavailability events are transient and do not r
 data loss"); an absence past it is one the cell's durability can no longer wait out, and the member
 is gone: its chunks are rebuilt elsewhere and its identity refused. The root range's leader asks
 `Gone { node }` once the leader's clock less the member's recorded start passes the mean. No time
-is chosen: the mean is the durability model's own input, today research/15's day until repair is
-built and measures itself (constants.md: `derive.rs` `REPAIR_HOURS`, an open row), and a measured
+is chosen: the mean is the durability model's own input, the rate the cell states
+(`durability.repair_rate`, `mantle init --repair-rate`), else research/15's day until repair
+measures its own rate (constants.md: `derive.rs` `REPAIR_HOURS`, an open row), and a measured
 repair rate shortens the wait with no change here. A judgment wrong about a member that comes back
 costs a grant and a join (§2, §3), and the rebuild the model would have asked anyway.
 
@@ -344,6 +345,13 @@ kept places until a person states it gone, and a table of `root.max_nodes` fills
 will never return. Until repair's record answers, both rules are written down and the merge keeps
 §5's judgment with repair's kept places beneath it.
 
+*Settled (2026-11-16).* Repair's record answers with §5's rule (repair.md §2.1, §7): the root
+range's leader asks `Gone` for a member whose recorded absence passes `1 / repair_rate`
+(`members::gone_by`, whose unit test is the judgment's), and a place an absence left is kept only
+until then. Repair's end-to-end test of a killed node states it gone rather than waiting the
+judgment out, since a repair time short enough to wait for in a test judged a running node of a
+loaded host gone as well (`crates/mantle/tests/repair.rs`).
+
 ## 9. Bounds
 
 Every map here is keyed by an identity the authority issued and bounded by the cell's statement
@@ -389,7 +397,6 @@ refusal; `crate::directory`'s, each admission rule.
   flight.
 - A volume that grows and shrinks with its machine's free space, where §3.1 sizes it once.
 - Gateways known by grants as nodes now are, rather than pinned.
-- §8's one point to settle with repair: whether a member is judged gone at `1 / repair_rate`.
 - On the node directory's file system the stores' bound is still that file system's total less
   the log's file and the volumes there (node.md §1.4); §3.1 leaves the rows of the cell's objects
   room beside a volume of what it spares, but the stores' own bound is not yet taken from it.

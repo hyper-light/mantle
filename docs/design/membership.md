@@ -2,9 +2,11 @@
 
 Status: design, 2026-11-14 (branch `fleet-cell`). Sources: docs/research/06 (consensus; its §A1.7
 quotes Ongaro's dissertation on membership changes and the 2015 single-server bug), 15 (Ford et
-al.'s availability study), 64 (starting and stopping a node), 75 (a full cell), 91 (this record's
+al.'s availability study), 64 (starting and stopping a node), 75 (a full cell), 92 (this record's
 own sources: the anti-replay window, revocation's bound, and each operating system's statement of
-the space a process may write); and the records this one joins: node.md
+the space a process may write), 98 (coming back after a write-off: re-admission online, an issuer
+beneath an offline root, and wiping a returning machine, §5.1, 2026-11-18); and the records this
+one joins: node.md
 (§1.4–§1.7, §2.4, §3.6, §6.4–§6.6), architecture.md (§7), metadata.md, replica.md (§6) and
 kubernetes.md.
 
@@ -35,7 +37,8 @@ The cell's root range already holds each node's failure domain, its volumes and 
 Whether the cell sees a member, and since when, is its presence (repair.md §2.1, the `Presence`
 row), the one record of that fact (§8).
 
-and, once for the cell, the **grant window** (§2).
+and, once for the cell, the **grant windows** (§2, §5.1), the **ledger** of written-off
+identities that may come back, and the **`rejoin`** setting (§5.1).
 
 A member's states and what moves it between them:
 
@@ -86,7 +89,11 @@ handshake verifies the chain, node.md §3.6) as the node it names when (`crate::
 2. its id is a member the root range holds `Serving` or `Leaving`, or `Removed` while the root
    range's configuration, as this node applied it, keeps it as a learner (§4 step 5), and its
    certificate's SHA-256 is the member's fingerprint; or
-3. it names no member and its grant is new by the window: a node granted and not yet joined.
+3. it names no member and its grant is new by the window: a node granted and not yet joined; or
+4. the cell's issuer signed it, its fingerprint is one the root range committed in a `Regrant`,
+   and its grant is new by the issuer's window: a node re-granted and not yet joined (§5.1). A
+   certificate the issuer signed is a node's alone, and is admitted by no other rule until it has
+   joined, when rule 2 admits it as any member.
 
 A `Gone` member, a removed one the root range keeps as a learner no more, a delisted one (its grant
 spent, its rows gone) and a certificate that is neither are refused at the handshake, pinned or
@@ -103,7 +110,9 @@ dialed. Rule 1 now judges it by its row as rules 2 and 3 judge a node pinned now
 still talks to the cell, and a leaving founder learns of its drop as a granted node does (§4 step
 5).
 
-*The protocol.* Granting is the authority holder's alone, offline: `mantle init grant DIR --cell
+*The protocol.* Granting a new machine is the authority holder's alone, offline; re-granting a
+machine the cell wrote off is the cell's, online, under an issuer the authority made (§5.1).
+`mantle init grant DIR --cell
 OUT --node ...` (§7) draws the id, numbers the grant, issues the node's certificate and its S3 endpoint's,
 and writes the node's directory: its configuration of stated keys, the cell's ranges, the members
 it may dial first (each `seed = ID QUIC PLANE`), its identity and keys. The node does the rest
@@ -278,8 +287,182 @@ on any member's standard input, or repair's own `Gone { node }` (§8), applied a
 A gone member's identity is refused at once (§2), its votes are removed (§6), and repair rebuilds
 its chunks from the others (§8); once its volumes are retired, the root range's leader asks
 `Remove`, then, once no range names it, `Delist`. A gone member that comes back finds its identity
-refused at every peer (`link PEER ... Identity`); its supervisor grants it anew, and it joins as a
-new member.
+refused at every peer (`link PEER ... Identity`); it wipes its disks and comes back under a new
+identity the cell issues it (§5.1), or, where the cell's setting or a ban forbids that, its
+supervisor grants it anew, and it joins as a new member.
+
+### 5.1 Coming back after a write-off
+
+**Decided (2026-11-18), Ada: automatic.** Asked how a node written off as gone, its data already
+rebuilt on other nodes, should come back as a new member, the owner chose that it does so on its
+own: it wipes its disks and rejoins. That needs the cell to issue an identity online to a node
+that asks. The sources are research/98.
+
+**Who issues.** **Decided: the cell itself, under an issuer the authority makes once, offline; the
+authority's own key stays offline.** The authority signs one certificate, the cell's issuer: a CA
+whose pathLenConstraint is zero, so it signs node certificates and no further CA (RFC 5280
+§4.2.1.9, research/98 [7]), as a public root's key signs subordinate CAs and not leaves (CA/B
+Forum Baseline Requirements §6.1.7, [8]) and as SPIRE's upstream authority mints its server's
+signing intermediate ([4]). `mantle init` makes it beside the authority and writes its key into
+each founder's directory, as it writes the root key, and `mantle init grant` into each granted
+node's. The root range's leader signs with it only for a `Regrant` it proposes (step 3 below), and
+what it signs is admitted only once the root range has committed it. Every member keeps the key,
+since every member votes in the root range and may lead it (§6). A member's directory already keeps the cell's root key, which opens every object
+(encryption.md §2), and the issuer's key is kept as that is; it is worth less to a thief: the
+directory takes a certificate the issuer signed only at a fingerprint the root range committed
+(rule 4, §2), so a key taken from a disk signs certificates no member admits. A cell made before
+the issuer has none until its authority's holder makes one (`mantle init issuer --cell OUT`) and
+its members take its key; until then a request is refused `Unissued`.
+
+Not taken: an online issuer kiln runs, which would make coming back kiln's act and leave a cell kiln
+does not supervise (a laptop's, the tests') without it; and the authority's key online, which signs
+founders', gateways' and clients' certificates as well. Which authority is the cell's stays Ada's
+question (§10): either signs the issuer.
+
+**What the node presents.** Its written-off certificate and, over a TLS 1.3 handshake under
+mantle's enrollment protocol (an ALPN of its own, node.md §3.6), proof it holds that certificate's
+key: the CertificateVerify signs the handshake's transcript, fresh to that handshake (RFC 8446
+§4.4.3, research/98 [6]), so a recorded exchange cannot be replayed. With it, the public key of a
+key pair it has just made. This is SPIRE's `x509pop` attestation, a node proving possession of a
+provisioned certificate's key and named by that certificate's fingerprint ([4]), and Kubernetes'
+renewal by the certificate a node already holds ([1]).
+
+**Why that is safe.**
+
+- *It gives the key no standing it lacked.* Until the write-off, whoever held that key was admitted
+  as the member itself, and a member away and not yet judged gone comes back under it with nothing
+  asked (§5). The write-off is the cell's judgment about time, made so its durability need not wait
+  (§5), not a judgment about whose hands hold the machine. A re-grant gives the key's holder a new
+  member with empty disks, less than it held before.
+- *Hands are judged by a person.* An operator or supervisor that knows a machine lost, stolen or
+  retired for good bans it: `ban ID` on any member's standard input writes the member off, as `gone
+  ID` does, and drops its ledger entry (below), so it is never re-granted, SPIRE's ban: "A banned
+  attested node is not able to re-attest" ([4]). The cell's setting `rejoin off` re-grants none
+  (below). A stolen machine or disk comes back only where the cell's setting allows it and no one
+  has banned it.
+- *Once.* A written-off identity is re-granted at most once: its ledger entry is spent with the
+  first key it certifies, so a copied disk yields one member, not two, and the second claimant is
+  refused `Regranted`.
+- *Only once nothing on its disks is needed.* The root range re-grants a written-off member only
+  once it is `Removed` or delisted, so no volume of it is left in the table (§4 step 5): repair
+  forgot each volume because no block names it (§8), so nothing on the returning disks is the last
+  copy of anything. Before then the request waits (step 3).
+
+**The ledger.** The root range keeps an entry for each identity it wrote off that may be
+re-granted: the old node's id, grant and fingerprint, and once re-granted the new identity's id,
+grant and certificate. `Gone`, judged or stated, adds one; a member that left in order adds none,
+its leave being its supervisor's statement that it goes; `ban` drops one; the re-granted identity's
+`Join` drops its predecessor's. At most `root.max_nodes` entries, the cell's own bound (§9): one
+past it evicts the oldest written off, whose node then needs the authority holder's grant, today's
+path (§2). The issuer's grants are numbered by the root range itself, in a window of their own
+beside the authority's, `root.max_nodes` wide as that one is (§2): the count is the root range's,
+committed, so it cannot be lost as a granter's file can (§2's `Stale`), and two issuers numbering
+apart never collide.
+
+**The order.** The node's configuration names one certificate and its key at every instant, the
+old until step 5's rename and the new after, so no step leaves it with half an identity, and every
+step resumes from the node's files after a crash at any point. The wipe follows the cell's answer
+rather than preceding the request: only the root range knows that no block names the returning
+node's volumes, and a node refused (a ban, the setting) keeps its disks for whoever decides.
+
+1. **It learns it is retired.** A member its replica holds serving or leaving refuses its identity
+   at a handshake either side began. A member refuses an identity only from an entry it applied
+   (§2), so one refusal is the cell's committed word. The node writes a marker, `rejoin`, holding
+   its old certificate's fingerprint, whole and durable (written under a temporary name, flushed,
+   renamed, its directory flushed, as `mantle init` writes keys, node.md §1.5), and says
+   `retired`.
+2. **It stops serving.** Its doors, ranges and chunk service stop; it dials no member under its old
+   identity and writes no liveness record. A node that starts with the marker present starts here.
+3. **It asks.** It makes a key pair and writes it (`identity/next.key`) whole and durable before
+   sending anything, and keeps it through every retry, since the cell may commit a certificate for
+   it before the answer arrives. It dials each member it knows, its seeds and the members its
+   replica holds, each once, at most `root.max_nodes`, each within the transport's handshake
+   deadline, under the enrollment protocol, and sends `Regrant { key }`. A member's directory
+   admits under that protocol only a certificate whose fingerprint is a ledger entry, and only for
+   that request and its answer. The member forwards it to the root range's leader with the
+   fingerprint its handshake proved, never one the request names, as `Join` is taken only from the
+   node it names (§3 step 2), and the leader proposes `Regrant { old, node, grant, key,
+   certificate, at_ns }`: a new id drawn from the OS, the issuer's next grant, and the
+   certificate it signed for them. Refused: `Off` (the setting), `Unissued`, `Unknown` (no entry:
+   banned, evicted, left in order or never written off), `Regranted` (the entry spent to another
+   key), `SameKey` (the old key again), `Full` (the issuer's window or the table). Applied, the
+   entry is spent and holds the certificate, and the same key asking again is answered the same
+   certificate, so an answer lost to a crash costs nothing. The answer carries the certificate, the
+   issuer's certificate for its chain, and the members' addresses the root range holds. A request
+   for a member not yet removed waits at the member holding it until the root range applies that
+   member's `Remove`, the fact it needs, or until its connection ends.
+   One round per start: a round no member answered, a wait its connection ended, or a refusal ends
+   the process with a line saying which (`rejoin unreachable`, `rejoin refused REASON`) and a
+   nonzero status. Starting it again is its supervisor's, kiln or the operating system's service
+   manager, as for any exit of `mantle serve`; a refusal stands until a person or supervisor acts.
+4. **It wipes.** It writes the certificate beside its next key (`identity/next.der`), whole and
+   durable, then deletes every volume's files, each range's store, its log, and its presence and
+   history files, flushing each parent directory (CLAUDE.md §6). It keeps what is the cell's or the
+   machine's rather than the member's: its configuration, the cell's keys (the root key's
+   generations, the access keys, the issuer's key), its S3 endpoint's certificate, the machine's
+   calibration and its devices' profiles. The wipe is deletion, not a cryptographic erase: each
+   file is sealed under its own data key, wrapped under the cell's root key (encryption.md §2), so
+   no key is a volume's own to forget as Ceph forgets an encrypted OSD's (research/98 [11]), and
+   the rebuilt copies elsewhere are under the same file keys. It is for correctness, not secrecy:
+   the machine is a member again, trusted with the same keys, and state written under an old
+   identity is never presented under a new one (Raft dissertation §3.8, research/98 [12]; etcd and
+   CockroachDB likewise never take the removed member back, [9], [10]). A deletion done is done
+   again as nothing, so a crash mid-wipe resumes it.
+5. **It takes the new identity.** It rewrites its configuration to name the new certificate and
+   key and the members' addresses as its seeds, written whole under a temporary name, flushed,
+   renamed over the old and its directory flushed: the one step at which its identity changes. It
+   then deletes the old certificate and key, and the marker.
+6. **It joins as a new member** (§3): its ranges open empty, it dials its seeds, a member admits it
+   by rule 4 (§2), and its `Join` spends the issuer's grant. Its volumes are laid out fresh at
+   their first start (§3.1) and enlisted as new capacity, which placement fills (§3 step 5).
+
+A start finds where it stopped from its files alone: no marker, a normal start; the marker and no
+`next.der`, step 3 again with the kept key; `next.der` with the configuration naming the old
+identity, steps 4 and 5; the configuration naming the new one, the rest of step 5, then step 6.
+
+**What stays forbidden.** The old identity is never admitted again: its grant stays spent in its
+issuer's window and its member written off. A re-grant draws a new id and refuses the old key. The
+issuer signs node certificates alone, never a CA, a gateway's or a client's, and the directory
+takes its certificates as nodes' alone.
+
+**What an operator can turn off.** The cell's setting `rejoin`, `automatic` or `off`, held in the
+root range: stated at `mantle init --rejoin off`, and changed on a running cell by a `rejoin off`
+or `rejoin automatic` line on any member's standard input, a root range command as `gone ID` is.
+**The default is `automatic`, the owner's choice.** `off` re-grants none, and a written-off node
+comes back by the authority holder's grant, as before (§2). `ban ID` withdraws one machine.
+
+**Tests**, for the slices that build it:
+
+- `mantle_meta::root`: each refusal; a judged and a stated `Gone` each add an entry and a `Leave`
+  none; `ban` drops one; the ledger past `root.max_nodes` evicts the oldest; the same key asking
+  twice is answered the same certificate and a second key refused `Regranted`; a member not yet
+  `Removed` waits; the issuer's window spends each grant once; the old grant is refused after.
+- `crate::directory`: rule 4 admits the issuer's certificate only at a committed fingerprint, and
+  never as a client's or a gateway's; the enrollment protocol admits only a ledger fingerprint, for
+  `Regrant` alone.
+- `mantle_cert`: the issuer's certificate (cA, pathLenConstraint zero, keyCertSign) and a node's
+  under it verify through the transport's verifier to the authority; a CA under the issuer does
+  not.
+- The node's steps: a directory left at each crash point resumes, from a start, to one identity.
+- End to end, real processes: the repair suite's stated-gone test (`crates/mantle/tests/repair.rs`)
+  restarts the killed node on its old directory once its member is removed; it says `retired`,
+  comes back under a new id with its old volumes' files gone, says `joined`, its new volumes are
+  enlisted, and every acknowledged object reads back through both doors. `crates/mantle/tests/
+  membership.rs`: a member judged gone comes back the same way; one banned, and one in a cell
+  `rejoin off`, is refused and exits with its disks untouched; a copy of a retired node's directory
+  started beside it is refused `Regranted`; a node killed after its answer, mid-wipe and after its
+  rename comes back once, under one identity. Each wait is on a line a process says.
+
+**Slices**, in order, each about an hour (implement, unit-test, merge):
+
+| # | Slice | Files |
+|---|---|---|
+| 1 | The transport tells the side a peer's handshake refused that it was refused: the refusing end closes with a code its peer's endpoint maps to `Refusal::Identity` of its own identity | `vendor/hyper-transport/src/endpoint.rs` (the refusal at `refuse_connection` after `Directory::identify`), its tests |
+| 2 | The node learns it is retired (step 1) and stops serving (step 2): the marker, `retired`, no more redials or liveness records | `crates/node/src/process.rs` (beside `Departure`), `crates/node/src/node/members.rs`, `crates/mantle/src/files.rs` |
+| 3 | The wipe (step 4) and the identity's switch (step 5), as functions over a node directory with each crash point's files, not yet triggered | `crates/mantle/src/files.rs`, `crates/mantle/src/disk.rs`, `crates/node/src/process.rs` |
+| 4 | The root range's records: the ledger, the issuer's window, the setting; `Regrant`, `ban`, `rejoin` and each refusal | `crates/meta/src/root.rs`, `crates/node/src/command.rs`, `crates/node/src/process.rs` (the lines) |
+| 5 | The online issuer: the issuer's certificate, `mantle init`'s and `mantle init issuer`'s, the leader's signing, rule 4 and the enrollment protocol's admission | `crates/cert/src/lib.rs`, `crates/mantle/src/init.rs`, `crates/node/src/directory.rs`, `crates/node/src/node/members.rs` |
+| 6 | The rejoin: steps 3 and 6 joined to the rest, and the end-to-end tests | `crates/node/src/process.rs`, `crates/mantle/tests/repair.rs`, `crates/mantle/tests/membership.rs` |
 
 ## 6. Each range's configuration
 
@@ -311,6 +494,8 @@ a range's voters are, `2f + 1` one to a failure domain (§6.5), is placement's, 
 | `mantle serve CONFIG` | runs a founder or a granted node; a granted node joins at its first start |
 | `mantle serve CONFIG --leave` | runs the node until it has left (§4), then exits 0 |
 | `leave`, `gone ID` on a running node's standard input | the same leave; an operator's statement that `ID` is gone (§5) |
+| `ban ID`, `rejoin off`, `rejoin automatic` on a running node's standard input | `ID` written off and never re-granted; the cell's setting for written-off nodes coming back (§5.1) |
+| `mantle init ... --rejoin off`, `mantle init issuer --cell OUT` | a cell that re-grants no written-off node; the cell's issuer for a cell made before it (§5.1) |
 | `mantle status DIR` | as before: 0 while a living process of the node holds its readiness lock, taken once it joined |
 
 kiln's installer, on each machine it adds: `mantle init grant` on the machine holding the authority
@@ -369,8 +554,9 @@ loaded host gone as well (`crates/mantle/tests/repair.rs`).
 
 ## 9. Bounds
 
-Every map here is keyed by an identity the authority issued and bounded by the cell's statement
-`root.max_nodes`: the standings and members, the grant window's bits, each node's peers and
+Every map here is keyed by an identity the authority or the cell's issuer issued and bounded by
+the cell's statement `root.max_nodes`: the standings and members, each grant window's bits, the
+ledger of written-off identities and the requests waiting on it (§5.1), each node's peers and
 directory entries, its liveness pairs (`Settings::max_peers`) and the plane's keys
 (`PlaneLimits::max_peers`), and the transport's identities (`bounds::Stated::peers`), each sized
 for every member the cell may hold, not those it holds now. The history of a removed member is added to one row of removed members' totals and its own row goes,
@@ -401,7 +587,8 @@ held still (`SIGSTOP`) and killed (`SIGKILL`) for long stretches and come back; 
 another is away; and after every step every acknowledged object reads back byte for byte through
 both doors. Each wait is on a fact a process says (`joined`, `config`, `left`, `standing`).
 `mantle_meta::root`'s and `mantle_range::membership`'s tests pin every transition and every
-refusal; `crate::directory`'s, each admission rule.
+refusal; `crate::directory`'s, each admission rule. §5.1 states the tests of a written-off node
+coming back.
 
 ## 12. Open
 
@@ -420,3 +607,11 @@ refusal; `crate::directory`'s, each admission rule.
   refused; the container's identity is the fact to compare.
 - A member removed while leaving that stops for good before it says it holds its removal stays a
   learner of the root range, its row kept: the gone rule judges members serving or leaving only.
+- Proof of the machine rather than of its files: a key a TPM or a vendor's enclave keeps, the one
+  proof that tells a machine from a copy of its disk (research/98 §1), would let `automatic` refuse
+  a stolen disk without a ban. It is each platform's own, and the portable path cannot assume it.
+- A key of each volume's own beneath the root key would let a written-off volume be erased by
+  forgetting it, as Ceph erases an encrypted OSD (research/98 [11]); §5.1's wipe deletes.
+- A returning node's old chunks offered to repair before its wipe, where a rebuild is still running
+  (Carbonite's reintegration, repair.md §3, which kept places do for a member away and not yet
+  gone): §5.1 waits for the rebuild instead.

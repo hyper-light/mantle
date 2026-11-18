@@ -4683,6 +4683,82 @@ mod tests {
         }
     }
 
+    /// A founder of the membership suite's cell (`three_of_five` made by `Cell::made`: five nodes
+    /// at most and the four test clients pinned as gateways, nine identities; its five founding
+    /// ranges; a volume of 256 MiB; S3 served) on CI's macOS arm64 runner, three cores and 7 GiB,
+    /// its device's queue 256 and measured 256 deep. Its ranges, log and transport, sized by the
+    /// nine identities' appends out, hold more than 6 GiB of its floor at any depth. Where a pool's
+    /// worker carries each transfer (macOS, Windows), the issuer's 257 threads' stacks take it past
+    /// the machine at its threads, as CI's founder refused to start, its floor 7,718,104,000 bytes
+    /// (run 44349745026); the rest fits. Measured 4 deep, it starts. Its need, its floor at the
+    /// deepest its queue lets calibration measure with every want whole, passes the machine at
+    /// either depth: no memory it states starts it there, nor the suite's two other founders, which
+    /// are alike.
+    #[test]
+    fn a_membership_founder_on_cis_macos_runner_passes_its_memory_at_its_issuers_stacks() {
+        let founder = || {
+            let mut s = Stated {
+                s3: Some(crate::process::S3Stated {
+                    listen: "127.0.0.1:7480".parse().unwrap(),
+                    region: "us-east-1".into(),
+                    names: Vec::new(),
+                    certificate: at("/node/s3/cert.der"),
+                    key: at("/node/s3/key.der"),
+                    access: Vec::new(),
+                }),
+                enlist: Some(Enlisting {
+                    root: 0x10,
+                    domain: "d1".into(),
+                    max_nodes: 5,
+                    max_volumes: 5,
+                }),
+                ..stated(1)
+            };
+            s.volumes[0].1 = VolumeBytes::Stated(256 << 20);
+            s.peers.retain(|p| p.role == Role::Node);
+            for id in 6..=9 {
+                s.peers
+                    .push(peer(id, Role::Gateway, "/node/identity/c.der", None));
+            }
+            s
+        };
+        let memory = 7u64 << 30;
+        let runner = |depth| {
+            let mut measured = deep(256, depth);
+            measured.cores = 3;
+            measured.memory = machine(memory, None);
+            measured
+        };
+        let shallow = derive(founder(), &runner(4), &mut fresh).unwrap();
+        let need = said_bytes(&shallow, "memory.need");
+        assert!(need > memory, "{need}");
+        assert!(matches!(
+            allowance(Some(need), &machine(memory, None)),
+            Err(DeriveError::Ceiling { .. })
+        ));
+        let large: u64 = ["ranges", "log", "transport"]
+            .iter()
+            .map(|class| said_bytes(&shallow, &format!("memory.floor.{class}")))
+            .sum();
+        assert!(large > 6 << 30, "{large}");
+        let stacks = threads(3, &[256], &[true]).unwrap() * STACK;
+        match derive(founder(), &runner(256), &mut fresh) {
+            Ok(deep) if cfg!(target_os = "linux") => {
+                assert_eq!(said_bytes(&deep, "memory.need"), need);
+            }
+            Err(DeriveError::Memory {
+                class: Class::Threads,
+                floor,
+                allowance,
+            }) if !cfg!(target_os = "linux") => {
+                assert_eq!(allowance, memory);
+                assert_eq!(stacks, 269 * STACK);
+                assert!(floor - stacks <= allowance, "{floor} {stacks}");
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+    }
+
     /// What a node needs (`memory.need`) is its floor at the most its device can be measured to
     /// take, its queue, and its wants whole: the same whatever depth calibration measured; given
     /// it, a node measured at any depth up to the queue holds its index's whole want, and its

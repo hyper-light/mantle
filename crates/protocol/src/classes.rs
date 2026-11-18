@@ -58,7 +58,17 @@ pub enum Role {
     Gateway,
     /// A client of mantle's own protocol.
     Client,
+    /// A node the cell wrote off, under its old certificate on the enrollment protocol
+    /// ([`ENROLL`]), asking for a new identity (docs/design/membership.md §5.1 step 3): it sends
+    /// none of a node's, a gateway's or a client's messages.
+    Enrolling,
 }
+
+/// The application protocol (RFC 7301) of mantle's enrollment, apart from the transport's own
+/// (docs/design/node.md §3.6, membership.md §5.1): a written-off node proves under it, by its
+/// handshake's CertificateVerify (RFC 8446 §4.4.3), that it holds its old certificate's key, and a
+/// member admits that certificate on this protocol alone, as [`Role::Enrolling`].
+pub const ENROLL: &[u8] = b"mantle-enroll/1";
 
 /// The largest message of each class the node's ranges make, in bytes: a frame past its class's
 /// bound is refused before it is read (hyper-transport `Classes::frame_bound`).
@@ -136,9 +146,11 @@ impl Classes for NodeClasses {
             // gateway for objects and never writes a volume (node.md §3.6).
             (Kind::ChunkPut | Kind::ChunkGet, Role::Node | Role::Gateway) => Some(Class::Transfer),
             // An object's body is a large request's: the transfer level (node.md §3.1).
-            (Kind::Object, _) => Some(Class::Transfer),
+            (Kind::Object, Role::Node | Role::Gateway | Role::Client) => Some(Class::Transfer),
             (Kind::Raft | Kind::Snapshot, Role::Gateway | Role::Client)
             | (Kind::Command | Kind::Read | Kind::ChunkPut | Kind::ChunkGet, Role::Client) => None,
+            // An enrolling node sends none of these (membership.md §5.1).
+            (_, Role::Enrolling) => None,
         }
     }
 
@@ -244,6 +256,19 @@ mod tests {
             for kind in [Kind::Command, Kind::Read] {
                 assert_eq!(NodeClasses::class_of(kind, role), Some(Class::Request));
             }
+        }
+    }
+
+    /// A node enrolling under its old certificate sends none of a node's, a gateway's or a
+    /// client's messages (membership.md §5.1).
+    #[test]
+    fn an_enrolling_node_sends_no_member_message() {
+        for kind in KINDS {
+            assert_eq!(
+                NodeClasses::class_of(kind, Role::Enrolling),
+                None,
+                "{kind:?}"
+            );
         }
     }
 

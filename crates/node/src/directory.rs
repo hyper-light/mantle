@@ -23,14 +23,22 @@
 //! still names the gateways and the founders `mantle init` pinned, in a cell made before grants
 //! or by them. A certificate the cell's issuer signed (membership.md §5.1), its issuer not the
 //! authority, is a node's alone, admitted only as the member the root range holds under its
-//! fingerprint ([`Peers::authority`]).
+//! fingerprint, or before it joins at the fingerprint a committed re-grant names (rule 4,
+//! [`Peers::authority`]).
+//!
+//! A node the cell wrote off asks for a new identity on the enrollment protocol
+//! (`mantle_protocol::classes::ENROLL`, membership.md §5.1 step 3) under its old certificate, which
+//! its handshake proved it holds the key of (RFC 8446 §4.4.3): admitted there alone, as
+//! `Role::Enrolling`, where that certificate's fingerprint is a ledger entry's not banned and the
+//! cell's setting is not `off`, and kept with the fingerprint and key the handshake proved
+//! ([`Peers::enrolling`]), never ones the request names.
 
 use std::net::SocketAddr;
 
 use hyper_transport::{Authenticated, Directory, PeerId};
-use mantle_meta::record::{FINGERPRINT, Grants};
+use mantle_meta::record::{FINGERPRINT, Grants, Ledgered, PUBLIC_KEY, Rejoin};
 use mantle_meta::root;
-use mantle_protocol::classes::Role;
+use mantle_protocol::classes::{ENROLL, Role};
 
 /// A peer as the directory holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +56,15 @@ pub struct Admitted {
     pub id: PeerId,
     pub fingerprint: [u8; FINGERPRINT],
     pub admitted: bool,
+}
+
+/// A written-off node admitted on the enrollment protocol (membership.md §5.1 step 3): its old id,
+/// and its old certificate's fingerprint and the key it certifies, as its handshake proved them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Enrolling {
+    pub old: PeerId,
+    pub fingerprint: [u8; FINGERPRINT],
+    pub key: [u8; PUBLIC_KEY],
 }
 
 /// A pinned peer as the directory holds it.
@@ -93,6 +110,20 @@ pub struct Peers {
     /// issuer under it signed ([`Peers::authority`]); none in a directory not told it, which takes
     /// every chain its handshake verified as the authority's.
     authority: Option<Vec<u8>>,
+    /// The identities the root range re-granted and has yet to see join, sorted by their new ids:
+    /// each its new id and its certificate's fingerprint, an entry of the ledger not banned (rule
+    /// 4, membership.md §5.1). At most the ledger's entries, which the cell's nodes bound.
+    regranted: Vec<(PeerId, [u8; FINGERPRINT])>,
+    /// The written-off identities that may ask for a new one, sorted by their old ids: each its old
+    /// id and its certificate's fingerprint, an entry of the ledger not banned, none where the
+    /// cell's setting is `off`. At most the ledger's entries.
+    ledger: Vec<(PeerId, [u8; FINGERPRINT])>,
+    /// The written-off nodes admitted on the enrollment protocol, sorted by their old ids: one an
+    /// entry of `ledger` at most, each kept while the transport holds a connection of it.
+    enrolling: Vec<Enrolling>,
+    /// The most enrolling nodes the node serves at once ([`Peers::enrollments_at_once`]): past
+    /// them, one is refused once its connection is up.
+    most_enrolling: usize,
 }
 
 impl Peers {
@@ -106,7 +137,7 @@ impl Peers {
                     let name = mantle_protocol::node_name(peer.id);
                     let grant = match peer.role {
                         Role::Node => mantle_cert::node_grant(&peer.certificate).ok().flatten(),
-                        Role::Gateway | Role::Client => None,
+                        Role::Gateway | Role::Client | Role::Enrolling => None,
                     };
                     let fingerprint = mantle_cert::fingerprint(&peer.certificate);
                     Pinned {
@@ -125,7 +156,18 @@ impl Peers {
             joining: Vec::new(),
             seeds: Vec::new(),
             authority: None,
+            regranted: Vec::new(),
+            ledger: Vec::new(),
+            enrolling: Vec::new(),
+            most_enrolling: 0,
         }
+    }
+
+    /// Serves at most `most` enrolling nodes at once: each is answered by a command of the root
+    /// range the node asks for it (membership.md §5.1 step 3), so the commands the node holds at
+    /// once bound them.
+    pub fn enrollments_at_once(&mut self, most: usize) {
+        self.most_enrolling = most;
     }
 
     /// Takes `certificate` as the cell's authority's (membership.md §2 rule 4, §5.1): a node's
@@ -169,6 +211,10 @@ impl Peers {
                 .is_some_and(|m| m.admitted)
             || self.joining.binary_search(&peer).is_ok()
             || self.seeds.binary_search(&peer).is_ok()
+            || self
+                .regranted
+                .binary_search_by_key(&peer, |(id, _)| *id)
+                .is_ok()
     }
 
     /// The pinned peer named `id`.
@@ -181,16 +227,17 @@ impl Peers {
     }
 
     /// The cell's members and grant window as this node's root range holds them now, `width` the
-    /// window's, the cell's bound on nodes (docs/design/membership.md §2). The members whose
-    /// identity this takes away, admitted before and not now, are given back, for the node to
-    /// close their connections: a change applies to the handshakes after it, and a connection
-    /// already identified keeps its peer until its owner closes it (hyper-transport
-    /// `Endpoint::directory_mut`).
+    /// window's, the cell's bound on nodes (docs/design/membership.md §2), and its ledger of
+    /// written-off identities and its `rejoin` setting (§5.1). The members whose identity this
+    /// takes away, admitted before and not now, are given back, for the node to close their
+    /// connections: a change applies to the handshakes after it, and a connection already
+    /// identified keeps its peer until its owner closes it (hyper-transport
+    /// `Endpoint::directory_mut`). So are the enrolling nodes whose entry no longer admits them.
     pub fn set_members(
         &mut self,
         mut members: Vec<Admitted>,
-        window: Grants,
-        width: u32,
+        (window, width): (Grants, u32),
+        (ledger, rejoin): (&[(u64, Ledgered)], Rejoin),
     ) -> Vec<PeerId> {
         members.sort_unstable_by_key(|m| m.id);
         let pinned_refused = |peers: &Self| -> Vec<PeerId> {
@@ -203,8 +250,27 @@ impl Peers {
         };
         let refused_before = pinned_refused(self);
         let was = std::mem::take(&mut self.members);
+        let was_regranted = std::mem::take(&mut self.regranted);
         self.members = members;
         self.window = Some((window, width));
+        // Rule 4: a re-granted identity, its entry not banned, as the join judges it
+        // (`mantle_meta::root`'s `regranted_as`).
+        self.regranted = ledger
+            .iter()
+            .filter(|(_, entry)| !entry.banned)
+            .filter_map(|(_, entry)| entry.regranted.as_ref())
+            .map(|r| (r.node, r.fingerprint))
+            .collect();
+        self.regranted.sort_unstable();
+        self.ledger = match rejoin {
+            Rejoin::Off => Vec::new(),
+            Rejoin::Automatic => ledger
+                .iter()
+                .filter(|(_, entry)| !entry.banned)
+                .map(|(old, entry)| (*old, entry.fingerprint))
+                .collect(),
+        };
+        self.ledger.sort_unstable();
         // Every identity admitted before is judged again under the new rows: a member gone or
         // removed, or a pinned node refused since, is withdrawn.
         let mut withdrawn: Vec<PeerId> = was
@@ -218,6 +284,23 @@ impl Peers {
                 .into_iter()
                 .filter(|id| !refused_before.contains(id)),
         );
+        withdrawn.extend(
+            was_regranted
+                .iter()
+                .filter(|(id, fingerprint)| {
+                    !self.member_admitted(*id, fingerprint)
+                        && !self.regrant_admits(*id, fingerprint)
+                })
+                .map(|(id, _)| *id),
+        );
+        let ledger = &self.ledger;
+        self.enrolling.retain(|e| {
+            let kept = ledger.binary_search(&(e.old, e.fingerprint)).is_ok();
+            if !kept {
+                withdrawn.push(e.old);
+            }
+            kept
+        });
         withdrawn.sort_unstable();
         withdrawn.dedup();
         withdrawn
@@ -249,6 +332,55 @@ impl Peers {
             .ok()
             .and_then(|at| self.members.get(at))
             .is_some_and(|m| m.admitted && m.fingerprint == *fingerprint)
+    }
+
+    /// Whether a committed re-grant names `id` under `fingerprint` and the root range holds no
+    /// member of it yet: rule 4, the issuer's certificate before its join (membership.md §5.1).
+    fn regrant_admits(&self, id: PeerId, fingerprint: &[u8; FINGERPRINT]) -> bool {
+        !self.is_member(id) && self.regranted.binary_search(&(id, *fingerprint)).is_ok()
+    }
+
+    /// The written-off node `old` admitted on the enrollment protocol, as its handshake proved
+    /// its old certificate: what a member forwards for it, never what its request names.
+    pub fn enrolling(&self, old: PeerId) -> Option<Enrolling> {
+        self.enrolling
+            .binary_search_by_key(&old, |e| e.old)
+            .ok()
+            .and_then(|at| self.enrolling.get(at))
+            .copied()
+    }
+
+    /// Whether more written-off nodes are admitted on the enrollment protocol than the node serves
+    /// at once: the one whose connection came up last is refused, typed (`Refusal::Identities`), as a
+    /// client past the node's bound is, and asks again after.
+    pub fn enrollments_past_bound(&self) -> bool {
+        self.enrolling.len() > self.most_enrolling
+    }
+
+    /// The node `old` asking on the enrollment protocol under `certificate`, its old one, if a
+    /// ledger entry not banned holds that certificate's fingerprint under `old` and the cell's
+    /// setting is not `off` (membership.md §5.1 step 3): one connection's admission, kept with the
+    /// fingerprint and key the handshake proved.
+    fn enroll(&mut self, certificate: &[u8], dialed: Option<PeerId>) -> Option<(PeerId, Role)> {
+        // A member dials no node to enroll it.
+        if dialed.is_some() {
+            return None;
+        }
+        let names = mantle_cert::node_names(certificate).ok()?;
+        let old = mantle_protocol::node_id(names.name)?;
+        let fingerprint = mantle_cert::fingerprint(certificate);
+        self.ledger.binary_search(&(old, fingerprint)).ok()?;
+        let key: [u8; PUBLIC_KEY] = mantle_cert::public_key(certificate).ok()?.try_into().ok()?;
+        let enrolling = Enrolling {
+            old,
+            fingerprint,
+            key,
+        };
+        match self.enrolling.binary_search_by_key(&old, |e| e.old) {
+            Ok(at) => *self.enrolling.get_mut(at)? = enrolling,
+            Err(at) => self.enrolling.insert(at, enrolling),
+        }
+        Some((old, Role::Enrolling))
     }
 
     /// Whether the root range holds a member of `id`, in any state.
@@ -325,14 +457,16 @@ impl Peers {
         self.clients.len()
     }
 
-    /// Keeps the clients that hold a connection, `held` the transport's identified connections
-    /// (hyper-transport `Endpoint::established`), and forgets the rest: those whose connections
-    /// went, and those identified and then refused admission.
+    /// Keeps the clients, joining nodes and enrolling nodes that hold a connection, `held` the
+    /// transport's identified connections (hyper-transport `Endpoint::established`), and forgets
+    /// the rest: those whose connections went, and those identified and then refused admission.
     pub fn keep_clients(&mut self, held: &[(PeerId, SocketAddr)]) {
         self.clients
             .retain(|(id, _)| held.iter().any(|(peer, _)| peer == id));
         self.joining
             .retain(|id| held.iter().any(|(peer, _)| peer == id));
+        self.enrolling
+            .retain(|e| held.iter().any(|(peer, _)| *peer == e.old));
     }
 }
 
@@ -345,6 +479,11 @@ impl Directory for Peers {
     /// peer's or names another account, or the clients held are at their bound.
     fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Role)> {
         let certificate = authenticated.certificate?;
+        // The enrollment protocol admits a written-off identity's certificate alone, and nothing
+        // else is admitted on it.
+        if authenticated.protocol == ENROLL {
+            return self.enroll(certificate, authenticated.dialed);
+        }
         if let Some(pinned) = self
             .peers
             .iter()
@@ -367,10 +506,12 @@ impl Directory for Peers {
                 return None;
             }
             let fingerprint = mantle_cert::fingerprint(certificate);
-            // The issuer's: a member's under the fingerprint the root range committed, rule 2, and
-            // nothing else; its grant is the issuer's, which the authority's window does not judge.
+            // The issuer's: a member's under the fingerprint the root range committed, rule 2, or
+            // before its join the fingerprint a committed re-grant names, rule 4, and nothing
+            // else; its grant is the issuer's, which the authority's window does not judge.
             if by_issuer {
-                if !self.member_admitted(id, &fingerprint) {
+                if !self.member_admitted(id, &fingerprint) && !self.regrant_admits(id, &fingerprint)
+                {
                     return None;
                 }
                 return Some((id, Role::Node));
@@ -434,6 +575,7 @@ impl Directory for Peers {
 mod tests {
     use super::*;
     use mantle_cert::{KeyPair, Serial, Validity};
+    use mantle_meta::record::Regranted;
 
     fn peer(id: u64, certificate: &[u8]) -> Peer {
         Peer {
@@ -556,7 +698,7 @@ mod tests {
         peers.seed(8);
         assert!(
             peers
-                .set_members(Vec::new(), Grants::default(), 3)
+                .set_members(Vec::new(), (Grants::default(), 3), (&[], Rejoin::Automatic))
                 .is_empty()
         );
         // New by the authority's window, and a seed: neither admits the issuer's.
@@ -567,14 +709,22 @@ mod tests {
             Some((9, Role::Node))
         );
         // Joined: the member under its fingerprint, and no other certificate of its id.
-        peers.set_members(vec![member(7, &seven, true)], Grants::default(), 3);
+        peers.set_members(
+            vec![member(7, &seven, true)],
+            (Grants::default(), 3),
+            (&[], Rejoin::Automatic),
+        );
         assert_eq!(peers.identify(&seen(&seven, None)), Some((7, Role::Node)));
         assert_eq!(
             peers.identify(&seen(&seven, Some(7))),
             Some((7, Role::Node))
         );
         assert_eq!(peers.identify(&seen(&issued(7, 1), None)), None);
-        peers.set_members(vec![member(7, &seven, false)], Grants::default(), 3);
+        peers.set_members(
+            vec![member(7, &seven, false)],
+            (Grants::default(), 3),
+            (&[], Rejoin::Automatic),
+        );
         assert_eq!(peers.identify(&seen(&seven, None)), None);
         // A client's the issuer signed is no client.
         let issued_client = mantle_cert::client(
@@ -600,8 +750,212 @@ mod tests {
         );
         // Told no authority, as before: every chain the authority's.
         let mut untold = Peers::new(Vec::new(), 0);
-        untold.set_members(Vec::new(), Grants::default(), 3);
+        untold.set_members(Vec::new(), (Grants::default(), 3), (&[], Rejoin::Automatic));
         assert_eq!(untold.identify(&seen(&seven, None)), Some((7, Role::Node)));
+    }
+
+    fn ledgered(certificate: &[u8], banned: bool, regranted: Option<(u64, &[u8])>) -> Ledgered {
+        Ledgered {
+            order: 1,
+            grant: 1,
+            fingerprint: mantle_cert::fingerprint(certificate),
+            banned,
+            regranted: regranted.map(|(node, certificate)| Regranted {
+                node,
+                grant: 1,
+                fingerprint: mantle_cert::fingerprint(certificate),
+                key: mantle_cert::public_key(certificate)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                certificate: certificate.to_vec(),
+            }),
+        }
+    }
+
+    fn enrolling_seen(certificate: &[u8], dialed: Option<PeerId>) -> Authenticated<'_> {
+        Authenticated {
+            certificate: Some(certificate),
+            protocol: ENROLL,
+            dialed,
+        }
+    }
+
+    /// The cell's authority, its certificate and its issuer's key, and a node certificate the
+    /// issuer signs.
+    fn issuer_cell() -> (KeyPair, Vec<u8>, KeyPair) {
+        let authority_key = KeyPair::generate().unwrap();
+        let authority =
+            mantle_cert::authority(&authority_key, "cell", validity().0, validity().1).unwrap();
+        (authority_key, authority, KeyPair::generate().unwrap())
+    }
+
+    fn issued_by(issuer_key: &KeyPair, id: u64, grant: u64) -> Vec<u8> {
+        mantle_cert::granted_node(
+            issuer_key,
+            "cell issuer",
+            KeyPair::generate().unwrap().public_key(),
+            (&mantle_protocol::node_name(id), grant),
+            validity(),
+        )
+        .unwrap()
+    }
+
+    /// Rule 4 (membership.md §2, §5.1): a certificate the cell's issuer signed is admitted before
+    /// its join at the fingerprint a committed re-grant names, and at no other; a ban since
+    /// refuses it and gives it back to close; once joined, its member's row admits it.
+    #[test]
+    fn rule_4_admits_an_issuer_signed_certificate_at_a_committed_regrant_alone() {
+        let (authority_key, authority, issuer_key) = issuer_cell();
+        let old = granted(&authority_key, 4, 1);
+        let new = issued_by(&issuer_key, 9, 1);
+        let mut peers = Peers::new(Vec::new(), 2);
+        peers.authority(authority);
+        let window = (Grants::default(), 3);
+        let committed = vec![(4, ledgered(&old, false, Some((9, &new))))];
+        let members = vec![member(4, &old, false)];
+        assert!(
+            peers
+                .set_members(
+                    members.clone(),
+                    window.clone(),
+                    (&committed, Rejoin::Automatic)
+                )
+                .is_empty()
+        );
+        assert_eq!(peers.identify(&seen(&new, None)), Some((9, Role::Node)));
+        assert_eq!(peers.identify(&seen(&new, Some(9))), Some((9, Role::Node)));
+        assert!(peers.is_node(9));
+        // Another certificate of its id, and one no committed re-grant names: refused.
+        assert_eq!(
+            peers.identify(&seen(&issued_by(&issuer_key, 9, 1), None)),
+            None
+        );
+        assert_eq!(
+            peers.identify(&seen(&issued_by(&issuer_key, 10, 2), None)),
+            None
+        );
+        // The re-grant not yet committed: refused.
+        let open = vec![(4, ledgered(&old, false, None))];
+        let mut before = Peers::new(Vec::new(), 2);
+        before.authority(peers.authority.clone().unwrap());
+        before.set_members(members.clone(), window.clone(), (&open, Rejoin::Automatic));
+        assert_eq!(before.identify(&seen(&new, None)), None);
+        // Banned since: refused, and given back for its connections to close.
+        let banned = vec![(4, ledgered(&old, true, Some((9, &new))))];
+        assert_eq!(
+            peers.set_members(members, window.clone(), (&banned, Rejoin::Automatic)),
+            vec![9]
+        );
+        assert_eq!(peers.identify(&seen(&new, None)), None);
+        // Joined, its predecessor's entry dropped: its member's row admits it.
+        peers.set_members(
+            vec![member(9, &new, true)],
+            window,
+            (&[], Rejoin::Automatic),
+        );
+        assert_eq!(peers.identify(&seen(&new, None)), Some((9, Role::Node)));
+    }
+
+    /// The enrollment protocol (membership.md §5.1 step 3) admits a written-off node under its old
+    /// certificate where that certificate's fingerprint is a ledger entry's, not banned, the
+    /// setting not `off`, as an enrolling node alone, kept with the fingerprint and key its
+    /// handshake proved; another certificate, a client's, a dial, a banned entry and the setting
+    /// `off` are refused on it, and the old certificate stays refused as a node's.
+    #[test]
+    fn the_enrollment_protocol_admits_a_ledgered_old_certificate_alone() {
+        let authority = KeyPair::generate().unwrap();
+        let old_key = KeyPair::generate().unwrap();
+        let old = mantle_cert::granted_node(
+            &authority,
+            "cell",
+            old_key.public_key(),
+            (&mantle_protocol::node_name(4), 1),
+            validity(),
+        )
+        .unwrap();
+        let mut peers = Peers::new(Vec::new(), 2);
+        peers.enrollments_at_once(1);
+        let window = (Grants::default(), 3);
+        let gone = || vec![member(4, &old, false)];
+        let ledger = vec![(4, ledgered(&old, false, None))];
+        peers.set_members(gone(), window.clone(), (&ledger, Rejoin::Automatic));
+        assert_eq!(
+            peers.identify(&enrolling_seen(&old, None)),
+            Some((4, Role::Enrolling))
+        );
+        // What the member forwards is what the handshake proved.
+        let proved = peers.enrolling(4).unwrap();
+        assert_eq!(proved.old, 4);
+        assert_eq!(proved.fingerprint, mantle_cert::fingerprint(&old));
+        assert_eq!(proved.key.as_slice(), old_key.public_key());
+        assert!(!peers.is_node(4));
+        assert!(!peers.enrollments_past_bound());
+        // Its member is gone: refused on the transport's own protocol.
+        assert_eq!(peers.identify(&seen(&old, None)), None);
+        // A dial, a certificate the ledger does not hold, another of the old id, a client's.
+        assert_eq!(peers.identify(&enrolling_seen(&old, Some(4))), None);
+        assert_eq!(
+            peers.identify(&enrolling_seen(&granted(&authority, 5, 2), None)),
+            None
+        );
+        assert_eq!(
+            peers.identify(&enrolling_seen(&granted(&authority, 4, 1), None)),
+            None
+        );
+        assert_eq!(
+            peers.identify(&enrolling_seen(&client(4, "123456789012"), None)),
+            None
+        );
+        // Banned: refused, and the enrolling node given back for its connection to close.
+        let banned = vec![(4, ledgered(&old, true, None))];
+        assert_eq!(
+            peers.set_members(gone(), window.clone(), (&banned, Rejoin::Automatic)),
+            vec![4]
+        );
+        assert_eq!(peers.enrolling(4), None);
+        assert_eq!(peers.identify(&enrolling_seen(&old, None)), None);
+        // The setting `off` re-grants none; `automatic` again admits it.
+        peers.set_members(gone(), window.clone(), (&ledger, Rejoin::Off));
+        assert_eq!(peers.identify(&enrolling_seen(&old, None)), None);
+        peers.set_members(gone(), window, (&ledger, Rejoin::Automatic));
+        assert_eq!(
+            peers.identify(&enrolling_seen(&old, None)),
+            Some((4, Role::Enrolling))
+        );
+    }
+
+    /// Past the enrollments the node serves at once the directory says so, for the node to refuse
+    /// the last typed; once a connection goes, there is room again.
+    #[test]
+    fn enrollments_past_the_bound_are_refused() {
+        let authority = KeyPair::generate().unwrap();
+        let (four, five) = (granted(&authority, 4, 1), granted(&authority, 5, 2));
+        let mut peers = Peers::new(Vec::new(), 0);
+        peers.enrollments_at_once(1);
+        let ledger = vec![
+            (4, ledgered(&four, false, None)),
+            (5, ledgered(&five, false, None)),
+        ];
+        peers.set_members(
+            vec![member(4, &four, false), member(5, &five, false)],
+            (Grants::default(), 3),
+            (&ledger, Rejoin::Automatic),
+        );
+        assert_eq!(
+            peers.identify(&enrolling_seen(&four, None)),
+            Some((4, Role::Enrolling))
+        );
+        assert!(!peers.enrollments_past_bound());
+        assert_eq!(
+            peers.identify(&enrolling_seen(&five, None)),
+            Some((5, Role::Enrolling))
+        );
+        assert!(peers.enrollments_past_bound());
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        peers.keep_clients(&[(4, addr)]);
+        assert!(!peers.enrollments_past_bound());
+        assert_eq!(peers.enrolling(5), None);
     }
 
     /// membership.md §2's rules: a granted node's certificate is admitted while its grant is new
@@ -616,7 +970,11 @@ mod tests {
         // No root range applied yet: a cell made before grants pins its nodes.
         assert_eq!(peers.identify(&seen(&two, None)), None);
         let empty = Grants::default();
-        assert!(peers.set_members(Vec::new(), empty.clone(), 3).is_empty());
+        assert!(
+            peers
+                .set_members(Vec::new(), (empty.clone(), 3), (&[], Rejoin::Automatic))
+                .is_empty()
+        );
         assert_eq!(peers.identify(&seen(&two, None)), Some((2, Role::Node)));
         assert_eq!(peers.identify(&seen(&two, Some(2))), Some((2, Role::Node)));
         assert_eq!(peers.identify(&seen(&two, Some(3))), None);
@@ -627,7 +985,11 @@ mod tests {
             seen: vec![1],
         };
         let rows = vec![member(2, &two, true)];
-        assert!(peers.set_members(rows, spent.clone(), 3).is_empty());
+        assert!(
+            peers
+                .set_members(rows, (spent.clone(), 3), (&[], Rejoin::Automatic))
+                .is_empty()
+        );
         assert_eq!(peers.identify(&seen(&two, None)), Some((2, Role::Node)));
         assert_eq!(peers.identify(&seen(&three, None)), Some((3, Role::Node)));
         // Another certificate under node 2's id and grant is refused.
@@ -635,14 +997,24 @@ mod tests {
         assert_eq!(peers.identify(&seen(&impostor, None)), None);
         // Gone: refused, and its connections are to close.
         let rows = vec![member(2, &two, false)];
-        assert_eq!(peers.set_members(rows, spent.clone(), 3), vec![2]);
+        assert_eq!(
+            peers.set_members(rows, (spent.clone(), 3), (&[], Rejoin::Automatic)),
+            vec![2]
+        );
         assert_eq!(peers.identify(&seen(&two, None)), None);
         // Removed: its grant spent, no row: refused, and so is a pinned copy of it.
-        assert!(peers.set_members(Vec::new(), spent.clone(), 3).is_empty());
+        assert!(
+            peers
+                .set_members(Vec::new(), (spent.clone(), 3), (&[], Rejoin::Automatic))
+                .is_empty()
+        );
         assert_eq!(peers.identify(&seen(&two, None)), None);
         let mut pinned = Peers::new(vec![peer(2, &two)], 0);
         assert_eq!(pinned.identify(&seen(&two, None)), Some((2, Role::Node)));
-        assert_eq!(pinned.set_members(Vec::new(), spent, 3), vec![2]);
+        assert_eq!(
+            pinned.set_members(Vec::new(), (spent, 3), (&[], Rejoin::Automatic)),
+            vec![2]
+        );
         assert_eq!(pinned.identify(&seen(&two, None)), None);
         // A node dialed by its seed name is checked against it.
         peers.name(3);

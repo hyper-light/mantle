@@ -282,8 +282,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .collect();
         let withdrawn = self.driver.endpoint().directory_mut().set_members(
             admitted_rows,
-            grants,
-            self.max_nodes,
+            (grants, self.max_nodes),
+            (&ledger, rejoin),
         );
         let clock = self.driver.clock()?;
         for peer in withdrawn {
@@ -740,7 +740,7 @@ mod tests {
                 row(&two, state, learner),
                 row(&three, MemberState::Serving, false),
             ];
-            peers.set_members(rows, Grants::default(), 3)
+            peers.set_members(rows, (Grants::default(), 3), (&[], Rejoin::Automatic))
         };
         let mut peers = Peers::new(vec![two.clone(), three.clone()], 0);
         // Before any row, admitted by its pin.
@@ -781,7 +781,11 @@ mod tests {
         let mut other = row(&founder(4), MemberState::Serving, false);
         other.id = 2;
         let rows = vec![other, row(&three, MemberState::Serving, false)];
-        assert!(peers.set_members(rows, Grants::default(), 3).is_empty());
+        assert!(
+            peers
+                .set_members(rows, (Grants::default(), 3), (&[], Rejoin::Automatic))
+                .is_empty()
+        );
         assert_eq!(accepted(&mut peers), None);
     }
 }

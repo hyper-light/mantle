@@ -8,6 +8,7 @@
 //! - [`client`]: a client of the cell's ranges, asking their leaders to apply entries.
 //! - [`command`]: a command for a range as a client asks it and a node answers it.
 //! - [`directory`]: the peers a connection may name, by certificate.
+//! - [`enroll`]: the cell's issuer on a member, and the re-grant the root range's leader signs.
 //! - [`frame`]: a range's Raft message as it travels.
 //! - [`layout`]: what the node keeps beside its log: its run.
 //! - [`names`]: the peers named by a host name, and when each is looked up again.
@@ -41,6 +42,7 @@ pub mod command;
 pub mod derive;
 pub mod directory;
 pub mod door;
+pub mod enroll;
 pub mod files;
 pub mod frame;
 pub mod history;

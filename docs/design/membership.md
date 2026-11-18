@@ -548,6 +548,40 @@ by the authority's window, as a seed or as a client. Left to slice 5b: rule 4 it
 certificate admitted at a committed `Regrant` fingerprint before it joins), the leader's signing,
 `SameKey`, `Unissued` and the enrollment protocol.
 
+*As built (slice 5b, 2026-11-18;* `crate::directory`*, `crate::enroll`, `mantle_cert::issuer_name`*).*
+Rule 4: the directory, given the ledger and the setting with the members (`Peers::set_members`),
+admits a certificate the issuer signed, before its join, at the new id and fingerprint a committed
+re-grant names, its entry not banned, as the join judges it (`root`'s `regranted_as`); another
+certificate of that id, one no committed re-grant names, and one whose entry was banned since are
+refused, the last given back for its connections to close, and once it joins its member's row
+admits it (rule 2). The enrollment protocol is an ALPN of its own, `mantle-enroll/1`
+(`mantle_protocol::classes::ENROLL`), which every member's server offers beside the transport's:
+hyper-transport's `Tls` carries a server's protocols and tells `Directory::identify` the one a
+handshake negotiated, so the transport is unchanged. On it the directory admits only a certificate
+of a node's profile, on a connection the peer opened, whose fingerprint is the ledger's entry for
+the id it names, not banned, the setting `automatic`, as `Role::Enrolling`, which may send none of
+a node's, a gateway's or a client's messages (`NodeClasses::class_of`), and keeps the old id with
+the fingerprint and key the handshake proved (`Peers::enrolling`): what the member forwards, never
+what a request names. An entry banned, evicted or turned `off` withdraws its enrolling node, given
+back for its connection to close. A member serves at most as many enrolling nodes at once as the
+commands it holds (`command_asks`), since each is answered by a command of the root range it asks;
+past them, the one whose connection came up last is refused `Identities` once up, as a client past
+the node's bound is, and asks again after. The leader's signing (`enroll::sign`) takes the issuer as
+a member keeps it (`enroll::Issuer`: its certificate, its key, and the name it signs as, read from
+its subject by `mantle_cert::issuer_name` rather than spelled from the authority's), signs a
+certificate of `granted_node`'s profile for the key asked, under the drawn id and grant, valid from
+the signing with no expiry (`mantle_cert::NO_EXPIRY`, moved there from `mantle init`), and makes the
+`Regrant` naming that certificate's SHA-256; it refuses before signing `Unissued`, where the member
+keeps no issuer, and `SameKey`, where the key asked for is the old certificate's (`enroll::judge`).
+A ban, the setting and a re-grant are a node's commands alone, as `gone ID` is, never a gateway's
+(`node.rs` `names_only_its_sender`): a node relays the first two from its operator, and the root
+range's leader proposes the third. Left to slice 5c: the request's kind and wire (`Regrant { key }` and its answer, the certificate,
+the issuer's and the members' addresses, each with golden vectors), the member's forwarding to the
+root range's leader, the leader's draw of the new id from the OS and of the issuer window's next
+grant with one re-grant out at a time, the start keeping the issuer's key for the node (it verifies
+it and drops it still), one request a connection and its close after the answer, and the node's
+client call `rejoin::ask`.
+
 **What stays forbidden.** The old identity is never admitted again: its grant stays spent in its
 issuer's window and its member written off. A re-grant draws a new id and refuses the old key. The
 issuer signs node certificates alone, never a CA, a gateway's or a client's, and the directory

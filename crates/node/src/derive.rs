@@ -1859,6 +1859,7 @@ fn role_name(role: Role) -> &'static str {
         Role::Node => "node",
         Role::Gateway => "gateway",
         Role::Client => "client",
+        Role::Enrolling => "enrolling",
     }
 }
 

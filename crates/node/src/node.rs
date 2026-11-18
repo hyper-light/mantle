@@ -1316,7 +1316,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         })
         .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;
 
-        let tls = Tls::mutual(&settings.credentials, true).map_err(at(Step::Identity))?;
+        let mut tls = Tls::mutual(&settings.credentials, true).map_err(at(Step::Identity))?;
+        // A written-off node asks a member for its new identity on the enrollment protocol, beside
+        // the transport's own (membership.md §5.1 step 3); the directory admits on it only a
+        // ledger entry's certificate (`crate::directory`).
+        if let Some(server) = tls.server.as_mut() {
+            server.alpn_protocols.push(classes::ENROLL.to_vec());
+        }
         let dial_only = Tls::mutual(&settings.credentials, false).map_err(at(Step::Identity))?;
         let config = Config {
             tls,
@@ -1339,6 +1345,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .saturating_add(limits.admission.pending)
         };
         let mut directory = Peers::new(settings.peers.clone(), most_clients);
+        directory.enrollments_at_once(settings.command_asks);
         if let Some(authority) = settings.credentials.roots.first() {
             directory.authority(authority.to_vec());
         }
@@ -2848,6 +2855,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 role: Role::Client,
                 ..
             } if self.driver.endpoint().directory().clients() > self.clients => {
+                let clock = self.driver.clock()?;
+                self.driver
+                    .endpoint()
+                    .refuse(clock, peer, Refusal::Identities);
+                Ok(())
+            }
+            // A written-off node's request is answered by a command of the root range this node
+            // asks for it (membership.md §5.1 step 3): past the commands it holds at once
+            // (`Peers::enrollments_at_once`), an enrollment is refused as an identity past the
+            // transport's is, and asked again after.
+            Event::Connected {
+                peer,
+                role: Role::Enrolling,
+                ..
+            } if self.driver.endpoint().directory().enrollments_past_bound() => {
                 let clock = self.driver.clock()?;
                 self.driver
                     .endpoint()
@@ -5202,15 +5224,18 @@ fn names_only_its_sender(command: &Command, sender: PeerId, node: bool) -> bool 
         Command::Root(Root::Join(j)) => node && j.node == sender,
         Command::Root(Root::Leave { node: leaving, .. }) => node && *leaving == sender,
         // What the cell sees, a leaving volume emptied and forgotten, the root range's leader's
-        // judgments and an operator's statement relayed by a member: a node states them, never a
-        // gateway, each checked where it applies.
+        // judgments and re-grants, and an operator's statement relayed by a member: a node states
+        // them, never a gateway, each checked where it applies (membership.md §5, §5.1).
         Command::Root(
             Root::Seen(_)
             | Root::Retire { .. }
             | Root::Forget { .. }
             | Root::Gone { .. }
             | Root::Remove { .. }
-            | Root::Delist { .. },
+            | Root::Delist { .. }
+            | Root::Ban { .. }
+            | Root::Rejoin(_)
+            | Root::Regrant(_),
         ) => node,
         Command::Register { owner, .. } => *owner == sender,
         _ => true,
@@ -5452,6 +5477,35 @@ mod tests {
             assert!(names_only_its_sender(&command, 7, true));
             assert!(!names_only_its_sender(&command, 8, true), "another node's");
             assert!(!names_only_its_sender(&command, 7, false), "a client's");
+        }
+    }
+
+    /// A ban, the `rejoin` setting and a re-grant are a node's to ask, relayed from its operator or
+    /// signed as the root range's leader, never a gateway's (membership.md §5.1).
+    #[test]
+    fn a_ban_a_setting_and_a_regrant_are_a_nodes_alone() {
+        use mantle_meta::record::Rejoin;
+        let regrant = root::Regrant {
+            old: 4,
+            node: 9,
+            grant: 1,
+            fingerprint: [1; 32],
+            key: [2; 32],
+            certificate: vec![3],
+            max_nodes: 3,
+        };
+        for command in [
+            root::Command::Ban {
+                node: 4,
+                max_nodes: 3,
+                at_ns: 0,
+            },
+            root::Command::Rejoin(Rejoin::Off),
+            root::Command::Regrant(regrant),
+        ] {
+            let command = Command::Root(command);
+            assert!(names_only_its_sender(&command, 7, true));
+            assert!(!names_only_its_sender(&command, 7, false), "a gateway's");
         }
     }
     /// The node's log reads its device's write cache where it reads its atomic write unit, and

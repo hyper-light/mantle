@@ -251,18 +251,29 @@ pub struct Laid {
 
 impl Default for Laid {
     fn default() -> Self {
-        Self::of(AtomicUnit::DEFAULT, DeviceCache::DEFAULT, None)
+        Self::of(
+            AtomicUnit::DEFAULT,
+            DeviceCache::DEFAULT,
+            None,
+            Answers::Whole,
+        )
     }
 }
 
 impl Laid {
     /// The facts of a log on a device of atomic write unit `device` and write cache `cache`, its
-    /// records laid in pieces as `pieces` says, or whole where `None`; it answers as they allow.
-    pub fn of(device: AtomicUnit, cache: DeviceCache, pieces: Option<format::Mark>) -> Self {
+    /// records laid in pieces as `pieces` says, or whole where `None`, answering as `answers`
+    /// says ([`Answers::of`]).
+    pub fn of(
+        device: AtomicUnit,
+        cache: DeviceCache,
+        pieces: Option<format::Mark>,
+        answers: Answers,
+    ) -> Self {
         Self {
             device,
             cache,
-            answers: Answers::of(pieces, cache),
+            answers,
             pieces,
         }
     }
@@ -270,9 +281,10 @@ impl Laid {
 
 /// How a log answers a frame's updates, and why: the policy a node reports (mantle
 /// docs/design/durability.md §7.5, §7.7 step 4). A frame is answered once confirmed, by the next
-/// frame's persist record or its own confirmation, each durable after the frame's flush; answering
-/// at the frame's own flush needs a device that rules out a frame torn after its record landed,
-/// which this log has not established. Each variant says what keeps this log from it.
+/// frame's persist record or its own confirmation, each durable after the frame's flush, unless
+/// the owner's decisions ([`AtFlush`]) and the device let it be answered at its own flush. Each
+/// variant says which and why. A frame is answered at its flush only where its record says so
+/// (`Update::at_flush`): a frame holding a one- or two-voter group stays answered once confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answers {
     /// Once confirmed: the persist records are whole (format 3, 4 sealed), which cannot say a
@@ -288,22 +300,111 @@ pub enum Answers {
     /// prove the frame landed; but the claim is not yet checked by measuring the device (mantle
     /// CLAUDE.md §5). Linux's `write_cache` is the kernel's view, which an administrator can set
     /// and which also drops the flushes it would send (Documentation/ABI/stable/sysfs-block,
-    /// Documentation/block/writeback_cache_control.rst).
+    /// Documentation/block/writeback_cache_control.rst). The owner's decision (B),
+    /// [`StatedCache::Unmeasured`].
     Unmeasured,
+    /// Once confirmed: the cache is stated to keep a completed write and trusted (decision (B),
+    /// [`StatedCache::Trusted`]), but the file's writes do not complete on the device itself
+    /// (`BlockFile::writes_reach_device`): a buffered write completes in the OS's cache, so its
+    /// record's write completing proves nothing of its frame.
+    Buffered,
+    /// At its flush, condition (a) of §7.5: the cache keeps a completed write, trusted (decision
+    /// (B)), and the file's writes complete on the device, so a frame written into space its file
+    /// holds written completes before its record is written, and a record that landed proves its
+    /// frame did. A frame that grows the file stays answered once confirmed.
+    Kept,
+    /// At its flush, on a volatile cache: the owner's decision (A), [`WriteBackFrames::AtFlush`],
+    /// accepts §7.5's fault (b), a power cut across a quorum leaving a group waiting reported
+    /// `Uncertain`, never an answered write lost (§7.4).
+    Accepted,
 }
 
 impl Answers {
     /// How a log answers whose records are laid in pieces as `pieces` says, or whole where
-    /// `None`, on a device whose write cache is `cache`.
-    pub fn of(pieces: Option<format::Mark>, cache: DeviceCache) -> Self {
+    /// `None`, on a device whose write cache is `cache`, under the owner's decisions `policy`,
+    /// its file's writes completing on the device where `reaches`
+    /// (`BlockFile::writes_reach_device`).
+    pub fn of(
+        pieces: Option<format::Mark>,
+        cache: DeviceCache,
+        policy: AtFlush,
+        reaches: bool,
+    ) -> Self {
         if pieces.is_none() {
             return Self::Whole;
         }
         match cache.cache() {
-            WriteCache::WriteBack => Self::WriteBack,
-            WriteCache::WriteThrough | WriteCache::PowerProtected => Self::Unmeasured,
+            WriteCache::WriteBack => match policy.write_back {
+                WriteBackFrames::Confirmed => Self::WriteBack,
+                WriteBackFrames::AtFlush => Self::Accepted,
+            },
+            WriteCache::WriteThrough | WriteCache::PowerProtected => match policy.stated {
+                StatedCache::Unmeasured => Self::Unmeasured,
+                StatedCache::Trusted if reaches => Self::Kept,
+                StatedCache::Trusted => Self::Buffered,
+            },
         }
     }
+
+    /// Whether the log answers a frame whose record says so at the frame's own flush.
+    pub fn at_flush(self) -> bool {
+        matches!(self, Self::Kept | Self::Accepted)
+    }
+}
+
+/// Where a log may answer a frame at its own flush: the owner's two decisions of mantle
+/// docs/design/durability.md §7.5, each stated, and the one place either changes
+/// ([`AtFlush::DECIDED`]). A frame is answered at its flush only where its record says so, every
+/// group in it of three voters or more, and its records are in pieces; everywhere else, once
+/// confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtFlush {
+    /// Decision (A): a device whose write cache is volatile, or that states none.
+    pub write_back: WriteBackFrames,
+    /// Decision (B): a cache the OS states keeps a completed write, write-through or
+    /// power-protected, which timing cannot check (§7.5).
+    pub stated: StatedCache,
+}
+
+impl AtFlush {
+    /// The owner's decisions as they stand (2026-11-18): neither (A) nor (B) is taken, so no
+    /// device answers a frame at its flush.
+    pub const DECIDED: Self = Self {
+        write_back: WriteBackFrames::Confirmed,
+        stated: StatedCache::Unmeasured,
+    };
+}
+
+impl Default for AtFlush {
+    fn default() -> Self {
+        Self::DECIDED
+    }
+}
+
+/// The owner's decision (A) of mantle docs/design/durability.md §7.5: whether a frame on a
+/// device whose write cache is volatile is answered at its flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteBackFrames {
+    /// Once confirmed ([`Answers::WriteBack`]): a power cut across a quorum can tear a frame
+    /// after its record landed, and its confirmation is what tells recovery it was not answered.
+    Confirmed,
+    /// At its flush ([`Answers::Accepted`]), accepting that such a power cut may leave a group
+    /// waiting, reported `Uncertain`: §7.5's count, 1 group of 8 on seeds 1-8 of fault (b).
+    AtFlush,
+}
+
+/// The owner's decision (B) of mantle docs/design/durability.md §7.5: whether a cache the OS
+/// states keeps a completed write is trusted. Linux's `write_cache` is the kernel's view, which an
+/// administrator can set, and on a queue it calls write-through the kernel completes a flush
+/// before it reaches the device (Documentation/block/writeback_cache_control.rst), so no timing
+/// of a write and a flush checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatedCache {
+    /// Not trusted until a measurement checks it: once confirmed ([`Answers::Unmeasured`]).
+    Unmeasured,
+    /// Trusted: a frame whose write completes on the device before its record is written is
+    /// answered at its flush ([`Answers::Kept`], condition (a)).
+    Trusted,
 }
 
 /// The frame after the last that reads, as its persist records leave it (mantle
@@ -653,6 +754,9 @@ pub struct With {
     /// The owner's admission for the file to grow past its slots ([`Growth`]); without one the
     /// file grows to `Config::max_segments`.
     pub growth: Option<Box<dyn Growth>>,
+    /// Where the log may answer a frame at its own flush: [`AtFlush::DECIDED`] unless a test
+    /// states another.
+    pub at_flush: AtFlush,
 }
 
 /// What starting a log needs besides its file and its state.
@@ -714,7 +818,7 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Formats a new log as [`Log::create`] does, giving the file back with a refusal.
     pub fn try_create(file: F, config: Config, id: u128) -> Result<Self, Refused<F>> {
-        Self::make(file, config, id, None, None)
+        Self::make(file, config, id, None, None, AtFlush::DECIDED)
     }
 
     /// Formats a new sealed log `id` in `file`, which must be empty (hyper-raft docs/seal.md §5):
@@ -740,7 +844,7 @@ impl<F: BlockFile + 'static> Log<F> {
             Ok(sealer) => sealer,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        Self::make(file, config, id, Some(sealer), None)
+        Self::make(file, config, id, Some(sealer), None, AtFlush::DECIDED)
     }
 
     fn make(
@@ -749,6 +853,7 @@ impl<F: BlockFile + 'static> Log<F> {
         id: u128,
         mut sealer: Option<seal::Sealer>,
         growth: Option<Box<dyn Growth>>,
+        at_flush: AtFlush,
     ) -> Result<Self, Refused<F>> {
         // A new log takes its persist area and its first slot: admitted before they are written,
         // refused as the bound reached, and held once the log is made.
@@ -767,7 +872,8 @@ impl<F: BlockFile + 'static> Log<F> {
             }
         };
         // Formatting reads and writes the file, the caller's code, inside an unwind boundary.
-        let made = device::guarded(|| recover::create(&file, &config, id, sealer.as_mut()));
+        let made =
+            device::guarded(|| recover::create(&file, &config, id, sealer.as_mut(), at_flush));
         let (state, laid) = match made {
             Ok(made) => made,
             Err(error) => {
@@ -793,7 +899,7 @@ impl<F: BlockFile + 'static> Log<F> {
             Some(Ok(sealer)) => Some(sealer),
             Some(Err(error)) => return Err(Refused::with(error, file)),
         };
-        Self::make(file, config, id, sealer, with.growth)
+        Self::make(file, config, id, sealer, with.growth, with.at_flush)
     }
 
     /// Opens log `id` in `file` with what `with` states, and recovers it as [`Log::open`] does.
@@ -809,7 +915,7 @@ impl<F: BlockFile + 'static> Log<F> {
             Some(Ok(sealer)) => Some(sealer),
             Some(Err(error)) => return Err(Refused::with(error, file)),
         };
-        Self::reopen(file, config, id, sealer, with.growth)
+        Self::reopen(file, config, id, sealer, with.growth, with.at_flush)
     }
 
     /// Opens log `id` in `file` and recovers it (mantle docs/design/raft-log.md §6). What a
@@ -822,7 +928,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Opens a log as [`Log::open`] does, giving the file back with a refusal: what recovery
     /// found damaged stays for whoever repairs or replaces it.
     pub fn try_open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), Refused<F>> {
-        Self::reopen(file, config, id, None, None)
+        Self::reopen(file, config, id, None, None, AtFlush::DECIDED)
     }
 
     /// Opens sealed log `id` in `file` with the keys it was created with, and recovers it as
@@ -848,7 +954,7 @@ impl<F: BlockFile + 'static> Log<F> {
             Ok(sealer) => sealer,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        Self::reopen(file, config, id, Some(sealer), None)
+        Self::reopen(file, config, id, Some(sealer), None, AtFlush::DECIDED)
     }
 
     fn reopen(
@@ -857,9 +963,11 @@ impl<F: BlockFile + 'static> Log<F> {
         id: u128,
         mut sealer: Option<seal::Sealer>,
         growth: Option<Box<dyn Growth>>,
+        at_flush: AtFlush,
     ) -> Result<(Self, Recovery), Refused<F>> {
         // Recovery reads the file, the caller's code, inside an unwind boundary.
-        let opened = device::guarded(|| recover::open(&file, &config, id, sealer.as_mut()));
+        let opened =
+            device::guarded(|| recover::open(&file, &config, id, sealer.as_mut(), at_flush));
         let (state, recovery, restores) = match opened {
             Ok(opened) => opened,
             Err(error) => return Err(Refused::with(error, file)),

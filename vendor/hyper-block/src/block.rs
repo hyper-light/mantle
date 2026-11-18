@@ -66,6 +66,17 @@ pub trait BlockFile: Send {
         Ok(DeviceCache::DEFAULT)
     }
 
+    /// Whether a write the file completes over space it has written already is the device's own
+    /// completion, with no cache of the OS's in front of it, so that a later write's completion
+    /// proves this one reached the device (mantle docs/design/durability.md §7.5, condition (a)).
+    /// A buffered write completes in the OS's page cache, and a write into space not yet written
+    /// changes metadata the file system's journal commits only at the next flush (fallocate(2)).
+    /// False by default: a file says it only where its path to the device is built and cited; a
+    /// simulated device's writes are its own.
+    fn writes_reach_device(&self) -> bool {
+        false
+    }
+
     /// The file's length, or a device node's capacity.
     fn len(&self) -> Result<u64, DiskError>;
 

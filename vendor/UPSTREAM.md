@@ -87,10 +87,20 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `abfca69` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and seventeen commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch
+**Every crate at `f9248d5` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and nineteen commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch
 is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last two commits
-are step 4a of mantle docs/design/durability.md §7.7. `abfca69` changes hyper-log alone: the open
+are step 4b of mantle docs/design/durability.md §7.7. `f9248d5` changes hyper-log alone: the owner's
+two decisions of §7.5 are one typed policy, `AtFlush` (decision (A) `WriteBackFrames`, decision (B)
+`StatedCache`), whose `AtFlush::DECIDED` takes neither, so no device answers a frame at its flush; a
+log is made or opened with it (`With::at_flush`, `DECIDED` by default); `Answers` gains `Kept`,
+`Accepted` and `Buffered`; the create and the open of a log that answers at the flush set the mark's
+bit and flush it before its first frame; and the writer answers a frame at its flush where its record
+says so and the log answers so, writing no confirmation of it, under condition (a) only in a slot the
+file holds written. `0f5dce2` changes hyper-sim and hyper-block: a simulated device that keeps every
+completed write (`Device::keep_completed`, `SimFile::keeping`, its cache write-through from a new
+`Source::Simulated`), and `BlockFile::writes_reach_device`, false for every real file. No new
+constants. The two before them are step 4a. `abfca69` changes hyper-log alone: the open
 and the create read the device's write cache where they read its atomic write unit, and `Laid`
 carries it with `Answers`, how the log answers a frame's updates and why (`Whole`, `WriteBack`,
 `Unmeasured`), every frame still answered once confirmed; and the mark of pieces says, in its

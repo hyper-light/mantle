@@ -67,6 +67,8 @@ pub enum Source {
     FullFsync,
     /// The OS described no device: write-back, the conservative default.
     Default,
+    /// A simulated device states its own cache, as its model holds it (`crate::sim::SimFile`).
+    Simulated,
 }
 
 /// The device's write cache, and where it was read.
@@ -99,11 +101,11 @@ impl DeviceCache {
     }
 
     /// Whether the OS stated the device's cache, rather than it being a rule for a device that
-    /// states none.
+    /// states none; a simulated device states its own.
     pub fn stated(self) -> bool {
         matches!(
             self.source,
-            Source::Sysfs { .. } | Source::StorageProperty | Source::Registry
+            Source::Sysfs { .. } | Source::StorageProperty | Source::Registry | Source::Simulated
         )
     }
 }

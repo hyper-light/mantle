@@ -330,6 +330,9 @@ pub(crate) struct Frame {
     pub(crate) these: Vec<Answering>,
     /// The owner knew when it laid the frame out that another follows.
     pub(crate) more: bool,
+    /// The frame is answered at its own flush (mantle durability.md §7.1): its record says so and
+    /// the log answers so (`Answers::at_flush`), so no confirmation of it is written.
+    pub(crate) at_flush: bool,
 }
 
 /// What the device answers.
@@ -622,10 +625,15 @@ impl<F: BlockFile> Device<F> {
     ) -> Completion {
         let (result, timing) =
             self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
-        let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
+        let confirming = result.is_ok() && !f.at_flush && !(f.more || self.follows(f.sequence));
         if result.is_ok() {
             // This frame's record confirms the frame before.
             answers.append(&mut f.before);
+            // A frame answered at its flush is answered now: the flush made it and its record
+            // durable, and the frame's write completed before its record's was issued.
+            if f.at_flush {
+                answers.append(&mut f.these);
+            }
         }
         if !confirming {
             return Completion::Frame {

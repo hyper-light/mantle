@@ -217,6 +217,9 @@ pub struct Device {
     since_flush: Vec<Pending>,
     recorded: usize,
     record_bytes: usize,
+    /// Every write is on the medium as it completes, as on a device with no volatile write cache
+    /// ([`Self::keep_completed`]).
+    keeps_completed: bool,
 }
 
 impl Device {
@@ -238,7 +241,18 @@ impl Device {
             since_flush: Vec::new(),
             recorded: 0,
             record_bytes: 0,
+            keeps_completed: false,
         })
+    }
+
+    /// Makes the device keep every write it completes, as a device with no volatile write cache
+    /// does: one with a write-back cache "signal[s] I/O completion to the operating system before
+    /// data actually has hit the non-volatile storage" (Linux
+    /// Documentation/block/writeback_cache_control.rst), and this one only once it has. Each
+    /// write's sectors are durable as it returns, so a crash loses none of them; a lost write still
+    /// never reaches the medium, and a write the power cut fails changes nothing, as before.
+    pub fn keep_completed(&mut self) {
+        self.keeps_completed = true;
     }
 
     /// Records each write since the last flush, up to `bytes` of them, so that the states within a
@@ -379,7 +393,24 @@ impl Device {
                 });
             }
         }
-        self.land(buf, admitted.at, admitted.end, lost)
+        self.land(buf, admitted.at, admitted.end, lost)?;
+        if self.keeps_completed && !lost {
+            self.persist_range(admitted.at, admitted.end);
+        }
+        Ok(())
+    }
+
+    /// Makes the sectors of `[at, end)` durable now, each no longer waiting on a flush.
+    fn persist_range(&mut self, at: u64, end: u64) {
+        if end <= at {
+            return;
+        }
+        let first = at.checked_div(self.sector).unwrap_or(0);
+        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
+        for sector in first..=last {
+            self.dirty.remove(&sector);
+            self.persist_sector(sector);
+        }
     }
 
     /// Where a write lands and whether the device takes it: its offset, or a misdirected one's; past
@@ -474,12 +505,7 @@ impl Device {
         let at = to.unwrap_or(offset);
         let len = u64::try_from(buf.len()).map_err(|_| StorageError::TooLarge)?;
         let end = at.checked_add(len).ok_or(StorageError::TooLarge)?;
-        let first = at.checked_div(self.sector).unwrap_or(0);
-        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
-        for sector in first..=last {
-            self.dirty.remove(&sector);
-            self.persist_sector(sector);
-        }
+        self.persist_range(at, end);
         Ok(())
     }
 
@@ -677,6 +703,29 @@ mod tests {
         d.crash(Crash::LoseAll);
         d.read(&mut b, 0).unwrap();
         assert_eq!(b, [3; 512]);
+    }
+
+    /// A device that keeps completed writes loses none of them to a crash, flushed or not; a lost
+    /// write still never reaches its medium, and a write the power cut fails changes nothing.
+    #[test]
+    fn a_device_keeping_completed_writes_loses_none_to_a_crash() {
+        for crash in [Crash::LoseAll, Crash::Random, Crash::KeepAll] {
+            let mut d = device();
+            d.keep_completed();
+            d.write(&[1; 1024], 0).unwrap();
+            d.inject(Fault::LostWrite);
+            d.write(&[2; 512], 512).unwrap();
+            d.inject(Fault::PowerCut { ops: 0 });
+            assert!(d.write(&[3; 512], 0).is_err());
+            d.crash(crash);
+            d.clear_faults();
+            let mut b = [0u8; 1024];
+            d.read(&mut b, 0).unwrap();
+            assert_eq!(
+                b, [1; 1024],
+                "the completed write kept, the lost one and the failed one never on the medium"
+            );
+        }
     }
 
     /// A misdirected write lands at its other offset: the target keeps what it held.

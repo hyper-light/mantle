@@ -87,6 +87,8 @@ pub(super) struct Writing<F> {
     target: Target,
     tail: u64,
     sequence: u64,
+    /// The frame is answered at its own flush, never confirmed (`device::Frame::at_flush`).
+    at_flush: bool,
 }
 
 impl<F> Writing<F> {
@@ -945,10 +947,17 @@ impl<F: BlockFile + 'static> Owner<F> {
             } else {
                 target.offset
             };
-            Ok((frame, at, record, self.record_at(sequence), confirm))
+            let at_flush = self.answers_at_flush(&target);
+            Ok((
+                frame,
+                at,
+                record,
+                self.record_at(sequence),
+                (confirm, at_flush),
+            ))
         });
         match job {
-            Ok((frame, at, record, record_at, confirm)) => {
+            Ok((frame, at, record, record_at, (confirm, at_flush))) => {
                 // A frame that opens the slot being filled ahead ends the fill: no zeros are
                 // written into a slot that holds a frame. What was filled stays written, and the
                 // rest of the slot is written by its frames as any unwritten space is.
@@ -989,6 +998,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     target,
                     tail,
                     sequence,
+                    at_flush,
                 });
                 self.io.push_back((
                     Job::Frame(Frame {
@@ -1001,6 +1011,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                         before,
                         these,
                         more,
+                        at_flush,
                     }),
                     doer,
                 ));
@@ -1224,6 +1235,30 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.p.area.at(sequence)
     }
 
+    /// Whether the frame just laid out, into `target`, is answered at its own flush (mantle
+    /// durability.md §7.1, §7.5): its record says so (`format::AT_FLUSH`, every update in it
+    /// allowing it), and the log answers so (`Answers::at_flush`), its mark saying so since the
+    /// open. Under condition (a) (`Answers::Kept`) the frame's write must complete on the device
+    /// before its record's is issued, so it is answered so only in a slot the file holds written
+    /// whole (`Params::fills`), an overwrite; a frame that grows the file is answered once
+    /// confirmed.
+    fn answers_at_flush(&self, target: &Target) -> bool {
+        if !self.buffers.persist.at_flush || !self.p.area.at_flush() {
+            return false;
+        }
+        match self.p.laid.answers {
+            crate::Answers::Accepted => true,
+            crate::Answers::Kept => {
+                let held = self.state.segments.incarnation.len();
+                self.p.fills && usize::try_from(target.slot).is_ok_and(|slot| slot < held)
+            }
+            crate::Answers::Whole
+            | crate::Answers::WriteBack
+            | crate::Answers::Unmeasured
+            | crate::Answers::Buffered => false,
+        }
+    }
+
     /// The frame is on the device: published, the frame before answered, and the loop goes on,
     /// with the frame's own confirmation on the device when no other frame follows.
     pub(super) fn written(&mut self, done: Flushed) {
@@ -1248,6 +1283,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             target,
             tail,
             sequence,
+            at_flush,
         } = w;
         // The frame before's answers come back only when this frame failed.
         match self.unconfirmed.as_mut() {
@@ -1311,6 +1347,27 @@ impl<F: BlockFile + 'static> Owner<F> {
             answering: these,
             confirm: None,
         };
+        let settled = self.await_answer(frame, (at_flush, confirming), confirm, timing.flushed_at);
+        self.schedule.answered = confirmed.saturating_add(settled);
+        self.forget();
+        self.schedule.backlog = backlog;
+        self.agenda.step = true;
+    }
+
+    /// Where a flushed frame waits for its answer: none where the device answered it at its flush,
+    /// its room given back now and no confirmation of it ever written; its confirmation, where the
+    /// device writes it on its own; or the next frame's record. The updates settled now.
+    fn await_answer(
+        &mut self,
+        frame: Unconfirmed<F>,
+        (at_flush, confirming): (bool, bool),
+        confirm: AlignedBuf,
+        flushed_at: Option<Instant>,
+    ) -> u64 {
+        if at_flush {
+            self.give_confirm(confirm);
+            return self.settle(frame, Ok(()), flushed_at);
+        }
         if confirming {
             self.give_confirm(confirm);
             self.phase = Phase::Confirming {
@@ -1323,10 +1380,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 ..frame
             });
         }
-        self.schedule.answered = confirmed;
-        self.forget();
-        self.schedule.backlog = backlog;
-        self.agenda.step = true;
+        0
     }
 
     /// Keeps a confirmation's buffer for a later frame's: one for each frame whose confirmation

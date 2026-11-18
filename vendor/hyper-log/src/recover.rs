@@ -11,7 +11,7 @@ use crate::format::{self, FRAME_HEADER_BYTES, FrameHeader, MAC_LEN, Owned, Segme
 use crate::seal::Sealer;
 use crate::state::{self, Live, Place, Replayed, Slot};
 use crate::state::{Head, Segments, State};
-use crate::{Config, Laid, LogError, Recovery, Tail};
+use crate::{Answers, AtFlush, Config, Laid, LogError, Recovery, Tail};
 
 /// What a frame's position holds.
 pub(crate) enum Found<'a> {
@@ -475,6 +475,11 @@ impl Area {
         self.pieces
     }
 
+    /// Whether the area's mark says the log may hold frames answered at their flush.
+    pub(crate) fn at_flush(&self) -> bool {
+        self.at_flush
+    }
+
     /// Whether a file whose block is `block` writes this area's slots as they lie: each slot's
     /// offset and length a multiple of the block, as the writer pads a record to it.
     fn takes(&self, block: Alignment) -> bool {
@@ -790,6 +795,7 @@ pub(crate) fn create<F: BlockFile>(
     config: &Config,
     id: u128,
     mut sealer: Option<&mut Sealer>,
+    at_flush: AtFlush,
 ) -> Result<(State, Laid), LogError> {
     let align = file.layout_block();
     check(config, align, sealer.is_some())?;
@@ -803,6 +809,11 @@ pub(crate) fn create<F: BlockFile>(
     // A new log lays its records in pieces where its persist area holds them: the file is empty,
     // so the slots read as zeros, and the mark is written under the log's first flush.
     let pieces = Area::in_pieces(config, align, device.unit(), sealer.is_some(), false)?;
+    // A log that answers frames at their flush says so in its mark, durable under the log's first
+    // flush, before any such frame (durability.md §7.7, step 4).
+    let reaches = file.writes_reach_device();
+    let answers = Answers::of(pieces.and_then(|p| p.mark()), cache, at_flush, reaches);
+    let pieces = pieces.map(|area| area.answered_at_flush(answers.at_flush()));
     let block = align.get();
     let nonce = random_nonce()?;
     let at = persist_area(config);
@@ -866,7 +877,7 @@ pub(crate) fn create<F: BlockFile>(
         write_mark(file, id, sealer.is_some(), pieces)?;
     }
     file.sync_data()?;
-    let laid = Laid::of(device, cache, pieces.as_ref().and_then(Area::mark));
+    let laid = Laid::of(device, cache, pieces.as_ref().and_then(Area::mark), answers);
     let state = State {
         groups: HashMap::new(),
         damaged: HashMap::new(),
@@ -1438,6 +1449,7 @@ pub(crate) fn open<F: BlockFile>(
     config: &Config,
     id: u128,
     mut sealer: Option<&mut Sealer>,
+    at_flush: AtFlush,
 ) -> Result<(State, Recovery, Vec<Restore>), LogError> {
     let align = file.layout_block();
     let sealed = sealer.is_some();
@@ -1463,6 +1475,19 @@ pub(crate) fn open<F: BlockFile>(
     // records moves to pieces of the device's unit where its area holds them, carrying its
     // records (durability.md §7.7).
     let area = laid_area(file, config, (id, sealer.as_deref()), device.unit())?;
+    // A log that answers frames at their flush sets its mark's bit, and flushes it, before the
+    // first such frame, the restore included: a binary from before then refuses the log rather
+    // than cut such a frame as the torn tail (durability.md §7.7, step 4). A mark that has it
+    // keeps it, whatever the log answers now.
+    let answers = Answers::of(area.mark(), cache, at_flush, file.writes_reach_device());
+    let area = if answers.at_flush() && !area.at_flush {
+        let marked = area.answered_at_flush(true);
+        write_mark(file, id, sealed, &marked)?;
+        file.sync_data()?;
+        marked
+    } else {
+        area
+    };
     // 4b. A frame after the last valid one may have been flushed and damaged since: its
     // persist record, written in the same flush, says what it held (AGL+18 §3.3.3).
     let (mut restores, copy, tail) = restores(
@@ -1503,7 +1528,7 @@ pub(crate) fn open<F: BlockFile>(
         head_offset,
         frames: replay.frames,
     };
-    let laid = Laid::of(device, cache, area.mark());
+    let laid = Laid::of(device, cache, area.mark(), answers);
     let (state, recovery) =
         opened.into_state(heads, &last, shape.slots, &restores, (tail, laid))?;
     Ok((state, recovery, restores))
@@ -1940,7 +1965,7 @@ mod tests {
     use super::{Area, check_record, laid_area, marked, persist_area, persist_slot, write_mark};
     use crate::format::{self, MAC_LEN, Persist, Persisted, Written};
     use crate::seal::Sealer;
-    use crate::{Config, LogError, Waits};
+    use crate::{Answers, AtFlush, Config, LogError, Waits};
 
     const ID: u128 = 0x7069_6563_6573;
 
@@ -2512,5 +2537,47 @@ mod tests {
             found.read(&large, found.at(3), ID, None).unwrap(),
             Some(odd)
         );
+    }
+
+    /// The mark the writer itself sets, where the owner's decisions let its log answer frames at
+    /// their flush (durability.md §7.7, step 4b), refuses a binary from before (hyper-raft f3dae3b6
+    /// and earlier) as the mark of step 4a does: at create, under the log's first flush, and at an
+    /// open of a log created before the decision, before its first frame. Under today's decisions
+    /// neither sets it.
+    #[test]
+    fn a_binary_before_answers_at_the_flush_refuses_a_log_the_writer_marked() {
+        let trusted = AtFlush {
+            write_back: crate::WriteBackFrames::Confirmed,
+            stated: crate::StatedCache::Trusted,
+        };
+        let cfg = config(16 * 4096, 64);
+        let keeping = |seed| SimFile::keeping(align(4096), align(512), seed).unwrap();
+        let refused_before = |file: &SimFile| {
+            file.crash(Crash::LoseAll).unwrap();
+            let image = file.durable_image().unwrap();
+            let bytes = &image[..4096];
+            let mark = format::pieces_marked(bytes, ID, false).expect("the mark");
+            assert!(mark.at_flush);
+            let laid = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+            assert!(laid > 1, "a binary before reads sequence {laid} as a mark");
+            let read = Persist::decode(bytes).expect("a whole record to a binary before");
+            assert!(matches!(
+                check_record(&read, bytes, None),
+                Err(LogError::Foreign(_))
+            ));
+        };
+        let created = keeping(41);
+        let (_, laid) = super::create(&created, &cfg, ID, None, trusted).unwrap();
+        assert_eq!(laid.answers, Answers::Kept);
+        refused_before(&created);
+        let unmarked = keeping(42);
+        let (_, laid) = super::create(&unmarked, &cfg, ID, None, AtFlush::DECIDED).unwrap();
+        assert_eq!(laid.answers, Answers::Unmeasured);
+        assert_eq!(laid.pieces.map(|m| m.at_flush), Some(false));
+        let (_, recovery, _) = super::open(&unmarked, &cfg, ID, None, AtFlush::DECIDED).unwrap();
+        assert_eq!(recovery.laid.pieces.map(|m| m.at_flush), Some(false));
+        let (_, recovery, _) = super::open(&unmarked, &cfg, ID, None, trusted).unwrap();
+        assert_eq!(recovery.laid.pieces.map(|m| m.at_flush), Some(true));
+        refused_before(&unmarked);
     }
 }

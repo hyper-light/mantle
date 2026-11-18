@@ -13,6 +13,7 @@ use crate::DiskError;
 use crate::atomic::AtomicUnit;
 use crate::block::BlockFile;
 use crate::buf::Alignment;
+use crate::write_cache::{DeviceCache, Source, WriteCache};
 
 mod shared;
 pub use shared::{SimDevice, SimHandle};
@@ -31,6 +32,9 @@ pub struct SimFile {
     align: Alignment,
     /// What a crash tears writes at: the simulated device's atomic write unit.
     sector: Alignment,
+    /// The device's write cache as it states it: write-back, a completed write lost to a crash
+    /// until flushed, unless made with [`SimFile::keeping`].
+    cache: DeviceCache,
 }
 
 impl SimFile {
@@ -42,6 +46,22 @@ impl SimFile {
             disk: RefCell::new(Disk::new(align, sector, seed)?),
             align,
             sector,
+            cache: DeviceCache::DEFAULT,
+        })
+    }
+
+    /// An empty simulated file, as [`SimFile::new`] makes, on a device that keeps every write it
+    /// completes, as one with no volatile write cache does (`hyper_sim::storage::Device::
+    /// keep_completed`): a crash loses no completed write, and the file states its cache
+    /// write-through.
+    pub fn keeping(align: Alignment, sector: Alignment, seed: u64) -> Result<Self, DiskError> {
+        let mut disk = Disk::new(align, sector, seed)?;
+        disk.device.keep_completed();
+        Ok(Self {
+            disk: RefCell::new(disk),
+            align,
+            sector,
+            cache: DeviceCache::new(WriteCache::WriteThrough, Source::Simulated),
         })
     }
 
@@ -226,6 +246,16 @@ impl BlockFile for SimFile {
         Ok(AtomicUnit::of_sector(self.sector))
     }
 
+    /// The cache the simulated device states: write-back, or write-through for [`SimFile::keeping`].
+    fn write_cache(&self) -> Result<DeviceCache, DiskError> {
+        Ok(self.cache)
+    }
+
+    /// The simulation has no cache of an OS's: a write it completes is the device's.
+    fn writes_reach_device(&self) -> bool {
+        true
+    }
+
     fn len(&self) -> Result<u64, DiskError> {
         self.lock()?.len()
     }
@@ -287,6 +317,36 @@ mod tests {
 
     fn bytes(b: &AlignedBuf) -> Vec<u8> {
         b.as_slice().to_vec()
+    }
+
+    /// A file on a device that keeps completed writes states its cache write-through, its writes
+    /// the device's own, and keeps every write it completed across a crash that keeps nothing
+    /// unflushed; a file of the default device states the write-back default and loses it.
+    #[test]
+    fn a_keeping_file_states_write_through_and_keeps_completed_writes() {
+        let keeping = SimFile::keeping(
+            Alignment::new(4096).unwrap(),
+            Alignment::new(512).unwrap(),
+            12,
+        )
+        .unwrap();
+        let cache = keeping.write_cache().unwrap();
+        assert_eq!(cache.cache(), WriteCache::WriteThrough);
+        assert_eq!(cache.source(), Source::Simulated);
+        assert!(keeping.writes_reach_device());
+        let plain = file(13);
+        assert_eq!(plain.write_cache().unwrap(), DeviceCache::DEFAULT);
+        let one = block(1);
+        for (f, kept) in [(&keeping, true), (&plain, false)] {
+            f.write_all_at(one.as_slice(), 0).unwrap();
+            f.crash(Crash::LoseAll).unwrap();
+            assert_eq!(f.durable_image().unwrap().len() == 4096, kept);
+            if kept {
+                let mut back = block(0);
+                f.read_exact_at(back.as_mut_slice(), 0).unwrap();
+                assert_eq!(bytes(&back), bytes(&one));
+            }
+        }
     }
 
     /// A write made durable on its own survives a power cut; a write before it that no flush has

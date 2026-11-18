@@ -156,8 +156,12 @@ chunk the cell's operations wrote it meanwhile, and a range's entry carries ever
 that fits its bytes, an append out to each follower for each entry a range can hold uncommitted (node.md §1.4, §2.8; `derive::in_flight`;
 research/71, step 9; research/87): more writes share each flush, and none is answered
 before the flush that holds its own bytes, which a simulated cell cut from power at any moment
-around a batched entry's answer checks (`crates/node/tests/sim.rs`). Group commit changes how many
-flushes a copy shares, not when it counts.
+around a batched entry's answer checks, and a cell whose flushes are held checks directly: a
+batched entry is never answered while the nodes left to flush it are one short of a quorum, nor
+while its leader's own flush is held after its followers' quorum committed and applied it, and
+it is answered whole once they end (`crates/node/tests/sim.rs`,
+`a_batched_entry_is_answered_only_after_the_flushes_it_needs_and_never_while_they_are_held`).
+Group commit changes how many flushes a copy shares, not when it counts.
 
 What the constant-rate chain leaves out, and where the sources show which way it errs
 (15 §8.5):

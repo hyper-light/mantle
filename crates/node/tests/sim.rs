@@ -495,3 +495,151 @@ fn a_batched_entry_is_answered_only_once_durable_and_a_power_cut_at_any_moment_k
         );
     }
 }
+
+/// An entry of [`BATCH`] puts from `first`, its session's serials `first..first + BATCH`, the
+/// session holding no answer the client has not read below `first`, each key tagged `tag`.
+fn batch(session: u64, first: u64, tag: &str) -> Entry {
+    Entry {
+        at_ns: 0,
+        commands: (first..first + BATCH)
+            .map(|serial| Sessioned {
+                session,
+                serial,
+                unanswered: first,
+                command: put(&format!("{tag}{serial}"), "e", u128::from(serial)),
+            })
+            .collect(),
+    }
+}
+
+/// Whether `answered` is a put's answer for every command of a [`BATCH`].
+fn batch_answered(answered: &[Answer]) -> bool {
+    answered.len() == usize::try_from(BATCH).unwrap()
+        && answered
+            .iter()
+            .all(|a| matches!(a, Answer::Name(name::Outcome::Put { .. })))
+}
+
+/// A batch is answered only after the flushes it needs (CLAUDE.md §6): the group commit of
+/// research/71 step 9 and research/87 §1, an entry carrying every command that waited, answers
+/// none of them before its own write is durable on a quorum, and on the leader that answers. A
+/// held write is kept on its device and its answer given to no range, as a device whose flush has
+/// not ended gives none (`Sim::hold_writes`). The cell first answers such an entry with nothing
+/// held, in `took` on its clock; then a client asks one entry while:
+///
+/// - so many followers' flushes are held that the nodes left are one short of a quorum: every
+///   node writes it, and for `took` past that it is unanswered; with one follower's let go a
+///   quorum flushes it, and every command of it is answered;
+/// - the leader's own flush is held, every follower's done: the followers' quorum commits it and
+///   each follower applies it, and for `took` past that the leader, which answers from what it
+///   applies and applies only what its own log holds durable (hyper-durable's I2 and R-4), does
+///   not answer; its flush let go, it does.
+///
+/// Once every node has written the entry, answering it without a flush it needs takes what is
+/// left of a round, a follower's answer, the leader's commit and its reply, so less than `took`:
+/// a node that answered a batch before its log's flush, or a leader before a quorum's, fails here,
+/// as a store that gives its answers while held fails at the first seed.
+#[test]
+fn a_batched_entry_is_answered_only_after_the_flushes_it_needs_and_never_while_they_are_held() {
+    for seed in 1..=4u64 {
+        let mut cell = Sim::new(seed);
+        let leader = cell.leader();
+        cell.open_bucket();
+        let order: Vec<u64> = (1..=cell.nodes).collect();
+        let asking = cell.asking(CLIENT, &order);
+        let (registered, _) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 1));
+        let session = match registered.as_deref() {
+            Ok([Answer::Registered { session }]) => *session,
+            other => panic!("seed {seed}: the registration answered {other:?}"),
+        };
+        // The same entry with nothing held: what the cell takes to answer it.
+        let began = cell.now_ns();
+        let (control, _) = cell.ask(&asking, GROUP, batch(session, 1, "c"));
+        let took = cell.now_ns() - began;
+        let control = control.unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        assert!(batch_answered(&control), "seed {seed}: {control:?}");
+
+        // The followers' flushes held, the nodes left one short of a quorum.
+        let followers: Vec<u64> = (1..=cell.nodes).filter(|id| *id != leader).collect();
+        let quorum = cell.nodes / 2 + 1;
+        let held: Vec<u64> = followers
+            .iter()
+            .copied()
+            .take(usize::try_from(cell.nodes - quorum + 1).unwrap())
+            .collect();
+        for &id in &held {
+            cell.hold_writes(id, true);
+        }
+        let short = format!(
+            "seed {seed}: answered with {held:?}'s flushes held, {} of {} nodes left to flush it, \
+             short of the quorum of {quorum}",
+            cell.nodes - u64::try_from(held.len()).unwrap(),
+            cell.nodes,
+        );
+        let readies = |c: &Sim, id: u64| {
+            c.members[&id]
+                .status
+                .as_ref()
+                .map_or(0, |s| s.writes.readies)
+        };
+        let wrote: Vec<(u64, u64)> = (1..=cell.nodes)
+            .map(|id| (id, readies(&cell, id)))
+            .collect();
+        asking
+            .try_send((GROUP, batch(session, 1 + BATCH, "q")))
+            .map_err(|_| "the client's asks are full")
+            .unwrap();
+        // Every node writes the entry, the held ones' answers kept from them; then, for a whole
+        // round of the unheld entry, past the follower's answer, the leader's commit and its reply
+        // that answering without the flushes would have taken, nothing is answered.
+        cell.until("every node writes the entry", |c| {
+            assert!(c.asked.is_none(), "{short}");
+            let written = wrote.iter().all(|&(id, was)| readies(c, id) > was);
+            if written { Some(()) } else { None }
+        });
+        cell.run_for(took);
+        assert!(cell.asked.take().is_none(), "{short}");
+        cell.hold_writes(held[0], false);
+        let (quorum_answered, _) =
+            cell.until("the answer once a quorum flushed", |c| c.asked.take());
+        let quorum_answered = quorum_answered.unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        assert!(
+            batch_answered(&quorum_answered),
+            "seed {seed}: {quorum_answered:?}"
+        );
+        for &id in &held {
+            cell.hold_writes(id, false);
+        }
+
+        // The leader's own flush held, every follower's done.
+        let applied = |c: &Sim, id: u64| c.members[&id].status.as_ref().map_or(0, |s| s.applied);
+        cell.hold_writes(leader, true);
+        asking
+            .try_send((GROUP, batch(session, 1 + 2 * BATCH, "l")))
+            .map_err(|_| "the client's asks are full")
+            .unwrap();
+        // Past what the held leader applied: only the entry, which their quorum committed.
+        cell.until("every follower applies past the held leader", |c| {
+            assert!(
+                c.asked.is_none(),
+                "seed {seed}: the leader {leader} answered with its own flush held"
+            );
+            let led = applied(c, leader);
+            let past = followers.iter().all(|&id| applied(c, id) > led);
+            if past { Some(()) } else { None }
+        });
+        cell.run_for(took);
+        assert!(
+            cell.asked.take().is_none(),
+            "seed {seed}: the leader {leader} answered with its own flush held"
+        );
+        cell.hold_writes(leader, false);
+        let (leader_answered, _) =
+            cell.until("the leader's answer once it flushed", |c| c.asked.take());
+        let leader_answered = leader_answered.unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        assert!(
+            batch_answered(&leader_answered),
+            "seed {seed}: {leader_answered:?}"
+        );
+    }
+}

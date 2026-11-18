@@ -3041,7 +3041,13 @@ loses what it is sent and not what it sends: once it has judged its links, for a
 good, and at its election, before it has judged any. Its followers trust it, for they hear it;
 it suspects them and steps down, and the others elect one of themselves, which it follows by its
 lanes. A Windows runner showed the same end with no fault at all: a leader on a starved host
-suspected both its followers at once. Still to build: many ranges per node, the clients in their
+suspected both its followers at once. Two hold a batched entry's answer to its flushes
+(durability.md): every node's power cut at once at a moment the seed draws around the answer,
+after which the cell applies through any entry it answered; and the flushes held, each held
+node's store keeping its writes' answers from its ranges as a device whose flush has not ended
+(`Sim::hold_writes`), so that an entry is unanswered while the nodes left to flush it are one
+short of a quorum, and while its leader's own flush is held after its followers' quorum applied
+it, and answered whole once they end. Still to build: many ranges per node, the clients in their
 millions, and the faults and loads listed above.
 
 ### 9.2 Real processes

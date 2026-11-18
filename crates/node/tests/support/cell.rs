@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::task::Waker;
 use std::time::Duration;
@@ -147,6 +148,9 @@ fn log_id(node: u64) -> u128 {
 /// between its own writes (hyper-log's `Log::with_file`), at the same point in every run.
 struct SimLog {
     log: Log<SimFile>,
+    /// While set, the node's ranges are given no answer to their writes, as from a device whose
+    /// flush has not ended ([`Sim::hold_writes`]).
+    hold: &'static AtomicBool,
     faults: mpsc::Receiver<DeviceFault>,
     /// The stream's next writes the test wants refused for room, whatever the log holds.
     refusals: mpsc::Receiver<u64>,
@@ -195,7 +199,7 @@ impl NodeLog for SimLog {
         self.arm();
         Ok(Synchronous::new(
             mantle_range::claim(&self.log, group, range)?,
-            None,
+            Some(self.hold),
         ))
     }
 
@@ -454,6 +458,9 @@ pub struct Member {
     refusals: Option<mpsc::Sender<u64>>,
     /// A fault armed on its device: it may stop on it.
     armed: bool,
+    /// While set, its ranges are given no answer to their writes ([`Sim::hold_writes`]): leaked
+    /// once a member, for each store its log claims to read, through its starts.
+    hold: &'static AtomicBool,
 }
 
 /// The cell, its runtime and what the test has heard.
@@ -538,6 +545,7 @@ impl Sim {
                     faults: None,
                     refusals: None,
                     armed: false,
+                    hold: Box::leak(Box::new(AtomicBool::new(false))),
                 },
             );
         }
@@ -595,6 +603,7 @@ impl Sim {
         let (refusals, refused) = mpsc::channel();
         let log = SimLog {
             log,
+            hold: self.members[&id].hold,
             faults: armed,
             refusals: refused,
             refusing: Cell::new(0),
@@ -747,6 +756,19 @@ impl Sim {
         member.bound = None;
         member.status = None;
         member.down = Some((file, engines));
+    }
+
+    /// Holds node `id`'s range writes unanswered, or lets them be answered again: held, each write
+    /// its ranges submit is kept on its device, but its answer is given to no range, as a device
+    /// whose flush has not ended gives none (`support/store.rs`, `Synchronous`'s hold). Its
+    /// liveness writes are answered as before.
+    pub fn hold_writes(&mut self, id: u64, held: bool) {
+        self.members[&id].hold.store(held, Ordering::SeqCst);
+    }
+
+    /// The simulated clock now.
+    pub fn now_ns(&self) -> u64 {
+        self.rt.now_ns()
     }
 
     /// Node `id`'s log refuses its stream's next `count` writes for room, whatever it holds.

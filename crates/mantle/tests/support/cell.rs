@@ -1245,6 +1245,11 @@ pub(crate) struct Cell {
     /// Each running node's latest stall on each of its shards as its process said it, and when
     /// that was heard, by node and shard: one a node's shard at most.
     pub(crate) stalls: BTreeMap<(u64, u64), (Instant, Stall)>,
+    /// Each running node's longest-held stall on each of its shards, and when it was heard: the
+    /// latest alone names the poll that held a shard only until a shorter one follows it, so a
+    /// failure kept a restarted node's 218 s poll as its length and nothing of whose it was (CI
+    /// run 44369369345).
+    pub(crate) longest_stalls: BTreeMap<(u64, u64), (Instant, Stall)>,
     /// The bytes each node's transfers moved as it last said, and its transport's serve period: a
     /// transfer that lives moves within one, so the quiet period is never shorter.
     pub(crate) transfers: BTreeMap<u64, (u64, Duration)>,
@@ -1670,6 +1675,7 @@ impl Cell {
             room: BTreeMap::new(),
             polls: BTreeMap::new(),
             stalls: BTreeMap::new(),
+            longest_stalls: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&founders.iter().map(|(id, _)| *id).collect::<Vec<_>>())),
@@ -1808,6 +1814,7 @@ impl Cell {
             room: BTreeMap::new(),
             polls: BTreeMap::new(),
             stalls: BTreeMap::new(),
+            longest_stalls: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
@@ -2168,6 +2175,7 @@ impl Cell {
         self.room.remove(&id);
         self.polls.remove(&id);
         self.stalls.retain(|(node, _), _| *node != id);
+        self.longest_stalls.retain(|(node, _), _| *node != id);
         self.transfers.remove(&id);
         self.hold();
     }
@@ -2431,11 +2439,11 @@ impl Cell {
 
     /// What the cell said last, for a wait's failure: each range's status at each node, the
     /// clients' progress, each node's link to each peer, its log, its room, its longest poll, its
-    /// stalls and its repair.
+    /// latest and longest stalls and its repair.
     fn seen(&self) -> String {
         format!(
             "{:?}, progress {:?}, links {:?}, log {:?}, room {:?}, longest polls {:?}, stalls {:?}, \
-             repairs {:?}",
+             longest stalls {:?}, repairs {:?}",
             self.status,
             self.progress,
             self.links,
@@ -2443,6 +2451,7 @@ impl Cell {
             self.room,
             self.polls,
             self.stalls,
+            self.longest_stalls,
             self.repairs
         )
     }
@@ -2520,6 +2529,14 @@ impl Cell {
                     // Nor does a stall: the node says it once its own shard is let go, or while
                     // another shard is held.
                     Line::Stall(shard, stall) => {
+                        let longer = self
+                            .longest_stalls
+                            .get(&(id, shard))
+                            .is_none_or(|(_, kept)| stall.held > kept.held);
+                        if longer {
+                            self.longest_stalls
+                                .insert((id, shard), (Instant::now(), stall.clone()));
+                        }
                         self.stalls.insert((id, shard), (Instant::now(), stall));
                         return;
                     }
@@ -2610,6 +2627,7 @@ impl Cell {
                     self.room.remove(&id);
                     self.polls.remove(&id);
                     self.stalls.retain(|(node, _), _| *node != id);
+                    self.longest_stalls.retain(|(node, _), _| *node != id);
                     self.transfers.remove(&id);
                 }
             }

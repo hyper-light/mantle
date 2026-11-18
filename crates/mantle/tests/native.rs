@@ -1063,10 +1063,23 @@ fn least_run() -> usize {
 /// a copy goes (research/77 D1). Saying so only as each copy was stored, it said nothing while they
 /// crossed, and the client gave the run up and sent it again, the first copies left behind
 /// (measurements/2026-10-29-a-node-cut-while-it-works.md). Each founder holds the block's one copy,
-/// and the object reads back whole once the links are free.
+/// and the object reads back whole once the links are free. The run begins once every founder's
+/// volume is enlisted and every range has caught up on them: a volume enters the table only with
+/// its node's enlistment, and a block takes the scheme of the domains whose volumes take chunks as
+/// it begins (docs/design/repair.md §5), so a run begun before a founder's enlistment reached the
+/// node serving it is two copies, on the other two founders, and that founder holds none.
 #[test]
 fn a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once() {
     let mut cell = Cell::made_alone_relayed(three_founders);
+    let founders: Vec<u64> = cell.dirs.keys().copied().collect();
+    for &id in &founders {
+        cell.enlisted(id);
+    }
+    let groups: std::collections::BTreeSet<u128> =
+        cell.status.keys().map(|(_, group)| *group).collect();
+    for group in groups {
+        cell.converged(group);
+    }
     let dir = made_client(&cell, "client");
     mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
     let period = mantle_protocol::bounds::idle_timeout();
@@ -1103,13 +1116,14 @@ fn a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once() {
     let copy = layout
         .chunk_len(layout.block_len(plain, 0).unwrap())
         .unwrap();
-    let founders: Vec<u64> = cell.dirs.keys().copied().collect();
     for id in founders {
         let (received, written, _, _) = cell.chunk_bytes(id);
         assert_eq!(
             received + written,
             copy,
-            "founder {id} took {received} bytes over QUIC and {written} of its own, not the run's one copy"
+            "founder {id} took {received} bytes over QUIC and {written} of its own, not the run's one \
+             copy; each member's standing as each node holds it: {:?}",
+            cell.standings
         );
     }
     holds(&dir, "paced", &object);

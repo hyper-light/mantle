@@ -102,7 +102,8 @@ pub const TLS_RECORD: usize = 5 + RECORD_PLAINTEXT + 2048;
 /// string to sign, the host's reply and the channels between the two; its fields are read where
 /// the head holds them, no table of them made, so none of this grows with their count), one body
 /// segment ([`PIECE`]), the piece a put's body is copied into, and one TLS record
-/// ([`TLS_RECORD`]). A put whose body is longer than one segment holds [`streamed_bytes`]. Pinned
+/// ([`TLS_RECORD`]). A put whose body comes in more than one piece, a read or a TLS record each,
+/// holds [`streamed_bytes`] at a depth past one, a body within one segment among them. Pinned
 /// by `tests/listener_memory.rs`
 /// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`), a head padded to
 /// its 8 KB with the most fields it carries among its cases.
@@ -127,7 +128,7 @@ pub fn most_pieces() -> usize {
         .max(1)
 }
 
-/// The most a put whose body is longer than one segment holds above its connection at rest: one
+/// The most a put whose body comes in more than one piece holds above its connection at rest: one
 /// head and one TLS record, as [`REQUEST_BYTES`], and the pieces of its body in the host's queue,
 /// at most the queue's depth of them, which the node learns and caps at [`most_pieces`]. The
 /// connection waits for the queue's room before it copies a piece

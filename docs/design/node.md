@@ -2765,12 +2765,14 @@ what the door makes of a head and answers it with, one body segment (`PIECE`) an
 at its largest (`TLS_RECORD`, 2^14 octets and TLS 1.2's 2,048 of expansion, RFC 8446 §5.1–5.2
 and RFC 5246 §6.2.3), 92,156 octets. A TLS connection encrypts a response a record at a time,
 each sent before the next is made, where hyper-tls's default would encrypt 64 KiB ahead of the
-socket. A put whose body is longer than a segment holds `listener::streamed_bytes`: one head and
-one TLS record, and its body's pieces in the host's queue, at most the queue's depth of them. The
-connection waits for the queue's room before it copies a piece (hyper-rt's `Sender::reserve`), so
-it holds none the queue has no room for; at a depth of one a put holds `REQUEST_BYTES`.
-`tests/listener_memory.rs` counts each request from its connection at rest to its answer, a put's
-body at the most pieces its queue holds.
+socket. A put whose body comes in more than one piece, a read or a TLS record each, holds
+`listener::streamed_bytes`: one head and one TLS record, and its body's pieces in the host's
+queue, at most the queue's depth of them. The connection waits for the queue's room before it
+copies a piece (hyper-rt's `Sender::reserve`), so it holds none the queue has no room for; at a
+depth of one a put holds `REQUEST_BYTES`. `tests/listener_memory.rs` counts each request from its
+connection at rest to its answer, at the first depth and at the most pieces a body's queue holds:
+there a TLS put of one segment, four records, holds 96,348 octets, past `REQUEST_BYTES` and within
+`streamed_bytes`.
 
 *Since 2026-11-18 (the owner's rule: no fixed depth, learned from what the node measures).* The
 queue's depth is learned from the pieces themselves (`door::Depth`), where it was 2 by fiat. By

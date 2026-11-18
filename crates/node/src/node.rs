@@ -734,6 +734,20 @@ struct Reading {
     query: Query,
 }
 
+/// The lanes between a node's shards, as `Node::lane_counts` counts them since it opened.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaneCounts {
+    /// Each kind of what the node's shard hands a range's shard, and the sends of it a full lane
+    /// refused: a Raft message dropped as the network may drop it, a proposal or a read refused
+    /// to its asker, the rest asked again or held for a later turn (node.md §2.9).
+    pub full: Vec<(&'static str, u64)>,
+    /// The stream's words held for want of room in a lane, each told at a later turn.
+    pub held_words: u64,
+    /// The proposals and the reads far ranges refused, each answered to its asker at once.
+    pub refused_proposals: u64,
+    pub refused_reads: u64,
+}
+
 /// Whom a read is answered to: a peer's exchange, or this node's own read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadOrigin {
@@ -1045,6 +1059,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// entries carried ([`Node::proposed`]).
     proposed_entries: u64,
     proposed_commands: u64,
+    /// The proposals and reads far ranges refused ([`Node::lane_counts`]).
+    far_refused_proposals: u64,
+    far_refused_reads: u64,
     /// The clients the node admits at once (`GatewaySettings::clients`), none where it hosts no
     /// objects.
     clients: usize,
@@ -1439,6 +1456,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             chunks_unkept: 0,
             proposed_entries: 0,
             proposed_commands: 0,
+            far_refused_proposals: 0,
+            far_refused_reads: 0,
             clients,
             generation: 0,
             held: Vec::new(),
@@ -1697,8 +1716,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     far.seen = seen;
                 }
             }
-            shard::Out::Served(group, id, served) => self.served_far(group, id, served, now)?,
+            shard::Out::Served(group, id, served) => {
+                if matches!(served, shard::Served::Refused) {
+                    self.far_refused_reads = self.far_refused_reads.saturating_add(1);
+                }
+                self.served_far(group, id, served, now)?;
+            }
             shard::Out::Refused(group, ask, refusal) => {
+                self.far_refused_proposals = self.far_refused_proposals.saturating_add(1);
                 self.refused_far(group, ask, refusal, now)?;
             }
             shard::Out::Compacted => self.compactions = self.compactions.saturating_add(1),
@@ -2125,6 +2150,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// counts as made.
     pub fn proposed(&self) -> (u64, u64) {
         (self.proposed_entries, self.proposed_commands)
+    }
+
+    /// The lanes between this node's shards since it opened (node.md §2.9), every shard's summed:
+    /// the sends a full lane refused, by the kind of what was sent, the stream's words held for
+    /// want of room, and the proposals and reads far ranges refused, each answered to its asker
+    /// at once. A refused proposal was counted as proposed ([`Node::proposed`]).
+    pub fn lane_counts(&self) -> LaneCounts {
+        let mut counts = LaneCounts {
+            full: shard::KINDS.iter().map(|kind| (*kind, 0)).collect(),
+            held_words: 0,
+            refused_proposals: self.far_refused_proposals,
+            refused_reads: self.far_refused_reads,
+        };
+        for lanes in &self.shards {
+            let (full, held) = lanes.full();
+            for ((_, sum), (_, count)) in counts.full.iter_mut().zip(full) {
+                *sum = sum.saturating_add(count);
+            }
+            counts.held_words = counts.held_words.saturating_add(held);
+        }
+        counts
     }
 
     /// The bytes of chunks peers put here over QUIC, of chunks this node put on its own volumes

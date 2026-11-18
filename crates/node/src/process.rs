@@ -91,7 +91,9 @@
 //! of its own process ([`answer_counts`]: `uncounted` where the binary gives none), then the
 //! write path's counts (`write_path_counts`): the log's frames, their updates and its flushes,
 //! the entries the node proposed and their commands, and its updates' commit waits since it was
-//! last asked; then the table of what held its shard (`slow_poll_counts`): each spawn site and
+//! last asked; then the lanes between its shards (`lane_counts`): the sends a full lane refused,
+//! by kind, the proposals and reads far ranges refused, and the stream's words held; then the
+//! table of what held its shard (`slow_poll_counts`): each spawn site and
 //! label whose polls held the shard past twice its quantum, with those polls since the shard
 //! began, how long they held it in all and at most, and whose time it was. A line it cannot read
 //! ends the process with the line named. Standard input closing ends `mantle node`, its
@@ -1407,7 +1409,24 @@ fn write_path_counts(
     Ok(())
 }
 
-/// The table of what held the node's shard, written after the write path's counts in a `counts`
+/// The lanes between the node's shards, written after the write path's counts in a `counts`
+/// answer, each a name and a value since the node opened (`Node::lane_counts`, node.md §2.9):
+/// `lane_full_KIND`, the sends of each kind a full lane refused, every kind named
+/// (`node::shard::KINDS`); `far_refused_proposals` and `far_refused_reads`, those far ranges
+/// refused, each answered to its asker at once; and `stream_held`, the stream's words held for
+/// want of room.
+pub fn lane_counts(said: &mut String, counts: &crate::node::LaneCounts) -> std::fmt::Result {
+    for (kind, full) in &counts.full {
+        write!(said, " lane_full_{kind} {full}")?;
+    }
+    write!(
+        said,
+        " far_refused_proposals {} far_refused_reads {} stream_held {}",
+        counts.refused_proposals, counts.refused_reads, counts.held_words
+    )
+}
+
+/// The table of what held the node's shard, written after the lanes' counts in a `counts`
 /// answer, as names and values (hyper-rt `slow`): `slow_entries`, the entries that follow, then
 /// for each `slow_site`, the file, line and column its tasks were spawned at, `slow_label`, the
 /// label they had as their polls ended (each a word, [`word`]; `-` for none), `slow_polls`, the
@@ -2537,6 +2556,7 @@ async fn serve(
                             &mut asked,
                         )
                         .map_err(wrote)?;
+                        lane_counts(&mut line, &node.lane_counts()).map_err(wrote)?;
                         // The table of the shard this task runs on, none where the runtime
                         // registers no table for it.
                         let slow = hyper_rt::registry::current_shard()
@@ -3416,6 +3436,25 @@ async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lanes' counts are said by name: each kind's sends a full lane refused, then the
+    /// proposals and reads far ranges refused and the stream's words held.
+    #[test]
+    fn the_lanes_counts_are_said_by_name() {
+        let counts = crate::node::LaneCounts {
+            full: vec![("step", 3), ("propose", 2)],
+            held_words: 4,
+            refused_proposals: 5,
+            refused_reads: 6,
+        };
+        let mut said = String::new();
+        lane_counts(&mut said, &counts).unwrap();
+        assert_eq!(
+            said,
+            " lane_full_step 3 lane_full_propose 2 far_refused_proposals 5 far_refused_reads 6 \
+             stream_held 4"
+        );
+    }
 
     /// A `counts` answer's write path says the log's and the proposals' counts as given, then the
     /// commit waits that ended since the last answer alone: their count, and the quantiles a

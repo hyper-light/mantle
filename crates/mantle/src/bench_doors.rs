@@ -30,7 +30,9 @@
 //! answer beside their own (`counts`): the cell's commands an entry its leaders proposed, its logs'
 //! updates a frame, and their frames and flushes an operation, every server's summed; and its
 //! logs' commit waits over the phase, each quantile the slowest server's, as quantiles do not sum
-//! ([`log_wait`]); and what held the servers' shards ([`slow_grown`]): the polls past twice a
+//! ([`log_wait`]); the lanes between the servers' shards ([`lane_columns`]): the sends a full lane
+//! refused by kind, the proposals and reads far ranges refused, and the stream's words held, each
+//! every server's growth summed; and what held the servers' shards ([`slow_grown`]): the polls past twice a
 //! shard's quantum an operation, and the label whose polls held the shards longest in all
 //! ([`slow_columns`]), each entry of the servers' tables that grew over the phase said on a line
 //! of its own after the phase's, `doors DOOR OP SIZE CONDITION slow`, then its server, spawn
@@ -2583,6 +2585,28 @@ fn write_path(before: &[Counted], after: &[Counted], ops: u64) -> String {
     )
 }
 
+/// A phase line's columns of the lanes between the servers' shards (node.md §2.9), each every
+/// server's growth over the phase summed ([`grown`]): the sends a full lane refused, Raft messages,
+/// proposals, reads and every other kind summed; the proposals and reads far ranges refused, each
+/// answered to its asker at once; and the stream's words held for want of room. A dash where a
+/// server answered none (an endpoint's).
+fn lane_columns(before: &[Counted], after: &[Counted]) -> String {
+    let grew = |f: fn(&Counted) -> Option<u64>| {
+        grown(before, after, f).map_or_else(|| "-".to_owned(), |n| format!("{n:.0}"))
+    };
+    format!(
+        " lane_full_step {} lane_full_propose {} lane_full_read {} lane_full_other {} \
+         far_refused_proposals {} far_refused_reads {} stream_held {}",
+        grew(|c| c.lane_full_step),
+        grew(|c| c.lane_full_propose),
+        grew(|c| c.lane_full_read),
+        grew(|c| c.lane_full_other),
+        grew(|c| c.far_refused_proposals),
+        grew(|c| c.far_refused_reads),
+        grew(|c| c.stream_held),
+    )
+}
+
 /// What a server's table of what held its shard counted over a phase for one spawn site and label
 /// (`Counted::slow`): the growth of its entry from the server's answer at the phase's start to its
 /// answer at the end, and the phase's longest poll where it passed every one before the phase (the
@@ -3123,7 +3147,7 @@ impl<'o> Bench<'o> {
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
-             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}{}",
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}{}{}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -3184,6 +3208,7 @@ impl<'o> Bench<'o> {
             m.again,
             t.failed,
             write_path(&before.counts, &after.counts, ops),
+            lane_columns(&before.counts, &after.counts),
             slow_columns(slow.as_deref(), ops),
             stall_column(stalled.as_deref()),
         )?;
@@ -4874,6 +4899,35 @@ mod tests {
             write_path(&pids, &pids, 40),
             " commands/entry - updates/frame - log_frames/op - log_flushes/op - log_wait_p50_us - \
              log_wait_p99_us - log_wait_max_us -"
+        );
+    }
+
+    /// A phase's lane columns are each server's growth over it, summed; a dash where a server
+    /// answered none.
+    #[test]
+    fn a_phases_lanes_are_each_servers_growth_summed() {
+        let at = |step, other, refused, held| Counted {
+            lane_full_step: Some(step),
+            lane_full_propose: Some(0),
+            lane_full_read: Some(1),
+            lane_full_other: Some(other),
+            far_refused_proposals: Some(refused),
+            far_refused_reads: Some(0),
+            stream_held: Some(held),
+            ..Counted::default()
+        };
+        let before = [at(1, 0, 2, 0), at(5, 1, 0, 3), at(0, 0, 0, 0)];
+        let after = [at(4, 2, 7, 0), at(5, 1, 1, 4), at(10, 0, 0, 0)];
+        assert_eq!(
+            lane_columns(&before, &after),
+            " lane_full_step 13 lane_full_propose 0 lane_full_read 0 lane_full_other 2 \
+             far_refused_proposals 6 far_refused_reads 0 stream_held 1"
+        );
+        let pids: [Counted; 3] = std::array::from_fn(|_| Counted::default());
+        assert_eq!(
+            lane_columns(&pids, &pids),
+            " lane_full_step - lane_full_propose - lane_full_read - lane_full_other - \
+             far_refused_proposals - far_refused_reads - stream_held -"
         );
     }
 

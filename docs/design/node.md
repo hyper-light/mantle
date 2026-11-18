@@ -1807,6 +1807,17 @@ lane's capacity and the one that woke it, so what a shard gives stays bounded. T
 past the range's bytes refused for what it is, the command waiting on each taken by its ask alone;
 and a read asked of a far member that leads not comes back refused at once.
 
+*As built (2026-11-18), the lanes' counts* (`Node::lane_counts`, `process::lane_counts`). So a
+ladder shows where placement's time goes, `mantle serve`'s `counts` answer says, since the node
+opened, the sends a full lane refused by the kind of what was sent (`lane_full_KIND`, each kind of
+`shard::KINDS`, named by one match over `In`'s variants, so a variant added fails to compile until
+it has one), the proposals and reads far ranges refused (`far_refused_proposals`,
+`far_refused_reads`; a refused proposal was counted proposed too) and the stream's words held for
+want of room (`stream_held`); `mantle bench doors` says each phase's growth of them, every server's
+summed (measurement.md §12). Tested: the answer says them by name (`process::tests`), the harness
+reads them back (`transfer::cell`) and sums each server's growth (`bench_doors`), and a full lane's
+refused proposal is counted under its kind alone (`node::shard`).
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

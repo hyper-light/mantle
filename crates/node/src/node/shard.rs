@@ -16,6 +16,7 @@
 //! which nothing else holds, so the node stops (`NodeError::ShardEnded`) and its next start
 //! recovers them from the log (node.md §1.7).
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::pin;
@@ -104,6 +105,51 @@ pub(crate) enum In<E: Engine, S: LogStore> {
     /// Each range's engine as it stands, handed back through the sender, and the task ends: the
     /// node closes (`Node::close`).
     Release(OneshotSender<Vec<(u128, E)>>),
+}
+
+/// Each kind of what the node's shard hands a range's shard ([`In`]), as the `counts` answer names
+/// it (`Node::lane_counts`).
+pub(crate) const KINDS: &[&str] = &[
+    "adopt",
+    "step",
+    "propose",
+    "believe",
+    "belief",
+    "measure",
+    "read",
+    "compact",
+    "reported",
+    "unreachable",
+    "transfer",
+    "toward",
+    "replace",
+    "table",
+    "block",
+    "release",
+];
+
+impl<E: Engine, S: LogStore> In<E, S> {
+    /// Its kind's name, one of [`KINDS`]: a variant added fails to compile until it has one.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Adopt(..) => "adopt",
+            Self::Step { .. } => "step",
+            Self::Propose(..) => "propose",
+            Self::Believe(_) => "believe",
+            Self::Belief(..) => "belief",
+            Self::Measure(_) => "measure",
+            Self::Read { .. } => "read",
+            Self::Compact => "compact",
+            Self::Reported { .. } => "reported",
+            Self::Unreachable(_) => "unreachable",
+            Self::Transfer { .. } => "transfer",
+            Self::Toward(..) => "toward",
+            Self::Replace(..) => "replace",
+            Self::Table(_) => "table",
+            Self::Block(..) => "block",
+            Self::Release(_) => "release",
+        }
+    }
 }
 
 /// What a shard's ranges gave, for the node's shard.
@@ -834,6 +880,10 @@ pub(crate) struct Lanes<E: Engine, S: LogStore> {
     /// The stream's words the shard is yet to be told of, in the order the stream gave them
     /// ([`Lanes::tell_stream`]): at most a lane's capacity.
     stream: VecDeque<In<E, S>>,
+    /// The sends a full lane refused, each kind's in its place in [`KINDS`], and the stream's
+    /// words held for want of room, each since the lanes were made (`Node::lane_counts`).
+    full: [Cell<u64>; KINDS.len()],
+    held_words: u64,
 }
 
 impl<E, S> Lanes<E, S>
@@ -862,6 +912,8 @@ where
             held: None,
             lost: Vec::new(),
             stream: VecDeque::new(),
+            full: std::array::from_fn(|_| Cell::new(0)),
+            held_words: 0,
         })
     }
 }
@@ -900,8 +952,18 @@ impl<E: Engine + 'static, S: LogStore> Lanes<E, S> {
     /// Hands `sent` to the shard without waiting: refused `LaneFull` when its lane holds all it
     /// takes, and `ShardEnded` when its task is gone.
     pub(crate) fn send(&self, sent: In<E, S>) -> Result<(), NodeError> {
+        let kind = sent.kind();
         self.into.try_send(sent).map_err(|refused| match refused {
-            SyncError::Full(_) => NodeError::LaneFull(self.shard),
+            SyncError::Full(_) => {
+                if let Some(count) = KINDS
+                    .iter()
+                    .position(|k| *k == kind)
+                    .and_then(|at| self.full.get(at))
+                {
+                    count.set(count.get().saturating_add(1));
+                }
+                NodeError::LaneFull(self.shard)
+            }
             SyncError::Closed(_) | SyncError::NotOnShardThread(_) => {
                 NodeError::ShardEnded(self.shard)
             }
@@ -932,7 +994,17 @@ impl<E: Engine + 'static, S: LogStore> Lanes<E, S> {
             return Err(NodeError::LaneFull(self.shard));
         }
         self.stream.push_back(word);
+        self.held_words = self.held_words.saturating_add(1);
         Ok(())
+    }
+
+    /// The sends a full lane refused, each kind's ([`KINDS`]), and the stream's words it held for
+    /// want of room, since the lanes were made.
+    pub(crate) fn full(&self) -> (impl Iterator<Item = (&'static str, u64)> + '_, u64) {
+        (
+            KINDS.iter().copied().zip(self.full.iter().map(Cell::get)),
+            self.held_words,
+        )
     }
 
     /// Tells the shard the stream's words held ([`Lanes::tell_stream`]) while its lane has room,
@@ -1804,6 +1876,8 @@ mod tests {
             held: None,
             lost: Vec::new(),
             stream: VecDeque::new(),
+            full: std::array::from_fn(|_| Cell::new(0)),
+            held_words: 0,
         };
         (lanes, (taken, given))
     }
@@ -2713,6 +2787,10 @@ mod tests {
             propose(&shards, &far, &put(), max, 0),
             Err(NodeError::LaneFull(1))
         ));
+        // Counted by its kind, and no other.
+        let (full, held) = shards[0].full();
+        let full: Vec<(&str, u64)> = full.filter(|(_, n)| *n > 0).collect();
+        assert_eq!((full, held), (vec![("propose", 1)], 0));
         far.shard = 2;
         assert!(matches!(
             propose(&shards, &far, &put(), max, 0),

@@ -320,6 +320,15 @@ stock clients stay the correctness suite.
   commit waits' quantiles of the slowest server's log, as quantiles do not sum: what group commit
   shares among a phase's writes (Helland et al., Tandem TR 88.1, §2; research/71 step 9, which
   counted them first in a diagnostic build).
+- **The lanes between a server's shards** (node.md §2.9), in every build: `counts` says, since the
+  server began, the sends a full lane refused by the kind of what was sent (`lane_full_KIND`, every
+  kind of `node::shard::KINDS`), the proposals and reads far ranges refused, each answered to its
+  asker at once (`far_refused_proposals`, `far_refused_reads`), and the stream's words held for
+  want of room (`stream_held`). A phase says `lane_full_step`, `lane_full_propose`,
+  `lane_full_read`, `lane_full_other` (every other kind summed), `far_refused_proposals`,
+  `far_refused_reads` and `stream_held`, each every server's growth over the phase summed, so a
+  ladder over `--range-shards spread` shows where placement's time goes; all stay 0 under `first`,
+  where no shard past the first runs a range.
 - **Instruments**: hyper-measure's counting allocator in `count-allocs` builds of `mantle serve`
   and the harness only, the harness's own work set aside, its peak said each phase beside the
   threads its process runs as the OS counts them, neither growing with clients or objects; each

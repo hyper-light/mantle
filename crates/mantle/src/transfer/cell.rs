@@ -101,6 +101,16 @@ pub struct Counted {
     pub wait_p50_ns: Option<u64>,
     pub wait_p99_ns: Option<u64>,
     pub wait_max_ns: Option<u64>,
+    /// The sends a full lane between the node's shards refused (`lane_full_KIND`): Raft messages,
+    /// proposals, reads, and every other kind summed (node.md §2.9).
+    pub lane_full_step: Option<u64>,
+    pub lane_full_propose: Option<u64>,
+    pub lane_full_read: Option<u64>,
+    pub lane_full_other: Option<u64>,
+    /// The proposals and reads far ranges refused, and the stream's words held for want of room.
+    pub far_refused_proposals: Option<u64>,
+    pub far_refused_reads: Option<u64>,
+    pub stream_held: Option<u64>,
     pub slow: Option<Vec<Slow>>,
     pub stalls: Option<Vec<Option<u64>>>,
 }
@@ -156,6 +166,20 @@ impl Counted {
                 }
                 continue;
             }
+            if let Some(kind) = name.strip_prefix("lane_full_") {
+                let full = unsigned()?;
+                let (slot, add) = match kind {
+                    "step" => (&mut counted.lane_full_step, false),
+                    "propose" => (&mut counted.lane_full_propose, false),
+                    "read" => (&mut counted.lane_full_read, false),
+                    _ => (&mut counted.lane_full_other, true),
+                };
+                *slot = match (*slot, add) {
+                    (Some(sum), true) => Some(sum.saturating_add(full)),
+                    _ => Some(full),
+                };
+                continue;
+            }
             if let Some(field) = name.strip_prefix("slow_") {
                 let slow = counted.slow.get_or_insert_with(Vec::new);
                 match field {
@@ -197,6 +221,9 @@ impl Counted {
                 "wait_p50_ns" => counted.wait_p50_ns = unsigned(),
                 "wait_p99_ns" => counted.wait_p99_ns = unsigned(),
                 "wait_max_ns" => counted.wait_max_ns = unsigned(),
+                "far_refused_proposals" => counted.far_refused_proposals = unsigned(),
+                "far_refused_reads" => counted.far_refused_reads = unsigned(),
+                "stream_held" => counted.stream_held = unsigned(),
                 _ => {}
             }
         }
@@ -783,6 +810,47 @@ mod tests {
         );
         assert_eq!(c.slow, None, "an answer with no table");
         assert_eq!(c.stalls, None, "an answer with no stalls");
+    }
+
+    /// The lanes between a node's shards, as the node says them in its `counts` answer
+    /// (`mantle_node::process::lane_counts`), are read back: Raft messages, proposals and reads by
+    /// kind, every other kind summed, and the far ranges' refusals and the stream's words held.
+    #[test]
+    fn a_counts_answers_lanes_are_read_back() {
+        let mut line = "counts uncounted frames 1".to_owned();
+        let counts = mantle_node::node::LaneCounts {
+            full: vec![
+                ("adopt", 1),
+                ("step", 2),
+                ("propose", 3),
+                ("read", 4),
+                ("measure", 5),
+            ],
+            held_words: 6,
+            refused_proposals: 7,
+            refused_reads: 8,
+        };
+        mantle_node::process::lane_counts(&mut line, &counts).unwrap();
+        let Some(Said::Counts(c)) = said(&line) else {
+            panic!("a counts answer not read: {line}");
+        };
+        assert_eq!(
+            (
+                c.lane_full_step,
+                c.lane_full_propose,
+                c.lane_full_read,
+                c.lane_full_other
+            ),
+            (Some(2), Some(3), Some(4), Some(6))
+        );
+        assert_eq!(
+            (c.far_refused_proposals, c.far_refused_reads, c.stream_held),
+            (Some(7), Some(8), Some(6))
+        );
+        let Some(Said::Counts(c)) = said("counts uncounted frames 1") else {
+            panic!("a counts answer not read");
+        };
+        assert_eq!((c.lane_full_step, c.stream_held), (None, None));
     }
 
     /// The stalls on each of a node's shards, as the node says them in its `counts` answer

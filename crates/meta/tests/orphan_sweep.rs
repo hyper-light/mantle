@@ -29,16 +29,17 @@
 //! block left is one a file names, every chunk left one a block holds, and every mark is on a
 //! file held or released.
 //!
-//! Clients of two principals draw operations putting keys, each with a horizon, and one may
-//! carry the identity another principal's operation carries (docs/design/gateway.md §2.1). Any
-//! number of gateways attempt each operation at any step, each with a block and a file of its
-//! own, and an attempt handed over is delivered again as a copy at any later step; the collector
-//! forgets the rows whose horizon passed. After every step the operation record's five
-//! obligations hold: at most one effect per identity within its horizon, the first's answer to
-//! every attempt, no attempt within the horizon changing its key's rows, every attempt's file
-//! released once within its deadline, and the rows unchanged by a split or a merge, each with
-//! its key. With the row, the gateway's scope or the collector's horizon check removed, a
-//! schedule breaks one (`each_piece_of_the_operation_record_removed_is_caught`).
+//! Clients of two principals draw operations putting or deleting keys, each with a horizon, and
+//! one may carry the identity another principal's operation carries (docs/design/gateway.md
+//! §2.1). Any number of gateways attempt each operation at any step, each put attempt with a
+//! block and a file of its own, and an attempt handed over is delivered again as a copy at any
+//! later step; the collector forgets the rows whose horizon passed. After every step the
+//! operation record's five obligations hold: at most one effect per identity within its
+//! horizon, the first's answer to every attempt, no attempt within the horizon changing its
+//! key's rows, every attempt's file released once within its deadline, and the rows unchanged
+//! by a split or a merge, each with its key. With the row, the gateway's scope or the
+//! collector's horizon check removed, a schedule breaks one
+//! (`each_piece_of_the_operation_record_removed_is_caught`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -191,14 +192,20 @@ enum Action {
         principal: usize,
         horizon: usize,
     },
+    /// A client of a principal draws an operation deleting a key, with a horizon.
+    OperateDelete {
+        key: usize,
+        principal: usize,
+        horizon: usize,
+    },
     /// A client of the other principal carries the identity an operation carries, on its key:
     /// forged, or drawn the same.
     Forge {
         of: usize,
         horizon: usize,
     },
-    /// A gateway starts an attempt of an operation: a block and a file of its own, handed over
-    /// as the operation's at its later steps.
+    /// A gateway starts an attempt of an operation: for a put, a block and a file of its own,
+    /// handed over as the operation's at its later steps; a delete, delivered at once.
     Attempt(usize),
     /// A gateway attempting an operation takes its next step.
     AdvanceAttempt(usize),
@@ -241,6 +248,9 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (0usize..4, 0usize..2, 0..HORIZONS.len()).prop_map(|(key, principal, horizon)| {
             Action::Operate { key, principal, horizon }
         }),
+        1 => (0usize..4, 0usize..2, 0..HORIZONS.len()).prop_map(|(key, principal, horizon)| {
+            Action::OperateDelete { key, principal, horizon }
+        }),
         1 => (0usize..4, 0..HORIZONS.len()).prop_map(|(of, horizon)| Action::Forge { of, horizon }),
         3 => (0usize..4).prop_map(Action::Attempt),
         4 => (0usize..4).prop_map(Action::AdvanceAttempt),
@@ -250,11 +260,13 @@ fn action() -> impl Strategy<Value = Action> {
 }
 
 /// A client's operation: the principal authentication established, the identity the client
-/// drew, the key it puts, the versioning it puts under, its horizon, and its last effect.
+/// drew, the key it puts or deletes, the versioning it writes under, its horizon, and its last
+/// effect.
 struct Op {
     principal: u128,
     raw: u128,
     key: &'static str,
+    delete: bool,
     versioning: Versioning,
     horizon_ns: u64,
     effect: Option<Effect>,
@@ -263,17 +275,16 @@ struct Op {
 /// What an operation's delivery made: the answer it got, and the range's time until which its
 /// row answers.
 struct Effect {
-    version: String,
-    etag: String,
+    answer: String,
     expiry_ns: u64,
 }
 
-/// An attempt of operation `op` handed over: its file, the file's deadline, and the command,
-/// which a copy carries again.
+/// An attempt of operation `op` handed over: its file if it carries one, the file's deadline,
+/// and the command, which a copy carries again.
 #[derive(Clone)]
 struct Delivered {
     op: usize,
-    file: u128,
+    file: Option<u128>,
     deadline_ns: u64,
     command: name::Command,
 }
@@ -686,21 +697,17 @@ impl World {
                 key,
                 principal,
                 horizon,
-            } => {
-                self.next_operation += 1;
-                self.ops.push(Op {
-                    principal: principal as u128,
-                    raw: self.next_operation,
-                    key: KEYS[key],
-                    versioning: versioning(self.ops.len()),
-                    horizon_ns: HORIZONS[horizon],
-                    effect: None,
-                });
-            }
+            } => self.operate(KEYS[key], principal, horizon, false),
+            Action::OperateDelete {
+                key,
+                principal,
+                horizon,
+            } => self.operate(KEYS[key], principal, horizon, true),
             Action::Forge { of, horizon } => {
                 if !self.ops.is_empty() {
                     let of = &self.ops[of % self.ops.len()];
-                    let (principal, raw, key) = ((of.principal + 1) % PRINCIPALS, of.raw, of.key);
+                    let (principal, raw, key, delete) =
+                        ((of.principal + 1) % PRINCIPALS, of.raw, of.key, of.delete);
                     // A principal's own operations never share an identity: a client draws
                     // each afresh.
                     if !self
@@ -712,6 +719,7 @@ impl World {
                             principal,
                             raw,
                             key,
+                            delete,
                             versioning: versioning(self.ops.len()),
                             horizon_ns: HORIZONS[horizon],
                             effect: None,
@@ -722,7 +730,11 @@ impl World {
             Action::Attempt(i) => {
                 if !self.ops.is_empty() {
                     let op = i % self.ops.len();
-                    self.start(self.ops[op].key, Some(op));
+                    if self.ops[op].delete {
+                        self.attempt_delete(op);
+                    } else {
+                        self.start(self.ops[op].key, Some(op));
+                    }
                 }
             }
             Action::AdvanceAttempt(i) => {
@@ -880,6 +892,52 @@ impl World {
         }
     }
 
+    /// A client of `principal` draws an operation putting or deleting `key`.
+    fn operate(&mut self, key: &'static str, principal: usize, horizon: usize, delete: bool) {
+        self.next_operation += 1;
+        self.ops.push(Op {
+            principal: principal as u128,
+            raw: self.next_operation,
+            key,
+            delete,
+            versioning: versioning(self.ops.len()),
+            horizon_ns: HORIZONS[horizon],
+            effect: None,
+        });
+    }
+
+    /// An attempt of delete operation `op`, delivered now.
+    fn attempt_delete(&mut self, op: usize) {
+        let o = &self.ops[op];
+        let delete = name::Delete {
+            bucket: BUCKET.into(),
+            incarnation: 1,
+            key: o.key.into(),
+            versioning: o.versioning,
+            named: None,
+            if_match: None,
+            at_ns: self.proposed(),
+            bypass: false,
+            owner: "o".into(),
+        };
+        let operation = Operation {
+            identity: self.scoped(op),
+            horizon_ns: o.horizon_ns,
+        };
+        let d = Delivered {
+            op,
+            file: None,
+            deadline_ns: u64::MAX,
+            command: name::Command::Operated(Box::new(Operated {
+                operation,
+                mutation: Mutation::Delete(delete),
+            })),
+        };
+        if self.deliver(&d).is_some() {
+            self.delivered.push(d);
+        }
+    }
+
     /// A gateway writes a chunk and its block, for a file of `key`, as an attempt of operation
     /// `op` if it carries one.
     fn start(&mut self, key: &'static str, op: Option<usize>) {
@@ -946,64 +1004,66 @@ impl World {
             .is_some_and(|e| before_ns <= e.expiry_ns);
         let rows = self.key_rows(key);
         let outcome = self.send(key, &d.command)?;
-        match &outcome {
-            name::Outcome::Put { version } => {
-                let now = mantle_meta::clock::now(self.holder(key), 0).unwrap();
-                if let Some(e) = &self.ops[d.op].effect
-                    && now <= e.expiry_ns
-                {
+        // What a delivery that went ahead answered, as an answer from its row says it.
+        let effect = match &outcome {
+            name::Outcome::Put { version } => Some(format!("{version} e{}", d.file.unwrap())),
+            name::Outcome::Deleted { marker, version } => Some(format!("{marker} {version:?}")),
+            _ => None,
+        };
+        if let Some(answer) = effect {
+            let now = mantle_meta::clock::now(self.holder(key), 0).unwrap();
+            if let Some(e) = &self.ops[d.op].effect
+                && now <= e.expiry_ns
+            {
+                self.broken.push(format!(
+                    "1, one effect: operation {} took a second effect at {now}, within its \
+                     first's horizon, to {}",
+                    d.op, e.expiry_ns
+                ));
+            }
+            let op = &mut self.ops[d.op];
+            op.effect = Some(Effect {
+                answer,
+                expiry_ns: now.saturating_add(op.horizon_ns),
+            });
+            self.made.extend(d.file);
+            if self.variant == Variant::NoRow {
+                let (id, identity) = (self.holder_id(key), self.scoped(d.op));
+                let range = self.names.get_mut(&id).unwrap();
+                range.index += 1;
+                let gone = Write::Delete(key::operation(BUCKET, key, identity));
+                range.engine.apply(range.index, vec![gone]).unwrap();
+            }
+        }
+        if let name::Outcome::Answered(made) = &outcome {
+            let answer = match made {
+                Made::Version {
+                    order, null, etag, ..
+                } => format!("{} {etag}", name::shown_id(*null, *order)),
+                Made::Deleted { marker, version } => format!("{marker} {version:?}"),
+                other => format!("{other:?}"),
+            };
+            let first = self.ops[d.op].effect.as_ref().map(|e| e.answer.clone());
+            if first.as_ref() != Some(&answer) {
+                self.broken.push(format!(
+                    "2, one answer: an attempt of operation {} was answered {answer}, its first \
+                     delivery {first:?}",
+                    d.op
+                ));
+            }
+            // A copy of a delivery that made a version leaves its file to the version.
+            if let Some(file) = d.file
+                && !self.made.contains(&file)
+                && !self.answered.contains_key(&file)
+            {
+                if self.queued(file).is_empty() {
                     self.broken.push(format!(
-                        "1, one effect: operation {} made a second version at {now}, within its \
-                         first's horizon, to {}",
-                        d.op, e.expiry_ns
+                        "4, released once: attempt file {file} answered from its row was not \
+                         released"
                     ));
                 }
-                let op = &mut self.ops[d.op];
-                op.effect = Some(Effect {
-                    version: version.clone(),
-                    etag: format!("e{}", d.file),
-                    expiry_ns: now.saturating_add(op.horizon_ns),
-                });
-                self.made.insert(d.file);
-                if self.variant == Variant::NoRow {
-                    let (id, identity) = (self.holder_id(key), self.scoped(d.op));
-                    let range = self.names.get_mut(&id).unwrap();
-                    range.index += 1;
-                    let gone = Write::Delete(key::operation(BUCKET, key, identity));
-                    range.engine.apply(range.index, vec![gone]).unwrap();
-                }
+                self.answered.insert(file, d.deadline_ns);
             }
-            name::Outcome::Answered(made) => {
-                let answer = match made {
-                    Made::Version {
-                        order, null, etag, ..
-                    } => Some((name::shown_id(*null, *order), etag.clone())),
-                    _ => None,
-                };
-                let first = self.ops[d.op]
-                    .effect
-                    .as_ref()
-                    .map(|e| (e.version.clone(), e.etag.clone()));
-                if first.is_none() || answer != first {
-                    self.broken.push(format!(
-                        "2, one answer: an attempt of operation {} was answered {made:?}, its \
-                         first delivery {first:?}",
-                        d.op
-                    ));
-                }
-                // A copy of a delivery that made a version leaves its file to the version.
-                if !self.made.contains(&d.file) && !self.answered.contains_key(&d.file) {
-                    if self.queued(d.file).is_empty() {
-                        self.broken.push(format!(
-                            "4, released once: attempt file {} answered from its row was not \
-                             released",
-                            d.file
-                        ));
-                    }
-                    self.answered.insert(d.file, d.deadline_ns);
-                }
-            }
-            _ => {}
         }
         if within && self.key_rows(key) != rows {
             self.broken.push(format!(
@@ -1197,7 +1257,7 @@ impl World {
                 };
                 let d = Delivered {
                     op,
-                    file: g.file,
+                    file: Some(g.file),
                     deadline_ns,
                     command: name::Command::Operated(Box::new(Operated {
                         operation,

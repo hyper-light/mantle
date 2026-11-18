@@ -1317,9 +1317,14 @@ targets. Each item is done when its test passes on every supported target.
    half, a write carrying its operation committed with a row of what it made, every later attempt
    answered from the row with nothing applied and its file released once, the collector's
    `Forget` past the horizon, and the rows carried by splits and merges (metadata.md §2,
-   "Operations", as built). *Open:* the host's half (scoping, `Operated` from both doors, the
-   answer from the row), `Expired` past a native attempt's horizon, the collector's driver, the
-   simulation's attempts, the real-process test, and the server's maximum horizon, which
+   "Operations", as built); and the orphan-sweep simulation's put and delete operations,
+   attempted at any step through any gateway, copied, forgotten, split and merged under clocks
+   that run behind, holding the five obligations after every step, with the row, the scope and
+   the horizon check each removed failing them (metadata.md §2, as built in the simulation).
+   *Open:* the host's half (scoping, `Operated` from both doors, the answer from the row),
+   `Expired` past a native attempt's horizon, the collector's driver, the simulation's parts,
+   uploads and completions as operations, the real-process test, and the server's maximum
+   horizon, which
    metadata.md §2 makes the operator's byte budget for the rows over the admitted mutation rate:
    no configuration states that budget and admission states no rate per principal yet (item 6),
    so the cap waits on the owner's choice of where the budget comes from.

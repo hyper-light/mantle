@@ -382,8 +382,16 @@ layers removes them, as Tectonic's does [01 §1.6].
   principal, kind of write, upload and part number, and answering `Answered` through both doors;
   the server's maximum horizon (STATUS item 9); the collector's driver for `Forget`, since nodes
   run no collector yet; `Expired` for a native attempt past its horizon, which needs each attempt
-  to carry its operation's deadline, as a write carries its file's; and the orphan-sweep
-  simulation's attempts.
+  to carry its operation's deadline, as a write carries its file's; and, in the orphan-sweep
+  simulation, parts, uploads and completions as operations. *As built in the simulation
+  (2026-11-17):* `tests/orphan_sweep.rs` draws put and delete operations of two principals,
+  one of which may carry the other's identity on its key, with a horizon of a gateway's
+  handover span or the clock's last instant; gateways attempt them at any step, each put
+  attempt with a file of its own, and copies of attempts handed over arrive at any later step,
+  among the sweeps, the collector, its `Forget`, splits, merges and leaders whose clocks run
+  behind. After every step it judges the five obligations, and with the row, the gateway's
+  scope or the horizon check removed, a schedule of its own budget, drawn from a fixed seed,
+  breaks one.
 - **Resumable native uploads** (research/30 §3.5, D3). A native upload is a multipart upload
   whose parts, runs, are numbered by the range as the gateway hands them over, each committed
   with the upload row's new durable offset and hash states in one transaction, so the offset

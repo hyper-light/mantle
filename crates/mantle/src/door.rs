@@ -9,7 +9,9 @@
 //! request, plain on a loopback endpoint and TLS elsewhere, verified by the endpoint's authority
 //! (node.md §4.1). It runs on one hyper-rt shard, as the native door's client does; files, standard
 //! input and output are the native door's own (src/client.rs). Every wait on the socket is held to
-//! a stock S3 client's patience, 60 s without a byte (`bounds::STOCK_PATIENCE`).
+//! a stock S3 client's patience, 60 s without a byte (`bounds::STOCK_PATIENCE`), and every try of
+//! the socket is a charge of the client's turn on its shard (`hyper_rt::coop`), as the listener's
+//! are, so a socket that can always be read or written yields the shard at its quantum.
 //!
 //! **What it asks again.** A request the listener let go of its connection before answering is
 //! asked once more on a new connection, where it is idempotent (RFC 9112 §9.3.1); one that is not
@@ -287,6 +289,7 @@ impl Tls {
     /// Sends what the connection holds of records, waiting while the socket is full.
     async fn flush(&mut self) -> Result<(), Error> {
         while self.connection.wants_write() {
+            hyper_rt::coop::consume_budget().await;
             match self.connection.write_tls(&mut Socket(&self.stream)) {
                 Ok(0) => return Err(Error::Http("a write the socket took none of".into())),
                 Ok(_) => {}
@@ -303,6 +306,7 @@ impl Tls {
     /// the server's side has ended.
     async fn take_records(&mut self) -> Result<bool, Error> {
         loop {
+            hyper_rt::coop::consume_budget().await;
             match self.connection.read_tls(&mut Socket(&self.stream)) {
                 Ok(0) => return Ok(false),
                 Ok(_) => break,
@@ -342,6 +346,7 @@ impl Conn {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         match self {
             Self::Plain(stream) => loop {
+                hyper_rt::coop::consume_budget().await;
                 if let Some(n) = stream
                     .try_read(buf)
                     .map_err(|e| Error::Http(format!("reading: {e:?}")))?
@@ -371,6 +376,7 @@ impl Conn {
             Self::Plain(stream) => {
                 let mut at = 0usize;
                 while let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) {
+                    hyper_rt::coop::consume_budget().await;
                     match stream
                         .try_write(rest)
                         .map_err(|e| Error::Http(format!("writing: {e:?}")))?

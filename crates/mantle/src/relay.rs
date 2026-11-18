@@ -23,7 +23,9 @@
 //!   once; a datagram past them is dropped and counted.
 //!
 //! One hyper-rt shard on a thread of its own drives every link, a task each, as the node tests'
-//! partitioning relay does (crates/node/tests/support/relay.rs).
+//! partitioning relay does (crates/node/tests/support/relay.rs). Each datagram a link reads or
+//! sends is a charge of its turn on that shard (`hyper_rt::coop`; hyper-raft docs/runtime.md
+//! §3.14), so a link whose client keeps it full yields the shard to the others at its quantum.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -207,6 +209,14 @@ fn delay(draws: &mut SplitMix64) -> u64 {
         .saturating_add(draws.below(span))
 }
 
+/// A datagram from `socket`, if one waits there: its try is a charge of the link's turn on the
+/// relay's shard (`hyper_rt::coop`), as `UdpSocket::recv_from`'s is, so a client that keeps its
+/// link's socket full yields the shard to the other links at the shard's quantum.
+async fn arrived(socket: &UdpSocket, datagram: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    hyper_rt::coop::consume_budget().await;
+    socket.try_recv_from(datagram).ok().flatten()
+}
+
 /// One link: datagrams from its front's sender to `to`, the node, and the node's replies back,
 /// each way through its own direction. Ends when the relay does, saying what it counted.
 async fn link(
@@ -221,17 +231,18 @@ async fn link(
     let mut from: Option<SocketAddr> = None;
     let mut datagram = vec![0u8; mantle_client::PIECE];
     loop {
-        let now = now_ns();
         let [forward, backward] = &mut ways;
-        while let Ok(Some((len, sender))) = front.try_recv_from(&mut datagram) {
+        // Each datagram is held from when it was read: a link that yields its shard within a drain
+        // reads the rest later.
+        while let Some((len, sender)) = arrived(&front, &mut datagram).await {
             from = Some(sender);
             if let Some(bytes) = datagram.get(..len) {
-                forward.take(&mut draws, (bytes, to), now);
+                forward.take(&mut draws, (bytes, to), now_ns());
             }
         }
-        while let Ok(Some((len, _))) = back.try_recv_from(&mut datagram) {
+        while let Some((len, _)) = arrived(&back, &mut datagram).await {
             if let (Some(from), Some(bytes)) = (from, datagram.get(..len)) {
-                backward.take(&mut draws, (bytes, from), now);
+                backward.take(&mut draws, (bytes, from), now_ns());
             }
         }
         // A datagram the OS refuses (its destination gone) is lost, as the network loses one.

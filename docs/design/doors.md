@@ -71,7 +71,10 @@ One connection is kept from request to request while the listener keeps it: plai
 endpoint, TLS elsewhere, its handshake verified by the endpoint's authority alone (node.md §4.1),
 dialed at each address the endpoint's name resolves to in turn until one answers (research/86 [9]),
 on one hyper-rt shard, as the native door's client runs. Every wait on the socket is a stock S3
-client's patience, 60 s without a byte (research/77 D2).
+client's patience, 60 s without a byte (research/77 D2). Every try of the socket, plain or under
+TLS, is a charge of the client's turn on its shard, as the listener's are (node.md, "a
+connection's turn by time"; hyper-raft docs/runtime.md §3.14): past the shard's quantum, with
+anything else wanting the shard, the client yields at that await and goes on at its next poll.
 
 An idempotent request whose connection the listener let go before any octet of its answer is asked
 once more on a new connection; one that is not, CreateMultipartUpload and CompleteMultipartUpload,

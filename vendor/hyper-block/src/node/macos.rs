@@ -1,4 +1,5 @@
-//! macOS: a disk node's capacity and full flush, from the disk ioctls of <sys/disk.h>.
+//! macOS: a disk node's capacity, physical block and full flush, from the disk ioctls of
+//! <sys/disk.h>.
 //!
 //! The capacity is DKIOCGETBLOCKCOUNT blocks of DKIOCGETBLOCKSIZE bytes. F_FULLFSYNC, the
 //! full flush of a file (fcntl(2)), fails on a disk node with ENOTTY (measured on a disk
@@ -28,6 +29,8 @@ const BLOCK_SIZE: Opcode = opcode::read::<u32>(b'd', 24);
 const BLOCK_COUNT: Opcode = opcode::read::<u64>(b'd', 25);
 /// DKIOCSYNCHRONIZE: `_IOW('d', 22, dk_synchronize_t)`.
 const SYNCHRONIZE: Opcode = opcode::write::<Synchronize>(b'd', 22);
+/// DKIOCGETPHYSICALBLOCKSIZE: `_IOR('d', 77, uint32_t)`.
+const PHYSICAL_BLOCK_SIZE: Opcode = opcode::read::<u32>(b'd', 77);
 
 pub(crate) fn len(file: &File) -> io::Result<u64> {
     // SAFETY: DKIOCGETBLOCKSIZE writes one uint32_t, the getter's output type.
@@ -40,6 +43,13 @@ pub(crate) fn len(file: &File) -> io::Result<u64> {
             "the device reports more bytes than a u64 holds",
         )
     })
+}
+
+/// A disk node's physical block: the "Physical Block Size" its storage device publishes, or else
+/// the media's preferred block size (IOMediaBSDClient.cpp, DKIOCGETPHYSICALBLOCKSIZE).
+pub(crate) fn physical_block(file: &File) -> io::Result<u32> {
+    // SAFETY: DKIOCGETPHYSICALBLOCKSIZE writes one uint32_t, the getter's output type.
+    Ok(unsafe { ioctl(file, Getter::<PHYSICAL_BLOCK_SIZE, u32>::new()) }?)
 }
 
 pub(crate) fn sync(file: &File) -> io::Result<()> {

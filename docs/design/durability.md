@@ -267,9 +267,16 @@ unit it was laid in, so that pieces of two writes of one sequence, a confirmatio
 a restore over a lost frame's, never read as one record, and a slot is never read in another unit
 than its own. The unit is read from the device, not assumed (CLAUDE.md §5): Linux's
 `physical_block_size`, "the smallest unit a physical storage device can write atomically", and
-`atomic_write_unit_min_bytes` where present (research/02 §2.4), the physical sector size from IOKit
-on macOS and from `IOCTL_STORAGE_QUERY_PROPERTY` on Windows. A device that reports none gets the
-smallest logical block, the conservative side.
+`atomic_write_unit_min_bytes` where present and no larger than the physical block, so that the unit
+holds for a write that asks for atomicity and one that does not (research/02 §2.4); the "Physical
+Block Size" the storage device publishes in IOKit's registry on macOS, read without opening the
+device, whose node is root's (research/02 §3.5); and `FILE_STORAGE_INFO`'s
+`PhysicalBytesPerSectorForAtomicity` on Windows, which GetFileInformationByHandleEx gives for any
+handle without privilege, where `IOCTL_STORAGE_QUERY_PROPERTY` asks a volume handle and may ask
+privilege (research/02 §4.4). A device that reports none gets its logical block, and one that
+reports neither 512 bytes, Linux's own rule for such a device (block/blk-settings.c,
+`blk_validate_limits`): the conservative side, since a piece no larger than the true unit, at an
+offset it divides, lies within one unit.
 
 ### 7.3 How the group resolves an undetermined entry
 
@@ -375,8 +382,10 @@ answered. Two cases reach it:
 2. Format 5, the record in pieces of the device's atomic unit, and the open's reading of them
    (§7.2's last two rows). 2a, built (hyper-raft `mantle-frame-flush`): the record's encoding in
    pieces and its decoding, a slot's newest record whole, torn with the rows its landed pieces
-   hold, or `LogError::Damaged`. 2b: the device's atomic write unit read from the OS, and the
-   writer and the open taking the pieces.
+   hold, or `LogError::Damaged`. 2b-i, built (hyper-raft `mantle-frame-flush`): the device's
+   atomic write unit read from the OS as §7.2 states, with whether the OS stated it or it is the
+   default (hyper-block `atomic::atomic_unit`). 2b-ii: the writer and the open taking the pieces in
+   that unit.
 3. Each frame records whether it was answered at its flush; the open restores an `Undetermined`
    frame so answered as `Lost` is, and the simulation's faults of §7.6 run against it.
 4. The writer answers a frame at its flush where §7.5 allows, and the flushes a PUT are counted.

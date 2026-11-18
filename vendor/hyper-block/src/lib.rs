@@ -3,7 +3,9 @@
 //! `147f035` (`ORIGIN.md`).
 //!
 //! Identifying and measuring a device stays in mantle-disk: a caller that knows the device's
-//! alignment, queue and measured depth hands them in.
+//! alignment, queue and measured depth hands them in. The one fact read here is the device's
+//! atomic write unit (`atomic`), which the log lays its records in on every consumer, whether or
+//! not it has mantle-disk.
 
 #![cfg_attr(
     test,
@@ -23,6 +25,7 @@
 use std::path::PathBuf;
 
 pub mod aio;
+pub mod atomic;
 pub mod block;
 pub mod buf;
 pub mod commit;

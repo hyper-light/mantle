@@ -87,10 +87,25 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `1cc3214` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and two commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is in
-the hyper-raft repository's own objects and not yet pushed to its origin. Its second commit,
-`1cc3214`, changes hyper-log's `format.rs` alone (mantle docs/design/durability.md §7.2 and §7.7,
+**Every crate at `9580588` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and four commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is in
+the hyper-raft repository's own objects and not yet pushed to its origin. Its third and fourth
+commits, `79c74de` and `9580588`, change hyper-block alone (mantle docs/design/durability.md §7.2
+and §7.7, step 2b-i): `atomic::atomic_unit(file, path)` reads the atomic write unit of the device
+under a file from the OS, an `AtomicUnit` of the unit (an `Alignment`, as `Pieces::new` takes it)
+and its `Source`. On Linux, the queue of the block device holding the file, found from its device
+number at `/sys/dev/block/MAJOR:MINOR`: `atomic_write_unit_min_bytes` where non-zero and no larger
+than the physical block, with `atomic_write_unit_max_bytes`, else `physical_block_size`, else
+`logical_block_size`. On macOS, the "Physical Block Size" the storage device publishes in the I/O
+Registry, found from the volume's BSD name without opening the device; a disk node opened directly
+answers DKIOCGETPHYSICALBLOCKSIZE. On Windows, `FILE_STORAGE_INFO`'s
+`PhysicalBytesPerSectorForAtomicity`. A device that states no physical block is taken at its
+logical block, and one that states neither at 512 bytes, Linux's own rule (`blk_validate_limits`).
+`AtomicUnit::stated` says whether the OS stated the unit or it is that default. Nothing writes in
+it yet: the writer and the open take it in step 2b-ii. New constants `Alignment::SECTOR`,
+`ATTRIBUTE_READ`, `LOGICAL_SECTOR_AT`, `ATOMICITY_AT`, the IOKit and CoreFoundation constants of
+`atomic/macos.rs` and `PHYSICAL_BLOCK_SIZE` of `node/macos.rs`, with their rows in
+docs/design/constants.md. Its second commit, `1cc3214`, changes hyper-log's `format.rs` alone (mantle docs/design/durability.md §7.2 and §7.7,
 step 2a): `Pieces` lays a persist record in pieces of the device's atomic write unit, which its
 caller passes, each piece naming its record (log, sequence, what it confirms, the CRC of all its
 rows), its index, the count, the unit and a CRC of its own, format 5 and 6 sealed (format 4 is the

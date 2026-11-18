@@ -55,6 +55,14 @@ impl Alignment {
     /// One byte: no constraint.
     pub const BYTE: Self = Self(NonZeroUsize::MIN);
 
+    /// 512 bytes, `SECTOR_SIZE`: the logical block Linux gives a device that states none, "Unless
+    /// otherwise specified, default to 512 byte logical blocks" (block/blk-settings.c,
+    /// `blk_validate_limits`), and the smallest a block device has.
+    pub const SECTOR: Self = match NonZeroUsize::new(512) {
+        Some(sector) => Self(sector),
+        None => Self::BYTE,
+    };
+
     /// The alignment of `bytes`, a power of two up to [`MAX_ALIGNMENT`].
     pub fn new(bytes: usize) -> Result<Self, BufError> {
         match NonZeroUsize::new(bytes) {

@@ -205,6 +205,16 @@ Read-only attributes are mode 0444 and read-write ones 0644 [src] (L23 `blk-sysf
 | `max_write_streams`, `write_stream_granularity` | RO | Nov 2024 | Write streams; granularity is "the size that should be discarded or overwritten together to avoid write amplification in the device" | |
 | `read_ahead_kb`, `iostats`, `add_random`, `nomerges`, `rq_affinity`, `wbt_lat_usec`, `io_timeout`, `async_depth`, `crypto/` | various | various | Tunables and inline-encryption capabilities | |
 
+A device that states no block sizes [src] (`block/blk-settings.c`, `blk_validate_limits`, fetched
+from torvalds/linux `master` on 2026-11-17): "Unless otherwise specified, default to 512 byte
+logical blocks and a physical block size equal to the logical block size", in code
+`if (!lim->logical_block_size) lim->logical_block_size = SECTOR_SIZE;` and
+`if (lim->physical_block_size < lim->logical_block_size) lim->physical_block_size =
+lim->logical_block_size;`. The atomic-write limits are checked to be powers of two
+(`blk_validate_atomic_write_limits`) and capped by what one bio may carry
+(`blk_atomic_writes_update_limits`), with no check against the physical block; they bind writes
+that ask for atomicity (`RWF_ATOMIC`), where `physical_block_size` describes every write.
+
 Per-disk attributes outside `queue/` [doc] (L1):
 - `alignment_offset`: "how many bytes the beginning of the device is offset from the disk's natural alignment".
 - `discard_alignment`.

@@ -19,7 +19,7 @@ mod macos;
 mod windows;
 
 #[cfg(target_vendor = "apple")]
-pub(crate) use macos::{len, sync};
+pub(crate) use macos::{len, physical_block, sync};
 #[cfg(windows)]
 pub(crate) use windows::{len, storage_info};
 

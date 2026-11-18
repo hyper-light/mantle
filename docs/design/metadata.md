@@ -693,12 +693,31 @@ engines implement it:
 
 - **A model engine** for deterministic simulation: an ordered map with explicit durable and
   not-yet-durable state, the latter dropped on a simulated crash (06 §C.b.3, §C.d.3).
-- **A production engine,** one instance per range with shared memory, compaction and
-  file-deletion budgets per node, as ZippyDB runs one RocksDB per shard (12 §6.1). Research
-  note 12 recommends RocksDB, with leveled compaction and the models of §6.6 setting its
-  parameters. Which binding carries it, the upstream crate (whose macOS build does not flush
-  the drive cache) with mantle-owned FFI, a maintained fork, or a mantle-built LSM, is the
-  owner's decision (12 §5.8), and the interface keeps it one crate's change.
+- **A production engine,** mantle's own, `mantle_engine::shard_db::ShardDb`
+  (engine-structure.md), one instance per range replica, as ZippyDB runs one RocksDB per shard
+  (12 §6.1). Research note 12 recommended RocksDB, with leveled compaction and the models of its
+  §6.6 setting its parameters, and left which binding carries it to the owner (12 §5.8): the
+  upstream crate (whose macOS build does not flush the drive cache) with mantle-owned FFI, a
+  maintained fork, or a mantle-built LSM. The owner chose to build it: RocksDB 11.8.1 converted
+  to Rust (engine.md, 2026-09-30), and then, on research/33, a structure and format of the
+  engine's own, SplinterDB's size-tiered Bε-tree (engine-structure.md, 2026-10-06).
+
+*As built (2026-10-19).* `mantle_range::Stored` holds a `ShardDb` as the interface's engine, in
+its range's own store file in the node's directory (`range-GROUP.store`, node.md §1.6) on
+hyper-block's device file, whose flush is the platform's full flush. It keeps no write-ahead log of
+its own: an entry's writes go into its memtable, a persist is a checkpoint recording the last
+applied index, and an engine opened again stands at its last checkpoint, from which the Raft log
+is replayed (engine-structure.md §2). Its page, extents and memtable are derived per node, and its
+resident metadata shares what memory is left past the node's floor with the volumes' indexes
+(node.md §1.4).
+
+The interface as built (`mantle_meta::engine`): a batch applied as its log entry's index, of puts,
+deletes and key ranges cleared, each range one write (`Write::Clear`, which `Stored` applies a
+row at a time); a get; the first row of a key range, which scans are made of; the indexes applied
+and durable, and a persist that makes all applied durable; and every row as of the applied index,
+taken out to a member that lags and installed in its place (`image`, `install`; replica.md §4).
+Exporting and ingesting files in their place, for snapshots, splits and moves, is node.md §6.1's
+design, not yet built.
 
 ## 5. Testing
 
@@ -711,7 +730,8 @@ cover the production engine, which the simulator cannot.
 
 ## 6. Open
 
-- The production engine and its binding (§4).
+- Exporting and ingesting a range's engine files for snapshots, splits and moves, in place of
+  carrying every row (§4; node.md §6.1).
 - An owner's quota and ListBuckets once the Bucket layer outgrows one range.
 
 - How an entry larger than a datagram reaches the replicas: over QUIC, or fragmented on the

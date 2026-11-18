@@ -47,7 +47,8 @@
 //! their requests arrive as a Poisson process and each waits for a free client; closed, a ladder
 //! of clients doubles while throughput grows, up to `--clients`, each step judged in rounds as a
 //! benchmark point is (measurement.md §5, [`ROUNDS`]) and its growth told by their intervals, the
-//! ladder ending three steps after the last that grew ([`FLAT`]). Each phase says the
+//! ladder ending three steps after the last that grew ([`FLAT`]), or at a step that left an
+//! operation unanswered, which asks no more once one is ([`Climb::after`]). Each phase says the
 //! threads the process ran as the OS counts them, read as its clients' requests were out, and what
 //! the harness's own work held at its peak: a phase's operations allocate nothing of the
 //! harness's, so neither grows with the clients or the objects.
@@ -80,7 +81,7 @@ use hyper_measure::alloc::{self, Counts};
 use hyper_measure::open_loop::Arrivals;
 use hyper_measure::quantile::{Level, ranks, samples_for};
 use hyper_measure::usage::{self, Usage};
-use hyper_rt::combine::TaskSet;
+use hyper_rt::combine::{Either, TaskSet, race2};
 use hyper_rt::futures::{now_ns, sleep};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
@@ -662,6 +663,25 @@ struct Answer {
     length: Option<u64>,
 }
 
+/// `io`, a read or a write of an HTTP connection, waited on as the AWS SDKs wait on one: at most
+/// the stock S3 clients' patience, 60 s between bytes, botocore's `read_timeout` and the AWS CLI's
+/// `--cli-read-timeout` by default (`bounds::STOCK_PATIENCE`, research/77 [9, 10]), past which a
+/// listener that said nothing is taken for gone, a typed failure. An exchange whose answer had not
+/// begun is asked once more on a connection opened anew (`Http::ask`), as one the listener let go.
+async fn patient<T>(io: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+    let patience =
+        u64::try_from(mantle_protocol::bounds::STOCK_PATIENCE.as_nanos()).map_err(failed)?;
+    match race2(std::pin::pin!(io), std::pin::pin!(sleep(patience))).await {
+        Either::First(done) => done,
+        Either::Second(slept) => {
+            slept.map_err(|e| failed(format!("{e:?}")))?;
+            Err(failed(
+                "the listener said nothing for the stock S3 clients' patience",
+            ))
+        }
+    }
+}
+
 /// A connection to an S3 listener, a request at a time.
 struct Http {
     at: SocketAddr,
@@ -859,10 +879,13 @@ impl Http {
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let stream = self.stream().await?;
-        stream
-            .write_all(bytes)
-            .await
-            .map_err(|e| failed(format!("writing: {e:?}")))?;
+        patient(async {
+            stream
+                .write_all(bytes)
+                .await
+                .map_err(|e| failed(format!("writing: {e:?}")))
+        })
+        .await?;
         self.wire = self
             .wire
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
@@ -882,10 +905,13 @@ impl Http {
             .read
             .get_mut(self.held..)
             .ok_or_else(|| failed("the read buffer"))?;
-        let n = stream
-            .read(into)
-            .await
-            .map_err(|e| failed(format!("reading: {e:?}")))?;
+        let n = patient(async {
+            stream
+                .read(into)
+                .await
+                .map_err(|e| failed(format!("reading: {e:?}")))
+        })
+        .await?;
         self.held = self.held.saturating_add(n);
         self.wire = self
             .wire
@@ -1322,8 +1348,14 @@ struct Climb {
 }
 
 impl Climb {
-    /// The ladder after `step`: whether it goes on.
-    fn after(&mut self, step: Stepped) -> bool {
+    /// The ladder after `step`, of whose operations `unanswered` went unanswered: whether it goes
+    /// on. A step that left one unanswered ends the ladder and is not its best: the cell did not
+    /// answer its load within its own patience, so the step is past the knee the ladder looks for
+    /// (measurement.md §12), and doubling its clients asks the cell to refuse more.
+    fn after(&mut self, step: Stepped, unanswered: u64) -> bool {
+        if unanswered > 0 {
+            return false;
+        }
         let grew = self.best.is_none_or(|best| step.low > best.high);
         if self.best.is_none_or(|best| step.median > best.median) {
             self.best = Some(step);
@@ -1342,9 +1374,20 @@ fn threads_now() -> usize {
     threads
 }
 
+/// What a phase's clients ask: operation `j` on a client's connection, and what it came to.
+trait Ask {
+    async fn ask(&self, logical: &mut Logical, j: u64) -> Result<Came, Error>;
+}
+
+impl Ask for Work {
+    async fn ask(&self, logical: &mut Logical, j: u64) -> Result<Came, Error> {
+        self.run(logical, j).await
+    }
+}
+
 /// One client's part of a phase: operations taken from the schedule until it ends, each at its
 /// intended start, its latency from then.
-async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>>) {
+async fn client<A: Ask>(mut logical: Logical, work: Rc<A>, shared: Rc<RefCell<Shared>>) {
     loop {
         let taken = harness(|| shared.borrow_mut().schedule.take(now_ns()));
         let (j, intended) = match taken {
@@ -1375,7 +1418,7 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
                 tally.threads = tally.threads.max(threads);
             });
         }
-        let came = work.run(&mut logical, j).await;
+        let came = work.ask(&mut logical, j).await;
         let took = now_ns().saturating_sub(intended);
         let ended = now_ns();
         let stop = harness(|| {
@@ -1383,11 +1426,20 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
             let shared = &mut *shared;
             shared.out = shared.out.saturating_sub(1);
             // A closed step's round ends with its operations, an operation not asked counting in
-            // none; once the rounds are enough, the step asks no more.
-            if !matches!(came, Ok(Came::Skipped))
-                && let Some(rounds) = shared.rounds.as_mut()
-                && rounds.completed(ended)
-            {
+            // none; once the rounds are enough, the step asks no more. Nor once one of its
+            // operations went unanswered, throttled or lost on every attempt: the cell no longer
+            // answers the load offered within its own patience, so the step past it measures
+            // refusals, and each operation more is one more the cell is asked to refuse. A
+            // harness's error ends the phase, so it asks no more either. The operations out end on
+            // their own bounds.
+            let enough = !matches!(came, Ok(Came::Skipped))
+                && shared
+                    .rounds
+                    .as_mut()
+                    .is_some_and(|rounds| rounds.completed(ended));
+            let unanswered = shared.rounds.is_some()
+                && matches!(came, Ok(Came::Unanswered(_) | Came::Lost(_) | Came::Slowed));
+            if enough || unanswered || came.is_err() {
                 shared.schedule.stop();
             }
             let tally = &mut shared.tally;
@@ -1445,10 +1497,11 @@ async fn client(mut logical: Logical, work: Rc<Work>, shared: Rc<RefCell<Shared>
 }
 
 /// A phase's operations `from..end` on `clients`, a task each, a closed step's in rounds of
-/// `round` operations until they are enough: the clients back, the tally and the rounds' rates.
-async fn phase(
+/// `round` operations until they are enough or one goes unanswered: the clients back, the tally
+/// and the rounds' rates.
+async fn phase<A: Ask + 'static>(
     clients: Vec<Logical>,
-    work: Rc<Work>,
+    work: Rc<A>,
     schedule: (Load, u64, u64, u64),
     round: Option<u64>,
 ) -> Result<(Vec<Logical>, Tally, Vec<f64>), Error> {
@@ -2907,14 +2960,15 @@ impl<'o> Bench<'o> {
     }
 
     /// One phase on `clients` connections, operations `from..end`, and its line: the operations it
-    /// asked, and its throughput, a closed step's in rounds (`in_rounds`) as they judged it.
+    /// asked, its throughput, a closed step's in rounds (`in_rounds`) as they judged it, and its
+    /// operations unanswered.
     fn step(
         &mut self,
         out: &mut impl Write,
         work: &Rc<Work>,
         (size, clients): (&str, usize),
         (from, end, in_rounds): (u64, u64, bool),
-    ) -> Result<(u64, Stepped), Error> {
+    ) -> Result<(u64, Stepped, u64), Error> {
         let round = match (in_rounds, self.options.load) {
             (true, Load::Closed) => Some(round_ops(clients)?),
             _ => None,
@@ -2965,7 +3019,7 @@ impl<'o> Bench<'o> {
         if let Some(pool) = self.pools.get_mut(work.door.at()) {
             pool.extend(held);
         }
-        let ops = tally.ops;
+        let (ops, unanswered) = (tally.ops, tally.unanswered);
         let rate = ops as f64 / (elapsed_ns.max(1) as f64 / 1e9);
         // A server outside this program that refuses every operation of a phase does not offer
         // it: the phase is excluded with the server's answer, not counted as a failed check. A
@@ -3014,6 +3068,7 @@ impl<'o> Bench<'o> {
                 .as_ref()
                 .and_then(|j| Stepped::of(clients, j))
                 .unwrap_or(point),
+            unanswered,
         ))
     }
 
@@ -3230,7 +3285,8 @@ impl<'o> Bench<'o> {
     /// A phase's steps: open loop, one of `n` operations from `from` on `--clients` clients;
     /// closed, a ladder from one client doubling up to `--clients`, each step judged in rounds
     /// ([`ROUNDS`]) where `n` holds them and asking at most `n` operations further on, and ending
-    /// [`FLAT`] steps after the last whose interval lay wholly above the best's before it. A step
+    /// [`FLAT`] steps after the last whose interval lay wholly above the best's before it, or at a
+    /// step that left an operation unanswered, which is not its best ([`Climb::after`]). A step
     /// whose `n` holds no judged rounds (a large object's, its bytes capped) is its one throughput.
     /// Operations end at `end` where the phase's keys end; `finish` runs what the ladder left of
     /// them at its best step's clients. Says how far the steps went.
@@ -3259,10 +3315,19 @@ impl<'o> Bench<'o> {
         let (mut at, mut clients) = (from, 1usize);
         while at < end {
             let to = at.saturating_add(n.min(step_ops(clients)?)).min(end);
-            let (asked, stepped) =
+            let (asked, stepped, unanswered) =
                 self.step(out, work, (size, clients), (at, to, judged(clients)?))?;
             at = at.saturating_add(asked).min(to);
-            if !climb.after(stepped) || clients >= budget {
+            if !climb.after(stepped, unanswered) || clients >= budget {
+                if unanswered > 0 {
+                    writeln!(
+                        out,
+                        "doors {} {} {size} {} ladder ended clients {clients} unanswered {unanswered}",
+                        self.named(work.door),
+                        work.kind.name(),
+                        self.options.condition,
+                    )?;
+                }
                 break;
             }
             clients = clients.saturating_mul(2).min(budget);
@@ -3619,7 +3684,8 @@ impl Opening {
 
 /// The runtime the harness's clients run on, one shard on this thread: a task for each of
 /// `conns` clients and the phase's own, a timer for each client's wait for its intended start and
-/// two for a native client's waits, and the sockets of as many native clients.
+/// two for a native client's waits or one for an HTTP connection's ([`patient`]), and the sockets
+/// of as many native clients.
 fn runtime(conns: usize) -> Result<LocalRuntime, Error> {
     let tasks = conns.checked_add(2).ok_or_else(|| failed("tasks"))?;
     let timers = conns
@@ -4557,15 +4623,116 @@ mod tests {
             best: None,
             flat: 0,
         };
-        assert!(climb.after(step(1, 30.0, 1.0)));
-        assert!(climb.after(step(2, 60.0, 2.0)));
-        assert!(climb.after(step(4, 59.0, 3.0)));
-        assert!(climb.after(step(8, 120.0, 5.0)));
+        assert!(climb.after(step(1, 30.0, 1.0), 0));
+        assert!(climb.after(step(2, 60.0, 2.0), 0));
+        assert!(climb.after(step(4, 59.0, 3.0), 0));
+        assert!(climb.after(step(8, 120.0, 5.0), 0));
         assert_eq!(climb.flat, 0);
-        assert!(climb.after(step(16, 125.0, 6.0)));
-        assert!(climb.after(step(32, 118.0, 6.0)));
-        assert!(!climb.after(step(64, 121.0, 6.0)));
+        assert!(climb.after(step(16, 125.0, 6.0), 0));
+        assert!(climb.after(step(32, 118.0, 6.0), 0));
+        assert!(!climb.after(step(64, 121.0, 6.0), 0));
         assert_eq!(climb.best.unwrap().clients, 16);
+    }
+
+    /// A step that left an operation unanswered ends the ladder at once, however its throughput
+    /// grew, and is not its best: the best stays the last step whose every operation was answered.
+    #[test]
+    fn a_ladder_ends_at_a_step_that_left_an_operation_unanswered() {
+        let step = |clients, median: f64| Stepped {
+            clients,
+            median,
+            low: median - 1.0,
+            high: median + 1.0,
+        };
+        let mut climb = Climb {
+            best: None,
+            flat: 0,
+        };
+        assert!(climb.after(step(1, 30.0), 0));
+        assert!(climb.after(step(2, 60.0), 0));
+        let before = climb;
+        assert!(!climb.after(step(4, 500.0), 1));
+        assert_eq!(climb, before);
+        assert_eq!(climb.best.unwrap().clients, 2);
+        let mut first = Climb {
+            best: None,
+            flat: 0,
+        };
+        assert!(!first.after(step(1, 30.0), 3));
+        assert_eq!(first.best, None);
+    }
+
+    /// A simulated client's operations for [`phase`], each answered after a turn of the runtime but
+    /// the `never`-th, which its node never answers: the client's bounds settle it unanswered
+    /// (`Work::settled`), as mantle-client gives up an exchange its node says nothing on.
+    struct Unanswering {
+        never: u64,
+    }
+
+    impl Ask for Unanswering {
+        async fn ask(&self, _: &mut Logical, j: u64) -> Result<Came, Error> {
+            hyper_rt::futures::yield_now().await;
+            Ok(if j == self.never {
+                Came::Unanswered("never answered".to_owned())
+            } else {
+                Came::Done
+            })
+        }
+    }
+
+    /// `count` logical clients that are never dialed, for a phase whose operations are simulated.
+    fn idle_clients(count: usize) -> Vec<Logical> {
+        let signer = Rc::new(Signer {
+            id: String::new(),
+            secret: String::new(),
+            region: String::new(),
+            bucket: String::new(),
+        });
+        let at = SocketAddr::from(([127, 0, 0, 1], 0));
+        (0..count)
+            .map(|_| Logical::new(Conn::Http(Box::new(Http::new(at, Rc::clone(&signer))))))
+            .collect()
+    }
+
+    /// A closed step in rounds whose one operation goes unanswered asks no more past it: the step
+    /// ends once the operations its other clients had out end, each client back, far short of the
+    /// operations its rounds may ask, the unanswered one counted a failure; a step not in rounds,
+    /// an open loop's or the rest a ladder left, asks every operation it was given.
+    #[test]
+    fn a_step_in_rounds_ends_at_its_first_unanswered_operation_and_counts_it() {
+        let clients = 4;
+        let never = 50;
+        let most = step_ops(clients).unwrap();
+        let mut rt = runtime(clients).unwrap();
+        let work = Rc::new(Unanswering { never });
+        let schedule = (Load::Closed, 1, 0, most);
+        let round = Some(round_ops(clients).unwrap());
+        let (back, tally, rates) = rt
+            .block_on(phase(
+                idle_clients(clients),
+                Rc::clone(&work),
+                schedule,
+                round,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.len(), clients);
+        assert_eq!((tally.unanswered, tally.failed), (1, 1));
+        let others = u64::try_from(clients - 1).unwrap();
+        assert!(
+            (never + 1..=never + 1 + others).contains(&tally.ops),
+            "{} of {most}",
+            tally.ops
+        );
+        assert!(rates.len() < ROUNDS.min);
+        let first = tally.first[Failure::Unanswered.at()].as_deref();
+        assert_eq!(first, Some("never answered"));
+        let (back, tally, _) = rt
+            .block_on(phase(back, work, schedule, None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.len(), clients);
+        assert_eq!((tally.ops, tally.unanswered), (most, 1));
     }
 
     /// A step whose rounds kept none is judged by none, so it falls back to its one throughput.

@@ -334,7 +334,16 @@ stock clients stay the correctness suite.
   best step's before it, and the ladder ends three steps after the last that grew, BBR's count
   before it calls a pipe full (Linux `tcp_bbr.c`, `bbr_full_bw_cnt`): a ladder that stopped at
   the first step not a tenth above the last stopped where one noisy step fell, its best 66 and 156
-  PUTs a second in two runs of one build (measurements/2026-11-14-the-ladder-paced.md).
+  PUTs a second in two runs of one build (measurements/2026-11-14-the-ladder-paced.md). A step in
+  rounds also ends at its first operation unanswered, throttled or lost on each attempt the AWS SDKs
+  give one (research/73), and the ladder ends at any step that left one, that step not its best: the
+  cell no longer answers the load offered within its own patience (research/77 D2), so a step past
+  it measures refusals and each doubling multiplies the retries it refuses (77 F3). The operations
+  out end on their own bounds and the step's line counts the failure. A ladder that went on past one
+  did not end: run r20 on the Mac Studio (lean-doors aef9efae), native PUT 1 B, left a PUT
+  unanswered (`SlowDown` asked three times) at 2,048 clients and then said nothing for three hours.
+  The HTTP door waits on a listener as the stock clients do, at most their 60 s between bytes
+  (research/77 [9, 10]).
 - **Stops**: each phase says how long the harness's process went without running past the 10 ms
   waits a thread of its asks, the sum and the longest. A process stopped whole (a frozen cgroup,
   a pacer duty-cycling the work it runs) stops the cell and its clients together, and every

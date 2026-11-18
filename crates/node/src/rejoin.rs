@@ -145,6 +145,9 @@ pub enum RejoinError {
     Order(Resume, &'static str),
     #[error("{0} acts did not finish the rejoin's wipe and switch")]
     Unfinished(usize),
+    /// A member's place in the cell's answer that a `seed` line cannot hold as one field.
+    #[error("member {0}'s place {1:?} is no HOST:PORT a seed line holds")]
+    Place(u64, String),
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> RejoinError {
@@ -357,12 +360,7 @@ fn switched(text: &str, file: &Path, (id, place): (u64, Place)) -> Result<String
     ];
     let mut rewritten = String::with_capacity(text.len());
     for line in text.lines() {
-        // A line's key as the configuration's reader takes it: before a comment and an `=`.
-        let key = line
-            .split('#')
-            .next()
-            .and_then(|line| line.split_once('='))
-            .map(|(key, _)| key.trim());
+        let key = key_of(line);
         match stated.iter_mut().find(|(name, _, _)| Some(*name) == key) {
             Some((name, value, times)) => {
                 *times = times.saturating_add(1);
@@ -380,6 +378,50 @@ fn switched(text: &str, file: &Path, (id, place): (u64, Place)) -> Result<String
         }
     }
     Ok(rewritten)
+}
+
+/// A configuration line's key as the configuration's reader takes it: before a comment and an `=`.
+fn key_of(line: &str) -> Option<&str> {
+    line.split('#')
+        .next()
+        .and_then(|line| line.split_once('='))
+        .map(|(key, _)| key.trim())
+}
+
+/// Rewrites the configuration's `seed` lines to name `members`, the cell's answer's (step 5's
+/// seeds), whole and durable, every other line kept: the members the new identity dials first
+/// (step 6). Taken at the ask, before the answer's certificate is kept, so a start that resumes at
+/// the wipe switches to a configuration already naming them, and one that resumes at the ask asks
+/// them. Refused, the configuration untouched, where a member's place is not one field a seed line
+/// holds: a printable word with no comment in it.
+pub fn seed(configured: &Configured, members: &[wire::Member]) -> Result<(), RejoinError> {
+    let file = &configured.file;
+    let one_field =
+        |place: &str| !place.is_empty() && place.chars().all(|c| c.is_ascii_graphic() && c != '#');
+    for member in members {
+        for place in [&member.quic, &member.plane] {
+            if !one_field(place) {
+                return Err(RejoinError::Place(member.id, place.clone()));
+            }
+        }
+    }
+    let text = std::fs::read_to_string(file).map_err(io("read", file))?;
+    let mut rewritten = String::with_capacity(text.len());
+    for line in text.lines().filter(|line| key_of(line) != Some("seed")) {
+        rewritten.push_str(line);
+        rewritten.push('\n');
+    }
+    for member in members {
+        rewritten.push_str("seed = ");
+        rewritten.push_str(&member.id.to_string());
+        for place in [&member.quic, &member.plane] {
+            rewritten.push(' ');
+            rewritten.push_str(place);
+        }
+        rewritten.push('\n');
+    }
+    files::write(file, rewritten.as_bytes())?;
+    Ok(())
 }
 
 /// The next identity's key (step 3): the one kept in the place the configuration does not name,

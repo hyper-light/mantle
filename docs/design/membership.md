@@ -619,6 +619,35 @@ start's call of `rejoin::ask` with its kept next key and the members it knows, t
 member for a `NotRemoved` member's removal, and the real-process tests through a member's own
 handler and the root range's leader.
 
+*As built (slice 6, 2026-11-18;* `crate::process`*'s `resume_rejoin`, `crate::rejoin::seed`,
+`crate::node::enrollments`*).* A start that finds the marker says `retired` and, under the node
+directory's and every volume's lock, takes the kept next key (`rejoin::next_key`) and asks the cell
+once (`rejoin::ask`): the members are its `seed` and `peer` lines that name where they listen, then
+the members serving or leaving that its replica of the root range holds, read from its store before
+anything opens it, each once, never itself, at most `root.max_nodes`. The ask runs on a runtime of
+the node's own shape, from its QUIC address on a port the OS chooses, under the message bounds its
+ranges state, the process's one statement of them (`classes::state_bounds`), so the start after it
+states the same; a `mantle serve` start derives its values first, under the rejoin's locks. A
+refusal says `rejoin refused REASON`, no answer `rejoin unreachable`, and the start ends
+`Unrejoined`, nonzero, the marker and the key kept. Granted, the answer's members are written as the
+configuration's `seed` lines, whole and durable, before its certificate is kept, so a start that
+resumes at the wipe switches to a configuration naming them and one that resumes at the ask asks
+them; a member's place a seed line cannot hold as one field is refused before the file is touched.
+Then the wipe and the switch, said `rejoined ID`, and the same start reads its configuration again
+and joins as the new node (step 6): `Rejoined`, slice 3's stop after the switch, is gone. A node
+that learns it is retired as it runs still ends `Retired`; its supervisor's next start asks, since
+the compute pool a node's start opens is the process's once. At a member, a request the root range
+refused `NotRemoved` waits for the rows to hold the old member removed or delisted, then is
+proposed again, at most until its patience less two idle timeouts (RFC 9000 §10.1): the asker gives
+each member the stock patience from its dial, which connects within one idle timeout before the
+request is read, and the answer reaches it within another; past that it is answered `NotRemoved`.
+The re-grant still waits for the removal, so the wipe never precedes the fact that nothing on the
+node's disks is needed. Tested: the start's ask with a stub answer, each refusal and no answer to
+its line and error with the directory as it was but for the key, and `Granted` to the seeds, the
+switch and a member's next start (`process`); the wait's bound (`node::enrollments`). End to end,
+written for the coordinator to run: the repair suite's stated-gone test and `membership.rs`'s
+stated-gone, rejoin, ban, `rejoin off` and copied-disk tests.
+
 **What stays forbidden.** The old identity is never admitted again: its grant stays spent in its
 issuer's window and its member written off. A re-grant draws a new id and refuses the old key. The
 issuer signs node certificates alone, never a CA, a gateway's or a client's, and the directory

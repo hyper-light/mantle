@@ -130,8 +130,8 @@ use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
 use hyper_rt::signal::Signal;
 use hyper_timing::Histogram;
-use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
+use hyper_transport::{PeerId, Refusal};
 use mantle_ec::durability::{Burst, Rates};
 use mantle_engine::store::{Config as StoreConfig, Shape, Store};
 use mantle_engine::trunk::TrunkConfig;
@@ -159,6 +159,7 @@ use crate::rejoin::{self, Configured, RejoinError, Resume};
 use crate::secret::{self, SecretError};
 use crate::storage::{Locks, NodeLock, Storage, StorageError, VolumeSettings};
 use mantle_protocol::classes::Role;
+use mantle_protocol::enroll as wire;
 
 /// Why the process stopped.
 #[derive(Debug, thiserror::Error)]
@@ -216,10 +217,11 @@ pub enum ProcessError {
     /// A step of the node's rejoin (membership.md §5.1 steps 4 and 5) that could not be taken.
     #[error("the rejoin: {0}")]
     Rejoin(#[from] RejoinError),
-    /// The node took its new identity (membership.md §5.1 step 5), the node its configuration now
-    /// names: its join as a new member (step 6) is the next start's, and that start a member's.
-    #[error("rejoined as node {0}: its next start joins the cell as a new member")]
-    Rejoined(u64),
+    /// The cell gave the written-off node no new identity (membership.md §5.1 step 3): a refusal,
+    /// which stands until a person or a supervisor acts, or no member answered; its supervisor
+    /// starts it again later, as for any exit.
+    #[error("{0}")]
+    Unrejoined(rejoin::AskError),
 }
 
 /// The signals that stop the node in order (node.md §1.7): SIGTERM, which a service manager or a
@@ -1411,9 +1413,17 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     mantle_engine::port::mmap::return_freed_blocks();
     let file = config;
     let config = ProcessConfig::read(file).map_err(step(Step::Configuration))?;
-    resume_rejoin(process_rejoining(file, &config), |file| {
-        ProcessConfig::read(file).map(|config| process_rejoining(file, &config))
-    })?;
+    let switched = resume_rejoin(
+        process_rejoining(file, &config),
+        |file| ProcessConfig::read(file).map(|config| process_rejoining(file, &config)),
+        |_, key| ask_cell(&config, key),
+    )?;
+    // Switched, the configuration names the new identity and its seeds: the start joins as it.
+    let config = if switched {
+        ProcessConfig::read(file).map_err(step(Step::Configuration))?
+    } else {
+        config
+    };
     let keys = config
         .gateway
         .as_ref()
@@ -1588,9 +1598,22 @@ fn since(now: &Histogram, then: &Histogram, q_ppm: u32) -> Option<u64> {
 pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
     mantle_engine::port::mmap::return_freed_blocks();
     let stated = read_stated(config).map_err(step(Step::Configuration))?;
-    resume_rejoin(stated_rejoining(config, &stated), |file| {
-        read_stated(file).map(|stated| stated_rejoining(file, &stated))
-    })?;
+    let switched = resume_rejoin(
+        stated_rejoining(config, &stated),
+        |file| read_stated(file).map(|stated| stated_rejoining(file, &stated)),
+        // The ask's runtime and bounds are the node's own, derived as its start derives them,
+        // under the locks the rejoin holds.
+        |configured, key| {
+            let stated = read_stated(&configured.file).map_err(step(Step::Configuration))?;
+            ask_cell(&said(stated)?.config, key)
+        },
+    )?;
+    // Switched, the configuration names the new identity and its seeds: the start joins as it.
+    let stated = if switched {
+        read_stated(config).map_err(step(Step::Configuration))?
+    } else {
+        stated
+    };
     let identity = identity(
         (&stated.certificate, &stated.key, &stated.authority),
         &stated.peers,
@@ -1628,37 +1651,187 @@ pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
 
 /// Takes a start of the node whose configuration `configured` read where its rejoin stands
 /// (docs/design/membership.md §5.1's resume table, `rejoin::state`), each configuration after it
-/// read by `read`. No marker: the start goes on. Any other place says `retired`, then:
+/// read by `read`: whether it switched to a new identity, which the start then reads and joins as
+/// (step 6). No marker: the start goes on as it stands. Any other place says `retired`, then, under
+/// the node directory's and every volume's lock:
 ///
-/// - the marker and no next certificate, the ask (step 3): before anything opens, measures, dials
-///   or writes, the start ends with the marker's fingerprint, the marker kept, until the cell's
-///   issuer and the ask are built (slices 4 to 6);
-/// - a next certificate, or the configuration naming it: under the node directory's and every
-///   volume's lock, the wipe and the switch to their end (steps 4 and 5), and the start ends
-///   naming the new node, whose join (step 6) is the next start's.
+/// - the marker and no next certificate, the ask (step 3): the next key kept (`rejoin::next_key`),
+///   the cell asked once for a certificate for it (`ask`, one round of `rejoin::ask`), the answer's
+///   members written as the configuration's seeds and its certificate kept beside the key. A
+///   refusal or no answer says `rejoin refused REASON` or `rejoin unreachable` and ends the start
+///   (`Unrejoined`), the marker and the key kept, for its supervisor to start again;
+/// - then the wipe and the switch to their end (steps 4 and 5), said `rejoined ID` with the new
+///   node's id.
 fn resume_rejoin(
     configured: Configured,
     read: impl Fn(&Path) -> Result<Configured, ProcessError>,
-) -> Result<(), ProcessError> {
+    ask: impl FnOnce(&Configured, &mantle_cert::KeyPair) -> Result<CellAnswer, ProcessError>,
+) -> Result<bool, ProcessError> {
     let stands = rejoin::state(&configured)?;
     if stands == Resume::Start {
-        return Ok(());
+        return Ok(false);
     }
-    let mut out = std::io::stdout().lock();
-    writeln!(out, "retired").map_err(|e| ProcessError::Say(e.to_string()))?;
-    out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
-    drop(out);
-    if let Resume::Ask(fingerprint) = stands {
-        return Err(ProcessError::Retired(hex(&fingerprint)));
-    }
+    say_now("retired")?;
     let _node = Locks::node(&configured.dir).map_err(step(Step::Locks))?;
     let _volumes =
         Locks::take(configured.volumes.iter().map(PathBuf::as_path)).map_err(step(Step::Locks))?;
+    if let Resume::Ask(_) = stands {
+        let key = rejoin::next_key(&configured)?;
+        let granted = match ask(&configured, &key)? {
+            Ok(granted) => granted,
+            Err(unanswered) => {
+                if let Some(line) = unanswered_line(&unanswered) {
+                    say_now(&line)?;
+                }
+                return Err(ProcessError::Unrejoined(unanswered));
+            }
+        };
+        rejoin::seed(&configured, &granted.members)?;
+        rejoin::keep_certificate(&read(&configured.file)?, &granted.certificate)?;
+    }
     let done = rejoin::resume(|| read(&configured.file))?;
     match rejoin::state(&done)? {
-        Resume::Start => Err(ProcessError::Rejoined(done.id)),
+        Resume::Start => {
+            say_now(&format!("rejoined {}", done.id))?;
+            Ok(true)
+        }
         stands => Err(RejoinError::Order(stands, "the join").into()),
     }
+}
+
+/// What the start's ask came to: the cell's answer, or why it gave none.
+type CellAnswer = Result<wire::Granted, rejoin::AskError>;
+
+/// The line a start says of an ask that took no identity (membership.md §5.1 step 3): the cell's
+/// refusal by its name, or that no member answered; none for a failure of the start's own, which
+/// its error says.
+fn unanswered_line(unanswered: &rejoin::AskError) -> Option<String> {
+    match unanswered {
+        rejoin::AskError::Refused(refusal) => Some(format!("rejoin refused {refusal:?}")),
+        rejoin::AskError::Unreachable | rejoin::AskError::Answer(_) => {
+            Some("rejoin unreachable".to_owned())
+        }
+        rejoin::AskError::Transport(_)
+        | rejoin::AskError::Runtime(_)
+        | rejoin::AskError::Bounds(_) => None,
+    }
+}
+
+/// Says `line` on standard output, flushed, before the node's runtime starts.
+fn say_now(line: &str) -> Result<(), ProcessError> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{line}")
+        .and_then(|()| out.flush())
+        .map_err(|e| ProcessError::Say(e.to_string()))
+}
+
+/// The start's ask (membership.md §5.1 step 3): the cell asked, under the old identity `config`
+/// names, for a certificate for `key`, each member it knows dialed once in turn by `rejoin::ask`
+/// ([`asked_members`]). Asked on a runtime of the node's own shape ([`runtime`]), from the node's
+/// QUIC address on a port the OS chooses, under the message bounds the node's ranges state
+/// (`node::message_bounds`), the process's one statement of them, so the start that follows
+/// states the same.
+fn ask_cell(
+    config: &ProcessConfig,
+    key: &mantle_cert::KeyPair,
+) -> Result<CellAnswer, ProcessError> {
+    let identity = identity(
+        (&config.certificate, &config.key, &config.authority),
+        &config.peers,
+        &[],
+    )
+    .map_err(step(Step::Identity))?;
+    let members = asked_members(config)?;
+    let key = key
+        .public_key()
+        .try_into()
+        .map_err(|_| ProcessError::Key(config.key.clone(), "the next key's length".to_owned()))?;
+    let hosted: Vec<Hosted<()>> = config
+        .ranges
+        .iter()
+        .map(|(group, layer)| Hosted {
+            group: *group,
+            range: Range {
+                layer: *layer,
+                rules: config.rules,
+                boot: ConfState::default(),
+                settings: config.settings,
+                members: 0,
+            },
+            engine: (),
+        })
+        .collect();
+    let messages = crate::node::message_bounds(&hosted, config.chunk_bytes)
+        .map_err(|e| step(Step::Budgets)(ProcessError::Node(e)))?;
+    let asking = rejoin::Asking {
+        credentials: identity.credentials,
+        members,
+        key,
+        bind: SocketAddr::new(config.quic.ip(), 0),
+        messages,
+        transport_bytes: config.transport_bytes,
+    };
+    let runtime = runtime(config, None).map_err(step(Step::Network))?;
+    let rt = Runtime::start(&runtime)
+        .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
+    run_on_first_shard(rt, move || rejoin::ask(asking))
+}
+
+/// The members the start's ask dials (membership.md §5.1 step 3), each once and never itself:
+/// its seeds and peers whose lines say where they listen ([`resolve`]), then each member its
+/// replica of the root range holds serving or leaving ([`held_members`]); at most the cell's bound
+/// on nodes where the configuration states it, else as many as its lines and its replica's table
+/// name, each bounded already.
+fn asked_members(config: &ProcessConfig) -> Result<Vec<(PeerId, SocketAddr)>, ProcessError> {
+    let lined = resolve(config).map_err(step(Step::Network))?.addresses;
+    let held = held_members(config).map_err(step(Step::Storage))?;
+    let most = match config.enlist.as_ref() {
+        Some(e) => usize::try_from(e.max_nodes)
+            .map_err(|e| ProcessError::Value("root.max_nodes", e.to_string()))?,
+        None => lined.len().saturating_add(held.len()),
+    };
+    let mut members: Vec<(PeerId, SocketAddr)> = Vec::with_capacity(most);
+    let known = lined.iter().map(|(id, quic, _)| (*id, *quic)).chain(held);
+    for (id, at) in known {
+        if members.len() >= most {
+            break;
+        }
+        if id != config.id && !members.iter().any(|(m, _)| *m == id) {
+            members.push((id, at));
+        }
+    }
+    Ok(members)
+}
+
+/// The members serving or leaving that the root range's replica in the node's directory holds,
+/// each at its QUIC place where that is an address (a name is its seed line's to resolve): read
+/// from its store before the node opens it, none where the node hosts no root range or keeps no
+/// store of it.
+fn held_members(config: &ProcessConfig) -> Result<Vec<(PeerId, SocketAddr)>, ProcessError> {
+    let Some((group, layer)) = config
+        .ranges
+        .iter()
+        .find(|(_, layer)| *layer == Layer::Root)
+    else {
+        return Ok(Vec::new());
+    };
+    let path = store_path(&config.dir, *group);
+    if !path
+        .try_exists()
+        .map_err(|e| ProcessError::Read(path.clone(), e.to_string()))?
+    {
+        return Ok(Vec::new());
+    }
+    let mut engine = engine(config, *group, *layer)?;
+    let meta = |e: mantle_meta::error::MetaError| ProcessError::Engine(e.to_string());
+    let nodes = root::census(&mut engine).map_err(meta)?.nodes;
+    let nodes = usize::try_from(nodes).map_err(|e| ProcessError::Engine(e.to_string()))?;
+    let rows = root::memberships(&mut engine, nodes).map_err(meta)?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, row)| matches!(row.state, MemberState::Serving | MemberState::Leaving))
+        .filter_map(|(id, row)| row.quic.parse().ok().map(|at| (id, at)))
+        .collect())
 }
 
 /// What the rejoin reads of `mantle node`'s configuration `config`, read from `file`.
@@ -1722,6 +1895,12 @@ fn said_derived(stated: Stated) -> Result<(Derived, NodeLock, Locks), ProcessErr
     let node = Locks::node(&stated.dir).map_err(step(Step::Locks))?;
     let locks = Locks::take(stated.volumes.iter().map(|(dir, _)| dir.as_path()))
         .map_err(step(Step::Locks))?;
+    Ok((said(stated)?, node, locks))
+}
+
+/// [`said_derived`]'s derivation, under the locks its caller holds: each device measured or its
+/// profile kept, every value derived and said, a `basis` line each.
+fn said(stated: Stated) -> Result<Derived, ProcessError> {
     let measured = measure(&stated).map_err(step(Step::Devices))?;
     let dir = stated.dir.clone();
     let align = measured.meta.align;
@@ -1743,7 +1922,7 @@ fn said_derived(stated: Stated) -> Result<(Derived, NodeLock, Locks), ProcessErr
         writeln!(out, "basis {basis}").map_err(|e| ProcessError::Say(e.to_string()))?;
     }
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
-    Ok((derived, node, locks))
+    Ok(derived)
 }
 
 /// How the node's thread ended, as [`start`] hears it.
@@ -5050,38 +5229,128 @@ mod tests {
         ));
     }
 
-    /// A start whose directory holds the rejoin marker and no next certificate is refused before
-    /// anything is written in it: no run raised, so the node opens no log, dials no member and
-    /// writes no liveness record (membership.md §5.1 step 2), the ask (step 3) not built yet. With
-    /// the cell's certificate beside the next key, the start wipes and switches (steps 4 and 5) and
-    /// ends naming the new node, and the next start is a member's.
+    /// membership.md §5.1 steps 3 to 5: a start whose directory holds the rejoin marker and no
+    /// next certificate says `retired` and asks the cell, before anything opens a log or raises a
+    /// run, for a certificate for its next key, kept through every ask. Each refusal, and no
+    /// answer, ends the start with its line and a typed error, the directory as it was but for the
+    /// key; the cell's certificate is kept, the answer's members written as the seeds, the wipe
+    /// and the switch run, and the start goes on as the new node, whose next start is a member's.
     #[test]
-    fn a_retired_node_starts_nothing_until_it_takes_its_new_identity() {
+    fn a_retired_node_asks_once_a_start_and_joins_as_the_identity_it_is_granted() {
         let dir = tempfile::tempdir().unwrap();
         let file = crate::rejoin::tests::laid_out(dir.path(), 5);
         let read = |file: &Path| read_stated(file).map(|stated| stated_rejoining(file, &stated));
         let listed = || -> Vec<_> {
-            std::fs::read_dir(dir.path())
+            let mut names: Vec<_> = std::fs::read_dir(dir.path())
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
-                .collect()
+                .collect();
+            names.sort();
+            names
         };
         let before = listed();
-        let fingerprint = Layout::new(dir.path()).retired().unwrap().unwrap();
-        match resume_rejoin(read(&file).unwrap(), read) {
-            Err(ProcessError::Retired(said)) => assert_eq!(said, hex(&fingerprint)),
-            other => panic!("not refused as retired: {other:?}"),
+        let config = std::fs::read_to_string(&file).unwrap();
+        let mut keys = Vec::new();
+        let refusals = [
+            wire::Refusal::Off,
+            wire::Refusal::Unissued,
+            wire::Refusal::Unknown,
+            wire::Refusal::Banned,
+            wire::Refusal::Regranted,
+            wire::Refusal::SameKey,
+            wire::Refusal::Full,
+            wire::Refusal::NotRemoved,
+            wire::Refusal::Stale,
+            wire::Refusal::Conflict,
+        ];
+        for refusal in refusals {
+            let refused = resume_rejoin(read(&file).unwrap(), read, |_, key| {
+                keys.push(key.public_key().to_vec());
+                Ok(Err(rejoin::AskError::Refused(refusal)))
+            });
+            match refused {
+                Err(ProcessError::Unrejoined(rejoin::AskError::Refused(r))) => {
+                    assert_eq!(r, refusal)
+                }
+                other => panic!("{refusal:?} not refused: {other:?}"),
+            }
+            assert_eq!(
+                unanswered_line(&rejoin::AskError::Refused(refusal)),
+                Some(format!("rejoin refused {refusal:?}"))
+            );
         }
+        match resume_rejoin(read(&file).unwrap(), read, |_, key| {
+            keys.push(key.public_key().to_vec());
+            Ok(Err(rejoin::AskError::Unreachable))
+        }) {
+            Err(ProcessError::Unrejoined(rejoin::AskError::Unreachable)) => {}
+            other => panic!("not unreachable: {other:?}"),
+        }
+        assert_eq!(
+            unanswered_line(&rejoin::AskError::Unreachable),
+            Some("rejoin unreachable".to_owned())
+        );
+        // Every ask asked for one key, and nothing but it was kept: the directory's files as they
+        // were, no run raised and no log opened, the configuration as it was.
+        keys.dedup();
+        assert_eq!(keys.len(), 1);
         assert_eq!(before, listed());
-        let key = crate::rejoin::next_key(&read(&file).unwrap()).unwrap();
-        let der = crate::rejoin::tests::certificate_for(9, &key);
-        crate::rejoin::keep_certificate(&read(&file).unwrap(), &der).unwrap();
-        match resume_rejoin(read(&file).unwrap(), read) {
-            Err(ProcessError::Rejoined(9)) => {}
-            other => panic!("not rejoined as node 9: {other:?}"),
-        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), config);
+        // Granted: the certificate for the kept key, the members the answer names as the seeds.
+        let members = vec![wire::Member {
+            id: 3,
+            quic: "127.0.0.1:7000".into(),
+            plane: "127.0.0.1:7001".into(),
+        }];
+        let switched = resume_rejoin(read(&file).unwrap(), read, |configured, key| {
+            assert_eq!(key.public_key(), keys[0].as_slice());
+            Ok(Ok(wire::Granted {
+                certificate: crate::rejoin::tests::certificate_for(9, key),
+                issuer: Vec::new(),
+                members: members.clone(),
+            }))
+            .inspect(|_: &CellAnswer| assert_eq!(configured.id, 5))
+        })
+        .unwrap();
+        assert!(switched);
+        let stated = read_stated(&file).unwrap();
+        assert_eq!(stated.id, 9);
+        assert_eq!(
+            stated.seeds.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![3]
+        );
         assert_eq!(Layout::new(dir.path()).retired().unwrap(), None);
         assert_eq!(Layout::new(dir.path()).run().unwrap(), None);
-        resume_rejoin(read(&file).unwrap(), read).unwrap();
+        // The next start is a member's: nothing asked.
+        let member = resume_rejoin(read(&file).unwrap(), read, |_, _| {
+            panic!("a member's start asked the cell")
+        });
+        assert!(!member.unwrap());
+    }
+
+    /// membership.md §5.1 step 3: a member's place that a seed line cannot hold as one field is
+    /// refused before the configuration is touched.
+    #[test]
+    fn an_answer_naming_a_place_no_seed_line_holds_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crate::rejoin::tests::laid_out(dir.path(), 5);
+        let read = |file: &Path| read_stated(file).map(|stated| stated_rejoining(file, &stated));
+        let config = std::fs::read_to_string(&file).unwrap();
+        let refused = resume_rejoin(read(&file).unwrap(), read, |_, key| {
+            Ok(Ok(wire::Granted {
+                certificate: crate::rejoin::tests::certificate_for(9, key),
+                issuer: Vec::new(),
+                members: vec![wire::Member {
+                    id: 3,
+                    quic: "127.0.0.1:7000\nid = 1".into(),
+                    plane: "127.0.0.1:7001".into(),
+                }],
+            }))
+        });
+        assert!(
+            matches!(refused, Err(ProcessError::Rejoin(RejoinError::Place(3, _)))),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), config);
     }
 }

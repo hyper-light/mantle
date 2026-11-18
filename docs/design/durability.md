@@ -1,9 +1,10 @@
 # Durability: the scheme a block is stored in
 
 Status: design, 2026-09-29; error bounds and field inputs 2026-09-30; classes, detection and
-flush-unverified copies 2026-09-30. Sources: docs/research/15 (durability models, cited as
-"15 §x"), docs/research/04 (erasure coding and placement, "04 §x"), docs/research/28 (storage
-classes, "28 §x") and 29 (device classes, "29 §x").
+flush-unverified copies 2026-09-30; a metadata write's answer (§7) 2026-11-17. Sources:
+docs/research/15 (durability models, cited as "15 §x"), docs/research/04 (erasure coding and
+placement, "04 §x"), docs/research/28 (storage classes, "28 §x"), 29 (device classes, "29 §x")
+and 95 (protocol-aware recovery, §7).
 
 A block is stored as whole copies or as a Reed–Solomon code, one chunk to each failure
 domain (04 §R1.2, §R2). The scheme a block uses follows from how likely each scheme is to
@@ -203,7 +204,176 @@ placement across zones, or copies in more than one cell (Ford's multi-cell resul
 Where a cell spans zones, a code that loses as many chunks with a zone as it can spare has no
 margin left after one zone's loss.
 
-## 7. Open
+## 7. A metadata write's answer: its log frame's own flush
+
+Status: design, 2026-11-17, the owner's decision 2 of research/71 ("Step 9, after"), approved
+that day. Source: research/95 (AGL+18, cited by section and page). Built: the open's account of
+the frame past the last that reads (§7.7, step 1). Until steps 2 to 4 land, a frame is answered
+only once confirmed, as raft-log.md §6 describes.
+
+A PUT's critical path holds seven flushes: the slowest replica's chunk, then the Block, File and
+Name commands, each a frame flushed and then confirmed by a second durable write (research/71,
+step 9). The confirmation exists so that recovery can tell a frame torn by a crash from one
+damaged after it was answered (raft-log.md §6, step 5). This section drops it: three of the
+seven flushes leave the path, and recovery does what protocol-aware recovery does with an entry
+it cannot place, asking the group.
+
+### 7.1 The rule
+
+A frame's updates are answered at the frame's own flush. A Raft entry is acknowledged by a
+member once the frame holding it is flushed there, and a command is answered once it is
+committed on a quorum so acknowledged and applied (CLAUDE.md §6: `fdatasync` on Linux,
+`F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows). The frame and its persist record are both
+written before that flush, so the flush that answers the frame made both durable. No later write
+is waited for. A frame is still written only after the frame before it is flushed, so a frame,
+or a record, with a later sequence proves every earlier frame flushed (raft-log.md §3).
+
+Where the frame holds a group the others could not resolve without (§7.5), it is answered once
+confirmed, as now.
+
+### 7.2 What recovery does with the frame past the last that reads
+
+Call `N` the frame after the last valid one (raft-log.md §6, step 2). Damage in the middle, a
+frame that fails while a later frame or record follows, is unchanged: the frame flushed and was
+answered, the log reports it, writes nothing, and its replicas recover from their peers (R17;
+AGL+18 §3.3.3: "CLSTORE can still conclude that it is a corruption if ei+1 or pi+1 is present").
+For `N` itself:
+
+| what reads | what it means | what recovery does | `hyper_log::Tail` |
+|---|---|---|---|
+| no record of `N` | `N`'s flush never ended, so it was never answered ("If pi is not present, CLSTORE can conclude that it is a crash", §3.3.3, p. 20) | the torn tail: cut | `Torn` |
+| `N`'s record and its confirmation (frames answered once confirmed) | answered, and damaged since | restored and marked, as now | `Lost` |
+| `N`'s record, no confirmation | torn by a crash after its record landed, or damaged after its flush answered it: "if ei is the last entry, then we cannot determine whether it was a crash or a corruption" (§3.3.3, p. 20) | while frames wait for their confirmation, never answered: the torn tail, its term and vote kept, as now. Answered at its flush: restored as `Lost` is, and the group decides (§7.3) | `Undetermined` |
+| some pieces of `N`'s record, each whole, the rest whole pieces of an older record | `N`'s flush never ended | the torn tail; each group a landed piece names keeps a later term and vote, which is always safe | `Torn` |
+| a piece of `N`'s record that fails its own checksum, `N` failing too | damage at rest: a piece is written atomically, so no crash tears it. Item and identifier are both faulty (§3.3.4, p. 21) | `LogError::Damaged`: the log writes nothing, and its replicas recover from their peers | |
+
+Restored as `Lost` is: each group the record names gets back the term, vote and promise the
+frame left (keeping any of them is always safe), its entries cut back to where the frame's began,
+its commit cut to the entries left, and an `Uncertain` mark through the frame's last entry; a
+group whose frame held proposals, which the record does not carry, is fenced `Damaged` and rebuilt
+from its peers (raft-log.md §6). The restore is written in one frame before the log serves anyone,
+as now, so a second crash finds the same marks.
+
+The record in pieces is the one format change (format 4). AGL+18's persist record "can be
+atomically written and thus cannot be 'corrupted' due to a crash" (§3.3.3, p. 20); hyper-log's
+names every group its frame holds, and five groups span two 512-byte sectors (raft-log.md §6), so
+a crash can leave it part old and part new, and a record that no longer reads would not say which
+groups to mark. Format 4 writes a record as pieces no larger than the device's atomic write unit,
+each carrying the log's identity, the frame's sequence, its own index and the count, and a
+checksum of its own. The unit is read from the device, not assumed (CLAUDE.md §5): Linux's
+`physical_block_size`, "the smallest unit a physical storage device can write atomically", and
+`atomic_write_unit_min_bytes` where present (research/02 §2.4), the physical sector size from IOKit
+on macOS and from `IOCTL_STORAGE_QUERY_PROPERTY` on Windows. A device that reports none gets the
+smallest logical block, the conservative side.
+
+### 7.3 How the group resolves an undetermined entry
+
+The mark is CTRL's question asked through Raft's own messages, and replica.md §4 builds it
+(hyper-raft core steps R-5 and R-7):
+
+- **No vote on an undetermined log.** A marked member judges a request for its vote against the
+  last entry it acknowledged, its claim, and refuses a candidate behind it; it campaigns only on
+  a quorum of each half of its configuration without its own vote. A grant is CTRL's
+  `dontHave`, an unmarked member's refusal `have`, a marked member's `haveFaulty` (§3.4.3, p. 22).
+- **Nothing served from it.** Its commit was cut to the entries it holds, so it applies nothing
+  marked; marked entries are never skipped and applied later (§3.4.1, p. 21). It leads only once
+  elected on its log, and then its mark ends.
+- **Fetched from a peer that has it.** Marked, it answers a heartbeat or append that counts
+  entries past its log with a refusal flagged lost, naming the last entry it holds; the leader
+  sends what it lacks (R-5). Once its log reaches the mark's index it holds the leader's entries
+  there, and the mark ends (Log Matching; Ongaro and Ousterhout, ATC 2014, §5.3). CTRL's Case 1.
+- **Discarded only by a quorum.** A leader elected without the marked member's vote holds every
+  committed entry (Leader Completeness, §5.4). Its first entry of its own term reaching the member
+  ends the mark, and the member's marked entries past the leader's log are overwritten, never
+  having been committed (§3.4, p. 21: "If the leader does not have an entry that the follower
+  has, then the entry must be an uncommitted entry"). CTRL's Case 2, with its exact count: a
+  quorum, ⌊N/2⌋ + 1, never fewer (§5.1.1, p. 26).
+- **Otherwise it waits.** Where every reachable copy is marked and the rest are no quorum, the
+  group waits as CTRL's does (Case 3; §3.4.2, p. 22). Each campaign is one election round on the
+  election timer, refused with the typed `Uncertain`, and the range reports it to repair
+  (replica.md §4). No member decides alone.
+
+Every step is bounded: the restore is one frame, the repair is the lost range sent in appends of
+the range's bounded size, and each election round is one timer's.
+
+### 7.4 Why no answered write is lost, and no unanswered one answered
+
+*Answered means kept.* An answered command's entry was flushed on every member of a quorum `Q`,
+each in a frame whose record the same flush made durable. After any crash, on each member of `Q`
+that frame reads whole and replays; or fails with a later frame after it and is restored and
+marked (`Lost`); or fails as the last frame with its record whole and is restored and marked
+(`Undetermined`); or fails with a record piece failing, and the log refuses to open
+(`LogError::Damaged`). It is never `Torn`: that needs a record that never landed, and the flush
+that answered it landed it. So every member of `Q` holds the entry, or is marked through it and
+refuses every candidate behind it. A candidate without the entry needs a quorum's votes, every
+quorum meets `Q`, and each member of `Q` in it refuses: by Raft's up-to-date check where it holds
+the entry (§5.4.1), by its claim where it is marked. Every leader therefore holds every answered
+entry, and a mark ends only by a leader's entries. A device that loses a flushed frame whole, a
+lost write, leaves nothing to read under this rule as under the confirmation (raft-log.md §6); the
+rule neither opens nor closes that case.
+
+*Unanswered stays unanswered.* An answer goes only from the gateway waiting on its command, in
+the process that proposed it, after the command commits and applies. A crash ends that wait and
+nothing answers for it later. The entry itself may still commit after the crash, from a member
+that holds it whole, as Raft lets any entry not yet known committed (Ongaro, 2014, §6.3); its
+client, unanswered, retries, and the session answers the retry once. A marked entry is applied
+only once repaired from a whole copy, so nothing applied after a crash rests on a frame that
+might have torn.
+
+### 7.5 Where the confirmation stays
+
+CTRL's wait (§7.3) needs every copy of an entry faulty, which the paper calls unlikely: it takes
+independent corruptions. Answered at the frame's own flush, a crash alone reaches it. A power cut
+that tears the same entry's frame after its record landed leaves that copy marked; on members the
+others are no quorum without, the group waits for good, with no byte damaged and nothing ever
+answered. Two cases reach it:
+
+- *A group of one or two voters.* The others are never a quorum without the member (replica.md
+  §4), so one torn frame suffices. A cell of one node, a laptop's, is all such groups. Frames
+  holding such a group stay answered once confirmed; the replica says so with each update it
+  hands the log, from its configuration.
+- *A power cut across a quorum of a group.* A cell whose nodes share one feed loses them at once
+  (node.md §9.1's "every node's power cut at once"). Each group whose entry was in flight on a
+  quorum, its record landed and its frame torn, waits. Two device facts close it without the
+  confirmation, each read from the device (CLAUDE.md §5): a device with no volatile write cache
+  (Linux `write_cache` "write through", research/02 §2.4) makes a completed write durable, so a
+  record written only after its frame's write completes proves the frame landed, at the cost of
+  one write's latency, not a flush; and a device whose atomic write unit holds a frame and its
+  record (`RWF_ATOMIC`, research/02 §2.10) cannot tear one. On any other device the simulation's
+  power cuts count the groups left waiting (§7.6), and the owner decides from that count whether
+  frames there are answered at their flush or once confirmed. Until then they are confirmed.
+
+### 7.6 What changes in the node's power-cut and torn-write tests
+
+- hyper-log: `an_unconfirmed_torn_frame_keeps_only_its_term_and_vote` and
+  `an_update_is_answered_only_once_its_frame_is_confirmed` hold for frames answered once
+  confirmed, and gain twins for frames answered at their flush: the same tear restores the
+  frame's groups and marks them (`Tail::Undetermined`), and the update is answered before any
+  confirmation is written. `a_torn_frame_without_its_persist_record_is_the_torn_tail` holds for
+  both. New: a record torn across pieces is the torn tail; a piece damaged with its frame is
+  `LogError::Damaged`; a crash between two frames never marks the earlier.
+- The simulation (node.md §9.1): "every node's power cut at once" keeps its law, the cell applies
+  through every entry it answered, and adds two: every mark ends once a quorum of the group's
+  members is up and one copy reads whole or a quorum lacks the entry, and the groups that wait are
+  counted and reported with `Uncertain`, never served. The held-flush test answers an entry when
+  its frames' flushes end, one write sooner. A new fault tears a frame after its record lands on
+  one member, then on a quorum, then on every member of a one-voter group whose frames are
+  answered once confirmed, which must never mark.
+- Real processes: `kill -9` never tears a completed write, so the end-to-end tests keep their
+  laws; they count flushes a PUT, 4 on the critical path where 7 were (research/71's
+  instruments).
+
+### 7.7 Steps, each built and tested before the next
+
+1. The open reports what it found past the last frame (`Recovery::tail`: `Torn`, `Undetermined`,
+   `Lost`), recovery unchanged. Built (hyper-raft `mantle-frame-flush`).
+2. Format 4, the record in pieces of the device's atomic unit, and the open's reading of them
+   (§7.2's last two rows).
+3. Each frame records whether it was answered at its flush; the open restores an `Undetermined`
+   frame so answered as `Lost` is, and the simulation's faults of §7.6 run against it.
+4. The writer answers a frame at its flush where §7.5 allows, and the flushes a PUT are counted.
+
+## 8. Open
 
 - Rates from mantle's own device and node history, in place of the literature's
   (docs/research/10), over the whole path to a chunk, with its clustering in time: the

@@ -448,6 +448,13 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    of latency where no frame follows at once
    (docs/measurements/2026-09-29-log-confirmation.md).
 
+   durability.md §7 answers a frame at its own flush again, and has the group decide what the
+   device cannot (research/95): there an unconfirmed frame whose record reads is undetermined,
+   restored and marked as a confirmed one is, and resolved as CTRL resolves a faulty entry
+   (AGL+18 §3.4), with the confirmation kept where the others could not resolve it without the
+   member. The open reports which of the three it found (`Recovery::tail`: `Torn`,
+   `Undetermined`, `Lost`). Until that rule lands, an unconfirmed frame is the torn tail, as above.
+
    Where each record goes is what keeps these answers. A record is written into its slot
    before its frame's flush, and a record larger than what the device writes atomically, a
    sector, can reach the disk part old and part new (research/02, `physical_block_size` and

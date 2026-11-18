@@ -7,14 +7,16 @@
 //! before it starts. A child's status lines (`bound`, `s3-bound`, `enlisted`, each range's
 //! `status`, and `chunks` and `counts` when asked) are read on a thread of its own, one for each node and no
 //! more, and every wait ends on the line it waits for or on a process's output ending, never on a
-//! guess of time.
+//! guess of time; an answer asked of a running node, its `chunks` or `counts`, is waited for at
+//! most the stock S3 clients' patience, as a node waits on a request (research/77 D2).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::Instant;
 
 use super::place::Gateway;
 
@@ -29,6 +31,8 @@ pub enum CellError {
     Init(String),
     /// A node's process ended before it said what it was waited for.
     Ended(u64),
+    /// A running node did not answer what it was asked within the stock S3 clients' patience.
+    Silent(u64),
 }
 
 impl std::fmt::Display for CellError {
@@ -37,6 +41,10 @@ impl std::fmt::Display for CellError {
             Self::Io(what, e) => write!(f, "{what}: {e}"),
             Self::Init(why) => write!(f, "mantle init: {why}"),
             Self::Ended(id) => write!(f, "node {id}'s process ended"),
+            Self::Silent(id) => write!(
+                f,
+                "node {id} did not answer within the stock S3 clients' patience"
+            ),
         }
     }
 }
@@ -445,7 +453,7 @@ impl Cell {
         }
         cell.introduce()?;
         for at in 0..FOUNDERS {
-            cell.until(at, |node| node.enlisted)?;
+            cell.until(at, |node| node.enlisted, None)?;
         }
         Ok(cell)
     }
@@ -457,14 +465,16 @@ impl Cell {
         self.spawn(at)?;
         self.listening(at)?;
         self.introduce()?;
-        self.until(at, |node| node.enlisted)
+        self.until(at, |node| node.enlisted, None)
     }
 
     /// Waits until node `at`'s listeners both listen.
     fn listening(&mut self, at: usize) -> Result<(), CellError> {
-        self.until(at, |node| {
-            node.quic.is_some() && node.s3.is_some() && node.region.is_some()
-        })
+        self.until(
+            at,
+            |node| node.quic.is_some() && node.s3.is_some() && node.region.is_some(),
+            None,
+        )
     }
 
     /// Starts node `at`'s process, its output read on a thread of its own.
@@ -527,8 +537,13 @@ impl Cell {
     }
 
     /// Waits until node `at` holds `done`, taking every node's lines meanwhile; a running node's
-    /// process ending first, its own or another's, is an error.
-    fn until(&mut self, at: usize, done: impl Fn(&Node) -> bool) -> Result<(), CellError> {
+    /// process ending first, its own or another's, is an error, and so is `by` passing first.
+    fn until(
+        &mut self,
+        at: usize,
+        done: impl Fn(&Node) -> bool,
+        by: Option<Instant>,
+    ) -> Result<(), CellError> {
         loop {
             let node = self
                 .nodes
@@ -537,8 +552,21 @@ impl Cell {
             if done(node) {
                 return Ok(());
             }
-            self.hear()?;
+            let id = node.id;
+            if !self.hear(by)? {
+                return Err(CellError::Silent(id));
+            }
         }
+    }
+
+    /// When an answer asked of a node now is waited for at most: the stock S3 clients' patience
+    /// (`bounds::STOCK_PATIENCE`, research/77 D2), the most a node waits on any request that
+    /// states no patience of its own, as no wait is without a bound (CLAUDE.md §2). A node that
+    /// says nothing for that long while it runs is taken for wedged, not waited on without end.
+    fn answer_by() -> Result<Instant, CellError> {
+        Instant::now()
+            .checked_add(mantle_protocol::bounds::STOCK_PATIENCE)
+            .ok_or_else(|| CellError::Init("the stock patience past the clock".into()))
     }
 
     /// Tells each running node where every other listens, its QUIC and its plane: `learn ID QUIC
@@ -571,7 +599,7 @@ impl Cell {
         let input = node.input.as_mut().ok_or(CellError::Ended(node.id))?;
         input.write_all(b"chunks\n").map_err(io("a node's input"))?;
         input.flush().map_err(io("a node's input"))?;
-        self.until(at, |node| node.chunks.is_some())?;
+        self.until(at, |node| node.chunks.is_some(), Some(Self::answer_by()?))?;
         self.nodes
             .get(at)
             .and_then(|node| node.chunks)
@@ -589,7 +617,7 @@ impl Cell {
         let input = node.input.as_mut().ok_or(CellError::Ended(node.id))?;
         input.write_all(b"counts\n").map_err(io("a node's input"))?;
         input.flush().map_err(io("a node's input"))?;
-        self.until(at, |node| node.counts.is_some())?;
+        self.until(at, |node| node.counts.is_some(), Some(Self::answer_by()?))?;
         self.nodes
             .get(at)
             .and_then(|node| node.counts.clone())
@@ -628,22 +656,31 @@ impl Cell {
             if led && !groups.is_empty() {
                 return Ok(());
             }
-            self.hear()?;
+            self.hear(None)?;
         }
     }
 
-    /// Takes the next line any node's process said; a running node's process ending is an
-    /// error.
-    fn hear(&mut self) -> Result<(), CellError> {
-        let (from, generation, said) = self
-            .heard
-            .recv()
-            .map_err(|_| CellError::Init("every node's reader ended".into()))?;
+    /// Takes the next line any node's process said, by `by` where it is given: whether one came
+    /// by then. A running node's process ending is an error.
+    fn hear(&mut self, by: Option<Instant>) -> Result<bool, CellError> {
+        let ended = || CellError::Init("every node's reader ended".into());
+        let heard = match by {
+            None => self.heard.recv().map_err(|_| ended())?,
+            Some(by) => match self
+                .heard
+                .recv_timeout(by.saturating_duration_since(Instant::now()))
+            {
+                Ok(heard) => heard,
+                Err(RecvTimeoutError::Timeout) => return Ok(false),
+                Err(RecvTimeoutError::Disconnected) => return Err(ended()),
+            },
+        };
+        let (from, generation, said) = heard;
         let Some(node) = self.nodes.get_mut(from) else {
-            return Ok(());
+            return Ok(true);
         };
         if generation != node.generation {
-            return Ok(());
+            return Ok(true);
         }
         match said {
             Said::Bound(quic, plane) => {
@@ -666,7 +703,7 @@ impl Cell {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Kills node `at`'s process, `SIGKILL` on Unix and `TerminateProcess` on Windows, and reaps

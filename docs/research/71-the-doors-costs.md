@@ -541,6 +541,9 @@ native request and reply this suite builds: 216 vectors, generated from 44c6d21e
 | 16 row keys, 3 key spans, a Name key read back | same, `a_key_is_one_buffer_made_at_its_length` | Name null key 1, 2 | 1, 0 each; spans 2, 0; read back 1, 0 |
 | an overlay given three puts and a delete | same, `an_overlay_keeps_its_rows_by_move` | 8, 0 | 1, 0 (its map's node) |
 | a cell of three serving its clients 40 ops each | `crates/node/tests/turn_allocs.rs` | 45,088–45,089 allocs, 6,372–6,377 reallocs | 41,182 in 7 of 7 runs, 2,303–2,307 |
+| a read's query, 30 cases over its 19 kinds (lean-doors d092770a) | `crates/node/tests/encoding_allocs.rs` `every_query_is_written_at_its_length` | 1, 0–4 (a ListObjectsV2 query 1, 4) | 1, 0 each |
+| a read's answer, 52 cases over its kinds: empty, one, many, the longest its bound allows | same, `every_answer_is_written_at_its_length` | 1–13,378 allocs, 0–16 reallocs (13,378 extents 13,378, 16; 10,000 parts 10,001, 16; 1,000 keys 1, 12) | 1, 0; 2, 0 where it carries a record whole, a signer 3, 0 |
+| a command's reply: one answer, eight, 65,536 | same, `every_command_reply_is_written_at_its_length` | 2, 1; 9, 3; 65,537, 16 | 1, 0 each |
 
 ## Steps 6 and 7, measured
 

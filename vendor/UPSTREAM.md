@@ -87,10 +87,22 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `d4bd299` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twenty-four commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+**Every crate at `51335dc` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twenty-five commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
 branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
-commit, `d4bd299`, changes hyper-quic and hyper-transport's `Endpoint::new_seeded` doc: an endpoint
+commit, `51335dc`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.16, hyper-rt ORIGIN.md): the
+compute pool, Kiln's, taken there. CPU-heavy jobs leave the shards for a pool of the CPUs the process
+is granted less its shards (`compute::workers_for` over `Facts::cpus_at_once`), its threads below the
+shards (Linux's batch policy at nice +10, macOS's utility QoS class, Windows' below-normal level, set
+and read back in the OS-interface file `prioritysys.rs`); a job in pieces gives its thread to a job
+waiting once its piece has run; admission refuses `Capacity` before anything is queued and hands the
+job back; results return by one-shot, an unwind boundary around each job; and `Config::for_runtime`
+takes every number from the runtime's own (room for a job of every task the shards hold, a piece of
+their step quantum). It adds `crossbeam-deque` 0.8, with `crossbeam-epoch` and `crossbeam-utils`, to
+hyper-rt's dependencies, by the owner's approval of 2026-11-18. Nothing in mantle starts the pool yet:
+S6b moves the durability model onto it. Its new constants have their rows in
+docs/design/constants.md. The one before it, `d4bd299`, changes hyper-quic and hyper-transport's
+`Endpoint::new_seeded` doc: an endpoint
 given a seed draws its connection IDs from it, each one's random part and the key they are hashed
 under unless a `RestartKey` chose it, from a stream apart from the endpoint's own, so its other draws
 are where they were; one given none draws them from the thread's generator as before (RFC 9000

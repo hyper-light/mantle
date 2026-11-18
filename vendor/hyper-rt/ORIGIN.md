@@ -196,3 +196,32 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   for running alone, a woken Critical slot within the lead, equal shares over time), its `coop.rs` cases
   (`give_way`, a woken Critical task on a shard) and its `tests/classes.rs`, with a spawn's class and a busy
   Critical class beside busy Normal and Background ones added.
+
+## Made here: the compute pool (2026-11-18)
+
+- CPU-heavy jobs off the shards, below them, in pieces (`src/compute.rs`: `start`, `run`, `run_pieces`,
+  `run_here`, `running`, `stats`, `stop`, `Config::for_runtime`, `workers_for`, `Turn`, `Step`, `Refused`,
+  `Priority`, `thread_priority`; `src/prioritysys.rs`, the OS-interface file that lowers a pool thread and
+  reads a thread's priority back; `crossbeam-deque` 0.8, by the owner's approval of 2026-11-18;
+  docs/runtime.md §3.16). Taken from Kiln's runtime copy (`kiln-rt`'s `compute.rs` and `prioritysys.rs`, its
+  goal 3, plan `01a1a59c2a8e`; read at Kiln's `8d36e0d3597`, the files last changed at `27da36b65`): the
+  injector and per-worker deques, the pieces and their `Turn`, the turns alternating the injector and the
+  worker's own deque, admission refusing `Capacity` before anything is queued and handing the job back,
+  results by one-shot with the place given back first, an unwind boundary around each piece and each drop of
+  a job's values, the idle slot word and its claim by compare-and-swap (one wake a submit), one pool per
+  process, the stop, and the rank below the shards (Linux's batch policy at nice +10 by `sched_setattr`, the
+  nice value alone where refused; macOS's utility QoS class; Windows' below-normal level), with their notes
+  and Kiln's measurements as Kiln wrote them.
+- Changed in the port: the size is `Facts::cpus_at_once` less the shards (Kiln's `Grant` and `cpu_grant` read
+  the same answer); `Config::for_runtime` derives the room and the piece from the runtime's own numbers, the
+  shards' admission limit and step quantum, as Kiln's server derives them; the pool's rank is the one below
+  (Kiln's `Rank::Idle`, measured and not taken there, is not taken). Not taken: a shard's EEVDF slice and its
+  real-time class and nudge (`prefer_current_thread`, `realtime_current_thread`, `nudge_current_thread`, the
+  owner's decisions after an A/B), the observer of each job's wait and piece, the pool's occupancy, idle
+  workers' spare work and cold parks (Kiln's `idle.rs`), and kicks counted by sender. A real-time class is
+  still read back, as the OS may report one.
+- Tests: Kiln's `compute.rs` unit cases (the size, the priorities' order, a park and the one unpark that ends
+  it, a stopping pool's worker), its `tests/compute.rs` (with a thread's wait, the rank stated per OS and
+  statics in place of `Arc`), a pool beside a runtime taking its numbers, `run_here`, and
+  `tests/compute_beside.rs`, new: a saturated pool sized from the machine's grant beside a shard whose loop
+  keeps turning, each job ending on a thread below it.

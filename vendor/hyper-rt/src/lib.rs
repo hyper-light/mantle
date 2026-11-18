@@ -24,7 +24,8 @@
 //!
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
 //! protocol and its loom model), [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
-//! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
+//! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), [`compute`] (CPU-heavy
+//! jobs off the shards, below them, in pieces; its OS calls in `prioritysys`), the async
 //! sockets ([`udp`] and [`tcp`] on every OS, over one shared readiness future), and the OS drivers.
 
 // Test code opts out of the no-panic wall at the crate root (CLAUDE.md §1); shipped code does not.
@@ -53,6 +54,7 @@ mod attribution;
 pub mod blocking;
 mod cells;
 pub mod combine;
+pub mod compute;
 pub mod control;
 pub mod coop;
 pub mod dns;
@@ -69,6 +71,7 @@ pub mod mem;
 mod netsys;
 mod park_cost;
 pub mod parking;
+mod prioritysys;
 pub mod queue;
 pub mod readiness;
 pub mod registry;

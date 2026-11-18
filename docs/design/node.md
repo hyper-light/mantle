@@ -2041,6 +2041,18 @@ TLS 1.3 and over TLS 1.2 alone, its certificate verified under the endpoint auth
 dialed, HTTP/1.1 chosen over an offered HTTP/2, an ECDHE-ECDSA AES-GCM suite on TLS 1.2, and a
 request answered over each.
 
+*As built (2026-11-17), a connection's turn by time* (`crates/node/src/listener/io.rs`; hyper-raft
+docs/runtime.md §3.14). Each try of a connection's socket charges its turn on its shard: a plain
+read goes through hyper-rt's `TcpStream::read` and a plain write through `write_all` or
+`write_vectored`, and under TLS each `read_tls` and `write_tls` is charged first
+(`hyper_rt::coop::consume_budget`). Once the connection has held its shard past the shard's own
+quantum, the one its watchdog and `wanted` use, with anything else wanting the shard, the charge
+answers no and the connection yields at that await, after Tokio's cooperative budget and Seastar's
+task quota (as Kiln's runtime copy built it): a client whose octets are always there no longer holds
+its shard for the length of its body. A wait for readiness is charged only once it fires, and each
+poll's first charge goes on, so a client that waits pays nothing for its waits and a connection is
+never refused at every poll. Tested in hyper-rt's `tests/coop_budget.rs` and `tests/coop_waits.rs`.
+
 *As built (2026-11-17), resumption without early data* (`crates/node/src/listener/sessions.rs`;
 research/94). A client resumes its TLS session with the endpoint, which skips the certificate and
 its signature (RFC 8446 §2.2), and sends no early data. The sessions stay on the node, in one store

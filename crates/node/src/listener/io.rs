@@ -1,6 +1,8 @@
 //! A connection's octets, plain or under TLS (node.md §4.1): plaintext read into the connection's
 //! buffer and written from its own, the socket's readiness awaited through the shard's driver, so
-//! a client that sends or reads slowly yields the shard rather than holding it. Under TLS the
+//! a client that sends or reads slowly yields the shard rather than holding it, and each try of
+//! the socket charged to the connection's turn (`hyper_rt::coop`), so one that sends or reads as
+//! fast as the shard serves yields it at the shard's quantum. Under TLS the
 //! records are hyper-tls's, read from and written to the non-blocking socket, the handshake run by
 //! the first read; the connection's configuration is its own and lent to each call that can
 //! advance the handshake.
@@ -58,9 +60,12 @@ impl Tls {
         })
     }
 
-    /// Sends what the connection holds of records, waiting while the socket is full.
+    /// Sends what the connection holds of records, waiting while the socket is full. Each write the
+    /// socket is tried for is a charge of the connection's turn on its shard (`hyper_rt::coop`), as a
+    /// plain stream's write is.
     async fn flush(&mut self) -> Result<(), IoError> {
         while self.connection.wants_write() {
+            hyper_rt::coop::consume_budget().await;
             match self.connection.write_tls(&mut Socket(&self.stream)) {
                 Ok(0) => return Err(IoError::Stalled),
                 Ok(_) => {}
@@ -105,15 +110,12 @@ impl io::Write for Socket<'_> {
 impl Io {
     /// Reads plaintext into `buf`, waiting until some comes: the octets read, none once the
     /// client's side has ended. Under TLS, a close without `close_notify` ends it too: HTTP's own
-    /// framing tells a whole message from a cut one (RFC 9112 §9.8).
+    /// framing tells a whole message from a cut one (RFC 9112 §9.8). Each read the socket is tried
+    /// for is a charge of the connection's turn on its shard (`hyper_rt::coop`), so a client whose
+    /// octets are always there yields the shard at its quantum, as one that waits does at its wait.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
         match self {
-            Self::Plain(stream) => loop {
-                if let Some(n) = stream.try_read(buf).map_err(IoError::Socket)? {
-                    return Ok(n);
-                }
-                stream.readable().await.map_err(IoError::Socket)?;
-            },
+            Self::Plain(stream) => stream.read(buf).await.map_err(IoError::Socket),
             Self::Tls(tls) => loop {
                 match tls.connection.reader().read(buf) {
                     Ok(n) => return Ok(n),
@@ -123,6 +125,7 @@ impl Io {
                 }
                 // What the handshake has to say goes before more is read: the server's flight.
                 tls.flush().await?;
+                hyper_rt::coop::consume_budget().await;
                 match tls.connection.read_tls(&mut Socket(&tls.stream)) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

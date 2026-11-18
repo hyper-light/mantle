@@ -44,7 +44,9 @@
 //!   `tests/coop_waits.rs`). Where only the operation itself can say whether it waits, a socket's try, the
 //!   try is charged and a wait it then arms is not.
 //!
-//! Sockets, readiness and timers charge here; channels, datagrams and signals do not yet.
+//! Charged here: sockets and datagrams as each tries, readiness waits, timers, and as each goes on, the sync
+//! primitives (`crate::sync`), joins and signals. A readiness group's members do not charge yet, nor the
+//! `try_*` calls a caller drives itself.
 //!
 //! Tokio's budget counts operations, 128 a poll, and reads no clock; Seastar's task quota is a time (0.5 ms
 //! by default) that a timer ends, checked between tasks. Here the count is kept (`Counters::coop_charges`,

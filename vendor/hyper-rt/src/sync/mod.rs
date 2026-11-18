@@ -26,9 +26,10 @@ mod room;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use crate::error::RtError;
+use crate::mem::Encoded;
 use crate::waker::polling_task;
 
 use cell::{CellRef, claim};
@@ -126,14 +127,21 @@ impl Future for Notified<'_> {
         let Some(cell) = self.notify.cell.cell() else {
             return Poll::Ready(Err(RtError::ShardGone { shard: 0 }));
         };
-        if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
-            return Poll::Ready(Ok(()));
+        let pending = || cell.state.load(Ordering::Acquire) & PENDING != 0;
+        loop {
+            if !pending() {
+                self.notify.cell.register(word);
+                if !pending() {
+                    return Poll::Pending;
+                }
+            }
+            // It goes on (`crate::coop`): charged before the notification is taken, which a refusal leaves.
+            ready!(crate::coop::poll_proceed(cx));
+            if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
+                return Poll::Ready(Ok(()));
+            }
+            // Another wait took it between the look and the take: this one waits on.
         }
-        self.notify.cell.register(word);
-        if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
-            return Poll::Ready(Ok(()));
-        }
-        Poll::Pending
     }
 }
 
@@ -234,6 +242,12 @@ impl<T> OneshotReceiver<T> {
             .unwrap_or(Err(SyncError::Closed(())))
     }
 
+    /// Whether [`OneshotReceiver::try_recv`] would end now (the value came, or the sender went): looked at,
+    /// nothing taken.
+    fn arrived(&self) -> bool {
+        self.shared.get().value.has_owned() || state_has(self.shared.cell(), SENDERS_GONE)
+    }
+
     /// The value if it came, without waiting.
     pub fn try_recv(&mut self) -> Result<Option<T>, SyncError<()>> {
         // The receiver is the ring's one taker until its drop closes it (`Ring::pop_owned`).
@@ -269,13 +283,18 @@ impl<T> Future for OneshotReceiver<T> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
-        if let Some(ready) = poll_value(&mut self.as_mut().try_recv()) {
-            return Poll::Ready(ready);
-        }
-        self.shared.cell().register(word);
-        match poll_value(&mut self.as_mut().try_recv()) {
-            Some(ready) => Poll::Ready(ready),
-            None => Poll::Pending,
+        loop {
+            if !self.arrived() {
+                self.shared.cell().register(word);
+                if !self.arrived() {
+                    return Poll::Pending;
+                }
+            }
+            // It goes on (`crate::coop`): charged before the value is taken, which a refusal leaves.
+            ready!(crate::coop::poll_proceed(cx));
+            if let Some(outcome) = poll_value(&mut self.as_mut().try_recv()) {
+                return Poll::Ready(outcome);
+            }
         }
     }
 }
@@ -380,6 +399,12 @@ impl<T> Drop for Sender<T> {
 }
 
 impl<T> Sender<T> {
+    /// Whether a send would end now (the channel has room, or its receiver went): looked at, nothing claimed,
+    /// so a racing sender may take the room first.
+    fn goes_on(&self) -> bool {
+        words_have(self.shared.words(), RECEIVER_GONE) || self.shared.get().values.has_room()
+    }
+
     /// Sends without waiting: `Full` when the channel is at its capacity, `Closed` when the receiver is gone.
     pub fn try_send(&self, value: T) -> Result<(), SyncError<T>> {
         self.try_send_on(value, None)
@@ -533,14 +558,9 @@ impl<T> Send<'_, T> {
         };
         let sender = self.sender;
         let room = &sender.shared.get().room;
-        // A grant seen before the try is used by a send that follows it.
-        let granted = self.place.is_some_and(|place| room.granted(place));
-        let value = match sender.try_send_on(value, Some(here)) {
-            Err(SyncError::Full(value)) => value,
-            sent => {
-                self.leave(granted);
-                return Poll::Ready(sent);
-            }
+        let value = match self.go_on(here, cx, value, true) {
+            Ok(ended) => return ended,
+            Err(value) => value,
         };
         let place = match self.place {
             Some(place) => {
@@ -560,24 +580,57 @@ impl<T> Send<'_, T> {
         };
         room.register_task(place, word.word());
         // Room made before the place showed waiting is seen here; room made after it is granted to the place.
+        let value = match self.go_on(here, cx, value, false) {
+            Ok(ended) => return ended,
+            Err(value) => value,
+        };
+        self.value = Some(value);
+        if room.granted(place) {
+            // A grant landed before this task's word did, so its wake went nowhere: be polled again.
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
+    /// One look at the channel: where the send goes on, a charge of the task's turn (`crate::coop`) and then
+    /// the try, the value kept for the next poll on a refusal; the value back while there is no room for it
+    /// (none looked, or a racing sender took it). With `grant`, a grant to the place seen before the try is the
+    /// send's.
+    fn go_on(
+        &mut self,
+        here: &crate::shard::ShardContext,
+        cx: &mut Context<'_>,
+        value: T,
+        grant: bool,
+    ) -> Result<Poll<Result<(), SyncError<T>>>, T> {
+        let sender = self.sender;
+        if !sender.goes_on() {
+            return Err(value);
+        }
+        if crate::coop::proceed_in(here, cx).is_pending() {
+            self.value = Some(value);
+            return Ok(Poll::Pending);
+        }
+        let room = &sender.shared.get().room;
+        let granted = grant && self.place.is_some_and(|place| room.granted(place));
         match sender.try_send_on(value, Some(here)) {
-            Err(SyncError::Full(value)) => {
-                self.value = Some(value);
-                if room.granted(place) {
-                    // A grant landed before this task's word did, so its wake went nowhere: be polled again.
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Pending
-            }
+            Err(SyncError::Full(value)) => Err(value),
             sent => {
-                self.leave(false);
-                Poll::Ready(sent)
+                self.leave(granted);
+                Ok(Poll::Ready(sent))
             }
         }
     }
 }
 
 impl<T> ChannelReceiver<T> {
+    /// Whether [`ChannelReceiver::try_recv`] would end now (a value waits, or every sender went): looked at,
+    /// nothing taken.
+    fn arrived(&self) -> bool {
+        let state = self.shared.get();
+        state.values.has_owned() || state.senders_gone.0.load(Ordering::Acquire)
+    }
+
     /// Takes a value without waiting: `None` when the channel is empty, `Closed` when every sender is gone.
     pub fn try_recv(&mut self) -> Result<Option<T>, SyncError<()>> {
         let state = self.shared.get();
@@ -641,15 +694,20 @@ impl<T> Future for Recv<'_, T> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
-        if let Some(ready) = poll_value(&mut self.receiver.try_recv()) {
-            return Poll::Ready(ready);
-        }
-        if let Some(words) = self.receiver.shared.words() {
-            words.register(word);
-        }
-        match poll_value(&mut self.receiver.try_recv()) {
-            Some(ready) => Poll::Ready(ready),
-            None => Poll::Pending,
+        loop {
+            if !self.receiver.arrived() {
+                if let Some(words) = self.receiver.shared.words() {
+                    words.register(word);
+                }
+                if !self.receiver.arrived() {
+                    return Poll::Pending;
+                }
+            }
+            // It goes on (`crate::coop`): charged before the value is taken, which a refusal leaves.
+            ready!(crate::coop::poll_proceed(cx));
+            if let Some(outcome) = poll_value(&mut self.receiver.try_recv()) {
+                return Poll::Ready(outcome);
+            }
         }
     }
 }
@@ -902,6 +960,15 @@ impl WatchReceiver {
         Changed { receiver: self }
     }
 
+    /// Whether [`WatchReceiver::check`] would end now (a version not seen, or the sender's end): looked at,
+    /// nothing marked seen.
+    fn has_news(&self) -> bool {
+        self.shared.cell().is_none_or(|cell| {
+            let version = cell.aux.load(Ordering::Acquire);
+            version & VERSION_MASK != self.seen || version & !VERSION_MASK != 0
+        })
+    }
+
     /// A change since the last seen version, or the sender's end.
     fn check(&mut self) -> Option<Result<(), SyncError<()>>> {
         let Some(cell) = self.shared.cell() else {
@@ -952,13 +1019,18 @@ impl Future for Changed<'_> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
-        if let Some(ready) = self.receiver.check() {
-            return Poll::Ready(ready);
-        }
-        self.receiver.own.register(word);
-        match self.receiver.check() {
-            Some(ready) => Poll::Ready(ready),
-            None => Poll::Pending,
+        loop {
+            if !self.receiver.has_news() {
+                self.receiver.own.register(word);
+                if !self.receiver.has_news() {
+                    return Poll::Pending;
+                }
+            }
+            // It goes on (`crate::coop`): charged before the version is marked seen, which a refusal leaves.
+            ready!(crate::coop::poll_proceed(cx));
+            if let Some(outcome) = self.receiver.check() {
+                return Poll::Ready(outcome);
+            }
         }
     }
 }
@@ -1021,6 +1093,13 @@ impl Semaphore {
         self.cell
             .cell()
             .map_or(0, |cell| cell.state.load(Ordering::Acquire))
+    }
+
+    /// Whether [`Semaphore::try_acquire`] would take a permit now: looked at, nothing taken.
+    fn looks_free(&self) -> bool {
+        self.cell.cell().is_some_and(|cell| {
+            cell.aux.load(Ordering::Acquire) == 0 && cell.state.load(Ordering::Acquire) > 0
+        })
     }
 
     /// A permit if one is free and nobody waits for one.
@@ -1098,24 +1177,45 @@ impl<'a> Future for Acquire<'a> {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
         let semaphore = self.semaphore;
-        if let Some(own) = self.waiting {
-            let granted = own
-                .cell()
-                .is_some_and(|words| words.state.load(Ordering::Acquire) & GRANTED != 0);
-            if granted {
-                self.waiting = None;
-                own.release();
-                return Poll::Ready(Ok(Permit { semaphore }));
+        let own = match self.waiting {
+            Some(own) => own,
+            None => {
+                if semaphore.looks_free() {
+                    // It goes on (`crate::coop`): charged before the permit is taken, which a refusal leaves.
+                    ready!(crate::coop::poll_proceed(cx));
+                    if let Some(permit) = semaphore.try_acquire() {
+                        return Poll::Ready(Ok(permit));
+                    }
+                }
+                match self.queue_up(word) {
+                    Ok(own) => own,
+                    Err(full) => return Poll::Ready(Err(full)),
+                }
             }
+        };
+        let granted = own
+            .cell()
+            .is_some_and(|words| words.state.load(Ordering::Acquire) & GRANTED != 0);
+        if !granted {
             own.register(word);
             return Poll::Pending;
         }
-        if let Some(permit) = semaphore.try_acquire() {
-            return Poll::Ready(Ok(permit));
-        }
-        let Ok(own) = claim(2) else {
-            return Poll::Ready(Err(SyncError::Full(())));
-        };
+        // It goes on: charged before the grant is taken, which a refusal leaves.
+        ready!(crate::coop::poll_proceed(cx));
+        self.waiting = None;
+        own.release();
+        Poll::Ready(Ok(Permit { semaphore }))
+    }
+}
+
+impl Acquire<'_> {
+    /// Queues this acquirer, the task `word` registered in a cell of its own, which it gives back; `Full` when
+    /// no cell or place in the queue is left. A permit freed between the caller's look and the queueing went
+    /// to the free count, the queue empty then: it goes to the oldest waiter, as a release hands one on (this
+    /// one, perhaps), so a permit is taken only through a charge ([`crate::coop`]).
+    fn queue_up(&mut self, word: Encoded) -> Result<CellRef, SyncError<()>> {
+        let semaphore = self.semaphore;
+        let own = claim(2).map_err(|_| SyncError::Full(()))?;
         own.register(word);
         if let Some(cell) = semaphore.cell.cell() {
             cell.aux.fetch_add(1, Ordering::AcqRel);
@@ -1126,10 +1226,9 @@ impl<'a> Future for Acquire<'a> {
             }
             own.release();
             own.release();
-            return Poll::Ready(Err(SyncError::Full(())));
+            return Err(SyncError::Full(()));
         }
-        // A permit freed between the try and the queueing went to the free count, since the queue looked empty:
-        // take it now, leaving the queue so no release grants this acquirer a second.
+        self.waiting = Some(own);
         if let Some(cell) = semaphore.cell.cell()
             && cell
                 .state
@@ -1138,20 +1237,9 @@ impl<'a> Future for Acquire<'a> {
                 })
                 .is_ok()
         {
-            if let Some(words) = own.cell()
-                && words
-                    .state
-                    .compare_exchange(0, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-            {
-                // Granted meanwhile as well: the spare permit goes on as a release, to the next waiter first.
-                semaphore.release();
-            }
-            own.release();
-            return Poll::Ready(Ok(Permit { semaphore }));
+            semaphore.release();
         }
-        self.waiting = Some(own);
-        Poll::Pending
+        Ok(own)
     }
 }
 

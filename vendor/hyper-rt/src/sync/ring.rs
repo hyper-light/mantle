@@ -275,6 +275,24 @@ impl<T> Ring<T> {
 }
 
 impl<T> Ring<T> {
+    /// Whether a push would claim a place now, or be refused for the ring's close: looked at, nothing claimed. A
+    /// racing producer may claim the place first, and a view of the tail a lap behind reads as full until the
+    /// looker fences (as [`Ring::push`]'s does), so a sender that finds no room looks again after its fence.
+    pub(crate) fn has_room(&self) -> bool {
+        let tail = self.tail.0.load(Ordering::Relaxed);
+        tail & self.mark != 0
+            || self
+                .slot(tail)
+                .is_some_and(|slot| slot.stamp.load(Ordering::Acquire) == tail)
+    }
+
+    /// Whether the ring's one taker would take a value now ([`Ring::pop_owned`]): looked at, nothing taken.
+    pub(crate) fn has_owned(&self) -> bool {
+        let head = self.head.0.load(Ordering::Relaxed);
+        self.slot(head)
+            .is_some_and(|slot| slot.stamp.load(Ordering::Acquire) == head.wrapping_add(1))
+    }
+
     /// Takes the value at the head as the ring's one taker: the primitives here take only through their one
     /// receiver until it closes the ring (`close`, in the receiver's drop), and a drain, the only other taker,
     /// begins only after that close, so while this end may take, the head is its alone and moves by a plain

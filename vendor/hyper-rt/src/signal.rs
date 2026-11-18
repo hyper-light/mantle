@@ -283,21 +283,21 @@ impl Future for Recv<'_> {
                 what: "a signal subscription outside the table",
             }));
         };
-        let arrived = slot.pending.swap(0, Ordering::AcqRel);
-        if arrived != 0 {
-            return Poll::Ready(Ok(Signals(arrived)));
+        if slot.pending.load(Ordering::Acquire) == 0 {
+            let Some(word) = polling_task(cx.waker()) else {
+                return Poll::Ready(Err(RtError::NotOnShardThread));
+            };
+            // Register, then look again, a read-modify-write as the delivery's mark is: a delivery between the
+            // first look and the registration marked `pending` before it read the waiter, so this look sees it.
+            slot.waiter.store(word.word(), Ordering::Release);
+            if slot.pending.fetch_or(0, Ordering::AcqRel) == 0 {
+                return Poll::Pending;
+            }
         }
-        let Some(word) = polling_task(cx.waker()) else {
-            return Poll::Ready(Err(RtError::NotOnShardThread));
-        };
-        // Register, then look again: a delivery between the first look and the registration marked
-        // `pending` before it read the waiter, so this second look sees it.
-        slot.waiter.store(word.word(), Ordering::Release);
-        let arrived = slot.pending.swap(0, Ordering::AcqRel);
-        if arrived != 0 {
-            return Poll::Ready(Ok(Signals(arrived)));
-        }
-        Poll::Pending
+        // It goes on (`crate::coop`): charged before the delivery is taken, which a refusal leaves. The stream
+        // is its slot's one taker, so what was looked at is there to take.
+        std::task::ready!(crate::coop::poll_proceed(cx));
+        Poll::Ready(Ok(Signals(slot.pending.swap(0, Ordering::AcqRel))))
     }
 }
 

@@ -87,10 +87,20 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `6a6b4d2` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
-`17371e2` and four commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
-branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its fourth
-commit, `6a6b4d2`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14, hyper-rt ORIGIN.md,
+**Every crate at `675a042` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
+`17371e2` and five commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its fifth
+commit, `675a042`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14, hyper-rt ORIGIN.md,
+"turns by time, the sync primitives, joins, datagrams and signals"): the rest of Kiln's charges, each
+made where the leaf goes on and never where it waits — a `Notify`'s notification, a one-shot's value,
+a channel's receive and send, a watched word's change, a semaphore's permit (free, or granted to a
+queued wait), a `Join`'s outcome and a `SignalStream`'s delivery, each looked at first with nothing
+taken; `UdpSocket::recv_from` and `send_to_writable` as each tries. A permit freed while its acquirer
+queued now goes to the oldest waiter as a release does, so a permit is taken only through a charge.
+No new constant: the share is still the shard's quantum. Readiness groups' members and
+hyper-rt-transport's datagram path do not charge yet. Every other crate is as at `17371e2`. Before
+it, every crate was at `6a6b4d2` (the same branch: `17371e2` and four commits), with no local delta.
+Its fourth commit, `6a6b4d2`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14, hyper-rt ORIGIN.md,
 "turns by time"): a task's operations on sockets and timers charge its turn (`TcpStream`'s reads and
 writes, and `LocalStream`'s through it; `TcpListener`'s and `LocalListener`'s accepts; a readiness
 wait once it fired; a sleep once due), and once it has held a shard something else wants past its
@@ -99,8 +109,7 @@ is picked), the leaf answers `Pending` with its task woken and nothing taken, so
 that await (`coop::consume_budget` is the charge alone; `Counters::coop_charges`, `coop_yields`).
 Each poll's first charge goes on, and a leaf is charged only as it goes on, never as it waits: the
 two livelocks Kiln's runtime copy, whose design this takes, found and fixed. Channels, joins,
-datagrams and signals do not charge yet. Every other crate is as at `17371e2`. Before it, every
-crate was at `c472c2e` (the same branch: `17371e2` and three commits), with no local delta, taken by
+datagrams and signals did not charge yet. Before it, every crate was at `c472c2e` (the same branch: `17371e2` and three commits), with no local delta, taken by
 `scripts/snapshot-hyper-raft.py`. Its third commit, `c472c2e`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.13, hyper-rt ORIGIN.md,
 "the watchdog"): each OS runtime runs one watchdog thread that sees a shard held in one poll past
 `batch` × twice its quantum (no step of tasks keeping the long-poll contract holds it longer) while

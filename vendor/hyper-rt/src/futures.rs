@@ -208,6 +208,10 @@ impl Future for Join {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let id = self.id;
         registry::with_current(|ctx| {
+            // A join that goes on is charged before its outcome is taken (`crate::coop`); one that waits is not.
+            if ctx.join_ends(id) && crate::coop::proceed_in(ctx, cx).is_pending() {
+                return Poll::Pending;
+            }
             ctx.poll_join(id, crate::waker::polling_task_in(ctx, cx.waker()))
         })
         .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))

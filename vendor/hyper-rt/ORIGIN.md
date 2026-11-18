@@ -158,3 +158,19 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   signals do not charge yet. Tests: `tests/coop_budget.rs` and `tests/coop_waits.rs`, Kiln's cases for
   these leaves (its `readiness_waits.rs` charge case among them) with socket reads and writes added beside
   its timer.
+
+## Made here: turns by time, the sync primitives, joins, datagrams and signals (2026-11-17)
+
+- The rest of Kiln's charges (its goal 6 step 1, plan `01a1a59c2abe`; read at Kiln's `7205b10c5b4`), each
+  as Kiln wrote it: a leaf looks first, taking nothing, registers and waits uncharged, and where it goes on
+  is charged before it takes. `Notified`, `OneshotReceiver`, `Recv` and `Changed` look and loop as Kiln's
+  do (`Ring::has_owned`, `WatchReceiver::has_news`); `Send` looks with `Sender::goes_on`
+  (`Ring::has_room`) and charges in its `go_on`, the value kept for the next poll on a refusal; `Acquire`
+  charges a free permit (`Semaphore::looks_free`) and a grant, and its `queue_up` hands a permit freed
+  while it queued to the oldest waiter as a release does (it took the permit itself before), so a permit
+  is taken only through a charge; `Join` charges where `ShardContext::join_ends`; `signal::Recv` looks,
+  registers with a read-modify-write look, and charges before it takes. `UdpSocket::recv_from` and
+  `send_to_writable` charge as they try, as Kiln's do. Changed in the port: none of the code; Kiln's
+  one-shot ring without padding (its goal 9) is not taken. Tests: Kiln's `coop_waits.rs` cases for these
+  (notification, one-shot, channel receive and send, watch, permit, join, signal), with a granted permit,
+  a delivered signal and datagrams added so every new charge has a case that fails without it.

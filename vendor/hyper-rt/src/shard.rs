@@ -935,6 +935,15 @@ impl ShardContext {
         Ok(())
     }
 
+    /// Whether [`ShardContext::poll_join`] would answer now: the task ended, or the join is refused. Looked at,
+    /// nothing taken.
+    pub(crate) fn join_ends(&self, id: TaskId) -> bool {
+        self.live(id)
+            .ok()
+            .and_then(|slot| self.task(slot))
+            .is_none_or(|cell| cell.phase.get() == Phase::Done)
+    }
+
     /// Polls a join: `Ready(outcome)` once the task is terminal (its slot is reaped then), else `Pending`
     /// with the polling task recorded as the joiner. Refused for a stale id, and for a joiner that is not a
     /// task of this shard (`NotOnShardThread`): the joiner is woken by its word.

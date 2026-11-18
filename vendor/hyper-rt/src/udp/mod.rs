@@ -518,6 +518,8 @@ impl UdpSocket {
         // which waiting for room never gives it (macOS reports an IPv6 destination on an IPv4 socket
         // so), and it is refused.
         let mut reported = false;
+        // A send is a charge of its task's turn (`crate::coop`): the try is charged; a wait it arms is not.
+        crate::coop::consume_budget().await;
         loop {
             let astray = self.astray_reports();
             if let Some(sent) = self.try_send_to(buf, addr)? {
@@ -566,6 +568,8 @@ impl UdpSocket {
     /// [`UdpSocket::try_recv_from`] — a caller whose buffer must not be held across the await (one buffer
     /// shared by a shard's readers) drives those two itself.
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), RtError> {
+        // A receive is a charge of its task's turn (`crate::coop`): the try is charged; a wait it arms is not.
+        crate::coop::consume_budget().await;
         loop {
             if let Some(received) = self.try_recv_from(buf)? {
                 return Ok(received);

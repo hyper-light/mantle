@@ -8,14 +8,20 @@
 //! socket, so the host writes no faster than the client reads. Each send wakes the other side's
 //! task: the node's, whose turn takes what came, through the waker the doorway holds.
 //!
+//! The body's channel holds as many pieces as the node learned a body needs in flight ([`Depth`]):
+//! by Little's law, the host's time to take a piece over the connection's time to deliver one,
+//! each measured on the pieces themselves, so the body comes at its client's pace and the node
+//! holds no piece more.
+//!
 //! Before its operation, a request signed with a principal's key asks the node for that key
 //! ([`KeyAsk`]): the node reads the key's row and its principal's from the root range by
 //! ReadIndex and unwraps the key's secret under the root key, so the connection checks the
 //! signature against what the cell holds as the request arrives (docs/design/principals.md).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::Waker;
+use std::time::Instant;
 
 use bytes::Bytes;
 use hyper_rt::RtError;
@@ -81,13 +87,65 @@ pub struct Request {
 /// A piece of a request's body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Piece {
-    Bytes(Bytes),
+    /// Bytes of the body, and how the connection delivered them, which the host learns the body's
+    /// depth from ([`Doorway::took`]).
+    Bytes(Bytes, Paced),
     /// The body ended whole, its signature's and its checksum's word held: the checksum an
     /// aws-chunked body's trailer carried, where it carried one (05 §3.2).
     End(Option<Checksum>),
     /// The body did not hold as it streamed: its signature, its digest or its framing, the status
     /// that says which; nothing of it commits.
     Refused(Status),
+}
+
+/// How the connection delivered a piece of body: when it sent it, and the time it took to deliver
+/// it, from its last piece's send to this one's bytes ready, none of it waiting for the queue's
+/// room; none for a body's first piece, whose time is its client's answer to `100 Continue` as
+/// much as its pace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Paced {
+    pub sent: Instant,
+    pub delivered_ns: Option<u64>,
+}
+
+/// The pieces a body's channel holds, learned from the pieces themselves (docs/design/node.md
+/// §4.3). By Little's law (Little 1961) the pieces in the channel at once for a body to come at its
+/// client's pace are the rate it comes at times the time each waits there: the host's time to take
+/// a piece, from its send to the host's turn taking it, over the connection's time to deliver one,
+/// rounded up and at least one. Each time is summed over a phase of as many pieces as admission's
+/// phase measures (`admit::PHASE`): the ratio of two such sums tells a quarter's change from chance
+/// as admission's ratio of two phases' powers does, its log error `√(2/n)`. A phase's depth
+/// replaces the last's, so what a phase measured is forgotten the phase after, and the sample is
+/// at most a phase's pieces. Until a phase is measured the depth is one, the least that moves a
+/// body: the host takes one piece while the connection reads the next into its own buffer, and a
+/// put holds no more than a request within one segment (`listener::REQUEST_BYTES`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Depth {
+    pieces: u64,
+    taken_ns: u128,
+    delivered_ns: u128,
+}
+
+impl Depth {
+    /// The depth before any phase is measured: one piece.
+    pub const FIRST: usize = 1;
+
+    /// A piece the host took `taken_ns` after its send, which the connection took `delivered_ns`
+    /// to deliver, a delivery too quick for the clock to time a nanosecond's: the phase's depth
+    /// once this piece ends it.
+    pub fn took(&mut self, taken_ns: u64, delivered_ns: u64) -> Option<usize> {
+        self.pieces = self.pieces.saturating_add(1);
+        self.taken_ns = self.taken_ns.saturating_add(u128::from(taken_ns));
+        self.delivered_ns = self
+            .delivered_ns
+            .saturating_add(u128::from(delivered_ns.max(1)));
+        if self.pieces < crate::admit::PHASE {
+            return None;
+        }
+        let depth = self.taken_ns.div_ceil(self.delivered_ns.max(1)).max(1);
+        *self = Self::default();
+        Some(usize::try_from(depth).unwrap_or(usize::MAX))
+    }
 }
 
 /// A piece of a reply.
@@ -117,6 +175,10 @@ pub struct Doorway {
     /// One request taken from the channel to learn that one waits, ahead of the rest.
     held: Option<Asked>,
     slowed: Arc<Slowings>,
+    /// The phase of pieces under way, and the depth the last phase learned, which the listener's
+    /// connections read as they make a body's channel.
+    depth: Depth,
+    learned: Arc<AtomicUsize>,
 }
 
 /// The listener's end: where it submits requests, and the waker of the node that takes them.
@@ -125,6 +187,7 @@ pub struct Submitter {
     requests: Sender<Asked>,
     node: Waker,
     slowed: Arc<Slowings>,
+    learned: Arc<AtomicUsize>,
 }
 
 /// The S3 requests the listener answered `503 SlowDown`, a count for each cause in
@@ -140,16 +203,20 @@ struct Slowings([AtomicU64; Slowed::ALL.len()]);
 pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtError> {
     let (requests, taken) = channel(capacity)?;
     let slowed = Arc::new(Slowings::default());
+    let learned = Arc::new(AtomicUsize::new(Depth::FIRST));
     Ok((
         Doorway {
             requests: taken,
             held: None,
             slowed: Arc::clone(&slowed),
+            depth: Depth::default(),
+            learned: Arc::clone(&learned),
         },
         Submitter {
             requests,
             node,
             slowed,
+            learned,
         },
     ))
 }
@@ -169,6 +236,19 @@ impl Doorway {
             self.held = self.requests.try_recv().ok().flatten();
         }
         self.held.as_ref()
+    }
+
+    /// The host took a piece of body the connection delivered as `paced` says: a sample of the
+    /// depth's phase ([`Depth`]), and the phase's depth for the connections once it ends. A body's
+    /// first piece, whose delivery is not timed, is no sample.
+    pub fn took(&mut self, paced: Paced) {
+        let Some(delivered_ns) = paced.delivered_ns else {
+            return;
+        };
+        let taken_ns = u64::try_from(paced.sent.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let Some(depth) = self.depth.took(taken_ns, delivered_ns) {
+            self.learned.store(depth, Ordering::Relaxed);
+        }
     }
 
     /// The S3 requests the listener answered `503 SlowDown`, for each cause in [`Slowed::ALL`]'s
@@ -219,6 +299,12 @@ impl Submitter {
         self.node.wake_by_ref();
     }
 
+    /// The pieces the node last learned a body needs in flight to its host ([`Depth`]), which a
+    /// connection caps at what its memory holds as it makes a body's channel.
+    pub fn depth(&self) -> usize {
+        self.learned.load(Ordering::Relaxed)
+    }
+
     /// Counts an S3 request the listener answers `503 SlowDown` for `cause`, which the node says
     /// in its lines; `cause` back, for the answer that names it.
     pub fn slowed(&self, cause: Slowed) -> Slowed {
@@ -226,5 +312,64 @@ impl Submitter {
             count.fetch_add(1, Ordering::Relaxed);
         }
         cause
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A phase's pieces, each taken `taken_ns` after its send and delivered in `delivered_ns`: the
+    /// depth the phase's last piece gives, none before it.
+    fn phase(depth: &mut Depth, taken_ns: u64, delivered_ns: u64) -> Option<usize> {
+        for _ in 1..crate::admit::PHASE {
+            assert_eq!(depth.took(taken_ns, delivered_ns), None);
+        }
+        depth.took(taken_ns, delivered_ns)
+    }
+
+    /// The host's time to take a piece over the connection's time to deliver one, rounded up,
+    /// once a phase is measured; never below one; each phase's depth its own.
+    #[test]
+    fn the_depth_is_the_pieces_delivered_while_the_host_takes_one() {
+        let mut depth = Depth::default();
+        // 300 µs to take, 100 µs to deliver: three pieces in flight.
+        assert_eq!(phase(&mut depth, 300_000, 100_000), Some(3));
+        // 250 µs over 100 µs, rounded up.
+        assert_eq!(phase(&mut depth, 250_000, 100_000), Some(3));
+        // A host faster than its connection, or one that takes at once: one.
+        assert_eq!(phase(&mut depth, 10_000, 100_000), Some(1));
+        assert_eq!(phase(&mut depth, 0, 100_000), Some(1));
+        // A delivery too quick to time is a nanosecond's.
+        assert_eq!(phase(&mut depth, 7, 0), Some(7));
+        // A phase forgets the last: the slow phase before says nothing of this one.
+        assert_eq!(phase(&mut depth, 1_000_000, 1_000), Some(1_000));
+        assert_eq!(phase(&mut depth, 1_000, 1_000), Some(1));
+    }
+
+    /// The listener's connections read the depth the node learned: one before any phase, a body's
+    /// first piece no sample, and a phase's depth once it ends.
+    #[test]
+    fn a_connection_reads_the_depth_the_node_learned() {
+        let (mut doorway, submitter) = doorway(1, Waker::noop().clone()).unwrap();
+        assert_eq!(submitter.depth(), Depth::FIRST);
+        let long_ago = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(10))
+            .unwrap();
+        for _ in 0..crate::admit::PHASE {
+            doorway.took(Paced {
+                sent: long_ago,
+                delivered_ns: None,
+            });
+        }
+        assert_eq!(submitter.depth(), Depth::FIRST);
+        for _ in 0..crate::admit::PHASE {
+            doorway.took(Paced {
+                sent: long_ago,
+                delivered_ns: Some(1_000_000),
+            });
+        }
+        // Taken 10 ms or more after its send, each delivered in 1 ms.
+        assert!(submitter.depth() >= 10, "{}", submitter.depth());
     }
 }

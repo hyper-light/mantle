@@ -2765,12 +2765,40 @@ what the door makes of a head and answers it with, one body segment (`PIECE`) an
 at its largest (`TLS_RECORD`, 2^14 octets and TLS 1.2's 2,048 of expansion, RFC 8446 §5.1–5.2
 and RFC 5246 §6.2.3), 92,156 octets. A TLS connection encrypts a response a record at a time,
 each sent before the next is made, where hyper-tls's default would encrypt 64 KiB ahead of the
-socket. A put whose body is longer than a segment holds `listener::STREAMED_BYTES`: one head and
-one TLS record, and its body's pieces in the host's queue, at most the queue's depth of them
-(`BODY_PIECES`, 2: one the driver takes while the next is read), 157,683 octets. The connection
-waits for the queue's room before it copies a piece (hyper-rt's `Sender::reserve`), so it holds
-none the queue has no room for; at a depth of one a put holds `REQUEST_BYTES`.
-`tests/listener_memory.rs` counts each request from its connection at rest to its answer.
+socket. A put whose body is longer than a segment holds `listener::streamed_bytes`: one head and
+one TLS record, and its body's pieces in the host's queue, at most the queue's depth of them. The
+connection waits for the queue's room before it copies a piece (hyper-rt's `Sender::reserve`), so
+it holds none the queue has no room for; at a depth of one a put holds `REQUEST_BYTES`.
+`tests/listener_memory.rs` counts each request from its connection at rest to its answer, a put's
+body at the most pieces its queue holds.
+
+*Since 2026-11-18 (the owner's rule: no fixed depth, learned from what the node measures).* The
+queue's depth is learned from the pieces themselves (`door::Depth`), where it was 2 by fiat. By
+Little's law (Little 1961) the pieces in the queue at once for a body to come at its client's pace
+are the rate it comes at times the time each waits there: the host's time to take a piece, from
+its send to the host's turn that takes it, over the connection's time to deliver one, from its
+last piece's send to the next one's bytes ready, none of it waiting for the queue's room; rounded
+up, and at least one. Each piece carries both times' ends (`door::Paced`), and the host sums them
+over a phase of as many pieces as admission's phase measures (`admit::PHASE`, 267, §2.8): the
+ratio of two such sums tells a quarter's change from chance as admission's ratio of two phases'
+powers does. A phase's depth replaces the last's, so the sample is at most a phase's pieces and
+what a phase measured is forgotten the phase after; a body's first piece, whose time is its
+client's answer to `100 Continue` as much as its pace, is no sample. Until a phase is measured the
+depth is one, the least that moves a body: the host takes a piece while the connection reads the
+next into its own buffer, as the learned window starts at one block (§1.4). A connection reads
+the depth as it makes a body's channel, whose capacity hyper-rt fixes then
+(`hyper_rt::sync::channel`), and caps it at what the node's memory division gives a connection
+(`listener::most_pieces`): the bytes `derive` charges each connection (`CONNECTION_BYTES`) past
+its read buffer, a head and a TLS record, in whole pieces, four, the four pieces of body the charge
+was counted holding. A put at the cap holds 288,737 octets above its connection at rest.
+
+A reply's channel keeps its depth of 2 (`REPLY_PIECES`) for now. Its argument is the body's turned
+round, the host giving and the connection taking, so it is learned the same way once its samples
+reach the one that learns: the time an answer waits in the channel ends where the connection takes
+it, on the connection's shard, while the depth's one writer is the host on the node's. Meanwhile a
+deeper reply channel moves no bytes the host does not already hold: what the channel has no room
+for waits in the host's own queue (`host::Local::pending`), and its depth bounds only how many of
+a get's pieces one turn of the node hands over.
 What the door makes of a head does not grow with its fields' count: they are read where the head
 holds them (`request::Parts`, `mantle_s3::sigv4::Fields`), no table of them made, which at 32
 octets a field held 60,160 for a head padded to 8 KB with 1,880 empty fields; and the metadata a

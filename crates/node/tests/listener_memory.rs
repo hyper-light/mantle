@@ -36,7 +36,7 @@ use hyper_tls::pki_types::{CertificateDer, ServerName};
 use hyper_tls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version};
 use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door::{self, Piece};
-use mantle_node::listener::{Listener, PIECE, Settings, tasks};
+use mantle_node::listener::{Listener, PIECE, Settings, most_pieces, tasks};
 use mantle_node::process::AccessKey;
 use mantle_protocol::bounds::STOCK_PATIENCE;
 
@@ -271,7 +271,7 @@ fn held(connections: usize, tls: bool) -> i64 {
                     let whole = async {
                         loop {
                             match request.body.recv().await.unwrap() {
-                                Piece::Bytes(bytes) => {
+                                Piece::Bytes(bytes, _) => {
                                     // The piece is the connection's copy; the list the test
                                     // keeps it in is the test's, uncounted.
                                     alloc::pause();
@@ -549,7 +549,7 @@ async fn host(method: Method, size: usize, mut request: Box<door::Request>) {
             request.reply.send(door::Answer::Ready).await.unwrap();
             loop {
                 match request.body.recv().await.unwrap() {
-                    Piece::Bytes(piece) => drop(piece),
+                    Piece::Bytes(piece, _) => drop(piece),
                     Piece::End(_) => break,
                     other => panic!("{other:?}"),
                 }
@@ -614,18 +614,45 @@ async fn settled(since: Instant) {
     }
 }
 
+/// The depth of a put's queue a request is made at: the node's first, before it has measured any,
+/// or the most a body's queue holds (`listener::most_pieces`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    First,
+    Most,
+}
+
 /// The listener thread's counts from one connection at rest, its kept buffers made by the same
 /// request before, to the second request's answer read whole by its client and the request let
-/// go.
+/// go, a put's queue at `depth`.
 fn one_request(
     over: Over,
     (method, size, padded): (Method, usize, Padded),
+    depth: Depth,
 ) -> (alloc::Counts, u16) {
     let chain = (!matches!(over, Over::Plain)).then(chain);
     let mut runtime = runtime();
     let (counts, status, client) = runtime
         .block_on(async move {
             let (mut doorway, submitter) = door::doorway(1, Waker::noop().clone()).unwrap();
+            // At the most pieces a body's queue holds, the node's learned depth is driven past the
+            // cap by pieces the host took a second after their send, each delivered in a
+            // nanosecond.
+            if depth == Depth::Most {
+                let long_ago = Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap();
+                for _ in 0..10_000 {
+                    if submitter.depth() >= most_pieces() {
+                        break;
+                    }
+                    doorway.took(door::Paced {
+                        sent: long_ago,
+                        delivered_ns: Some(1),
+                    });
+                }
+                assert!(submitter.depth() >= most_pieces());
+            }
             let authority = chain.as_ref().map(|c| c.authority.clone());
             let settings = Settings {
                 listen: "127.0.0.1:0".parse().unwrap(),
@@ -689,18 +716,22 @@ fn one_request(
 /// counted is the door's: its request, its pieces, its TLS records, and the host's reply it
 /// answers from.
 ///
-/// A put whose body is longer than a segment holds `listener::STREAMED_BYTES`: one head and one
-/// TLS record, and the pieces in the host's queue, at most its depth (`listener::BODY_PIECES`) of
-/// them. The connection waits for the queue's room before it copies a piece, so it holds none
-/// beside them.
+/// Each request is made at the depth of a put's queue before the node has measured any, one piece,
+/// and at the most a body's queue holds (`listener::most_pieces`), the depth the node learns driven
+/// past it. At the most, a put whose body comes in more than one piece, a read or a TLS record each,
+/// holds `listener::streamed_bytes`: one head and one TLS record, and the pieces in the host's
+/// queue, at most its depth of them. The connection waits for the queue's room before it copies a
+/// piece, so it holds none beside them.
 ///
 /// A head padded to S3's 8 KB with empty fields, CRLF-ended (about 1,880 of them) or ended by a
 /// lone LF (the most a head carries, about 2,500), holds no more: the door reads a head's fields
 /// where the head holds them and copies only those a version keeps.
 #[test]
 fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
-    use mantle_node::listener::{REQUEST_BYTES, STREAMED_BYTES};
-    let records = 3 * (1 << 14) + 1;
+    use mantle_node::listener::{REQUEST_BYTES, streamed_bytes};
+    // A TLS record's plaintext at its largest (RFC 8446 §5.1): a TLS body's piece.
+    const RECORD: usize = 1 << 14;
+    let records = 3 * RECORD + 1;
     let many = 4 * PIECE;
     for over in [Over::Plain, Over::Tls13, Over::Tls12] {
         for (method, size, padded) in [
@@ -718,28 +749,32 @@ fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
             (Method::Head, many, Padded::No),
             (Method::Delete, 0, Padded::No),
         ] {
-            let (counts, status) = one_request(over, (method, size, padded));
-            let bound = match method {
-                Method::Put if size > PIECE => STREAMED_BYTES,
-                _ => REQUEST_BYTES,
-            };
-            let case = format!("{over:?} {method:?} {size} {padded:?}");
-            eprintln!(
-                "{case}: status {status}, peak {} of {bound}, live after {}, {} allocations, {} \
+            for depth in [Depth::First, Depth::Most] {
+                let (counts, status) = one_request(over, (method, size, padded), depth);
+                // A body that comes in more than one piece, a read or a TLS record each, may have as
+                // many in the queue as its depth.
+                let bound = match (method, depth) {
+                    (Method::Put, Depth::Most) if size > RECORD => streamed_bytes(),
+                    _ => REQUEST_BYTES,
+                };
+                let case = format!("{over:?} {method:?} {size} {padded:?} {depth:?}");
+                eprintln!(
+                    "{case}: status {status}, peak {} of {bound}, live after {}, {} allocations, {} \
                  reallocations",
-                counts.peak, counts.live, counts.allocations, counts.reallocations
-            );
-            assert!(matches!(status, 200 | 204), "{case}: {status}");
-            assert!(
-                usize::try_from(counts.peak).unwrap() <= bound,
-                "{case}: a peak of {} past {bound}",
-                counts.peak
-            );
-            assert!(
-                counts.live <= 0,
-                "{case}: {} left past the answer",
-                counts.live
-            );
+                    counts.peak, counts.live, counts.allocations, counts.reallocations
+                );
+                assert!(matches!(status, 200 | 204), "{case}: {status}");
+                assert!(
+                    usize::try_from(counts.peak).unwrap() <= bound,
+                    "{case}: a peak of {} past {bound}",
+                    counts.peak
+                );
+                assert!(
+                    counts.live <= 0,
+                    "{case}: {} left past the answer",
+                    counts.live
+                );
+            }
         }
     }
 }
@@ -771,7 +806,7 @@ fn a_warmed_request_reallocates_none_of_the_doors_buffers() {
             (Method::Put, many),
             (Method::Delete, 0),
         ] {
-            let (counts, status) = one_request(over, (method, size, Padded::No));
+            let (counts, status) = one_request(over, (method, size, Padded::No), Depth::First);
             let expected = match (over, method) {
                 (Over::Tls13 | Over::Tls12, Method::Put) if size >= PLAINTEXT => deframer,
                 _ => 0,
@@ -819,7 +854,7 @@ fn a_warmed_request_allocates_only_what_crosses_to_the_host() {
             (Method::Put, 1),
             (Method::Delete, 0),
         ] {
-            let (counts, status) = one_request(over, (method, size, Padded::No));
+            let (counts, status) = one_request(over, (method, size, Padded::No), Depth::First);
             let put = u64::from(matches!(method, Method::Put));
             // Its box, its two channels of three each, its bucket, key and account; a put's piece.
             let crossing = 1 + 2 * 3 + 3 + put;

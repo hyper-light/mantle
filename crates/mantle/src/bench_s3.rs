@@ -146,7 +146,7 @@ fn host(doorway: &mut Doorway, jobs: &mut Vec<Job>, object: &Bytes) {
     jobs.retain_mut(|job| {
         while job.taking {
             match job.request.body.try_recv() {
-                Ok(Some(Piece::Bytes(_))) => {}
+                Ok(Some(Piece::Bytes(..))) => {}
                 Ok(Some(Piece::End(_))) => {
                     job.taking = false;
                     job.answers.push_back(Answer::Head(Box::new(Reply {

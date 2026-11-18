@@ -42,7 +42,7 @@ use hyper_tls::{ServerConfig, version};
 use crate::door::Submitter;
 use crate::process::AccessKey;
 
-pub use conn::{BODY_PIECES, PIECE};
+pub use conn::PIECE;
 use sessions::Sessions;
 
 /// The connections one stock client opens to an endpoint at once by default, the AWS CLI's
@@ -102,21 +102,46 @@ pub const TLS_RECORD: usize = 5 + RECORD_PLAINTEXT + 2048;
 /// string to sign, the host's reply and the channels between the two; its fields are read where
 /// the head holds them, no table of them made, so none of this grows with their count), one body
 /// segment ([`PIECE`]), the piece a put's body is copied into, and one TLS record
-/// ([`TLS_RECORD`]). A put whose body is longer than one segment holds [`STREAMED_BYTES`]. Pinned
+/// ([`TLS_RECORD`]). A put whose body is longer than one segment holds [`streamed_bytes`]. Pinned
 /// by `tests/listener_memory.rs`
 /// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`), a head padded to
 /// its 8 KB with the most fields it carries among its cases.
 pub const REQUEST_BYTES: usize = mantle_http::MAX_HEAD + PIECE + TLS_RECORD;
 
+/// The most pieces a put's body holds in the host's queue: the cap on the depth the node learns
+/// (`door::Depth`). The bytes the node's memory division gives each connection
+/// ([`CONNECTION_BYTES`], `derive`'s charge for each of the listener's connections) past what a
+/// connection holds of a request beside its queue, its own read buffer ([`PIECE`]), one head
+/// ([`mantle_http::MAX_HEAD`]) and one TLS record ([`TLS_RECORD`]), in whole pieces, and at least
+/// one, the least that moves a body. Four at today's terms, the four pieces of body the charge was
+/// counted holding.
+pub fn most_pieces() -> usize {
+    let beside = PIECE
+        .saturating_add(mantle_http::MAX_HEAD)
+        .saturating_add(TLS_RECORD);
+    usize::try_from(CONNECTION_BYTES)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(beside)
+        .checked_div(PIECE)
+        .unwrap_or(0)
+        .max(1)
+}
+
 /// The most a put whose body is longer than one segment holds above its connection at rest: one
 /// head and one TLS record, as [`REQUEST_BYTES`], and the pieces of its body in the host's queue,
-/// at most the queue's depth of them ([`BODY_PIECES`]: one the host's driver takes while the
-/// connection reads the next). The connection waits for the queue's room before it copies a piece
+/// at most the queue's depth of them, which the node learns and caps at [`most_pieces`]. The
+/// connection waits for the queue's room before it copies a piece
 /// (`hyper_rt::sync::Sender::reserve`), so it holds no piece the queue has no room for, and the
-/// one it copies is one of the queue's. At a depth of one this is [`REQUEST_BYTES`]. Pinned by
+/// one it copies is one of the queue's. At a depth of one this is [`REQUEST_BYTES`]. A sum past a
+/// `usize` is past any memory, so it saturates there. Pinned at the cap by
 /// `tests/listener_memory.rs`
 /// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`).
-pub const STREAMED_BYTES: usize = mantle_http::MAX_HEAD + BODY_PIECES * PIECE + TLS_RECORD;
+pub fn streamed_bytes() -> usize {
+    most_pieces()
+        .saturating_mul(PIECE)
+        .saturating_add(mantle_http::MAX_HEAD)
+        .saturating_add(TLS_RECORD)
+}
 
 /// The connections past those it serves ([`Settings::connections`]) the listener answers `503
 /// SlowDown`, `Connection: close`, rather than closes: as many as one more stock client opens at
@@ -463,6 +488,22 @@ mod tests {
     use hyper_rt::combine::race2;
 
     use super::*;
+
+    /// The most pieces a body's queue holds are what the charge for a connection holds past its
+    /// read buffer, a head and a TLS record, at least one; a put at that depth holds no more above
+    /// its connection's rest than the charge.
+    #[test]
+    fn a_bodys_queue_holds_what_the_charge_for_a_connection_holds() {
+        let beside = PIECE + mantle_http::MAX_HEAD + TLS_RECORD;
+        let charge = usize::try_from(CONNECTION_BYTES).unwrap();
+        assert_eq!(most_pieces(), (charge - beside) / PIECE);
+        assert_eq!(most_pieces(), 4);
+        assert_eq!(
+            streamed_bytes(),
+            mantle_http::MAX_HEAD + most_pieces() * PIECE + TLS_RECORD
+        );
+        assert!(streamed_bytes() + PIECE <= charge);
+    }
 
     /// A listener spread over its runtime's second shard hands that shard the connection it
     /// accepts on the first: the connection's request is answered, and while its client holds it

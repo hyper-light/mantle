@@ -2811,7 +2811,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(());
             }
             match local.body.try_recv() {
-                Ok(Some(Piece::Bytes(bytes))) => {
+                Ok(Some(Piece::Bytes(bytes, paced))) => {
+                    // The piece's time from its send to this turn: a sample of the body's depth.
+                    if let Some(doorway) = self.doorway.as_mut() {
+                        doorway.took(paced);
+                    }
                     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                     self.moved = self.moved.saturating_add(len);
                     let took = match put.feed(&bytes) {

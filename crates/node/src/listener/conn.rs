@@ -29,7 +29,7 @@ use super::Endpoint;
 use super::io::{Io, IoError};
 use super::request::{self, Parts, Plan, Refused, Streamed, Upload};
 use super::respond::{self, Echo, Fields, Ids, Resource, Response};
-use crate::door::{self, Answer, Piece, Submitter};
+use crate::door::{self, Answer, Paced, Piece, Submitter};
 use mantle_protocol::bounds;
 use mantle_protocol::object::{Op, Status};
 
@@ -50,9 +50,6 @@ fn patience_ns() -> u64 {
 /// The octets a connection reads at once, and a body's piece: the native door's, the transport's
 /// receive chunk (`crate::node::PIECE`), so a put's driver takes the same pieces by either door.
 pub const PIECE: usize = hyper_transport::RECEIVE_CHUNK;
-
-/// A body's pieces in flight to the host: one the driver takes while the next is read.
-pub const BODY_PIECES: usize = 2;
 
 /// A reply's answers in flight from the host: its head, or a get's piece while the last is sent.
 const REPLY_PIECES: usize = 2;
@@ -535,10 +532,12 @@ impl Connection {
     ) -> Result<bool, ()> {
         let mut unread = has_body(framing) && body.is_some();
         let slow = |submitter: &Submitter| respond::slowed(submitter.slowed(door::Slowed::Door));
-        let (Ok((pieces, taken)), Ok((answers, mut replies))) = (
-            channel::<Piece>(BODY_PIECES),
-            channel::<Answer>(REPLY_PIECES),
-        ) else {
+        // The body's channel holds the pieces the node learned a body needs in flight, within what
+        // the node's memory gives a connection (`super::most_pieces`): fixed as it is made.
+        let depth = self.door.depth().min(super::most_pieces()).max(1);
+        let (Ok((pieces, taken)), Ok((answers, mut replies))) =
+            (channel::<Piece>(depth), channel::<Answer>(REPLY_PIECES))
+        else {
             return self
                 .refuse(&slow(&self.door), resource, ids, (version, head), unread)
                 .await;
@@ -767,7 +766,9 @@ impl Connection {
     }
 
     /// Streams a put's body to the host, a piece at a time as it takes them, so TCP's window
-    /// carries the backpressure; its end only once its digests and signatures held.
+    /// carries the backpressure; its end only once its digests and signatures held. Each piece
+    /// says when it was sent and how long it took to deliver ([`Paced`]), which the host learns the
+    /// body's depth from.
     async fn stream(
         &mut self,
         framing: Framing,
@@ -776,6 +777,8 @@ impl Connection {
     ) -> Result<(), Stopped> {
         let mut sha256 = Self::hasher(&upload)?;
         let mut body = http::Body::new(framing);
+        // When the last piece was sent: the next one's delivery is timed from it.
+        let mut last: Option<std::time::Instant> = None;
         let refuse = |why: Refused, status: Status| async move {
             // The job fails with the nearest status the host keeps; the listener's own answer is
             // the one written.
@@ -816,19 +819,27 @@ impl Connection {
                 let Some(payload) = data.get(payload).filter(|p| !p.is_empty()) else {
                     continue;
                 };
+                let ready = std::time::Instant::now();
                 // The queue's room is waited for before the piece is copied, so the connection
                 // holds no piece the host's queue has no room for: what it holds ahead of the host
-                // is the queue's pieces alone (`super::STREAMED_BYTES`). It is the queue's one
+                // is the queue's pieces alone (`super::streamed_bytes`). It is the queue's one
                 // sender, so the room it waited for is there for the piece.
                 let Ok(room) = pieces.reserve().await else {
                     return Err(Stopped::Host);
                 };
-                if room
-                    .send(Piece::Bytes(Bytes::copy_from_slice(payload)))
-                    .is_err()
-                {
+                let bytes = Bytes::copy_from_slice(payload);
+                let sent = std::time::Instant::now();
+                let paced = Paced {
+                    sent,
+                    delivered_ns: last.map(|last| {
+                        u64::try_from(ready.saturating_duration_since(last).as_nanos())
+                            .unwrap_or(u64::MAX)
+                    }),
+                };
+                if room.send(Piece::Bytes(bytes, paced)).is_err() {
                     return Err(Stopped::Host);
                 }
+                last = Some(sent);
                 self.door.wake();
             }
             self.input.take(step.consumed);

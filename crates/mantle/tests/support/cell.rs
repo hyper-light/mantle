@@ -84,19 +84,51 @@ pub(crate) const DEVICE_PATIENCE: Duration = mantle_protocol::bounds::STOCK_PATI
 /// over (github.com/giltene/jHiccup, `HiccupMeter.java`, `resolutionMs = 1.0`).
 pub(crate) const HOLD_TICK: Duration = Duration::from_millis(1);
 
-/// The most a wait goes on, however the cell moves meanwhile ([`Cell::waiting_on`]): a client's
-/// whole patience for one operation, past which no client of the cell waits for what it asked. It
-/// asks an operation at most `ATTEMPTS` times in a row with nothing taken, each attempt's dial, its
-/// dial again once its name is looked up again and its exchange ending once the stock patience
-/// passes with nothing moving (`Client::period_ns`, research/77 D2), and each pause between
-/// attempts at most `SLOWED_MOST` (`Client::slowed_wait`). A link a node dials ends within it as
-/// well: its dial's handshake within the idle timeout, under the stock patience, and its next dial
-/// within its stated reconnect, under the idle timeout (`bounds::pause`). A fact the cell has not
-/// stated by then, the cell moving all along, is one it moves without reaching.
-pub(crate) fn wait_bound() -> Duration {
+/// The most the work a wait awaits goes without advancing ([`Progress`]), and the whole of a wait
+/// that reads none, however the cell moves meanwhile ([`Cell::waiting_on`]): a client's whole
+/// patience for one operation, past which no client of the cell waits for what it asked. It asks an
+/// operation at most `ATTEMPTS` times in a row with nothing taken, each attempt's dial, its dial
+/// again once its name is looked up again and its exchange ending once the stock patience passes
+/// with nothing moving (`Client::period_ns`, research/77 D2), and each pause between attempts at
+/// most `SLOWED_MOST` (`Client::slowed_wait`). A link a node dials ends within it as well: its
+/// dial's handshake within the idle timeout, under the stock patience, and its next dial within its
+/// stated reconnect, under the idle timeout (`bounds::pause`). So each kind of work a wait reads
+/// takes its next step within it, or never: an operation is answered or its client gives up, an
+/// entry or a chunk crosses a link that is up or one dialed again, and a link changes state. A
+/// fact the cell has not stated by then, the cell moving all along, is one it moves without
+/// reaching.
+pub(crate) fn wait_patience() -> Duration {
     let waits_per_attempt = 3;
     (mantle_protocol::bounds::STOCK_PATIENCE * waits_per_attempt + mantle_client::SLOWED_MOST)
         * mantle_client::ATTEMPTS
+}
+
+/// What a wait reads of the work it awaits ([`Cell::waiting_on`]): a count that grows as that work
+/// goes on. The wait goes on while the count passes the highest it reached in the wait within
+/// [`wait_patience`] of the last time it did; a count that falls (a node killed, a client begun
+/// anew) and rises again moves the wait only past that highest. Each count has a ceiling the work
+/// reaches, so a wait whose fact never comes ends one patience after its work stops.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Progress<'a> {
+    /// None: the wait ends one patience after it began, however the cell moves. A process's start
+    /// or end, a thread's end, a leader's election, a record a node says once, and a member's
+    /// standing, each a step the cell takes or does not.
+    Unmeasured,
+    /// Client `id`'s operations, as it told each done: its work's ceiling is its operations.
+    Operations(u64),
+    /// Every client's operations, as each told them done, in all: the workload's.
+    Workload,
+    /// The ranges of nodes `ids`, each as far as the node applied it and no further than the
+    /// furthest running node had as the wait began: nodes catching up, whose count stops once they
+    /// have.
+    CaughtUp(&'a [u64]),
+    /// The cell's settle: the chunks each node's repair rebuilt and the bytes each node's transfers
+    /// moved, in all, each as far as the blocks to move.
+    Settle,
+    /// The links whose state, as their node last said it, ends with this: at most every pair's.
+    Links(&'a str),
+    /// A count the caller keeps of its own work, as of the caller's last look.
+    Counted(&'a std::cell::Cell<u64>),
 }
 
 /// RFC 5280 §4.1.2.5: the notAfter of a certificate with no well-defined expiration.
@@ -1896,9 +1928,11 @@ impl Cell {
     #[track_caller]
     pub(crate) fn listening(&mut self, id: u64) {
         let what = format!("node {id}'s start");
-        self.waiting_on(&what, DEVICE_PATIENCE, |c| match c.running.get(&id) {
-            Some(running) => running.bound.map(|_| ()),
-            None => panic!("node {id} ended before it listened: {:?}", c.status),
+        self.waiting_on(&what, DEVICE_PATIENCE, Progress::Unmeasured, |c| {
+            match c.running.get(&id) {
+                Some(running) => running.bound.map(|_| ()),
+                None => panic!("node {id} ended before it listened: {:?}", c.status),
+            }
         });
     }
 
@@ -2022,7 +2056,9 @@ impl Cell {
     #[track_caller]
     fn exited(&mut self, id: u64, running: &mut Running) -> std::process::ExitStatus {
         let what = format!("node {id}'s exit");
-        self.waiting_on(&what, Duration::ZERO, |_| running.child.try_wait().unwrap())
+        self.waiting_on(&what, Duration::ZERO, Progress::Unmeasured, |_| {
+            running.child.try_wait().unwrap()
+        })
     }
 
     /// Overwrites the first two pages of node `id`'s engine store, where both its superblocks
@@ -2099,13 +2135,14 @@ impl Cell {
 
     /// Waits until each of `observers` says each range's configuration is what `wanted` takes:
     /// its voters and its learners as that node's member applied them, each range one a node said
-    /// a configuration of (a cell `mantle init` made draws its ranges' groups).
+    /// a configuration of (a cell `mantle init` made draws its ranges' groups). It goes on while
+    /// the observers catch their ranges up, as a learner does before it votes.
     pub(crate) fn configured(
         &mut self,
         observers: &[u64],
         wanted: impl Fn(&[u64], &[u64]) -> bool,
     ) {
-        self.until(|c| {
+        self.until_by(Progress::CaughtUp(observers), |c| {
             let groups: BTreeSet<u128> = c.configs.keys().map(|(_, group)| *group).collect();
             let configured = groups.len() == c.ranges.len()
                 && observers.iter().all(|node| {
@@ -2249,27 +2286,43 @@ impl Cell {
     /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing, past
     /// the time the host held the watch: each wait at most `HOLD_TICK`, and a wait that ends late
     /// moves the watch's end by its lateness, so each spends exactly the span it scheduled. Fails
-    /// too once [`wait_bound`] passes, past the time the host held the watch over the whole wait,
-    /// however the cell moves meanwhile: a cell that keeps moving without `done` ever holding
+    /// too once [`wait_patience`] passes from its start, past the time the host held the watch
+    /// meanwhile, however the cell moves: a cell that keeps moving without `done` ever holding
     /// holds no wait open. A failure names the wait by its caller and says what the cell said last.
     #[track_caller]
     pub(crate) fn until<T>(&mut self, done: impl FnMut(&mut Self) -> Option<T>) -> T {
-        self.waiting_on("the wait", Duration::ZERO, done)
+        self.waiting_on("the wait", Duration::ZERO, Progress::Unmeasured, done)
     }
 
-    /// [`Cell::until`] for `what`, as its failure names it, its quiet period and its bound each
-    /// longer by `allowance`.
+    /// [`Cell::until`] for work `progress` reads: its patience runs from the last time that work
+    /// advanced, not from the wait's start.
+    #[track_caller]
+    pub(crate) fn until_by<T>(
+        &mut self,
+        progress: Progress<'_>,
+        done: impl FnMut(&mut Self) -> Option<T>,
+    ) -> T {
+        self.waiting_on("the wait", Duration::ZERO, progress, done)
+    }
+
+    /// [`Cell::until_by`] for `what`, as its failure names it, its quiet period and its patience
+    /// each longer by `allowance`.
     #[track_caller]
     pub(crate) fn waiting_on<T>(
         &mut self,
         what: &str,
         allowance: Duration,
+        progress: Progress<'_>,
         mut done: impl FnMut(&mut Self) -> Option<T>,
     ) -> T {
         let at = std::panic::Location::caller();
-        let bound = wait_bound() + allowance;
+        let patience = wait_patience() + allowance;
         let began = Instant::now();
-        // The host's holds over the whole wait, which no movement forgets, as the watch's are.
+        let furthest = self.furthest();
+        // The awaited work at its highest in this wait, when it last rose there, and the host's
+        // holds since, which no movement of the cell forgets, as the watch's are.
+        let mut highest = self.measured(progress, &furthest);
+        let mut rose = began;
         let mut host_held = Duration::ZERO;
         self.moved();
         loop {
@@ -2282,10 +2335,16 @@ impl Cell {
             if let Some(found) = done(self) {
                 return found;
             }
+            let measured = self.measured(progress, &furthest);
+            if measured > highest {
+                (highest, rose, host_held) = (measured, Instant::now(), Duration::ZERO);
+            }
             assert!(
-                began.elapsed() <= bound + host_held,
-                "{what} at {at}: not so within {bound:?}, besides {host_held:?} the host held the \
-                 watch, though the cell moved: {}",
+                rose.elapsed() <= patience + host_held,
+                "{what} at {at}: not so, its work {progress:?} at {highest} and no further within \
+                 {patience:?}, {:?} into the wait, besides {host_held:?} the host held the watch, \
+                 though the cell moved: {}",
+                began.elapsed(),
                 self.seen()
             );
             // What `done` waited on itself, a read it asked under a watch of its own, is not the
@@ -2323,6 +2382,50 @@ impl Cell {
                     self.seen()
                 ),
             }
+        }
+    }
+
+    /// Each range's applied index at its furthest running node, as each last said it.
+    fn furthest(&self) -> BTreeMap<u128, u64> {
+        let mut furthest = BTreeMap::new();
+        for &(id, group) in self.status.keys() {
+            if self.running.contains_key(&id) {
+                let applied = self.applied(id, group);
+                furthest
+                    .entry(group)
+                    .and_modify(|f: &mut u64| *f = (*f).max(applied))
+                    .or_insert(applied);
+            }
+        }
+        furthest
+    }
+
+    /// The count `progress` reads now, nodes catching up each range to its applied index in
+    /// `furthest`.
+    fn measured(&self, progress: Progress<'_>, furthest: &BTreeMap<u128, u64>) -> u64 {
+        match progress {
+            Progress::Unmeasured => 0,
+            Progress::Operations(id) => self.progress.get(&id).copied().unwrap_or(0),
+            Progress::Workload => self.progress.values().sum(),
+            Progress::CaughtUp(ids) => ids
+                .iter()
+                .flat_map(|id| {
+                    furthest
+                        .iter()
+                        .map(|(group, f)| self.applied(*id, *group).min(*f))
+                })
+                .sum(),
+            Progress::Settle => {
+                let rebuilt: u64 = self.repairs.values().map(|r| r.rebuilt).sum();
+                let moved: u64 = self.transfers.values().map(|(bytes, _)| bytes).sum();
+                rebuilt + moved
+            }
+            Progress::Links(state) => self
+                .links
+                .values()
+                .filter(|link| link.ends_with(state))
+                .count() as u64,
+            Progress::Counted(count) => count.get(),
         }
     }
 
@@ -2600,7 +2703,8 @@ impl Cell {
     /// node's commit as its log holds it may trail what it applied by the commit that moved alone,
     /// which rides the group's next write (hyper-durable), so applied is the measure.
     pub(crate) fn converged(&mut self, group: u128) -> u64 {
-        self.until(|c| {
+        let running: Vec<u64> = self.running.keys().copied().collect();
+        self.until_by(Progress::CaughtUp(&running), |c| {
             let mut ends = c.running.keys().map(|id| c.applied(*id, group));
             let first = ends.next()?;
             if first > 0 && ends.all(|a| a == first) {
@@ -2686,7 +2790,7 @@ impl Cell {
     /// of them in all.
     pub(crate) fn done_by(&mut self, ops: u64, quarters: u64) {
         let done = ops * CLIENTS * quarters / 4;
-        self.until(|c| {
+        self.until_by(Progress::Workload, |c| {
             if c.progress.values().sum::<u64>() >= done {
                 Some(())
             } else {
@@ -2728,7 +2832,7 @@ impl Cell {
     #[track_caller]
     pub(crate) fn joined<T>(&mut self, id: u64, done: u64, thread: JoinHandle<T>) -> T {
         let what = format!("client {id}'s {done} operations");
-        self.waiting_on(&what, Duration::ZERO, |c| {
+        self.waiting_on(&what, Duration::ZERO, Progress::Operations(id), |c| {
             if c.progress.get(&id).copied().unwrap_or(0) >= done {
                 Some(())
             } else {
@@ -2743,7 +2847,7 @@ impl Cell {
     /// watch. A failure, the watch's or the thread's own, names `what` at its caller.
     #[track_caller]
     pub(crate) fn watched<T>(&mut self, what: &str, thread: JoinHandle<T>) -> T {
-        self.waiting_on(what, Duration::ZERO, |_| {
+        self.waiting_on(what, Duration::ZERO, Progress::Unmeasured, |_| {
             if thread.is_finished() { Some(()) } else { None }
         });
         match thread.join() {
@@ -2761,7 +2865,7 @@ impl Cell {
 
     /// Waits until the gateway has done `done` of its operations.
     pub(crate) fn gateway_done(&mut self, done: u64) {
-        self.until(|c| {
+        self.until_by(Progress::Operations(GATEWAY), |c| {
             if c.progress.get(&GATEWAY).is_some_and(|d| *d >= done) {
                 Some(())
             } else {
@@ -2818,16 +2922,18 @@ impl Cell {
         }
     }
 
-    /// Waits until node `id`'s running process says the root range took its enlistment.
     /// Waits until node `id`'s running process says what its failure detectors start from: the
     /// cell's history and its own part of it.
     pub(crate) fn history(&mut self, id: u64) -> (Lived, Lived) {
         self.until(|c| c.histories.get(&id).copied())
     }
 
+    /// Waits until node `id`'s running process says the root range took its enlistment, which it
+    /// asks until its member of the root range applies the answer: the wait goes on while the node
+    /// catches its ranges up.
     #[track_caller]
     pub(crate) fn enlisted(&mut self, id: u64) {
-        self.until(|c| {
+        self.until_by(Progress::CaughtUp(&[id]), |c| {
             if c.enlisted.contains(&id) {
                 Some(())
             } else {

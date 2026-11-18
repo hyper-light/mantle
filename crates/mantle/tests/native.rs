@@ -132,7 +132,9 @@ fn watching<T>(
     said: impl FnOnce() -> String,
 ) -> T {
     let watched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cell.waiting_on(what, command_patience(), |_| done(child))
+        cell.waiting_on(what, command_patience(), Progress::Unmeasured, |_| {
+            done(child)
+        })
     }));
     match watched {
         Ok(found) => found,

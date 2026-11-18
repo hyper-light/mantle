@@ -119,7 +119,7 @@ fn run(
     let stdout = drained(child.0.stdout.take().unwrap());
     let stderr = drained(child.0.stderr.take().unwrap());
     let what = format!("{program} {args:?}");
-    let status = cell.waiting_on(&what, STOCK_PATIENCE, |_| {
+    let status = cell.waiting_on(&what, STOCK_PATIENCE, Progress::Unmeasured, |_| {
         let ended = stdout.is_finished()
             && stderr.is_finished()
             && writing.as_ref().is_none_or(JoinHandle::is_finished);

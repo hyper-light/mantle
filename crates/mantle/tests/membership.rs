@@ -383,9 +383,12 @@ fn lead(cell: &mut Cell, load: &mut Steady, ids: &[u64]) {
     let led = load.told_last;
     load.leads.send(Lead::Nodes(led, targets)).unwrap();
     // The load's word comes on its own channel: the cell's watch hears the nodes move as its puts
-    // commit, and the load is taken at each look.
-    cell.until(|_| {
+    // commit, and the load is taken at each look. Its round under way ends first, as its objects
+    // are acknowledged: that round's objects are the count's ceiling.
+    let acked = std::cell::Cell::new(load.acked.len() as u64);
+    cell.until_by(Progress::Counted(&acked), |_| {
         load.take();
+        acked.set(load.acked.len() as u64);
         holds(load.asking >= led)
     });
 }
@@ -394,8 +397,10 @@ fn lead(cell: &mut Cell, load: &mut Steady, ids: &[u64]) {
 fn acknowledged(cell: &mut Cell, load: &mut Steady, more: usize) {
     load.take();
     let wanted = load.acked.len() + more;
-    cell.until(|_| {
+    let acked = std::cell::Cell::new(load.acked.len() as u64);
+    cell.until_by(Progress::Counted(&acked), |_| {
         load.take();
+        acked.set(load.acked.len() as u64);
         holds(load.acked.len() >= wanted)
     });
 }
@@ -783,7 +788,7 @@ fn a_member_with_nothing_to_move_leaves_whole_and_one_stated_gone_is_refused() {
     });
     cell.until(|c| holds(stands(c, &founders, doomed, "delisted")));
     // Its identity refused at every founder: each link it keeps ends refused.
-    cell.until(|c| {
+    cell.until_by(Progress::Links("Identity"), |c| {
         holds(founders.iter().all(|f| {
             c.links
                 .get(&(doomed, *f))

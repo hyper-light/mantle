@@ -139,7 +139,7 @@ fn settled_after(
     mark: u64,
     mut done: impl FnMut(&Repairing) -> bool,
 ) -> Repairing {
-    cell.until(|c| {
+    cell.until_by(Progress::Settle, |c| {
         leading(c).filter(|r| r.settled && r.running == 0 && r.root_applied >= mark && done(r))
     })
 }
@@ -234,7 +234,7 @@ fn leave(cell: &mut Cell, id: u64) {
 /// node moved the cell meanwhile (`Cell::until`).
 #[track_caller]
 fn forgotten(cell: &mut Cell, g: Groups, id: u64) {
-    cell.until(|c| {
+    cell.until_by(Progress::Settle, |c| {
         if table(c, g).iter().any(|p| p.node == id) {
             None
         } else {
@@ -639,7 +639,7 @@ fn three_nodes_rebuild_a_volume_lost_mid_write_and_one_lost_at_rest() {
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     whole_on_disk(&mut cell, g, "b", &keys);
     // Each lost volume, once nothing names it, the table forgets: one volume a node.
-    cell.until(|c| {
+    cell.until_by(Progress::Settle, |c| {
         if table(c, g).len() == 3 {
             Some(())
         } else {
@@ -852,6 +852,7 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
     cell.waiting_on(
         "each running node's refusal of the node stated gone",
         Duration::ZERO,
+        Progress::Links("Identity"),
         |c| {
             let refused = others.iter().all(|peer| {
                 c.links

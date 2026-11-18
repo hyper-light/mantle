@@ -112,9 +112,9 @@ fn a_leader_killed_mid_write_loses_no_answered_write_and_catches_up_when_started
         }
     };
     // Killed part way: the writes after go through the survivors.
-    cell.until(written(WRITES));
+    cell.until_by(Progress::Operations(CLIENT), written(WRITES));
     cell.kill(leader);
-    cell.until(written(writes));
+    cell.until_by(Progress::Operations(CLIENT), written(writes));
     let answered = thread.join().unwrap();
     cell.start(leader);
     cell.introduce();
@@ -124,7 +124,7 @@ fn a_leader_killed_mid_write_loses_no_answered_write_and_catches_up_when_started
         .map(|id| cell.applied(id, GROUP))
         .max()
         .unwrap();
-    cell.until(|c| {
+    cell.until_by(Progress::CaughtUp(&[leader]), |c| {
         if c.applied(leader, GROUP) >= last {
             Some(())
         } else {
@@ -265,7 +265,8 @@ fn damaged_and_replaced(voters: u64) {
     cell.introduce();
     cell.tell_workload(spare);
     cell.replace(damaged, spare);
-    cell.until(|c| {
+    // The leader ends the replacement once the spare, a learner first, caught up.
+    cell.until_by(Progress::CaughtUp(&[spare]), |c| {
         if c.replaced.contains(&(GROUP, damaged, spare)) {
             Some(())
         } else {

@@ -681,11 +681,17 @@ impl World {
         );
         let rows = carries.then(|| self.operation_rows());
         self.step(action);
-        if let Some(rows) = rows
-            && self.operation_rows() != rows
-        {
+        if let Some(rows) = rows {
+            self.carried(&rows, &format!("{action:?}"));
+        }
+    }
+
+    /// Obligation 5: a split or a merge's step left the owners' operation rows as they were,
+    /// each with its key.
+    fn carried(&mut self, rows: &BTreeSet<(Vec<u8>, Vec<u8>)>, step: &str) {
+        if self.operation_rows() != *rows {
             self.broken.push(format!(
-                "5, carried with its key: {action:?} changed the operation rows"
+                "5, carried with its key: {step} changed the operation rows"
             ));
         }
     }
@@ -1823,7 +1829,9 @@ impl World {
         // Late requests arrive, and every merge in flight is carried to its end, each in turn,
         // since one may wait on another's end.
         while let Some(request) = self.late.pop() {
+            let rows = self.operation_rows();
             self.serve_merge(request);
+            self.carried(&rows, "a late merge request");
             self.check();
         }
         self.resume_merges();
@@ -1831,7 +1839,9 @@ impl World {
             if self.mergers.is_empty() {
                 break;
             }
+            let rows = self.operation_rows();
             self.merge_step(turn % self.mergers.len());
+            self.carried(&rows, "a resumed merge's step");
             self.check();
         }
         assert!(self.mergers.is_empty(), "a merge never finished");

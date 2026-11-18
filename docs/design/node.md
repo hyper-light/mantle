@@ -2014,7 +2014,10 @@ its transport and its QUIC door stay on the first shard, which keeps one durable
 writer and one UDP endpoint; the S3 connections go to the others. **The placement rule:** the
 listener accepts on the first shard and hands each connection it admits, served or answered
 refused, to the other shard with the fewest of its connections open, the first of those tied,
-through a channel of that shard's own bounded at the connections the listener holds at once
+passing over a shard hyper-rt's watchdog sees held in one poll past its limit (`watch::stalled`,
+where a connection would wait for the poll to end before its first byte is read) and one gone;
+with every other shard passed over, the first serves it, as it serves one a channel refuses. It
+goes through a channel of that shard's own bounded at the connections the listener holds at once
 (`listener::tasks`), so a channel never refuses one for want of room. A task on that shard takes
 each, adopts its socket and starts its connection there, so the connection's future is made on
 the shard that runs it, as hyper-rt's `tcp::serve` hands a connection off. A shard's count is a

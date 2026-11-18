@@ -1,7 +1,8 @@
 //! The S3 listener's connections spread over the node's shards (node.md §4.1). The listener
 //! accepts on the node's shard, the first, which keeps the node's ranges, its log, its transport
 //! and its QUIC door: one durable owner, one log writer, one UDP endpoint. It hands each connection
-//! to the lane of another shard with the fewest connections open ([`least`]): a channel of that
+//! to the lane of another shard with the fewest connections open ([`least`]), passing over a shard
+//! hyper-rt's watchdog sees held in one poll past its limit and one gone: a channel of that
 //! shard's own, bounded at the connections the listener holds at once, whose taker, a task on that
 //! shard, starts the connection there, so the connection's future is made on the shard that runs
 //! it, as hyper-rt's `tcp::serve` hands a connection off. A lane that refuses one, its channel full
@@ -17,8 +18,10 @@ use hyper_rt::SlotHolder;
 use hyper_rt::sync::{Sender, SyncError, channel};
 use hyper_rt::tcp::{ConnectionBudget, ConnectionSlot};
 
-/// A shard connections are handed to: the channel its taker reads, and the connections open there.
+/// A shard connections are handed to: the shard, the channel its taker reads, and the connections
+/// open there.
 pub(crate) struct Lane<T> {
+    holder: SlotHolder,
     sender: Sender<T>,
     open: ConnectionBudget,
 }
@@ -44,7 +47,11 @@ impl<T: Send + 'static> Lane<T> {
             }
         };
         hyper_rt::runtime::submit_to_holder(holder, taker)?;
-        Ok(Self { sender, open })
+        Ok(Self {
+            holder,
+            sender,
+            open,
+        })
     }
 }
 
@@ -52,6 +59,13 @@ impl<T> Lane<T> {
     /// The connections open on the lane's shard.
     pub(crate) fn open(&self) -> u64 {
         self.open.open()
+    }
+
+    /// Whether the lane's shard takes a connection now: neither gone, nor held in one poll past its
+    /// limit, as hyper-rt's watchdog sees it (`watch::stalled`), where a connection handed to it
+    /// would wait for the poll to end before its first byte is read.
+    pub(crate) fn takes(&self) -> bool {
+        hyper_rt::watch::stalls(self.holder).is_some_and(|stalls| !stalls.stalled)
     }
 
     /// A connection's place in the lane's count, held by its stream and given back as the stream
@@ -73,9 +87,14 @@ impl<T> Lane<T> {
     }
 }
 
-/// The lane with the fewest connections open, the first of those tied; none of no lanes.
+/// The lane with the fewest connections open, the first of those tied, of those whose shard takes a
+/// connection now ([`Lane::takes`]); none where no lane's does, and the listener serves the
+/// connection on its own shard, as it does one a lane refuses.
 pub(crate) fn least<T>(lanes: &[Lane<T>]) -> Option<&Lane<T>> {
-    lanes.iter().min_by_key(|lane| lane.open())
+    lanes
+        .iter()
+        .filter(|lane| lane.takes())
+        .min_by_key(|lane| lane.open())
 }
 
 #[cfg(test)]
@@ -153,6 +172,104 @@ pub(crate) mod tests {
         assert!(std::ptr::eq(least(&lanes).unwrap(), &lanes[1]));
         drop(lanes);
         rt.shutdown().unwrap();
+    }
+
+    /// A runtime of `shards` shards whose watchdog's limit is short: a fixed quantum of a
+    /// millisecond and a batch of one, a limit of two milliseconds (hyper-rt `watch`). Each shard
+    /// holds a lane's taker and a wedged task, its control queue taking both at once.
+    fn watched(shards: u16) -> Runtime {
+        Runtime::start(&RuntimeConfig {
+            shards,
+            tasks_per_shard: 2,
+            timers_per_shard: 1,
+            interests_per_shard: hyper_rt::runtime::interests_for(2),
+            ring_entries: 2,
+            step_budget_ns: 1_000_000,
+            timer_tick_ns: 100_000,
+            batch: 1,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: usize::try_from(hyper_rt::machine::facts::Facts::query().page.base)
+                .unwrap(),
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        })
+        .unwrap()
+    }
+
+    /// Wedges the shard `holder` names in one poll, blocked inside a call until the sender it
+    /// returns is dropped.
+    fn wedge(holder: SlotHolder) -> std::sync::mpsc::SyncSender<()> {
+        let (release, released) = sync_channel::<()>(1);
+        hyper_rt::runtime::submit_to_holder(holder, async move {
+            let _ = released.recv();
+        })
+        .unwrap();
+        release
+    }
+
+    /// Waits until `test` holds: the watchdog's look comes every half limit, a millisecond, so ten
+    /// seconds is far past it on a loaded host and only fails a test that would never hold.
+    fn wait_for(what: &str, mut test: impl FnMut() -> bool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !test() {
+            assert!(std::time::Instant::now() < until, "waited for {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Placement passes over a lane whose shard the watchdog sees held in one poll past its limit,
+    /// the fewest open among the rest taking the connection; with every lane's shard held, or
+    /// gone, there is none, and the listener serves the connection on its own shard. A shard let
+    /// go takes connections again.
+    #[test]
+    fn placement_passes_over_a_stalled_or_gone_shard() {
+        let rt = watched(4);
+        let holders: Vec<SlotHolder> = rt.shard_ids()[1..]
+            .iter()
+            .map(|shard| rt.holder_of(*shard).unwrap())
+            .collect();
+        let lane = |holder: SlotHolder, open: u64| {
+            let lane = Lane::new(holder, 8, |()| {}).unwrap();
+            let held: Vec<ConnectionSlot> = (0..open).map(|_| lane.place().unwrap()).collect();
+            (lane, held)
+        };
+        let (a, _a) = lane(holders[0], 3);
+        let (b, _b) = lane(holders[1], 1);
+        let (c, _c) = lane(holders[2], 2);
+        let lanes = [a, b, c];
+        assert!(lanes.iter().all(Lane::takes));
+        // 3, 1, 2 open: the second.
+        assert!(std::ptr::eq(least(&lanes).unwrap(), &lanes[1]));
+
+        // The second's shard held: the third, the fewest of the rest.
+        let held_b = wedge(holders[1]);
+        wait_for("the second shard stalled", || {
+            hyper_rt::watch::stalled(holders[1])
+        });
+        assert!(!lanes[1].takes());
+        assert!(std::ptr::eq(least(&lanes).unwrap(), &lanes[2]));
+
+        // Every lane's shard held: none, the listener's own shard serves it.
+        let held_a = wedge(holders[0]);
+        let held_c = wedge(holders[2]);
+        wait_for("every shard stalled", || {
+            holders.iter().all(|h| hyper_rt::watch::stalled(*h))
+        });
+        assert!(least(&lanes).is_none());
+
+        // Let go, the second takes connections again.
+        drop((held_a, held_b, held_c));
+        wait_for("no shard stalled", || {
+            holders.iter().all(|h| !hyper_rt::watch::stalled(*h))
+        });
+        assert!(std::ptr::eq(least(&lanes).unwrap(), &lanes[1]));
+
+        // Every lane's shard gone: none.
+        rt.shutdown().unwrap();
+        assert!(lanes.iter().all(|lane| !lane.takes()));
+        assert!(least(&lanes).is_none());
     }
 
     /// A connection handed to a lane is adopted on the lane's shard, its task run there, and its

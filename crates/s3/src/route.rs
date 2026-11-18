@@ -9,6 +9,8 @@
 //! CNAME rule only when configured to: otherwise a request to an address the deployment did
 //! not expect would silently name a bucket.
 
+use std::borrow::Cow;
+
 use crate::sigv4::{Fields, percent_decode};
 
 /// The endpoint's addressing.
@@ -88,12 +90,15 @@ pub enum Operation {
     ListParts,
 }
 
-/// A request's operation and what it names.
+/// A request's operation and what it names: its bucket and key borrowed from the request's head
+/// where it holds them as they are, made into strings of their own only where they carry an
+/// escape or a virtual host its capitals, so a warmed request routes without allocating
+/// (Lean doors step 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Route {
+pub struct Route<'r> {
     pub operation: Operation,
-    pub bucket: Option<String>,
-    pub key: Option<String>,
+    pub bucket: Option<Cow<'r, str>>,
+    pub key: Option<Cow<'r, str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -148,14 +153,14 @@ const UNSUPPORTED: [&str; 11] = [
 
 /// Finds a request's route. `host` is the `Host` header, `path` the request target's path as
 /// sent, still percent-encoded, and `query` its query string.
-pub fn route(
+pub fn route<'r>(
     endpoint: &Endpoint,
     method: &str,
-    host: Option<&str>,
-    path: &str,
+    host: Option<&'r str>,
+    path: &'r str,
     query: &str,
     headers: &(impl Fields + ?Sized),
-) -> Result<Route, RouteError> {
+) -> Result<Route<'r>, RouteError> {
     let (bucket, key) = target(endpoint, host, path)?;
     // A preflight asks about the request it precedes, whose parameters it may carry: it is
     // answered from the bucket's CORS rules whatever its query (16 §3).
@@ -392,29 +397,24 @@ fn object_operation(method: &str, q: &Query, copy: bool) -> Result<Operation, Ro
 }
 
 /// The bucket and key a request names (05 §14).
-fn target(
+fn target<'r>(
     endpoint: &Endpoint,
-    host: Option<&str>,
-    path: &str,
-) -> Result<(Option<String>, Option<String>), RouteError> {
+    host: Option<&'r str>,
+    path: &'r str,
+) -> Result<Named<'r>, RouteError> {
     let path = path.strip_prefix('/').ok_or(RouteError::InvalidUri)?;
-    let decoded = |s: &str| -> Result<String, RouteError> {
+    let decoded = |s: &'r str| -> Result<Cow<'r, str>, RouteError> {
+        if !s.contains('%') {
+            return Ok(Cow::Borrowed(s));
+        }
         String::from_utf8(percent_decode(s.as_bytes()).ok_or(RouteError::InvalidUri)?)
+            .map(Cow::Owned)
             .map_err(|_| RouteError::InvalidUri)
     };
-    let host = host.map(|h| strip_port(h).to_ascii_lowercase());
-    let bucket_from_host = match host.as_deref() {
+    let bucket_from_host = match host.map(|h| lowercase(strip_port(h))) {
         None => None,
-        Some(h) if is_path_style_host(endpoint, h) => None,
-        Some(h) => match endpoint
-            .domains
-            .iter()
-            .find_map(|d| h.strip_suffix(d.as_str()).and_then(|b| b.strip_suffix('.')))
-        {
-            Some(bucket) => Some(bucket.to_owned()),
-            None if endpoint.cname => Some(h.to_owned()),
-            None => return Err(RouteError::InvalidUri),
-        },
+        Some(h) if is_path_style_host(endpoint, &h) => None,
+        Some(h) => Some(virtual_bucket(endpoint, h)?),
     };
     let (bucket, key) = match bucket_from_host {
         Some(bucket) => (
@@ -431,10 +431,41 @@ fn target(
     if key.as_ref().is_some_and(|k| k.len() > MAX_KEY) {
         return Err(RouteError::KeyTooLong);
     }
-    if bucket.as_ref().is_some_and(String::is_empty) {
+    if bucket.as_ref().is_some_and(|b| b.is_empty()) {
         return Err(RouteError::InvalidUri);
     }
     Ok((bucket, key))
+}
+
+/// A request's bucket and key, as [`Route`] holds them.
+type Named<'r> = (Option<Cow<'r, str>>, Option<Cow<'r, str>>);
+
+/// `host` in lowercase, as DNS compares names (RFC 4343): borrowed where it has no capitals.
+fn lowercase(host: &str) -> Cow<'_, str> {
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host)
+    }
+}
+
+/// The bucket a virtual host names: the host before one of the endpoint's domains, or the whole
+/// host where the endpoint takes a CNAME's.
+fn virtual_bucket<'r>(endpoint: &Endpoint, host: Cow<'r, str>) -> Result<Cow<'r, str>, RouteError> {
+    let named = endpoint.domains.iter().find_map(|d| {
+        host.strip_suffix(d.as_str())
+            .and_then(|b| b.strip_suffix('.'))
+            .map(str::len)
+    });
+    match named {
+        Some(len) => match host {
+            Cow::Borrowed(h) => h.get(..len).map(Cow::Borrowed),
+            Cow::Owned(h) => h.get(..len).map(|b| Cow::Owned(b.to_owned())),
+        }
+        .ok_or(RouteError::InvalidUri),
+        None if endpoint.cname => Ok(host),
+        None => Err(RouteError::InvalidUri),
+    }
 }
 
 fn is_path_style_host(endpoint: &Endpoint, host: &str) -> bool {
@@ -525,8 +556,28 @@ mod tests {
     /// A request with no fields.
     const NONE: [(&str, &str); 0] = [];
 
-    fn r(method: &str, host: &str, path: &str, query: &str) -> Result<Route, RouteError> {
+    fn r<'a>(
+        method: &str,
+        host: &'a str,
+        path: &'a str,
+        query: &str,
+    ) -> Result<Route<'a>, RouteError> {
         route(&endpoint(), method, Some(host), path, query, &NONE)
+    }
+
+    /// A bucket and key with no escape are borrowed from the request as it came; an escape, or a
+    /// virtual host's capitals, make a string of their own.
+    #[test]
+    fn a_plain_route_borrows_its_names() {
+        let plain = r("GET", "s3.example.com", "/photos/2024/a.jpg", "").unwrap();
+        assert!(matches!(plain.bucket, Some(Cow::Borrowed("photos"))));
+        assert!(matches!(plain.key, Some(Cow::Borrowed("2024/a.jpg"))));
+        let escaped = r("GET", "s3.example.com", "/photos/a%20b", "").unwrap();
+        assert!(matches!(escaped.key, Some(Cow::Owned(ref k)) if k == "a b"));
+        let hosted = r("GET", "photos.s3.example.com", "/a", "").unwrap();
+        assert!(matches!(hosted.bucket, Some(Cow::Borrowed("photos"))));
+        let capitals = r("GET", "Photos.S3.Example.com", "/a", "").unwrap();
+        assert!(matches!(capitals.bucket, Some(Cow::Owned(ref b)) if b == "photos"));
     }
 
     fn op(method: &str, path: &str, query: &str) -> Operation {

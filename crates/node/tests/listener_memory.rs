@@ -787,3 +787,59 @@ fn a_warmed_request_reallocates_none_of_the_doors_buffers() {
         }
     }
 }
+
+/// A warmed request allocates only what crosses to the host, one copy its door does not read and,
+/// over TLS, hyper-tls's buffer of each record, from its connection at rest to its answer read
+/// whole, over plain HTTP, TLS 1.3 and TLS 1.2: a HEAD, a GET, a PUT of 1 octet and a DELETE. The
+/// door parses the head in place in the connection's buffer, routes it to the bucket and key the
+/// head holds, checks its signature in buffers on the stack and a put's payload digest in an array,
+/// and names the account the node's configuration holds. What it allocates, each named:
+///
+/// - the request, boxed into the door's queue (`door::Submitter::submit`), which the host takes;
+/// - the channel the body crosses on and the one the reply comes back on, each a ring, its room's
+///   slots and their shared state (`hyper_rt::sync::channel`), whose other ends the host holds;
+/// - the operation's bucket and key, and the account it acts for (`door::Request::principal`),
+///   strings of their own because the host holds them past the head's buffer;
+/// - a put's piece of body (`Piece::Bytes`), the host's to write;
+/// - the access key `sigv4::verify` copies into its `Verified`, which the door does not read, and
+///   which is the one it could still cut.
+///
+/// The host is the test's own (`host`): its reply's box and a reply's etag are the host's, not the
+/// door's. hyper-tls copies each record it reads into a buffer of its own
+/// (`CommonState::take_received_plaintext`) and writes each into one (`PrefixedPayload`): a
+/// request's head is one record, a put's body one more; an answer is one record, a GET's of four
+/// segments 17, its head and 262,108 octets at 16,384 a record.
+#[test]
+fn a_warmed_request_allocates_only_what_crosses_to_the_host() {
+    let many = 4 * PIECE;
+    for over in [Over::Plain, Over::Tls13, Over::Tls12] {
+        for (method, size) in [
+            (Method::Head, many),
+            (Method::Get, many),
+            (Method::Put, 1),
+            (Method::Delete, 0),
+        ] {
+            let (counts, status) = one_request(over, (method, size, Padded::No));
+            let put = u64::from(matches!(method, Method::Put));
+            // Its box, its two channels of three each, its bucket, key and account; a put's piece.
+            let crossing = 1 + 2 * 3 + 3 + put;
+            // `Verified::access_key`.
+            let unread = 1;
+            // The test's host's reply: its box, and its etag but a delete's.
+            let host = 1 + u64::from(!matches!(method, Method::Delete));
+            let records = match (over, method) {
+                (Over::Plain, _) => 0,
+                (_, Method::Get) => 1 + 17,
+                _ => 1 + put + 1,
+            };
+            let case = format!("{over:?} {method:?} {size}");
+            eprintln!("{case}: {} allocations", counts.allocations);
+            assert!(matches!(status, 200 | 204), "{case}: {status}");
+            assert_eq!(
+                counts.allocations,
+                crossing + unread + host + records,
+                "{case}: allocations past those named"
+            );
+        }
+    }
+}

@@ -21,7 +21,8 @@ use hyper_rt::sync::{Sender, channel};
 use hyper_rt::tcp::ConnectionSlot;
 use mantle_http::write::{self, Length};
 use mantle_http::{self as http, Framing, Head, Refusal, Version};
-use mantle_s3::checksum::{Algorithm, Checksum, Hasher};
+use mantle_s3::checksum::{Algorithm, Checksum};
+use mantle_s3::crypto::{self, Digest};
 use mantle_s3::route::Query;
 
 use super::Endpoint;
@@ -351,7 +352,7 @@ impl Connection {
         let echo = Echo {
             route: &route,
             query: &query,
-            principal: &principal,
+            principal,
             region: &self.endpoint.region,
             head: is_head,
             checksums: parts
@@ -391,9 +392,10 @@ impl Connection {
                 }
             }
         };
+        // The account's own string, which the host holds as its request's (`door::Request`).
         let exchanged = self
             .exchange(
-                (op, principal.clone(), denied),
+                (op, principal.to_owned(), denied),
                 body,
                 (framing, continues),
                 (&echo, &ids, resource),
@@ -406,12 +408,13 @@ impl Connection {
     /// What `parts` asks, routed, its signature checked against the key it claims, and judged:
     /// the account's root's key from the node's configuration, or a principal's from the cell's
     /// root range, looked up through the door as the request arrives (docs/design/principals.md).
-    async fn authenticated(
+    async fn authenticated<'h>(
         &self,
-        parts: &Parts<'_>,
+        parts: &Parts<'h>,
         framing: Framing,
-    ) -> Result<request::Asked, Refused> {
-        let route = request::routed(parts, self.endpoint)?;
+    ) -> Result<request::Asked<'h>, Refused> {
+        let endpoint: &'static Endpoint = self.endpoint;
+        let route = request::routed(parts, endpoint)?;
         // What the connection's polls hold its shard for from here to the request's end.
         crate::labels::set(Some(crate::labels::s3(&route.operation)));
         let claimed = request::claimed(parts)?;
@@ -419,9 +422,9 @@ impl Connection {
             secure: self.endpoint.certified.is_some(),
             address: self.peer,
         };
-        if let Some(root) = self.endpoint.key(&claimed) {
+        if let Some(root) = endpoint.key(&claimed) {
             let key = request::Key::Root(root);
-            return request::ask(parts, (self.endpoint, route, &key, source), now(), framing);
+            return request::ask(parts, (endpoint, route, &key, source), now(), framing);
         }
         let unknown = || Refused::new("InvalidAccessKeyId", 403, "the access key is not known");
         // A key in another form than the cell draws is no principal's, and is asked of no range.
@@ -430,8 +433,9 @@ impl Connection {
         }
         // The account a principal acts for is the one the cell's keys act for; a node with no key
         // of the account's has none to name.
-        let account = self.endpoint.account().ok_or_else(unknown)?;
-        let signer = match self.look_up(claimed).await {
+        let account = endpoint.account().ok_or_else(unknown)?;
+        // The key's id crosses to the host, which reads its row (`door::KeyAsk`).
+        let signer = match self.look_up(claimed.into_owned()).await {
             door::Signed::Principal(signer) => signer,
             door::Signed::Unknown => return Err(unknown()),
             door::Signed::Refused(status) => return Err(respond::refusal(status)),
@@ -441,7 +445,7 @@ impl Connection {
             signer: &signer,
             account,
         };
-        request::ask(parts, (self.endpoint, route, &key, source), now(), framing)
+        request::ask(parts, (endpoint, route, &key, source), now(), framing)
     }
 
     /// Key `id` as the node reads it from the root range: asked through the door, the answer on
@@ -693,7 +697,7 @@ impl Connection {
     fn decode(
         upload: &mut Upload,
         data: &[u8],
-        sha256: &mut Option<Hasher>,
+        sha256: &mut Option<Digest>,
     ) -> Result<(usize, std::ops::Range<usize>), Refused> {
         match upload {
             Upload::Plain(_) => {
@@ -712,16 +716,17 @@ impl Connection {
 
     /// The body's end as `upload` reads it: the signed digest compared, or aws-chunked's trailer
     /// and its checksum.
-    fn ended(upload: Upload, sha256: Option<Hasher>) -> Result<Option<Checksum>, Refused> {
+    fn ended(upload: Upload, sha256: Option<Digest>) -> Result<Option<Checksum>, Refused> {
         match upload {
             Upload::Plain(Some(expected)) => {
+                // The digest as an array of its own length, which needs no buffer made for it.
                 let digest = sha256
-                    .map(Hasher::finish)
+                    .map(Digest::finish_array::<32>)
                     .transpose()
                     .ok()
                     .flatten()
                     .ok_or_else(|| Refused::new("InternalError", 500, "a body's digest"))?;
-                if digest.bytes.as_slice() != expected.as_slice() {
+                if digest != expected {
                     return Err(Refused::new(
                         "XAmzContentSHA256Mismatch",
                         400,
@@ -752,9 +757,9 @@ impl Connection {
         }
     }
 
-    fn hasher(upload: &Upload) -> Result<Option<Hasher>, Stopped> {
+    fn hasher(upload: &Upload) -> Result<Option<Digest>, Stopped> {
         match upload {
-            Upload::Plain(Some(_)) => Hasher::new(Algorithm::Sha256).map(Some).map_err(|_| {
+            Upload::Plain(Some(_)) => Digest::new(&crypto::SHA256).map(Some).map_err(|_| {
                 Stopped::Refused(Refused::new("InternalError", 500, "a body's digest"))
             }),
             _ => Ok(None),

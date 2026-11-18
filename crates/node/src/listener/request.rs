@@ -8,6 +8,8 @@
 //! that account, so its retries are one operation (gateway.md §2.1) and no principal can name
 //! another's.
 
+use std::borrow::Cow;
+
 use mantle_http::{Framing, Head};
 use mantle_s3::checksum::{self, Algorithm, Checksum};
 use mantle_s3::chunked::Decoder;
@@ -174,25 +176,27 @@ pub enum Plan {
     },
 }
 
-/// A request the listener will hand over: what it routes to, who asks, and its plan.
-pub struct Asked {
-    pub route: Route,
-    pub principal: String,
+/// A request the listener will hand over: what it routes to, borrowed from its head where the
+/// head holds it, who asks, the account as the node's configuration holds it, and its plan.
+pub struct Asked<'a> {
+    pub route: Route<'a>,
+    pub principal: &'a str,
     pub plan: Plan,
 }
 
-/// The key a request is signed with, as the cell holds it.
-pub enum Key<'k> {
+/// The key a request is signed with, as the cell holds it: a principal's signer as the root range
+/// gave it, `'s`, and the account as the node's configuration holds it, `'a`.
+pub enum Key<'s, 'a> {
     /// One of the account's root's keys, from the node's configuration (`mantle init`).
-    Root(&'k crate::process::AccessKey),
+    Root(&'a crate::process::AccessKey),
     /// A principal's, from the root range, under the account the cell's keys act for.
     Principal {
-        signer: &'k Signer,
-        account: &'k str,
+        signer: &'s Signer,
+        account: &'a str,
     },
 }
 
-impl Key<'_> {
+impl<'a> Key<'_, 'a> {
     fn secret(&self) -> &str {
         match self {
             Self::Root(key) => &key.secret,
@@ -203,7 +207,7 @@ impl Key<'_> {
     /// The account a request signed with the key acts for: the root's, or the principal's own
     /// account's, which owns what its principals make, as an AWS account owns what its users
     /// make (research/91 §1).
-    fn account(&self) -> &str {
+    fn account(&self) -> &'a str {
         match self {
             Self::Root(key) => &key.account,
             Self::Principal { account, .. } => account,
@@ -220,7 +224,7 @@ pub struct Source {
 }
 
 /// What `parts` routes to (node.md §4.2, step 2).
-pub fn routed(parts: &Parts<'_>, endpoint: &Endpoint) -> Result<Route, Refused> {
+pub fn routed<'h>(parts: &Parts<'h>, endpoint: &Endpoint) -> Result<Route<'h>, Refused> {
     route::route(
         &endpoint.addressing,
         parts.method,
@@ -232,8 +236,9 @@ pub fn routed(parts: &Parts<'_>, endpoint: &Endpoint) -> Result<Route, Refused> 
     .map_err(|e| Refused::of(e.code(), &e))
 }
 
-/// The access key `parts`'s signature claims, its form checked before any key is looked up.
-pub fn claimed(parts: &Parts<'_>) -> Result<String, Refused> {
+/// The access key `parts`'s signature claims, its form checked before any key is looked up:
+/// borrowed from its `Authorization` header.
+pub fn claimed<'p>(parts: &'p Parts<'p>) -> Result<Cow<'p, str>, Refused> {
     sigv4::access_key(&request_of(parts)).map_err(|e| Refused::of(e.code(), &e))
 }
 
@@ -249,12 +254,12 @@ fn request_of<'p>(parts: &'p Parts<'p>) -> sigv4::Request<'p, Parts<'p>> {
 /// Reads what `parts` asks of `route`, its signature checked at `now` (Unix seconds) against
 /// `key`, the one it claimed, and a principal's request judged by its identity policy, from
 /// `source`. `framing` is how its body is framed, which says whether it has one.
-pub fn ask(
-    parts: &Parts<'_>,
-    (endpoint, route, key, source): (&Endpoint, Route, &Key<'_>, Source),
+pub fn ask<'a>(
+    parts: &Parts<'a>,
+    (endpoint, route, key, source): (&Endpoint, Route<'a>, &Key<'_, 'a>, Source),
     now: i64,
     framing: Framing,
-) -> Result<Asked, Refused> {
+) -> Result<Asked<'a>, Refused> {
     let verified = sigv4::verify(&request_of(parts), &endpoint.region, now, |_| {
         Some(key.secret())
     })
@@ -270,8 +275,8 @@ pub fn ask(
         )?)),
         Key::Root(_) => None,
     };
-    let principal = key.account().to_owned();
-    let id = identity(parts, &principal)?;
+    let principal = key.account();
+    let id = identity(parts, principal)?;
     let plan = plan(parts, (&route, &query), verified, id, framing, judge)?;
     Ok(Asked {
         route,
@@ -331,7 +336,7 @@ impl Judge {
 fn judge(
     signer: &Signer,
     account: &str,
-    (parts, route, query): (&Parts<'_>, &Route, &Query),
+    (parts, route, query): (&Parts<'_>, &Route<'_>, &Query),
     source: Source,
     now: i64,
 ) -> Result<Judge, Refused> {
@@ -389,7 +394,7 @@ fn judge(
 /// object's ARN. An operation S3 names no action for asks what no policy grants: `AccessDenied`.
 fn asks(
     parts: &Parts<'_>,
-    route: &Route,
+    route: &Route<'_>,
     query: &Query,
 ) -> Result<Vec<(&'static str, String)>, Refused> {
     let source = match route.operation {
@@ -415,7 +420,7 @@ fn deleting(versioned: bool) -> &'static [&'static str] {
 /// [`asks`] of `route`, `versioned` where its query names a version, and a copy's `source`; a
 /// copy with no source asks what no policy grants.
 fn asked(
-    route: &Route,
+    route: &Route<'_>,
     versioned: bool,
     source: Option<&copy::Source>,
 ) -> Result<Vec<(&'static str, String)>, Refused> {
@@ -482,18 +487,21 @@ fn identity(parts: &Parts<'_>, principal: &str) -> Result<u128, Refused> {
     Ok(u128::from_le_bytes(octets))
 }
 
-/// The bucket a route names, which every operation but ListBuckets has.
-fn bucket(route: &Route) -> Result<String, Refused> {
+/// The bucket a route names, which every operation but ListBuckets has: a string of its own, as
+/// the operation that crosses to the host holds it.
+fn bucket(route: &Route<'_>) -> Result<String, Refused> {
     route
         .bucket
-        .clone()
+        .as_deref()
+        .map(str::to_owned)
         .ok_or_else(|| Refused::new("InvalidRequest", 400, "no bucket named"))
 }
 
-fn key(route: &Route) -> Result<String, Refused> {
+fn key(route: &Route<'_>) -> Result<String, Refused> {
     route
         .key
-        .clone()
+        .as_deref()
+        .map(str::to_owned)
         .ok_or_else(|| Refused::new("InvalidRequest", 400, "no key named"))
 }
 
@@ -563,7 +571,7 @@ fn headers(parts: &Parts<'_>, range: bool) -> Headers {
 
 fn plan(
     parts: &Parts<'_>,
-    (route, query): (&Route, &Query),
+    (route, query): (&Route<'_>, &Query),
     verified: Verified,
     id: u128,
     framing: Framing,
@@ -822,7 +830,7 @@ fn count(value: Option<&str>, most: usize) -> Result<u32, Refused> {
 }
 
 /// ListObjectsV2's request (05 §6.2): a continuation token mantle issued, else `start-after`.
-fn list(route: &Route, query: &Query) -> Result<List, Refused> {
+fn list(route: &Route<'_>, query: &Query) -> Result<List, Refused> {
     let start = match query.value("continuation-token") {
         Some(token) => Some(s3list::continuation_start(token).ok_or_else(|| {
             Refused::new(
@@ -852,7 +860,7 @@ fn list(route: &Route, query: &Query) -> Result<List, Refused> {
 
 /// ListObjectVersions' request (research/89 §2.3): its markers, the version ID marker only with
 /// a key marker, and its page's size.
-fn list_versions(route: &Route, query: &Query) -> Result<ListVersions, Refused> {
+fn list_versions(route: &Route<'_>, query: &Query) -> Result<ListVersions, Refused> {
     let key_marker = query
         .value("key-marker")
         .filter(|m| !m.is_empty())
@@ -1258,11 +1266,11 @@ fn held(document: &[u8], md5: Option<[u8; 16]>, checksum: Option<Checksum>) -> R
 mod tests {
     use super::*;
 
-    fn route(operation: Operation, key: Option<&str>) -> Route {
+    fn route(operation: Operation, key: Option<&str>) -> Route<'_> {
         Route {
             operation,
             bucket: Some("dst".into()),
-            key: key.map(str::to_owned),
+            key: key.map(Cow::Borrowed),
         }
     }
 

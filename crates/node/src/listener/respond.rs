@@ -352,7 +352,7 @@ impl Ids<'_> {
 pub enum Resource<'a> {
     Text(&'a str),
     /// The bucket and key as the request's path names them.
-    Route(&'a Route),
+    Route(&'a Route<'a>),
 }
 
 impl Resource<'_> {
@@ -399,7 +399,7 @@ pub fn error(
 
 /// What a response echoes of its request.
 pub struct Echo<'a> {
-    pub route: &'a Route,
+    pub route: &'a Route<'a>,
     pub query: &'a Query,
     /// The account that asked: the owner a listing names.
     pub principal: &'a str,
@@ -467,7 +467,7 @@ pub fn reply(
 }
 
 /// The resource an error names: the bucket and key as the request's path names them.
-pub fn resource(route: &Route) -> String {
+pub fn resource(route: &Route<'_>) -> String {
     match (&route.bucket, &route.key) {
         (Some(bucket), Some(key)) => format!("/{bucket}/{key}"),
         (Some(bucket), None) => format!("/{bucket}"),

@@ -44,10 +44,10 @@ fn authorization(signed: &str, signature: &str) -> String {
 }
 
 /// AWS's GetObject example (S3 developer guide, "Signature Calculation: Transfer Payload in a
-/// Single Chunk"), checked: its key derived into one buffer, its string to sign into another, and
-/// the access key it names; nothing grows.
+/// Single Chunk"), checked: its key derived and its string to sign written on the stack; the one
+/// buffer is the access key it names, copied into its `Verified`; nothing grows.
 #[test]
-fn a_signature_is_checked_in_three_buffers() {
+fn a_signature_is_checked_with_one_buffer_its_access_keys() {
     let auth = authorization(
         "host;range;x-amz-content-sha256;x-amz-date",
         "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
@@ -68,7 +68,7 @@ fn a_signature_is_checked_in_three_buffers() {
     let secret = |key: &str| if key == KEY { Some(SECRET) } else { None };
     let (verified, made) = counted(|| sigv4::verify(&request, "us-east-1", now(), secret));
     assert_eq!(verified.unwrap().access_key, KEY);
-    assert_eq!(made, (3, 0));
+    assert_eq!(made, (1, 0));
 }
 
 /// AWS's chunked upload example (S3 developer guide, "Signature Calculation: Transfer Payload in

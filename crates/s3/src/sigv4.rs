@@ -6,6 +6,8 @@
 //! characters they escape, and the signed form is always the `UriEncode` form (05 §1.2.2).
 //! S3 paths are encoded once and never normalized, so `a//b` stays `a//b`.
 
+use std::borrow::Cow;
+
 use crate::crypto::{self, CryptoError};
 
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -317,14 +319,18 @@ impl Claim<'_> {
 /// The access key a request's signature claims, its form checked as [`verify`] checks it, before
 /// any secret is asked for: the `Authorization` header's `Credential`, or a presigned URL's
 /// `X-Amz-Credential`. A request with neither is unsigned, [`AuthError::Missing`].
-pub fn access_key<H: Fields + ?Sized>(request: &Request<'_, H>) -> Result<String, AuthError> {
+/// A header's is borrowed from it; a presigned URL's, decoded from its query, is a string of its
+/// own.
+pub fn access_key<'a, H: Fields + ?Sized>(
+    request: &Request<'a, H>,
+) -> Result<Cow<'a, str>, AuthError> {
     if let Some(authorization) = header(request.headers, "authorization") {
-        return header_claim(authorization).map(|claim| claim.access_key.to_owned());
+        return header_claim(authorization).map(|claim| Cow::Borrowed(claim.access_key));
     }
     if query_has(request.query, "X-Amz-Signature") || query_has(request.query, "X-Amz-Algorithm") {
         let params =
             query_pairs(request.query).ok_or(AuthError::QueryMalformed("undecodable query"))?;
-        return presigned_claim(&params).map(|claim| claim.access_key.to_owned());
+        return presigned_claim(&params).map(|claim| Cow::Owned(claim.access_key.to_owned()));
     }
     Err(AuthError::Missing)
 }
@@ -568,31 +574,67 @@ fn check_signature<S: AsRef<str>>(
 ) -> Result<[u8; 32], AuthError> {
     let secret = secret(claim.access_key).ok_or(AuthError::UnknownKey)?;
     let key = signing_key(secret.as_ref(), claim.date, claim.region, claim.service)?;
-    let sts = signed_string(timestamp, claim.scope(), canonical);
-    let expected = crypto::hmac_sha256(&key, &sts)?;
+    let digits = hex_digits(canonical);
+    let signed = signed_string(timestamp, claim.scope(), &digits);
+    let len = ALGORITHM
+        .len()
+        .saturating_add(timestamp.len())
+        .saturating_add(claim.scope().len())
+        .saturating_add(digits.len())
+        .saturating_add(3);
+    let mut stack = [0u8; SIGNED_STRING];
+    let heap: Vec<u8>;
+    let sts: &[u8] = match stack.get_mut(..len) {
+        Some(sts) => {
+            for (to, from) in sts.iter_mut().zip(signed) {
+                *to = from;
+            }
+            sts
+        }
+        None => {
+            heap = signed.collect();
+            &heap
+        }
+    };
+    let expected = crypto::hmac_sha256(&key, sts)?;
     if !crypto::equal(&expected, &claim.signature)? {
         return Err(AuthError::Mismatch);
     }
     Ok(key)
 }
 
+/// The string to sign at its longest on the stack (05 §1.3): the algorithm's name, the request's
+/// time (`YYYYMMDDTHHMMSSZ`, 16 octets) and its scope's date (8), a region as long as one DNS
+/// label may be (63, RFC 1035 §2.3.4: S3 names a region as one label of its endpoints' host
+/// names), `s3` (2), `aws4_request`, the canonical request's hash in 64 hex digits, and 6
+/// separators: 187 octets. A string to sign naming a longer region is made on the heap.
+const SIGNED_STRING: usize = ALGORITHM.len() + 16 + 8 + 63 + 2 + Scope::END.len() + 64 + 6;
+
 /// The string to sign (05 §1.3): the algorithm, the request's time, its scope and the canonical
-/// request's hash, in one buffer made at their length.
-fn signed_string(timestamp: &str, scope: Scope<'_>, canonical: &[u8; 32]) -> Vec<u8> {
-    let len = ALGORITHM
-        .len()
-        .saturating_add(timestamp.len())
-        .saturating_add(scope.len())
-        .saturating_add(64 + 3);
-    let mut sts = Vec::with_capacity(len);
-    sts.extend_from_slice(ALGORITHM.as_bytes());
-    sts.push(b'\n');
-    sts.extend_from_slice(timestamp.as_bytes());
-    sts.push(b'\n');
-    scope.put(&mut sts);
-    sts.push(b'\n');
-    sts.extend_from_slice(&hex_digits(canonical));
-    sts
+/// request's hash, `digits`, byte after byte.
+fn signed_string<'a>(
+    timestamp: &'a str,
+    scope: Scope<'a>,
+    digits: &'a [u8; 64],
+) -> impl Iterator<Item = u8> + 'a {
+    [
+        ALGORITHM.as_bytes(),
+        b"\n",
+        timestamp.as_bytes(),
+        b"\n",
+        scope.date.as_bytes(),
+        b"/",
+        scope.region.as_bytes(),
+        b"/",
+        scope.service.as_bytes(),
+        b"/",
+        Scope::END.as_bytes(),
+        b"\n",
+        digits.as_slice(),
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
 }
 
 /// The canonical request (05 §1.2): method, URI, query, headers, signed headers, payload.
@@ -877,10 +919,27 @@ pub fn signing_key(
     region: &str,
     service: &str,
 ) -> Result<[u8; 32], AuthError> {
-    let mut first = Vec::with_capacity(secret.len().saturating_add(4));
-    first.extend_from_slice(b"AWS4");
-    first.extend_from_slice(secret.as_bytes());
-    let date_key = crypto::hmac_sha256(&first, date.as_bytes())?;
+    // `AWS4` and the secret, on the stack where they fit the block HMAC-SHA256 takes a key of
+    // whole (64 bytes, RFC 2104 §2), as a 40-character AWS secret does; a longer one, which HMAC
+    // hashes first, on the heap.
+    let mut block = [0u8; 64];
+    let long: Vec<u8>;
+    let first: &[u8] = match block.get_mut(..secret.len().saturating_add(4)) {
+        Some(first) => {
+            for (to, from) in first
+                .iter_mut()
+                .zip(b"AWS4".iter().chain(secret.as_bytes()))
+            {
+                *to = *from;
+            }
+            first
+        }
+        None => {
+            long = [b"AWS4".as_slice(), secret.as_bytes()].concat();
+            &long
+        }
+    };
+    let date_key = crypto::hmac_sha256(first, date.as_bytes())?;
     let region_key = crypto::hmac_sha256(&date_key, region.as_bytes())?;
     let service_key = crypto::hmac_sha256(&region_key, service.as_bytes())?;
     Ok(crypto::hmac_sha256(&service_key, b"aws4_request")?)
@@ -1051,6 +1110,47 @@ pub fn unhex(text: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
 
+    /// A secret past HMAC's block and a region past the stack's string to sign take the heap's
+    /// buffers, and derive and sign the bytes the short ones' stack buffers do: the key is
+    /// HMAC's chain from `AWS4` and the secret whole, and the string to sign is
+    /// [`string_to_sign`]'s.
+    #[test]
+    fn a_long_secret_or_region_signs_as_a_short_one_does() {
+        for (secret, region) in [
+            (
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
+                "us-east-1".to_owned(),
+            ),
+            ("s".repeat(61), "r".repeat(SIGNED_STRING)),
+        ] {
+            let mut first = b"AWS4".to_vec();
+            first.extend_from_slice(secret.as_bytes());
+            let mut key = crypto::hmac_sha256(&first, b"20130524").unwrap();
+            for part in [region.as_bytes(), b"s3", b"aws4_request"] {
+                key = crypto::hmac_sha256(&key, part).unwrap();
+            }
+            assert_eq!(
+                signing_key(&secret, "20130524", &region, "s3").unwrap(),
+                key
+            );
+            let canonical = "GET\n/\n\nhost:h\n\nhost\nUNSIGNED-PAYLOAD";
+            let digits = hex_digits(&crypto::sha256(canonical.as_bytes()).unwrap());
+            let named = Scope {
+                date: "20130524",
+                region: &region,
+                service: "s3",
+            };
+            let made: Vec<u8> = signed_string("20130524T000000Z", named, &digits).collect();
+            let want = string_to_sign(
+                "20130524T000000Z",
+                &scope("20130524", &region, "s3"),
+                canonical,
+            )
+            .unwrap();
+            assert_eq!(made, want.into_bytes());
+        }
+    }
+
     /// Hex values take digits alone: no sign, which `from_str_radix` would take, nothing
     /// empty, and nothing past u64.
     #[test]
@@ -1185,7 +1285,7 @@ mod tests {
             let verified = verify(&request, "us-east-1", now(), secret).unwrap();
             assert_eq!(verified.access_key, KEY);
             // The key a signature claims is read before any secret is asked for.
-            assert_eq!(access_key(&request), Ok(KEY.to_owned()));
+            assert_eq!(access_key(&request), Ok(Cow::from(KEY)));
         }
     }
 
@@ -1230,7 +1330,7 @@ mod tests {
         };
         assert_eq!(
             access_key(&presigned),
-            Ok("AKIAIOSFODNN7EXAMPLE".to_owned())
+            Ok(Cow::from("AKIAIOSFODNN7EXAMPLE"))
         );
     }
 

@@ -351,6 +351,13 @@ struct Limits {
     tick_ns: u64,
 }
 
+/// The watchdog's limit for a shard of `quantum_ns` and `batch` polls a step: a step's worth of polls each held
+/// at most the long-poll threshold, twice the quantum (the module's notes). Also the most a poll counts to its
+/// task's class (`crate::queue::LocalQueue::charge`).
+pub(crate) fn stall_limit_ns(quantum_ns: u64, batch: u64) -> u64 {
+    quantum_ns.saturating_mul(2).saturating_mul(batch)
+}
+
 impl Limits {
     fn of(config: &crate::runtime::RuntimeConfig) -> Limits {
         Limits {
@@ -375,10 +382,9 @@ impl Limits {
         }
     }
 
-    /// The limit: a step's worth of polls each held at most the long-poll threshold, twice the quantum (the
-    /// module's notes).
+    /// The limit: [`stall_limit_ns`] of the shard's quantum now.
     fn limit_ns(&self, quantum_ns: u64) -> u64 {
-        quantum_ns.saturating_mul(2).saturating_mul(self.batch)
+        stall_limit_ns(quantum_ns, self.batch)
     }
 
     /// How long to wait between looks given the shortest limit now: half of it, never under a tick.

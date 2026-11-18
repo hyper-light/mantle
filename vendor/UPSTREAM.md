@@ -87,10 +87,22 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `675a042` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
-`17371e2` and five commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
-branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its fifth
-commit, `675a042`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14, hyper-rt ORIGIN.md,
+**Every crate at `85bd35f` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
+`17371e2` and six commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its sixth
+commit, `85bd35f`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.15, hyper-rt ORIGIN.md,
+"task classes"): tasks carry a class, Critical, Normal (the default) or Background, each with its
+own lists in the run queue, made as a task of the shard first takes it; each class with work has an
+equal share of the shard's time, and the most urgent goes first while it has run no more than the
+shard's quantum past the least-run class ready, so a woken Critical task overtakes queued Normal
+and Background work and no class is starved. A poll counts to its class at most the watchdog's
+limit, a class that starts listing is raised to the shard's virtual time, and while classes are kept
+a batch reads its inputs once a budget. A spawn takes the class it is given, Normal unless
+`futures::spawn_detached_as` names another; `coop::set_class` changes a task's and `coop::give_way`
+hands the shard to more urgent work. Taken from Kiln's runtime copy (its goal 6 step 3). No new
+constant: the lead is the shard's quantum and the cap the watchdog's limit (§3.13). Every other
+crate is as at `17371e2`. Before it, every crate was at `675a042` (the same branch: `17371e2` and
+five commits), with no local delta. Its fifth commit, `675a042`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14, hyper-rt ORIGIN.md,
 "turns by time, the sync primitives, joins, datagrams and signals"): the rest of Kiln's charges, each
 made where the leaf goes on and never where it waits — a `Notify`'s notification, a one-shot's value,
 a channel's receive and send, a watched word's change, a semaphore's permit (free, or granted to a

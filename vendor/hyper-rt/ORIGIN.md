@@ -174,3 +174,25 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   one-shot ring without padding (its goal 9) is not taken. Tests: Kiln's `coop_waits.rs` cases for these
   (notification, one-shot, channel receive and send, watch, permit, join, signal), with a granted permit,
   a delivered signal and datagrams added so every new charge has a case that fails without it.
+
+## Made here: task classes (2026-11-17)
+
+- Tasks carry a class, Critical, Normal (the default) or Background, and each class with work has an equal
+  share of its shard's time, the most urgent first while it has run no more than the shard's quantum past the
+  least-run class ready (`src/coop.rs`'s `Class`, `set_class`, `class`, `outranked`, `give_way`;
+  `src/queue.rs`'s classes' lists, `pop_within`, `charge`, `waiting_above`, `has_classes`; `src/shard.rs`'s
+  `Incoming::class`, set as each slot is claimed; `src/shard_loop.rs`, each poll charged to its class at most
+  the watchdog's limit, `watch::stall_limit_ns`, and the inputs read once a budget while classes are kept;
+  `src/futures.rs`'s `spawn_detached_as`; docs/runtime.md §3.15). Taken from Kiln's runtime copy (`kiln-rt`'s
+  `queue.rs`, `coop.rs` and `shard_loop.rs`, its goal 6 step 3, plan `01a1a59c2abe`; read at Kiln's
+  `b1bcb2fa589`): the lists, the shares by time run, the virtual time a class starting to list is raised to,
+  the quantum as the lead, the stall cap and `give_way` as Kiln wrote them. Changed in the port: the classes
+  sit on this queue's rings and pending flags (Kiln's slab of places, its stamps of each listing and its bits
+  of the classes with work, its goals 9 and 11, are not taken), and the slots' classes and each other class's
+  lists are made as a task first takes that class; a spawn takes the class it is given, Normal unless
+  `spawn_detached_as` names another, where Kiln's take their spawner's (a node's Critical task accepts
+  connections that stay Normal); Kiln's per-class queueing counters and its blocking pool's Critical line are
+  not taken. Tests: Kiln's `queue.rs` cases (the order among classes run alike, no credit for idling, no debt
+  for running alone, a woken Critical slot within the lead, equal shares over time), its `coop.rs` cases
+  (`give_way`, a woken Critical task on a shard) and its `tests/classes.rs`, with a spawn's class and a busy
+  Critical class beside busy Normal and Background ones added.

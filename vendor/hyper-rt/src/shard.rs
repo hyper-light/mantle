@@ -20,6 +20,7 @@ use std::cell::Cell;
 use std::task::Poll;
 
 use crate::cells::{CellRing, CellStack};
+use crate::coop::Class;
 use crate::error::RtError;
 use crate::mem::Encoded;
 use crate::queue::LocalQueue;
@@ -88,6 +89,8 @@ pub(crate) struct Incoming {
     /// Where it was spawned (`#[track_caller]`), which the shard's long polls are counted against
     /// (`crate::slow`).
     pub(crate) site: Option<&'static std::panic::Location<'static>>,
+    /// Its class on the run queue (`crate::coop::Class`), set on its slot as it is claimed.
+    pub(crate) class: Class,
 }
 
 /// A poller's readiness question: a task that owns a ring the loop cannot see (a client's command ring in
@@ -792,6 +795,7 @@ impl ShardContext {
             joinable: true,
             service: false,
             site: Some(std::panic::Location::caller()),
+            class: Class::Normal,
         })
     }
 
@@ -804,6 +808,7 @@ impl ShardContext {
             joinable: false,
             service: false,
             site: Some(std::panic::Location::caller()),
+            class: Class::Normal,
         })
     }
 
@@ -821,17 +826,18 @@ impl ShardContext {
             joinable: true,
             service: true,
             site: Some(std::panic::Location::caller()),
+            class: Class::Normal,
         })
     }
 
     /// Spawns `future` written into a frame of this shard's (`crate::frames`): under `parent` (a slot of this
-    /// shard), joinable or detached, a service or not, spawned at `site`. The spawns a task makes on its own
-    /// shard (`crate::futures`); refused as a claim is, and `Mem` when no frame could be had.
+    /// shard), joinable or detached, a service or not, of `class`, spawned at `site`. The spawns a task makes on
+    /// its own shard (`crate::futures`); refused as a claim is, and `Mem` when no frame could be had.
     pub(crate) fn spawn_framed<F: std::future::Future<Output = ()> + 'static>(
         &self,
         future: F,
         parent: Option<u32>,
-        (joinable, service): (bool, bool),
+        (joinable, service, class): (bool, bool, Class),
         site: &'static std::panic::Location<'static>,
     ) -> Result<TaskId, RtError> {
         let future = TaskFuture::Framed(self.frames.put(future)?);
@@ -841,6 +847,7 @@ impl ShardContext {
             joinable,
             service,
             site: Some(site),
+            class,
         })
     }
 
@@ -880,6 +887,8 @@ impl ShardContext {
         cell.parented.set(parented);
         cell.site.set(incoming.site);
         cell.label.set(None);
+        // Every claim sets its slot's class, so a slot a task of another class left starts as its spawn says.
+        let _ = self.local.set_class(slot, incoming.class);
         cell.incoming.set(Some(incoming));
         if parented {
             self.ask(slot, ask::INSTALL);

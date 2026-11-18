@@ -8,6 +8,7 @@ use std::task::{Context, Poll};
 
 use pin_project_lite::pin_project;
 
+use crate::coop::Class;
 use crate::error::RtError;
 use crate::registry;
 use crate::shard::{ShardId, TaskId, TimerId};
@@ -73,7 +74,7 @@ pub fn current_task() -> Option<TaskId> {
 #[track_caller]
 pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
     let site = std::panic::Location::caller();
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, (true, false), site))
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, (true, false, Class::Normal), site))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -85,7 +86,7 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
 #[track_caller]
 pub fn spawn_service<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
     let site = std::panic::Location::caller();
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, (true, true), site))
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, (true, true, Class::Normal), site))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -149,7 +150,21 @@ impl Future for Cancelled {
 #[track_caller]
 pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
     let site = std::panic::Location::caller();
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, (false, false), site))
+    registry::with_current(|ctx| {
+        ctx.spawn_framed(future, None, (false, false, Class::Normal), site)
+    })
+    .ok_or(RtError::NotOnShardThread)?
+}
+
+/// Spawns a detached task of `class` on the current shard (`crate::coop::Class`): as [`spawn_detached`], which
+/// spawns a Normal one, but listed in `class`'s lists and its polls counted to `class`'s share.
+#[track_caller]
+pub fn spawn_detached_as<F: Future<Output = ()> + 'static>(
+    class: Class,
+    future: F,
+) -> Result<TaskId, RtError> {
+    let site = std::panic::Location::caller();
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, (false, false, class), site))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -159,7 +174,7 @@ pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId
     let site = std::panic::Location::caller();
     registry::with_current(|ctx| {
         let parent = ctx.current_task().map(|t| t.0.slot());
-        ctx.spawn_framed(future, parent, (true, false), site)
+        ctx.spawn_framed(future, parent, (true, false, Class::Normal), site)
     })
     .ok_or(RtError::NotOnShardThread)?
 }

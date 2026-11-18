@@ -657,6 +657,7 @@ impl Shard {
             joinable: false,
             service,
             site,
+            class: crate::coop::Class::Normal,
         });
         if let Ok(task) = &admitted {
             self.install_listed(task.0.slot());
@@ -812,6 +813,7 @@ impl Shard {
             joinable,
             service,
             site: _,
+            class: _,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
         let (generation, cancelled) = self.desk.task(slot).map_or((0, false), |cell| {
@@ -1218,7 +1220,8 @@ impl Shard {
     /// listed tasks of their own (a wake of this shard's, a spawn), which go ahead of every wake still
     /// unread, the batch reads the inputs again before its next poll, and the step goes on to its count.
     /// Polls that list nothing leave the order as reading would: what arrives goes behind the tasks
-    /// already listed either way.
+    /// already listed either way, unless the shard keeps classes (`crate::coop::Class`), where what arrives
+    /// may go ahead, and the batch reads the inputs once a budget whatever its polls listed.
     fn poll_batch(&mut self, mark: Option<u64>) -> bool {
         registry::with_current_cell(self, |shard, current| shard.poll_batch_in(mark, current))
     }
@@ -1242,7 +1245,7 @@ impl Shard {
         };
         let mut polled_any = false;
         for polled in 1..=batch {
-            let Some(slot) = self.next_in_batch(&mut at) else {
+            let Some(slot) = self.next_in_batch(&mut at, quantum_ns) else {
                 break;
             };
             polled_any = true;
@@ -1254,9 +1257,12 @@ impl Shard {
             let ended = self.poll_slot(slot, start, quantum_ns, carried, current);
             at.mark = Some(ended);
             self.apply();
+            // With classes kept (`crate::coop::Class`), what arrives may go ahead of what is listed: a Critical
+            // task's timer or socket waits no longer than the budget to be seen, whether or not the polls listed
+            // any (Kiln's `shard_loop.rs`).
             if polled < batch
                 && ended.saturating_sub(since) >= budget_ns
-                && self.desk.local.listed() != at.listed_at_read
+                && (self.desk.local.listed() != at.listed_at_read || self.desk.local.has_classes())
             {
                 self.read_inputs_within(&mut at, ended);
             }
@@ -1264,10 +1270,11 @@ impl Shard {
         polled_any
     }
 
-    /// The batch's next task: the ring's oldest, or, where only tasks that woke themselves remain, the
-    /// first after the inputs are read again, which lists them behind what those made ready.
-    fn next_in_batch(&mut self, at: &mut BatchMark) -> Option<u32> {
-        if let Some(slot) = self.desk.local.pop() {
+    /// The batch's next task: the queue's next, a class leading by at most `quantum_ns` (`crate::queue`), or,
+    /// where only tasks that woke themselves remain, the first after the inputs are read again, which lists them
+    /// behind what those made ready.
+    fn next_in_batch(&mut self, at: &mut BatchMark, quantum_ns: u64) -> Option<u32> {
+        if let Some(slot) = self.desk.local.pop_within(quantum_ns) {
             return Some(slot);
         }
         if !self.desk.local.has_yielded() {
@@ -1278,7 +1285,7 @@ impl Shard {
             None => self.carried_now_ns(),
         };
         self.read_inputs_within(at, now);
-        self.desk.local.pop()
+        self.desk.local.pop_within(quantum_ns)
     }
 
     /// The inputs read again within the batch at `now_ns`, the step's time from here; where they did work,
@@ -1908,6 +1915,16 @@ impl Shard {
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
         let elapsed = ended.saturating_sub(start);
+        // The poll counts to its class's share (`crate::queue`), at most the watchdog's limit (`crate::watch`):
+        // past it the poll is a stall, reported as one, and charged in full it would leave its class owing all of
+        // it, its other tasks waiting as long again while the other classes caught up (Kiln's `shard_loop.rs`).
+        self.desk.local.charge(
+            slot,
+            elapsed.min(crate::watch::stall_limit_ns(
+                quantum_ns,
+                u64::try_from(self.core.batch).unwrap_or(u64::MAX),
+            )),
+        );
         // How long the poll held the shard unasked (docs/runtime.md §3.11): from its start, or from the last
         // time it asked `wanted` and was let go on; long past twice the quantum, which a task that asks once a
         // quantum and yields when told to never reaches.

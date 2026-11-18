@@ -157,7 +157,9 @@ core, so the count is the node's. A flip in a command's length leaves the entry 
 fences the replica as before; the window for it is the leader's buffer between `stamp` and the
 log's frame CRC. Measured by `wire::tests::a_flipped_bit_in_any_commands_bytes_is_refused_corrupt_and_writes_nothing`
 (every bit of every kind's body and CRC), `apply::tests::a_corrupt_command_is_refused_alike_on_every_member_and_applies_once_sent_again`
-and `ask::tests::a_command_answered_corrupt_is_sent_again_once_under_its_serial`.
+`ask::tests::a_command_answered_corrupt_is_sent_again_once_under_its_serial`, and a group of
+three over simulated devices (`crates/range/tests/group.rs`,
+`a_flipped_command_is_refused_alike_on_every_member_and_applies_once_sent_again`).
 
 **Members compare digests** (research/31 §5.8, D21). Replicas apply the same log
 deterministically, so a digest of a range's rows at an applied index is the same on every member

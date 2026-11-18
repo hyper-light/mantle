@@ -513,6 +513,12 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
         propose_entry(&mut self.shell, entry, self.max_entry_bytes)
     }
 
+    /// Proposes an entry's encoding as it came, its commands' CRCs with it ([`propose_encoded`]);
+    /// only a leader takes it, and none larger than the range's bound.
+    pub fn propose_encoded(&mut self, data: Vec<u8>) -> Result<(), ReplicaError> {
+        propose_encoded(&mut self.shell, data, self.max_entry_bytes)
+    }
+
     pub fn propose_change(&mut self, change: &ConfChangeV2) -> Result<(), ReplicaError> {
         self.bounded(change.encoded_len())?;
         self.shell.change(Vec::new(), change).map_err(shell_error)

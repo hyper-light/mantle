@@ -25,7 +25,7 @@ use mantle_meta::engine::{Engine, Model, Rows};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
 use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
-use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
+use mantle_meta::wire::{Answer, Command, ENTRY_HEAD_BYTES, Entry, Sessioned};
 use mantle_range::{
     ConfState, Driven, Message, MessageType, Range, Replica, ReplicaError, Settings,
 };
@@ -294,6 +294,77 @@ fn a_group_elects_a_leader_and_applies_the_same_entries_everywhere() {
     assert_eq!(at(1).len(), 2);
     assert_eq!(at(1), at(2));
     assert_eq!(at(1), at(3));
+    for n in &mut nodes {
+        let current = name::current(n.replica.engine_mut(), "b", "k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.1.etag, "k");
+    }
+}
+
+/// A command whose bytes flipped after its CRC was computed is answered `Corrupt` by every member
+/// at the same index, and none writes it, the command beside it applying; sent again under its
+/// serial, it applies once everywhere (docs/design/replica.md §2).
+#[test]
+fn a_flipped_command_is_refused_alike_on_every_member_and_applies_once_sent_again() {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    nodes[0].replica.propose(&registration(0)).unwrap();
+    settle(&mut nodes, &mut answers);
+    let Some((_, _, first)) = answers.iter().find(|(id, _, _)| *id == 1) else {
+        panic!("{answers:?}")
+    };
+    let [Answer::Registered { session }] = first[..] else {
+        panic!("{first:?}")
+    };
+    let sent = |serial: u64, command: Command| Sessioned {
+        session,
+        serial,
+        unanswered: 1,
+        command,
+    };
+    let entry = Entry {
+        at_ns: 20,
+        commands: vec![sent(1, open_gate()), sent(2, put("k"))],
+    };
+    let mut bytes = entry.encode().unwrap();
+    // A bit of the put's own bytes: past the head, the gate's frame, its length and session fields.
+    let gate = entry.commands[0].encoded_len().unwrap();
+    bytes[ENTRY_HEAD_BYTES + gate + 4 + 24 + 5] ^= 0x04;
+    nodes[0].replica.propose_encoded(bytes).unwrap();
+    settle(&mut nodes, &mut answers);
+    let at = |answers: &Answered, id: u64| {
+        answers
+            .iter()
+            .filter(|(n, _, _)| *n == id)
+            .map(|(_, i, a)| (*i, a.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(at(&answers, 1), at(&answers, 2));
+    assert_eq!(at(&answers, 1), at(&answers, 3));
+    let (_, last) = at(&answers, 1).pop().unwrap();
+    assert_eq!(last.len(), 2);
+    assert!(matches!(last[0], Answer::Name(_)), "{last:?}");
+    assert_eq!(last[1], Answer::Corrupt);
+    for n in &mut nodes {
+        assert!(
+            name::current(n.replica.engine_mut(), "b", "k")
+                .unwrap()
+                .is_none()
+        );
+    }
+    nodes[0]
+        .replica
+        .propose(&Entry {
+            at_ns: 30,
+            commands: vec![sent(2, put("k"))],
+        })
+        .unwrap();
+    settle(&mut nodes, &mut answers);
+    assert_eq!(at(&answers, 1), at(&answers, 2));
+    assert_eq!(at(&answers, 1), at(&answers, 3));
     for n in &mut nodes {
         let current = name::current(n.replica.engine_mut(), "b", "k")
             .unwrap()

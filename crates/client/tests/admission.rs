@@ -17,36 +17,14 @@
 
 use std::sync::mpsc::channel;
 
-use mantle_client::{Client, Credentials, Settings, Source, TRAILER};
+use mantle_client::{Client, Credentials, Settings, TRAILER};
 use mantle_protocol::bounds::CONNECTIONS_PER_PEER;
 use mantle_protocol::object::{Headers, Op, Status};
 use mantle_s3::body::MIN_PART;
 
 #[allow(dead_code)]
 mod support;
-use support::{CLIENT, Made, NODE, Script, credentials, pattern, runtime, scripted, serve};
-
-/// The pattern's bytes, from their first again once asked: a file, say.
-struct Again {
-    at: u64,
-    length: u64,
-}
-
-impl Source for Again {
-    async fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
-        let n = into.len().min((self.length - self.at) as usize);
-        for byte in &mut into[..n] {
-            *byte = pattern(self.at);
-            self.at += 1;
-        }
-        Ok(n)
-    }
-
-    async fn again(&mut self) -> std::io::Result<bool> {
-        self.at = 0;
-        Ok(true)
-    }
-}
+use support::{Again, CLIENT, Made, NODE, Script, credentials, runtime, scripted, serve};
 
 /// Another copy of `credentials`: a client's, the same identity.
 fn copy(credentials: &Credentials) -> Credentials {
@@ -118,7 +96,7 @@ fn a_put_refused_busy_while_its_identity_holds_every_connection_is_answered_once
             let mut asking = open().await.unwrap();
             let length = MIN_PART;
             let reply = asking
-                .put(&put(length), &mut Again { at: 0, length }, u64::MAX)
+                .put(&put(length), &mut Again(Made { at: 0, length }), u64::MAX)
                 .await;
             drop(asking);
             drop(holders);

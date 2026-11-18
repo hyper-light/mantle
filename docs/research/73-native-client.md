@@ -88,6 +88,18 @@ https://docs.aws.amazon.com/cli/latest/topic/s3-config.html: `multipart_threshol
 commands have decided to use multipart operations, the file is divided into chunks. This
 configuration option specifies what the chunk size (also referred to as the part size) should be."
 
+[11] botocore, https://github.com/boto/botocore (develop, read 2026-11-17). `botocore/retries/
+standard.py`: `TransientRetryableChecker`'s `_TRANSIENT_STATUS_CODES = [500, 502, 503, 504]`, and
+`ThrottledRetryableChecker`'s `_THROTTLED_ERROR_CODES`, fourteen codes, `'SlowDown'` among them;
+`StandardRetryConditions.is_retryable` is the attempts' check and any of its checkers, each judging
+the response's error code or status or the exception caught, none the request or its body.
+`botocore/endpoint.py`, `Endpoint._send_request`, before each retry: "If there is a stream
+associated with the request, we need to reset it before attempting to send the request again. This
+will ensure that we resend the entire contents of the body." `botocore/awsrequest.py`,
+`AWSPreparedRequest.reset_stream`: "If the request contains a streaming body (a streamable
+file-like object) seek to the object's initial position to ensure the entire contents of the object
+is sent"; a body whose `seek(0)` fails raises `UnseekableStreamError`.
+
 ## Findings and decisions
 
 **A client's certificate is a leaf for clientAuth alone, named by its subject.** [1] lets a
@@ -135,7 +147,11 @@ caller's, told whether the request was sent whole, except a node's `SlowDown`: a
 like the SDKs' throttling errors (2026-10-31, research/77 D4), within the same three attempts,
 after botocore's standard mode's throttling backoff (full jitter over `min(2^(n-1) s, 20 s)`) and
 paid from its retry quota (500 units, 5 a retry, refilled by answers), of the next node, its
-identity with it; a run of an upload is sent again from where it began.
+identity with it, and its body, where it has one, sent again from its first byte where its source
+gives it again, as botocore retries a throttling error whatever the operation and rewinds a
+request's body before each retry, refusing one it cannot rewind [11] (2026-11-17); a body read once
+is not sent again, and the `SlowDown` is the caller's. A run of an upload is sent again from where
+it began.
 
 **A streamed put states its checksum in a trailer, CRC-64/NVME unless named.** A source read once
 (standard input) cannot state its checksum before its bytes, so the native put carries the

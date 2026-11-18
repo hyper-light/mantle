@@ -745,6 +745,31 @@ copies within the cell under each directive, `multipart copy` of a range, `ls --
 and `rm` by `--version-id`, and `rm` of three keys in one DeleteObjects, a missing one among them.
 Every object is read back byte-identical.
 
+*As built (2026-11-17).* A node's `SlowDown` is a cause that passes: a range step past its budget
+with no leader that can serve it (node.md §5.4), or a block whose chunks no volume took (§2). The
+library asks it again as botocore's standard retry mode asks a throttling error, the owner's
+decision of 2026-10-31 (research/77 D4): within the same three attempts, after a full-jitter backoff
+over `min(2^(n-1) s, 20 s)`, paid from a retry quota of 500 units, 5 a retry, an answer after none
+giving one back and an answer after some what they took, of the next node, its identity with it
+(research/73). botocore asks a throttling error again whatever the operation, rewinding a request's
+body before each retry and refusing one it cannot rewind (research/73 [11]), and so does the
+library: a put's or a part's body is sent again from its first byte where its source gives it again
+(`Source::again`: a file from where it was opened, bytes held whole, the transfer harness's
+generator), and one read once, standard input streamed to a part, is not, its `SlowDown` the
+caller's answer, as the S3 door's commands answer a `503` (`crates/mantle/src/door.rs`). A native
+upload's run is sent again by its upload from the node's offset, which answers `Offset` where the
+slowed run committed after all. Before this a request with a body answered `SlowDown` was not asked
+again: release run 43905794145's check, on linux-x86_64, had a part of `mantle bench transfer`'s
+native multipart way answered `SlowDown` on a fresh cell before any kill, and the upload aborted,
+where the AWS CLI's and boto3's parts are asked again. Every attempt carries the first's identity,
+from which the Name range is to answer it (§2.1, STATUS item 9, not yet built); until it does, an
+attempt whose first applied after all, its step ended past its budget, applies again: a part
+overwrites the one before with the same bytes (research/05 §4.3), and a put makes its object again,
+a second version where versioning is on, as a stock client's retry does (§2.1). Tested against a
+stub node (`crates/client/tests/slowed.rs`): a part answered `SlowDown` once is put again whole with
+its identity and kept with its bytes' checksum; a part from a source read once answers `SlowDown`,
+put once; and a part slowed at every attempt is put three times and answers `SlowDown`.
+
 Not yet built: the journal in the library and its power-cut tests, the checkpoint interval's
 measured terms and two runs in flight (§2.1), credits and the admission level, path adaptation and
 migration, per-block GET streams, the validated caches, and the TLS-over-TCP route.

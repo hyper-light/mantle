@@ -47,6 +47,20 @@ impl Source for Made {
     }
 }
 
+/// The object's bytes, made as they are read, and from their first again once asked: a file, say.
+pub(crate) struct Again(pub(crate) Made);
+
+impl Source for Again {
+    async fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(into).await
+    }
+
+    async fn again(&mut self) -> std::io::Result<bool> {
+        self.0.at = 0;
+        Ok(true)
+    }
+}
+
 /// A get's bytes, each checked against the pattern as it comes and kept nowhere.
 pub(crate) struct Checked {
     pub(crate) at: u64,
@@ -164,7 +178,9 @@ impl Directory for Clients {
 /// once half again as long has passed as its client waited on the one it gave up on, as a node
 /// whose durable writes take longer than the client gave it answers the run sent again; and the
 /// first Opens and the Append it answers `SlowDown`, its run not committed, as a node whose range
-/// step waited past its budget for a leader answers (node.md §5.4).
+/// step waited past its budget for a leader answers (node.md §5.4). The first part puts it answers
+/// `SlowDown` too, once it read each body whole, as a node answers a part whose block it placed on
+/// no volume (gateway.md §2).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Script {
     pub(crate) lose_append: Option<u32>,
@@ -175,12 +191,14 @@ pub(crate) struct Script {
     pub(crate) vouch_head: bool,
     pub(crate) slow_opens: u32,
     pub(crate) slow_append: Option<u32>,
+    pub(crate) slow_parts: u32,
     /// Its client's connections it serves on past their close, each close told on `bound` again,
     /// as a node outlives a client's connection its idle timeout closed.
     pub(crate) outlive: u32,
 }
 
-/// The native upload's requests the stub took, by kind, and the exchanges its client cut.
+/// The native upload's requests the stub took, by kind, and the exchanges its client cut; and
+/// the identity each part put it took carried, in the order they came.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seen {
     pub(crate) opens: u32,
@@ -188,6 +206,7 @@ pub(crate) struct Seen {
     pub(crate) offsets: u32,
     pub(crate) finishes: u32,
     pub(crate) cut: u32,
+    pub(crate) parts: Vec<u128>,
 }
 
 /// The stub's one native upload: its durable offset, its committed runs, and whether the last
@@ -523,7 +542,9 @@ fn run(
                         if !bytes.is_empty() {
                             let op = head.op(fields).unwrap();
                             let (length, from) = match op {
-                                Op::Put { length, .. } => (length, None),
+                                Op::Put { length, .. } | Op::UploadPart { length, .. } => {
+                                    (length, None)
+                                }
                                 Op::Append { length, offset, .. } => (length, Some(offset)),
                                 other => panic!("bytes past the fields of {other:?}"),
                             };
@@ -581,6 +602,25 @@ fn run(
                                 Reply {
                                     size: length,
                                     etag: "put".into(),
+                                    checksum: Some(Stored {
+                                        algorithm: TRAILER.code(),
+                                        parts: 0,
+                                        value: sum,
+                                    }),
+                                    ..Reply::status(Status::Done)
+                                }
+                            } else {
+                                Reply::status(Status::BadDigest)
+                            };
+                            Some((reply, 0))
+                        }
+                        Op::UploadPart { id, .. } => {
+                            seen.parts.push(id);
+                            let reply = if seen.parts.len() <= script.slow_parts as usize {
+                                Reply::status(Status::SlowDown)
+                            } else if sum == *trailer {
+                                Reply {
+                                    etag: "part".into(),
                                     checksum: Some(Stored {
                                         algorithm: TRAILER.code(),
                                         parts: 0,

@@ -24,10 +24,14 @@
 //! body's bytes were handed over, is told so ([`ClientError::Refused`]): nothing was applied. An
 //! exchange that ended otherwise without a reply is the caller's: [`ClientError::Lost`] says
 //! whether the request was sent whole, after which a mutation may have been applied, and asking it
-//! again with its identity is answered from what it made. A node's `SlowDown`, its range out of
-//! reach of a leader for its budget (node.md §5.4), is asked again as the AWS SDKs ask a throttling
-//! error again: of the next node, within the same attempts, after a full-jitter backoff and paid
-//! from a retry quota (botocore's), an upload's run sent again from where it began.
+//! again with its identity is answered from what it made. A node's `SlowDown`, a cause that passes
+//! (its range out of reach of a leader for its budget, node.md §5.4, or a block no volume took,
+//! gateway.md §2), is asked again as the AWS SDKs ask a throttling error again, whatever the
+//! operation: of the next node, within the same attempts, after a full-jitter backoff and paid from
+//! a retry quota (botocore's). A put's or a part's body is sent again from its first byte where its
+//! source gives it again ([`Source::again`]), as botocore rewinds a body before each retry
+//! (research/73 [11]); from a source read once it is not, and the `SlowDown` is the caller's. An
+//! upload's run is sent again by its upload from where it began.
 //!
 //! **What it checks.** The transport checks each body's CRC-32C on the way (node.md §3.2). A put
 //! whose op names a trailer states its checksum after its bytes, computed as they are sent, which
@@ -187,8 +191,10 @@ pub trait Source {
     fn read(&mut self, into: &mut [u8]) -> impl Future<Output = std::io::Result<usize>>;
 
     /// Positions the source to give its bytes from its first again, where it can: whether it did.
-    /// A request its node refused at admission took none of its body, so one whose source can give
-    /// it again is asked again (`untaken`); a source read once, standard input say, cannot.
+    /// A request its node refused at admission took none of its body (`untaken`), and one its node
+    /// answered `SlowDown` is put again whole, so either is asked again where its source gives its
+    /// body again; a source read once, standard input say, cannot, and the refusal or the
+    /// `SlowDown` is its caller's.
     fn again(&mut self) -> impl Future<Output = std::io::Result<bool>> {
         std::future::ready(Ok(false))
     }
@@ -666,6 +672,8 @@ impl Client {
 
     /// Puts `op`'s bytes, a PutObject's or an UploadPart's, `length` of them read from `source`,
     /// by `deadline_ns`; with a trailer named in `op`, its checksum computed as they are sent.
+    /// Answered `SlowDown`, they are put again from the source's first byte where it gives them
+    /// again ([`Source::again`]), within the client's attempts and retry quota.
     pub async fn put<S: Source>(
         &mut self,
         op: &Op,
@@ -1289,16 +1297,21 @@ impl Client {
             match asked {
                 Attempt::Replied(reply) => {
                     let reply = *reply;
-                    // Slowed (`SlowDown`, node.md §5.4), a request whose body need not be sent
-                    // again is asked again, its identity with it, as botocore's standard mode
-                    // retries a throttling error: within the attempts and the retry quota, of the
-                    // next node, from which its range's leader may be reached where this one's
-                    // could not. A run's body is gone; its upload sends it again (`Ran::Slowed`).
-                    if reply.status == Status::SlowDown
-                        && upload.is_none()
+                    // Slowed (`SlowDown`, node.md §5.4), a request is asked again, its identity
+                    // with it, as botocore's standard mode retries a throttling error whatever the
+                    // operation: within the attempts and the retry quota, of the next node, from
+                    // which its range's leader may be reached where this one's could not. Its
+                    // body, where it has one, is sent again from its first byte, as botocore
+                    // rewinds a body before each retry (research/73 [11]); one its source cannot
+                    // give again is not, the `SlowDown` the caller's. A run's source gives it no
+                    // `again`: its upload sends it again from the node's offset (`Ran::Slowed`).
+                    let again = reply.status == Status::SlowDown
                         && attempt.saturating_add(1) < ATTEMPTS
-                        && self.quota.take()
-                    {
+                        && match upload.as_deref_mut() {
+                            Some(upload) => upload.again().await?,
+                            None => true,
+                        };
+                    if again && self.quota.take() {
                         slowed = slowed.saturating_add(1);
                         taken = taken.saturating_add(SLOWED_RETRY);
                         self.slowed_wait(slowed, deadline_ns).await?;

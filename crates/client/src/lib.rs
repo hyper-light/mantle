@@ -346,6 +346,8 @@ pub fn stated(nodes: usize, transport_bytes: u64) -> Stated {
         pool: 0,
         ranges: 1,
         inflight: 0,
+        // Nothing replicates to a client: one lane, the least a peer may open.
+        lanes: 1,
         transfers: 0,
         asked: 0,
         transport_bytes,

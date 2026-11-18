@@ -105,6 +105,7 @@ pub fn stated(transport_bytes: u64) -> Stated {
         pool: 0,
         ranges: 5,
         inflight: settings.max_inflight_msgs,
+        lanes: 1,
         transfers: 38,
         asked: 0,
         transport_bytes,

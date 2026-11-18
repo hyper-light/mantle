@@ -6,6 +6,7 @@
 
 use std::mem::size_of;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1319,14 +1320,27 @@ pub fn shard_shape(listening: Option<u64>, peers: usize) -> Option<ShardShape> {
         Some(served) => usize::try_from(crate::listener::tasks(served)).ok()?,
         None => 0,
     };
-    let tasks = connections.checked_add(2)?;
+    // The first shard: the node's task, the launcher that spawns it, and each connection, which
+    // falls back to it where the shard it was handed to refuses it. Each past it: the task of the
+    // ranges the node places there (node.md §2.9), the listener's taker of the connections it is
+    // handed, and each of them.
+    let first = connections.checked_add(2)?;
+    let past = connections
+        .checked_add(usize::from(listening.is_some()))?
+        .checked_add(1)?;
+    let tasks = first.max(past);
     let sockets = peers.checked_add(2)?.checked_add(match listening {
         Some(_) => connections.checked_add(1)?,
         None => 0,
     })?;
+    // The first's: those the node's task holds at once; each past it, its ranges' task's wait and
+    // each connection's.
+    let timers = crate::process::TIMERS
+        .checked_add(connections)?
+        .max(connections.checked_add(1)?);
     Some(ShardShape {
         tasks,
-        timers: crate::process::TIMERS.checked_add(connections)?,
+        timers,
         interests: hyper_rt::runtime::interests_for(tasks).max(sockets.checked_mul(2)?),
     })
 }
@@ -2044,6 +2058,12 @@ pub fn derive(
             pool: if hosts { objects } else { 0 },
             ranges,
             inflight: settings.max_inflight_msgs,
+            // A lane for each shard that runs ranges: the node's shards are its cores
+            // (`process::shards`), one where it measured none.
+            lanes: crate::node::lanes(
+                NonZeroUsize::new(measured.cores).unwrap_or(NonZeroUsize::MIN),
+                ranges,
+            ),
             transfers,
             asked: asked.chunks,
             transport_bytes: 0,
@@ -2082,8 +2102,18 @@ pub fn derive(
             Some(_) => Some(0),
             None => None,
         };
+        // The shards past the first that run ranges, each with its two lanes to the node's
+        // (node.md §2.9), each lane holding the exchanges the transport admits at once.
+        let far = match NonZeroUsize::new(measured.cores) {
+            Some(shards) if shards.get() > 1 => crate::node::lanes(shards, ranges),
+            _ => 0,
+        };
+        let lanes = crate::node::shard_lanes_bytes(limits.exchanges)
+            .and_then(|pair| u64::try_from(far).ok()?.checked_mul(pair))
+            .ok_or(overflow("the ranges' shards' lanes"))?;
         let runtime = shard_shape(listening, stated.peers.len())
             .and_then(|shape| runtime_bytes(measured.cores, &shape, measured.ring, listening))
+            .and_then(|bytes| bytes.checked_add(lanes))
             .ok_or(overflow("the node's runtime"))?;
         Ok(Held {
             asked,
@@ -3587,6 +3617,7 @@ mod tests {
             pool: 0,
             ranges: 5,
             inflight: settings.max_inflight_msgs,
+            lanes: 1,
             transfers: 38,
             asked: 0,
             transport_bytes,

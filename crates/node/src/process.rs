@@ -112,6 +112,7 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::OnceLock;
@@ -2225,6 +2226,11 @@ async fn serve(
     let connections = gateway
         .as_ref()
         .map_or(0, |g| u64::try_from(g.objects).unwrap_or(u64::MAX));
+    // The runtime's shards that take tasks, which the node places its ranges over: its first, the
+    // node's, and each past it.
+    let shards = NonZeroUsize::MIN
+        .checked_add(others.len())
+        .ok_or_else(|| step(Step::Network)(ProcessError::Runtime("the node's shards".into())))?;
     let settings = NodeSettings {
         id: config.id,
         dir: config.dir.clone(),
@@ -2234,6 +2240,7 @@ async fn serve(
         peers,
         addresses,
         ranges,
+        shards,
         log: config.log,
         transport_bytes: config.transport_bytes,
         seed: None,
@@ -2249,6 +2256,10 @@ async fn serve(
         seeds: config.seeds.iter().map(|s| s.id).collect(),
     };
     let mut node = Node::open(settings).await.map_err(opened)?;
+    // Each range placed past the first shard moves to its shard before the node's first turn
+    // (node.md §2.9); a refusal stops the start, typed, as nothing would drive those ranges.
+    node.spread(&others)
+        .map_err(|e| step(Step::Network)(ProcessError::Node(e)))?;
     let run = layout
         .run()
         .map_err(kept)?

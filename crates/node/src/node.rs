@@ -93,8 +93,32 @@ const LIVENESS_GROUP: u128 = u128::MAX;
 /// The label of the exporter both ends of a connection derive its plane epoch from (RFC 5705 §4:
 /// a label beginning "EXPERIMENTAL" is for private use, unregistered).
 const EPOCH_LABEL: &[u8] = b"EXPERIMENTAL mantle plane epoch";
-/// The lane each peer's Raft frames travel on: the node runs its ranges on one shard.
+/// The lane each peer's Raft frames travel on: the node's task sends every range's, its own and
+/// those its shards hand back (node.md §2.9).
 const LANE: u32 = 0;
+
+/// The Raft lanes each peer may open to a node of `shards` shards hosting `ranges` ranges: a lane
+/// for each shard that runs ranges (node.md §3.2), as the node places them (§2.9), at most one a
+/// range.
+pub fn lanes(shards: NonZeroUsize, ranges: usize) -> usize {
+    spread::Spread::running(shards, ranges)
+}
+
+/// What the two lanes between the node's shard and one running its ranges hold at most beside what
+/// their values point to, each lane of `capacity` values (`Node::spread_to`): a place of hyper-rt's
+/// ring for each, a stamp and a value, and as many places of its room for a sender waiting, two
+/// words each (hyper-rt `sync::ring`, `sync::room`), one lane's values handed to the shard
+/// (`shard::In`) and the other's given back (`shard::Out`), at the types a node's process runs.
+pub fn shard_lanes_bytes(capacity: usize) -> Option<u64> {
+    let into = std::mem::size_of::<(
+        usize,
+        shard::In<mantle_range::Stored<DeviceFile>, GroupStore<DeviceFile>>,
+    )>();
+    let out = std::mem::size_of::<(usize, shard::Out)>();
+    let room = std::mem::size_of::<(u64, u64)>();
+    let each = into.checked_add(out)?.checked_add(room.checked_mul(2)?)?;
+    u64::try_from(capacity.checked_mul(each)?).ok()
+}
 
 /// The log's id: the node's.
 fn log_id(node: u64) -> u128 {
@@ -114,6 +138,10 @@ pub struct NodeSettings<E> {
     pub addresses: Vec<(PeerId, SocketAddr, SocketAddr)>,
     /// The ranges it hosts, each a member named by the node's id.
     pub ranges: Vec<Hosted<E>>,
+    /// The shards its ranges are placed over (node.md §2.9): its runtime's, the first the one whose
+    /// task opens and turns the node. Each range placed past the first moves to its shard before
+    /// the node's first turn ([`Node::spread`]).
+    pub shards: NonZeroUsize,
     pub log: LogConfig,
     /// The bytes the transport may hold at once.
     pub transport_bytes: u64,
@@ -1172,6 +1200,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pool: settings.gateway.as_ref().map_or(0, |g| g.objects),
             ranges: settings.ranges.len(),
             inflight,
+            lanes: lanes(settings.shards, settings.ranges.len()),
             transfers: settings.storage.transfers(),
             asked: settings.chunk_asks,
             transport_bytes: settings.transport_bytes,
@@ -1189,10 +1218,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let hosting = std::mem::take(&mut settings.ranges);
         let mut owner = shard::Here::new(Owner::new(vec![waker.clone(); hosting.len()]));
         let mut ranges = Vec::with_capacity(hosting.len());
-        // The node runs every range in its one task, on the shard that task runs on (node.md §1.2,
-        // as built 2026-11-17): one shard, the least a spread holds, so the rule places each range
-        // there, where it runs (§2.9).
-        let mut spread = spread::Spread::over(NonZeroUsize::MIN, hosting.len());
+        // Each range placed over the node's shards (§2.9): where they are one, the node's own,
+        // where it runs; past the first otherwise, where [`Node::spread`] moves it before the
+        // node's first turn.
+        let mut spread = spread::Spread::over(settings.shards, hosting.len());
         for hosted in hosting {
             if hosted.group == 0 || hosted.group == LIVENESS_GROUP {
                 return Err(at(Step::Configuration)(NodeError::Reserved(hosted.group)));
@@ -1491,6 +1520,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .filter_map(|place| self.ranges.get(place).map(|k| k.group))
     }
 
+    /// Moves each range placed past the node's first shard to its shard before the node's first
+    /// turn (node.md §2.9): shard `i`, numbered from the node's first, is the runtime shard
+    /// `holders[i - 1]` names, in the runtime's order. A shard placed no range starts no task. A
+    /// shard placed ranges with no holder is refused, typed, as one whose task ended
+    /// (`NodeError::ShardEnded`), and so is each refusal of [`Node::spread_to`] (`WritesOut`,
+    /// `LaneFull`): its ranges would be placed where nothing drives them, so the node does not
+    /// turn, and its process stops on the refusal.
+    pub fn spread(&mut self, holders: &[hyper_rt::SlotHolder]) -> Result<(), NodeError>
+    where
+        E: Send,
+        L::Store: Send + 'static,
+    {
+        for shard in 1..self.spread.shards() {
+            if self.spread.on(shard).next().is_none() {
+                continue;
+            }
+            let holder = shard
+                .checked_sub(1)
+                .and_then(|at| holders.get(at))
+                .ok_or(NodeError::ShardEnded(shard))?;
+            self.spread_to(*holder, shard)?;
+        }
+        Ok(())
+    }
+
     /// Starts the task of the node's shard `shard` (numbered from the node's first) on the runtime
     /// shard `holder` names, and moves there each range the table places on it, before its first
     /// drive (node.md §2.9): its replica leaves this task's owner for that task's, the stream keeps
@@ -1617,6 +1671,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         for lanes in &mut self.shards {
+            lanes.tell_held()?;
             lanes.tell_lost()?;
         }
         Ok(())
@@ -1695,8 +1750,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if far.peers.binary_search(peer).is_err() {
                 self.liveness.attach(*peer).map_err(NodeError::Liveness)?;
                 let belief = shard::Belief::of(&self.liveness, *peer);
-                if let Some(lanes) = self.shards.iter().find(|lanes| lanes.shard() == far.shard) {
-                    lanes.send(shard::In::Belief(group, belief))?;
+                if let Some(lanes) = self
+                    .shards
+                    .iter_mut()
+                    .find(|lanes| lanes.shard() == far.shard)
+                {
+                    lanes.tell_stream(shard::In::Belief(group, belief))?;
                 }
             }
         }
@@ -2585,10 +2644,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
             self.owner.believe(&change);
-            // A change a shard's lane has no room for stops the node: a range that missed it
-            // would believe what the stream no longer does.
-            for lanes in &self.shards {
-                lanes.send(shard::In::Believe(change))?;
+            // A change a shard's lane has no room for is held for the next turn, in order: a range
+            // that missed it would believe what the stream no longer does.
+            for lanes in &mut self.shards {
+                lanes.tell_stream(shard::In::Believe(change))?;
             }
             self.liveness_moved = true;
         }

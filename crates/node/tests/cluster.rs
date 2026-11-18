@@ -1,5 +1,6 @@
-//! Three nodes on real sockets on loopback, each on a thread of its own running a hyper-rt shard, as
-//! a node's process runs its owner (docs/design/node.md §2): one Name range replicated over QUIC
+//! Three nodes on real sockets on loopback, each on a thread of its own running its hyper-rt
+//! runtime's shards, as a node's process runs its owner (docs/design/node.md §2), its range on the
+//! shard the node places it on (§2.9; `MANTLE_NODE_SHARDS`): one Name range replicated over QUIC
 //! lanes and the
 //! sealed datagram plane, elected by the suspicion of the node-pair liveness stream (hyper-raft
 //! timing steps L-2, L-3). Nothing is told by hand: each node dials the nodes above it, keys the
@@ -69,9 +70,11 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -79,9 +82,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, Waits};
+use hyper_rt::SlotHolder;
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::facts::Facts;
-use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
+use hyper_rt::runtime::{LocalRuntime, Runtime, RuntimeConfig, interests_for};
 use hyper_rt::sync::{ChannelReceiver, Sender, channel};
 use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -137,6 +141,10 @@ const COMMAND_ASKS: usize = 8;
 const READ_ASKS: usize = 8;
 /// The nodes of most cells, each a founding voter of the range.
 const NODES: u64 = 3;
+/// The shards each node runs over unless `MANTLE_NODE_SHARDS` states otherwise ([`node_shards`]):
+/// two, the least that places a range past the node's own shard, as a process of more than one CPU
+/// places them (node.md §2.9); one is the shape of a process of one.
+const NODE_SHARDS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 /// The most nodes a cell has: five, the larger of the cells node.md's Phase C asks histories of
 /// (three voters and five).
 const MOST_NODES: u64 = 5;
@@ -324,6 +332,62 @@ fn shard(sockets: usize) -> LocalRuntime {
     .unwrap()
 }
 
+/// The shards each node runs over, as a node's process runs over its runtime's (node.md §2.9):
+/// its first runs the node's task, and each range the node places past it runs on its own shard.
+/// `MANTLE_NODE_SHARDS` states another count, so the suite runs the same laws over each.
+fn node_shards() -> NonZeroUsize {
+    std::env::var("MANTLE_NODE_SHARDS")
+        .ok()
+        .map_or(NODE_SHARDS, |shards| shards.parse().unwrap())
+}
+
+/// A node's runtime of `shards` shards, sized by what each holds: the first, the node's task and
+/// the launcher that spawns it ([`on_first_shard`]), its wait's timer and its driver's QUIC timer,
+/// and `sockets` sockets, each read and written; each past it, the task of the ranges the node
+/// places there and its wait's timer. The rest as [`shard`]'s.
+fn node_runtime(sockets: usize, shards: NonZeroUsize) -> Runtime {
+    Runtime::start(&RuntimeConfig {
+        shards: u16::try_from(shards.get()).unwrap(),
+        tasks_per_shard: 2,
+        timers_per_shard: 2,
+        interests_per_shard: interests_for(2).max(2 * sockets),
+        ring_entries: 1,
+        step_budget_ns: 1_000_000_000,
+        timer_tick_ns: 100_000,
+        batch: 1,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: usize::try_from(Facts::query().page.base).unwrap(),
+        spin_ns: 0,
+        wake_tracking: None,
+        latency_objective_ns: None,
+    })
+    .unwrap()
+}
+
+/// Runs the future `make` makes on `rt`'s first shard until it ends, as a node's process runs its
+/// node (`process::run_on_first_shard`), then shuts `rt` down, every shard's task ended with it.
+fn on_first_shard<M, F>(rt: Runtime, make: M)
+where
+    M: FnOnce() -> F + Send + 'static,
+    F: Future<Output = ()> + 'static,
+{
+    let (ended, heard) = mpsc::sync_channel(1);
+    let launch = async move {
+        let made = make();
+        hyper_rt::futures::spawn_detached(async move {
+            made.await;
+            let _ = ended.try_send(());
+        })
+        .unwrap();
+    };
+    rt.spawn_on(rt.shard_ids()[0], launch).unwrap();
+    // The task ends once its orders do (`Cell`'s drop) or it fails, which it reports; a task
+    // that unwound drops its end unsent.
+    let _ = heard.recv();
+    rt.shutdown().unwrap();
+}
+
 /// The sockets of a node of a cell of `nodes`: its endpoint's, one for each connection (its
 /// peers' and each client's) and its plane's.
 fn node_sockets(nodes: u64) -> usize {
@@ -453,6 +517,7 @@ impl Pki {
             peers,
             addresses: Vec::new(),
             ranges: vec![hosted(self.voters, engine)],
+            shards: NonZeroUsize::MIN,
             log: log_config(),
             transport_bytes,
             seed: None,
@@ -618,15 +683,30 @@ fn orders_bound(nodes: u64) -> usize {
 /// A node's task: opens the node, as the task that turns a node opens it (`Node::open`), reports
 /// where it listens, then turns it, each turn raced against the test's next order, reporting its
 /// status when it changed and each registration's answer as it applied.
-async fn run<E: Engine + 'static>(
+async fn run<E: Engine + Send + 'static>(
     settings: NodeSettings<E>,
     mut orders: ChannelReceiver<Order>,
     reports: mpsc::Sender<Report>,
+    others: Vec<SlotHolder>,
 ) {
     let id = settings.id;
-    let opened = Node::open(settings).await;
+    // Each range placed past the first shard moves to its shard before the node's first turn, as
+    // a node's process moves them (node.md §2.9).
+    let opened = Node::open(settings)
+        .await
+        .and_then(|mut node| node.spread(&others).map(|()| node));
     let mut node = match opened.and_then(|node| node.addresses().map(|a| (node, a))) {
         Ok((node, (quic, plane))) => {
+            // The rule places the range past the first shard wherever there is one (§2.9).
+            let placed = usize::from(!others.is_empty());
+            if node.shard_of(GROUP) != Some(placed) {
+                let why = format!(
+                    "its range on {:?}, not shard {placed}",
+                    node.shard_of(GROUP)
+                );
+                let _ = reports.send(Report::Failed(id, why));
+                return;
+            }
             if reports.send(Report::Bound(id, quic, plane)).is_err() {
                 return;
             }
@@ -1346,8 +1426,9 @@ impl Cell {
         }
     }
 
-    /// Starts node `id` on a thread of its own, its shard, on its directory: the engine is opened
-    /// on the shard that turns its node. A spare starts as the founding voters did, with their
+    /// Starts node `id` on a thread of its own, its runtime's shards ([`node_shards`]), on its
+    /// directory: the engine is opened on the shard that turns its node, and moved to the shard
+    /// the node places its range on. A spare starts as the founding voters did, with their
     /// configuration and rows, and is no member of the range until a replacement adds it.
     fn spawn(&mut self, id: u64) {
         let (order, taken) = channel(orders_bound(self.nodes)).unwrap();
@@ -1361,6 +1442,7 @@ impl Cell {
             ..template
         });
         let chunk_bytes = self.chunk_bytes.get(&id).copied().unwrap_or(CHUNK_BYTES);
+        let shards = node_shards();
         let thread = std::thread::spawn(move || {
             // A panic on the node's thread is told as its failure, so a wait on it ends.
             let failed = tell.clone();
@@ -1371,24 +1453,37 @@ impl Cell {
                     Some(volume) => Storage::open(&[volume]).unwrap(),
                     None => Storage::none(),
                 };
-                let mut rt = shard(sockets);
-                match engines {
-                    Engines::Model => {
-                        let mut settings = pki.settings(id, &dir, first_range(Model::default()));
-                        settings.storage = storage;
-                        settings.chunk_bytes = chunk_bytes;
-                        rt.block_on(run(settings, taken, tell)).unwrap();
+                let rt = node_runtime(sockets, shards);
+                // The shards past the first, each named by the registration holding it.
+                let others: Vec<SlotHolder> = rt.shard_ids()[1..]
+                    .iter()
+                    .map(|shard| rt.holder_of(*shard).unwrap())
+                    .collect();
+                let shards = NonZeroUsize::MIN.checked_add(others.len()).unwrap();
+                let make = move || -> Pin<Box<dyn Future<Output = ()>>> {
+                    match engines {
+                        Engines::Model => {
+                            let mut settings =
+                                pki.settings(id, &dir, first_range(Model::default()));
+                            settings.storage = storage;
+                            settings.chunk_bytes = chunk_bytes;
+                            settings.shards = shards;
+                            Box::pin(run(settings, taken, tell, others))
+                        }
+                        Engines::Mantle => {
+                            // The node's shard is its metadata shard: its replicas apply through
+                            // the engine's synchronous calls (node.md §1.2), as a far range's
+                            // shard's do.
+                            mantle_engine::store::permit_blocking();
+                            let mut settings = pki.settings(id, &dir, stored(&dir));
+                            settings.storage = storage;
+                            settings.chunk_bytes = chunk_bytes;
+                            settings.shards = shards;
+                            Box::pin(run(settings, taken, tell, others))
+                        }
                     }
-                    Engines::Mantle => {
-                        // The node's shard is its metadata shard: its replicas apply through the
-                        // engine's synchronous calls (node.md §1.2).
-                        mantle_engine::store::permit_blocking();
-                        let mut settings = pki.settings(id, &dir, stored(&dir));
-                        settings.storage = storage;
-                        settings.chunk_bytes = chunk_bytes;
-                        rt.block_on(run(settings, taken, tell)).unwrap();
-                    }
-                }
+                };
+                on_first_shard(rt, make);
             }));
             if ran.is_err() {
                 let _ = failed.send(Report::Failed(id, "its thread panicked".into()));

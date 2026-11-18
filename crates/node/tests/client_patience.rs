@@ -172,6 +172,7 @@ fn client_settings(pki: &Pki) -> ClientSettings {
         pool: 0,
         ranges: 1,
         inflight: 0,
+        lanes: 1,
         transfers: 0,
         asked: 1,
         transport_bytes: 0,

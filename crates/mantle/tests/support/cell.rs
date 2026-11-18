@@ -890,6 +890,7 @@ impl Pki {
             pool: 0,
             ranges: 1,
             inflight: 0,
+            lanes: 1,
             transfers: 0,
             asked: usize::from(role == Role::Gateway),
             transport_bytes: 0,

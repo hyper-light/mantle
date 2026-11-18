@@ -16,7 +16,7 @@
 //! which nothing else holds, so the node stops (`NodeError::ShardEnded`) and its next start
 //! recovers them from the log (node.md §1.7).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
@@ -812,6 +812,9 @@ pub(crate) struct Lanes<E: Engine, S: LogStore> {
     /// The peers whose connection went that the shard is yet to be told of ([`Lanes::lost`]):
     /// each once, so at most the node's peers.
     lost: Vec<PeerId>,
+    /// The stream's words the shard is yet to be told of, in the order the stream gave them
+    /// ([`Lanes::tell_stream`]): at most a lane's capacity.
+    stream: VecDeque<In<E, S>>,
 }
 
 impl<E, S> Lanes<E, S>
@@ -839,6 +842,7 @@ where
             from,
             held: None,
             lost: Vec::new(),
+            stream: VecDeque::new(),
         })
     }
 }
@@ -883,6 +887,51 @@ impl<E: Engine + 'static, S: LogStore> Lanes<E, S> {
                 NodeError::ShardEnded(self.shard)
             }
         })
+    }
+
+    /// Hands the shard a word of the stream, a change of it ([`In::Believe`]) or its belief of a
+    /// peer a range came to share its group with ([`In::Belief`]), after those held: held while
+    /// its lane is full, in order, and told at the next turn's take ([`Lanes::tell_held`]), as a
+    /// lost peer is, since a range that missed it would believe what the stream no longer does. A
+    /// lane full of Raft messages, which it drops, so holds a word for a turn rather than stopping
+    /// the node. At most a lane's capacity is held: one past it is refused `LaneFull`, which stops
+    /// the node; and `ShardEnded` when the shard's task is gone.
+    pub(crate) fn tell_stream(&mut self, word: In<E, S>) -> Result<(), NodeError> {
+        self.tell_held()?;
+        let word = if self.stream.is_empty() {
+            match self.into.try_send(word) {
+                Ok(()) => return Ok(()),
+                Err(SyncError::Full(word)) => word,
+                Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => {
+                    return Err(NodeError::ShardEnded(self.shard));
+                }
+            }
+        } else {
+            word
+        };
+        if self.stream.len() >= self.capacity {
+            return Err(NodeError::LaneFull(self.shard));
+        }
+        self.stream.push_back(word);
+        Ok(())
+    }
+
+    /// Tells the shard the stream's words held ([`Lanes::tell_stream`]) while its lane has room,
+    /// in order, and holds the rest for the next turn's take.
+    pub(crate) fn tell_held(&mut self) -> Result<(), NodeError> {
+        while let Some(word) = self.stream.pop_front() {
+            match self.into.try_send(word) {
+                Ok(()) => {}
+                Err(SyncError::Full(word)) => {
+                    self.stream.push_front(word);
+                    break;
+                }
+                Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => {
+                    return Err(NodeError::ShardEnded(self.shard));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Holds that `peer`'s connection went, for the shard to be told at the turn's take
@@ -1458,6 +1507,9 @@ async fn run<E: Engine + 'static, S: LogStore>(
     slots: usize,
     capacity: usize,
 ) {
+    // Its replicas apply through the engine's synchronous calls, as the node's own shard's do: a
+    // metadata shard, which may wait on the device (node.md §1.2, §2.9).
+    mantle_engine::store::permit_blocking();
     let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
     let mut shard = Shard {
         owner: Owner::new(vec![waker.clone(); slots]),
@@ -1715,6 +1767,7 @@ mod tests {
             from,
             held: None,
             lost: Vec::new(),
+            stream: VecDeque::new(),
         };
         (lanes, (taken, given))
     }
@@ -2552,6 +2605,40 @@ mod tests {
         lanes.lost(4);
         drop((taken, given));
         assert!(matches!(lanes.tell_lost(), Err(NodeError::ShardEnded(1))));
+    }
+
+    /// A word of the stream a far range's shard's lane has no room for, full of what the node
+    /// handed it, is held and told at a later take, in the order the stream gave it; held past a
+    /// lane's capacity it stops the node, typed, and so does one held for a shard whose task
+    /// ended.
+    #[test]
+    fn a_stream_word_is_held_while_the_lane_is_full_and_told_in_order() {
+        let (mut lanes, (mut taken, given)) = unstarted(1);
+        let trusted = |at_ns| In::Believe(Change::Trusted { peer: 2, at_ns });
+        let restarted = || In::Believe(Change::Restarted { peer: 3, at_ns: 2 });
+        lanes.send(measured()).unwrap();
+        lanes.tell_stream(trusted(1)).unwrap();
+        assert_eq!(lanes.stream.len(), 1, "held while the lane is full");
+        assert!(
+            matches!(lanes.tell_stream(restarted()), Err(NodeError::LaneFull(1))),
+            "past a lane's capacity held"
+        );
+        assert!(matches!(taken.try_recv(), Ok(Some(In::Measure(_)))));
+        lanes.tell_held().unwrap();
+        assert!(lanes.stream.is_empty());
+        assert!(matches!(
+            taken.try_recv(),
+            Ok(Some(In::Believe(Change::Trusted { at_ns: 1, .. })))
+        ));
+        lanes.tell_stream(restarted()).unwrap();
+        assert!(matches!(
+            taken.try_recv(),
+            Ok(Some(In::Believe(Change::Restarted { .. })))
+        ));
+        lanes.send(measured()).unwrap();
+        lanes.tell_stream(trusted(3)).unwrap();
+        drop((taken, given));
+        assert!(matches!(lanes.tell_held(), Err(NodeError::ShardEnded(1))));
     }
 
     /// A far range's shard told a peer's connection went goes on driving its ranges: one that

@@ -49,6 +49,21 @@ impl Spread {
         Some(shard)
     }
 
+    /// The shards the ranges are placed over, the first among them.
+    pub(super) fn shards(&self) -> usize {
+        self.held.len()
+    }
+
+    /// The shards that run ranges once `ranges` ranges are placed over `shards` by the rule: the
+    /// one where it is the only shard, and otherwise those past the first, each taking one before
+    /// any takes a second, so at most one a range; none where there is no range.
+    pub(super) fn running(shards: NonZeroUsize, ranges: usize) -> usize {
+        match shards.get().checked_sub(1) {
+            Some(0) | None => ranges.min(1),
+            Some(past) => past.min(ranges),
+        }
+    }
+
     /// The shard that runs the range at `place` in the table.
     pub(super) fn shard(&self, place: usize) -> Option<usize> {
         self.shard_of.get(place).copied()
@@ -121,6 +136,25 @@ mod tests {
             let mut spread = over(shards);
             let placed: Vec<usize> = (0..5).map(|_| spread.place().unwrap()).collect();
             assert_eq!(placed, vec![1, 2, 3, 4, 5], "{shards} shards");
+        }
+    }
+
+    #[test]
+    fn the_shards_running_ranges_are_those_the_rule_fills_at_most_one_a_range() {
+        for shards in 1..=9 {
+            let mut spread = over(shards);
+            for ranges in 0..=40 {
+                if ranges > 0 {
+                    spread.place().unwrap();
+                }
+                let filled = spread.held.iter().filter(|held| **held > 0).count();
+                assert_eq!(
+                    Spread::running(NonZeroUsize::new(shards).unwrap(), ranges),
+                    filled,
+                    "{shards} shards, {ranges} ranges"
+                );
+                assert_eq!(spread.shards(), shards);
+            }
         }
     }
 

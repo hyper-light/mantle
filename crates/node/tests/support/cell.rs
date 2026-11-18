@@ -775,6 +775,7 @@ impl Sim {
                     engine,
                 })
                 .collect(),
+            shards: std::num::NonZeroUsize::MIN,
             log: self.log,
             transport_bytes: u64::try_from(
                 self.pki.peers(id).len() * 4 * hyper_transport::RECEIVE_CHUNK,

@@ -991,6 +991,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/chunk/src/volume.rs` `read_superblock:(64 << 10)#2` | derived | `64 << 10` | As the pool's buffer: the largest block a copy is read at. |
 | `crates/chunk/src/writer.rs` `Writer::place_frame:with_capacity(2)` | derived | `2` | A frame's writes: its own and, when it wraps, the wrap record before it. |
 | `crates/client/src/lib.rs` `stated:ranges` | derived | `1` | The client's own count: it keeps one object exchange out at a time (its loop sends one command and waits for its answer). |
+| `crates/client/src/lib.rs` `stated:lanes` | derived | `1` | The Raft lanes a node may open to the client (`bounds::Stated::lanes`, `limits:lanes_per_peer`): nothing replicates to a client, and one lane is the least the transport takes. A node's own is derived: a lane for each of its shards that runs ranges, at most one a range (`node::lanes`; node.md §3.2, §2.9). |
 | `crates/crc/src/lib.rs` `$::shift_operator:k` | derived | `3` | 8 = 2^3: the operator for one byte's shift, squared from 2^3 bits. |
 | `crates/disk/src/calibrate.rs` `Plan::standard:[1, 4, 16, 64]` | picked | `[1, 4, 16, 64]` | Read depths measured, a ladder by four picked (audit 2026-11-12 §3 #18). Replace: bisect between the last growing and the first flat depth. |
 | `crates/disk/src/calibrate.rs` `Plan::standard:[1, 4]` | picked | `[1, 4]` | Sequential depths measured, picked (audit 2026-11-12 §3 #18). Replace: the same growing ladder as random reads. |
@@ -1217,6 +1218,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/mantle/src/relay.rs` `runtime:shards` | derived | `1` | One thread drives every link of the relay, a task each (the module's doc), so one shard, as a client's runtime has (`client.rs` `runtime_of:shards`). |
 | `crates/mantle/src/transfer/mod.rs` `transfer:workers` | derived | `1` | One place, the client asking one lookup at a time. |
 | `crates/mantle/src/transfer/place.rs` `Gateway::stated:ranges` | derived | `1` | As the range client states it (`Client::open`): one read out at a time. |
+| `crates/mantle/src/transfer/place.rs` `Gateway::stated:lanes` | derived | `1` | As the range client states it (`Client::open`): nothing replicates to a gateway, one lane the least the transport takes. |
 | `crates/mantle/src/transfer/place.rs` `Reader::moved:max` | picked | `1` | As `Get::advance`: one extent asked a round trip. |
 | `crates/meta/src/key.rs` `escape:[0x00, 0xFF]` | format | `[0x00, 0xFF]` | An escaped zero byte in an order-preserving key: 0x00 0xFF, so that 0x00 0x00 ends the component. |
 | `crates/meta/src/name.rs` `first:generation` | format | `1` | A cell's first Name range is at generation one. |
@@ -1226,6 +1228,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/node/src/ask.rs` `Asking::answered_entry:next_serial` | format | `1` | A session's serials count from one; zero means none answered. |
 | `crates/node/src/ask.rs` `Asking::new:next_serial` | format | `1` | A session's serials count from one; zero means none answered. |
 | `crates/node/src/client.rs` `Client::open:ranges` | derived | `1` | The range client's own count: one command out, to one range at a time, a session's commands applying in serial order (audit 2026-11-12 §1: a structural limit, not a number). |
+| `crates/node/src/client.rs` `Client::open:lanes` | derived | `1` | The Raft lanes a node may open to the range client (`bounds::Stated::lanes`): nothing replicates to a client, and one lane is the least the transport takes (`Limits::validate` refuses none). |
 | `crates/node/src/derive.rs` `cell:expiries_per_entry` | derived | `1` | expiry work an entry does: structural: with no lifetime nothing expires |
 | `crates/node/src/derive.rs` `gateway:scan_rows` | picked | `1` | rows a bucket coordinator's read or collection passes at a step. Refused (audit 2026-11-12 §6): a floor; bucket create/delete pass one row a command round. Replace: rows a step = what one entry of the range's largest bytes holds (derive from row bounds), or the measured rows a commit round amortizes |
 | `crates/node/src/derive.rs` `gateway:window` | guessed | `1` | blocks a PUT holds going down and a GET holds reading. Refused (audit 2026-11-12 §6): a floor taken as the operating value; an 8 MiB+ object's next block waits a Block command (~17 ms, research/71). Replace: blocks in flight = measured block commit latency × the client's measured body rate / block size (Little), within the memory each operation may hold |
@@ -1241,7 +1244,6 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/node/src/place.rs` `key:(1u64 << 53)` | external | `1u64 << 53` | 2^53: an IEEE 754 binary64's significand holds 53 bits, so the draw is uniform in [0, 1) (IEEE Std 754-2019 §3.6). |
 | `crates/node/src/process.rs` `run_node:workers` | derived | `1` | name lookups at once: structural |
 | `crates/node/src/process.rs` `run_on_first_shard:sync_channel(1)` | derived | `1` | A channel of one slot: the one value sent on it, the node's task's output or its launcher's refusal to spawn the task, never both. |
-| `crates/protocol/src/bounds.rs` `limits:lanes_per_peer` | derived | `1` | Raft lanes a peer opens: a lane for each shard that runs ranges (node.md §3.2), and the node runs every range on its first shard alone, which keeps its one durable owner, its one log writer and its transport's one UDP endpoint; its other shards run S3 connections only (node.md §4.1, `listener::shards`). |
 | `crates/protocol/src/object.rs` `take_digests:take(16)` | format | `16` | The width of the field the decoder reads, fixed by the encoding it reads. |
 | `crates/range/src/replica.rs` `limits:depth` | derived | `1` | A replica's member keeps one write out on its log at a time in this harness, which runs the log in-process. |
 | `crates/s3/src/post.rs` `answer:status` | external | `303` | 303 See Other, what S3 answers a POST with success_action_redirect (RFC 9110 §15.4.4; AWS S3 API reference, POST Object). |

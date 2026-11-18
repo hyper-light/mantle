@@ -59,6 +59,9 @@ pub struct Stated {
     pub ranges: usize,
     /// The appends a range's leader keeps out to one follower (`Settings::max_inflight_msgs`).
     pub inflight: usize,
+    /// The Raft lanes each peer may open to it, at least one (node.md §3.2): a node's shards that
+    /// run its ranges, at most one a range (§2.9); a client's one.
+    pub lanes: usize,
     /// The chunk exchanges its volumes take at once, which its peers may open to it: each volume's
     /// writer queue and its reads at the device and waiting.
     pub transfers: usize,
@@ -249,8 +252,8 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
         },
         ask_queue: AskQueue::Table,
         exchanges,
-        // One lane a peer: the node runs its ranges on one shard (node.md §3.2's lane a shard).
-        lanes_per_peer: 1,
+        // A lane a peer for each shard that runs ranges (node.md §3.2's lane a shard).
+        lanes_per_peer: lanes(stated)?,
         lane_window,
         // A command's head names its range; a reply's, its status and the leader; a chunk's, its
         // volume, its key and the CRC-32C or the range asked; an object's, the operation and its
@@ -278,11 +281,16 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
     })
 }
 
+/// The lanes each peer may open ([`Stated::lanes`]), at least one.
+fn lanes(stated: &Stated) -> Result<u32, Unfit> {
+    u32::try_from(stated.lanes.max(1)).map_err(|_| Unfit("lanes"))
+}
+
 /// The bytes the transport and its owner hold of messages at once, at most: every exchange's head
 /// both ways (an outgoing message's prefix and head, an incoming head), the one body piece the
 /// owner reads at a time (a receive chunk: the node's and the client's `PIECE`), and, for a node
 /// that keeps appends out (`Stated::inflight`), each peer lane's frames, its window queued out and
-/// one read in.
+/// one read in, for each lane it may open.
 fn messages(
     stated: &Stated,
     exchanges: usize,
@@ -302,10 +310,16 @@ fn messages(
         0
     } else {
         let frame = frame_grant(stated.messages.replication);
+        let lanes = u64::from(lanes(stated)?);
         u64::try_from(stated.peers.max(1))
             .ok()
             .zip(u64::try_from(lane_window.checked_add(1).ok_or_else(unfit)?).ok())
-            .and_then(|(peers, window)| peers.checked_mul(window)?.checked_mul(frame))
+            .and_then(|(peers, window)| {
+                peers
+                    .checked_mul(lanes)?
+                    .checked_mul(window)?
+                    .checked_mul(frame)
+            })
             .ok_or_else(unfit)?
     };
     let piece = u64::try_from(RECEIVE_CHUNK).map_err(|_| unfit())?;
@@ -472,6 +486,7 @@ mod tests {
             pool: 0,
             ranges: 3,
             inflight: 4,
+            lanes: 1,
             transfers: 5,
             asked: 0,
             transport_bytes: 64 << 20,
@@ -482,6 +497,40 @@ mod tests {
                 bulk: 1 << 24,
             },
             max_head: crate::object::MAX_HEAD,
+        }
+    }
+
+    /// A peer may open a lane for each shard that runs the node's ranges, at least one, and the
+    /// messages' bytes count each lane's frames; the exchanges, which a lane to a shard running
+    /// ranges holds (mantle-node's `Node::spread_to`), are at least four a range, so never fewer
+    /// than the ranges on one shard.
+    #[test]
+    fn a_peer_opens_a_lane_a_shard_and_the_exchanges_hold_every_range() {
+        assert_eq!(limits(&stated()).unwrap().lanes_per_peer, 1);
+        let none = Stated {
+            lanes: 0,
+            ..stated()
+        };
+        assert_eq!(limits(&none).unwrap().lanes_per_peer, 1);
+        let three = Stated {
+            lanes: 3,
+            ..stated()
+        };
+        assert_eq!(limits(&three).unwrap().lanes_per_peer, 3);
+        assert!(least_transport(&three).unwrap() > least_transport(&stated()).unwrap());
+        for ranges in [1, 5, 64] {
+            for peers in [1, 2, 9] {
+                let s = Stated {
+                    ranges,
+                    peers,
+                    ..stated()
+                };
+                let s = Stated {
+                    transport_bytes: least_transport(&s).unwrap(),
+                    ..s
+                };
+                assert!(limits(&s).unwrap().exchanges >= 4 * ranges);
+            }
         }
     }
 
@@ -564,6 +613,7 @@ mod tests {
             peers: 3,
             ranges: 1,
             inflight: 0,
+            lanes: 1,
             transfers: 1,
             asked: 0,
             transport_bytes: 3 * 4 * RECEIVE_CHUNK as u64,
@@ -577,6 +627,7 @@ mod tests {
             pool: 0,
             ranges: 5,
             inflight: 2,
+            lanes: 1,
             transfers: 130,
             asked: 0,
             transport_bytes: 7 * 4 * RECEIVE_CHUNK as u64,

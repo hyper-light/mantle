@@ -215,6 +215,24 @@ pub fn most_charged(charges: &Charges) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// The most one native PUT or GET holds above its node's idle at the floor's window, the bound a
+/// body crossing the client, the host and the transport is held to (node.md §1.4): its charge,
+/// the most an operation holds ([`Charges::most`]), which is its driver's window of blocks
+/// (`gateway.window`) at the largest block (`put::most_bytes`, `get::most_bytes`), a put's chunks
+/// copied to send for each block going down and one piece of its body carried, the transport's
+/// receive chunk (`hyper_transport::RECEIVE_CHUNK`), and a get's block taken to be written out;
+/// `beside`, what one more operation adds past its charge to the transport, the ranges, the
+/// listener and the runtime, [`derive`]'s difference of the node at two operations and at one:
+/// its client's connection and exchange at QUIC's windows, a range's read, its task; and the
+/// host's records of it, its job and its boxed put or get (`node::record_bytes`). A put admitted
+/// at a window it learned holds that window's blocks instead ([`Charges::write`]), at most the
+/// operations' bytes. Not in it: a put's record of each block it wrote until its file names them
+/// (`mantle_gateway::put`'s `recorded`), which grows with the body by design and no layout states.
+pub fn native(charges: &Charges, beside: u64) -> Option<u64> {
+    let records = u64::try_from(crate::node::record_bytes()?).ok()?;
+    charges.most().checked_add(beside)?.checked_add(records)
+}
+
 /// What one stock client's part holds going down (`listener::STOCK_PART`), charged as the host
 /// charges a write of it (`host::sized`): every block of it at once, the most any window the node
 /// learns gives a body of that length (`crate::window::Window::blocks`).
@@ -2281,7 +2299,7 @@ pub fn derive(
     say_need(&mut said, need(&deepest_floor, wanted)?);
     // The operations' share holds as many operations as it holds at what one costs: its charge,
     // and what one more adds to the transport and the ranges, the model's own difference.
-    let (objects, objects_bytes) = if hosts {
+    let (objects, objects_bytes, native) = if hosts {
         let total = |held: &Held| {
             held.bounds
                 .transport_bytes
@@ -2308,9 +2326,11 @@ pub fn derive(
             .checked_add(each)
             .and_then(|share| share.checked_add(slack))
             .ok_or(overflow("the operations' share"))?;
-        operations(share, each, &charges, serving)
+        let (objects, bytes) = operations(share, each, &charges, serving);
+        let native = native(&charges, each).ok_or(overflow("a native operation's bound"))?;
+        (objects, bytes, Some(native))
     } else {
-        (0, 0)
+        (0, 0, None)
     };
     let gateway = gateway(objects, objects_bytes)?;
     let Held {
@@ -2336,6 +2356,9 @@ pub fn derive(
         &rates,
         (target, stated.target.is_some(), stated.repair.is_some()),
     );
+    if let Some(native) = native {
+        say_native(&mut said, native);
+    }
 
     let classes = classes_at(
         &Held {
@@ -3077,6 +3100,19 @@ fn say_objects(
             "S3's eleven nines a year, applied to each block (durability.md §1)",
         );
     }
+}
+
+fn say_native(said: &mut Said, native: u64) {
+    said.add(
+        "memory.native",
+        native,
+        Kind::Derived,
+        "the most one native PUT or GET holds above the node's idle at gateway.window: the most \
+         an operation is charged, its window of blocks at the largest block, a put's chunks copied \
+         to send and a piece of its body (derive::Charges); what one more operation adds beside \
+         it to the transport, the ranges, the listener and the runtime; and the host's records of \
+         it (derive::native)",
+    );
 }
 
 fn say_need(said: &mut Said, need: u64) {
@@ -4571,6 +4607,32 @@ mod tests {
     fn said_bytes(derived: &Derived, key: &str) -> u64 {
         let basis = derived.bases.iter().find(|b| b.key == key).unwrap();
         basis.value.parse().unwrap()
+    }
+
+    /// The bound a native PUT or GET is held to (`memory.native`) is the most an operation is
+    /// charged at the floor's window, what one more operation adds beside its charge, and the
+    /// host's records of it; a node that hosts no objects says none.
+    #[test]
+    fn a_native_operations_bound_is_its_charge_its_state_and_its_records() {
+        let records = u64::try_from(crate::node::record_bytes().unwrap()).unwrap();
+        let three = Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap();
+        assert_eq!(
+            native(&three, 300_000),
+            Some(three.most() + 300_000 + records)
+        );
+        let hosting = stated(1);
+        let charges = charges(1, hosting.enlist.as_ref(), &rates(), target(None)).unwrap();
+        let derived = derive(hosting, &facts(1), &mut fresh).unwrap();
+        let said = said_bytes(&derived, "memory.native");
+        let beside = said - charges.most() - records;
+        eprintln!(
+            "memory.native {said}: charge {}, beside {beside}, records {records}",
+            charges.most()
+        );
+        assert!(beside > 0, "{said}");
+        assert_eq!(native(&charges, beside), Some(said));
+        let alone = derive(stated(0), &facts(0), &mut fresh).unwrap();
+        assert!(alone.bases.iter().all(|b| b.key != "memory.native"));
     }
 
     /// `facts(1)` with its volume's device reporting a queue of `queue` and calibrated at `depth`.

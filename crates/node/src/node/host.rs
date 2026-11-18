@@ -205,6 +205,13 @@ impl Job {
     }
 }
 
+/// What the host keeps of one native put or get beside its charge, by design: its job, and the
+/// work it boxes, a put's or a get's whichever is larger, its driver inline in it
+/// (`derive::native`).
+pub(crate) fn record_bytes() -> Option<usize> {
+    size_of::<Job>().checked_add(size_of::<Putting>().max(size_of::<Getting>()))
+}
+
 /// What a held job's bound makes of it at a turn (research/77 D2).
 #[derive(Debug, PartialEq, Eq)]
 enum Bounded {

@@ -79,6 +79,7 @@ mod spread;
 mod stop;
 use answers::Answers;
 pub use host::GatewaySettings;
+pub(crate) use host::record_bytes;
 pub use members::Cell;
 pub use repair::RepairStatus;
 use stop::Stopping;

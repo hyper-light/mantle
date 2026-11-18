@@ -2584,3 +2584,169 @@ fn a_get_copies_each_byte_it_reads_once() {
         "{counts:?}"
     );
 }
+
+/// A PUT's request as the cell takes it: made while the count is paused, so what the cell keeps
+/// (a volume's disk, a range's rows) is not the gateway's heap, and the request itself let go
+/// while the count runs, as the node lets go of what it sent. A chunk's bytes are copied, as the
+/// node copies a chunk to send (`derive::Charges`), and the driver's view of its block let go.
+fn put_served(cell: &mut Cell, request: Request) -> Answer {
+    alloc::pause();
+    let asked = match &request {
+        Request::Chunk {
+            volume,
+            key,
+            bytes,
+            crc,
+        } => Request::Chunk {
+            volume: *volume,
+            key: *key,
+            bytes: Bytes::copy_from_slice(bytes),
+            crc: *crc,
+        },
+        other => other.clone(),
+    };
+    alloc::resume();
+    drop(request);
+    received(|| cell.serve(asked))
+}
+
+/// A GET's request as the cell takes it ([`put_served`]); it holds nothing on the heap. A chunk's
+/// bytes come back in a buffer of their own, as the node receives them from its transport.
+fn get_served(cell: &mut Cell, request: get::Request) -> get::Answer {
+    alloc::pause();
+    let answer = cell.serve_get(request);
+    alloc::resume();
+    let taken = match &answer {
+        get::Answer::Chunk(bytes) => get::Answer::Chunk(Bytes::copy_from_slice(bytes)),
+        other => other.clone(),
+    };
+    alloc::pause();
+    drop(answer);
+    alloc::resume();
+    taken
+}
+
+/// The cell's answer made while the count is paused, and the copy the driver is given made while
+/// it runs, as the node decodes an answer it receives.
+fn received<T: Clone>(serve: impl FnOnce() -> T) -> T {
+    alloc::pause();
+    let answer = serve();
+    alloc::resume();
+    let taken = answer.clone();
+    alloc::pause();
+    drop(answer);
+    alloc::resume();
+    taken
+}
+
+/// The most live bytes a PUT of `blocks` whole blocks under `scheme` and then a GET of it hold, at
+/// the floor's window of one block (node.md §1.4), each counted from before its driver is made to
+/// after it is dropped, with nothing but the drivers and what crosses into them counted
+/// ([`put_served`], [`get_served`]): the body is the client's, made before the count and fed a
+/// segment at a time; the GET's plaintext is compared with it in place and let go, as the node
+/// writes it to its transport.
+fn stream_peaks(scheme: Scheme, blocks: u64, seed: u8) -> (i64, i64) {
+    let layout = Layout::new(scheme).unwrap();
+    let len = blocks * layout.segments_per_block() * seal::SEGMENT as u64;
+    let bytes = body(len as usize, seed);
+    let mut cell = Cell::new(scheme.width() as u128);
+    let wrapping = WrappingKey::generate().unwrap();
+    let file = 170;
+    alloc::begin();
+    let mut put = new_put_in(&cell, object("k"), len, layout, keys(file, &wrapping), 1);
+    let (mut at, mut ended) = (0usize, false);
+    for _ in 0..1_000_000 {
+        if put.outcome().is_some() {
+            break;
+        }
+        let mut went = false;
+        if at < bytes.len() && put.wants_body() {
+            let end = (at + seal::SEGMENT).min(bytes.len());
+            at += put.feed(&bytes[at..end]).unwrap();
+            went = true;
+        } else if at == bytes.len() && !ended {
+            put.end(&Expected::default()).unwrap();
+            ended = true;
+            went = true;
+        }
+        if let Some((id, request)) = put.poll() {
+            cell.clock += 1;
+            put.tick(cell.clock).unwrap();
+            let answer = put_served(&mut cell, request);
+            put.answer(id, answer).unwrap();
+            went = true;
+        }
+        if !went {
+            let due = put.due_ns().expect("a PUT waits on nothing");
+            cell.clock = cell.clock.max(due);
+            put.tick(cell.clock).unwrap();
+        }
+    }
+    assert!(matches!(put.outcome(), Some(Ok(_))), "{:?}", put.outcome());
+    drop(put);
+    let put_counts = alloc::end();
+
+    alloc::begin();
+    let root = Root(WrappingKey::new(wrapping.bytes()));
+    let mut get = Get::new(Some(file), len, 0..len, Box::new(root), 1).unwrap();
+    let mut pending = VecDeque::new();
+    let mut read = 0usize;
+    loop {
+        while let Some(piece) = get.take() {
+            assert!(piece[..] == bytes[read..read + piece.len()], "at {read}");
+            read += piece.len();
+        }
+        if let Some(outcome) = get.outcome() {
+            outcome.clone().unwrap();
+            break;
+        }
+        while let Some(request) = get.poll() {
+            pending.push_back(request);
+        }
+        let (id, request) = pending.pop_front().expect("a GET waits on nothing");
+        let answer = get_served(&mut cell, request);
+        get.answer(id, answer).unwrap();
+    }
+    drop((get, pending));
+    let get_counts = alloc::end();
+    assert_eq!(read, bytes.len());
+    (put_counts.peak, get_counts.peak)
+}
+
+/// A body crosses the drivers with no growth it does not need (lean-doors step 5), counted as
+/// [`stream_peaks`] counts them: a PUT of 16 blocks and then a GET of it, each at the floor's
+/// window of one block, against a PUT and a GET of two. A buffer or a copy held past its window
+/// is at least a segment, the least the body crosses the drivers in, so 14 windows more would
+/// hold at least 14 segments more; what the PUT holds more is less than one, its record of each
+/// block it wrote, which its file's write names (gateway.md §2.2; `put.rs`'s `recorded`), and the
+/// GET holds not a byte more. Each holds the window of blocks its driver states at the largest
+/// blocks (`put::bytes_for`, `get::most_bytes`; the node's bound, `derive::native`): the GET
+/// within it, the PUT past it by its records alone, which no layout states, 3,971 bytes at two
+/// blocks and 6,019 at 16 on this Mac (about 146 bytes a block).
+#[test]
+fn a_put_and_a_get_many_windows_long_hold_their_windows_bytes() {
+    const MANY: u64 = 16;
+    let scheme = Scheme::Copies(1);
+    let layout = Layout::new(scheme).unwrap();
+    let (put_two, get_two) = stream_peaks(scheme, 2, 59);
+    let (put_many, get_many) = stream_peaks(scheme, MANY, 61);
+    let len = |blocks: u64| blocks * layout.segments_per_block() * seal::SEGMENT as u64;
+    let signed = |bytes: u64| i64::try_from(bytes).unwrap();
+    let window_put = |blocks| signed(put::bytes_for(1, &layout, len(blocks)).unwrap());
+    let window_get = signed(get::most_bytes(1, &layout).unwrap());
+    let segment = i64::try_from(seal::SEGMENT).unwrap();
+    eprintln!(
+        "put {put_two} {put_many}, past its window's {} {}; get {get_two} {get_many} of {window_get}",
+        put_two - window_put(2),
+        put_many - window_put(MANY),
+    );
+    assert!(put_many >= put_two, "{put_many} {put_two}");
+    assert!(put_many - put_two < segment, "{put_many} {put_two}");
+    assert!(
+        put_two - window_put(2) < segment,
+        "{put_two} {}",
+        window_put(2)
+    );
+    assert_eq!(get_many, get_two);
+    assert!(get_many <= window_get, "{get_many} of {window_get}");
+}

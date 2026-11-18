@@ -54,6 +54,21 @@ pub fn encode(out: &mut Vec<u8>, group: u128, message: &Message) {
     }
 }
 
+/// The frame of `message` for `group` behind the byte `lead`, in `out`, a buffer reused from frame
+/// to frame: one smaller than the frame is replaced, before a byte is written, by one made at the
+/// frame's length (the old one freed first, so the two are never held together), and one large
+/// enough is written in place, so no frame grows its buffer.
+pub fn encode_behind(out: &mut Vec<u8>, lead: u8, group: u128, message: &Message) {
+    let len = encoded_len(message).saturating_add(1);
+    out.clear();
+    if out.capacity() < len {
+        drop(std::mem::take(out));
+        *out = mantle_codec::Writer::with_capacity(len).into_vec();
+    }
+    out.push(lead);
+    encode(out, group, message);
+}
+
 /// The bytes `message`'s frame takes.
 pub fn encoded_len(message: &Message) -> usize {
     HEADER_BYTES.saturating_add(message.encoded_len())

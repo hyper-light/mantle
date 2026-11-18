@@ -3250,7 +3250,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Sends a range's message by its class: control that fits a datagram on the plane, a
     /// snapshot on the bulk class, everything else on the peer's lane. The message is encoded
-    /// once, behind the plane's first byte: the plane takes the whole, a lane the frame after it.
+    /// once, behind the plane's first byte, in the node's frame buffer made at least its length
+    /// first (`frame::encode_behind`): the plane takes the whole, a lane the frame after it.
     fn send(&mut self, group: u128, message: Message, _now: u64) -> Result<(), NodeError> {
         let to = message.to;
         let Some(remote_at) = self.remotes.iter().position(|r| r.id == to) else {
@@ -3258,9 +3259,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let snapshot = message.snapshot.is_some() && message.msg_type == MessageType::MsgSnapshot;
         let control = message.entries.is_empty() && message.snapshot.is_none();
-        self.frame.clear();
-        self.frame.push(PLANE_RAFT);
-        frame::encode(&mut self.frame, group, &message);
+        frame::encode_behind(&mut self.frame, PLANE_RAFT, group, &message);
         if control && self.remotes.get(remote_at).is_some_and(|r| r.keyed) {
             let mut queued = self.plane.queue(to, &self.frame);
             // The datagram in the making is full: send it and queue this in the next.

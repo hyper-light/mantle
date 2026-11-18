@@ -15,6 +15,7 @@
 )]
 
 use hyper_measure::alloc;
+use hyper_raft::proto::{ConfState, Entry, Message, MessageType, Snapshot, SnapshotMetadata};
 use mantle_codec::Writer;
 use mantle_meta::name::{Named, Probe, Routed};
 use mantle_meta::record::{
@@ -25,7 +26,7 @@ use mantle_meta::record::{
 use mantle_meta::root::{MAX_DOMAIN, Placed};
 use mantle_meta::wire::{Answer as Applied, MAX_BUCKET, MAX_COMMANDS, MAX_KEY, MAX_OWNER};
 use mantle_node::read::{self, Query, Read};
-use mantle_node::{chunk, command};
+use mantle_node::{chunk, command, frame};
 use mantle_protocol::object::{
     self, Buckets, List, ListVersions, Listed, MAX_BUCKETS, MAX_CHECKSUM, MAX_PAGE_PARTS,
     MAX_PAGE_PRINCIPALS, MAX_TAG, Page, PrincipalListed, Principals, UploadListed, Uploads,
@@ -977,6 +978,128 @@ fn a_chunks_heads_are_written_at_their_length() {
     assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()), "put");
     let (bytes, made) = counted(|| get.encode());
     assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()), "get");
+}
+
+/// A leader's Raft message whose kind is `kind`, carrying `entries` and `snapshot`, stating its
+/// classic commit as a leader's append always does.
+fn raft(kind: MessageType, entries: Vec<Entry>, snapshot: Option<Snapshot>) -> Message {
+    Message {
+        msg_type: kind,
+        to: 2,
+        from: 1,
+        term: 7,
+        log_term: 6,
+        index: 41,
+        commit: 40,
+        entries,
+        snapshot: snapshot.map(Box::new),
+        classic: Some(40),
+        ..Message::default()
+    }
+}
+
+/// Entries of `len` bytes each, `count` of them.
+fn raft_entries(count: u64, len: usize) -> Vec<Entry> {
+    (0..count)
+        .map(|i| Entry {
+            term: 7,
+            index: 42 + i,
+            data: vec![0xab; len],
+            ..Entry::default()
+        })
+        .collect()
+}
+
+/// A range's Raft frame is written into the node's reused frame buffer (`send`) at its length: a
+/// buffer smaller than the frame is replaced by one made at it, one allocation, and a larger one
+/// written in place, none; neither grows. Control messages, appends of one entry, of many and of
+/// the largest entry a range takes (its frame the replication class's bound), a snapshot, and a
+/// heartbeat after them all, each the bytes `send` wrote before step 7 (`frame::encode` behind the
+/// plane's byte, in a buffer that grew) and decoded back.
+#[test]
+fn a_raft_frame_is_written_at_its_length_in_its_reused_buffer() {
+    const LEAD: u8 = 0x52;
+    const GROUP: u128 = 0x0072_616e_6765;
+    let bound = mantle_node::derive::messages().unwrap().replication;
+    // The entry whose frame is the bound: the bound less the frame's header, the message's fixed
+    // bytes and the entry's own.
+    let largest = usize::try_from(bound).unwrap()
+        - frame::HEADER_BYTES
+        - hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES
+        - hyper_raft::wire::ENTRY_FIXED_BYTES;
+    let snapshot = Snapshot {
+        data: vec![3; 1 << 20],
+        metadata: Some(SnapshotMetadata {
+            conf_state: Some(ConfState {
+                voters: vec![1, 2, 3],
+                ..ConfState::default()
+            }),
+            index: 41,
+            term: 7,
+        }),
+    };
+    let messages = [
+        (
+            "heartbeat",
+            raft(MessageType::MsgHeartbeat, Vec::new(), None),
+        ),
+        (
+            "heartbeat again",
+            raft(MessageType::MsgHeartbeat, Vec::new(), None),
+        ),
+        (
+            "append of one entry",
+            raft(MessageType::MsgAppend, raft_entries(1, 64), None),
+        ),
+        (
+            "append of many entries",
+            raft(MessageType::MsgAppend, raft_entries(100, 1024), None),
+        ),
+        (
+            "append of the largest entry",
+            raft(MessageType::MsgAppend, raft_entries(1, largest), None),
+        ),
+        (
+            "snapshot",
+            raft(MessageType::MsgSnapshot, Vec::new(), Some(snapshot)),
+        ),
+        (
+            "heartbeat after",
+            raft(MessageType::MsgHeartbeat, Vec::new(), None),
+        ),
+    ];
+    let (mut buf, mut before_buf) = (Vec::new(), Vec::new());
+    let mut wrong = Vec::new();
+    for (what, message) in messages {
+        let len = 1 + frame::encoded_len(&message);
+        let fresh = buf.capacity() < len;
+        let (_, before) = counted(|| {
+            before_buf.clear();
+            before_buf.push(LEAD);
+            frame::encode(&mut before_buf, GROUP, &message);
+        });
+        let (_, made) = counted(|| frame::encode_behind(&mut buf, LEAD, GROUP, &message));
+        println!(
+            "raft {what}: before {before:?}, now {made:?}, {} bytes",
+            buf.len()
+        );
+        if made != (u64::from(fresh), 0) || (fresh && buf.capacity() != len) {
+            wrong.push(format!(
+                "{what}: (allocations, reallocations) {made:?}, capacity {} for {len} bytes",
+                buf.capacity()
+            ));
+        }
+        assert_eq!(buf.len(), len, "{what}");
+        assert_eq!(buf, before_buf, "{what}");
+        if message.msg_type != MessageType::MsgSnapshot {
+            assert!(u64::try_from(len - 1).unwrap() <= bound, "{what}");
+        }
+        if what == "append of the largest entry" {
+            assert_eq!(u64::try_from(len - 1).unwrap(), bound, "{what}");
+        }
+        assert_eq!(frame::decode(&buf[1..]), Ok((GROUP, message)), "{what}");
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// `command::encode_answers` as it was before step 7: each answer sealed in its own buffer and

@@ -2883,9 +2883,10 @@ holds them (`request::Parts`, `mantle_s3::sigv4::Fields`), no table of them made
 octets a field held 60,160 for a head padded to 8 KB with 1,880 empty fields; and the metadata a
 version keeps copies only the fields it keeps, each name judged in place. A head so padded, its
 lines ended by CRLF or by a lone LF (the most fields a head carries), holds what the same request
-unpadded does. A warmed request reallocates none of the door's buffers; a TLS put whose body
-fills a record reallocates hyper-tls's deframer's four times, its buffer grown from one 4,096
-octet read toward a record a read at a time (`a_warmed_request_reallocates_none_of_the_doors_buffers`).
+unpadded does. A warmed request reallocates none of the door's buffers, nor hyper-tls's: its
+deframer keeps a record at its largest across records and idles, where it let its buffer go at
+every drain and grew it four times for the next record (vendor/hyper-tls/VENDORED.md §13;
+`a_warmed_request_reallocates_none_of_the_doors_buffers`).
 
 ### 4.4 Errors
 

@@ -793,24 +793,19 @@ fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
     }
 }
 
-/// A warmed request reallocates none of the door's buffers, from its connection at rest to its
-/// answer read whole, over plain HTTP, TLS 1.3 and TLS 1.2: a HEAD, a GET, a PUT of 1 octet, of
-/// several TLS records and of many segments, and a DELETE; each buffer the door makes is made at
-/// the length it is known to need. What reallocates is hyper-tls's: its deframer grows its buffer
-/// from one read (4,096 octets) toward a record at its largest (`listener::TLS_RECORD`, its
-/// `MAX_WIRE_SIZE`) a read at a time, four times for a put whose body fills a record, and lets it
-/// back to one read once drained (`msgs/deframer/buffers.rs`, `prepare_read`). The host is the
-/// test's own (`host`), so what a node's driver reallocates is not counted here.
+/// A warmed request reallocates none of the door's buffers, nor hyper-tls's, from its connection at
+/// rest to its answer read whole, over plain HTTP, TLS 1.3 and TLS 1.2: a HEAD, a GET, a PUT of 1
+/// octet, of several TLS records and of many segments, and a DELETE; each buffer the door makes is
+/// made at the length it is known to need. hyper-tls's deframer grows its buffer a read at a time to
+/// a record at its largest (`listener::TLS_RECORD`, its `MAX_WIRE_SIZE`) and keeps it across records
+/// and idles (vendor/hyper-tls/VENDORED.md §13), so the warming request leaves it whole. The host is
+/// the test's own (`host`), so what a node's driver reallocates is not counted here.
 #[test]
 fn a_warmed_request_reallocates_none_of_the_doors_buffers() {
-    use mantle_node::listener::TLS_RECORD;
-    // hyper-tls's deframer's read (`prepare_read`'s `READ_SIZE`), and a record's plaintext at its
-    // largest (RFC 8446 §5.1).
-    const READ: usize = 4096;
+    // A record's plaintext at its largest (RFC 8446 §5.1).
     const PLAINTEXT: usize = 1 << 14;
     let records = 3 * PLAINTEXT + 1;
     let many = 4 * PIECE;
-    let deframer = u64::try_from((TLS_RECORD - READ).div_ceil(READ)).unwrap();
     for over in [Over::Plain, Over::Tls13, Over::Tls12] {
         for (method, size) in [
             (Method::Head, many),
@@ -821,17 +816,13 @@ fn a_warmed_request_reallocates_none_of_the_doors_buffers() {
             (Method::Delete, 0),
         ] {
             let (counts, status) = one_request(over, (method, size, Padded::No), Depth::First);
-            let expected = match (over, method) {
-                (Over::Tls13 | Over::Tls12, Method::Put) if size >= PLAINTEXT => deframer,
-                _ => 0,
-            };
             assert!(
                 matches!(status, 200 | 204),
                 "{over:?} {method:?} {size}: {status}"
             );
             assert_eq!(
-                counts.reallocations, expected,
-                "{over:?} {method:?} {size}: reallocations past hyper-tls's deframer's"
+                counts.reallocations, 0,
+                "{over:?} {method:?} {size}: reallocations"
             );
         }
     }

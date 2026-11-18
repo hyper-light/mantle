@@ -20,8 +20,9 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
+use hyper_rt::compute;
 use hyper_rt::slow::Label;
-use hyper_rt::sync::{ChannelReceiver, Sender, SyncError};
+use hyper_rt::sync::{ChannelReceiver, OneshotReceiver, Sender, SyncError};
 use hyper_transport::{ExchangeId, PeerId, Refusal};
 use mantle_ec::durability::{self, Choice, Rates};
 use mantle_gateway::complete::{self, CompleteError, Completion};
@@ -656,33 +657,32 @@ pub(crate) struct Table {
     /// The same volumes, each with its standing and its node's presence (`root::facts`): what
     /// placement and repair judge by (docs/design/repair.md §2).
     pub(super) facts: Vec<root::Fact>,
-    /// The volumes that take chunks now, which the scheme was chosen over.
+    /// The volumes that take chunks now, which the scheme is chosen over.
     standing: Vec<Placed>,
-    scheme: Option<durability::Scheme>,
+    scheming: Scheming,
 }
 
 impl Table {
-    /// The table of `facts`, read as of entry `applied`, after `was`: its scheme chosen over the
-    /// volumes that take chunks now, or kept where their domains are as they were.
-    fn of(
-        was: Option<&Table>,
-        gateway: Option<&GatewaySettings>,
-        applied: u64,
-        facts: Vec<root::Fact>,
-    ) -> Self {
+    /// The table of `facts`, read as of entry `applied`, after `was`: its scheme carried where the
+    /// domains of the volumes that take chunks now are as they were, and asked again where they
+    /// changed (`Scheming::settle`, which `Node::table` calls at each look).
+    fn of(was: Option<Table>, applied: u64, facts: Vec<root::Fact>) -> Self {
         let placed: Vec<Placed> = facts.iter().map(|f| f.placed.clone()).collect();
         let standing: Vec<Placed> = facts
             .iter()
             .filter(|f| f.takes())
             .map(|f| f.placed.clone())
             .collect();
-        let scheme = scheme_over(was, &standing, gateway);
+        let same = was
+            .as_ref()
+            .is_some_and(|t| same_domains(&t.standing, &standing));
+        let scheming = Scheming::after(was.map(|t| t.scheming), same, applied);
         Self {
             applied,
             placed,
             facts,
             standing,
-            scheme,
+            scheming,
         }
     }
 
@@ -699,41 +699,172 @@ impl Table {
     pub(super) fn applied(&self) -> u64 {
         self.applied
     }
-}
 
-/// The scheme a new block takes over `table`: the durability model's choice among the schemes that
-/// fit the cell's failure domains, or the closest to the target where none meets it, as a cell
-/// short of domains places on those there are (node.md §1.5). A domain counts while it holds a
-/// volume that takes chunks now, active and its node seen: a block written while machines sleep
-/// takes the scheme the machines seen meet the target with, a chunk to each domain, rather than
-/// waiting for them or doubling chunks on the domains there are (docs/design/repair.md §5).
-fn scheme(gateway: &GatewaySettings, table: &[Placed]) -> Option<durability::Scheme> {
-    let mut domains: Vec<&str> = table.iter().map(|p| p.domain.as_str()).collect();
-    domains.sort_unstable();
-    domains.dedup();
-    match durability::choose(
-        &durability::candidates(),
-        domains.len(),
-        &gateway.rates,
-        gateway.target,
-    ) {
-        Ok(Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. })) => Some(scheme),
-        _ => None,
+    /// The scheme new blocks take now: none where no candidate fits the domains, and refused
+    /// where the durability model's choice for them unwound on the compute pool, until the
+    /// domains change and it is asked again.
+    pub(super) fn scheme(&self) -> Result<Option<durability::Scheme>, NodeError> {
+        self.scheming.now.map_err(|Unwound| {
+            NodeError::Runtime("the durability model's choice unwound on the compute pool".into())
+        })
     }
 }
 
-/// The scheme new blocks take over `placed`, the volume table read again: the one chosen over the
-/// table read before (`was`), carried while every volume keeps its place and its domain, or chosen
-/// again. The durability model's choice so runs once per change of the domains, not once per entry
-/// the root range applies (research/71: 2,448.5 allocations each time it ran).
-fn scheme_over(
-    was: Option<&Table>,
-    placed: &[Placed],
-    gateway: Option<&GatewaySettings>,
-) -> Option<durability::Scheme> {
-    match was.filter(|t| same_domains(&t.standing, placed)) {
-        Some(table) => table.scheme,
-        None => gateway.and_then(|g| scheme(g, placed)),
+/// The durability model's choice for a table's domains, and the scheme new blocks take meanwhile
+/// (docs/design/node.md §5.1). The model runs on hyper-rt's compute pool, off the shard, which it
+/// held for 2,448.5 allocations each time it ran there (research/71); the shard reads the answer
+/// once it landed. Until then new blocks take the scheme chosen before wherever it still fits the
+/// domains, no wider than they are: the model prices a scheme by the scheme and the gateway's
+/// rates alone, the domains only ruling out the wider candidates (durability.md §4), so a block
+/// placed under it, one chunk to each domain (`place::offer`), is exactly as durable as the blocks
+/// before the change: within the target, or as near it as the cell came. Where it no longer fits,
+/// or none was chosen yet, a block placed under it would put two of its chunks in one domain,
+/// which the model never priced: placements wait for the choice, made at once on the shard.
+struct Scheming {
+    /// The scheme new blocks take now.
+    now: Result<Option<durability::Scheme>, Unwound>,
+    /// The generation of the table's domains: the applied index of the reading at which they last
+    /// changed. A choice is asked for one and its answer taken only for the same.
+    domains_at: u64,
+    /// Whether `now` was chosen for the domains of `domains_at`.
+    settled: bool,
+    /// The choice running on the compute pool, at most one: a table whose domains changed again
+    /// while it ran asks again once its stale answer lands, as a per-node task is discarded if its
+    /// node changed meanwhile (CLAUDE.md §10).
+    choosing: Option<Choosing>,
+}
+
+/// The durability model's choice for a table's domains unwound on the compute pool: its job's
+/// receiver saw the sender gone without a value (hyper-rt `compute::run`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unwound;
+
+/// A choice running on the compute pool: the generation of the domains it was asked for, and its
+/// answer.
+struct Choosing {
+    asked_at: u64,
+    answer: OneshotReceiver<Option<durability::Scheme>>,
+}
+
+impl Scheming {
+    /// The scheming of a table read at `applied`, after `was`'s: carried whole where the domains
+    /// are the `same`, and otherwise a new generation, the scheme chosen before kept until
+    /// `settle` judges whether it fits, and a choice still running kept to be judged stale.
+    fn after(was: Option<Scheming>, same: bool, applied: u64) -> Self {
+        match was {
+            Some(was) if same => was,
+            Some(was) => Self {
+                now: was.now,
+                domains_at: applied,
+                settled: false,
+                choosing: was.choosing,
+            },
+            None => Self {
+                now: Ok(None),
+                domains_at: applied,
+                settled: false,
+                choosing: None,
+            },
+        }
+    }
+
+    /// Takes the running choice's answer if it landed, and asks the model where the scheme is not
+    /// yet chosen for the domains of the volumes that take chunks now, `standing`: on the compute
+    /// pool while the scheme held fits them, and on the shard at once where it does not, or where
+    /// the pool refuses the job (none in this process, one at its bound, or one stopping: the
+    /// choice is never left undone, and runs where it ran before the pool).
+    fn settle(&mut self, gateway: Option<&GatewaySettings>, standing: &[Placed]) {
+        self.take();
+        let asked = self
+            .choosing
+            .as_ref()
+            .is_some_and(|c| c.asked_at == self.domains_at);
+        if self.settled || asked {
+            return;
+        }
+        let Some(gateway) = gateway else {
+            return;
+        };
+        let ask = Ask::of(gateway, standing);
+        let fits = matches!(self.now, Ok(Some(scheme)) if scheme.width() <= ask.domains);
+        if fits && self.choosing.is_some() {
+            return;
+        }
+        if fits {
+            match compute::run(move || ask.choose()) {
+                Ok(answer) => {
+                    self.choosing = Some(Choosing {
+                        asked_at: self.domains_at,
+                        answer,
+                    });
+                    return;
+                }
+                Err(refused) => {
+                    let job = refused.job;
+                    self.now = Ok(job());
+                }
+            }
+        } else {
+            self.now = Ok(ask.choose());
+        }
+        self.settled = true;
+    }
+
+    /// The running choice's answer, if it landed: taken where it was asked for the domains the
+    /// table has, and dropped where they changed since.
+    fn take(&mut self) {
+        let Some(choosing) = self.choosing.as_mut() else {
+            return;
+        };
+        let landed = match choosing.answer.try_recv() {
+            Ok(None) => return,
+            Ok(Some(scheme)) => Ok(scheme),
+            Err(_) => Err(Unwound),
+        };
+        let current = choosing.asked_at == self.domains_at;
+        self.choosing = None;
+        if current {
+            self.now = landed;
+            self.settled = true;
+        }
+    }
+}
+
+/// What the durability model's choice reads, owned, so it runs on the compute pool: the
+/// candidates, the count of the domains that take chunks now, and the gateway's rates and target.
+struct Ask {
+    candidates: Vec<durability::Scheme>,
+    domains: usize,
+    rates: Rates,
+    target: f64,
+}
+
+impl Ask {
+    /// The choice over `standing`: a domain counts while it holds a volume that takes chunks now,
+    /// active and its node seen.
+    fn of(gateway: &GatewaySettings, standing: &[Placed]) -> Self {
+        let mut domains: Vec<&str> = standing.iter().map(|p| p.domain.as_str()).collect();
+        domains.sort_unstable();
+        domains.dedup();
+        Self {
+            candidates: durability::candidates(),
+            domains: domains.len(),
+            rates: gateway.rates.clone(),
+            target: gateway.target,
+        }
+    }
+
+    /// The scheme a new block takes: the durability model's choice among the schemes that fit the
+    /// cell's failure domains, or the closest to the target where none meets it, as a cell short
+    /// of domains places on those there are (node.md §1.5). A block written while machines sleep
+    /// takes the scheme the machines seen meet the target with, a chunk to each domain, rather
+    /// than waiting for them or doubling chunks on the domains there are (docs/design/repair.md
+    /// §5).
+    fn choose(self) -> Option<durability::Scheme> {
+        match durability::choose(&self.candidates, self.domains, &self.rates, self.target) {
+            Ok(Some(Choice::Meets { scheme, .. } | Choice::Short { scheme, .. })) => Some(scheme),
+            _ => None,
+        }
     }
 }
 
@@ -1557,7 +1688,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !matches!(op, Op::Open { .. }) {
             return None;
         }
-        let scheme = self.table().ok()?.scheme?;
+        let scheme = self.table().ok()?.scheme().ok()??;
         let segments = Layout::new(scheme).ok()?.segments_per_block();
         segments.checked_mul(u64::try_from(mantle_s3::seal::SEGMENT).ok()?)
     }
@@ -1574,7 +1705,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// range's rows again only once the member applied an entry since the last read. Where another
     /// shard drives the root range, the table its shard last answered, asked again once the range
     /// shows it applied past it ([`shard::ask_table`]), the one held read meanwhile: the node read
-    /// one before the range moved (`Node::spread_to`).
+    /// one before the range moved (`Node::spread_to`). At each look the scheme new blocks take is
+    /// settled as far as it can be without waiting (`Scheming::settle`): an answer the compute pool
+    /// gave taken, and a choice asked where the domains changed.
     pub(super) fn table(&mut self) -> Result<&Table, NodeError> {
         let (handle, group) = self
             .ranges
@@ -1585,8 +1718,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
             if let Some(answered) = far.table.take() {
                 let shard::Facts { applied, facts } = *answered?;
-                let held = self.table.as_ref();
-                self.table = Some(Table::of(held, self.gateway.as_ref(), applied, facts));
+                self.table = Some(Table::of(self.table.take(), applied, facts));
             }
             let held = self.table.as_ref().map(|t| t.applied);
             match shard::ask_table(&self.shards, far, held) {
@@ -1601,13 +1733,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let applied = shell.applied().index;
             if self.table.as_ref().is_none_or(|t| t.applied != applied) {
                 let facts = shard::read_facts(shell.machine_mut().engine_mut())?;
-                let held = self.table.as_ref();
-                self.table = Some(Table::of(held, self.gateway.as_ref(), applied, facts));
+                self.table = Some(Table::of(self.table.take(), applied, facts));
             }
         }
-        self.table
-            .as_ref()
-            .ok_or(NodeError::Bounds("no volume table".into()))
+        let table = self
+            .table
+            .as_mut()
+            .ok_or(NodeError::Bounds("no volume table".into()))?;
+        table
+            .scheming
+            .settle(self.gateway.as_ref(), &table.standing);
+        Ok(table)
     }
 
     /// The host at a turn: each operation's answers taken, its next requests asked, its body read
@@ -2355,7 +2491,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// current generation, and its blocks laid out by the scheme new blocks take; or the reply
     /// its failure earns.
     fn start_put(&mut self, at: usize, commit: Commit) -> Result<(), NodeError> {
-        let Ok(Some(scheme)) = self.table().map(|t| t.scheme) else {
+        let Ok(Some(scheme)) = self.table().and_then(Table::scheme) else {
             return self.fail_job(at, Status::Failed);
         };
         let now = self.wall.now_ns();
@@ -4066,7 +4202,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             _ => return self.fail_job(at, Status::Failed),
         };
         let now = self.wall.now_ns();
-        let Ok(Some(scheme)) = self.table().map(|t| t.scheme) else {
+        let Ok(Some(scheme)) = self.table().and_then(Table::scheme) else {
             return self.fail_job(at, Status::Failed);
         };
         let Some(gateway) = self.gateway.as_ref() else {
@@ -5486,13 +5622,9 @@ fn get_answer(outcome: Outcome) -> get::Answer {
 mod tests {
     use super::*;
 
-    /// The volume table read again after an entry that left its volumes and their domains as
-    /// they were takes the scheme chosen before, asking nothing of the allocator; one whose
-    /// domains changed is chosen again (research/71, step 5: the choice ran at each entry the
-    /// root range applied, 2,448.5 allocations each time).
-    #[test]
-    fn the_scheme_is_chosen_again_only_when_the_tables_domains_change() {
-        let gateway = GatewaySettings {
+    /// A gateway of the rates and target `mantle init`'s cells state (crates/mantle/tests/support).
+    fn scheming_gateway() -> GatewaySettings {
+        GatewaySettings {
             keys: Vec::new(),
             handover_ns: 1,
             window: 1,
@@ -5502,7 +5634,6 @@ mod tests {
             clients: 1,
             bucket_quota: 1,
             scan_rows: 1,
-            // The rates and target `mantle init`'s cells state (crates/mantle/tests/support).
             rates: Rates {
                 chunk: 0.000_001_552_511_415_525_114_2,
                 domains: None,
@@ -5510,42 +5641,255 @@ mod tests {
                 repair: 0.041_666_666_666_666_664,
             },
             target: 1e-11,
-        };
-        let placed = |domains: [&str; 3]| -> Vec<Placed> {
-            domains
-                .iter()
-                .zip(1u128..)
-                .map(|(domain, volume)| Placed {
-                    volume,
-                    node: u64::try_from(volume).unwrap(),
-                    domain: (*domain).to_owned(),
-                    bytes: 1 << 30,
-                })
-                .collect()
-        };
-        let first = placed(["a", "b", "c"]);
-        let chosen = scheme(&gateway, &first);
-        assert!(chosen.is_some());
-        let table = Table {
-            applied: 1,
-            placed: first.clone(),
-            facts: Vec::new(),
-            standing: first,
-            scheme: chosen,
-        };
-        let same = placed(["a", "b", "c"]);
+        }
+    }
+
+    /// A volume in each of `domains`, in order.
+    fn placed_in(domains: &[&str]) -> Vec<Placed> {
+        domains
+            .iter()
+            .zip(1u128..)
+            .map(|(domain, volume)| Placed {
+                volume,
+                node: u64::try_from(volume).unwrap(),
+                domain: (*domain).to_owned(),
+                bytes: 1 << 30,
+            })
+            .collect()
+    }
+
+    /// The scheming of a table read at `applied` over `standing` after `was`, settled as far as
+    /// it goes without waiting, as `Node::table` reads it.
+    fn read(
+        was: Option<Scheming>,
+        before: &[Placed],
+        standing: &[Placed],
+        applied: u64,
+        gateway: &GatewaySettings,
+    ) -> Scheming {
+        let mut scheming = Scheming::after(was, same_domains(before, standing), applied);
+        scheming.settle(Some(gateway), standing);
+        scheming
+    }
+
+    /// The process's compute pool, started once for this test binary with one worker, so a test
+    /// holding that worker holds the pool, and room for a job of each test at once; and the
+    /// tests that use it one at a time, as each may hold its worker or fill its room.
+    fn pool() -> std::sync::MutexGuard<'static, ()> {
+        static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        STARTED.get_or_init(|| {
+            compute::start(compute::Config {
+                workers: 1,
+                queued: 64,
+                piece_ns: 1,
+            })
+            .unwrap();
+        });
+        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Holds the pool's one worker in a job until the returned sender is dropped: returns once
+    /// the worker is in it.
+    fn hold_the_worker() -> std::sync::mpsc::SyncSender<()> {
+        let (release, held) = std::sync::mpsc::sync_channel::<()>(0);
+        let (entered, inside) = std::sync::mpsc::sync_channel::<()>(1);
+        let job = compute::run(move || {
+            entered.send(()).unwrap();
+            let _ = held.recv();
+        });
+        assert!(job.is_ok());
+        inside.recv().unwrap();
+        release
+    }
+
+    /// The volume table read again after an entry that left its volumes and their domains as
+    /// they were takes the scheme chosen before, asking nothing of the allocator; one whose
+    /// domains changed is chosen again (research/71, step 5: the choice ran at each entry the
+    /// root range applied, 2,448.5 allocations each time).
+    #[test]
+    fn the_scheme_is_chosen_again_only_when_the_tables_domains_change() {
+        let gateway = scheming_gateway();
+        let first = placed_in(&["a", "b", "c"]);
+        let chosen = read(None, &[], &first, 1, &gateway);
+        assert!(chosen.settled && chosen.choosing.is_none());
+        let scheme = chosen.now;
+        // Three wide: two domains do not fit it, so a table of two chooses again at once.
+        assert!(
+            matches!(scheme, Ok(Some(s)) if s.width() == 3),
+            "{scheme:?}"
+        );
+        let same = placed_in(&["a", "b", "c"]);
         hyper_measure::alloc::begin();
-        let carried = scheme_over(Some(&table), &same, Some(&gateway));
+        let carried = read(Some(chosen), &first, &same, 2, &gateway);
         let counts = hyper_measure::alloc::end();
-        assert_eq!(carried, chosen);
+        assert_eq!(carried.now, scheme);
         assert_eq!((counts.allocations, counts.reallocations), (0, 0));
         // One domain fewer: chosen again, over two domains.
-        let fewer = placed(["a", "b", "b"]);
+        let fewer = placed_in(&["a", "b", "b"]);
         hyper_measure::alloc::begin();
-        let again = scheme_over(Some(&table), &fewer, Some(&gateway));
+        let again = read(Some(carried), &same, &fewer, 3, &gateway);
         let counts = hyper_measure::alloc::end();
-        assert_eq!(again, scheme(&gateway, &fewer));
+        assert!(again.settled && again.choosing.is_none());
+        assert_eq!(again.now, Ok(Ask::of(&gateway, &fewer).choose()));
         assert_eq!((counts.allocations, counts.reallocations), (1_833, 3));
+    }
+
+    /// The scheme the model chooses on the compute pool is the one it chooses inline, at every
+    /// count of domains a candidate fits, and over the tables above; a table whose domains grew
+    /// asks the pool, its scheme held meanwhile, and takes the pool's answer once it landed.
+    #[test]
+    fn the_scheme_chosen_on_the_pool_is_the_one_chosen_inline() {
+        let _pool = pool();
+        let gateway = scheming_gateway();
+        let names = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
+        ];
+        for count in 1..=names.len() {
+            let standing = placed_in(&names[..count]);
+            let inline = Ask::of(&gateway, &standing).choose();
+            let ask = Ask::of(&gateway, &standing);
+            let mut answer = compute::run(move || ask.choose()).unwrap();
+            assert_eq!(answer.blocking_recv().unwrap(), inline, "{count} domains");
+        }
+        // Two domains, then three: the scheme of two fits three, so the choice goes to the pool.
+        let two = placed_in(&["a", "b"]);
+        let three = placed_in(&["a", "b", "c"]);
+        let first = read(None, &[], &two, 1, &gateway);
+        let held = first.now;
+        let mut grown = read(Some(first), &two, &three, 2, &gateway);
+        assert!(!grown.settled);
+        assert_eq!(grown.now, held, "the scheme held until the answer lands");
+        let mut choosing = grown.choosing.take().unwrap();
+        assert_eq!(choosing.asked_at, 2);
+        let landed = choosing.answer.blocking_recv().unwrap();
+        assert_eq!(landed, Ask::of(&gateway, &three).choose());
+        // Its answer, as it lands, is taken for the domains it was asked for.
+        let (sender, answer) = hyper_rt::sync::oneshot().unwrap();
+        sender.send(landed).unwrap();
+        grown.choosing = Some(Choosing {
+            asked_at: 2,
+            answer,
+        });
+        grown.settle(Some(&gateway), &three);
+        assert!(grown.settled && grown.choosing.is_none());
+        assert_eq!(grown.now, Ok(landed));
+    }
+
+    /// An answer asked for domains the table has since left is dropped, the scheme held kept,
+    /// and the choice asked again for the domains the table has; a choice that unwound is a
+    /// typed refusal of the scheme until the domains change.
+    #[test]
+    fn a_stale_answer_is_dropped_and_the_choice_asked_again() {
+        let _pool = pool();
+        let gateway = scheming_gateway();
+        let two = placed_in(&["a", "b"]);
+        let three = placed_in(&["a", "b", "c"]);
+        let four = placed_in(&["a", "b", "c", "d"]);
+        let first = read(None, &[], &two, 1, &gateway);
+        let held = first.now;
+        let release = hold_the_worker();
+        // Grown to three at 2, the choice waiting behind the held worker; grown to four at 3
+        // before it ran: the one choice still runs, now stale.
+        let grown = read(Some(first), &two, &three, 2, &gateway);
+        let mut again = read(Some(grown), &three, &four, 3, &gateway);
+        assert_eq!(again.choosing.as_ref().map(|c| c.asked_at), Some(2));
+        assert_eq!(again.now, held);
+        // Its answer for three domains lands: not taken, and a choice asked for four.
+        drop(release);
+        let mut stale = again.choosing.take().unwrap();
+        let answer = stale.answer.blocking_recv().unwrap();
+        let (sender, landed) = hyper_rt::sync::oneshot().unwrap();
+        sender.send(answer).unwrap();
+        again.choosing = Some(Choosing {
+            asked_at: 2,
+            answer: landed,
+        });
+        again.settle(Some(&gateway), &four);
+        assert_eq!(again.now, held, "the stale answer dropped");
+        assert!(!again.settled);
+        let mut fresh = again.choosing.take().unwrap();
+        assert_eq!(fresh.asked_at, 3);
+        assert_eq!(
+            fresh.answer.blocking_recv().unwrap(),
+            Ask::of(&gateway, &four).choose()
+        );
+        // A choice for the current domains whose job unwound: its sender gone without a value.
+        let (sender, unwound) = hyper_rt::sync::oneshot::<Option<durability::Scheme>>().unwrap();
+        drop(sender);
+        again.choosing = Some(Choosing {
+            asked_at: 3,
+            answer: unwound,
+        });
+        again.settle(Some(&gateway), &four);
+        assert!(again.settled && again.choosing.is_none());
+        assert_eq!(again.now, Err(Unwound));
+        let table = Table {
+            applied: 3,
+            placed: four.clone(),
+            facts: Vec::new(),
+            standing: four,
+            scheming: again,
+        };
+        assert!(matches!(table.scheme(), Err(NodeError::Runtime(_))));
+    }
+
+    /// A choice the pool refuses, at its bound here, is made at once on the shard, as it was
+    /// before the pool: the table never waits on a choice nobody runs.
+    #[test]
+    fn a_refused_choice_is_made_at_once_on_the_shard() {
+        let _pool = pool();
+        let gateway = scheming_gateway();
+        let two = placed_in(&["a", "b"]);
+        let three = placed_in(&["a", "b", "c"]);
+        let first = read(None, &[], &two, 1, &gateway);
+        let release = hold_the_worker();
+        // The pool's room filled behind its held worker, a job at a time until one is refused.
+        let mut filled = Vec::new();
+        for _ in 0..64 {
+            match compute::run(|| ()) {
+                Ok(receiver) => filled.push(receiver),
+                Err(refused) => {
+                    assert!(matches!(refused.error, hyper_rt::RtError::Capacity { .. }));
+                    break;
+                }
+            }
+        }
+        let grown = read(Some(first), &two, &three, 2, &gateway);
+        drop(release);
+        assert!(grown.settled && grown.choosing.is_none());
+        assert_eq!(grown.now, Ok(Ask::of(&gateway, &three).choose()));
+    }
+
+    /// A reading whose domains changed under a scheme that still fits them returns before the
+    /// model runs: with the pool's worker held, the choice cannot have run, yet the reading is
+    /// done, its scheme the one held; and the shard did a fraction of the model's work,
+    /// allocating less than the model alone does inline.
+    #[test]
+    fn the_shard_is_not_held_while_the_model_chooses() {
+        let _pool = pool();
+        let gateway = scheming_gateway();
+        let two = placed_in(&["a", "b"]);
+        let three = placed_in(&["a", "b", "c"]);
+        let first = read(None, &[], &two, 1, &gateway);
+        let held = first.now;
+        hyper_measure::alloc::begin();
+        let inline = Ask::of(&gateway, &three).choose();
+        let model = hyper_measure::alloc::end();
+        let release = hold_the_worker();
+        hyper_measure::alloc::begin();
+        let grown = read(Some(first), &two, &three, 2, &gateway);
+        let shard = hyper_measure::alloc::end();
+        assert_eq!(grown.now, held);
+        assert!(!grown.settled);
+        let mut choosing = grown.choosing.unwrap();
+        assert!(choosing.answer.try_recv().unwrap().is_none(), "not run yet");
+        assert!(
+            shard.allocations < model.allocations,
+            "the shard's {shard:?} against the model's {model:?}"
+        );
+        drop(release);
+        assert_eq!(choosing.answer.blocking_recv().unwrap(), inline);
     }
 
     /// A write is charged at the widest window from the floor's to the one learned whose charge

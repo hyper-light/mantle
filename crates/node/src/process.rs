@@ -41,7 +41,8 @@
 //! the identity (the node's key and certificate, the authority's and each peer's, the root keys);
 //! the node directory's `LOCK` and each device directory's, held while the process runs; for
 //! `mantle serve`, the devices measured and the budgets derived; the storage (the volumes, the log,
-//! each range's store and replica); the network (the peers' addresses resolved, the runtime, the
+//! each range's store and replica); the network (the peers' addresses resolved, the runtime and
+//! beside it hyper-rt's compute pool, said `compute WORKERS LOWERED PRIORITY` as it starts, the
 //! QUIC endpoint and the plane bound). A failure ends the start naming its step ([`Step`],
 //! [`ProcessError::Start`]), and the process exits non-zero.
 //!
@@ -1693,6 +1694,25 @@ fn run_node(
     let runtime = runtime(&config, listening).map_err(step(Step::Network))?;
     let rt = Runtime::start(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
+    // The compute pool beside the shards and below them (hyper-rt `compute`, its runtime.md
+    // §3.16), sized from the runtime's own numbers: the durability model's choice runs there, off
+    // the node's shard (`node::host`'s `Scheming`). Once a process, never stopped: it cannot start
+    // again. Said as it starts: its threads, those the OS lowered, and the priority they took.
+    let pool = hyper_rt::compute::Config::for_runtime(
+        &runtime,
+        hyper_rt::machine::facts::Facts::query().cpus_at_once(),
+    )
+    .and_then(hyper_rt::compute::start)
+    .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
+    let priority = match pool.priority {
+        Ok(priority) => priority.to_string(),
+        Err(refusal) => refusal.to_string(),
+    };
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "compute {} {} {priority}", pool.workers, pool.lowered)
+        .and_then(|()| out.flush())
+        .map_err(|e| ProcessError::Say(e.to_string()))?;
+    drop(out);
     // The shards past the first, which the S3 listener hands its connections to, each named by
     // the registration holding it: a lane submitted to it reaches this runtime's shard and never
     // a later holder of its slot. A shard already gone takes none.

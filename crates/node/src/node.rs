@@ -1518,12 +1518,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let mut peers: Vec<PeerId> = replica.peers().collect();
             peers.sort_unstable();
             peers.dedup();
+            let seen = shard::Seen::of(&replica);
             lanes.send(shard::In::Adopt(kept.group, Box::new(replica)))?;
             self.far.push(shard::Far {
                 group: kept.group,
                 shard,
                 peers,
                 election: None,
+                seen,
             });
         }
         self.shards.push(lanes);
@@ -1553,11 +1555,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// One thing a shard's ranges gave: as the node's own drive takes it (`Node::drive`).
+    /// One thing a shard's ranges gave: as the node's own drive takes it (`Node::drive`). An
+    /// applied answer is given to the command waiting for it, which the turn's drive then replies
+    /// (`Node::reply_commands`).
     fn took(&mut self, out: shard::Out, now: u64) -> Result<(), NodeError> {
         match out {
             shard::Out::Message(group, message) => self.send(group, message, now)?,
-            shard::Out::Applied(group, applied) => self.applied.push((group, applied)),
+            shard::Out::Applied(group, applied) => {
+                answer_command(&mut self.commanded, group, &applied);
+                self.applied.push((group, applied));
+            }
+            shard::Out::Seen(group, seen) => {
+                if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+                    far.seen = seen;
+                }
+            }
+            shard::Out::Served(group, id, served) => self.served_far(group, id, served)?,
+            shard::Out::Compacted => self.compactions = self.compactions.saturating_add(1),
             shard::Out::Flushed(started, durable) => {
                 self.liveness
                     .on_durable(hyper_liveness::Write::Log, started, durable);
@@ -1621,18 +1635,52 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// Whether this node's member leads `group`.
-    pub fn is_leader(&self, group: u128) -> bool {
+    /// A read a far range served ([`shard::Served`]): answered to its asker as `serve_reads`
+    /// answers one, and one its replica refused as `ask_read` refuses one.
+    fn served_far(&mut self, group: u128, id: u64, served: shard::Served) -> Result<(), NodeError> {
+        let Some(at) = self
+            .reading
+            .iter()
+            .position(|r| r.id == id && r.group == group)
+        else {
+            return Ok(());
+        };
+        let reading = self.reading.swap_remove(at);
+        match served {
+            shard::Served::Read(read) => self.answer_read(reading.origin, Some(*read)),
+            shard::Served::Failed => self.answer_read(reading.origin, None),
+            shard::Served::Refused => match reading.origin {
+                ReadOrigin::Exchange(exchange) => self.refuse_read(exchange, group),
+                // This node's own: asked again of the leader there is now.
+                ReadOrigin::Own(ask) => {
+                    if let Some(out) = self.reads_out.iter_mut().find(|o| o.ask == ask) {
+                        out.via = Via::Unasked;
+                    }
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    /// What `group`'s member shows now: read from its replica where the node's own task drives
+    /// it, and as its shard last reported it where another shard does (node.md §2.9).
+    fn seen(&self, group: u128) -> Option<shard::Seen> {
+        if let Some(far) = self.far.iter().find(|far| far.group == group) {
+            return Some(far.seen);
+        }
         self.kept(group)
             .and_then(|k| self.owner.get(k.handle))
-            .is_some_and(|r| r.is_leader())
+            .map(shard::Seen::of)
+    }
+
+    /// Whether this node's member leads `group`.
+    pub fn is_leader(&self, group: u128) -> bool {
+        self.seen(group).is_some_and(|seen| seen.leading)
     }
 
     /// The last entry this node's member of `group` applied.
     pub fn applied(&self, group: u128) -> u64 {
-        self.kept(group)
-            .and_then(|k| self.owner.get(k.handle))
-            .map_or(0, |r| r.applied().index)
+        self.seen(group).map_or(0, |seen| seen.applied)
     }
 
     /// Proposes an entry of commands to `group`, stamped with this node's wall clock as the
@@ -1680,7 +1728,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     pub fn status(&self, group: u128) -> Option<Status> {
-        let replica = self.kept(group).and_then(|k| self.owner.get(k.handle))?;
+        let seen = self.seen(group)?;
         let (mut heartbeats, mut measuring) = (0u64, 0u64);
         let mut measuring_for: Option<Duration> = None;
         let mut judged = true;
@@ -1700,10 +1748,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let patience = self.patience(group);
         Some(Status {
-            term: replica.term(),
-            leader: replica.leader(),
-            commit: replica.logged_commit(),
-            applied: replica.applied().index,
+            term: seen.term,
+            leader: seen.leader,
+            commit: seen.commit,
+            applied: seen.applied,
             heartbeats,
             judged,
             measuring,
@@ -1711,13 +1759,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             patience,
             snapshots_sent: self.snapshots_sent,
             snapshots_taken: self.snapshots_taken,
-            stalled: replica.is_stalled(),
+            stalled: seen.stalled,
             liveness_waits: self.liveness_waits,
             compactions: self.compactions,
-            in_flight: replica.in_flight(),
-            writes: replica.writes(),
-            fenced: replica.fenced().is_some(),
-            uncertain: replica.mark().is_some(),
+            in_flight: seen.in_flight,
+            writes: seen.writes,
+            fenced: seen.fenced,
+            uncertain: seen.uncertain,
             sends: self.sends,
             received: self.received,
             reconnect: self
@@ -1753,8 +1801,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     paused.into_iter().chain(unled).max()
                 })
                 .max(),
-            reads_held: replica.core().raft.reads_held(),
-            reads_confirming: replica.core().raft.pending_read_count(),
+            reads_held: seen.reads_held,
+            reads_confirming: seen.reads_confirming,
             reading: self.reading.iter().filter(|r| r.group == group).count(),
             commanded: self.commanded.iter().filter(|c| c.group == group).count(),
         })
@@ -1770,7 +1818,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// leading up to 7.7 s after their last heartbeat, freshness about 5 s and sending about 2 s
     /// (CI run 39567831694), and the deaf leader's watch gave up at 5.3 s (run 39565012904).
     fn patience(&self, group: u128) -> Option<Duration> {
-        let replica = self.kept(group).and_then(|k| self.owner.get(k.handle))?;
+        let timing = self.seen(group)?.timing;
         let (mut evidence, mut sending) = (None::<Duration>, Duration::ZERO);
         for report in self
             .remotes
@@ -1785,7 +1833,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         let judging = sending.saturating_add(self.liveness.flush_mean().unwrap_or_default());
-        let timing = replica.core().raft.timing()?;
+        let timing = timing?;
         Some(
             evidence?
                 .saturating_add(judging)
@@ -2262,16 +2310,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     fn applied_total(&self) -> u64 {
         self.ranges
             .iter()
-            .filter_map(|k| self.owner.get(k.handle))
-            .fold(0u64, |sum, r| sum.saturating_add(r.applied().index))
+            .filter_map(|k| self.owner.get(k.handle).map(|r| r.applied().index))
+            .chain(self.far.iter().map(|far| far.seen.applied))
+            .fold(0u64, |sum, applied| sum.saturating_add(applied))
     }
 
     /// Whether every range applied all its log holds committed.
     fn caught_up(&self) -> bool {
         self.ranges
             .iter()
-            .filter_map(|k| self.owner.get(k.handle))
-            .all(|r| r.applied().index >= r.logged_commit())
+            .filter_map(|k| {
+                self.owner
+                    .get(k.handle)
+                    .map(|r| (r.applied().index, r.logged_commit()))
+            })
+            .chain(
+                self.far
+                    .iter()
+                    .map(|far| (far.seen.applied, far.seen.commit)),
+            )
+            .all(|(applied, commit)| applied >= commit)
     }
 
     /// Whether the owed write is asked again now: a range's write became durable since it was
@@ -2847,12 +2905,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// with neither moved they would be refused the same way, and a try drives every range again,
     /// so the node would turn without ever parking and nothing it waits for could arrive
     /// (node.md §6.2).
+    ///
+    /// One log holds every range's entries, so room any range frees serves each: a range another
+    /// shard drives counts as stalled as its shard last showed it, and compacts on that shard
+    /// (node.md §2.9).
     fn compact_if_stalled(&mut self, now: u64) -> Result<(), NodeError> {
         let wanted = std::mem::take(&mut self.liveness_compact);
         let any_stalled = self
             .ranges
             .iter()
-            .any(|k| self.owner.get(k.handle).is_some_and(|r| r.is_stalled()));
+            .any(|k| self.owner.get(k.handle).is_some_and(|r| r.is_stalled()))
+            || self.far.iter().any(|far| far.seen.stalled);
         let mut retry = false;
         if any_stalled {
             let reached = (self.log_durables, self.applied_total());
@@ -2862,33 +2925,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !(wanted || retry) {
             return Ok(());
         }
-        let mut made_room = false;
-        for kept in &self.ranges {
-            let Some(shell) = self.owner.get_mut(kept.handle) else {
-                continue;
-            };
-            let stalled = shell.is_stalled();
-            // A write out may yet be refused for room, and hyper-log takes a compaction's start
-            // even then, as it frees room: durable behind the refused write, it fences the range.
-            // Its answer brings the next try.
-            if !stalled && shell.in_flight() > 0 {
-                continue;
-            }
-            let compacted = shell
-                .compact(0, now, &self.waker)
-                .map_err(mantle_range::ReplicaError::from)?;
-            made_room |= compacted;
-            if stalled && !compacted {
-                shell.resume();
-            }
-            // A stalled range drives every range again, as it always has; a compaction for an
-            // owed liveness write drives only the ranges whose compaction started, or a node
-            // waiting with nothing to compact would turn every range again at every turn.
-            if any_stalled || compacted {
-                self.owner.schedule(kept.handle);
+        // The ranges another shard drives compact there, with that shard's waker; a lane with no
+        // room for the ask has it asked again at the next turn.
+        for lanes in &self.shards {
+            match lanes.send(shard::In::Compact) {
+                Ok(()) => {}
+                Err(NodeError::LaneFull(_)) => self.liveness_compact = true,
+                Err(e) => return Err(e),
             }
         }
-        if made_room {
+        let handles = self.ranges.iter().map(|k| k.handle);
+        if shard::compact(&mut self.owner, handles, any_stalled, now, &self.waker)? {
             self.compactions = self.compactions.saturating_add(1);
         }
         Ok(())
@@ -3272,6 +3319,38 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if query.layer() != layer {
             return self.answer_status(exchange, command::Status::WrongLayer, self.id);
         }
+        // A range another shard drives is asked there, when it leads as last shown; one its lane
+        // has no room for is refused, which its asker asks again after its pause (node.md §2.9).
+        if let Some(far) = self.far.iter().find(|far| far.group == group) {
+            let asked = if far.seen.leading {
+                let lanes = self
+                    .shards
+                    .iter()
+                    .find(|lanes| lanes.shard() == far.shard)
+                    .ok_or(NodeError::ShardEnded(far.shard))?;
+                match lanes.send(shard::In::Read {
+                    group,
+                    id,
+                    query: query.clone(),
+                }) {
+                    Ok(()) => true,
+                    Err(NodeError::LaneFull(_)) => false,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                false
+            };
+            if !asked {
+                return self.refuse_read(exchange, group);
+            }
+            self.reading.push(Reading {
+                id,
+                origin: ReadOrigin::Exchange(exchange),
+                group,
+                query,
+            });
+            return Ok(());
+        }
         let asked = self
             .owner
             .get_mut(handle)
@@ -3287,14 +3366,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 Ok(())
             }
-            _ => {
-                let leader = self.leader_of(group);
-                if leader == self.id {
-                    self.answer_status(exchange, command::Status::Refused, leader)
-                } else {
-                    self.redirect(exchange, group)
-                }
-            }
+            _ => self.refuse_read(exchange, group),
+        }
+    }
+
+    /// Refuses a read its range's member took not: as its leader, `Refused`, which its asker asks
+    /// again after a pause; else redirected to the leader it knows.
+    fn refuse_read(&mut self, exchange: ExchangeId, group: u128) -> Result<(), NodeError> {
+        let leader = self.leader_of(group);
+        if leader == self.id {
+            self.answer_status(exchange, command::Status::Refused, leader)
+        } else {
+            self.redirect(exchange, group)
         }
     }
 
@@ -3318,36 +3401,39 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             // An answer fills at most what a reply's body carries, past its head.
             let room = crate::read::reply_room(NodeClasses::frame_bound(classes::Class::Request));
-            let read = self
-                .owner
-                .get_mut(handle)
-                .map(|shell| reading.query.answer(shell.machine_mut().engine_mut(), room));
-            let exchange = match reading.origin {
-                ReadOrigin::Exchange(exchange) => exchange,
-                ReadOrigin::Own(ask) => {
-                    // This node's own read, answered in-process; one the engine failed is refused
-                    // as a peer's would be.
-                    let outcome = match read {
-                        Some(Ok(read)) => ReadOutcome::Read(Box::new(read)),
-                        _ => ReadOutcome::Refused(command::Status::Refused),
-                    };
-                    self.reads_out.retain(|r| r.ask != ask);
-                    self.reads_done.push((ask, outcome));
-                    continue;
-                }
-            };
-            let body = match read {
-                Some(Ok(read)) => read.encode().ok(),
-                _ => None,
-            };
-            let Some(body) = body else {
-                // The engine failed the read: the range is fenced at its next write.
-                self.answer_status(exchange, command::Status::Refused, self.id)?;
-                continue;
-            };
-            self.reply_body(exchange, body)?;
+            let read = self.owner.get_mut(handle).and_then(|shell| {
+                reading
+                    .query
+                    .answer(shell.machine_mut().engine_mut(), room)
+                    .ok()
+            });
+            self.answer_read(reading.origin, read)?;
         }
         Ok(())
+    }
+
+    /// Answers a read to `origin` with what its range's engine gave, `None` when the engine
+    /// failed it.
+    fn answer_read(&mut self, origin: ReadOrigin, read: Option<Read>) -> Result<(), NodeError> {
+        let exchange = match origin {
+            ReadOrigin::Exchange(exchange) => exchange,
+            ReadOrigin::Own(ask) => {
+                // This node's own read, answered in-process; one the engine failed is refused as
+                // a peer's would be.
+                let outcome = match read {
+                    Some(read) => ReadOutcome::Read(Box::new(read)),
+                    None => ReadOutcome::Refused(command::Status::Refused),
+                };
+                self.reads_out.retain(|r| r.ask != ask);
+                self.reads_done.push((ask, outcome));
+                return Ok(());
+            }
+        };
+        let Some(body) = read.and_then(|read| read.encode().ok()) else {
+            // The engine failed the read: the range is fenced at its next write.
+            return self.answer_status(exchange, command::Status::Refused, self.id);
+        };
+        self.reply_body(exchange, body)
     }
 
     /// Replies `body` answered, refused `TooLarge` past the class's bound, and writes it.
@@ -3440,9 +3526,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The leader this node's member of `group` knows, 0 for none.
     fn leader_of(&self, group: u128) -> u64 {
-        self.kept(group)
-            .and_then(|k| self.owner.get(k.handle))
-            .map_or(0, |r| r.leader())
+        self.seen(group).map_or(0, |seen| seen.leader)
     }
 
     /// Whether this node's member of `group` and the members its detectors trust are a quorum,
@@ -3455,14 +3539,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !measured {
             return None;
         }
-        let replica = self.kept(group).and_then(|k| self.owner.get(k.handle))?;
-        Some(
-            replica
-                .core()
-                .raft
-                .campaign_state()
-                .is_none_or(|state| state.trusted_quorum),
-        )
+        Some(self.seen(group)?.trusted_quorum)
     }
 
     /// A step of `group`'s at a turn at `now`, asked `via` and its clock `since` (node.md §5.4):
@@ -4686,10 +4763,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let mut at = 0;
         while let Some(c) = self.commanded.get(at) {
             let answered = c.commands.iter().all(|(_, _, a)| a.is_some());
-            let led = self
-                .kept(c.group)
-                .and_then(|k| self.owner.get(k.handle))
-                .is_some_and(|r| r.is_leader());
+            let led = self.is_leader(c.group);
             if !answered && led {
                 at = at.saturating_add(1);
                 continue;
@@ -4729,10 +4803,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // A read whose range this node no longer leads may never be confirmed here.
         let mut at = 0;
         while let Some(r) = self.reading.get(at) {
-            let led = self
-                .kept(r.group)
-                .and_then(|k| self.owner.get(k.handle))
-                .is_some_and(|r| r.is_leader());
+            let led = self.is_leader(r.group);
             if led {
                 at = at.saturating_add(1);
                 continue;

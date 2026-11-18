@@ -1605,7 +1605,8 @@ refuses, typed; and a shard whose task ended, its lane's end dropped or its runt
 reported ended once what it gave is taken. Left: a far range's reads, snapshots and status (2b),
 and its membership, stop, repair and the host's reads of it (2c).
 
-*As built (2026-11-18), step 2b: a far range's status, reads, answers and compaction*
+*As built (2026-11-18), step 2b: a far range's status, reads, answers, compaction and
+snapshots*
 (`crates/node/src/node/shard.rs`, `Node::seen`). What the node reads of a range's member, its
 term, leader, leading, commit, applied, stall, writes, fence, held reads, timing and whether its
 detectors trust a quorum (`shard::Seen`), is read from the replica where the node's own task
@@ -1627,16 +1628,23 @@ of compaction (`Node::compact_if_stalled`), asked when a range anywhere stalls f
 as its shard last showed it, or the stream's write is owed, runs on each shard with that shard's
 waker (`In::Compact`, `shard::compact`, the node's own ranges compacting with the same function),
 since one log holds every range's entries and room any range frees serves each; a shard's round
-that started one is counted (`Out::Compacted`). Each new lane message keeps the lanes' bounds. A
-full lane: a read is refused, its asker asking again after its pause, as a busy leader refuses
-one; a round of compaction is asked again at the next turn; the shard's reports and served reads
-wait for room, as all it gives does. Tested (`node::shard`): a far range's leading, term, leader
+that started one is counted (`Out::Compacted`). A snapshot a far range sends leaves its lane as
+any message does, `Node::send` opening its exchange, and one arriving for it is stepped there as
+any message is; the end of one it sent, which `report_snapshot` tells its member, is held on the
+far range, at most one a member, a later end superseding an earlier, and handed to its shard at
+each turn while the lane has room (`Node::report_far`, `In::Reported`): a member that missed it
+would wait in hyper-raft's snapshot state for that peer for good (`handle_snapshot_status`). Each
+new lane message keeps the lanes' bounds. A full lane: a read is refused, its asker asking again
+after its pause, as a busy leader refuses one; a round of compaction is asked again at the next
+turn; a snapshot's end is held for the next turn; the shard's reports and served reads wait for
+room, as all it gives does. Tested (`node::shard`): a far range's leading, term, leader
 and applied entries are seen from the node's shard; a read is served from its engine through the
 lanes, and one of a range the shard holds not is refused; a far range's applied answer reaches the
-command waiting for it; and a round of compaction runs on the range's shard, its write answered
-there. Left for 2c: a far range's snapshots (reporting a sent snapshot's end to its replica, which
-waits in hyper-raft's snapshot state until told, and a full lane must not lose that report), the
-host's own reads of a far range (`Node::read`), and its membership, stop and repair.
+command waiting for it; a round of compaction runs on the range's shard, its write answered
+there; and a leader on one shard compacted past a learner on another sends it a snapshot out of
+its lane, which the learner installs from its own, the snapshot's end reported into the leader's,
+which then sends it entries. Left for 2c: the host's own reads of a far range (`Node::read`), and
+its membership, stop and repair.
 
 ## 3. Transport
 

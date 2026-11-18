@@ -300,6 +300,15 @@ enum InitCommand {
         #[arg(long)]
         cell: PathBuf,
     },
+    /// The cell's issuer, for a cell made before cells had one (docs/design/membership.md §5.1):
+    /// its key and its certificate under the cell's authority, a CA of node certificates alone,
+    /// kept beside the authority's key and in each node's directory in the cell's, which the cell
+    /// re-grants a node it wrote off under. Run once, offline, by the authority's holder.
+    Issuer {
+        /// The directory `mantle init` made the cell in, which holds its authority.
+        #[arg(long)]
+        cell: PathBuf,
+    },
     /// A node that joins the running cell (docs/design/membership.md §2, §7): its id and a grant
     /// numbered past the authority's last, its certificate naming the grant, its S3 endpoint's,
     /// the cell's keys, and its directory NAME with its configuration, the cell's ranges and the
@@ -1138,6 +1147,10 @@ fn main() -> ExitCode {
         } => init::pin_gateway(&mut out, &name, &cell)
             .map(|_| ())
             .map_err(|e| e.to_string()),
+        Command::Init {
+            what: Some(InitCommand::Issuer { cell }),
+            ..
+        } => init::issuer(&mut out, &cell).map_err(|e| e.to_string()),
         Command::Init {
             what: Some(InitCommand::Grant { name, cell, node }),
             ..

@@ -5,14 +5,16 @@
 //! (`--founders`), or both, the file's first; the cell's bounds on its volume table and its
 //! durability target likewise (architecture §11 leaves the bounds' values open: they are stated).
 //!
-//! It draws from the OS the cell's authority's key (`mantle_cert::authority`), the root key's first
+//! It draws from the OS the cell's authority's key (`mantle_cert::authority`), its issuer's key,
+//! whose certificate the authority signs (`mantle_cert::issuer`, docs/design/membership.md §5.1),
+//! the root key's first
 //! generation, 32 bytes (encryption.md §2), the founding ranges' groups, one for the root range and
 //! one for each of the Bucket, Name, File and Block layers, and each founder's id, 64 bits; issues
 //! each founder's certificate under the authority (`mantle_cert::node`); and writes each founder's
 //! directory (§1.6): its `config`, the stated keys alone (`mantle_node::process::STATED_KEYS`), its
 //! paths relative to the directory so it moves to its host whole; `identity/`, the authority's
-//! certificate, the founder's own certificate and key, and each other founder's certificate,
-//! pinned (§3.6); and `keys/`, the root key. Keys are owner-only (`crate::files`). One founder makes
+//! certificate, the issuer's certificate and key beside it, the founder's own certificate and key,
+//! and each other founder's certificate, pinned (§3.6); and `keys/`, the root key. Keys are owner-only (`crate::files`). One founder makes
 //! a cell of one in OUT, which keeps the authority's key (§1.5: "on a laptop it is in the node's
 //! directory"), and is measured now: this machine's calibration record and each of its devices'
 //! profiles, each device under its directory's lock (`mantle_disk::profile`). Several make
@@ -54,6 +56,7 @@ use mantle_node::derive::VolumeBytes;
 use mantle_protocol::node_name;
 
 use mantle_node::files;
+use mantle_node::process::ISSUER;
 
 /// RFC 5280 §4.1.2.5: "To indicate that a certificate has no well-defined expiration date, the
 /// notAfter SHOULD be assigned the GeneralizedTime value of 99991231235959Z", in Unix seconds.
@@ -787,6 +790,7 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
         Serial::draw().map_err(cert)?,
     )
     .map_err(cert)?;
+    let (issuer_key, issuer) = make_issuer(&authority_key, &authority_name, now)?;
     let root_key = random::<32>()?;
     let ids = distinct(cell.founders.len(), || {
         Ok(u64::from_le_bytes(random::<8>()?))
@@ -847,6 +851,7 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
     files::create_dir(&authority_dir)?;
     files::write(&authority_dir.join("authority.der"), &authority)?;
     files::write_secret(&authority_dir.join("authority.key"), authority_key.pkcs8())?;
+    keep_issuer(&authority_dir, &issuer, &issuer_key)?;
     files::write(&authority_dir.join("s3-authority.der"), &endpoint_authority)?;
     files::write_secret(
         &authority_dir.join("s3-authority.key"),
@@ -892,6 +897,7 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
             .ok_or_else(|| Error::Cell("a founder's certificate".into()))?;
         if !one {
             files::write(&identity.join("authority.der"), &authority)?;
+            keep_issuer(&identity, &issuer, &issuer_key)?;
         }
         files::write(&identity.join("node.der"), certificate)?;
         files::write_secret(&identity.join("node.key"), own.pkcs8())?;
@@ -1177,6 +1183,98 @@ impl Authority {
     }
 }
 
+impl Authority {
+    /// The cell's issuer kept beside the authority's key, its certificate and key, where the cell
+    /// has one (docs/design/membership.md §5.1).
+    fn issuer(&self) -> Result<Option<(Vec<u8>, KeyPair)>, Error> {
+        let (certificate, key) = (self.dir.join(ISSUER.0), self.dir.join(ISSUER.1));
+        if !certificate.try_exists()? {
+            return Ok(None);
+        }
+        let der = std::fs::read(&certificate)?;
+        let pair = mantle_node::secret::read(&key)
+            .map_err(|e| Error::Cert(e.to_string()))
+            .and_then(|pkcs8| {
+                KeyPair::from_pkcs8(&pkcs8).map_err(|e| Error::Cert(format!("{e:?}")))
+            })?;
+        Ok(Some((der, pair)))
+    }
+}
+
+/// The cell's issuer under the authority holding `authority_key` and named `authority_name`
+/// (docs/design/membership.md §5.1): its key, drawn from the OS, and its certificate, named after
+/// the authority, a CA of node certificates alone (`mantle_cert::issuer`), checked as a node's
+/// start checks it.
+fn make_issuer(
+    authority_key: &KeyPair,
+    authority_name: &str,
+    now: u64,
+) -> Result<(KeyPair, Vec<u8>), Error> {
+    let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
+    let key = KeyPair::generate().map_err(cert)?;
+    let certificate = mantle_cert::issuer(
+        authority_key,
+        authority_name,
+        key.public_key(),
+        &format!("{authority_name} issuer"),
+        (
+            Validity {
+                not_before: now,
+                not_after: NO_EXPIRY,
+            },
+            Serial::draw().map_err(cert)?,
+        ),
+    )
+    .map_err(cert)?;
+    Ok((key, certificate))
+}
+
+/// The issuer's certificate and key kept in `dir`, beside an authority's certificate, where a
+/// node's start finds them (`mantle_node::process::ISSUER`): the key owner-only, each written
+/// whole and durable (CLAUDE.md §6).
+fn keep_issuer(dir: &Path, certificate: &[u8], key: &KeyPair) -> Result<(), Error> {
+    files::write(&dir.join(ISSUER.0), certificate)?;
+    files::write_secret(&dir.join(ISSUER.1), key.pkcs8())?;
+    Ok(())
+}
+
+/// The issuer of a cell `mantle init` made in `cell` before cells had one (docs/design/membership.md
+/// §5.1), made by its authority's holder, offline, once: kept beside the authority's key, and in
+/// each node's directory `mantle init` made in `cell`, beside the authority's certificate there;
+/// a node whose directory is elsewhere takes the two files from beside the authority's key. Refused
+/// where the cell has an issuer, so the authority signs one.
+pub fn issuer(said: &mut impl Write, cell: &Path) -> Result<(), Error> {
+    let authority = Authority::read(cell)?;
+    let at = authority.dir.join(ISSUER.0);
+    if at.try_exists()? {
+        return Err(Error::Cell(format!(
+            "{}: the cell has its issuer already, which its authority signs once",
+            at.display()
+        )));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Cert(e.to_string()))?
+        .as_secs();
+    let (key, certificate) = make_issuer(&authority.key, &authority.name, now)?;
+    mantle_cert::issuer_issued(&certificate, &authority.certificate, now)
+        .map_err(|e| Error::Cert(format!("{e:?}")))?;
+    keep_issuer(&authority.dir, &certificate, &key)?;
+    writeln!(
+        said,
+        "issuer {}: it signs the certificates of the nodes the cell re-grants; every member keeps          it",
+        at.display()
+    )?;
+    for (id, _) in &authority.nodes {
+        let identity = cell.join(format!("node-{id}")).join("identity");
+        if identity.join("authority.der").is_file() {
+            keep_issuer(&identity, &certificate, &key)?;
+            writeln!(said, "issuer kept by node {id} {}", identity.display())?;
+        }
+    }
+    Ok(())
+}
+
 /// A gateway's identity for the cell `mantle init` made in `cell`, which its operator pins in each
 /// founder's configuration (`peer = ID gateway CERTIFICATE`, node.md §3.6): its id drawn from the
 /// OS, nonzero and no founder's, its certificate issued under the cell's authority, and its key.
@@ -1402,6 +1500,9 @@ pub fn grant(
     files::create_dir(&identity.join("peers"))?;
     files::create_dir(&out.join("keys").join("s3"))?;
     files::write(&identity.join("authority.der"), &authority.certificate)?;
+    if let Some((issuer, issuer_key)) = authority.issuer()? {
+        keep_issuer(&identity, &issuer, &issuer_key)?;
+    }
     files::write(&identity.join("node.der"), &certificate)?;
     files::write_secret(&identity.join("node.key"), own.pkcs8())?;
     files::write(&identity.join("s3.der"), &endpoint)?;
@@ -1762,6 +1863,124 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// A granted node keeps the cell's issuer as a founder does, its certificate and its key
+    /// beside its authority's certificate, the key owner-only.
+    #[test]
+    fn a_granted_node_keeps_the_cells_issuer() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cell");
+        let founder = |n: u16| Founder {
+            quic: address(&format!("127.0.0.1:{}", 7200 + n)),
+            plane: address(&format!("127.0.0.1:{}", 8200 + n)),
+            s3: None,
+            names: Vec::new(),
+            domain: Some("rack".into()),
+            volumes: Vec::new(),
+            memory: None,
+            reach: None,
+        };
+        let cell = Cell {
+            founders: vec![founder(0), founder(1)],
+            max_nodes: Some(5),
+            max_volumes: Some(10),
+            ..Cell::default()
+        };
+        init(&mut Vec::new(), &out, &cell).unwrap();
+        let granted = root.path().join("granted");
+        grant(&mut Vec::new(), &granted, &out, &founder(2)).unwrap();
+        for file in [ISSUER.0, ISSUER.1] {
+            assert_eq!(
+                std::fs::read(granted.join("identity").join(file)).unwrap(),
+                std::fs::read(out.join("authority").join(file)).unwrap(),
+                "{file}"
+            );
+        }
+        assert!(files::owner_only(&granted.join("identity").join(ISSUER.1)).unwrap());
+    }
+
+    /// A cell has its issuer from its founding, beside the authority's key and in each founder's
+    /// directory beside its authority's certificate, where a node's start finds it; and one made
+    /// before cells had an issuer is given it by `mantle init issuer`, once: each copy its
+    /// certificate whole, issued by the authority, and its key owner-only, the one the certificate
+    /// certifies, written durable under a temporary name that none is left at.
+    #[test]
+    fn an_issuer_is_made_once_owner_only_beside_the_authority_and_in_each_founder() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cell");
+        let founders = (0..2)
+            .map(|n| Founder {
+                quic: address(&format!("127.0.0.1:{}", 7100 + n)),
+                plane: address(&format!("127.0.0.1:{}", 8100 + n)),
+                s3: None,
+                names: Vec::new(),
+                domain: None,
+                volumes: Vec::new(),
+                memory: None,
+                reach: None,
+            })
+            .collect();
+        let cell = Cell {
+            founders,
+            ..Cell::default()
+        };
+        init(&mut Vec::new(), &out, &cell).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let authority_dir = out.join("authority");
+        let authority = std::fs::read(authority_dir.join("authority.der")).unwrap();
+        let mut holders = vec![authority_dir.clone()];
+        for entry in std::fs::read_dir(&out).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("node-")
+            {
+                holders.push(path.join("identity"));
+            }
+        }
+        assert_eq!(holders.len(), 3);
+        let held = |dir: &Path| -> Vec<u8> {
+            let der = std::fs::read(dir.join(ISSUER.0)).unwrap();
+            mantle_cert::issuer_issued(&der, &authority, now).unwrap();
+            let key = dir.join(ISSUER.1);
+            assert!(files::owner_only(&key).unwrap(), "{}", key.display());
+            let pair = KeyPair::from_pkcs8(&mantle_node::secret::read(&key).unwrap()).unwrap();
+            assert_eq!(mantle_cert::public_key(&der).unwrap(), pair.public_key());
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(!name.to_str().unwrap().ends_with(".new"), "{name:?}");
+            }
+            der
+        };
+        let founded = held(&authority_dir);
+        for dir in &holders {
+            assert_eq!(held(dir), founded);
+            std::fs::remove_file(dir.join(ISSUER.0)).unwrap();
+            std::fs::remove_file(dir.join(ISSUER.1)).unwrap();
+        }
+        let mut said = Vec::new();
+        issuer(&mut said, &out).unwrap();
+        let said = String::from_utf8(said).unwrap();
+        assert_eq!(
+            said.lines()
+                .filter(|l| l.starts_with("issuer kept by node "))
+                .count(),
+            2
+        );
+        let made = held(&authority_dir);
+        assert_ne!(made, founded);
+        for dir in &holders {
+            assert_eq!(held(dir), made);
+        }
+        assert!(matches!(issuer(&mut Vec::new(), &out), Err(Error::Cell(_))));
+        assert_eq!(held(&authority_dir), made);
     }
 
     /// Founders of a larger cell: each directory pins every other founder and names every founder a

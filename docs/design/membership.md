@@ -523,6 +523,31 @@ they move: `ledger ID open`, `ledger ID banned`, `ledger ID regranted NEW`, `led
 certificate and the issuer's key; and `Join`'s use of the issuer's window and its drop of its
 predecessor's entry, which need the directory's rule 4 to say the issuer signed the joiner.
 
+*As built (slice 5a, 2026-11-18;* `mantle_cert`*, `mantle init`, the node's start and directory).*
+The issuer's certificate (`mantle_cert::issuer`) is the authority's signature over a key `mantle
+init` draws beside the authority's, named after the authority (`NAME issuer`), never as it: cA with
+pathLenConstraint 0 and keyUsage keyCertSign alone, both critical; it signs `mantle_cert::
+granted_node`'s profile, `node-ID` and the grant in serialNumber, as the authority does. Its
+certificate and key, the key owner-only, are kept whole and durable as `issuer.der` and `issuer.key`
+beside the authority's key and in each founder's `identity/` beside the authority's certificate,
+where a node's start finds them (`mantle_node::process::ISSUER`); `mantle init grant` copies them
+into a granted node's; `mantle init issuer --cell OUT` makes them for a cell made before, once,
+and writes them into each node directory in OUT. A start refuses an issuer not of that profile or
+not the authority's, and a key its certificate does not certify (`mantle_cert::public_key`, which
+the rejoin's switch and its keeping of the cell's answer also check the next key by). The node's
+own certificate is verified by `mantle_cert::node_issued`: the authority's directly, or the issuer's
+of a node's profile with the issuer under the authority, a path of at most two; one the issuer
+signed is presented with the issuer's certificate, and its `Join` says so (`Join::issued`). A join
+the issuer signed is judged by the ledger, not by either window: the entry re-granted to its id
+under its grant and fingerprint (`Unknown` where none, `Banned` where the old machine was banned
+since, `Conflict` for another grant or certificate), whose issuer's grant the re-grant spent; it
+drops that entry, and the authority's window is never touched. The directory, told the authority's
+certificate (`Peers::authority`), takes a certificate whose issuer is not the authority as the
+issuer's: admitted only as the member the root range holds under its fingerprint (rule 2), never
+by the authority's window, as a seed or as a client. Left to slice 5b: rule 4 itself (an issuer's
+certificate admitted at a committed `Regrant` fingerprint before it joins), the leader's signing,
+`SameKey`, `Unissued` and the enrollment protocol.
+
 **What stays forbidden.** The old identity is never admitted again: its grant stays spent in its
 issuer's window and its member written off. A re-grant draws a new id and refuses the old key. The
 issuer signs node certificates alone, never a CA, a gateway's or a client's, and the directory

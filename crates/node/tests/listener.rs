@@ -25,6 +25,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::task::Waker;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use hyper_rt::combine::{Either, race2};
@@ -113,7 +114,7 @@ fn the_listener_answers_over_tls_1_3_and_1_2_with_the_endpoint_chain() {
     let access = access();
     let pkcs8 = key.pkcs8().to_vec();
     let asked = access.clone();
-    let said = runtime()
+    let (said, client) = runtime()
         .block_on(async move {
             // No node takes what the door holds: every request here is refused before it.
             let (_doorway, submitter) = door::doorway(1, Waker::noop().clone()).unwrap();
@@ -143,16 +144,15 @@ fn the_listener_answers_over_tls_1_3_and_1_2_with_the_endpoint_chain() {
                     .collect();
                 told.blocking_send(said).unwrap();
             });
-            let said = match race2(listener.serve(), heard.recv()).await {
-                Either::Second(Ok(said)) => said,
-                // The client failed: its own failure, which names its wait, is the test's.
-                Either::Second(Err(_)) => std::panic::resume_unwind(client.join().unwrap_err()),
+            // A client that failed told nothing: its own failure is the test's, raised on the
+            // test's thread once the runtime is left (`joined`).
+            match race2(listener.serve(), heard.recv()).await {
+                Either::Second(said) => (said.ok(), client),
                 Either::First(e) => panic!("the listener ended: {e}"),
-            };
-            client.join().unwrap();
-            said
+            }
         })
         .unwrap();
+    let said = joined(said, client);
     let [tls13, tls12] = said.as_slice() else {
         panic!("{said:?}")
     };
@@ -208,7 +208,7 @@ fn plain(access: AccessKey) -> Settings {
 /// says.
 fn beside<T: Send + 'static>(client: impl FnOnce(SocketAddr) -> T + Send + 'static) -> T {
     let access = access();
-    runtime()
+    let (said, thread) = runtime()
         .block_on(async move {
             // No node takes what the door holds: every request here is refused before it.
             let (_doorway, submitter) = door::doorway(1, Waker::noop().clone()).unwrap();
@@ -221,16 +221,27 @@ fn beside<T: Send + 'static>(client: impl FnOnce(SocketAddr) -> T + Send + 'stat
                     panic!("the listener's side ended");
                 }
             });
-            let said = match race2(listener.serve(), heard.recv()).await {
-                Either::Second(Ok(said)) => said,
-                // The client failed: its own failure, which names its wait, is the test's.
-                Either::Second(Err(_)) => std::panic::resume_unwind(thread.join().unwrap_err()),
+            // A client that failed told nothing: its own failure is the test's, raised on the
+            // test's thread once the runtime is left (`joined`).
+            match race2(listener.serve(), heard.recv()).await {
+                Either::Second(said) => (said.ok(), thread),
                 Either::First(e) => panic!("the listener ended: {e}"),
-            };
-            thread.join().unwrap();
-            said
+            }
         })
-        .unwrap()
+        .unwrap();
+    joined(said, thread)
+}
+
+/// What a client beside the listener told it, once the runtime that ran the listener is left; or
+/// the client's own failure, which names its wait and the test's line, raised on the test's
+/// thread. Raised within the runtime, an unwind ends its root, and the test fails `RootUnwound`,
+/// which names neither.
+fn joined<T>(said: Option<T>, client: JoinHandle<()>) -> T {
+    match (said, client.join()) {
+        (_, Err(failure)) => std::panic::resume_unwind(failure),
+        (Some(said), Ok(())) => said,
+        (None, Ok(())) => panic!("the client ended telling nothing"),
+    }
 }
 
 /// A connection past the listener's budget is answered, never closed with no answer (node.md

@@ -61,18 +61,23 @@ fn at_rest(seed: u64) -> alloc::Counts {
 /// 477,128 allocations before the turn kept its buffers (`drive`'s three lists, 189,808 of
 /// them; the plane's message copies, 119,301); 168,019 after, 96,388 since hyper-raft 3d6640f
 /// (a group's pairs told in place, a packet's credit recorded without allocating, a stream's queue
-/// of pieces kept), and 96,375 since its fb74b59, whose driver reads its sockets before it judges
-/// its timers: the transport's, QUIC's, the stream's and the simulated network's own. The same
-/// every run and on every host: nothing at rest draws at random, and a node's QUIC endpoint and
-/// its liveness stream keep the simulation's clock. With the host's, read as the endpoint was made
-/// and for the clock's resolution, the count was the machine's: at fb74b59 96,375 on a Linux
-/// x86_64 host, 94,195 on a macOS aarch64 one and 65,102 in a Linux aarch64 VM on that.
+/// of pieces kept), 96,375 since its fb74b59, whose driver reads its sockets before it judges its
+/// timers: the transport's, QUIC's, the stream's and the simulated network's own, and 95,102 since
+/// its 17371e2, whose liveness stream's sender floor is never below the stream's own proof, from
+/// the poll that asks a liveness write to the poll that takes its answer (65cdd84): the cell
+/// answers that write once its shard's clock has passed the ask, so the proof outlasts the writes'
+/// flushes and the floor rose, and the ten seconds send 446 fewer heartbeats and ask 217 fewer
+/// liveness writes, while the plane carries 758 more of the ranges' Raft frames. The same every run
+/// and on every host: nothing at rest draws at random, and a node's QUIC endpoint and its liveness
+/// stream keep the simulation's clock. With the host's, read as the endpoint was made and for the
+/// clock's resolution, the count was the machine's: at fb74b59 96,375 on a Linux x86_64 host,
+/// 94,195 on a macOS aarch64 one and 65,102 in a Linux aarch64 VM on that.
 #[test]
 fn a_cell_at_rest_turns_without_remaking_what_a_turn_keeps() {
     let counts = at_rest(1);
     assert_eq!(
         (counts.allocations, counts.reallocations),
-        (96_375, 0),
+        (95_102, 0),
         "{counts:?}"
     );
 }
@@ -112,13 +117,16 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// its first node, one allocation for each of the 120 puts' three commands. 6 fewer since a peer's
 /// connection is granted only the streams the node serves it, not the chunks the node asks of
 /// peers itself (`bounds::Stated::asked`): hyper-quic builds a connection's stream tables in fewer
-/// steps of growth.
+/// steps of growth. 52 more since hyper-raft 17371e2, whose liveness stream's sender floor takes
+/// the stream's own proof (the cell at rest's count): the clients' run asks 10 more liveness
+/// writes and sends 6 fewer heartbeats, its plane carries 144 fewer Raft frames, and it ends
+/// 61.8 ms sooner on the virtual clock.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
         34_388
     } else {
-        34_337
+        34_389
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

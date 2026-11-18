@@ -958,6 +958,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The bytes of chunks received or put that no volume kept: refused, or a body that ended
     /// before it was whole.
     chunks_unkept: u64,
+    /// The entries this node's members proposed as their ranges' leader, and the commands those
+    /// entries carried ([`Node::proposed`]).
+    proposed_entries: u64,
+    proposed_commands: u64,
     /// The clients the node admits at once (`GatewaySettings::clients`), none where it hosts no
     /// objects.
     clients: usize,
@@ -1333,6 +1337,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             chunks_received: 0,
             chunks_written: 0,
             chunks_unkept: 0,
+            proposed_entries: 0,
+            proposed_commands: 0,
             clients,
             generation: 0,
             held: Vec::new(),
@@ -1433,6 +1439,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .ok_or(NodeError::Bounds("a range's handle names nothing".into()))?;
         mantle_range::propose_entry(shell, entry, max)?;
         self.owner.schedule(handle);
+        self.proposed_entries = self.proposed_entries.saturating_add(1);
+        self.proposed_commands = self
+            .proposed_commands
+            .saturating_add(u64::try_from(entry.commands.len()).unwrap_or(u64::MAX));
         Ok(())
     }
 
@@ -1585,6 +1595,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written).
     pub fn moved(&self) -> u64 {
         self.moved
+    }
+
+    /// The entries this node's members proposed as their ranges' leader since it opened, and the
+    /// commands those entries carried: their ratio is the write path's batching, an entry carrying
+    /// every command that waited for it (`derive::batch`). A proposal a later leader overwrites
+    /// counts as made.
+    pub fn proposed(&self) -> (u64, u64) {
+        (self.proposed_entries, self.proposed_commands)
     }
 
     /// The bytes of chunks peers put here over QUIC, of chunks this node put on its own volumes

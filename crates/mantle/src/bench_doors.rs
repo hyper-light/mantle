@@ -26,7 +26,11 @@
 //! allocator's counts in a `count-allocs` build, its faults and switches in any), what the OS
 //! charged each server's process (read by pid), what the harness's own thread allocated for the
 //! doors beside its own work, which is set aside (`alloc::aside`), and the latency of each
-//! operation from its intended start (measurement.md §10). The servers' peak live heap over the
+//! operation from its intended start (measurement.md §10), and the write path's counts the servers
+//! answer beside their own (`counts`): the cell's commands an entry its leaders proposed, its logs'
+//! updates a frame, and their frames and flushes an operation, every server's summed; and its
+//! logs' commit waits over the phase, each quantile the slowest server's, as quantiles do not sum
+//! ([`log_wait`]). The servers' peak live heap over the
 //! phase, above what they held as it began, is given per request, over the most requests the
 //! harness had out at once, and per connection, over the connections the phase held. Logical
 //! clients are tasks on one hyper-rt shard, each holding one connection and the buffers its
@@ -2483,6 +2487,37 @@ fn summed(mut values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     values.try_fold(0.0, |sum, v| Some(sum + v?))
 }
 
+/// Each server's growth of a count it answers since it began, from its answer `before` to its
+/// answer `after` (a server a slot in each), summed: none where any server's is none.
+fn grown(before: &[Counted], after: &[Counted], f: fn(&Counted) -> Option<u64>) -> Option<f64> {
+    summed(
+        after
+            .iter()
+            .zip(before)
+            .map(|(a, b)| Some(f(a)?.saturating_sub(f(b)?) as f64)),
+    )
+}
+
+/// A phase line's write-path columns, from the servers' `counts` answers at its start and end: the
+/// cell's commands an entry its leaders proposed, its logs' updates a frame, and their frames and
+/// flushes an operation, each count every server's growth over the phase summed ([`grown`]); then
+/// its logs' commit waits' median, 99th percentile and longest ([`log_wait`]).
+fn write_path(before: &[Counted], after: &[Counted], ops: u64) -> String {
+    let grew = |f: fn(&Counted) -> Option<u64>| grown(before, after, f);
+    let ops = Some(ops as f64);
+    format!(
+        " commands/entry {} updates/frame {} log_frames/op {} log_flushes/op {} log_wait_p50_us {} \
+         log_wait_p99_us {} log_wait_max_us {}",
+        ratio(grew(|c| c.commands), grew(|c| c.entries)),
+        ratio(grew(|c| c.updates), grew(|c| c.frames)),
+        ratio(grew(|c| c.frames), ops),
+        ratio(grew(|c| c.flushes), ops),
+        log_wait(after, Some(Level::P50), |c| c.wait_p50_ns),
+        log_wait(after, Some(Level::P99), |c| c.wait_p99_ns),
+        log_wait(after, None, |c| c.wait_max_ns),
+    )
+}
+
 /// `value / ops` to a tenth, or `-` where there is no value or no operation.
 fn per(value: Option<f64>, ops: u64) -> String {
     match value {
@@ -2493,6 +2528,40 @@ fn per(value: Option<f64>, ops: u64) -> String {
 
 fn micros(ns: u64) -> String {
     format!("{:.1}", ns as f64 / 1_000.0)
+}
+
+/// `of / per` to a hundredth, or `-` where either is unknown or `per` is none: a ratio of the write
+/// path's counts over a phase (commands an entry, updates a frame, frames and flushes an operation).
+fn ratio(of: Option<f64>, per: Option<f64>) -> String {
+    match (of, per) {
+        (Some(of), Some(per)) if per > 0.0 => format!("{:.2}", of / per),
+        _ => "-".to_owned(),
+    }
+}
+
+/// A commit-wait quantile of the phase's in microseconds, `f` of each server's `counts` answer at the
+/// phase's end, which counts the waits its log's updates ended since the answer at its start: the
+/// largest of the servers', a quantile of each server's own log, as quantiles do not sum. A dash
+/// unless every server answered one over the waits that resolve `level` at 95%
+/// (`quantile::samples_for`, as the phase's latencies are dashed), or, for the longest (`None`),
+/// over one wait at least.
+fn log_wait(after: &[Counted], level: Option<Level>, f: fn(&Counted) -> Option<u64>) -> String {
+    let needed = match level {
+        Some(level) => coverage().and_then(|c| samples_for(level, c).ok()),
+        None => Some(1),
+    };
+    let resolved = |c: &Counted| match (c.waits, needed) {
+        (Some(waits), Some(needed)) => waits >= needed,
+        _ => false,
+    };
+    if after.is_empty() || !after.iter().all(resolved) {
+        return "-".to_owned();
+    }
+    after
+        .iter()
+        .map(f)
+        .try_fold(0, |most: u64, ns| Some(most.max(ns?)))
+        .map_or_else(|| "-".to_owned(), micros)
 }
 
 /// A latency quantile in microseconds, a dash below the samples that resolve it.
@@ -2825,15 +2894,7 @@ impl<'o> Bench<'o> {
         let counted = |f: fn(&Counted) -> Option<u64>| {
             summed(after.counts.iter().map(|c| f(c).map(|v| v as f64)))
         };
-        let grew = |f: fn(&Counted) -> Option<u64>| {
-            summed(
-                after
-                    .counts
-                    .iter()
-                    .zip(&before.counts)
-                    .map(|(a, b)| Some(f(a)?.saturating_sub(f(b)?) as f64)),
-            )
-        };
+        let grew = |f: fn(&Counted) -> Option<u64>| grown(&before.counts, &after.counts, f);
         let charged = |f: fn(&Usage) -> Option<u64>| {
             summed(
                 after
@@ -2869,7 +2930,7 @@ impl<'o> Bench<'o> {
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
-             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}",
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -2929,6 +2990,7 @@ impl<'o> Bench<'o> {
             t.differed,
             m.again,
             t.failed,
+            write_path(&before.counts, &after.counts, ops),
         )?;
         self.step_line(out, m)?;
         for kind in Failure::ALL {
@@ -3419,8 +3481,9 @@ fn runtime(conns: usize) -> Result<LocalRuntime, Error> {
     .map_err(|e| failed(format!("{e:?}")))
 }
 
-/// What a `mantle serve` process answers `counts` with ([`mantle_node::process::answer_counts`]):
-/// in a `count-allocs` build its allocator's counts across every thread since it was last asked,
+/// What a `mantle serve` process's `counts` answer begins with, the words after `counts`
+/// ([`mantle_node::process::answer_counts`]; the node says its write path's counts after them): in
+/// a `count-allocs` build its allocator's counts across every thread since it was last asked,
 /// counting afresh from there (a few events another thread makes between the read and the restart
 /// are counted in neither window); in any build, its faults and context switches since it began.
 pub fn counts_line() -> String {
@@ -3445,7 +3508,7 @@ pub fn counts_line() -> String {
     } else {
         "uncounted allocs - reallocs - moved - bytes - live - peak -".to_owned()
     };
-    format!("counts {counted} minor {minor} major {major} switches {switches}\n")
+    format!("{counted} minor {minor} major {major} switches {switches}")
 }
 
 /// Runs every phase of `options` against a cell of three made under its directory: whether every
@@ -4383,6 +4446,95 @@ mod tests {
         assert_eq!(size_arg("128K").unwrap(), 128 << 10);
         assert_eq!(Work::range(1), (0, 0));
         assert_eq!(Work::range(65_537), (21_845, 43_689));
+    }
+
+    /// A phase's write-path columns: each count the servers' growth over the phase, summed, as a
+    /// ratio to the hundredth (commands an entry, updates a frame, frames and flushes an
+    /// operation); each commit-wait quantile the slowest server's, in microseconds. A dash where a
+    /// server answered none (an endpoint's), where the phase grew no entry, frame or operation, or
+    /// where a server's waits are too few to resolve the quantile.
+    #[test]
+    fn a_phases_write_path_is_the_servers_growth_and_the_slowest_logs_waits() {
+        let at = |frames, updates, flushes, entries, commands| Counted {
+            frames: Some(frames),
+            updates: Some(updates),
+            flushes: Some(flushes),
+            entries: Some(entries),
+            commands: Some(commands),
+            ..Counted::default()
+        };
+        let waited = |mut c: Counted, waits, p50, p99, max| {
+            c.waits = Some(waits);
+            c.wait_p50_ns = p50;
+            c.wait_p99_ns = p99;
+            c.wait_max_ns = max;
+            c
+        };
+        let before = [
+            at(10, 20, 20, 5, 5),
+            at(100, 300, 200, 0, 0),
+            at(7, 7, 14, 3, 6),
+        ];
+        // Grown: frames 20 + 40 + 20, updates 50 + 80 + 50, flushes 40 + 80 + 40, entries 10 +
+        // 10 + 0 and commands 20 + 20 + 0, over 40 operations.
+        let after = [
+            waited(
+                at(30, 70, 60, 15, 25),
+                1_000,
+                Some(40_000),
+                Some(90_000),
+                Some(120_000),
+            ),
+            waited(
+                at(140, 380, 280, 10, 20),
+                1_000,
+                Some(50_000),
+                Some(70_000),
+                Some(400_000),
+            ),
+            waited(
+                at(27, 57, 54, 3, 6),
+                1_000,
+                Some(30_000),
+                Some(95_000),
+                Some(99_000),
+            ),
+        ];
+        assert_eq!(
+            write_path(&before, &after, 40),
+            " commands/entry 2.00 updates/frame 2.25 log_frames/op 2.00 log_flushes/op 4.00 \
+             log_wait_p50_us 50.0 log_wait_p99_us 95.0 log_wait_max_us 400.0"
+        );
+
+        // Ten waits on one server resolve its median, not its 99th percentile.
+        let mut few = after;
+        few[2].waits = Some(10);
+        assert_eq!(
+            write_path(&before, &few, 40),
+            " commands/entry 2.00 updates/frame 2.25 log_frames/op 2.00 log_flushes/op 4.00 \
+             log_wait_p50_us 50.0 log_wait_p99_us - log_wait_max_us 400.0"
+        );
+
+        // A phase of reads: no entry, frame, flush or wait grew on any server.
+        let idle = before.map(|c| waited(c, 0, None, None, None));
+        assert_eq!(
+            write_path(&before, &idle, 40),
+            " commands/entry - updates/frame - log_frames/op 0.00 log_flushes/op 0.00 \
+             log_wait_p50_us - log_wait_p99_us - log_wait_max_us -"
+        );
+        assert_eq!(
+            write_path(&before, &after, 0),
+            " commands/entry 2.00 updates/frame 2.25 log_frames/op - log_flushes/op - \
+             log_wait_p50_us 50.0 log_wait_p99_us 95.0 log_wait_max_us 400.0"
+        );
+
+        // An endpoint's servers, read by pid, answer no write path.
+        let pids = [Counted::default(); 3];
+        assert_eq!(
+            write_path(&pids, &pids, 40),
+            " commands/entry - updates/frame - log_frames/op - log_flushes/op - log_wait_p50_us - \
+             log_wait_p99_us - log_wait_max_us -"
+        );
     }
 
     /// A listing's keys are its set's, each after the one before it as S3 orders keys, byte by

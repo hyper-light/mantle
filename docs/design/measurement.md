@@ -311,6 +311,15 @@ stock clients stay the correctness suite.
   on TCP), datagrams on the native door, and latency at p50, p99, p99.9, p99.99 and max from each
   request's intended start; per connection, the memory slope at two connection counts (§10) and
   the handshake's counts (70 [2][4][5]).
+- **The write path**, in every build: each server answers `counts` with its log's frames, their
+  updates and its flushes (hyper-log's `LogStats`), and the entries it proposed as a range's leader
+  and their commands, since it began, and its log's commit-wait p50, p99 and longest since it was
+  last asked, read from the log's fixed histogram less its copy at the last answer, so nothing
+  grows with the operations. A phase says the cell's commands an entry, updates a frame, and
+  frames and log flushes an operation, every server's growth over the phase summed, and the
+  commit waits' quantiles of the slowest server's log, as quantiles do not sum: what group commit
+  shares among a phase's writes (Helland et al., Tandem TR 88.1, §2; research/71 step 9, which
+  counted them first in a diagnostic build).
 - **Instruments**: hyper-measure's counting allocator in `count-allocs` builds of `mantle serve`
   and the harness only, the harness's own work set aside, its peak said each phase beside the
   threads its process runs as the OS counts them, neither growing with clients or objects; each

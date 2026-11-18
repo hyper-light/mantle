@@ -63,7 +63,10 @@ pub struct Chunks {
 /// A node's process's own account as it answers `counts` (`mantle_node::process::answer_counts`):
 /// its allocator's counts since it was last asked, none where the build counts no allocations
 /// (only a `count-allocs` build does), and the page faults and context switches its process was
-/// charged since it began, none where the OS does not say them apart.
+/// charged since it began, none where the OS does not say them apart; then its write path's
+/// (`mantle_node::process::write_path_counts`): its log's frames, their updates and its flushes,
+/// and the entries it proposed and their commands, since it began, and its log's commit waits
+/// since it was last asked, their count and three quantiles in nanoseconds, none where none ended.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counted {
     pub allocations: Option<u64>,
@@ -75,6 +78,15 @@ pub struct Counted {
     pub minor: Option<u64>,
     pub major: Option<u64>,
     pub switches: Option<u64>,
+    pub frames: Option<u64>,
+    pub updates: Option<u64>,
+    pub flushes: Option<u64>,
+    pub entries: Option<u64>,
+    pub commands: Option<u64>,
+    pub waits: Option<u64>,
+    pub wait_p50_ns: Option<u64>,
+    pub wait_p99_ns: Option<u64>,
+    pub wait_max_ns: Option<u64>,
 }
 
 impl Counted {
@@ -95,6 +107,15 @@ impl Counted {
                 "minor" => counted.minor = unsigned(),
                 "major" => counted.major = unsigned(),
                 "switches" => counted.switches = unsigned(),
+                "frames" => counted.frames = unsigned(),
+                "updates" => counted.updates = unsigned(),
+                "flushes" => counted.flushes = unsigned(),
+                "entries" => counted.entries = unsigned(),
+                "commands" => counted.commands = unsigned(),
+                "waits" => counted.waits = unsigned(),
+                "wait_p50_ns" => counted.wait_p50_ns = unsigned(),
+                "wait_p99_ns" => counted.wait_p99_ns = unsigned(),
+                "wait_max_ns" => counted.wait_max_ns = unsigned(),
                 _ => {}
             }
         }
@@ -114,8 +135,9 @@ enum Said {
     Enlisted,
     /// Its chunks, asked.
     Chunks(Chunks),
-    /// Its process's counts, asked.
-    Counts(Counted),
+    /// Its process's counts, asked: boxed, the largest of what a node says by far, read twice a
+    /// phase.
+    Counts(Box<Counted>),
     /// A range's leader as the node knows it now, none while it knows of none.
     Status(u128, u64),
     /// The native clients it admits at once, as it derived them (`basis gateway.clients`).
@@ -132,7 +154,7 @@ fn said(line: &str) -> Option<Said> {
         ["s3", _listen, region, _ids] => Some(Said::Region((*region).to_owned())),
         ["enlisted"] => Some(Said::Enlisted),
         ["basis", "gateway.clients", "=", clients, ..] => clients.parse().ok().map(Said::Clients),
-        ["counts", _counting, rest @ ..] => Counted::parse(rest).map(Said::Counts),
+        ["counts", _counting, rest @ ..] => Counted::parse(rest).map(|c| Said::Counts(Box::new(c))),
         ["status", group, _term, leader, ..] => Some(Said::Status(
             u128::from_str_radix(group, 16).ok()?,
             leader.parse().ok()?,
@@ -557,7 +579,7 @@ impl Cell {
             Said::Enlisted => node.enlisted = true,
             Said::Clients(clients) => node.clients = Some(clients),
             Said::Chunks(chunks) => node.chunks = Some(chunks),
-            Said::Counts(counts) => node.counts = Some(counts),
+            Said::Counts(counts) => node.counts = Some(*counts),
             Said::Status(group, leader) => {
                 node.leaders.insert(group, leader);
             }
@@ -592,5 +614,45 @@ impl Drop for Cell {
         for at in 0..self.nodes.len() {
             let _ = self.kill(at);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `counts` answer is read whole: the binary's account, then the write path's counts the
+    /// node says after it, a quantile none ended said `-`.
+    #[test]
+    fn a_counts_answer_is_read_with_its_write_path() {
+        let line = "counts counted allocs 1 reallocs 2 moved 3 bytes 4 live 5 peak 6 minor 7 major - \
+                    switches 8 frames 9 updates 10 flushes 11 entries 12 commands 13 waits 14 \
+                    wait_p50_ns 15 wait_p99_ns 16 wait_max_ns 17";
+        let Some(Said::Counts(c)) = said(line) else {
+            panic!("a counts answer not read: {line}");
+        };
+        assert_eq!(
+            (c.allocations, c.peak, c.major, c.switches),
+            (Some(1), Some(6), None, Some(8))
+        );
+        assert_eq!(
+            (c.frames, c.updates, c.flushes, c.entries, c.commands),
+            (Some(9), Some(10), Some(11), Some(12), Some(13))
+        );
+        assert_eq!(
+            (c.waits, c.wait_p50_ns, c.wait_p99_ns, c.wait_max_ns),
+            (Some(14), Some(15), Some(16), Some(17))
+        );
+
+        let line = "counts uncounted frames 0 updates 0 flushes 0 entries 0 commands 0 waits 0 \
+                    wait_p50_ns - wait_p99_ns - wait_max_ns -";
+        let Some(Said::Counts(c)) = said(line) else {
+            panic!("a counts answer not read: {line}");
+        };
+        assert_eq!((c.allocations, c.frames, c.waits), (None, Some(0), Some(0)));
+        assert_eq!(
+            (c.wait_p50_ns, c.wait_p99_ns, c.wait_max_ns),
+            (None, None, None)
+        );
     }
 }

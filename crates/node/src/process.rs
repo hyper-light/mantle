@@ -88,8 +88,10 @@
 //! it put on its own volumes, of those its volumes hold and of those of the first two no volume
 //! kept; the fragments its volumes' indexes hold and the most they may; and the bytes of its
 //! volumes' free segments (`Node::chunk_bytes`); and `counts`, answered with the binary's account
-//! of its own process ([`answer_counts`]: `counts uncounted` where the binary gives none). A line
-//! it cannot read ends the process
+//! of its own process ([`answer_counts`]: `uncounted` where the binary gives none), then the
+//! write path's counts (`write_path_counts`): the log's frames, their updates and its flushes,
+//! the entries the node proposed and their commands, and its updates' commit waits since it was
+//! last asked. A line it cannot read ends the process
 //! with the line named. Standard input closing ends `mantle node`, its
 //! harness's child, at once, without the orderly stop's steps; `mantle serve` runs on, as under a
 //! service manager, whose input is empty.
@@ -120,6 +122,7 @@ use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::signal::Signal;
+use hyper_timing::Histogram;
 use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_ec::durability::{Burst, Rates};
@@ -1312,15 +1315,78 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     )
 }
 
-/// What a node answers `counts` on its standard input with: the binary's account of its own
-/// process (its allocator's counts, its faults and switches), which only the binary can give, the
-/// global allocator being the binary's choice (`mantle bench doors`). Set once, before the node runs.
+/// What a node's `counts` answer begins with: the binary's account of its own process (its
+/// allocator's counts, its faults and switches), which only the binary can give, the global
+/// allocator being the binary's choice (`mantle bench doors`). Set once, before the node runs.
 static COUNTS: OnceLock<fn() -> String> = OnceLock::new();
 
-/// Sets what `counts` answers ([`COUNTS`]), a line ended by a newline: false when it was set
-/// already. A node it was never set for answers `counts uncounted`.
+/// Sets the binary's account that `counts` answers first ([`COUNTS`]), the line's words after
+/// `counts`, the write path's counts said after them (`write_path_counts`): false when it was set
+/// already. A node it was never set for says `uncounted` in its place.
 pub fn answer_counts(with: fn() -> String) -> bool {
     COUNTS.set(with).is_ok()
+}
+
+/// The write path's counts, written after the binary's account in a `counts` answer, each a name
+/// and a value: the log's frames, the updates they carried and its flushes (hyper-log's
+/// `LogStats`), and the entries the node proposed as its ranges' leader and the commands they
+/// carried (`Node::proposed`), each since the node opened; then its updates' commit waits since
+/// the node was last asked, how many, and their median, 99th percentile and longest in
+/// nanoseconds, each the most its histogram's bucket holds (`-` where none ended). `asked` is the
+/// log's commit-wait histogram (`waited`) as it stood at the last answer, set to now's: a copy in
+/// the room it has, so an answer grows nothing.
+fn write_path_counts(
+    said: &mut String,
+    (frames, updates, flushes): (u64, u64, u64),
+    (entries, commands): (u64, u64),
+    waited: &Histogram,
+    asked: &mut Histogram,
+) -> std::fmt::Result {
+    let waits = waited.count().saturating_sub(asked.count());
+    write!(
+        said,
+        " frames {frames} updates {updates} flushes {flushes} entries {entries} commands {commands} \
+         waits {waits}"
+    )?;
+    let quantiles = [
+        ("wait_p50_ns", since(waited, asked, 500_000)),
+        ("wait_p99_ns", since(waited, asked, 990_000)),
+        ("wait_max_ns", since(waited, asked, 1_000_000)),
+    ];
+    for (name, ns) in quantiles {
+        match ns {
+            Some(ns) => write!(said, " {name} {ns}")?,
+            None => write!(said, " {name} -")?,
+        }
+    }
+    asked.clone_from(waited);
+    Ok(())
+}
+
+/// The `q_ppm` quantile of the values `now` counted since it stood as `then`, bucket by bucket, as
+/// `Histogram::quantile` reads one histogram (by the nearest rank, the most the bucket holding it
+/// holds): `None` when nothing was counted since. `then` is an earlier state of the one histogram,
+/// so no bucket of it is above `now`'s.
+fn since(now: &Histogram, then: &Histogram, q_ppm: u32) -> Option<u64> {
+    let count = now.count().checked_sub(then.count()).filter(|n| *n > 0)?;
+    let rank = u128::from(count)
+        .saturating_mul(u128::from(q_ppm))
+        .div_ceil(1_000_000)
+        .clamp(1, u128::from(count));
+    let mut seen = 0u128;
+    let buckets = now.buckets().iter().zip(then.buckets().iter());
+    for (bucket, (held, was)) in buckets.enumerate() {
+        seen = seen.saturating_add(u128::from(held.saturating_sub(*was)));
+        if seen >= rank {
+            let (_, past) = Histogram::bounds(bucket);
+            return Some(if bucket == Histogram::BUCKETS.saturating_sub(1) {
+                past
+            } else {
+                past.saturating_sub(1)
+            });
+        }
+    }
+    None
 }
 
 /// Runs the node whose operator's statements the file at `config` holds (`mantle serve`, node.md
@@ -2157,8 +2223,11 @@ async fn serve(
     let mut pending = Vec::new();
     // Each range's status as last said, a range a slot in the configuration's order.
     let mut told: Vec<Option<Status>> = vec![None; config.ranges.len()];
-    // The log's measures, filled again at each status said (hyper-log's `Log::stats`).
+    // The log's measures, filled again at each status said and each `counts` answered (hyper-log's
+    // `Log::stats`), and its commit-wait histogram as the last `counts` answer read it: one of
+    // fixed room, copied over at each answer (`write_path_counts`).
     let mut stats: Option<Box<LogStats>> = None;
+    let mut asked = Box::new(Histogram::new());
     // Each peer's link as last said, a peer a slot.
     let mut links: Vec<Link> = Vec::with_capacity(config.peers.len());
     // The bytes its transfers moved as last said, and when, none before the first: the first
@@ -2251,9 +2320,21 @@ async fn serve(
                         );
                         say(&mut output, &line).await?;
                     } else if line.trim_ascii() == b"counts" {
-                        let line = COUNTS
+                        let log = node.log_stats(stats.take())?;
+                        let own = COUNTS
                             .get()
-                            .map_or_else(|| "counts uncounted\n".to_owned(), |counts| counts());
+                            .map_or_else(|| "uncounted".to_owned(), |counts| counts());
+                        let mut line = format!("counts {own}");
+                        write_path_counts(
+                            &mut line,
+                            (log.frames, log.updates, log.flushes),
+                            node.proposed(),
+                            &log.commit_wait,
+                            &mut asked,
+                        )
+                        .map_err(wrote)?;
+                        line.push('\n');
+                        stats = Some(log);
                         say(&mut output, &line).await?;
                     } else if line.trim_ascii() == b"leave" {
                         departure.ask(&mut node, config.enlist.as_ref(), enlisted)?;
@@ -3017,6 +3098,69 @@ async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `counts` answer's write path says the log's and the proposals' counts as given, then the
+    /// commit waits that ended since the last answer alone: their count, and the quantiles a
+    /// histogram holding only them gives, where the log's histogram from its opening, a slow wait
+    /// in every three, gives another; an answer with none since says dashes. Each answer sets where
+    /// the next counts from, in the one histogram's room.
+    #[test]
+    fn a_counts_answer_says_the_commit_waits_since_the_last_answer() {
+        let mut waited = Histogram::new();
+        let mut first = Histogram::new();
+        for _ in 0..50 {
+            waited.record(5_000_000);
+            first.record(5_000_000);
+        }
+        let mut asked = Box::new(Histogram::new());
+        let quantiles =
+            |h: &Histogram| [500_000, 990_000, 1_000_000].map(|ppm| h.quantile(ppm).unwrap());
+        let mut said = String::new();
+        write_path_counts(&mut said, (3, 9, 6), (2, 5), &waited, &mut asked).unwrap();
+        let [p50, p99, max] = quantiles(&first);
+        assert_eq!(
+            said,
+            format!(
+                " frames 3 updates 9 flushes 6 entries 2 commands 5 waits 50 wait_p50_ns {p50} \
+                 wait_p99_ns {p99} wait_max_ns {max}"
+            )
+        );
+        assert_eq!(
+            p50, 5_242_879,
+            "the most 5 ms's bucket holds, an eighth of a doubling"
+        );
+
+        let mut second = Histogram::new();
+        for us in 1..=100u64 {
+            waited.record(us * 1_000);
+            second.record(us * 1_000);
+        }
+        let mut said = String::new();
+        write_path_counts(&mut said, (4, 12, 8), (3, 9), &waited, &mut asked).unwrap();
+        let [p50, p99, max] = quantiles(&second);
+        assert_eq!(
+            said,
+            format!(
+                " frames 4 updates 12 flushes 8 entries 3 commands 9 waits 100 wait_p50_ns {p50} \
+                 wait_p99_ns {p99} wait_max_ns {max}"
+            )
+        );
+        assert_eq!((p50, p99), (53_247, 106_495));
+        assert_ne!(
+            quantiles(&waited),
+            quantiles(&second),
+            "the opening's waits are not this answer's"
+        );
+
+        let mut said = String::new();
+        write_path_counts(&mut said, (4, 12, 8), (3, 9), &waited, &mut asked).unwrap();
+        assert_eq!(
+            said,
+            " frames 4 updates 12 flushes 8 entries 3 commands 9 waits 0 wait_p50_ns - wait_p99_ns - \
+             wait_max_ns -"
+        );
+        assert_eq!(*asked, waited);
+    }
 
     /// A `repair` line says each count in its place, the domains its last pass found taking chunks
     /// among them: the fact a test of a joining node waits on, which the root range's commit the

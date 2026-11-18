@@ -387,27 +387,20 @@ impl Drop for Runtime {
 }
 
 /// A shard's worker body: builds the shard on this thread (pinned first, so its tables are first touched
-/// on the shard's own core), acknowledges the build — or its refusal — on `ready`, then runs the loop.
-/// The acknowledgement's sender is dropped with it, so a worker that ends before acknowledging is seen as
-/// gone rather than awaited.
+/// on the shard's own core), says on `answer` that it runs (`crate::startup`), then runs the loop. A refused
+/// build returns its refusal, and `answer`, dropped unsaid, tells the starter the worker went, so a worker
+/// that ends before it runs is seen as gone rather than awaited.
 fn run_worker(
     seed: ShardSeed,
     core: Option<u32>,
-    ready: std::sync::mpsc::SyncSender<(u16, Result<(), RtError>)>,
+    answer: crate::startup::Answer,
 ) -> Result<Counters, RtError> {
     let id = seed.id;
     let pinned = core.map(|core| (core, crate::machine::probes::pin_current_thread(core)));
-    let mut shard = match Shard::build(seed) {
-        Ok(shard) => shard,
-        Err(error) => {
-            let _ = ready.send((id, Err(error.clone())));
-            return Err(error);
-        }
-    };
+    let mut shard = Shard::build(seed)?;
     // The shard's CPU clock, for observers that count their budget in its own time.
     registry::record_cpu_clock(id);
-    let _ = ready.send((id, Ok(())));
-    drop(ready);
+    answer.ran();
     if let Some((core, Pinning::Refused)) = pinned {
         shard.note_pin_refused();
         log_pin_refused(id, core);
@@ -522,10 +515,10 @@ impl Runtime {
             .ok_or(RtError::BadConfig {
                 what: "native retirement task capacity overflow",
             })?;
+        let answers = crate::startup::Answers::new()?;
         let mut notes = Vec::new();
         let seeds = register_seeds(config, prepare, &mut notes)?;
         let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
-        let (ready, acknowledged) = std::sync::mpsc::sync_channel(seeds.len().max(1));
         let mut workers = Vec::with_capacity(seeds.len());
         let mut seeds = seeds.into_iter().enumerate();
         while let Some((index, seed)) = seeds.next() {
@@ -536,14 +529,14 @@ impl Runtime {
             };
             let id = seed.id;
             let holder = seed.holder;
-            let ready = ready.clone();
+            let answer = answers.answer();
             #[allow(
                 clippy::disallowed_methods,
                 reason = "the runtime owns one thread per shard (docs/runtime.md §3)"
             )]
             let spawned = std::thread::Builder::new()
                 .name(format!("hyper-rt-shard-{id}"))
-                .spawn(move || run_worker(seed, core, ready));
+                .spawn(move || run_worker(seed, core, answer));
             match spawned {
                 Ok(thread) => workers.push(Worker { id, holder, thread }),
                 Err(error) => {
@@ -559,11 +552,10 @@ impl Runtime {
                 }
             }
         }
-        drop(ready);
-        if let Err(error) = await_readiness(&acknowledged, &workers) {
-            roll_back(workers, &error);
-            return Err(error);
+        if answers.wait(workers.len()).is_err() {
+            return Err(refused(workers));
         }
+        drop(answers);
         let holders: Vec<registry::SlotHolder> =
             workers.iter().map(|worker| worker.holder).collect();
         let watchdog = match crate::watch::Watchdog::start(&holders, config) {
@@ -745,26 +737,15 @@ fn roll_back(workers: Vec<Worker>, refusal: &RtError) {
     }
 }
 
-/// Waits for every worker to acknowledge its build: the first refusal, or `WorkerFailed` for a worker that
-/// ended without acknowledging (its sender dropped with it), so no failed shard is ever advertised.
-fn await_readiness(
-    acknowledged: &std::sync::mpsc::Receiver<(u16, Result<(), RtError>)>,
-    workers: &[Worker],
-) -> Result<(), RtError> {
-    for _ in workers {
-        match acknowledged.recv() {
-            Ok((_, Ok(()))) => {}
-            Ok((_, Err(error))) => return Err(error),
-            Err(_) => {
-                let silent = workers
-                    .iter()
-                    .find(|worker| worker.thread.is_finished())
-                    .map_or(u16::MAX, |worker| worker.id);
-                return Err(RtError::WorkerFailed { shard: silent });
-            }
-        }
+/// Stops and joins the workers of a start one of which went without running, giving every slot back, and
+/// returns why it went: the first worker's failure, which is the refusal its build returned, or
+/// `WorkerFailed` for a worker that ended without building. So no failed shard is ever advertised.
+fn refused(workers: Vec<Worker>) -> RtError {
+    match stop(workers) {
+        Err(error) => error,
+        // A worker that went without running returned its refusal or unwound, so its join fails: never seen.
+        Ok(_) => RtError::WorkerFailed { shard: u16::MAX },
     }
-    Ok(())
 }
 
 /// One shard on the calling thread with the OS driver (tests, benchmarks, a command's own work).

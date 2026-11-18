@@ -87,10 +87,19 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `20aa3a6` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twenty-seven commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+**Every crate at `4c033bb` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twenty-eight commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
 branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
-commit, `20aa3a6`, changes hyper-transport and hyper-quic (hyper-raft docs/transport.md, hyper-quic
+commit, `4c033bb`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.17, hyper-rt ORIGIN.md): a
+thread `Runtime::start` starts, a shard's worker or the watchdog, says it runs through a cell of
+hyper-rt's process-wide table (`startup.rs`) in place of a `std::sync::mpsc::sync_channel`, which
+whichever end dropped last freed: a started thread dropped its end after its send had woken the
+starter, so a starter that ran first returned with the channel still allocated, and
+`crates/node/tests/shard_memory.rs`, counting the bytes live as `start` returns, failed on CI's
+one-CPU Linux leg (744 bytes over) and in 1–4% of serial runs on macOS. The cell allocates nothing,
+so nothing of the hand-off is left to free whichever end lets go last; a refused build is the
+worker's own return, which the rollback's join reads. The one before it, `20aa3a6`, changes
+hyper-transport and hyper-quic (hyper-raft docs/transport.md, hyper-quic
 VENDORED.md §53), for slice 1 of membership.md §5.1: a directory's refusal of an identity closes
 with the TLS alert `access_denied` (RFC 8446 §6.2) as a QUIC transport close's CRYPTO_ERROR (RFC
 9001 §4.8), which a peer reads in Handshake packets, where an application's close code is replaced

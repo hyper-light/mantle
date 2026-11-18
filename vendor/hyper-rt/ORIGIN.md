@@ -225,3 +225,13 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   statics in place of `Arc`), a pool beside a runtime taking its numbers, `run_here`, and
   `tests/compute_beside.rs`, new: a saturated pool sized from the machine's grant beside a shard whose loop
   keeps turning, each job ending on a thread below it.
+
+## Made here: start-up hand-offs that allocate nothing (2026-11-18)
+
+- A started thread (a shard's worker, the watchdog) says it runs through a cell of the process-wide table
+  (`src/startup.rs`: `Answers`, `Answer`, `Went`; docs/runtime.md §3.17), in place of a
+  `std::sync::mpsc::sync_channel` that whichever end dropped last freed, which a starter woken first could
+  return before. A refused build is the worker's own return, which the rollback's join reads.
+- Tests: `startup.rs`'s unit cases (every thread ran; an answer dropped unsaid; the cell given back by the
+  last end) and `tests/start_memory.rs`, new: 2,000 starts on one pinned thread each leave the same bytes
+  live.

@@ -522,7 +522,9 @@ fn off_cpu(holder: SlotHolder) -> Whose {
 ///
 /// It allocates nothing once started: what it keeps is made on the starting thread and moved to it, it waits by
 /// parking and reads the stop by a receive that never blocks, and `start` returns only once the thread runs, so
-/// the thread's own start is counted against the runtime's start, never against work measured after it.
+/// the thread's own start is counted against the runtime's start, never against work measured after it. The
+/// thread says it runs through a hand-off that allocates nothing (`crate::startup`), so nothing of the start is
+/// left for it to free after `start` returns.
 #[derive(Debug)]
 pub(crate) struct Watchdog {
     /// Dropped to stop the thread, which is unparked to see it.
@@ -539,7 +541,8 @@ impl Watchdog {
         let limits = Limits::of(config);
         let shards: Vec<Watched> = holders.iter().map(|&holder| Watched::new(holder)).collect();
         let (stop, stopped) = sync_channel(1);
-        let (running, started) = sync_channel(1);
+        let answers = crate::startup::Answers::new()?;
+        let answer = answers.answer();
         #[allow(
             clippy::disallowed_methods,
             reason = "a runtime's watchdog is one thread outside its shards that the runtime starts and joins (crate::watch)"
@@ -548,9 +551,7 @@ impl Watchdog {
             .name("hyper-rt-watchdog".into())
             .spawn(move || {
                 let counted = Counted::new();
-                let _ = running.send(());
-                // Let go now, while the starting thread still holds its end: the channel is freed there.
-                drop(running);
+                answer.ran();
                 watch(shards, limits, &stopped);
                 drop(counted);
             })
@@ -562,7 +563,7 @@ impl Watchdog {
             stop: Some(stop),
             thread: Some(thread),
         };
-        if started.recv().is_err() {
+        if answers.wait(1).is_err() {
             watchdog.stop();
             return Err(RtError::DriverRefused {
                 call: "thread spawn",

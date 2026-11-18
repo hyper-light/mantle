@@ -84,6 +84,7 @@ pub mod signal;
 mod signal_protocol;
 pub mod sim;
 pub mod slow;
+mod startup;
 pub mod stdio;
 pub mod sync;
 pub mod task;

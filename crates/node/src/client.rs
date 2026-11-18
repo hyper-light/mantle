@@ -30,6 +30,23 @@
 //! Raft dissertation §6.3: a registration asked twice registers twice): its exchange is never cut
 //! by a period, only by its connection's loss, as a live node answers every command, applied or,
 //! once it no longer leads, with the leader it knows.
+//!
+//! **Each kind of work measured apart.** Once a node holds a request whole it is given a period to
+//! answer it (hyper-transport's progress), so a period must outlast the node's work for it, and that
+//! work differs by kind ([`Work`]): a range leader's quorum round for a command or a read, the
+//! node's job for an object, a volume's verified read or durable write for a chunk. One kind's reply
+//! measures nothing of another's work: a chunk put given the pace of a command answered before it
+//! was cut while its node said it worked on it (`tests/client_patience.rs`), and a command given a
+//! transfer's would wait on a leader that died as long as a chunk takes to move. So each kind keeps
+//! its slowest reply and each node its periods cut, by kind. A transfer's size is no part of it: a period is judged on what it
+//! moved, and an exchange whose bytes move a datagram a period is not cut however long it runs
+//! (`hyper_transport::progress`). An object's or a chunk's exchange is given at least the node's
+//! serve period, the least any asker of a node gives an exchange, which the node's notes of its
+//! work come three times within (hyper-transport's `Endpoint::working`, research/77 D1): a node
+//! at work on it is never cut, however quick the replies measured before. And it is given at most
+//! the stock S3 clients' patience (`bounds::STOCK_PATIENCE`), as a node waits on such work asked
+//! with no deadline at the most (node.md §5.4, research/77 D2): one asked with no deadline of a
+//! node that says nothing is given up, not waited on without end, before any reply is measured.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -133,12 +150,54 @@ struct Known {
     /// The epoch of the newest connection to it that came up: the transport counts each peer's
     /// connections, so one dialed since has a newer epoch.
     epoch: Epoch,
-    /// Exchanges with it in a row cut by their period with no reply from it since: each doubles
-    /// the next one's period (RFC 6298 §5.5), and its reply, a new measurement of it, sets it back
-    /// (§5).
-    stalled: u32,
+    /// Exchanges of each kind of work with it in a row cut by their period with no reply of that
+    /// kind from it since: each doubles the next one's period (RFC 6298 §5.5), and its reply, a new
+    /// measurement of it, sets it back (§5).
+    stalled: ByWork<u32>,
     /// Why its last connection or dial ended, where it said.
     refused: Option<Refusal>,
+}
+
+/// The work a node does for an exchange once it holds the request, which the exchange's period
+/// must outlast: each kind measured apart (the module's rules).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Work {
+    /// A command or a read: the range leader's quorum round.
+    Request,
+    /// An object's request: the node's job for it (gateway.md §2).
+    Object,
+    /// A chunk's put or get: its volume's durable write or verified read (node.md §5.2).
+    Chunk,
+}
+
+impl Work {
+    const ALL: [Self; 3] = [Self::Request, Self::Object, Self::Chunk];
+}
+
+/// What the client keeps of each kind of work.
+#[derive(Clone, Copy, Debug, Default)]
+struct ByWork<T> {
+    request: T,
+    object: T,
+    chunk: T,
+}
+
+impl<T> ByWork<T> {
+    fn of(&self, work: Work) -> &T {
+        match work {
+            Work::Request => &self.request,
+            Work::Object => &self.object,
+            Work::Chunk => &self.chunk,
+        }
+    }
+
+    fn of_mut(&mut self, work: Work) -> &mut T {
+        match work {
+            Work::Request => &mut self.request,
+            Work::Object => &mut self.object,
+            Work::Chunk => &mut self.chunk,
+        }
+    }
 }
 
 /// RFC 9002 §7.6.1's `kPersistentCongestionThreshold`: probe timeouts with no acknowledgement
@@ -156,8 +215,9 @@ pub struct Client {
     nodes: Vec<Known>,
     /// The leader each range was last found at, for the ranges this client asked.
     leaders: BTreeMap<u128, PeerId>,
-    /// The slowest exchange measured, from its opening to its reply, nanoseconds.
-    slowest_ns: Option<u64>,
+    /// The slowest exchange of each kind of work measured, from its opening to its reply,
+    /// nanoseconds.
+    slowest_ns: ByWork<Option<u64>>,
     /// Waits paused for so far: the draw each pause's jitter takes (`bounds::pause`).
     waits: u32,
     asks: Asks,
@@ -210,7 +270,7 @@ impl Client {
                 quic: None,
                 connected: false,
                 epoch: 0,
-                stalled: 0,
+                stalled: ByWork::default(),
                 refused: None,
             })
             .collect();
@@ -230,7 +290,7 @@ impl Client {
             driver,
             nodes,
             leaders: BTreeMap::new(),
-            slowest_ns: None,
+            slowest_ns: ByWork::default(),
             waits: 0,
             asks: Asks::default(),
             body: Vec::new(),
@@ -331,7 +391,7 @@ impl Client {
                 None => self.next_node(None).ok_or(ClientError::NoNodes)?,
             };
             tried = tried.saturating_add(1);
-            if !self.reach(node, deadline_ns).await? {
+            if !self.reach(node, Work::Request, deadline_ns).await? {
                 target = self.next_node(Some(node));
                 continue;
             }
@@ -392,11 +452,16 @@ impl Client {
     }
 
     /// Dials `node` if it has no connection and waits for it, as long as the client gives an
-    /// exchange with it (the module's law): whether it was reached. A dial that takes longer leaves
-    /// the node unreached this round and goes on, and a later round finds it up: a dial to a node
-    /// that is gone ends only at its handshake's idle timeout, which a request asked of the nodes
-    /// that answer never waits out.
-    async fn reach(&mut self, node: PeerId, deadline_ns: u64) -> Result<bool, ClientError> {
+    /// exchange of `work` with it (the module's law): whether it was reached. A dial that takes
+    /// longer leaves the node unreached this round and goes on, and a later round finds it up: a
+    /// dial to a node that is gone ends only at its handshake's idle timeout, which a request asked
+    /// of the nodes that answer never waits out.
+    async fn reach(
+        &mut self,
+        node: PeerId,
+        work: Work,
+        deadline_ns: u64,
+    ) -> Result<bool, ClientError> {
         self.forget_quiet()?;
         let Some(known) = self.nodes.iter().find(|n| n.id == node) else {
             return Ok(false);
@@ -415,7 +480,7 @@ impl Client {
             return Ok(false);
         }
         let now_ns = hyper_rt::futures::now_ns();
-        let until_ns = now_ns.saturating_add(self.period_ns(node, deadline_ns, now_ns));
+        let until_ns = now_ns.saturating_add(self.period_ns(node, work, deadline_ns, now_ns));
         loop {
             match self.next_event(until_ns).await? {
                 Some(Event::Connected { peer, .. }) if peer == node => return Ok(true),
@@ -441,7 +506,7 @@ impl Client {
         let clock = self.driver.clock()?;
         let opened_ns = hyper_rt::futures::now_ns();
         let period_ns = if guarded {
-            self.period_ns(node, deadline_ns, opened_ns)
+            self.period_ns(node, Work::Request, deadline_ns, opened_ns)
         } else {
             deadline_ns.saturating_sub(opened_ns).max(1)
         };
@@ -476,11 +541,7 @@ impl Client {
                     self.write(exchange, &mut written)?;
                 }
                 Event::Reply { exchange: e, .. } if e == exchange => {
-                    let took = hyper_rt::futures::now_ns().saturating_sub(opened_ns);
-                    self.slowest_ns = Some(self.slowest_ns.map_or(took, |s| s.max(took)));
-                    if let Some(known) = self.nodes.iter_mut().find(|n| n.id == node) {
-                        known.stalled = 0;
-                    }
+                    self.replied(node, Work::Request, opened_ns);
                     let Some(head) = self.driver.endpoint().head(exchange) else {
                         // Ended by the transport after the reply came, its connection lost or
                         // its stream stopped: the refusal queued behind the reply ends it.
@@ -510,11 +571,7 @@ impl Client {
                     refusal,
                     ..
                 } if e == exchange => {
-                    if refusal == Refusal::Stalled
-                        && let Some(known) = self.nodes.iter_mut().find(|n| n.id == node)
-                    {
-                        known.stalled = known.stalled.saturating_add(1);
-                    }
+                    self.cut(node, Work::Request, refusal);
                     return Ok(Asked::Lost);
                 }
                 Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
@@ -557,29 +614,70 @@ impl Client {
     }
 
     /// The longest the client may wait now without asking a node anything, by the module's law,
-    /// for a caller with no deadline of its own: an exchange with any node it knows, or a dial,
-    /// given its period before the node is taken as lost, and a pause between rounds, at most the
-    /// idle timeout (`bounds::backed_off`). None until an exchange is measured, before which an
-    /// exchange is given all the time its caller left.
+    /// for a caller with no deadline of its own: an exchange of any kind of work it measured with
+    /// any node it knows, or a dial, given its period before the node is taken as lost, and a pause
+    /// between rounds, at most the idle timeout (`bounds::backed_off`). None until an exchange is
+    /// measured, before which an exchange is given all the time its caller left, an object's or a
+    /// chunk's at most the stock patience.
     pub fn patience(&mut self) -> Option<Duration> {
-        self.slowest_ns?;
         let now = hyper_rt::futures::now_ns();
-        let mut most = 0u64;
-        for at in 0..self.nodes.len() {
-            if let Some(id) = self.nodes.get(at).map(|n| n.id) {
-                most = most.max(self.period_ns(id, u64::MAX, now));
+        let mut most: Option<u64> = None;
+        for work in Work::ALL {
+            if self.slowest_ns.of(work).is_none() {
+                continue;
+            }
+            for at in 0..self.nodes.len() {
+                if let Some(id) = self.nodes.get(at).map(|n| n.id) {
+                    let period = self.period_ns(id, work, u64::MAX, now);
+                    most = Some(most.map_or(period, |m| m.max(period)));
+                }
             }
         }
-        Some(Duration::from_nanos(most).max(bounds::idle_timeout()))
+        most.map(|most| Duration::from_nanos(most).max(bounds::idle_timeout()))
     }
 
-    /// The progress period an exchange with `node` is given (the module's law): the time left
-    /// before `deadline_ns` while nothing is measured, else the slowest exchange measured or the
-    /// path's persistent-congestion duration, whichever is longer, doubled for each exchange with
-    /// the node cut by its period since its last reply, within that time.
-    fn period_ns(&mut self, node: PeerId, deadline_ns: u64, now_ns: u64) -> u64 {
-        let left = deadline_ns.saturating_sub(now_ns).max(1);
-        let Some(slowest) = self.slowest_ns else {
+    /// An exchange of `work` with `node`, opened at `opened_ns`, was replied to: its time is the
+    /// work's measure, and the node's reply, a new measurement of it, sets its backed-off period
+    /// back (RFC 6298 §5).
+    fn replied(&mut self, node: PeerId, work: Work, opened_ns: u64) {
+        let took = hyper_rt::futures::now_ns().saturating_sub(opened_ns);
+        let slowest = self.slowest_ns.of_mut(work);
+        *slowest = Some(slowest.map_or(took, |s| s.max(took)));
+        if let Some(known) = self.nodes.iter_mut().find(|n| n.id == node) {
+            *known.stalled.of_mut(work) = 0;
+        }
+    }
+
+    /// An exchange of `work` with `node` ended unanswered with `refusal`: one cut by its period is
+    /// no measure, and doubles the next one's period (RFC 6298 §5.5).
+    fn cut(&mut self, node: PeerId, work: Work, refusal: Refusal) {
+        if refusal == Refusal::Stalled
+            && let Some(known) = self.nodes.iter_mut().find(|n| n.id == node)
+        {
+            let stalled = known.stalled.of_mut(work);
+            *stalled = stalled.saturating_add(1);
+        }
+    }
+
+    /// The progress period an exchange of `work` with `node` is given (the module's law): the time
+    /// left before `deadline_ns` while that work is not measured, else the slowest exchange of it
+    /// measured or the path's persistent-congestion duration, whichever is longer, doubled for each
+    /// exchange of it with the node cut by its period since its last reply, within that time. An
+    /// object's or a chunk's is at least the node's serve period and at most the stock patience.
+    fn period_ns(&mut self, node: PeerId, work: Work, deadline_ns: u64, now_ns: u64) -> u64 {
+        let mut left = deadline_ns.saturating_sub(now_ns).max(1);
+        // The serve period: the least any asker of a node gives an exchange, which the node's
+        // notes of its work for one, a beat apart, come three times within (hyper-transport's
+        // `Endpoint::working`). The node's notes vouch for its jobs and its volumes' held chunks;
+        // a range's commands and reads it answers unvouched.
+        let served = match work {
+            Work::Request => 0,
+            Work::Object | Work::Chunk => {
+                left = left.min(nanos(bounds::STOCK_PATIENCE));
+                nanos(bounds::idle_timeout())
+            }
+        };
+        let Some(slowest) = *self.slowest_ns.of(work) else {
             return left;
         };
         // hyper-quic's probe timeout adds the delay its ACK frequency asks for, which may be
@@ -596,9 +694,13 @@ impl Client {
             .nodes
             .iter()
             .find(|n| n.id == node)
-            .map_or(0, |n| n.stalled);
+            .map_or(0, |n| *n.stalled.of(work));
         let doubling = 1u64.checked_shl(stalled).unwrap_or(u64::MAX);
-        slowest.max(congested).saturating_mul(doubling).min(left)
+        slowest
+            .max(congested)
+            .max(served)
+            .saturating_mul(doubling)
+            .min(left)
     }
 
     /// Writes what the exchange takes of the command's body.
@@ -719,7 +821,7 @@ impl Client {
                 .map(Duration::from_nanos),
         )
         .map_err(|e| ClientError::Bounds(e.to_string()))?;
-        if !self.reach(node, deadline_ns).await? {
+        if !self.reach(node, Work::Object, deadline_ns).await? {
             let refused = self
                 .nodes
                 .iter()
@@ -730,11 +832,12 @@ impl Client {
             ));
         }
         let clock = self.driver.clock()?;
-        let now_ns = hyper_rt::futures::now_ns();
+        let opened_ns = hyper_rt::futures::now_ns();
         let period = Progress::new(Duration::from_nanos(self.period_ns(
             node,
+            Work::Object,
             deadline_ns,
-            now_ns,
+            opened_ns,
         )))?;
         let exchange = match self.driver.endpoint().open(
             clock,
@@ -784,6 +887,7 @@ impl Client {
                     write(self.driver.endpoint(), &mut written)?;
                 }
                 Event::Reply { exchange: e, .. } if e == exchange => {
+                    self.replied(node, Work::Object, opened_ns);
                     let Some(head) = self.driver.endpoint().head(exchange) else {
                         // Ended by the transport after the reply came: the refusal queued behind
                         // the reply ends it.
@@ -827,7 +931,10 @@ impl Client {
                     exchange: e,
                     refusal,
                     ..
-                } if e == exchange => return Ok(ObjectOutcome::Lost(refusal)),
+                } if e == exchange => {
+                    self.cut(node, Work::Object, refusal);
+                    return Ok(ObjectOutcome::Lost(refusal));
+                }
                 Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
                     self.lost(peer);
                     if peer == node {
@@ -848,15 +955,16 @@ impl Client {
         (head, body, len): (&[u8], &[u8], Option<u64>),
         deadline_ns: u64,
     ) -> Result<Result<(chunk::Status, Vec<u8>), Refusal>, ClientError> {
-        if !self.reach(node, deadline_ns).await? {
+        if !self.reach(node, Work::Chunk, deadline_ns).await? {
             return Ok(Err(Refusal::NotConnected));
         }
         let clock = self.driver.clock()?;
-        let now_ns = hyper_rt::futures::now_ns();
+        let opened_ns = hyper_rt::futures::now_ns();
         let period = Progress::new(Duration::from_nanos(self.period_ns(
             node,
+            Work::Chunk,
             deadline_ns,
-            now_ns,
+            opened_ns,
         )))?;
         let exchange = match self
             .driver
@@ -884,6 +992,7 @@ impl Client {
                     write_body(self.driver.endpoint(), exchange, body, &mut written)?;
                 }
                 Event::Reply { exchange: e, .. } if e == exchange => {
+                    self.replied(node, Work::Chunk, opened_ns);
                     let Some(head) = self.driver.endpoint().head(exchange) else {
                         // Ended by the transport after the reply came: the refusal queued behind
                         // the reply ends it.
@@ -913,7 +1022,10 @@ impl Client {
                     exchange: e,
                     refusal,
                     ..
-                } if e == exchange => return Ok(Err(refusal)),
+                } if e == exchange => {
+                    self.cut(node, Work::Chunk, refusal);
+                    return Ok(Err(refusal));
+                }
                 Event::Closed { peer, .. } | Event::Unreachable { peer, .. } => {
                     self.lost(peer);
                     if peer == node {
@@ -1154,6 +1266,11 @@ fn write_body(
         }
     }
     Ok(())
+}
+
+/// `duration` in nanoseconds, the most a `u64` holds past that.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The time a request asked by `deadline_ns` on the shard's clock still waits, in nanoseconds, as

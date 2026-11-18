@@ -1446,7 +1446,22 @@ period, and each cut doubles the next period with that node until that node repl
 §5.5, collapsed only by a new measurement of the same path, §5). A registration, which would
 register again if asked again (the Raft dissertation §6.3), is cut by no period. On the Windows
 runners, registrations cut and asked again filled a range's 64 sessions (`SessionsFull`).
-`crates/node/tests/sim.rs` holds both laws.
+`crates/node/tests/sim.rs` holds both laws. The node's client (`mantle_node::client`) measures
+each kind of work apart, its slowest reply and each node's cuts kept by kind: a command or a read,
+the range leader's quorum round; an object's request, the node's job; a chunk's put or get, its
+volume's durable write or verified read. A node holding a request whole is given a period to
+answer it (hyper-transport's progress), so the period must outlast that work, and one kind's reply
+measures nothing of another's: measured as one, the requests' replies alone set the measure, so a
+client asking only objects or chunks never had one and gave an exchange asked with no deadline all
+of it (the repair suite's puts and chunk reads, asked with none), and one that had asked a request
+gave a chunk put a few round trips, cut while its node said each beat that it worked on it. A
+transfer's size is no part of it: a period that moved a datagram is not judged, however long the
+transfer runs. An object's or a chunk's exchange is given at least the node's serve period, the
+least any asker of a node gives an exchange, within which the node's notes of its jobs and held
+chunks come three times (`Endpoint::working`, research/77 D1), and at most the stock S3 clients'
+patience, the most a node waits on such work asked with no deadline (§5.4, research/77 D2), so
+one asked with no deadline of a node that says nothing is given up before any reply is measured
+(`crates/node/tests/client_patience.rs`).
 Still to build: the TCP fallback below, an ALPN of mantle's own in place of the transport's, chunk
 transfers (§5.2) and SWIM (§3.5).
 

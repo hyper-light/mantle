@@ -78,14 +78,29 @@ jobs:
   # std::thread::available_parallelism follows the affinity mask (sched_getaffinity(2)), so the
   # engine's worker pools and the test harness size themselves to that host
   # (scripts/linux-test.sh runs the same locally: CPUS, HOGS).
+  #
+  # On one CPU the suites outlast a GitHub job's six hours: run 44032796943 (c3b16c42) passed every
+  # binary it reached for 5 h 56 min, mantle's own taking 5 h 48 min of it, and was cut in
+  # mantle-engine's unit tests. So linux-aarch64-1cpu is three jobs, each on a runner of its own
+  # with the same one CPU, which together run every suite once:
+  #   membership: mantle's tests/membership.rs, 2 h 45 min to 4 h 06 min in runs 43876969116 to
+  #     44032796943;
+  #   mantle: the binary's unit tests and mantle's other tests/*.rs, 2 h 38 min in 44032796943;
+  #   crates: every other package's suites, then the vendored crates'.
+  # Each part picks its targets within --workspace: -p mantle alone resolves hyper-block without
+  # the `sim` feature the other crates' dev-dependencies unify in, and so would build and test
+  # other code than the whole run does (cargo --unit-graph: twelve units differ; within
+  # --workspace, none). The parts share the leg's cache: they build the same suites.
   constrained:
     strategy:
       fail-fast: false
       matrix:
         include:
           - { name: linux-x86_64-2cpu-busy, runner: ubuntu-24.04, cpus: "0-1", hogs: 2 }
-          - { name: linux-aarch64-1cpu, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
-    name: ${{ matrix.name }}
+          - { name: linux-aarch64-1cpu, part: membership, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
+          - { name: linux-aarch64-1cpu, part: mantle, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
+          - { name: linux-aarch64-1cpu, part: crates, runner: ubuntu-24.04-arm, cpus: "0", hogs: 0 }
+    name: ${{ matrix.part && format('{0} ({1})', matrix.name, matrix.part) || matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -108,10 +123,35 @@ jobs:
         shell: bash
         run: bash scripts/stock-clients.sh
       - name: Suites on ${{ matrix.cpus }}, beside ${{ matrix.hogs }} busy loops
+        shell: bash
         run: |
           for _ in $(seq ${{ matrix.hogs }}); do taskset -c ${{ matrix.cpus }} sh -c 'while :; do :; done' & done
-          taskset -c ${{ matrix.cpus }} cargo test --workspace --locked
-          taskset -c ${{ matrix.cpus }} cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+          case "${{ matrix.part }}" in
+            "")
+              taskset -c ${{ matrix.cpus }} cargo test --workspace --locked
+              taskset -c ${{ matrix.cpus }} cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+              ;;
+            membership)
+              taskset -c ${{ matrix.cpus }} cargo test --workspace --locked --test membership
+              ;;
+            mantle)
+              # mantle's tests/*.rs but membership's as cargo lists them, so one added there runs here;
+              # one flag a line, read into an array, so each reaches cargo whole.
+              mapfile -t suites < <(cargo metadata --no-deps --format-version 1 --locked | python3 -c "import json, sys; print('\n'.join(
+                '--test=' + t['name'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'mantle'
+                for t in p['targets'] if t['kind'] == ['test'] and t['name'] != 'membership'))")
+              if [ "${#suites[@]}" -eq 0 ]; then echo "mantle lists no tests/*.rs but membership's" >&2; exit 1; fi
+              taskset -c ${{ matrix.cpus }} cargo test --workspace --locked --bin mantle "${suites[@]}"
+              ;;
+            crates)
+              taskset -c ${{ matrix.cpus }} cargo test --workspace --locked --exclude mantle
+              taskset -c ${{ matrix.cpus }} cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+              ;;
+            *)
+              echo "no part named ${{ matrix.part }}" >&2
+              exit 1
+              ;;
+          esac
 
   # A cell on Kubernetes (plan step 11; docs/design/kubernetes.md): the chart's gates, helm lint and
   # its golden render, then scripts/kind-cell.sh: the image built, a kind cluster of three workers,

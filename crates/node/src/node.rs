@@ -52,7 +52,7 @@ use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::record::History;
 use mantle_meta::wire::{Answer, Command, Entry};
-use mantle_range::membership::{Next, Replacement};
+use mantle_range::membership::Replacement;
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
 use crate::ask::{
@@ -1530,6 +1530,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             peers.sort_unstable();
             peers.dedup();
             let seen = shard::Seen::of(&replica);
+            let configured = shard::Configured::of(&replica);
             lanes.send(shard::In::Adopt(kept.group, Box::new(replica)))?;
             self.far.push(shard::Far {
                 group: kept.group,
@@ -1538,6 +1539,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 election: None,
                 seen,
                 reports: Vec::new(),
+                configured,
+                // A replacement the node was told before the range moved goes with it.
+                replacing: kept.replacing.take().map(|replacement| (replacement, true)),
             });
         }
         self.shards.push(lanes);
@@ -1570,12 +1574,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The ends of the snapshots far ranges sent, each handed to its range's shard while its lane
     /// has room, and held for the next turn while it has none: a range that missed one would wait
-    /// in its snapshot state for that member for good (hyper-raft's `handle_snapshot_status`).
+    /// in its snapshot state for that member for good (hyper-raft's `handle_snapshot_status`). A
+    /// replacement the node was told of a far range is held the same way: dropped, it would never
+    /// progress.
     fn report_far(&mut self) -> Result<(), NodeError> {
         for far in &mut self.far {
             let Some(lanes) = self.shards.iter().find(|lanes| lanes.shard() == far.shard) else {
                 continue;
             };
+            if let Some((replacement, true)) = far.replacing {
+                match lanes.send(shard::In::Replace(far.group, replacement)) {
+                    Ok(()) => far.replacing = Some((replacement, false)),
+                    Err(NodeError::LaneFull(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
             while let Some(&(to, arrived)) = far.reports.first() {
                 match lanes.send(shard::In::Reported {
                     group: far.group,
@@ -1622,6 +1635,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             shard::Out::Pairs(group, peers) => self.pair_far(group, peers)?,
             shard::Out::Elected(group, election) => self.elect_far(group, election),
             shard::Out::Handing(group, to) => self.handing_far(group, to),
+            shard::Out::Configured(group, configured) => {
+                if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+                    far.configured = configured;
+                }
+            }
+            shard::Out::Replaced(group, replacement) => {
+                // The one told is done; a later one told since stays, for its shard to step.
+                if let Some(far) = self.far.iter_mut().find(|far| far.group == group)
+                    && far
+                        .replacing
+                        .is_some_and(|(told, unsent)| told == replacement && !unsent)
+                {
+                    far.replacing = None;
+                }
+                self.replaced.push((group, replacement));
+            }
             shard::Out::Stopped(error) => return Err(error),
         }
         Ok(())
@@ -1993,6 +2022,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .iter_mut()
             .find(|k| k.group == group)
             .ok_or(NodeError::Bounds(format!("no range of group {group:x}")))?;
+        // A far range's is held until its lane takes it (`Node::report_far`), and its shard steps
+        // it (node.md §2.9).
+        if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+            far.replacing = Some((replacement, true));
+            return Ok(());
+        }
         kept.replacing = Some(replacement);
         self.owner.schedule(kept.handle);
         Ok(())
@@ -2004,39 +2039,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         std::mem::take(&mut self.replaced)
     }
 
-    /// Proposes what each replacement names next, of the ranges this node leads: a change only
-    /// while none is pending, since the core takes one at a time (a change it drops, with a
-    /// leader stepping down, is proposed again by whichever node leads next).
+    /// Proposes what each replacement names next, of the ranges this node's task drives and
+    /// leads ([`shard::step_replacement`]); a far range's shard steps its own.
     fn step_replacements(&mut self) {
         for kept in &mut self.ranges {
             let Some(replacement) = kept.replacing else {
                 continue;
             };
-            let Some(shell) = self.owner.get_mut(kept.handle) else {
-                continue;
-            };
-            if !shell.is_leader() {
-                continue;
-            }
-            let next = replacement.next(
-                shell.configuration(),
-                shell.caught_up(replacement.joining()),
-                shell.configuration_known(),
-            );
-            match next {
-                Next::Propose(change) => {
-                    if !shell.core().raft.has_pending_conf() {
-                        // A change the core refuses (its leader stepping down, its log full) is
-                        // proposed again at a later turn.
-                        let _ = shell.change(Vec::new(), &change);
-                        self.owner.schedule(kept.handle);
-                    }
-                }
-                Next::Wait => {}
-                Next::Done => {
-                    kept.replacing = None;
-                    self.replaced.push((kept.group, replacement));
-                }
+            if shard::step_replacement(&mut self.owner, kept.handle, replacement) {
+                kept.replacing = None;
+                self.replaced.push((kept.group, replacement));
             }
         }
     }

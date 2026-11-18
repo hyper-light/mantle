@@ -5,13 +5,14 @@
 //! there in an owner of its own (`hyper_durable::Owner`), made with that task's waker, so a range's
 //! log answers wake the shard that drives it, and keeps that shard's deadlines. The two talk over
 //! two bounded lanes of hyper-rt's channel: into the shard, each replica moved there before its
-//! first drive, Raft messages, proposals, reads, and the stream's changes and measurements
-//! ([`In`]); out of it, Raft messages, applied answers, flushes, each range's peers, its expected
-//! election, what it shows after a drive that changed it ([`Seen`]) and its reads served ([`Out`]). The node's shard sends without waiting, a full lane refused, typed
-//! (`NodeError::LaneFull`); the shard waits for room on its way out, its replicas' next turn held
-//! until the node's shard takes what they gave. A shard whose task ended took its ranges with it,
-//! which nothing else holds, so the node stops (`NodeError::ShardEnded`) and its next start
-//! recovers them from the log (node.md §1.7).
+//! first drive, Raft messages, proposals, reads, the stream's changes and measurements, and the
+//! membership's targets and replacements ([`In`]); out of it, Raft messages, applied answers,
+//! flushes, each range's peers, its expected election, what it shows after a drive that changed it
+//! ([`Seen`], [`Configured`]), its reads served and its replacements done ([`Out`]). The node's
+//! shard sends without waiting, a full lane refused, typed (`NodeError::LaneFull`); the shard waits
+//! for room on its way out, its replicas' next turn held until the node's shard takes what they
+//! gave. A shard whose task ended took its ranges with it, which nothing else holds, so the node
+//! stops (`NodeError::ShardEnded`) and its next start recovers them from the log (node.md §1.7).
 
 use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
@@ -32,7 +33,8 @@ use mantle_meta::engine::Engine;
 use mantle_meta::wire::Entry;
 use mantle_protocol::bounds;
 use mantle_protocol::classes::{self, NodeClasses};
-use mantle_range::{Applied, LogStore, RangeMachine};
+use mantle_range::membership::{Next, Replacement, Step, Toward};
+use mantle_range::{Applied, ConfState, LogStore, RangeMachine};
 
 use super::NodeError;
 use super::answers::Answers;
@@ -76,6 +78,13 @@ pub(crate) enum In<E: Engine, S: LogStore> {
     /// The stop's hand-over of a range's lead ([`transfer`]), past the voter `failed` whose
     /// transfer its core gave up: the voter it goes to told back ([`Out::Handing`]).
     Transfer { group: u128, failed: Option<u64> },
+    /// The configuration the cell's members would give a range, worked out by the node's shard
+    /// from what the range last showed ([`Configured`]): stepped once ([`step_toward`]).
+    Toward(u128, Toward),
+    /// A member of a range lost for good, replaced (`Node::replace`): kept by the shard and stepped
+    /// at each of its turns while the range leads here ([`step_replacement`]), until it is done
+    /// ([`Out::Replaced`]). A later one supersedes it.
+    Replace(u128, Replacement),
     /// Each range's engine as it stands, handed back through the sender, and the task ends: the
     /// node closes (`Node::close`).
     Release(OneshotSender<Vec<(u128, E)>>),
@@ -104,6 +113,10 @@ pub(crate) enum Out {
     /// The voter a range's hand-over ([`In::Transfer`]) goes to; `None` where it began none: the
     /// range leads not here, or its core refused.
     Handing(u128, Option<u64>),
+    /// A range's configuration and its learners' progress after a drive that changed them.
+    Configured(u128, Configured),
+    /// A replacement ([`In::Replace`]) that ended while the range led here.
+    Replaced(u128, Replacement),
     /// Why the shard stopped: its task ends after it.
     Stopped(NodeError),
 }
@@ -222,6 +235,132 @@ pub(crate) struct Far {
     pub(crate) election: Option<Duration>,
     pub(crate) seen: Seen,
     pub(crate) reports: Vec<(u64, bool)>,
+    /// Its configuration and learners' progress as it last showed them.
+    pub(crate) configured: Configured,
+    /// The replacement the node was told of it ([`In::Replace`]) until its shard reports it done,
+    /// and whether its lane has yet to take it: one, a later superseding it.
+    pub(crate) replacing: Option<(Replacement, bool)>,
+}
+
+/// What a range's member applied of its configuration, whether a change of it is pending, and,
+/// while it leads, each learner's progress: what the membership's steps read of a range
+/// (`Node::configuration`, `members.rs`). Read from the replica where the node's own task drives
+/// it; where another shard does, as that shard reported it after the range's latest drive that
+/// changed it ([`Out::Configured`]), as [`Seen`] is. Only the learners' progress: a removed member
+/// of the root range learns until it says it holds the commit that removed it, and a learner the
+/// target makes a voter is promoted once caught up (membership.md §4, §6), while a voter's progress
+/// moves with every entry, which would report a range at each drive.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Configured {
+    pub(crate) conf: ConfState,
+    /// Whether a change is proposed and not yet applied (`Raft::has_pending_conf`).
+    pub(crate) pending: bool,
+    /// Each learner, the commit it last said its storage holds, and whether it holds everything the
+    /// leader knows committed (`Replica::caught_up`); none while the member leads not.
+    pub(crate) learners: Vec<(u64, u64, bool)>,
+}
+
+impl Configured {
+    /// What `replica` shows now.
+    pub(crate) fn of<E: Engine + 'static, S: LogStore>(replica: &Replica<E, S>) -> Self {
+        Self {
+            conf: replica.configuration().clone(),
+            pending: replica.core().raft.has_pending_conf(),
+            learners: learners(replica).collect(),
+        }
+    }
+
+    /// Whether `replica` shows what this says, read without a copy, as a shard asks after each
+    /// drive.
+    fn shown<E: Engine + 'static, S: LogStore>(&self, replica: &Replica<E, S>) -> bool {
+        self.conf == *replica.configuration()
+            && self.pending == replica.core().raft.has_pending_conf()
+            && self.learners.iter().copied().eq(learners(replica))
+    }
+}
+
+/// Each learner of `replica`'s configuration, the commit it last said its storage holds, and
+/// whether it is caught up, while `replica` leads.
+fn learners<E: Engine + 'static, S: LogStore>(
+    replica: &Replica<E, S>,
+) -> impl Iterator<Item = (u64, u64, bool)> + '_ {
+    let leads = replica.is_leader();
+    let tracker = replica.core().raft.tracker();
+    replica
+        .configuration()
+        .learners
+        .iter()
+        .filter(move |_| leads)
+        .map(move |&id| {
+            let committed = tracker.get(id).map_or(0, |p| p.committed_index);
+            (id, committed, replica.caught_up(id))
+        })
+}
+
+/// Steps the range at `handle` toward `target` (membership.md §6; `Toward::step`): a change
+/// proposed, or its lead handed on, only while its member leads, no change is pending and no
+/// hand-over is under way, one at a time. A change or a transfer the core refuses (its leader
+/// stepping down, its log full) is asked again at a later turn.
+pub(crate) fn step_toward<E: Engine + 'static, S: LogStore>(
+    owner: &mut Owner<Answers<S>, RangeMachine<E>, Unbounded>,
+    handle: Handle,
+    target: &Toward,
+) {
+    let Some(shell) = owner.get_mut(handle) else {
+        return;
+    };
+    let raft = &shell.core().raft;
+    if !shell.is_leader() || raft.has_pending_conf() || raft.lead_transferee().is_some() {
+        return;
+    }
+    match target.step(shell.configuration(), shell.id(), |member| {
+        shell.caught_up(member)
+    }) {
+        Step::Propose(change) => {
+            let _ = shell.change(Vec::new(), &change);
+            owner.schedule(handle);
+        }
+        Step::Transfer(to) => {
+            let _ = shell.transfer(to);
+            owner.schedule(handle);
+        }
+        Step::Wait | Step::Done => {}
+    }
+}
+
+/// Proposes what `replacement` names next of the range at `handle` while its member leads: a
+/// change only while none is pending, since the core takes one at a time (a change it drops, with
+/// a leader stepping down, is proposed again by whichever node leads next). Whether it is done:
+/// the joining member votes, the failed one is gone, and every voter knows it.
+pub(crate) fn step_replacement<E: Engine + 'static, S: LogStore>(
+    owner: &mut Owner<Answers<S>, RangeMachine<E>, Unbounded>,
+    handle: Handle,
+    replacement: Replacement,
+) -> bool {
+    let Some(shell) = owner.get_mut(handle) else {
+        return false;
+    };
+    if !shell.is_leader() {
+        return false;
+    }
+    let next = replacement.next(
+        shell.configuration(),
+        shell.caught_up(replacement.joining()),
+        shell.configuration_known(),
+    );
+    match next {
+        Next::Propose(change) => {
+            if !shell.core().raft.has_pending_conf() {
+                // A change the core refuses (its leader stepping down, its log full) is proposed
+                // again at a later turn.
+                let _ = shell.change(Vec::new(), &change);
+                owner.schedule(handle);
+            }
+            false
+        }
+        Next::Wait => false,
+        Next::Done => true,
+    }
 }
 
 /// What a range's member shows of itself: what the node's status, its leadership and its applied
@@ -656,6 +795,10 @@ struct Kept {
     peers: Vec<PeerId>,
     /// What the range showed when last told the node's shard ([`Out::Seen`]).
     seen: Seen,
+    /// Its configuration when last told the node's shard ([`Out::Configured`]).
+    configured: Configured,
+    /// The replacement the node's shard asked of it ([`In::Replace`]), until it is done.
+    replacing: Option<Replacement>,
 }
 
 /// A read a range's replica took and has yet to serve: its range, its context and its query.
@@ -707,6 +850,7 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             In::Adopt(group, replica) => {
                 let peers = sorted(replica.peers());
                 let seen = Seen::of(&replica);
+                let configured = Configured::of(&replica);
                 let handle = self.owner.insert(*replica).map_err(|_| NodeError::Full)?;
                 self.ranges.push(Kept {
                     group,
@@ -714,6 +858,8 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     wake: None,
                     peers,
                     seen,
+                    configured,
+                    replacing: None,
                 });
             }
             In::Step {
@@ -840,6 +986,22 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                 }
                 self.gave.push(Out::Handing(group, to));
             }
+            In::Toward(group, target) => {
+                let replacing = self
+                    .ranges
+                    .iter()
+                    .any(|kept| kept.group == group && kept.replacing.is_some());
+                // No replacement and a step toward the members change one range at once.
+                if let Some(handle) = self.at(group).filter(|_| !replacing) {
+                    step_toward(&mut self.owner, handle, &target);
+                }
+            }
+            In::Replace(group, replacement) => {
+                if let Some(kept) = self.ranges.iter_mut().find(|kept| kept.group == group) {
+                    kept.replacing = Some(replacement);
+                    self.owner.schedule(kept.handle);
+                }
+            }
             In::Release(reply) => self.release = Some(reply),
         }
         Ok(())
@@ -873,6 +1035,20 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             self.gave.push(Out::Compacted);
         }
         Ok(())
+    }
+
+    /// Steps each replacement the shard keeps ([`step_replacement`]), each turn, and hands back
+    /// those done.
+    fn replace(&mut self) {
+        for kept in &mut self.ranges {
+            let Some(replacement) = kept.replacing else {
+                continue;
+            };
+            if step_replacement(&mut self.owner, kept.handle, replacement) {
+                kept.replacing = None;
+                self.gave.push(Out::Replaced(kept.group, replacement));
+            }
+        }
     }
 
     /// Serves the reads the replicas gave back this turn, each confirmed and applied through: its
@@ -1032,6 +1208,11 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     kept.seen = seen;
                     self.gave.push(Out::Seen(kept.group, seen));
                 }
+                if !kept.configured.shown(replica) {
+                    kept.configured = Configured::of(replica);
+                    self.gave
+                        .push(Out::Configured(kept.group, kept.configured.clone()));
+                }
             }
         }
         self.serve();
@@ -1116,7 +1297,11 @@ async fn run<E: Engine + 'static, S: LogStore>(
         let now = hyper_rt::futures::now_ns();
         if stopped.is_none() {
             shard.schedule_due(now);
-            stopped = shard.drive(now).and_then(|()| shard.compact(now)).err();
+            stopped = shard
+                .drive(now)
+                .and_then(|()| shard.compact(now))
+                .map(|()| shard.replace())
+                .err();
         }
         for out in shard.gave.drain(..) {
             if given.send(out).await.is_err() {
@@ -1742,6 +1927,12 @@ mod tests {
             election: None,
             seen,
             reports: Vec::new(),
+            configured: Configured {
+                conf: ConfState::default(),
+                pending: false,
+                learners: Vec::new(),
+            },
+            replacing: None,
         }
     }
 
@@ -2226,5 +2417,208 @@ mod tests {
         let again = here.insert(replica).unwrap();
         assert!(!here.left.contains(&again));
         assert!(here.get(again).is_some());
+    }
+
+    /// A far range's configuration reaches the node's shard after the drive that changed it: a
+    /// learner the cell's target adds through the range's lane ([`In::Toward`]) is shown in the
+    /// configuration it applied, with its progress as its leader holds it.
+    #[test]
+    fn a_far_ranges_configuration_change_is_seen() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (mut lanes, _, _) = leading(&rt, &log, &range);
+        let target = Toward {
+            voters: vec![1],
+            learners: vec![2],
+        };
+        lanes.send(In::Toward(GROUP, target)).unwrap();
+        let until = deadline();
+        let shown = loop {
+            if let Out::Configured(group, shown) =
+                next(&mut lanes, "the learner shown added", until, |out| {
+                    !matches!(out, Out::Configured(..))
+                })
+                && shown.conf.learners == [2]
+            {
+                assert_eq!(group, GROUP);
+                break shown;
+            }
+        };
+        assert_eq!(shown.conf.voters, [1]);
+        assert!(!shown.pending, "the change it applied is pending no more");
+        let progress: Vec<(u64, bool)> = shown
+            .learners
+            .iter()
+            .map(|(id, _, caught_up)| (*id, *caught_up))
+            .collect();
+        assert_eq!(progress, [(2, false)], "a learner never heard from");
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// Node 1's member of `range` on the second shard of `rt`, campaigning, and node 2's on the
+    /// first, each on a log of its own: the lanes of each.
+    fn two(
+        rt: &Runtime,
+        log: &Log<DeviceFile>,
+        other_log: &Log<DeviceFile>,
+        range: &Range,
+    ) -> (Lanes<Model, Stored>, Lanes<Model, Stored>) {
+        let other = {
+            let mut engine = Model::default();
+            engine.install(0, name::first(1).unwrap()).unwrap();
+            engine.persist().unwrap();
+            let store = Answers::new(mantle_range::claim(other_log, GROUP, range).unwrap());
+            mantle_range::open_shell(2, store, engine, range, 2, Elections::Suspicion).unwrap()
+        };
+        let leader = Lanes::start(rt.holder_of(rt.shard_ids()[1]).unwrap(), 1, 1, 8).unwrap();
+        let member = Lanes::start(rt.holder_of(rt.shard_ids()[0]).unwrap(), 0, 1, 8).unwrap();
+        leader
+            .send(In::Adopt(GROUP, Box::new(campaigning(log, range))))
+            .unwrap();
+        member.send(In::Adopt(GROUP, Box::new(other))).unwrap();
+        (leader, member)
+    }
+
+    /// Carries each member's messages to the other, the test's thread their network, which drops
+    /// one a full lane refuses, as a network may, and hands `seen` each other thing node 1's
+    /// member gives, with its lanes, until it says what the test waits for, `what`, came.
+    fn carried(
+        leader: &mut Lanes<Model, Stored>,
+        member: &mut Lanes<Model, Stored>,
+        what: &'static str,
+        mut seen: impl FnMut(Out, &Lanes<Model, Stored>) -> bool,
+    ) {
+        let until = deadline();
+        loop {
+            assert!(
+                std::time::Instant::now() < until,
+                "waited {PATIENCE:?} for {what}"
+            );
+            if let Some(out) = leader.take().unwrap() {
+                match out {
+                    Out::Message(_, message) => {
+                        let _ = member.send(In::Step {
+                            group: GROUP,
+                            sender: 1,
+                            message,
+                        });
+                    }
+                    Out::Stopped(error) => panic!("node 1's shard stopped: {error}"),
+                    out => {
+                        if seen(out, leader) {
+                            return;
+                        }
+                    }
+                }
+            }
+            if let Some(out) = member.take().unwrap() {
+                match out {
+                    Out::Message(_, message) => {
+                        let _ = leader.send(In::Step {
+                            group: GROUP,
+                            sender: 2,
+                            message,
+                        });
+                    }
+                    Out::Stopped(error) => panic!("node 2's shard stopped: {error}"),
+                    _ => {}
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// A voter is added to a far range and removed from it through its lane, each target worked
+    /// out on the node's shard and handed over ([`In::Toward`]), and stepped on the range's from
+    /// what its replica shows: node 2 learns, is made a voter once caught up, then is removed,
+    /// each change seen in the configuration the range shows. The node works its target out at
+    /// each turn; the test hands it again at each change node 1's member shows.
+    #[test]
+    fn a_voter_is_added_and_removed_through_a_far_ranges_lane() {
+        let rt = started(2, 2);
+        let (dir, other_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut range = one_member();
+        range.boot.learners = vec![2];
+        let (log, other_log) = (log_in(dir.path(), &range), log_in(other_dir.path(), &range));
+        let (mut leader, mut member) = two(&rt, &log, &other_log, &range);
+        let toward = |voters: &[u64]| {
+            In::Toward(
+                GROUP,
+                Toward {
+                    voters: voters.to_vec(),
+                    learners: Vec::new(),
+                },
+            )
+        };
+        for (voters, what) in [
+            (&[1, 2][..], "node 2 made a voter"),
+            (&[1][..], "node 2 removed"),
+        ] {
+            let _ = leader.send(toward(voters));
+            carried(&mut leader, &mut member, what, |out, leader| match out {
+                Out::Configured(_, shown) if shown.conf.voters == voters => {
+                    assert!(shown.conf.learners.is_empty());
+                    true
+                }
+                Out::Configured(..) | Out::Seen(..) => {
+                    let _ = leader.send(toward(voters));
+                    false
+                }
+                _ => false,
+            });
+        }
+        drop((leader, member));
+        rt.shutdown().unwrap();
+        drop((log, other_log));
+    }
+
+    /// A far range's replacement ([`In::Replace`]) is kept by its shard and stepped at each of its
+    /// turns until it is done: node 2, under an identity the range never named, learns, catches up
+    /// and is made a voter in place of node 3, which the range names no more, and once every
+    /// voter knows it the shard hands the replacement back done ([`Out::Replaced`]). It was told
+    /// before the range led, as every node may be told one.
+    #[test]
+    fn a_far_ranges_replacement_progresses_to_done() {
+        let rt = started(2, 2);
+        let (dir, other_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let range = one_member();
+        let (log, other_log) = (log_in(dir.path(), &range), log_in(other_dir.path(), &range));
+        let (mut leader, mut member) = two(&rt, &log, &other_log, &range);
+        let replacement = Replacement::new(3, 2).unwrap();
+        leader.send(In::Replace(GROUP, replacement)).unwrap();
+        let (mut voters, mut proposed) = (Vec::new(), false);
+        carried(
+            &mut leader,
+            &mut member,
+            "the replacement done",
+            |out, leader| {
+                match out {
+                    Out::Configured(_, shown) => {
+                        // Node 2 says it holds the change once a message carries its commit to it:
+                        // the next entry's append here, as the leader's next heartbeat would.
+                        if shown.conf.voters == [1, 2] && !proposed {
+                            let max = range.settings.max_entry_bytes;
+                            leader.send(In::Propose(GROUP, put(), max)).unwrap();
+                            proposed = true;
+                        }
+                        voters = shown.conf.voters;
+                    }
+                    Out::Replaced(group, done) => {
+                        assert_eq!((group, done), (GROUP, replacement));
+                        return true;
+                    }
+                    _ => {}
+                }
+                false
+            },
+        );
+        assert_eq!(voters, [1, 2], "node 2 votes in its place");
+        drop((leader, member));
+        rt.shutdown().unwrap();
+        drop((log, other_log));
     }
 }

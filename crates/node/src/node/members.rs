@@ -115,15 +115,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// as a learner.
     fn root_learner(&self, id: u64) -> bool {
         self.root_range()
-            .and_then(|(handle, _)| self.owner.get(handle))
-            .is_some_and(|shell| {
-                let c = shell.configuration();
-                c.learners.contains(&id) || c.learners_next.contains(&id)
-            })
+            .and_then(|(_, group)| self.configuration(group))
+            .is_some_and(|c| c.learners.contains(&id) || c.learners_next.contains(&id))
     }
 
-    /// The configuration this node's member of `group` applied.
+    /// The configuration this node's member of `group` applied: read from its replica where the
+    /// node's own task drives it, and as its shard last reported it where another shard does
+    /// (node.md §2.9).
     pub fn configuration(&self, group: u128) -> Option<&ConfState> {
+        if let Some(far) = self.far.iter().find(|far| far.group == group) {
+            return Some(&far.configured.conf);
+        }
         self.kept(group)
             .and_then(|k| self.owner.get(k.handle))
             .map(|r| r.configuration())
@@ -147,7 +149,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.cell.is_none() {
             return Ok(());
         }
-        self.step_configurations();
+        self.step_configurations()?;
         self.step_duties()
     }
 
@@ -367,16 +369,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Steps each range this node leads toward its target: a change proposed only while none is
     /// pending and no replacement steps the range; a lead handed on only while none is.
-    fn step_configurations(&mut self) {
+    fn step_configurations(&mut self) -> Result<(), NodeError> {
         for at in 0..self.ranges.len() {
-            let Some((handle, layer, replacing)) = self
+            let Some((handle, group, layer, replacing)) = self
                 .ranges
                 .get(at)
-                .map(|k| (k.handle, k.layer, k.replacing.is_some()))
+                .map(|k| (k.handle, k.group, k.layer, k.replacing.is_some()))
             else {
                 continue;
             };
             if replacing {
+                continue;
+            }
+            if self.far.iter().any(|far| far.group == group) {
+                self.step_far(group, layer)?;
                 continue;
             }
             let Some(shell) = self.owner.get(handle) else {
@@ -396,23 +402,61 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some(target) = self.target(&conf, layer, told) else {
                 continue;
             };
-            let Some(shell) = self.owner.get_mut(handle) else {
-                continue;
-            };
-            let step = target.step(&conf, self.id, |member| shell.caught_up(member));
-            match step {
-                // A change or a transfer the core refuses (its leader stepping down, its log full)
-                // is asked again at a later turn.
-                Step::Propose(change) => {
-                    let _ = shell.change(Vec::new(), &change);
-                    self.owner.schedule(handle);
-                }
-                Step::Transfer(to) => {
-                    let _ = shell.transfer(to);
-                    self.owner.schedule(handle);
-                }
-                Step::Wait | Step::Done => {}
-            }
+            super::shard::step_toward(&mut self.owner, handle, &target);
+        }
+        Ok(())
+    }
+
+    /// Steps a far range this node leads toward its target, as [`Node::step_configurations`] steps
+    /// its own, from what the range last showed (`shard::Configured`): the target worked out here
+    /// and handed to its shard ([`super::shard::In::Toward`]), which steps it from what its replica
+    /// shows then, and only where a step is due by what it showed, so a range at its target, or
+    /// one waiting on a learner to catch up, costs its lane nothing. A full lane drops it: the
+    /// target is worked out afresh at the next turn and handed on then. A shard whose task ended
+    /// stops the node.
+    fn step_far(&self, group: u128, layer: Layer) -> Result<(), NodeError> {
+        let Some(far) = self.far.iter().find(|far| far.group == group) else {
+            return Ok(());
+        };
+        let shown = &far.configured;
+        if !far.seen.leading
+            || shown.pending
+            || far.seen.transferee.is_some()
+            || far.replacing.is_some()
+        {
+            return Ok(());
+        }
+        let told = |member: u64, at: u64| {
+            shown
+                .learners
+                .iter()
+                .any(|(id, committed, _)| *id == member && *committed >= at)
+        };
+        let Some(target) = self.target(&shown.conf, layer, told) else {
+            return Ok(());
+        };
+        // A voter's progress is not shown; its shard reads it where it matters (an heir chosen).
+        let caught_up = |member: u64| {
+            shown
+                .learners
+                .iter()
+                .find(|(id, ..)| *id == member)
+                .is_none_or(|(_, _, caught_up)| *caught_up)
+        };
+        if matches!(
+            target.step(&shown.conf, self.id, caught_up),
+            Step::Wait | Step::Done
+        ) {
+            return Ok(());
+        }
+        let lanes = self
+            .shards
+            .iter()
+            .find(|lanes| lanes.shard() == far.shard)
+            .ok_or(NodeError::ShardEnded(far.shard))?;
+        match lanes.send(super::shard::In::Toward(group, target)) {
+            Ok(()) | Err(NodeError::LaneFull(_)) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -420,8 +464,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// at all: what the root range's leader waits for before it removes, and delists, a member.
     fn named_nowhere(&self, id: u64, entirely: bool) -> bool {
         self.ranges.iter().all(|kept| {
-            self.owner.get(kept.handle).is_none_or(|r| {
-                let c = r.configuration();
+            self.configuration(kept.group).is_none_or(|c| {
                 let voting = c.voters.contains(&id) || c.voters_outgoing.contains(&id);
                 let learning = c.learners.contains(&id) || c.learners_next.contains(&id);
                 !voting && !(entirely && learning)
@@ -436,7 +479,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// it vote; delisted, where it is removed and no range names it. Whether it is away is repair's
     /// record, which the same leader keeps (`Node::observe_presence`; membership.md §8).
     fn step_duties(&mut self) -> Result<(), NodeError> {
-        let Some((handle, group)) = self.root_range() else {
+        let Some((_, group)) = self.root_range() else {
             return Ok(());
         };
         let duties = std::mem::take(&mut self.duties);
@@ -444,7 +487,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .into_iter()
             .filter(|(ask, _)| self.take_command(*ask).is_none())
             .collect();
-        if !self.owner.get(handle).is_some_and(|r| r.is_leader()) {
+        if !self.is_leader(group) {
             return Ok(());
         }
         let Some(cell) = self.cell.as_ref() else {

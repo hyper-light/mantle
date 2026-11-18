@@ -58,15 +58,20 @@ pub(crate) const STOCK_PART: u64 = 8 << 20;
 
 /// What one connection holds with a request in flight, the host holding the pieces of its body:
 /// measured by a counting allocator on the listener's thread with the whole body taken
-/// (`tests/listener_memory.rs`), 382,028 bytes at the most, over TLS 1.3 at one connection on
-/// Windows x86_64 (Jupiter, 2026-11-16); a connection over TLS adds 381,964 from one connection to
-/// four and one over plain HTTP 346,132, the same on macOS arm64 and Windows x86_64 at every count,
-/// whose single-connection counts hold 80 bytes more there. Mostly pieces of 64 KiB (`PIECE`): the
-/// four of the test's body, and the connection's own buffer, which each read reuses; TLS 1.3 adds
-/// its session's buffers. Counted with only what a connection reads ahead taken, the count read
-/// however far each connection had read: 300,208 over TLS, and on one CPU 101 KB less at one
-/// connection (CI run 43762797164).
-pub const CONNECTION_BYTES: u64 = 382_028;
+/// (`tests/listener_memory.rs`). 382,052 bytes at the most, over TLS 1.3 at one connection on
+/// Windows x86_64: the 382,028 counted there (Jupiter, 2026-11-16) and the 24 a TLS connection has
+/// held since it resumes sessions, its way into the endpoint's store (`sessions::Kept`, boxed in its
+/// TLS configuration), an 8-octet reference and a 16-octet `Option<u64>` on every 64-bit target.
+/// Counted on macOS arm64 (2026-11-17), a connection over TLS adds 381,988 from one connection to
+/// four, the 381,964 macOS arm64 and Windows x86_64 both counted before and those 24, and one over
+/// plain HTTP 346,132 as before. One connection over TLS holds 382,036 there: 80 bytes under
+/// Windows x86_64 as before, and 64 more once, as std's `Mutex` around the store boxes its pthread
+/// mutex at the first lock on macOS, where on Windows and Linux it is an atomic and allocates
+/// nothing. Mostly pieces of 64 KiB (`PIECE`): the four of the test's body, and the connection's
+/// own buffer, which each read reuses; TLS 1.3 adds its session's buffers. Counted with only what a
+/// connection reads ahead taken, the count read however far each connection had read: 300,208 over
+/// TLS, and on one CPU 101 KB less at one connection (CI run 43762797164).
+pub const CONNECTION_BYTES: u64 = 382_052;
 
 /// What the listener holds for each connection it serves beside the connection's own bytes, all
 /// reserved when it binds: the slots of the sessions one handshake leaves its client

@@ -337,19 +337,29 @@ fn held(connections: usize, tls: bool) -> i64 {
     panic!("{what} of {connections} over {over} at {line}: {why}")
 }
 
-/// A connection with a request in flight holds the same bytes whichever its place, over plain
-/// HTTP and over TLS, and no more than `listener::CONNECTION_BYTES` states.
+/// A connection with a request in flight holds no more than `listener::CONNECTION_BYTES` states,
+/// over plain HTTP and over TLS, at every count of connections: one alone, with what the
+/// listener's first connection makes once (on macOS std's `Mutex` around the TLS sessions boxes
+/// its pthread mutex at the first lock, 64 bytes), is the most one holds, and each past it adds
+/// no more.
 #[test]
 fn a_listener_connection_holds_its_stated_bytes() {
+    let bound = mantle_node::listener::CONNECTION_BYTES;
     for tls in [false, true] {
-        let counts: Vec<i64> = [1, 2, 4].into_iter().map(|n| held(n, tls)).collect();
+        let connections = [1, 2, 4];
+        let counts: Vec<i64> = connections.into_iter().map(|n| held(n, tls)).collect();
         let each = (counts[2] - counts[0]) / 3;
         eprintln!("tls {tls}: held {counts:?}, {each} a connection");
         assert!(each > 0, "{counts:?}");
+        for (n, count) in connections.into_iter().zip(&counts) {
+            assert!(
+                u64::try_from(*count).unwrap() <= u64::try_from(n).unwrap() * bound,
+                "tls {tls}: {count} held by {n} connections, past {bound} each"
+            );
+        }
         assert!(
-            u64::try_from(each).unwrap() <= mantle_node::listener::CONNECTION_BYTES,
-            "tls {tls}: {each} a connection past {}",
-            mantle_node::listener::CONNECTION_BYTES
+            u64::try_from(each).unwrap() <= bound,
+            "tls {tls}: {each} a connection past {bound}"
         );
     }
 }

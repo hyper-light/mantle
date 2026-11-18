@@ -2358,10 +2358,13 @@ anyway (RFC 9110 §10.1.1); the listener then half-closes and reads what comes u
 closes, at most the largest body a request may carry, so the response is not lost to a reset
 (RFC 9112 §9.6; research/72). The connection budget is as many connections as the node runs
 operations at most (`gateway.objects`, §2.8), each carrying one request at a time, so one past them
-would only wait at the door; each connection's bytes, measured with a request in flight (341,668 at
-most over plain HTTP, 295,744 over TLS 1.3; `tests/listener_memory.rs`), enter what an operation
-costs the node and so the count itself. It was ten, what botocore and the AWS CLI's classic
-transfers open at their defaults (research/72), thirty requests in a cell's S3 door at once. The
+would only wait at the door; each connection's bytes, measured with a request in flight and its
+whole body taken (`listener::CONNECTION_BYTES`, 382,052 at most, over TLS 1.3 at one connection:
+382,028 counted on Windows x86_64 and the 24 a connection's way into the session store holds; a
+connection over TLS 381,988 and over plain HTTP 346,132 from one connection to four on macOS arm64;
+`tests/listener_memory.rs`), enter what an operation costs the node and so the count itself. It
+was ten, what botocore and the AWS CLI's classic transfers open at their defaults (research/72),
+thirty requests in a cell's S3 door at once. The
 kernel queues as many connections as the budget. A connection past it is answered
 `503 SlowDown` with `Connection: close` to its first request, from a reserve of ten more, never
 closed with no answer: the AWS CLI drops a ranged GET whose every attempt met a connection closed

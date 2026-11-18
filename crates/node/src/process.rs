@@ -139,7 +139,7 @@ use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
 use mantle_meta::name;
 use mantle_meta::record::History;
-use mantle_meta::record::MemberState;
+use mantle_meta::record::{MemberState, Rejoin};
 use mantle_meta::root::{self, Enlist, Join, Lived, MAX_DOMAIN};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command};
@@ -2542,12 +2542,16 @@ async fn serve(
             .as_nanos(),
     )
     .unwrap_or(u64::MAX);
-    // A member stated gone is asked of the root range once the node's commands have room; each
-    // id is held once, and at most as many as the cell holds nodes.
-    let mut stated_gone: Vec<(Option<CommandAsk>, u64)> = Vec::new();
+    // An operator's statement (a member gone or banned, the cell's `rejoin` setting) is asked of
+    // the root range once the node's commands have room; each is held once, and at most as many as
+    // the cell holds nodes.
+    let mut stated: Vec<(Option<CommandAsk>, Statement)> = Vec::new();
     // Each member's standing as last said, and each range's configuration, a range a slot in the
     // configuration's order.
     let mut said_standing: Vec<(u64, MemberState, u64)> = Vec::new();
+    // The ledger's entries and the cell's `rejoin` setting as last said (membership.md §5.1).
+    let mut said_ledger: Vec<(u64, LedgerState)> = Vec::new();
+    let mut said_rejoin: Option<Rejoin> = None;
     let mut said_config: Vec<Option<(Vec<u64>, Vec<u64>)>> = vec![None; config.ranges.len()];
     let mut read = vec![0u8; chunk];
     let mut pending = Vec::new();
@@ -2705,27 +2709,33 @@ async fn serve(
                         say(&mut output, &line).await?;
                     } else if line.trim_ascii() == b"leave" {
                         departure.ask(&mut node, config.enlist.as_ref(), enlisted)?;
-                    } else if let Some(id) = gone_line(&line)? {
+                    } else if let Some(statement) = statement_line(&line)? {
                         let most = config.enlist.as_ref().map(|e| e.max_nodes).ok_or(
                             ProcessError::Input(
-                                format!("gone {id}"),
-                                "a node that hosts no root range states no member gone",
+                                statement.to_string(),
+                                "a node that hosts no root range states nothing of the cell",
                             ),
                         )?;
-                        if stated_gone.iter().any(|(_, held)| *held == id) {
-                            // Stated already: one statement out for each member.
-                        } else if u64::try_from(stated_gone.len()).unwrap_or(u64::MAX)
-                            >= u64::from(most)
+                        // A setting stated again before the last was asked replaces it, so the
+                        // last stated is the last applied.
+                        if let Statement::Rejoin(_) = statement {
+                            stated.retain(|(ask, held)| {
+                                ask.is_some() || !matches!(held, Statement::Rejoin(_))
+                            });
+                        }
+                        if stated.iter().any(|(_, held)| *held == statement) {
+                            // Stated already: one statement out for each.
+                        } else if u64::try_from(stated.len()).unwrap_or(u64::MAX) >= u64::from(most)
                         {
                             say(
                                 &mut output,
                                 &format!(
-                                    "gone {id} refused: as many stated gone as the cell's nodes\n"
+                                    "{statement} refused: as many statements out as the cell's nodes\n"
                                 ),
                             )
                             .await?;
                         } else {
-                            stated_gone.push((None, id));
+                            stated.push((None, statement));
                         }
                     } else {
                         take_line(&mut node, &config.ranges, &line)?;
@@ -2834,31 +2844,28 @@ async fn serve(
             say(&mut output, "retired\n").await?;
             return Err(ProcessError::Retired(hex(&fingerprint)));
         }
-        for at in (0..stated_gone.len()).rev() {
-            let Some(&(ask, id)) = stated_gone.get(at) else {
-                continue;
-            };
+        // Each statement asked in the order it was stated, and said once answered.
+        let mut at = 0;
+        while let Some(&(ask, statement)) = stated.get(at) {
             match ask {
                 Some(ask) => {
                     if let Some(outcome) = node.take_command(ask) {
-                        stated_gone.swap_remove(at);
-                        say(&mut output, &format!("gone {id} {outcome:?}\n")).await?;
+                        stated.remove(at);
+                        say(&mut output, &format!("{statement} {outcome:?}\n")).await?;
+                        continue;
                     }
                 }
                 None => {
                     if let (Some(e), true) = (&config.enlist, node.command_room()) {
-                        let gone = Command::Root(root::Command::Gone {
-                            node: id,
-                            // The entry that carries it gives it its time.
-                            at_ns: 0,
-                        });
-                        let asked = node.command(e.root, gone, u64::MAX, Wait::Answered)?;
-                        if let Some(held) = stated_gone.get_mut(at) {
+                        let command = Command::Root(statement.command(e.max_nodes));
+                        let asked = node.command(e.root, command, u64::MAX, Wait::Answered)?;
+                        if let Some(held) = stated.get_mut(at) {
                             held.0 = Some(asked);
                         }
                     }
                 }
             }
+            at = at.saturating_add(1);
         }
         // The members whose reach names a host: looked up as a peer's name is; those the cell no
         // longer admits, and that no line names, looked up no more.
@@ -2910,6 +2917,7 @@ async fn serve(
             said_repair = Some(repair);
         }
         standing_lines(&mut lines, &node, &mut said_standing).map_err(wrote)?;
+        ledger_lines(&mut lines, &node, &mut said_ledger, &mut said_rejoin).map_err(wrote)?;
         for ((group, _), was) in config.ranges.iter().zip(said_config.iter_mut()) {
             let Some(conf) = node.configuration(*group) else {
                 continue;
@@ -3308,18 +3316,137 @@ fn reached_at(reach: Option<&str>, bound: SocketAddr) -> Result<String, ProcessE
     }
 }
 
-/// The member a `gone ID` line names, an operator's statement that it is gone for good
-/// (membership.md §5); none for another line.
-fn gone_line(line: &[u8]) -> Result<Option<u64>, ProcessError> {
+/// An operator's statement of the cell on standard input, which the node asks of the root range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Statement {
+    /// `gone ID`: the member is gone for good (membership.md §5).
+    Gone(u64),
+    /// `ban ID`: the machine is no longer the cell's, and its identity never re-granted (§5.1).
+    Ban(u64),
+    /// `rejoin automatic` or `rejoin off`: the cell's setting for a written-off node coming
+    /// back (§5.1).
+    Rejoin(Rejoin),
+}
+
+impl Statement {
+    /// The root range's command the statement asks, in a cell of at most `max_nodes` nodes, the
+    /// bound on the ledger. The entry that carries it gives it its time.
+    fn command(self, max_nodes: u32) -> root::Command {
+        match self {
+            Self::Gone(node) => root::Command::Gone {
+                node,
+                max_nodes,
+                at_ns: 0,
+            },
+            Self::Ban(node) => root::Command::Ban {
+                node,
+                max_nodes,
+                at_ns: 0,
+            },
+            Self::Rejoin(setting) => root::Command::Rejoin(setting),
+        }
+    }
+}
+
+impl std::fmt::Display for Statement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gone(id) => write!(f, "gone {id}"),
+            Self::Ban(id) => write!(f, "ban {id}"),
+            Self::Rejoin(setting) => write!(f, "rejoin {}", rejoin_word(*setting)),
+        }
+    }
+}
+
+/// The word a `rejoin` line and the node's own line name a setting by.
+fn rejoin_word(setting: Rejoin) -> &'static str {
+    match setting {
+        Rejoin::Automatic => "automatic",
+        Rejoin::Off => "off",
+    }
+}
+
+/// The statement a `gone ID`, `ban ID` or `rejoin automatic|off` line makes (membership.md §5,
+/// §5.1); none for another line.
+fn statement_line(line: &[u8]) -> Result<Option<Statement>, ProcessError> {
     let text = String::from_utf8_lossy(line).trim().to_owned();
     let mut words = text.split_whitespace();
+    let id = |id: &str, what| {
+        id.parse()
+            .map_err(|_| ProcessError::Input(text.clone(), what))
+    };
     match (words.next(), words.next(), words.next()) {
-        (Some("gone"), Some(id), None) => id
-            .parse()
-            .map(Some)
-            .map_err(|_| ProcessError::Input(text.clone(), "gone ID: a member's id")),
+        (Some("gone"), Some(word), None) => {
+            id(word, "gone ID: a member's id").map(|id| Some(Statement::Gone(id)))
+        }
+        (Some("ban"), Some(word), None) => {
+            id(word, "ban ID: a node's id").map(|id| Some(Statement::Ban(id)))
+        }
+        (Some("rejoin"), Some("automatic"), None) => Ok(Some(Statement::Rejoin(Rejoin::Automatic))),
+        (Some("rejoin"), Some("off"), None) => Ok(Some(Statement::Rejoin(Rejoin::Off))),
+        (Some("rejoin"), ..) => Err(ProcessError::Input(
+            text.clone(),
+            "rejoin automatic|off: the cell's setting",
+        )),
         _ => Ok(None),
     }
+}
+
+/// What the ledger holds of a written-off identity, as the node says it: open to a re-grant,
+/// banned, or re-granted as the node it names (membership.md §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerState {
+    Open,
+    Banned,
+    Regranted(u64),
+}
+
+/// Each ledger entry's `ledger ID STATE` line, `STATE` `open`, `banned` or `regranted NEW`, for each
+/// that moved since `said`, one `ledger ID evicted` for each the ledger no longer holds, and the
+/// cell's `rejoin automatic|off` where it moved, as this node's member of the root range holds them
+/// (membership.md §5.1).
+fn ledger_lines<E: Engine + 'static>(
+    lines: &mut String,
+    node: &Node<E>,
+    said: &mut Vec<(u64, LedgerState)>,
+    said_rejoin: &mut Option<Rejoin>,
+) -> std::fmt::Result {
+    let Some(cell) = node.cell() else {
+        return Ok(());
+    };
+    if *said_rejoin != Some(cell.rejoin()) {
+        writeln!(lines, "rejoin {}", rejoin_word(cell.rejoin()))?;
+        *said_rejoin = Some(cell.rejoin());
+    }
+    let now: Vec<(u64, LedgerState)> = cell
+        .ledger()
+        .iter()
+        .map(|(id, entry)| {
+            let state = match (&entry.regranted, entry.banned) {
+                (_, true) => LedgerState::Banned,
+                (Some(r), false) => LedgerState::Regranted(r.node),
+                (None, false) => LedgerState::Open,
+            };
+            (*id, state)
+        })
+        .collect();
+    for (id, state) in &now {
+        if said.contains(&(*id, *state)) {
+            continue;
+        }
+        match state {
+            LedgerState::Open => writeln!(lines, "ledger {id} open")?,
+            LedgerState::Banned => writeln!(lines, "ledger {id} banned")?,
+            LedgerState::Regranted(new) => writeln!(lines, "ledger {id} regranted {new}")?,
+        }
+    }
+    for (id, _) in said.iter() {
+        if !now.iter().any(|(held, _)| held == id) {
+            writeln!(lines, "ledger {id} evicted")?;
+        }
+    }
+    *said = now;
+    Ok(())
 }
 
 /// Each member's `standing ID STATE ABSENT_NS` line, written onto `lines`, for each whose state or
@@ -3718,6 +3845,61 @@ async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An operator's `gone ID`, `ban ID` and `rejoin automatic|off` lines are the statements they
+    /// name, said back as they were written; a malformed one is refused with the line, and any
+    /// other line is none of them (membership.md §5, §5.1).
+    #[test]
+    fn the_statement_lines_parse() {
+        for (line, statement) in [
+            ("gone 4", Statement::Gone(4)),
+            ("  ban 18446744073709551615 ", Statement::Ban(u64::MAX)),
+            ("rejoin automatic", Statement::Rejoin(Rejoin::Automatic)),
+            ("rejoin off\n", Statement::Rejoin(Rejoin::Off)),
+        ] {
+            let read = statement_line(line.as_bytes()).unwrap();
+            assert_eq!(read, Some(statement));
+            assert_eq!(statement.to_string(), line.trim());
+        }
+        for line in [
+            "ban x",
+            "gone -1",
+            "rejoin",
+            "rejoin maybe",
+            "rejoin off now",
+        ] {
+            assert!(
+                matches!(
+                    statement_line(line.as_bytes()),
+                    Err(ProcessError::Input(..))
+                ),
+                "{line}"
+            );
+        }
+        for line in ["leave", "counts", "ban 4 5", "banned 4", ""] {
+            assert_eq!(statement_line(line.as_bytes()).unwrap(), None, "{line}");
+        }
+        assert_eq!(
+            Statement::Ban(4).command(3),
+            root::Command::Ban {
+                node: 4,
+                max_nodes: 3,
+                at_ns: 0
+            }
+        );
+        assert_eq!(
+            Statement::Gone(4).command(3),
+            root::Command::Gone {
+                node: 4,
+                max_nodes: 3,
+                at_ns: 0
+            }
+        );
+        assert_eq!(
+            Statement::Rejoin(Rejoin::Off).command(3),
+            root::Command::Rejoin(Rejoin::Off)
+        );
+    }
 
     /// The lanes' counts are said by name: each kind's sends a full lane refused, then the
     /// proposals and reads far ranges refused and the stream's words held.

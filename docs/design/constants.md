@@ -624,7 +624,9 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/key.rs` `GRANTS` | format | `10` | Root-range row tag 10 after `DATA` for the grant window: the highest grant spent, its floor and the window's bits (docs/design/membership.md §2). |
 | `crates/meta/src/key.rs` `HEADER` | format | `1` | File-layer row tag 1 for a file's header. |
 | `crates/meta/src/key.rs` `HISTORY` | format | `3` | Root-range row tag 3 after `DATA` for a node's history: its time run and its crashes (docs/design/node.md §2.4, item 7). |
+| `crates/meta/src/key.rs` `ISSUER` | format | `14` | Root-range row tag 14 after `DATA` for the issuer's grant window: the highest re-grant spent, its floor and the window's bits (docs/design/membership.md §5.1). |
 | `crates/meta/src/key.rs` `KEPT` | format | `5` | Block-layer row tag 5 for a block's kept places, after its origin's, keyed by the volume that keeps one (docs/design/repair.md §3). |
+| `crates/meta/src/key.rs` `LEDGER` | format | `12` | Root-range row tag 12 after `DATA` for the ledger's entry of a written-off identity that may come back, keyed by the old node's id (docs/design/membership.md §5.1). |
 | `crates/meta/src/key.rs` `LINEAGE` | format | `b'l'` | Marker byte `l` after `LOCAL` for the Name range's lineage row. |
 | `crates/meta/src/key.rs` `LOCAL` | format | `0x00` | Key-space prefix byte 0x00 for a range's own rows (docs/design/metadata.md §1). |
 | `crates/meta/src/key.rs` `MARK` | format | `1` | Component tag 1 after a routing key in the marks space; below 0xFF so it is not read as an escaped 0x00 (FDB tuple-layer byte string). |
@@ -640,6 +642,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/key.rs` `PRINCIPAL` | format | `4` | Root-range row tag 4 after `DATA` for a principal's row, keyed by its name lowercase, as IAM's names "aren't distinguished by case" (docs/design/principals.md; research/91 §2). |
 | `crates/meta/src/key.rs` `PRINCIPALS` | format | `6` | Root-range row tag 6 after `DATA` for the count of the account's principals, which IAM's 5,000 bounds (docs/design/principals.md). |
 | `crates/meta/src/key.rs` `PRESENCE` | format | `7` | Root-range row tag 7 after `DATA` for a node's presence as the cell has seen it (docs/design/repair.md §2.1). |
+| `crates/meta/src/key.rs` `REJOIN` | format | `15` | Root-range row tag 15 after `DATA` for the cell's `rejoin` setting, `automatic` or `off` (docs/design/membership.md §5.1). |
 | `crates/meta/src/key.rs` `RELEASED` | format | `b'q'` | Marker byte `q` after `LOCAL` for the queue of released files. |
 | `crates/meta/src/key.rs` `RETIRED` | format | `11` | Root-range row tag 11 after `DATA` for the removed nodes' history, their totals added together (docs/design/membership.md §9). |
 | `crates/meta/src/key.rs` `REVERSE` | format | `0x02` | Key-space prefix byte 0x02 for reverse-index rows. |
@@ -652,6 +655,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/key.rs` `UPLOAD` | format | `3` | Name-row tag 3: upload rows, sorting after versions. |
 | `crates/meta/src/key.rs` `VERSION` | format | `2` | Name-row tag 2: version rows, sorting after the null pointer. |
 | `crates/meta/src/key.rs` `VOLUME` | format | `2` | Root-range row tag 2 after `DATA` for a volume's row, keyed by the volume's id so the table reads in id order. |
+| `crates/meta/src/key.rs` `WRITTEN_OFF` | format | `13` | Root-range row tag 13 after `DATA` for the ledger's own count: the entries it has added, which orders their eviction, and those it holds (docs/design/membership.md §5.1). |
 | `crates/meta/src/name.rs` `FLOOR` | format | `&[key::LOCAL, key::marker::FLOOR]` | The range's gate floor: no attempt older than it may place a gate where there is none. A gate's removal raises it to the removing attempt, so a coordinator left behind by a later attempt cannot open a gate for a bucket that is gone, and the range keeps no row for it. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/meta/src/name.rs` `LINEAGE` | format | `&[key::LOCAL, key::marker::LINEAGE]` | The range's lineage: its descriptor, and the child of its last split. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/meta/src/name.rs` `MAX_PART` | external | `5 << 30` | The S3 maximum part size of 5 GiB (docs/research/05 §4.1, AWS S3 multipart limits). |
@@ -662,6 +666,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/meta/src/record.rs` `FINGERPRINT` | external | `32` | Bytes of a certificate's fingerprint, which a member's standing keeps: SHA-256's 256-bit output (FIPS 180-4 §1) (docs/design/membership.md §1). |
 | `crates/meta/src/record.rs` `FORMAT` | format | `6` | Version byte 6 that begins every row value written by this code; 6 since a file keeps a row for each block it names, 5 since a part's row records its file's handover deadline, which the completion adopting it gives the part's mark without reading it, 4 since a mark records its write's handover deadline and a queue row whether its ID names a file, 3 since a file's mark records how the range took it (a version's order, a part, an adopting composite, or refused), 2 since a version records its completion's part listing. |
 | `crates/meta/src/record.rs` `LISTING` | external | `32` | Bytes of a completion's listing digest: SHA-256's 256-bit output (FIPS 180-4 §1). |
+| `crates/meta/src/record.rs` `PUBLIC_KEY` | external | `32` | Bytes of a node's public key, which a re-granted identity's ledger entry keeps: an Ed25519 public key's 32 octets (RFC 8032 §5.1.5) (docs/design/membership.md §5.1). |
 | `crates/meta/src/record.rs` `RUNS_FLAG` | format | `5` | Bit 5 of an upload row's flag byte, set when a native upload's runs follow (docs/design/gateway.md §2.1); bits 0 to 4 hold the checksum and the lock, so a row written before runs has it clear and decodes unchanged. |
 | `crates/meta/src/record.rs` `SESSION_ANSWER_FIXED` | format | `12` | Bytes each answer a session's row holds besides the answer: its serial and its length, as `Session::encode` writes them. |
 | `crates/meta/src/record.rs` `SESSION_FIXED` | format | `25` | Bytes of a session's row besides its answers: its format, last use, low serial, count of answers and checksum, as `Session::encode` writes them; `Session::row_bytes` is checked against the encoding. |

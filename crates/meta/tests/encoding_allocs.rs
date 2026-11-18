@@ -15,10 +15,11 @@ use mantle_meta::engine::{Model, Rows, Write};
 use mantle_meta::key::{self, NameRow};
 use mantle_meta::overlay::Overlay;
 use mantle_meta::record::{
-    BlockHeader, ChunkPlace, Extent, FileHeader, Referrer, Target, WrappedKey, Wrapper,
+    BlockHeader, ChunkPlace, Extent, FINGERPRINT, FileHeader, Ledgered, PUBLIC_KEY, Referrer,
+    Regranted, Rejoin, Target, WrappedKey, Wrapper, WrittenOff,
 };
 use mantle_meta::wire::{Answer, Command, Entry, Sessioned};
-use mantle_meta::{block, file};
+use mantle_meta::{block, file, root};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -205,4 +206,71 @@ fn an_overlay_keeps_its_rows_by_move() {
     applied.unwrap();
     assert_eq!(made, (1, 0));
     assert_eq!(overlay.into_writes().len(), 4);
+}
+
+/// The ledger's commands in an entry, its rows and its answers are each one buffer at its length
+/// (docs/design/membership.md §5.1): a re-grant's certificate is written in place.
+#[test]
+fn the_ledgers_commands_rows_and_answers_are_each_one_buffer() {
+    let regranted = Regranted {
+        node: 9,
+        grant: 1,
+        fingerprint: [4; FINGERPRINT],
+        key: [5; PUBLIC_KEY],
+        certificate: vec![6; 300],
+    };
+    let commands = [
+        root::Command::Gone {
+            node: 2,
+            max_nodes: 3,
+            at_ns: 1,
+        },
+        root::Command::Ban {
+            node: 2,
+            max_nodes: 3,
+            at_ns: 1,
+        },
+        root::Command::Rejoin(Rejoin::Off),
+        root::Command::Regrant(root::Regrant {
+            old: 2,
+            node: regranted.node,
+            grant: regranted.grant,
+            fingerprint: regranted.fingerprint,
+            key: regranted.key,
+            certificate: regranted.certificate.clone(),
+            max_nodes: 3,
+        }),
+    ];
+    let entry = Entry {
+        at_ns: 1,
+        commands: commands
+            .into_iter()
+            .enumerate()
+            .map(|(i, command)| Sessioned {
+                session: 1,
+                serial: i as u64,
+                unanswered: 0,
+                command: Command::Root(command),
+            })
+            .collect(),
+    };
+    let (bytes, made) = counted(|| entry.encode().unwrap());
+    assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()));
+    assert_eq!(Entry::decode(&bytes).unwrap(), entry);
+    let row = Ledgered {
+        order: 7,
+        grant: 2,
+        fingerprint: [3; FINGERPRINT],
+        banned: false,
+        regranted: Some(regranted),
+    };
+    let (bytes, made) = counted(|| row.encode().unwrap());
+    assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()));
+    let (bytes, made) = counted(|| WrittenOff { added: 3, held: 2 }.encode());
+    assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()));
+    let (bytes, made) = counted(|| Rejoin::Off.encode());
+    assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()));
+    let granted = Answer::Root(root::Outcome::Granted { node: 9, grant: 1 });
+    let (bytes, made) = counted(|| granted.encode().unwrap());
+    assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()));
 }

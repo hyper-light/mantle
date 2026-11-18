@@ -495,6 +495,34 @@ files whole and durable moved from the binary to `mantle_node::files`, which `ma
 rejoin both reach: the node crate keeps its directory's layout, so the binary driving steps 4 and 5
 would have needed every name of it.
 
+*As built (slice 4, 2026-11-18;* `mantle_meta::root`*).* The root range keeps the ledger as one
+row per written-off identity under its old id (`key::ledger`): its order of write-off, its grant
+and fingerprint, whether it is banned, and once re-granted the new identity's id, issuer's grant,
+fingerprint, public key and certificate (`record::Ledgered`); beside it the ledger's own count
+(`record::WrittenOff`: the entries ever added, which number each one's order, and those held), the
+issuer's grant window (`key::issuer`, a `Grants` as the authority's is) and the `rejoin` setting
+(`record::Rejoin`, absent read as `automatic`). `Gone` and `Ban` carry the cell's `max_nodes`, the
+ledger's bound, as `Join` carries it for the grant window; an entry past it evicts the entries of
+lowest order, one read of at most the entries held. A ban keeps its entry, marked banned, rather
+than dropping it, so a later request is refused `Banned`, saying why, and not `Unknown`; a ban of a
+member serving or leaving writes it off as `Gone` does, its entry banned from the start, and a ban
+of a member written off with no entry (evicted, or left in order) changes nothing, as nothing
+re-grants it. `Regrant { old, node, grant, fingerprint, key, certificate, max_nodes }` checks, in
+order: the setting (`Off`), the entry (`Unknown`), the ban (`Banned`), a re-grant held (the same key
+answered `Granted` with the held identity and nothing spent; another key `Regranted`), the old
+member's row (`NotRemoved` unless `Removed` or delisted), the new id (`Conflict` where it is 0, the
+old id, a node the table holds or another entry's), the issuer's window (`Stale { top }` for a grant
+it spent or passed), and the table's room (`Full` where the table, less the old member it still
+holds, has `max_nodes` nodes); applied, the issuer's grant is spent and the entry holds the new
+identity. The issuer's grant is spent at the re-grant, which numbers it, so two proposals of one
+number are one grant and one `Stale`. A running node takes `ban ID` and `rejoin automatic|off` on
+standard input as it takes `gone ID`, each asked of the root range in the order stated and said
+back with its outcome (`ban 4 Banned`, `rejoin off Kept`), and says the ledger and the setting as
+they move: `ledger ID open`, `ledger ID banned`, `ledger ID regranted NEW`, `ledger ID evicted` and
+`rejoin automatic|off`. Left to slice 5: `SameKey` and `Unissued`, which need the handshake's old
+certificate and the issuer's key; and `Join`'s use of the issuer's window and its drop of its
+predecessor's entry, which need the directory's rule 4 to say the issuer signed the joiner.
+
 **What stays forbidden.** The old identity is never admitted again: its grant stays spent in its
 issuer's window and its member written off. A re-grant draws a new id and refuses the old key. The
 issuer signs node certificates alone, never a CA, a gateway's or a client's, and the directory

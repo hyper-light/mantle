@@ -329,6 +329,15 @@ impl Answer {
                     }
                     root::Outcome::Holding => w.u8(11),
                     root::Outcome::Delisted => w.u8(12),
+                    root::Outcome::Banned => w.u8(13),
+                    root::Outcome::Off => w.u8(14),
+                    root::Outcome::NotRemoved => w.u8(15),
+                    root::Outcome::Regranted => w.u8(16),
+                    root::Outcome::Granted { node, grant } => {
+                        w.u8(17);
+                        w.u64(*node);
+                        w.u64(*grant);
+                    }
                 }
             }
         }
@@ -393,6 +402,14 @@ impl Answer {
                     10 => root::Outcome::Stale { top: r.u64()? },
                     11 => root::Outcome::Holding,
                     12 => root::Outcome::Delisted,
+                    13 => root::Outcome::Banned,
+                    14 => root::Outcome::Off,
+                    15 => root::Outcome::NotRemoved,
+                    16 => root::Outcome::Regranted,
+                    17 => root::Outcome::Granted {
+                        node: r.u64()?,
+                        grant: r.u64()?,
+                    },
                     _ => return None,
                 }),
                 _ => return None,
@@ -613,10 +630,13 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u32(j.max_nodes);
             w.u32(j.max_volumes);
         }
-        Command::Root(root::Command::Gone { node, .. }) => {
+        Command::Root(root::Command::Gone {
+            node, max_nodes, ..
+        }) => {
             w.u8(5);
             w.u8(12);
             w.u64(*node);
+            w.u32(*max_nodes);
         }
         Command::Root(root::Command::Remove { node }) => {
             w.u8(5);
@@ -627,6 +647,30 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u8(5);
             w.u8(14);
             w.u64(*node);
+        }
+        Command::Root(root::Command::Ban {
+            node, max_nodes, ..
+        }) => {
+            w.u8(5);
+            w.u8(15);
+            w.u64(*node);
+            w.u32(*max_nodes);
+        }
+        Command::Root(root::Command::Rejoin(setting)) => {
+            w.u8(5);
+            w.u8(16);
+            w.u8(setting.code());
+        }
+        Command::Root(root::Command::Regrant(g)) => {
+            w.u8(5);
+            w.u8(17);
+            w.u64(g.old);
+            w.u64(g.node);
+            w.u64(g.grant);
+            w.bytes(&g.fingerprint);
+            w.bytes(&g.key);
+            record::put_bytes(w, &g.certificate)?;
+            w.u32(g.max_nodes);
         }
         // What a corrupt command asked is unknown: there is nothing to encode.
         Command::Corrupt => return Err(RecordError::Corrupt("a corrupt command")),
@@ -926,10 +970,26 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
             }
             12 => root::Command::Gone {
                 node: r.u64()?,
+                max_nodes: r.u32()?,
                 at_ns,
             },
             13 => root::Command::Remove { node: r.u64()? },
             14 => root::Command::Delist { node: r.u64()? },
+            15 => root::Command::Ban {
+                node: r.u64()?,
+                max_nodes: r.u32()?,
+                at_ns,
+            },
+            16 => root::Command::Rejoin(record::Rejoin::of(r.u8()?)?),
+            17 => root::Command::Regrant(root::Regrant {
+                old: r.u64()?,
+                node: r.u64()?,
+                grant: r.u64()?,
+                fingerprint: r.take(crate::record::FINGERPRINT)?.try_into().ok()?,
+                key: r.take(crate::record::PUBLIC_KEY)?.try_into().ok()?,
+                certificate: record::take_bytes(r)?,
+                max_nodes: r.u32()?,
+            }),
             tag => root::Command::Principal(take_principal(tag, r, at_ns)?),
         }),
         _ => return None,
@@ -2996,9 +3056,14 @@ mod tests {
                 max_volumes: 10,
                 at_ns,
             })),
-            Command::Root(root::Command::Gone { node: 4, at_ns }),
+            Command::Root(root::Command::Gone {
+                node: 4,
+                max_nodes: 5,
+                at_ns,
+            }),
             Command::Root(root::Command::Gone {
                 node: u64::MAX,
+                max_nodes: u32::MAX,
                 at_ns,
             }),
             Command::Root(root::Command::Remove { node: 4 }),
@@ -3030,6 +3095,26 @@ mod tests {
         commands.extend(operated);
         // Last, so every command before keeps the session its golden vector was written with.
         commands.push(Command::File(file::Command::Release { file: u128::MAX }));
+        // Since 2026-11-18, after it, so every earlier command's vector keeps its line: the
+        // ledger's commands (membership.md §5.1).
+        commands.extend([
+            Command::Root(root::Command::Ban {
+                node: u64::MAX,
+                max_nodes: 5,
+                at_ns,
+            }),
+            Command::Root(root::Command::Rejoin(record::Rejoin::Off)),
+            Command::Root(root::Command::Rejoin(record::Rejoin::Automatic)),
+            Command::Root(root::Command::Regrant(root::Regrant {
+                old: 4,
+                node: u64::MAX,
+                grant: u64::MAX,
+                fingerprint: [7; crate::record::FINGERPRINT],
+                key: [9; crate::record::PUBLIC_KEY],
+                certificate: vec![0x30, 0x82, 0x01, 0x0a],
+                max_nodes: u32::MAX,
+            })),
+        ]);
         commands
     }
 
@@ -3385,6 +3470,21 @@ mod tests {
         answers.push(Answer::File(file::Outcome::Released));
         // Last, so every answer before keeps the line its golden vector was written on.
         answers.push(Answer::Corrupt);
+        // Since 2026-11-18, after it, so every earlier answer's vector keeps its line: the
+        // ledger's answers (membership.md §5.1).
+        answers.extend(
+            [
+                root::Outcome::Banned,
+                root::Outcome::Off,
+                root::Outcome::NotRemoved,
+                root::Outcome::Regranted,
+                root::Outcome::Granted {
+                    node: u64::MAX,
+                    grant: 1,
+                },
+            ]
+            .map(Answer::Root),
+        );
         answers
     }
 

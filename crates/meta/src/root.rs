@@ -33,8 +33,8 @@ use crate::clock;
 use crate::engine::{Rows, Write};
 use crate::error::{MetaError, reserved};
 use crate::record::{
-    Census, FINGERPRINT, Grants, History, Member, MemberState as State, Membership, Presence,
-    VolumeRow, VolumeStanding, VolumeState,
+    Census, FINGERPRINT, Grants, History, Ledgered, Member, MemberState as State, Membership,
+    PUBLIC_KEY, Presence, Regranted, Rejoin, VolumeRow, VolumeStanding, VolumeState, WrittenOff,
 };
 use crate::{key, principal};
 
@@ -76,9 +76,12 @@ pub enum Command {
     Join(Join),
     /// A member gone for good (membership.md §5), every volume of it gone in the same entry:
     /// judged so by the root range's leader, its presence away past what the cell's durability
-    /// model lets a chunk stay lost, or stated so by an operator, a supervisor or repair.
+    /// model lets a chunk stay lost, or stated so by an operator, a supervisor or repair. Its
+    /// identity enters the ledger of those that may come back (§5.1), which holds at most
+    /// `max_nodes`, the cell's bound on nodes.
     Gone {
         node: u64,
+        max_nodes: u32,
         at_ns: u64,
     },
     /// A member leaving or gone, with no volume left, removed (membership.md §4, §5).
@@ -90,6 +93,34 @@ pub enum Command {
     Delist {
         node: u64,
     },
+    /// `node` banned by a person who knows its machine is no longer the cell's (membership.md
+    /// §5.1): a member serving or leaving is written off as `Gone` writes it off, and its ledger
+    /// entry is banned, so it is never re-granted.
+    Ban {
+        node: u64,
+        max_nodes: u32,
+        at_ns: u64,
+    },
+    /// The cell's setting for a written-off node coming back (membership.md §5.1).
+    Rejoin(Rejoin),
+    /// A written-off identity re-granted as a new one (membership.md §5.1 step 3).
+    Regrant(Regrant),
+}
+
+/// A written-off node's identity re-granted (membership.md §5.1 step 3): the old node, and the
+/// new identity the root range's leader made for it, a new id, the issuer's next grant, its
+/// certificate's SHA-256, the public key it certifies and the certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Regrant {
+    pub old: u64,
+    pub node: u64,
+    pub grant: u64,
+    pub fingerprint: [u8; FINGERPRINT],
+    pub key: [u8; PUBLIC_KEY],
+    pub certificate: Vec<u8>,
+    /// The most nodes the cell holds, as it states them: the issuer's grant window is as wide
+    /// (membership.md §5.1).
+    pub max_nodes: u32,
 }
 
 /// Whether the cell sees `node` now, as the node that leads the root range judges it by its
@@ -186,6 +217,20 @@ pub enum Outcome {
     /// A removal of a member serving, or with volumes left, or a delisting of a member not
     /// removed: nothing changed.
     Holding,
+    /// The node is banned (membership.md §5.1): a ban taken, or a re-grant of a banned identity,
+    /// refused.
+    Banned,
+    /// A re-grant refused: the cell's setting is `rejoin off`.
+    Off,
+    /// A re-grant refused: the old member is not removed, so its volumes may still hold a chunk no
+    /// other copy holds (membership.md §5.1, *Only once nothing on its disks is needed*).
+    NotRemoved,
+    /// A re-grant refused: the identity was re-granted to another key, once, as a copied disk
+    /// yields one member and not two.
+    Regranted,
+    /// The identity is re-granted as `node` under the issuer's `grant`: anew, or again to the key
+    /// it was re-granted to, which is answered the certificate the ledger holds.
+    Granted { node: u64, grant: u64 },
 }
 
 /// A volume as the table holds it, with its node's failure domain.
@@ -250,9 +295,20 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Retire { volume, at_ns } => retire(engine, *volume, *at_ns)?,
         Command::Forget { volume } => forget(engine, *volume)?,
         Command::Join(j) => join(engine, j)?,
-        Command::Gone { node, at_ns } => gone(engine, *node, *at_ns)?,
+        Command::Gone {
+            node,
+            max_nodes,
+            at_ns,
+        } => gone(engine, *node, *max_nodes, *at_ns)?,
         Command::Remove { node } => remove(engine, *node)?,
         Command::Delist { node } => delist(engine, *node)?,
+        Command::Ban {
+            node,
+            max_nodes,
+            at_ns,
+        } => ban(engine, *node, *max_nodes, *at_ns)?,
+        Command::Rejoin(setting) => set_rejoin(engine, *setting)?,
+        Command::Regrant(g) => regrant(engine, g)?,
     };
     engine.apply(index, writes)?;
     Ok(outcome)
@@ -477,24 +533,201 @@ fn join<E: Rows>(engine: &mut E, j: &Join) -> Result<(Outcome, Vec<Write>), Meta
 }
 
 /// A member gone for good (membership.md §5): serving or leaving, it is gone from now on, and every
-/// volume of it gone in the same entry, so repair rebuilds its chunks at once (membership.md §8).
+/// volume of it gone in the same entry, so repair rebuilds its chunks at once (membership.md §8);
+/// and its identity enters the ledger of those that may come back (§5.1).
 fn gone<E: Rows>(
     engine: &mut E,
     node: u64,
+    max_nodes: u32,
     at_ns: u64,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
-    let Some(mut s) = membership(engine, node)? else {
+    let Some(s) = membership(engine, node)? else {
         return Ok((Outcome::Unknown, Vec::new()));
     };
     match s.state {
-        State::Gone => return Ok((Outcome::Gone, Vec::new())),
-        State::Removed => return Ok((Outcome::Removed, Vec::new())),
-        State::Serving | State::Leaving => {}
+        State::Gone => Ok((Outcome::Gone, Vec::new())),
+        State::Removed => Ok((Outcome::Removed, Vec::new())),
+        State::Serving | State::Leaving => Ok((
+            Outcome::Gone,
+            written_off(engine, node, s, false, max_nodes, at_ns)?,
+        )),
     }
-    s.state = State::Gone;
-    let mut writes = vec![Write::Put(key::standing(node), s.encode()?)];
+}
+
+/// What writing off member `node`, serving or leaving under `standing`, writes: its standing
+/// `Gone`, every volume of it gone, and its ledger entry, banned or not, the oldest entries
+/// evicted past `max_nodes` (membership.md §5.1: "one past it evicts the oldest written off").
+fn written_off<E: Rows>(
+    engine: &mut E,
+    node: u64,
+    mut standing: Membership,
+    banned: bool,
+    max_nodes: u32,
+    at_ns: u64,
+) -> Result<Vec<Write>, MetaError> {
+    standing.state = State::Gone;
+    let mut writes = vec![Write::Put(key::standing(node), standing.encode()?)];
     writes.extend(volumes_written(engine, node, VolumeStanding::Gone, at_ns)?);
-    Ok((Outcome::Gone, writes))
+    // A cell that states no bound on nodes holds no member and so no entry; an identity is written
+    // off once, and an entry it holds already is kept as it is.
+    if max_nodes == 0 || ledgered(engine, node)?.is_some() {
+        return Ok(writes);
+    }
+    let mut count = ledger_count(engine)?;
+    let entry = Ledgered {
+        order: count.added,
+        grant: standing.grant,
+        fingerprint: standing.fingerprint,
+        banned,
+        regranted: None,
+    };
+    writes.push(Write::Put(key::ledger(node), entry.encode()?));
+    let held = usize::try_from(count.held).map_err(|_| MetaError::Corrupt)?;
+    let mut entries = ledger(engine, held)?;
+    // With the new entry, the ledger holds one more than it held: those past the bound go, the
+    // oldest written off first, and none where it is within it. The new entry is the youngest, and
+    // the bound at least one.
+    let over = count
+        .held
+        .checked_add(1)
+        .ok_or(MetaError::Corrupt)?
+        .saturating_sub(max_nodes);
+    entries.sort_unstable_by_key(|(_, e)| e.order);
+    let mut evicted = 0u32;
+    for (old, _) in entries
+        .iter()
+        .take(usize::try_from(over).map_err(|_| MetaError::Corrupt)?)
+    {
+        writes.push(Write::Delete(key::ledger(*old)));
+        evicted = evicted.checked_add(1).ok_or(MetaError::Corrupt)?;
+    }
+    count.added = count.added.checked_add(1).ok_or(MetaError::Corrupt)?;
+    count.held = count
+        .held
+        .checked_add(1)
+        .and_then(|held| held.checked_sub(evicted))
+        .ok_or(MetaError::Corrupt)?;
+    writes.push(Write::Put(key::written_off(), count.encode()));
+    Ok(writes)
+}
+
+/// A ban (membership.md §5.1): a member serving or leaving written off as `Gone` writes it off,
+/// its entry banned; a written-off one's entry banned. One written off with no entry, evicted or
+/// having left in order, is re-granted by nothing already, and a node the table names nowhere is
+/// unknown.
+fn ban<E: Rows>(
+    engine: &mut E,
+    node: u64,
+    max_nodes: u32,
+    at_ns: u64,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if let Some(mut entry) = ledgered(engine, node)? {
+        if entry.banned {
+            return Ok((Outcome::Banned, Vec::new()));
+        }
+        entry.banned = true;
+        return Ok((
+            Outcome::Banned,
+            vec![Write::Put(key::ledger(node), entry.encode()?)],
+        ));
+    }
+    match membership(engine, node)? {
+        None => Ok((Outcome::Unknown, Vec::new())),
+        Some(s) if matches!(s.state, State::Serving | State::Leaving) => Ok((
+            Outcome::Banned,
+            written_off(engine, node, s, true, max_nodes, at_ns)?,
+        )),
+        Some(_) => Ok((Outcome::Banned, Vec::new())),
+    }
+}
+
+/// The cell's `rejoin` setting stated: written where it changes.
+fn set_rejoin<E: Rows>(
+    engine: &mut E,
+    setting: Rejoin,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    if rejoin(engine)? == setting {
+        return Ok((Outcome::Kept, Vec::new()));
+    }
+    Ok((
+        Outcome::Kept,
+        vec![Write::Put(key::rejoin(), setting.encode())],
+    ))
+}
+
+/// A written-off identity re-granted (membership.md §5.1 step 3), once: refused where the cell's
+/// setting is off, the ledger holds no entry for it, a person banned it, it was re-granted to
+/// another key, its member is not removed, the new identity names a node the table holds or the
+/// old one, the issuer's window has spent or passed the grant, or the table has no room for one
+/// more node. The same key asking again is answered as it was, and nothing changes.
+fn regrant<E: Rows>(engine: &mut E, g: &Regrant) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let refused = |outcome| Ok((outcome, Vec::new()));
+    if rejoin(engine)? == Rejoin::Off {
+        return refused(Outcome::Off);
+    }
+    let Some(mut entry) = ledgered(engine, g.old)? else {
+        return refused(Outcome::Unknown);
+    };
+    if entry.banned {
+        return refused(Outcome::Banned);
+    }
+    if let Some(held) = &entry.regranted {
+        return refused(if held.key == g.key {
+            Outcome::Granted {
+                node: held.node,
+                grant: held.grant,
+            }
+        } else {
+            Outcome::Regranted
+        });
+    }
+    if membership(engine, g.old)?.is_some_and(|s| s.state != State::Removed) {
+        return refused(Outcome::NotRemoved);
+    }
+    // The new id is new: no node the table holds, no written-off one, and none another entry was
+    // re-granted as, a read of at most the entries the ledger holds.
+    let held = usize::try_from(ledger_count(engine)?.held).map_err(|_| MetaError::Corrupt)?;
+    if g.node == 0
+        || g.node == g.old
+        || engine.get(&key::member(g.node))?.is_some()
+        || ledger(engine, held)?
+            .iter()
+            .any(|(id, e)| *id == g.node || e.regranted.as_ref().is_some_and(|r| r.node == g.node))
+    {
+        return refused(Outcome::Conflict);
+    }
+    let window = issuer_grants(engine)?;
+    if !admits(&window, g.grant, g.max_nodes) {
+        return refused(Outcome::Stale { top: window.top });
+    }
+    // The new node takes a place in the table at its join; the old one's, while the table holds
+    // it, is freed at its delisting.
+    let old_held = u32::from(engine.get(&key::member(g.old))?.is_some());
+    let others = census(engine)?
+        .nodes
+        .checked_sub(old_held)
+        .ok_or(MetaError::Corrupt)?;
+    if others >= g.max_nodes {
+        return refused(Outcome::Full);
+    }
+    let spent = spend(&window, g.grant, g.max_nodes)?;
+    entry.regranted = Some(Regranted {
+        node: g.node,
+        grant: g.grant,
+        fingerprint: g.fingerprint,
+        key: g.key,
+        certificate: g.certificate.clone(),
+    });
+    Ok((
+        Outcome::Granted {
+            node: g.node,
+            grant: g.grant,
+        },
+        vec![
+            Write::Put(key::issuer(), spent.encode()?),
+            Write::Put(key::ledger(g.old), entry.encode()?),
+        ],
+    ))
 }
 
 /// A member leaving or gone, with no volume of it left in the table, removed: its identity
@@ -836,6 +1069,55 @@ pub fn grants<E: Rows>(engine: &mut E) -> Result<Grants, MetaError> {
         Some(bytes) => Ok(Grants::decode(&bytes)?),
         None => Ok(Grants::default()),
     }
+}
+
+/// The issuer's grant window (membership.md §5.1): empty before any re-grant.
+pub fn issuer_grants<E: Rows>(engine: &mut E) -> Result<Grants, MetaError> {
+    match engine.get(&key::issuer())? {
+        Some(bytes) => Ok(Grants::decode(&bytes)?),
+        None => Ok(Grants::default()),
+    }
+}
+
+/// The cell's `rejoin` setting: automatic until stated otherwise, the owner's default
+/// (membership.md §5.1).
+pub fn rejoin<E: Rows>(engine: &mut E) -> Result<Rejoin, MetaError> {
+    match engine.get(&key::rejoin())? {
+        Some(bytes) => Ok(Rejoin::decode(&bytes)?),
+        None => Ok(Rejoin::default()),
+    }
+}
+
+/// The ledger's own count: none before any write-off.
+pub fn ledger_count<E: Rows>(engine: &mut E) -> Result<WrittenOff, MetaError> {
+    match engine.get(&key::written_off())? {
+        Some(bytes) => Ok(WrittenOff::decode(&bytes)?),
+        None => Ok(WrittenOff::default()),
+    }
+}
+
+/// Written-off node `node`'s ledger entry, if the ledger holds one.
+pub fn ledgered<E: Rows>(engine: &mut E, node: u64) -> Result<Option<Ledgered>, MetaError> {
+    match engine.get(&key::ledger(node))? {
+        Some(bytes) => Ok(Some(Ledgered::decode(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// The ledger's entries, in the order of their old nodes' ids, at most `max`.
+pub fn ledger<E: Rows>(engine: &mut E, max: usize) -> Result<Vec<(u64, Ledgered)>, MetaError> {
+    let (mut from, to) = key::ledger_rows();
+    let mut out = Vec::new();
+    while out.len() < max {
+        let Some((k, v)) = engine.next(&from, &to)? else {
+            break;
+        };
+        let node = key::decode_ledger(&k).ok_or(MetaError::Corrupt)?;
+        out.push((node, Ledgered::decode(&v)?));
+        from = k;
+        from.push(0);
+    }
+    Ok(out)
 }
 
 /// The table's volumes after `after`, or from the first, in the order of their ids, at most
@@ -1675,10 +1957,12 @@ mod tests {
             &[
                 Command::Gone {
                     node: 2,
+                    max_nodes: 5,
                     at_ns: 600,
                 },
                 Command::Gone {
                     node: 2,
+                    max_nodes: 5,
                     at_ns: 601,
                 },
                 join(2, 2, &[(20, 100)]),
@@ -1711,6 +1995,7 @@ mod tests {
                 Command::Remove { node: 2 },
                 Command::Gone {
                     node: 2,
+                    max_nodes: 5,
                     at_ns: 700,
                 },
                 Command::Delist { node: 2 },
@@ -1744,5 +2029,361 @@ mod tests {
             .collect();
         assert_eq!(ids, [1, 2, 3]);
         assert_eq!(memberships(&mut m, 2).unwrap().len(), 2);
+    }
+
+    /// A written-off identity's re-grant as `node` under the issuer's `grant`, for the key whose
+    /// every byte is `key`, in a cell of at most three nodes.
+    fn regranting(old: u64, node: u64, grant: u64, key: u8) -> Command {
+        Command::Regrant(Regrant {
+            old,
+            node,
+            grant,
+            fingerprint: [key ^ 0xff; FINGERPRINT],
+            key: [key; PUBLIC_KEY],
+            certificate: vec![0x30, key],
+            max_nodes: 3,
+        })
+    }
+
+    fn written_off_as(node: u64, max_nodes: u32) -> Command {
+        Command::Gone {
+            node,
+            max_nodes,
+            at_ns: 0,
+        }
+    }
+
+    /// Members 1, 2 and 3 joined under grants 1 to 3, each with a volume `10 * id`.
+    fn three() -> Model {
+        let mut m = Model::default();
+        let joins = [
+            join(1, 1, &[(10, 100)]),
+            join(2, 2, &[(20, 100)]),
+            join(3, 3, &[(30, 100)]),
+        ];
+        assert_eq!(applied(&mut m, 1, &joins), vec![Outcome::Joined; 3]);
+        m
+    }
+
+    /// Member `node` written off from `first`, its volume forgotten and the member removed: what
+    /// a re-grant waits for.
+    fn written_off_and_removed(m: &mut Model, first: u64, node: u64) {
+        let volume = u128::from(node) * 10;
+        let outcomes = applied(
+            m,
+            first,
+            &[
+                written_off_as(node, 3),
+                Command::Forget { volume },
+                Command::Remove { node },
+            ],
+        );
+        assert_eq!(outcomes, [Outcome::Gone, Outcome::Kept, Outcome::Removed]);
+    }
+
+    /// A judged or stated `Gone` adds the member's entry; a re-grant is refused while the member is
+    /// not removed, granted once it is, answered the same to the same key, and refused
+    /// `Regranted` to any other: a copied disk yields one member, not two.
+    #[test]
+    fn a_written_off_identity_is_regranted_once_and_only_once_removed() {
+        let mut m = three();
+        assert_eq!(
+            apply(&mut m, 4, &written_off_as(2, 3)).unwrap(),
+            Outcome::Gone
+        );
+        let entry = ledgered(&mut m, 2).unwrap().unwrap();
+        assert_eq!(
+            (
+                entry.grant,
+                entry.fingerprint,
+                entry.banned,
+                entry.regranted
+            ),
+            (2, [2; FINGERPRINT], false, None)
+        );
+        assert_eq!(
+            apply(&mut m, 5, &regranting(2, 9, 1, 7)).unwrap(),
+            Outcome::NotRemoved
+        );
+        let outcomes = applied(
+            &mut m,
+            6,
+            &[Command::Forget { volume: 20 }, Command::Remove { node: 2 }],
+        );
+        assert_eq!(outcomes, [Outcome::Kept, Outcome::Removed]);
+        assert_eq!(
+            apply(&mut m, 8, &regranting(2, 9, 1, 7)).unwrap(),
+            Outcome::Granted { node: 9, grant: 1 }
+        );
+        let held = ledgered(&mut m, 2).unwrap().unwrap().regranted.unwrap();
+        assert_eq!(
+            (held.node, held.grant, held.key, held.certificate),
+            (9, 1, [7; PUBLIC_KEY], vec![0x30, 7])
+        );
+        // The same key again, as after an answer lost to a crash: the same identity, and nothing
+        // spent.
+        assert_eq!(
+            apply(&mut m, 9, &regranting(2, 10, 2, 7)).unwrap(),
+            Outcome::Granted { node: 9, grant: 1 }
+        );
+        assert_eq!(issuer_grants(&mut m).unwrap().top, 1);
+        // Another key: a copy of the disk.
+        assert_eq!(
+            apply(&mut m, 10, &regranting(2, 11, 2, 8)).unwrap(),
+            Outcome::Regranted
+        );
+        // The issuer's grants are numbered apart from the authority's, whose window is untouched.
+        assert_eq!(grants(&mut m).unwrap().top, 3);
+        // Delisted, its entry stays spent.
+        assert_eq!(
+            apply(&mut m, 11, &Command::Delist { node: 2 }).unwrap(),
+            Outcome::Delisted
+        );
+        assert_eq!(
+            apply(&mut m, 12, &regranting(2, 11, 2, 8)).unwrap(),
+            Outcome::Regranted
+        );
+    }
+
+    /// A ban writes a member off and bans its entry, or bans a written-off one's; the setting
+    /// `off` re-grants none; a member that left in order has no entry; and each refusal changes
+    /// nothing.
+    #[test]
+    fn a_banned_identity_a_cell_set_off_and_one_that_left_are_never_regranted() {
+        use crate::engine::Engine as _;
+        let mut m = three();
+        written_off_and_removed(&mut m, 4, 2);
+        // Off: none re-granted; automatic again, the default.
+        assert_eq!(rejoin(&mut m).unwrap(), Rejoin::Automatic);
+        let outcomes = applied(
+            &mut m,
+            7,
+            &[
+                Command::Rejoin(Rejoin::Off),
+                regranting(2, 9, 1, 7),
+                Command::Rejoin(Rejoin::Automatic),
+            ],
+        );
+        assert_eq!(outcomes, [Outcome::Kept, Outcome::Off, Outcome::Kept]);
+        assert_eq!(rejoin(&mut m).unwrap(), Rejoin::Automatic);
+        // Banned: never re-granted, and a ban again changes nothing.
+        let before = m.image().unwrap();
+        let ban = |node| Command::Ban {
+            node,
+            max_nodes: 3,
+            at_ns: 0,
+        };
+        assert_eq!(apply(&mut m, 10, &ban(2)).unwrap(), Outcome::Banned);
+        assert!(ledgered(&mut m, 2).unwrap().unwrap().banned);
+        assert_ne!(m.image().unwrap(), before);
+        let banned = m.image().unwrap();
+        let outcomes = applied(&mut m, 11, &[regranting(2, 9, 1, 7), ban(2)]);
+        assert_eq!(outcomes, [Outcome::Banned, Outcome::Banned]);
+        assert_eq!(m.image().unwrap(), banned);
+        // A member serving, banned: written off as `Gone` writes it off, its entry banned.
+        assert_eq!(apply(&mut m, 13, &ban(1)).unwrap(), Outcome::Banned);
+        assert_eq!(membership(&mut m, 1).unwrap().unwrap().state, State::Gone);
+        assert_eq!(standing(&mut m, 10).unwrap(), VolumeStanding::Gone);
+        assert!(ledgered(&mut m, 1).unwrap().unwrap().banned);
+        // A member that left in order: no entry, so unknown to a re-grant.
+        let outcomes = applied(
+            &mut m,
+            14,
+            &[
+                Command::Leave { node: 3, at_ns: 0 },
+                Command::Retire {
+                    volume: 30,
+                    at_ns: 0,
+                },
+                Command::Forget { volume: 30 },
+                Command::Remove { node: 3 },
+                regranting(3, 9, 1, 7),
+                ban(42),
+            ],
+        );
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Leaving,
+                Outcome::Kept,
+                Outcome::Kept,
+                Outcome::Removed,
+                Outcome::Unknown,
+                Outcome::Unknown
+            ]
+        );
+        assert_eq!(ledgered(&mut m, 3).unwrap(), None);
+        assert_eq!(issuer_grants(&mut m).unwrap(), Grants::default());
+    }
+
+    /// The issuer's window spends each of its grants once: a grant spent, or passed, is refused
+    /// `Stale` with the window's top, and one above it or unspent within it is granted; a new
+    /// identity naming a node the table holds is a conflict; and a table with no room for one more
+    /// node refuses `Full`.
+    #[test]
+    fn the_issuers_window_refuses_a_stale_grant_and_a_full_table_refuses_a_regrant() {
+        let mut m = three();
+        written_off_and_removed(&mut m, 4, 2);
+        written_off_and_removed(&mut m, 7, 3);
+        let outcomes = applied(
+            &mut m,
+            10,
+            &[
+                regranting(2, 9, 0, 7),
+                regranting(2, 1, 1, 7),
+                regranting(2, 9, 1, 7),
+                regranting(3, 10, 1, 8),
+            ],
+        );
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Stale { top: 0 },
+                Outcome::Conflict,
+                Outcome::Granted { node: 9, grant: 1 },
+                Outcome::Stale { top: 1 },
+            ]
+        );
+        // A new id another entry was re-granted as, or a written-off one, is no new id.
+        let outcomes = applied(
+            &mut m,
+            14,
+            &[regranting(3, 9, 2, 8), regranting(3, 2, 2, 8)],
+        );
+        assert_eq!(outcomes, [Outcome::Conflict, Outcome::Conflict]);
+        // Granted above the top, the window moves past grants it never spent; one below it, and
+        // within it, is granted still.
+        assert_eq!(
+            apply(&mut m, 16, &regranting(3, 10, 3, 8)).unwrap(),
+            Outcome::Granted { node: 10, grant: 3 }
+        );
+        let window = issuer_grants(&mut m).unwrap();
+        assert!(admits(&window, 2, 3));
+        assert!(!admits(&window, 1, 3) && !admits(&window, 3, 3));
+        // The table full: its old members delisted and a new one joined, three of three.
+        let mut full = three();
+        written_off_and_removed(&mut full, 4, 2);
+        let outcomes = applied(
+            &mut full,
+            7,
+            &[
+                Command::Delist { node: 2 },
+                join(4, 4, &[(40, 100)]),
+                regranting(2, 9, 1, 7),
+            ],
+        );
+        assert_eq!(
+            outcomes,
+            [Outcome::Delisted, Outcome::Joined, Outcome::Full]
+        );
+    }
+
+    /// The ledger holds at most the cell's nodes: one written off past them evicts the oldest
+    /// written off, whose node then needs the authority's grant.
+    #[test]
+    fn the_ledger_evicts_its_oldest_past_the_cells_nodes() {
+        let mut m = three();
+        let outcomes = applied(
+            &mut m,
+            4,
+            &[
+                written_off_as(1, 2),
+                written_off_as(3, 2),
+                written_off_as(2, 2),
+            ],
+        );
+        assert_eq!(outcomes, vec![Outcome::Gone; 3]);
+        let held: Vec<u64> = ledger(&mut m, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(held, [2, 3]);
+        assert_eq!(
+            ledger_count(&mut m).unwrap(),
+            WrittenOff { added: 3, held: 2 }
+        );
+        // A gone member stated gone again adds nothing.
+        assert_eq!(
+            apply(&mut m, 7, &written_off_as(2, 2)).unwrap(),
+            Outcome::Gone
+        );
+        assert_eq!(ledger_count(&mut m).unwrap().held, 2);
+    }
+
+    /// Every command of the ledger applies the same on every member: two members applying the
+    /// same entries hold the same rows and answer the same.
+    #[test]
+    fn the_ledgers_commands_apply_the_same_on_every_member() {
+        use crate::engine::Engine as _;
+        let commands = [
+            join(1, 1, &[(10, 100)]),
+            join(2, 2, &[(20, 100)]),
+            join(3, 3, &[(30, 100)]),
+            written_off_as(2, 3),
+            regranting(2, 9, 1, 7),
+            Command::Forget { volume: 20 },
+            Command::Remove { node: 2 },
+            Command::Rejoin(Rejoin::Off),
+            regranting(2, 9, 1, 7),
+            Command::Rejoin(Rejoin::Automatic),
+            regranting(2, 9, 1, 7),
+            regranting(2, 9, 1, 8),
+            Command::Ban {
+                node: 3,
+                max_nodes: 3,
+                at_ns: 0,
+            },
+            regranting(3, 10, 2, 9),
+        ];
+        let (mut a, mut b) = (Model::default(), Model::default());
+        let answered = applied(&mut a, 1, &commands);
+        assert_eq!(applied(&mut b, 1, &commands), answered);
+        assert_eq!(a.image().unwrap(), b.image().unwrap());
+        assert_eq!(
+            answered[4..],
+            [
+                Outcome::NotRemoved,
+                Outcome::Kept,
+                Outcome::Removed,
+                Outcome::Kept,
+                Outcome::Off,
+                Outcome::Kept,
+                Outcome::Granted { node: 9, grant: 1 },
+                Outcome::Regranted,
+                Outcome::Banned,
+                Outcome::Banned,
+            ]
+        );
+    }
+
+    /// The ledger's rows read back as written, and a flipped bit anywhere is refused.
+    #[test]
+    fn the_ledgers_rows_read_back_and_damage_is_corrupt() {
+        let entry = Ledgered {
+            order: 7,
+            grant: u64::MAX,
+            fingerprint: [3; FINGERPRINT],
+            banned: true,
+            regranted: Some(Regranted {
+                node: 9,
+                grant: 1,
+                fingerprint: [4; FINGERPRINT],
+                key: [5; PUBLIC_KEY],
+                certificate: vec![6; 300],
+            }),
+        };
+        let bytes = entry.encode().unwrap();
+        assert_eq!(Ledgered::decode(&bytes).unwrap(), entry);
+        for i in 0..bytes.len() * 8 {
+            let mut damaged = bytes.clone();
+            damaged[i / 8] ^= 1 << (i % 8);
+            assert!(Ledgered::decode(&damaged).is_err());
+        }
+        let count = WrittenOff { added: 3, held: 2 };
+        assert_eq!(WrittenOff::decode(&count.encode()).unwrap(), count);
+        for setting in [Rejoin::Automatic, Rejoin::Off] {
+            assert_eq!(Rejoin::decode(&setting.encode()).unwrap(), setting);
+        }
     }
 }

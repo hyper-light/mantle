@@ -694,6 +694,51 @@ pub struct Grants {
     pub seen: Vec<u8>,
 }
 
+/// The bytes of a node's public key: an Ed25519 key's 32 (RFC 8032 §5.1.5).
+pub const PUBLIC_KEY: usize = 32;
+
+/// An entry of the ledger of written-off identities that may come back (docs/design/membership.md
+/// §5.1), keyed by the old node's id: when it was written off, as the ledger's count of entries
+/// added then stood, which orders its eviction; the old identity's grant and certificate's
+/// SHA-256; whether a person banned it; and, once re-granted, the new identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ledgered {
+    pub order: u64,
+    pub grant: u64,
+    pub fingerprint: [u8; FINGERPRINT],
+    pub banned: bool,
+    pub regranted: Option<Regranted>,
+}
+
+/// The identity a written-off one was re-granted as: its id, the issuer's grant it carries, its
+/// certificate's SHA-256, the public key it certifies and the certificate itself, which the same
+/// key asking again is answered (docs/design/membership.md §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Regranted {
+    pub node: u64,
+    pub grant: u64,
+    pub fingerprint: [u8; FINGERPRINT],
+    pub key: [u8; PUBLIC_KEY],
+    pub certificate: Vec<u8>,
+}
+
+/// The ledger's own count: the entries it has ever added, which numbers each one's order, and the
+/// entries it holds, at most the cell's nodes (docs/design/membership.md §5.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WrittenOff {
+    pub added: u64,
+    pub held: u32,
+}
+
+/// The cell's setting for a written-off node coming back (docs/design/membership.md §5.1):
+/// re-granted on its own, the owner's default, or never.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Rejoin {
+    #[default]
+    Automatic,
+    Off,
+}
+
 /// A reverse row: which chunk of its block the volume in its key holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reverse {
@@ -1560,6 +1605,105 @@ impl Grants {
             })
         })();
         decoded(grants, &r, "grants")
+    }
+}
+
+impl Ledgered {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        record(|w| {
+            w.u64(self.order);
+            w.u64(self.grant);
+            w.bytes(&self.fingerprint);
+            w.u8(u8::from(self.banned));
+            match &self.regranted {
+                None => w.u8(0),
+                Some(r) => {
+                    w.u8(1);
+                    w.u64(r.node);
+                    w.u64(r.grant);
+                    w.bytes(&r.fingerprint);
+                    w.bytes(&r.key);
+                    put_bytes(w, &r.certificate)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "ledger")?;
+        let entry = (|| {
+            Some(Self {
+                order: r.u64()?,
+                grant: r.u64()?,
+                fingerprint: r.take(FINGERPRINT)?.try_into().ok()?,
+                banned: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                regranted: match r.u8()? {
+                    0 => None,
+                    1 => Some(Regranted {
+                        node: r.u64()?,
+                        grant: r.u64()?,
+                        fingerprint: r.take(FINGERPRINT)?.try_into().ok()?,
+                        key: r.take(PUBLIC_KEY)?.try_into().ok()?,
+                        certificate: take_bytes(&mut r)?,
+                    }),
+                    _ => return None,
+                },
+            })
+        })();
+        decoded(entry, &r, "ledger")
+    }
+}
+
+impl WrittenOff {
+    pub fn encode(&self) -> Vec<u8> {
+        sealed(|w| {
+            w.u64(self.added);
+            w.u32(self.held);
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "written off")?;
+        let count = (|| {
+            Some(Self {
+                added: r.u64()?,
+                held: r.u32()?,
+            })
+        })();
+        decoded(count, &r, "written off")
+    }
+}
+
+impl Rejoin {
+    /// The setting's byte in its row and in the command that states it.
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Self::Automatic => 0,
+            Self::Off => 1,
+        }
+    }
+
+    pub(crate) fn of(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Automatic),
+            1 => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        sealed(|w| w.u8(self.code()))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "rejoin")?;
+        let setting = r.u8().and_then(Self::of);
+        decoded(setting, &r, "rejoin")
     }
 }
 
@@ -2824,6 +2968,39 @@ mod tests {
             hex(operation_rows()[1].encode().unwrap()),
             hex(operation_rows()[2].encode().unwrap()),
             hex(operation_rows()[3].encode().unwrap()),
+            // Since 2026-11-18: the ledger's rows (membership.md §5.1), last, so every earlier
+            // row's vector keeps its line.
+            hex(Ledgered {
+                order: 7,
+                grant: 2,
+                fingerprint: [3; FINGERPRINT],
+                banned: false,
+                regranted: None,
+            }
+            .encode()
+            .unwrap()),
+            hex(Ledgered {
+                order: u64::MAX,
+                grant: u64::MAX,
+                fingerprint: [3; FINGERPRINT],
+                banned: true,
+                regranted: Some(Regranted {
+                    node: u64::MAX,
+                    grant: 1,
+                    fingerprint: [4; FINGERPRINT],
+                    key: [5; PUBLIC_KEY],
+                    certificate: vec![0x30, 0x82, 0x01, 0x0a],
+                }),
+            }
+            .encode()
+            .unwrap()),
+            hex(WrittenOff {
+                added: u64::MAX,
+                held: u32::MAX,
+            }
+            .encode()),
+            hex(Rejoin::Automatic.encode()),
+            hex(Rejoin::Off.encode()),
         ]
     }
 

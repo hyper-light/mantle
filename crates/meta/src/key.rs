@@ -711,6 +711,13 @@ const STATE: u8 = 8;
 const STANDING: u8 = 9;
 const GRANTS: u8 = 10;
 const RETIRED: u8 = 11;
+/// After `RETIRED`: the ledger's entries of written-off identities that may come back, its own
+/// count, the issuer's grant window and the cell's `rejoin` setting (docs/design/membership.md
+/// §5.1).
+const LEDGER: u8 = 12;
+const WRITTEN_OFF: u8 = 13;
+const ISSUER: u8 = 14;
+const REJOIN: u8 = 15;
 
 /// The key of the root range's census: how many nodes and volumes its table holds.
 pub fn census() -> Vec<u8> {
@@ -778,6 +785,37 @@ pub fn grants() -> Vec<u8> {
 /// The key of the removed nodes' history, their totals added together.
 pub fn retired() -> Vec<u8> {
     vec![DATA, RETIRED]
+}
+
+/// The key of the ledger's entry for written-off node `node` (docs/design/membership.md §5.1).
+pub fn ledger(node: u64) -> Vec<u8> {
+    numbered(LEDGER, &node.to_be_bytes())
+}
+
+/// The first key of the ledger's entries and a key past the last.
+pub fn ledger_rows() -> (Vec<u8>, Vec<u8>) {
+    (vec![DATA, LEDGER], vec![DATA, LEDGER.saturating_add(1)])
+}
+
+/// The written-off node a ledger entry's key names.
+pub fn decode_ledger(k: &[u8]) -> Option<u64> {
+    let rest = k.strip_prefix(&[DATA, LEDGER])?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// The key of the ledger's own count.
+pub fn written_off() -> Vec<u8> {
+    vec![DATA, WRITTEN_OFF]
+}
+
+/// The key of the issuer's grant window (docs/design/membership.md §5.1).
+pub fn issuer() -> Vec<u8> {
+    vec![DATA, ISSUER]
+}
+
+/// The key of the cell's `rejoin` setting (docs/design/membership.md §5.1).
+pub fn rejoin() -> Vec<u8> {
+    vec![DATA, REJOIN]
 }
 
 /// The key of volume `volume`'s row in the root range's table: volumes sort by id.

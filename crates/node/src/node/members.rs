@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use hyper_transport::{PeerId, Refusal};
 use mantle_meta::apply::Layer;
 use mantle_meta::engine::Engine;
-use mantle_meta::record::{Grants, MemberState, Membership, Presence};
+use mantle_meta::record::{Grants, Ledgered, MemberState, Membership, Presence, Rejoin};
 use mantle_meta::root;
 use mantle_meta::wire::Command;
 use mantle_range::ConfState;
@@ -51,6 +51,12 @@ pub struct Cell {
     /// before it is dropped from the root range, so it applies its own removal (membership.md §4
     /// step 5). At most the table's nodes.
     removed: Vec<(u64, u64)>,
+    /// The ledger's entries of written-off identities that may come back, in the order of their old
+    /// ids: at most the entries the ledger counts, which the cell's nodes bound (membership.md
+    /// §5.1).
+    ledger: Vec<(u64, Ledgered)>,
+    /// The cell's setting for a written-off node coming back.
+    rejoin: Rejoin,
 }
 
 impl Cell {
@@ -80,6 +86,16 @@ impl Cell {
             .ok()
             .and_then(|at| self.presences.get(at))
     }
+
+    /// The ledger's entries, in the order of their old nodes' ids (membership.md §5.1).
+    pub fn ledger(&self) -> &[(u64, Ledgered)] {
+        &self.ledger
+    }
+
+    /// The cell's setting for a written-off node coming back (membership.md §5.1).
+    pub fn rejoin(&self) -> Rejoin {
+        self.rejoin
+    }
 }
 
 /// The root range's rows the membership reads, as its member held them after an entry it applied:
@@ -95,6 +111,9 @@ pub(crate) struct Rows {
     grants: Grants,
     /// The nodes the volume table holds a volume of, sorted: at most the table's volumes.
     holding: Vec<u64>,
+    /// The ledger's entries, at most those it counts, and the cell's `rejoin` setting.
+    ledger: Vec<(u64, Ledgered)>,
+    rejoin: Rejoin,
 }
 
 impl Rows {
@@ -122,12 +141,18 @@ impl Rows {
             holding.sort_unstable();
             holding.dedup();
         }
+        let held = root::ledger_count(engine).map_err(meta)?.held;
+        let ledger =
+            root::ledger(engine, usize::try_from(held).unwrap_or(usize::MAX)).map_err(meta)?;
+        let rejoin = root::rejoin(engine).map_err(meta)?;
         Ok(Self {
             applied,
             members,
             presences,
             grants,
             holding,
+            ledger,
+            rejoin,
         })
     }
 }
@@ -240,6 +265,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             presences,
             grants,
             holding,
+            ledger,
+            rejoin,
         } = rows;
         if members.is_empty() && grants.top == 0 && self.cell.is_none() {
             // No member has joined: a cell made before grants, or one whose founders have yet to.
@@ -283,6 +310,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             presences,
             holding,
             removed,
+            ledger,
+            rejoin,
         });
         self.keep_peers()
     }
@@ -555,6 +584,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 {
                     Some(root::Command::Gone {
                         node: *id,
+                        max_nodes: self.max_nodes,
                         // The entry that carries it gives it its time.
                         at_ns: 0,
                     })

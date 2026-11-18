@@ -87,14 +87,22 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `2dd3bde` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is in
-the hyper-raft repository's own objects and not yet pushed to its origin. Its commit, `2dd3bde`,
-changes hyper-log alone (hyper-raft docs/durable.md; mantle docs/design/durability.md §7.7, step 1):
-the open reports what the persist records left of the frame after the last that reads
+**Every crate at `1cc3214` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and two commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is in
+the hyper-raft repository's own objects and not yet pushed to its origin. Its second commit,
+`1cc3214`, changes hyper-log's `format.rs` alone (mantle docs/design/durability.md §7.2 and §7.7,
+step 2a): `Pieces` lays a persist record in pieces of the device's atomic write unit, which its
+caller passes, each piece naming its record (log, sequence, what it confirms, the CRC of all its
+rows), its index, the count, the unit and a CRC of its own, format 5 and 6 sealed (format 4 is the
+sealed log's); `Pieces::decode` reads a slot's newest record whole, torn with the rows of the
+pieces that landed, or `LogError::Damaged` where a piece fails its own checksum. Nothing writes
+the pieces yet: the writer and the open still take whole records of format 3 or 4. New constants
+`FORMAT_PIECES`, `FORMAT_SEALED_PIECES` and `PIECE_HEADER_LEN`, with their rows in
+docs/design/constants.md. Its first commit, `2dd3bde`, changes hyper-log alone (hyper-raft
+docs/durable.md; mantle docs/design/durability.md §7.7, step 1): the open reports what the persist records left of the frame after the last that reads
 (`Recovery::tail`), `Torn` where no record of it reads, `Undetermined` where its record reads and
 no confirmation does, `Lost` where its confirmation reads; recovery is unchanged. No new constant.
-Every other crate is as at `85bd35f`. Before it, every crate was at `85bd35f` (hyper-raft branch
+Every other crate is as at `85bd35f`. Before them, every crate was at `85bd35f` (hyper-raft branch
 `mantle-shard-port`: `land/mantle-general-4`'s `17371e2` and six commits), with no local delta. Its
 sixth commit, `85bd35f`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.15, hyper-rt ORIGIN.md,
 "task classes"): tasks carry a class, Critical, Normal (the default) or Background, each with its

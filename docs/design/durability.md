@@ -208,8 +208,9 @@ margin left after one zone's loss.
 
 Status: design, 2026-11-17, the owner's decision 2 of research/71 ("Step 9, after"), approved
 that day. Source: research/97 (AGL+18, cited by section and page). Built: the open's account of
-the frame past the last that reads (§7.7, step 1). Until steps 2 to 4 land, a frame is answered
-only once confirmed, as raft-log.md §6 describes.
+the frame past the last that reads (§7.7, step 1), and the record in pieces, its encoding and
+decoding (step 2a). Until steps 2b to 4 land, a frame is answered only once confirmed, as
+raft-log.md §6 describes.
 
 A PUT's critical path holds seven flushes: the slowest replica's chunk, then the Block, File and
 Name commands, each a frame flushed and then confirmed by a second durable write (research/71,
@@ -254,13 +255,17 @@ group whose frame held proposals, which the record does not carry, is fenced `Da
 from its peers (raft-log.md §6). The restore is written in one frame before the log serves anyone,
 as now, so a second crash finds the same marks.
 
-The record in pieces is the one format change (format 4). AGL+18's persist record "can be
-atomically written and thus cannot be 'corrupted' due to a crash" (§3.3.3, p. 20); hyper-log's
-names every group its frame holds, and five groups span two 512-byte sectors (raft-log.md §6), so
-a crash can leave it part old and part new, and a record that no longer reads would not say which
-groups to mark. Format 4 writes a record as pieces no larger than the device's atomic write unit,
-each carrying the log's identity, the frame's sequence, its own index and the count, and a
-checksum of its own. The unit is read from the device, not assumed (CLAUDE.md §5): Linux's
+The record in pieces is the one format change: format 5, and 6 in a sealed log, whose whole records
+are format 4 (hyper-log `FORMAT_PIECES`, `FORMAT_SEALED_PIECES`). AGL+18's persist record "can be
+atomically written and thus cannot be 'corrupted' due to a crash" (§3.3.3, p. 20); hyper-log's names
+every group its frame holds, and five groups span two 512-byte sectors (raft-log.md §6), so a crash
+can leave it part old and part new, and a record that no longer reads would not say which groups to
+mark. Format 5 writes a record as pieces no larger than the device's atomic write unit, each
+carrying the log's identity, the frame's sequence, its own index and the count, and a checksum of
+its own; each also carries what the record confirms, the checksum of all the record's rows and the
+unit it was laid in, so that pieces of two writes of one sequence, a confirmation over its record or
+a restore over a lost frame's, never read as one record, and a slot is never read in another unit
+than its own. The unit is read from the device, not assumed (CLAUDE.md §5): Linux's
 `physical_block_size`, "the smallest unit a physical storage device can write atomically", and
 `atomic_write_unit_min_bytes` where present (research/02 §2.4), the physical sector size from IOKit
 on macOS and from `IOCTL_STORAGE_QUERY_PROPERTY` on Windows. A device that reports none gets the
@@ -367,8 +372,11 @@ answered. Two cases reach it:
 
 1. The open reports what it found past the last frame (`Recovery::tail`: `Torn`, `Undetermined`,
    `Lost`), recovery unchanged. Built (hyper-raft `mantle-frame-flush`).
-2. Format 4, the record in pieces of the device's atomic unit, and the open's reading of them
-   (§7.2's last two rows).
+2. Format 5, the record in pieces of the device's atomic unit, and the open's reading of them
+   (§7.2's last two rows). 2a, built (hyper-raft `mantle-frame-flush`): the record's encoding in
+   pieces and its decoding, a slot's newest record whole, torn with the rows its landed pieces
+   hold, or `LogError::Damaged`. 2b: the device's atomic write unit read from the OS, and the
+   writer and the open taking the pieces.
 3. Each frame records whether it was answered at its flush; the open restores an `Undetermined`
    frame so answered as `Lost` is, and the simulation's faults of §7.6 run against it.
 4. The writer answers a frame at its flush where §7.5 allows, and the flushes a PUT are counted.

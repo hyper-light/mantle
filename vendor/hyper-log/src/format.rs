@@ -6,8 +6,14 @@
 //! header and payload. Each entry and proposal also carries a CRC-32C of its group, index,
 //! term and bytes, so one entry read back alone is verified, and verified as the one asked
 //! for. A persist record says what one frame's flush made durable, group by group, and is
-//! checksummed as a whole.
+//! checksummed as a whole; in format 5 it is laid in pieces of the device's atomic write unit,
+//! each checksummed on its own ([`Pieces`]).
 
+use std::num::NonZeroUsize;
+
+use hyper_block::buf::Alignment;
+
+use crate::LogError;
 use crate::codec::{Reader, Writer};
 
 /// The first bytes of a segment's header: mantle-log's, kept so that hyper-log reads the files
@@ -28,6 +34,13 @@ pub const FORMAT: u8 = 3;
 /// frame and persist record ends with a MAC under the log's authentication key. A log is sealed or
 /// not from its creation, and a sealed log reads no frame of format 3.
 pub const FORMAT_SEALED: u8 = 4;
+/// 5: a persist record written in pieces, each no larger than the device's atomic write unit and
+/// checksummed on its own, so that no crash tears a piece and a piece that fails its checksum is
+/// damage (mantle docs/design/durability.md §7.2). Only persist records take it: segment headers
+/// and frames keep theirs, and a whole record of format 3 or 4 still reads ([`Persist::decode`]).
+pub const FORMAT_PIECES: u8 = 5;
+/// 6: format 5's pieces in a sealed log, each with room for its MAC after its CRC.
+pub const FORMAT_SEALED_PIECES: u8 = 6;
 
 /// Bytes of the MAC a sealed log's segment header, frame and persist record end with: a full
 /// HMAC-SHA-256 (hyper-raft docs/seal.md §5.1).
@@ -84,6 +97,11 @@ pub const PERSIST_HEADER_LEN: usize = 44;
 /// Bytes of one group in a persist record: its ID, which fields it carries, its hard state,
 /// start, entries and uncertainty.
 pub const PERSIST_GROUP_LEN: usize = 97;
+/// Bytes of a piece of a persist record before its rows: magic 4, format 1, the base-2 logarithm
+/// of the atomic write unit it was laid in 1, padding 2, the log's ID 16, the frame's sequence and
+/// the last sequence known flushed 8 each, the CRC-32C of every row of the record 4, the piece's
+/// index, the count of pieces and the rows it holds 4 each.
+pub const PIECE_HEADER_LEN: usize = 56;
 
 /// A segment's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1021,6 +1039,51 @@ fn persist_header(bytes: &[u8]) -> Option<(u128, u64, u64, usize, bool)> {
     Some((log, sequence, confirms, count, sealed))
 }
 
+/// One group's row of a persist record's bytes, as a whole record and each of its pieces carry it.
+fn row(g: &Persisted) -> Option<[u8; PERSIST_GROUP_LEN]> {
+    let mut flags = 0u8;
+    for (set, flag) in [
+        (g.hard_state.is_some(), HAS_HARD_STATE),
+        (g.start.is_some(), HAS_START),
+        (g.entries.is_some(), HAS_ENTRIES),
+        (g.uncertain.is_some(), HAS_UNCERTAIN),
+        (g.removed, IS_REMOVED),
+        (g.proposals, HAS_PROPOSALS),
+        (g.damaged, IS_DAMAGED),
+        (
+            g.hard_state.is_some_and(|hard| hard.held.is_some()),
+            HARD_STATE_HELD_FLAG,
+        ),
+    ] {
+        if set {
+            flags |= flag;
+        }
+    }
+    let hard = g.hard_state.unwrap_or_default();
+    let start = g.start.unwrap_or_default();
+    let entries = g.entries.unwrap_or_default();
+    let uncertain = g.uncertain.unwrap_or_default();
+    let mut out = [0u8; PERSIST_GROUP_LEN];
+    let mut f = Fixed::new(&mut out);
+    f.bytes(&g.group.to_le_bytes())?;
+    f.bytes(&[flags])?;
+    for field in [
+        hard.term,
+        hard.vote,
+        hard.commit,
+        start.index,
+        start.term,
+        entries.first,
+        entries.count,
+        entries.term,
+        uncertain.index,
+        uncertain.term,
+    ] {
+        f.bytes(&field.to_le_bytes())?;
+    }
+    (f.at == PERSIST_GROUP_LEN).then_some(out)
+}
+
 /// One group's row of a persist record.
 fn persisted(r: &mut Reader<'_>) -> Option<Persisted> {
     let group = r.u128()?;
@@ -1082,40 +1145,7 @@ impl Persist {
         w.u64(self.confirms);
         w.u32(u32::try_from(self.groups.len()).ok()?);
         for g in &self.groups {
-            let mut flags = 0u8;
-            for (set, flag) in [
-                (g.hard_state.is_some(), HAS_HARD_STATE),
-                (g.start.is_some(), HAS_START),
-                (g.entries.is_some(), HAS_ENTRIES),
-                (g.uncertain.is_some(), HAS_UNCERTAIN),
-                (g.removed, IS_REMOVED),
-                (g.proposals, HAS_PROPOSALS),
-                (g.damaged, IS_DAMAGED),
-                (
-                    g.hard_state.is_some_and(|hard| hard.held.is_some()),
-                    HARD_STATE_HELD_FLAG,
-                ),
-            ] {
-                if set {
-                    flags |= flag;
-                }
-            }
-            let hard = g.hard_state.unwrap_or_default();
-            let start = g.start.unwrap_or_default();
-            let entries = g.entries.unwrap_or_default();
-            let uncertain = g.uncertain.unwrap_or_default();
-            w.u128(g.group);
-            w.u8(flags);
-            w.u64(hard.term);
-            w.u64(hard.vote);
-            w.u64(hard.commit);
-            w.u64(start.index);
-            w.u64(start.term);
-            w.u64(entries.first);
-            w.u64(entries.count);
-            w.u64(entries.term);
-            w.u64(uncertain.index);
-            w.u64(uncertain.term);
+            w.bytes(&row(g)?);
         }
         let crc = crate::codec::crc32c(w.as_slice().get(from..)?);
         w.u32(crc);
@@ -1148,6 +1178,305 @@ impl Persist {
     /// Bytes of this record as encoded, before a sealed log's MAC: what the MAC covers.
     pub fn encoded_len(&self) -> Option<usize> {
         persist_len(self.groups.len())
+    }
+}
+
+/// How a persist record is cut into pieces for a device whose atomic write unit is `unit`: format
+/// 5, and 6 in a sealed log (mantle docs/design/durability.md §7.2). Piece `i` lies `i` units into
+/// the record's slot: its header, its rows, its CRC over both, a sealed log's MAC, then zeros to
+/// the unit. Written at an offset the unit divides, a piece is one write the device makes
+/// atomically, so a crash leaves each piece old or new, never torn. Every piece names its record:
+/// the log, the frame's sequence, what the record confirms and the CRC of all its rows, so pieces
+/// of two writes never read as one record; and the unit it was laid in, so a slot is never read in
+/// another's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pieces {
+    /// Bytes of each piece's place: the device's atomic write unit.
+    unit: Alignment,
+    /// Rows one piece holds.
+    rows: NonZeroUsize,
+    /// Whether the pieces are a sealed log's: format 6, room for a MAC after each CRC.
+    sealed: bool,
+}
+
+/// What a persist slot written in pieces holds: the newest record its pieces name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pieced {
+    /// No piece: nothing was written there in pieces.
+    Empty,
+    /// Every piece of the record reads at its place: the record.
+    Whole(Persist),
+    /// Some of the record's pieces read at their places, each whole, and the others hold zeros or
+    /// another record's pieces: the record's write never ended. Its groups are the rows of the
+    /// pieces that landed.
+    Torn(Persist),
+}
+
+/// A piece's header as decoded from a piece whose CRC holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Piece {
+    sealed: bool,
+    log: u128,
+    sequence: u64,
+    confirms: u64,
+    /// The CRC-32C of every row of the record.
+    rows_crc: u32,
+    index: u32,
+    count: u32,
+    rows: u32,
+}
+
+impl Piece {
+    /// Whether `other` is a piece of the same write of the same record.
+    fn same_record(&self, other: &Self) -> bool {
+        (
+            self.sealed,
+            self.log,
+            self.sequence,
+            self.confirms,
+            self.rows_crc,
+            self.count,
+        ) == (
+            other.sealed,
+            other.log,
+            other.sequence,
+            other.confirms,
+            other.rows_crc,
+            other.count,
+        )
+    }
+}
+
+/// One unit of a slot written in pieces, as read.
+enum Unit<'a> {
+    /// Zeros: nothing written there.
+    Zero,
+    /// A piece whose CRC holds: its header and the bytes of its rows.
+    Piece(Piece, &'a [u8]),
+    /// Neither: a piece that fails its own checksum, or bytes no write of a piece leaves.
+    Damaged,
+}
+
+/// A piece that fails its own checksum where the newest record's pieces go.
+const DAMAGED_PIECE: LogError =
+    LogError::Damaged("a persist record's piece fails its own checksum");
+
+impl Pieces {
+    /// The layout for a device whose atomic write unit is `unit`, as the device reports it; `None`
+    /// when a piece that size holds no row.
+    pub fn new(unit: Alignment, sealed: bool) -> Option<Self> {
+        let room = unit
+            .get()
+            .checked_sub(PIECE_HEADER_LEN)?
+            .checked_sub(4)?
+            .checked_sub(if sealed { MAC_LEN } else { 0 })?;
+        let rows = NonZeroUsize::new(room.checked_div(PERSIST_GROUP_LEN)?)?;
+        Some(Self { unit, rows, sealed })
+    }
+
+    /// The atomic write unit each piece fills.
+    pub fn unit(&self) -> Alignment {
+        self.unit
+    }
+
+    /// Rows one piece holds.
+    pub fn rows(&self) -> usize {
+        self.rows.get()
+    }
+
+    /// Pieces a record of `groups` groups takes: one at least, as a record of no groups does.
+    pub fn count(&self, groups: usize) -> Option<usize> {
+        Some(
+            groups
+                .checked_add(self.rows.get().checked_sub(1)?)?
+                .checked_div(self.rows.get())?
+                .max(1),
+        )
+    }
+
+    /// Bytes a record of `groups` groups takes in pieces: a unit each.
+    pub fn len(&self, groups: usize) -> Option<usize> {
+        self.count(groups)?.checked_mul(self.unit.get())
+    }
+
+    /// The record's bytes in pieces; `None` when its sealing is not the layout's, or past `u32`
+    /// pieces.
+    pub fn encode(&self, record: &Persist) -> Option<Vec<u8>> {
+        let mut w = Writer::with_capacity(self.len(record.groups.len())?);
+        self.encode_into(record, &mut w)?;
+        Some(w.into_vec())
+    }
+
+    /// Appends the record's pieces to `w`, as [`Pieces::encode`] gives them. In a sealed log each
+    /// piece's MAC, over its bytes through its CRC, is the caller's to write after the CRC.
+    pub fn encode_into(&self, record: &Persist, w: &mut Writer) -> Option<()> {
+        if record.sealed != self.sealed {
+            return None;
+        }
+        let mut crc = crate::codec::Crc32c::new();
+        for g in &record.groups {
+            crc.update(&row(g)?);
+        }
+        let rows_crc = crc.finish();
+        let count = u32::try_from(self.count(record.groups.len())?).ok()?;
+        let unit = u8::try_from(self.unit.get().trailing_zeros()).ok()?;
+        let mut rows = record.groups.chunks(self.rows.get());
+        for index in 0..count {
+            let from = w.len();
+            let piece = rows.next().unwrap_or_default();
+            w.bytes(&PERSIST_MAGIC);
+            w.u8(if self.sealed {
+                FORMAT_SEALED_PIECES
+            } else {
+                FORMAT_PIECES
+            });
+            w.u8(unit);
+            w.zeros(2);
+            w.u128(record.log);
+            w.u64(record.sequence);
+            w.u64(record.confirms);
+            w.u32(rows_crc);
+            w.u32(index);
+            w.u32(count);
+            w.u32(u32::try_from(piece.len()).ok()?);
+            for g in piece {
+                w.bytes(&row(g)?);
+            }
+            let piece_crc = crate::codec::crc32c(w.as_slice().get(from..)?);
+            w.u32(piece_crc);
+            let used = w.len().checked_sub(from)?;
+            w.zeros(self.unit.get().checked_sub(used)?);
+        }
+        Some(())
+    }
+
+    /// The newest record the pieces in `slot` name. `slot` is one a log written in pieces holds:
+    /// zeros where nothing was written, and pieces. Where the newest record's pieces go, a piece that
+    /// fails its own checksum, or bytes no write of a piece leaves, is [`LogError::Damaged`]: a
+    /// piece is written atomically, so no crash leaves it so (durability.md §7.2). The units past
+    /// the newest record's hold older records' pieces and are not read. A sealed piece's MAC is the
+    /// caller's to verify, as [`Persist::decode`] leaves a whole record's.
+    pub fn decode(&self, slot: &[u8]) -> Result<Pieced, LogError> {
+        let unit = self.unit.get();
+        let mut newest: Option<Piece> = None;
+        let mut damaged = false;
+        for bytes in slot.chunks_exact(unit) {
+            match self.unit_of(bytes) {
+                Unit::Piece(p, _) => {
+                    if newest.is_none_or(|n| (p.sequence, p.confirms) > (n.sequence, n.confirms)) {
+                        newest = Some(p);
+                    }
+                }
+                Unit::Damaged => damaged = true,
+                Unit::Zero => {}
+            }
+        }
+        let Some(newest) = newest else {
+            return if damaged {
+                Err(DAMAGED_PIECE)
+            } else {
+                Ok(Pieced::Empty)
+            };
+        };
+        let count = usize::try_from(newest.count).map_err(|_| DAMAGED_PIECE)?;
+        let mut groups = Vec::new();
+        let mut whole = true;
+        let mut crc = crate::codec::Crc32c::new();
+        for index in 0..count {
+            let bytes = index
+                .checked_mul(unit)
+                .and_then(|at| slot.get(at..at.checked_add(unit)?))
+                .ok_or(LogError::Damaged(
+                    "a persist record's pieces run past its slot",
+                ))?;
+            match self.unit_of(bytes) {
+                Unit::Damaged => return Err(DAMAGED_PIECE),
+                Unit::Piece(p, rows) if p.same_record(&newest) => {
+                    if usize::try_from(p.index).ok() != Some(index) {
+                        return Err(LogError::Damaged(
+                            "a persist record's piece lies out of its place",
+                        ));
+                    }
+                    crc.update(rows);
+                    let mut r = Reader::new(rows);
+                    for _ in 0..p.rows {
+                        groups.push(persisted(&mut r).ok_or(DAMAGED_PIECE)?);
+                    }
+                }
+                Unit::Zero | Unit::Piece(..) => whole = false,
+            }
+        }
+        let record = Persist {
+            log: newest.log,
+            sequence: newest.sequence,
+            confirms: newest.confirms,
+            groups,
+            sealed: newest.sealed,
+        };
+        if !whole {
+            return Ok(Pieced::Torn(record));
+        }
+        if crc.finish() != newest.rows_crc {
+            return Err(LogError::Damaged(
+                "a persist record's pieces fail the checksum of its rows",
+            ));
+        }
+        Ok(Pieced::Whole(record))
+    }
+
+    /// What one unit of a slot holds.
+    fn unit_of<'a>(&self, bytes: &'a [u8]) -> Unit<'a> {
+        if bytes.iter().all(|&b| b == 0) {
+            return Unit::Zero;
+        }
+        self.piece(bytes)
+            .map_or(Unit::Damaged, |(p, rows)| Unit::Piece(p, rows))
+    }
+
+    /// The piece `bytes` hold, if its header is one of this layout's and its CRC holds.
+    fn piece<'a>(&self, bytes: &'a [u8]) -> Option<(Piece, &'a [u8])> {
+        let p = self.header(bytes)?;
+        let len = usize::try_from(p.rows)
+            .ok()?
+            .checked_mul(PERSIST_GROUP_LEN)?
+            .checked_add(PIECE_HEADER_LEN)?;
+        let end = len
+            .checked_add(4)?
+            .checked_add(if p.sealed { MAC_LEN } else { 0 })?;
+        if p.index >= p.count || end > bytes.len() {
+            return None;
+        }
+        let (body, rest) = bytes.split_at_checked(len)?;
+        let crc = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
+        (crate::codec::crc32c(body) == crc).then_some((p, body.get(PIECE_HEADER_LEN..)?))
+    }
+
+    /// The header at the start of `bytes`, if it has the magic, a format of pieces and this
+    /// layout's unit; not yet verified.
+    fn header(&self, bytes: &[u8]) -> Option<Piece> {
+        let mut r = Reader::new(bytes);
+        if r.take(4)? != PERSIST_MAGIC {
+            return None;
+        }
+        let sealed = match r.u8()? {
+            FORMAT_PIECES => false,
+            FORMAT_SEALED_PIECES => true,
+            _ => return None,
+        };
+        if u32::from(r.u8()?) != self.unit.get().trailing_zeros() {
+            return None;
+        }
+        r.take(2)?;
+        Some(Piece {
+            sealed,
+            log: r.u128()?,
+            sequence: r.u64()?,
+            confirms: r.u64()?,
+            rows_crc: r.u32()?,
+            index: r.u32()?,
+            count: r.u32()?,
+            rows: r.u32()?,
+        })
     }
 }
 
@@ -1511,6 +1840,199 @@ mod tests {
             bad[i / 8] ^= 1 << (i % 8);
             assert_eq!(Persist::decode(&bad), None, "bit {i}");
         }
+    }
+
+    /// A layout for each atomic write unit a piece fits in: every power of two from the smallest
+    /// that holds a row to the largest alignment a block file takes.
+    fn layouts(sealed: bool) -> Vec<Pieces> {
+        (0..=hyper_block::buf::MAX_ALIGNMENT.trailing_zeros())
+            .filter_map(|shift| Pieces::new(Alignment::new(1 << shift).unwrap(), sealed))
+            .collect()
+    }
+
+    /// The persist record of the frame of `sequence`, which confirms `confirms`, with `groups`
+    /// groups whose rows differ from `seed`'s.
+    fn persist(sequence: u64, confirms: u64, groups: usize, seed: u64, sealed: bool) -> Persist {
+        Persist {
+            log: 7,
+            sequence,
+            confirms,
+            groups: (0..groups as u64)
+                .map(|g| Persisted {
+                    group: u128::from(g + 1),
+                    hard_state: Some(HardState {
+                        term: seed + g,
+                        vote: 2,
+                        commit: 9,
+                        held: None,
+                    }),
+                    entries: Some(Written {
+                        first: seed,
+                        count: g,
+                        term: seed + g,
+                    }),
+                    damaged: g % 3 == 0,
+                    ..Persisted::default()
+                })
+                .collect(),
+            sealed,
+        }
+    }
+
+    /// A record reads back whole from its pieces at every atomic write unit the layout takes,
+    /// sealed or not, with no groups, one, a piece's worth and across pieces; and so it does from a
+    /// slot whose later units hold an older record's pieces and zeros.
+    #[test]
+    fn records_round_trip_in_pieces_at_every_atomic_unit() {
+        for sealed in [false, true] {
+            let layouts = layouts(sealed);
+            assert_eq!(
+                layouts.last().map(|p| p.unit().get()),
+                Some(hyper_block::buf::MAX_ALIGNMENT)
+            );
+            assert!(
+                Pieces::new(Alignment::new(layouts[0].unit().get() / 2).unwrap(), sealed).is_none()
+            );
+            for pieces in layouts {
+                let rows = pieces.rows();
+                for groups in [0, 1, rows, rows + 1, 2 * rows + 1] {
+                    let record = persist(41, 40, groups, 5, sealed);
+                    let bytes = pieces.encode(&record).unwrap();
+                    assert_eq!(bytes.len(), pieces.len(groups).unwrap());
+                    assert_eq!(
+                        bytes.len(),
+                        pieces.count(groups).unwrap() * pieces.unit().get()
+                    );
+                    assert_eq!(
+                        pieces.decode(&bytes).unwrap(),
+                        Pieced::Whole(record.clone())
+                    );
+                    let mut slot = pieces
+                        .encode(&persist(39, 38, 3 * rows + 1, 3, sealed))
+                        .unwrap();
+                    slot[..bytes.len()].copy_from_slice(&bytes);
+                    slot.resize(slot.len() + pieces.unit().get(), 0);
+                    assert_eq!(pieces.decode(&slot).unwrap(), Pieced::Whole(record));
+                }
+                assert_eq!(
+                    pieces.decode(&vec![0; pieces.unit().get()]).unwrap(),
+                    Pieced::Empty
+                );
+                assert!(pieces.encode(&persist(41, 40, 1, 5, !sealed)).is_none());
+            }
+        }
+    }
+
+    /// Any bit flipped in a piece's checksummed bytes, header, rows or CRC, in any piece of the
+    /// record, is the typed corruption error: a piece is written atomically, so no crash leaves
+    /// it failing its own checksum.
+    #[test]
+    fn a_damaged_piece_is_a_typed_corruption_error() {
+        for sealed in [false, true] {
+            for pieces in layouts(sealed).into_iter().take(2) {
+                let rows = pieces.rows();
+                let record = persist(41, 40, 2 * rows + 1, 5, sealed);
+                let bytes = pieces.encode(&record).unwrap();
+                let unit = pieces.unit().get();
+                for piece in 0..pieces.count(record.groups.len()).unwrap() {
+                    let held = if piece < 2 { rows } else { 1 };
+                    let checked = PIECE_HEADER_LEN + held * PERSIST_GROUP_LEN + 4;
+                    for bit in 0..checked * 8 {
+                        let mut bad = bytes.clone();
+                        bad[piece * unit + bit / 8] ^= 1 << (bit % 8);
+                        assert!(
+                            matches!(pieces.decode(&bad), Err(LogError::Damaged(_))),
+                            "unit {unit}, piece {piece}, bit {bit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A slot whose pieces are part one record's and part another's reads as the newer record
+    /// torn, holding the rows of its pieces that landed, never as either whole: over an older
+    /// frame's record, over the same frame's record its confirmation rewrites, over a record of
+    /// the same sequence and confirmation with other rows (a restore taking a lost frame's
+    /// sequence), and over zeros.
+    #[test]
+    fn pieces_of_two_records_read_as_torn() {
+        for sealed in [false, true] {
+            let pieces = layouts(sealed)[0];
+            let rows = pieces.rows();
+            let unit = pieces.unit().get();
+            let groups = 2 * rows + 1;
+            let count = pieces.count(groups).unwrap();
+            let newer = persist(41, 40, groups, 5, sealed);
+            let cases = [
+                (Some(persist(39, 38, groups, 3, sealed)), true),
+                (Some(persist(41, 39, groups, 5, sealed)), true),
+                (Some(persist(41, 40, groups, 4, sealed)), false),
+                (Some(persist(39, 38, 1, 3, sealed)), true),
+                (None, true),
+            ];
+            for (older, newest_known) in cases {
+                let mut slot = match &older {
+                    Some(older) => pieces.encode(older).unwrap(),
+                    None => Vec::new(),
+                };
+                slot.resize(count * unit, 0);
+                let new = pieces.encode(&newer).unwrap();
+                for landed in 0..1u32 << count {
+                    let mut mixed = slot.clone();
+                    for piece in 0..count {
+                        if landed & (1 << piece) != 0 {
+                            let at = piece * unit;
+                            mixed[at..at + unit].copy_from_slice(&new[at..at + unit]);
+                        }
+                    }
+                    let read = pieces.decode(&mixed).unwrap();
+                    if landed == (1 << count) - 1 {
+                        assert_eq!(read, Pieced::Whole(newer.clone()));
+                    } else if landed == 0 {
+                        let expect = match &older {
+                            Some(older) => Pieced::Whole(older.clone()),
+                            None => Pieced::Empty,
+                        };
+                        assert_eq!(read, expect);
+                    } else if newest_known {
+                        let kept = (0..count)
+                            .filter(|piece| landed & (1 << piece) != 0)
+                            .flat_map(|piece| {
+                                newer.groups.chunks(rows).nth(piece).unwrap().to_vec()
+                            })
+                            .collect();
+                        assert_eq!(
+                            read,
+                            Pieced::Torn(Persist {
+                                groups: kept,
+                                ..newer.clone()
+                            }),
+                            "landed {landed:b}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(read, Pieced::Torn(_)),
+                            "landed {landed:b}: {read:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A piece that lies at another piece's place, its own checksum whole, is damage, as no write
+    /// of a piece puts it there.
+    #[test]
+    fn a_piece_out_of_its_place_is_damage() {
+        let pieces = layouts(false)[0];
+        let unit = pieces.unit().get();
+        let mut bytes = pieces
+            .encode(&persist(41, 40, 2 * pieces.rows(), 5, false))
+            .unwrap();
+        let (first, second) = bytes.split_at_mut(unit);
+        first.swap_with_slice(&mut second[..unit]);
+        assert!(matches!(pieces.decode(&bytes), Err(LogError::Damaged(_))));
     }
 
     fn record() -> impl Strategy<Value = (u8, u128, u64, Vec<(u64, Vec<u8>)>)> {

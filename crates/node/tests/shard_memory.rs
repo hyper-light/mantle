@@ -27,6 +27,7 @@ use hyper_rt::coop::Class;
 use hyper_rt::runtime::{Runtime, RuntimeConfig, WakeTracking};
 use mantle_node::derive::{self, ShardShape};
 use mantle_node::listener::{Listener, Settings};
+use mantle_node::process::RangeShards;
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -105,7 +106,8 @@ fn lanes(rt: &Runtime, served: u64) -> u64 {
 /// What a shard of `shape` makes as a task on it first takes `class`, past what a Normal task
 /// spawned alike makes, counted on the shard's thread around the spawn: the queue's classes
 /// (hyper-rt `queue::Kept`) and the class's lists, the node's task being Critical on the first
-/// shard (`process::run_on_first_shard`).
+/// shard (`process::run_on_first_shard`) and the ranges' task on each shard past it that runs them
+/// (`node::shard::Lanes::start`).
 fn classed(shape: &ShardShape, class: Class) -> u64 {
     let spawned = |class| {
         let rt = Runtime::start(&config(1, shape, 4)).unwrap();
@@ -247,43 +249,59 @@ fn each_figure_of_the_runtime_holds_what_it_counts() {
 }
 
 /// The floor's runtime holds the node's runtime whole: built as the node builds it at a sweep of
-/// shards, S3 connections, peers and control entries, its shards counted as `Runtime::start`
-/// returns and the listener's lanes to the shards past the first as `Listener::spread` makes them,
-/// none past `derive::runtime_bytes`. A floor that undercounts a shard, a lane or a connection
-/// fails here at the shape it undercounts.
+/// shards, S3 connections, peers, control entries and the shards its ranges are placed over, its
+/// shards counted as `Runtime::start` returns, the classes each Critical task makes on its shard,
+/// and the listener's lanes to the shards past the first as `Listener::spread` makes them, none
+/// past `derive::runtime_bytes`. A floor that undercounts a shard, a lane or a connection fails
+/// here at the shape it undercounts.
 #[test]
 fn the_floor_holds_the_nodes_runtime_at_every_shape() {
     let _alone = ALONE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Once, for what a process makes at its first runtime and keeps.
-    let warm = derive::shard_shape(Some(1), 2).unwrap();
+    let warm = derive::shard_shape(Some(1), 2, RangeShards::First).unwrap();
     started(&config(1, &warm, 1));
     for shards in [1u16, 2, 4, 10] {
         for listening in [None, Some(1), Some(10), Some(256)] {
             for peers in [2, 8] {
                 for ring in [1, 16, 1024] {
-                    let shape = derive::shard_shape(listening, peers).unwrap();
-                    let runtime = config(shards, &shape, ring);
-                    // The node's task Critical on the first shard.
-                    let mut held = started(&runtime) + classed(&shape, Class::Critical);
-                    if let Some(served) = listening.filter(|_| shards > 1) {
-                        let rt = Runtime::start(&runtime).unwrap();
-                        held += lanes(&rt, served);
-                        rt.shutdown().unwrap();
+                    for ranges in [RangeShards::First, RangeShards::Spread] {
+                        let shape = derive::shard_shape(listening, peers, ranges).unwrap();
+                        let runtime = config(shards, &shape, ring);
+                        // Spread, a range on each shard past the first, the most that run ranges.
+                        let ranging = match ranges {
+                            RangeShards::First => 0,
+                            RangeShards::Spread => usize::from(shards) - 1,
+                        };
+                        // The node's task Critical on the first shard, and the ranges' on each
+                        // past it that runs them.
+                        let critical = (1 + u64::try_from(ranging).unwrap())
+                            * classed(&shape, Class::Critical);
+                        let mut held = started(&runtime) + critical;
+                        if let Some(served) = listening.filter(|_| shards > 1) {
+                            let rt = Runtime::start(&runtime).unwrap();
+                            held += lanes(&rt, served);
+                            rt.shutdown().unwrap();
+                        }
+                        let stated = derive::runtime_bytes(
+                            usize::from(shards),
+                            &shape,
+                            ring,
+                            listening,
+                            ranging,
+                        )
+                        .unwrap();
+                        eprintln!(
+                            "{shards} shards, {listening:?} served, {peers} peers, {ring} \
+                             entries, ranges {ranges:?}: held {held} of {stated}"
+                        );
+                        assert!(
+                            held <= stated,
+                            "{shards} shards, {listening:?} served, {peers} peers, {ring} \
+                             entries, ranges {ranges:?}: held {held}, past {stated}"
+                        );
                     }
-                    let stated =
-                        derive::runtime_bytes(usize::from(shards), &shape, ring, listening)
-                            .unwrap();
-                    eprintln!(
-                        "{shards} shards, {listening:?} served, {peers} peers, {ring} entries: \
-                         held {held} of {stated}"
-                    );
-                    assert!(
-                        held <= stated,
-                        "{shards} shards, {listening:?} served, {peers} peers, {ring} entries: \
-                         held {held}, past {stated}"
-                    );
                 }
             }
         }

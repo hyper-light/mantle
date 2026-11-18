@@ -886,15 +886,37 @@ pub(crate) struct Lanes<E: Engine, S: LogStore> {
     held_words: u64,
 }
 
+/// Submits `task` to the shard `holder` names, through its control queue, to run there in hyper-rt's
+/// Critical class (`coop::Class`; hyper-raft docs/runtime.md §3.15), as the node's task runs on the
+/// first (`process::run_on_first_shard`): a shard's task drives its ranges' Raft and apply, so woken
+/// it goes ahead of the S3 connections the shard serves beside it, which stay Normal, the shares of
+/// the shard's time staying equal. A submission takes the Normal class, so what is submitted is a
+/// launcher that spawns `task` Critical on its shard and ends, holding a task slot of its own while
+/// it spawns (`derive::shard_shape`). Refused when the shard takes no task now: gone, or its control
+/// queue full.
+fn submit_critical<F: Future<Output = ()> + Send + 'static>(
+    holder: SlotHolder,
+    task: F,
+) -> Result<(), NodeError> {
+    hyper_rt::runtime::submit_to_holder(holder, async move {
+        // A shard that refuses it drops `task` with what it holds, a shard's task its lanes' ends,
+        // which the node reads as the shard's end (`NodeError::ShardEnded`), as it reads a shard
+        // that refuses the launcher.
+        let _ = hyper_rt::futures::spawn_detached_as(hyper_rt::coop::Class::Critical, task);
+    })?;
+    Ok(())
+}
+
 impl<E, S> Lanes<E, S>
 where
     E: Engine + Send + 'static,
     S: LogStore + Send + 'static,
 {
     /// Starts shard `shard`'s task on the shard `holder` names, through its control queue (as the
-    /// S3 listener's lanes start their takers, `listener::shards`), its owner holding `slots`
-    /// replicas and each lane `capacity` values. Refused when a lane cannot be made or the shard
-    /// takes no task now: gone, or its control queue full.
+    /// S3 listener's lanes start their takers, `listener::shards`), Critical there
+    /// ([`submit_critical`]), its owner holding `slots` replicas and each lane `capacity` values.
+    /// Refused when a lane cannot be made or the shard takes no task now: gone, or its control
+    /// queue full.
     pub(crate) fn start(
         holder: SlotHolder,
         shard: usize,
@@ -903,7 +925,7 @@ where
     ) -> Result<Self, NodeError> {
         let (into, taken) = channel(capacity)?;
         let (given, from) = channel(capacity)?;
-        hyper_rt::runtime::submit_to_holder(holder, run(taken, given, slots, capacity))?;
+        submit_critical(holder, run(taken, given, slots, capacity))?;
         Ok(Self {
             shard,
             capacity,
@@ -1888,6 +1910,31 @@ mod tests {
             flush_mean: None,
             paths: Vec::new(),
         }))
+    }
+
+    /// A shard's task is spawned Critical on the shard it is submitted to, so its ranges' Raft and
+    /// apply go ahead of the S3 connections that shard serves; what it spawns stays Normal. The
+    /// launcher and the task fit the two slots a shard past the first holds for them.
+    #[test]
+    fn a_range_shards_task_is_spawned_critical_and_what_it_spawns_normal() {
+        use hyper_rt::coop::Class;
+        let rt = started(2, 2);
+        let (tell, heard) = std::sync::mpsc::sync_channel(1);
+        submit_critical(rt.holder_of(rt.shard_ids()[1]).unwrap(), async move {
+            let (told, spawned) = oneshot().unwrap();
+            hyper_rt::futures::spawn_detached(async move {
+                let _ = told.send(hyper_rt::coop::class());
+            })
+            .unwrap();
+            let spawned = spawned.await.ok().flatten();
+            let _ = tell.try_send((hyper_rt::coop::class(), spawned));
+        })
+        .unwrap();
+        assert_eq!(
+            heard.recv().unwrap(),
+            (Some(Class::Critical), Some(Class::Normal))
+        );
+        rt.shutdown().unwrap();
     }
 
     /// A one-member range moved to the second shard of two before its first drive is driven by

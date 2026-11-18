@@ -155,7 +155,9 @@ Critical class (`coop::Class`; hyper-raft docs/runtime.md §3.15), and the liste
 connection stay Normal, the class every other spawn takes: woken by a peer's frame, a timer or its
 log, the task goes ahead of the connections queued on its shard, and each class with work keeps an
 equal share of the shard's time, the lead the shard's quantum, so neither starves the other. What
-it buys in heartbeat and commit latency under S3 load is not measured yet.
+it buys in heartbeat and commit latency under S3 load is not measured yet. Under `range_shards =
+spread` the task of each shard past the first that runs ranges is spawned Critical alike
+(2026-11-18, §2.9).
 
 A granted core is what `std::thread::available_parallelism` reports: the operating system's
 answer, affinity masks and quotas included where it reports them. Three pools of that size
@@ -314,14 +316,18 @@ measures the second, and derives the rest by these rules:
   `Issuer::device_threads`), each volume's writer, cleaner and scrubber), each at
   Rust's default stack of 2 MiB, reserved whole; the runtime beside those stacks
   (`derive::runtime_bytes`: its own 867 bytes, its watchdog's; each shard, hyper-rt sizing every
-  one for the first's role (`derive::shard_shape`, as `process::runtime` sizes them), at 11,875
+  one for the largest role, the first's, or under `range_shards = spread` with an S3 listener a
+  shard's past it that runs ranges, one task more, their task's launcher (`derive::shard_shape`, as
+  `process::runtime` sizes them), at 11,875
   bytes, 206 a task slot, 84 a timer, 397 a readiness waiter and 16 a slot of its waiters' table,
   the power of two at or past twice them, and 64 a control entry, as many as the host's
-  calibration gives a shard (the `ring` basis line); the classes the first shard's queue makes as
-  the node's task takes Critical there, 192 bytes and 9 a task slot; and with an S3 listener its lane to each
+  calibration gives a shard (the `ring` basis line); the classes a shard's queue makes as a task
+  takes Critical there, the first's for the node's task and under `spread` each's past it that runs
+  ranges for their task (§2.9), 192 bytes and 9 a task slot; and with an S3 listener its lane to each
   shard past the first, 1,576 bytes and 88 for each connection the listener holds at once
   (`listener::tasks`). At ten shards and 256 connections served, 3.6 MB stated against 2.6 MB
-  counted on macOS arm64 (3,605,177 and 2,560,629 bytes): a waiter's 397 holds Windows' table of its outstanding polls, 188 of
+  counted on macOS arm64 (3,605,177 and 2,560,629 bytes; under `spread`, every shard past the first
+  running ranges, 3,630,763 and 2,586,205, 2026-11-18): a waiter's 397 holds Windows' table of its outstanding polls, 188 of
   them, derived from its sizes; a lane's 88, Windows' socket of 8 octets where a descriptor is 4);
   and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:
@@ -1829,14 +1835,25 @@ shards that run ranges trades those device waits for the S3 capacity those shard
 a share the host decides, five shards of 31 past the first on 32 cores but five of seven on eight,
 so it is a rule only once that ladder measures both. And the reverse, ranges kept off the shards
 that serve S3, is no rule: ranges are placed once, at open, and connections at each accept, so only
-the listener's rule can follow both. Next, from the code: a range shard's task is submitted at the
-default class (`Lanes::start`, `submit_to_holder`), where the node's task is spawned Critical so
-its consensus, log and transport go ahead of the connections beside it (`run_on_first_shard`;
-hyper-raft docs/runtime.md §3.15). A range shard's task spawned Critical alike, through a launcher
-on its shard as the node's is, which `derive::shard_shape` must then count among a shard's tasks,
-comes first; then the HTTP door's ladder over `spread`, S3 over every shard against S3 over the
-shards with no range where any remain (`listen`'s holders less those `Node::ranges_on` names),
-chooses the listener's rule.
+the listener's rule can follow both. Next, the HTTP door's ladder over `spread`, S3 over every
+shard against S3 over the shards with no range where any remain (`listen`'s holders less those
+`Node::ranges_on` names), chooses the listener's rule.
+
+*As built (2026-11-18), a range shard's task Critical.* A shard's task that runs ranges past the
+first is spawned in hyper-rt's Critical class, as the node's is (`run_on_first_shard`; hyper-raft
+docs/runtime.md §3.15), so woken by a Raft message, a proposal or its log, its ranges' Raft and
+apply go ahead of the S3 connections queued on its shard, which stay Normal. A submission through
+a shard's control queue takes Normal, so `Lanes::start` submits a launcher that spawns the task
+Critical there and ends (`shard::submit_critical`); a shard that refuses it drops the task and its
+lanes' ends, which the node reads as the shard's end, as before. The launcher holds a slot while it
+spawns, so `derive::shard_shape` counts it beside the task on a shard past the first under
+`spread`: with an S3 listener that shard holds one task more than the first, and every shard is
+sized so; and the floor counts the classes each such shard's queue then keeps
+(`derive::CRITICAL_BYTES`, `CRITICAL_SLOT_BYTES`). Under `first` no shard past the first runs a
+range, and neither changes. Tested: the task is spawned Critical and what it spawns Normal
+(`node::shard`); the floor holds the runtime with every shard past the first running ranges
+(`tests/shard_memory.rs`). What it buys in commit latency under S3 load is the `spread` ladder's
+to measure.
 
 ## 3. Transport
 

@@ -1269,17 +1269,18 @@ pub const SHARD_INTEREST_SLOT_BYTES: u64 = 16;
 /// measured on macOS arm64, 40 an entry and 24 a poll of the batch, from 5 entries to 1,024.
 pub const SHARD_RING_BYTES: u64 = 64;
 
-/// What the first shard's queue makes as the node's task takes the Critical class
-/// (`process::run_on_first_shard`; hyper-rt `queue::Kept`, made once a shard's first task takes a
-/// class other than Normal, and kept): the classes' own state and Critical's lists' besides their
+/// What a shard's queue makes as a task of the node takes the Critical class there: the first's as
+/// the node's task does (`process::run_on_first_shard`), and each that runs ranges as their task
+/// does (`node::shard::Lanes::start`); hyper-rt `queue::Kept`, made once a shard's first task takes
+/// a class other than Normal, and kept: the classes' own state and Critical's lists' besides their
 /// slots. Counted on the shard's thread around the spawn, a Critical spawn's count less a Normal
 /// one's of the same future (`tests/shard_memory.rs`, macOS arm64, 2026-11-17): 228 at four task
 /// slots, 192 less their 36. No other task of the node takes a class, and none of it is the
 /// driver's, so no platform holds more.
 pub const CRITICAL_BYTES: u64 = 192;
 
-/// What the first shard's queue makes for each of its task slots as the node's task takes the
-/// Critical class: the slot's class, an octet, and its places in Critical's two lists, four octets
+/// What a shard's queue makes for each of its task slots as a task of the node takes the Critical
+/// class there: the slot's class, an octet, and its places in Critical's two lists, four octets
 /// each. Counted on macOS arm64: 9,216 for 1,024 slots more, 9 a slot.
 pub const CRITICAL_SLOT_BYTES: u64 = 9;
 
@@ -1298,11 +1299,13 @@ pub const LANE_BYTES: u64 = 1_576;
 pub const LANE_CONNECTION_BYTES: u64 = 88;
 
 /// What each of the node's shards is sized for, hyper-rt sizing every shard alike
-/// (`process::runtime`): the first's role, the largest.
+/// (`process::runtime`): the largest role, the first's or that of a shard past it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardShape {
     /// The node's task and the launcher that spawns it, and with an S3 listener a task for each
-    /// connection it holds at once, served or answered refused (`listener::tasks`).
+    /// connection it holds at once, served or answered refused (`listener::tasks`); past the first,
+    /// where the node spreads its ranges, their task and its launcher, the listener's taker and
+    /// those connections.
     pub tasks: usize,
     /// The timers the node's task holds at once (`process::TIMERS`), and one for each of those
     /// connections.
@@ -1313,31 +1316,39 @@ pub struct ShardShape {
     pub interests: usize,
 }
 
-/// The shape of each of the node's shards with `peers` peers, and with an S3 listener serving
-/// `listening` connections where it has one ([`ShardShape`]).
-pub fn shard_shape(listening: Option<u64>, peers: usize) -> Option<ShardShape> {
+/// The shape of each of the node's shards with `peers` peers, with an S3 listener serving
+/// `listening` connections where it has one, and its ranges placed as `ranges` states
+/// ([`ShardShape`]).
+pub fn shard_shape(
+    listening: Option<u64>,
+    peers: usize,
+    ranges: RangeShards,
+) -> Option<ShardShape> {
     let connections = match listening {
         Some(served) => usize::try_from(crate::listener::tasks(served)).ok()?,
         None => 0,
     };
+    // Whether the shards past the first run ranges (node.md §2.9).
+    let ranging = usize::from(ranges == RangeShards::Spread);
     // The first shard: the node's task, the launcher that spawns it, and each connection, which
-    // falls back to it where the shard it was handed to refuses it. Each past it: the task of the
-    // ranges the node places there (node.md §2.9), the listener's taker of the connections it is
-    // handed, and each of them.
+    // falls back to it where the shard it was handed to refuses it. Each past it: the listener's
+    // taker of the connections it is handed, and each of them; and where it runs ranges, their
+    // task and the launcher that spawns it Critical (`node::shard::Lanes::start`), holding its own
+    // slot while it spawns.
     let first = connections.checked_add(2)?;
     let past = connections
         .checked_add(usize::from(listening.is_some()))?
-        .checked_add(1)?;
+        .checked_add(ranging.checked_mul(2)?)?;
     let tasks = first.max(past);
     let sockets = peers.checked_add(2)?.checked_add(match listening {
         Some(_) => connections.checked_add(1)?,
         None => 0,
     })?;
-    // The first's: those the node's task holds at once; each past it, its ranges' task's wait and
-    // each connection's.
+    // The first's: those the node's task holds at once; each past it, its ranges' task's wait where
+    // it runs ranges, and each connection's.
     let timers = crate::process::TIMERS
         .checked_add(connections)?
-        .max(connections.checked_add(1)?);
+        .max(connections.checked_add(ranging)?);
     Some(ShardShape {
         tasks,
         timers,
@@ -1347,8 +1358,9 @@ pub fn shard_shape(listening: Option<u64>, peers: usize) -> Option<ShardShape> {
 
 /// What the node's runtime holds of its `shards` shards, each of `shape` with `ring` control
 /// entries, beside their threads' stacks ([`stacks`]): its own ([`RUNTIME_BYTES`]); each shard's
-/// fixed bytes, its tasks', timers', waiters', waiters' table's and control entries'; the classes
-/// the first shard's queue makes as the node's task takes Critical there ([`CRITICAL_BYTES`]); and
+/// fixed bytes, its tasks', timers', waiters', waiters' table's and control entries'; the classes a
+/// shard's queue makes as a task takes Critical there ([`CRITICAL_BYTES`]), on the first for the
+/// node's task and on each of the `ranging` shards past it that run ranges for their task; and
 /// where an S3 listener serves `listening` connections, its lane to each shard past the first, each
 /// holding as many as the listener holds at once (`listener::tasks`).
 pub fn runtime_bytes(
@@ -1356,6 +1368,7 @@ pub fn runtime_bytes(
     shape: &ShardShape,
     ring: usize,
     listening: Option<u64>,
+    ranging: usize,
 ) -> Option<u64> {
     let count = |n: usize| u64::try_from(n).ok();
     let slots = shape
@@ -1375,9 +1388,11 @@ pub fn runtime_bytes(
             .checked_add(LANE_BYTES)?,
         None => 0,
     };
+    // On the first shard and on each past it that runs ranges.
     let critical = CRITICAL_SLOT_BYTES
         .checked_mul(count(shape.tasks)?)?
-        .checked_add(CRITICAL_BYTES)?;
+        .checked_add(CRITICAL_BYTES)?
+        .checked_mul(count(ranging)?.checked_add(1)?)?;
     let shards = count(shards)?;
     // The shards past the first, each with a lane: none past a lone shard.
     let lanes = shards.saturating_sub(1).checked_mul(lane)?;
@@ -2036,6 +2051,11 @@ pub fn derive(
         })
         .collect();
     let messages = messages()?;
+    // The shards the node places its ranges over, which its runtime's shards are sized for.
+    let (range_shards, range_shards_why) = match stated.range_shards {
+        Some(shards) => (shards, Kind::Stated),
+        None => (RangeShards::First, Kind::Cited),
+    };
     // What `objects` operations at once hold beside their charges, the volumes moving `transfers`
     // at once: their asks, the transport's bounds with a native client each beside the pinned
     // peers (node.md §3.6) drawing its exchanges from a pool of as many, and each range's reads.
@@ -2113,8 +2133,16 @@ pub fn derive(
         let lanes = crate::node::shard_lanes_bytes(limits.exchanges)
             .and_then(|pair| u64::try_from(far).ok()?.checked_mul(pair))
             .ok_or(overflow("the ranges' shards' lanes"))?;
-        let runtime = shard_shape(listening, stated.peers.len())
-            .and_then(|shape| runtime_bytes(measured.cores, &shape, measured.ring, listening))
+        // Where the node spreads its ranges, each of those shards runs their task Critical
+        // (`node::shard::Lanes::start`); none past the first runs one where it does not.
+        let ranging = match range_shards {
+            RangeShards::First => 0,
+            RangeShards::Spread => far,
+        };
+        let runtime = shard_shape(listening, stated.peers.len(), range_shards)
+            .and_then(|shape| {
+                runtime_bytes(measured.cores, &shape, measured.ring, listening, ranging)
+            })
             .and_then(|bytes| bytes.checked_add(lanes))
             .ok_or(overflow("the node's runtime"))?;
         Ok(Held {
@@ -2419,10 +2447,6 @@ pub fn derive(
          period for a Linux container, 10 s, the shortest of the orchestrators' (Kubernetes 30 s, \
          systemd 90 s), so a stop ends before their SIGKILL (research 64; node.md §1.7)",
     );
-    let (range_shards, range_shards_why) = match stated.range_shards {
-        Some(shards) => (shards, Kind::Stated),
-        None => (RangeShards::First, Kind::Cited),
-    };
     said.add(
         "range_shards",
         range_shards,
@@ -3522,7 +3546,7 @@ mod tests {
     #[test]
     fn the_runtime_holds_each_shard_at_the_firsts_shape_and_a_lane_past_the_first() {
         assert_eq!(
-            shard_shape(None, 4),
+            shard_shape(None, 4, RangeShards::First),
             Some(ShardShape {
                 tasks: 2,
                 timers: 3,
@@ -3530,7 +3554,7 @@ mod tests {
             })
         );
         // 256 served and 10 answered refused.
-        let shape = shard_shape(Some(256), 4).unwrap();
+        let shape = shard_shape(Some(256), 4, RangeShards::First).unwrap();
         assert_eq!(
             shape,
             ShardShape {
@@ -3549,17 +3573,17 @@ mod tests {
         // The node's task Critical on the first shard alone.
         let critical = CRITICAL_BYTES + 268 * CRITICAL_SLOT_BYTES;
         assert_eq!(
-            runtime_bytes(1, &shape, 16, Some(256)),
+            runtime_bytes(1, &shape, 16, Some(256), 0),
             Some(RUNTIME_BYTES + shard + critical)
         );
         assert_eq!(
-            runtime_bytes(10, &shape, 16, Some(256)),
+            runtime_bytes(10, &shape, 16, Some(256), 0),
             Some(RUNTIME_BYTES + 10 * shard + critical + 9 * lane)
         );
         // No listener, no lane.
-        let alone = shard_shape(None, 4).unwrap();
+        let alone = shard_shape(None, 4, RangeShards::First).unwrap();
         assert_eq!(
-            runtime_bytes(10, &alone, 16, None),
+            runtime_bytes(10, &alone, 16, None, 0),
             Some(
                 RUNTIME_BYTES
                     + CRITICAL_BYTES
@@ -3572,7 +3596,49 @@ mod tests {
                         + 16 * SHARD_RING_BYTES)
             )
         );
-        assert_eq!(runtime_bytes(usize::MAX, &shape, 16, Some(256)), None);
+        assert_eq!(runtime_bytes(usize::MAX, &shape, 16, Some(256), 0), None);
+    }
+
+    /// Where the node spreads its ranges, a shard past the first that runs them holds their task
+    /// and the launcher that spawns it Critical beside the listener's taker and each connection
+    /// handed to it, one task more than the first holds; and the runtime holds the classes their
+    /// Critical task makes on each such shard, as the node's makes on the first.
+    #[test]
+    fn a_shard_that_runs_ranges_holds_their_launcher_and_the_classes_their_critical_task_makes() {
+        // 256 served and 10 answered refused, the taker, the ranges' task and its launcher.
+        let shape = shard_shape(Some(256), 4, RangeShards::Spread).unwrap();
+        assert_eq!(
+            shape,
+            ShardShape {
+                tasks: 269,
+                timers: 269,
+                interests: 2 * (4 + 2 + 267),
+            }
+        );
+        // No listener: the first's two, the node's task and its launcher, as the ranges' two.
+        assert_eq!(
+            shard_shape(None, 4, RangeShards::Spread),
+            shard_shape(None, 4, RangeShards::First)
+        );
+        let shard = SHARD_BYTES
+            + 269 * SHARD_TASK_BYTES
+            + 269 * SHARD_TIMER_BYTES
+            + 546 * SHARD_INTEREST_BYTES
+            + 2048 * SHARD_INTEREST_SLOT_BYTES
+            + 16 * SHARD_RING_BYTES;
+        let lane = LANE_BYTES + 266 * LANE_CONNECTION_BYTES;
+        let critical = CRITICAL_BYTES + 269 * CRITICAL_SLOT_BYTES;
+        // The first shard's and each of the nine past it that run ranges.
+        assert_eq!(
+            runtime_bytes(10, &shape, 16, Some(256), 9),
+            Some(RUNTIME_BYTES + 10 * shard + 10 * critical + 9 * lane)
+        );
+        // Three ranges over ten shards run on three past the first.
+        assert_eq!(
+            runtime_bytes(10, &shape, 16, Some(256), 3),
+            Some(RUNTIME_BYTES + 10 * shard + 4 * critical + 9 * lane)
+        );
+        assert_eq!(runtime_bytes(10, &shape, 16, Some(256), usize::MAX), None);
     }
 
     /// A range's member holds more for each read it is asked, up to the core's bound on reads,

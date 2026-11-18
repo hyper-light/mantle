@@ -344,7 +344,8 @@ fn node_shards() -> NonZeroUsize {
 /// A node's runtime of `shards` shards, sized by what each holds: the first, the node's task and
 /// the launcher that spawns it ([`on_first_shard`]), its wait's timer and its driver's QUIC timer,
 /// and `sockets` sockets, each read and written; each past it, the task of the ranges the node
-/// places there and its wait's timer. The rest as [`shard`]'s.
+/// places there, the launcher that spawns it Critical (`Node::spread_to`), and its wait's timer.
+/// The rest as [`shard`]'s.
 fn node_runtime(sockets: usize, shards: NonZeroUsize) -> Runtime {
     Runtime::start(&RuntimeConfig {
         shards: u16::try_from(shards.get()).unwrap(),

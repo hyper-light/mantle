@@ -2133,18 +2133,19 @@ fn shards(facts: &hyper_rt::machine::facts::Facts) -> usize {
 /// `RuntimeConfig::from_calibration`). The first runs the node's task, its ranges, log, transport
 /// and doors; with an S3 listener, the rest each run the connections it hands them
 /// (`listener::Listener::spread`). hyper-rt sizes every shard alike, so each is sized for the
-/// first's role, the largest: the node's one task, the launcher that spawns it there
+/// largest role, the first's or another's: the node's one task, the launcher that spawns it there
 /// ([`run_on_first_shard`]), the timers the task holds at once ([`TIMERS`]), and a socket for its
 /// endpoint, each connection and its plane, each read and written; with an S3 listener, a task and
 /// a timer for each connection it holds at once, served or answered refused (`listener::tasks`),
 /// as each falls back to the first shard where the shard it was handed to refuses it, and a socket
 /// for the listener and each of those connections. Another shard holds at most its taker of
-/// handed connections and each connection.
+/// handed connections and each connection, and where the node spreads its ranges
+/// (`range_shards`), their task, the launcher that spawns it Critical and the task's timer.
 fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = constants(&calibration)?;
     // The shape the node's floor counts each shard at (`derive::runtime_bytes`).
-    let shape = crate::derive::shard_shape(listening, config.peers.len())
+    let shape = crate::derive::shard_shape(listening, config.peers.len(), config.range_shards)
         .ok_or_else(|| ProcessError::Runtime("the node's shards' tasks".into()))?;
     let mut runtime =
         RuntimeConfig::from_calibration(&calibration, &constants, shape.tasks, shape.timers);

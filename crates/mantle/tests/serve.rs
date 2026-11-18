@@ -32,6 +32,9 @@ mod relay;
 #[allow(dead_code)]
 #[path = "support/s3.rs"]
 mod s3;
+#[allow(dead_code)]
+#[path = "support/s3_watched.rs"]
+mod s3_watched;
 use cell::*;
 use std::process::{Command, Stdio};
 
@@ -2111,7 +2114,7 @@ fn fill_put(
         let (reply, _) = ask(cell, ids[at], put, data);
         format!("{:?}", reply.status)
     } else {
-        let put = http[at].send("PUT", &format!("/http/{key}"), &[], &data);
+        let put = http[at].request(cell, "PUT", &format!("/http/{key}"), &[], &data);
         if put.status == 200 {
             "Done".to_owned()
         } else {
@@ -2150,7 +2153,10 @@ fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
         id: 0,
     };
     assert_eq!(status(&mut cell, ids[0], create), ObjectStatus::Done);
-    assert_eq!(http[0].send("PUT", "/http", &[], b"").status, 200);
+    assert_eq!(
+        http[0].request(&mut cell, "PUT", "/http", &[], b"").status,
+        200
+    );
 
     // Each object through the next door and node in turn: the cell's volumes are stated at 256
     // MiB, so it takes fewer than nine of 32 MiB before one has no room.
@@ -2205,7 +2211,7 @@ fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
             assert_eq!(reply.status, ObjectStatus::Done, "o{n}");
             assert!(got == data, "o{n} came back otherwise");
         } else {
-            let got = http[other].send("GET", &format!("/http/o{n}"), &[], b"");
+            let got = http[other].request(&mut cell, "GET", &format!("/http/o{n}"), &[], b"");
             assert_eq!(got.status, 200, "o{n}");
             assert!(got.body == data, "o{n} came back otherwise");
         }
@@ -2222,7 +2228,7 @@ fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
                 "o{n}"
             );
         } else {
-            let got = http[1].send("GET", &format!("/http/o{n}"), &[], b"");
+            let got = http[1].request(&mut cell, "GET", &format!("/http/o{n}"), &[], b"");
             assert_eq!(got.status, 404, "o{n}");
         }
     }
@@ -2245,7 +2251,7 @@ fn a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors() {
         .map(|(_, n)| format!("o{n}"))
         .collect();
     assert_eq!(native, expected);
-    let listed = http[2].send("GET", "/http?list-type=2", &[], b"");
+    let listed = http[2].request(&mut cell, "GET", "/http?list-type=2", &[], b"");
     assert_eq!(listed.status, 200);
     let text = listed.text();
     for n in [full, next] {

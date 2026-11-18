@@ -38,6 +38,9 @@ mod relay;
 #[allow(dead_code)]
 #[path = "support/s3.rs"]
 mod s3;
+#[allow(dead_code)]
+#[path = "support/s3_watched.rs"]
+mod s3_watched;
 
 use cell::*;
 use mantle_ec::Code;
@@ -465,7 +468,10 @@ fn put_objects(cell: &mut Cell, bucket: &str, prefix: &str, sizes: &[usize], see
         let node = nodes[i % nodes.len()];
         if i % 2 == 0 {
             let target = format!("/{bucket}/{key}");
-            let put = s3_send(cell, &mut s3, node, ("PUT", target), data.clone());
+            let put = s3
+                .get_mut(&node)
+                .unwrap()
+                .request(cell, "PUT", &target, &[], &data);
             assert_eq!(put.status, 200, "{key}: {}", put.text());
         } else {
             native.push((
@@ -499,7 +505,10 @@ fn read_back(cell: &mut Cell, bucket: &str, objects: &Objects, lost: &BTreeSet<S
     for (key, data) in objects {
         for &node in &nodes {
             let target = format!("/{bucket}/{key}");
-            let got = s3_send(cell, &mut s3, node, ("GET", target), Vec::new());
+            let got = s3
+                .get_mut(&node)
+                .unwrap()
+                .request(cell, "GET", &target, &[], b"");
             if lost.contains(key) {
                 assert!(
                     got.status == 500 || got.status == 503,
@@ -559,39 +568,11 @@ fn ready(cell: &mut Cell, bucket: &str) {
     }
     let mut s3 = listeners(cell);
     let node = *s3.keys().next().unwrap();
-    let made = s3_send(
-        cell,
-        &mut s3,
-        node,
-        ("PUT", format!("/{bucket}")),
-        Vec::new(),
-    );
+    let made = s3
+        .get_mut(&node)
+        .unwrap()
+        .request(cell, "PUT", &format!("/{bucket}"), &[], b"");
     assert_eq!(made.status, 200, "{}", made.text());
-}
-
-/// What node `node`'s listener answered `method` on `target` with `body`, asked by its client in
-/// `s3` on a thread of its own and waited on under the cell's watch, as the native door's
-/// operations are.
-#[track_caller]
-fn s3_send(
-    cell: &mut Cell,
-    s3: &mut BTreeMap<u64, S3>,
-    node: u64,
-    (method, target): (&'static str, String),
-    body: Vec<u8>,
-) -> s3::Response {
-    let what = format!("{method} {target} through node {node}'s listener");
-    let mut client = s3.remove(&node).unwrap();
-    let thread = std::thread::spawn(move || {
-        let response = client.send(method, &target, &[], &body);
-        (client, response)
-    });
-    cell.waiting_on(&what, Duration::ZERO, |_| {
-        if thread.is_finished() { Some(()) } else { None }
-    });
-    let (client, response) = thread.join().unwrap();
-    s3.insert(node, client);
-    response
 }
 
 /// Object sizes across the layout: an empty one, under a segment, past one, past a block's chunk.
@@ -1028,7 +1009,10 @@ fn put_objects_on(
         let data = object_bytes(seed * 1000 + i as u64, size);
         let node = nodes[i % nodes.len()];
         let target = format!("/{bucket}/{key}");
-        let put = s3_send(cell, &mut s3, node, ("PUT", target), data.clone());
+        let put = s3
+            .get_mut(&node)
+            .unwrap()
+            .request(cell, "PUT", &target, &[], &data);
         assert_eq!(put.status, 200, "{key} through {node}: {}", put.text());
         objects.insert(key, data);
     }
@@ -1042,7 +1026,10 @@ fn read_back_through(cell: &mut Cell, nodes: &[u64], bucket: &str, objects: &Obj
     for (key, data) in objects {
         for &node in nodes {
             let target = format!("/{bucket}/{key}");
-            let got = s3_send(cell, &mut s3, node, ("GET", target), Vec::new());
+            let got = s3
+                .get_mut(&node)
+                .unwrap()
+                .request(cell, "GET", &target, &[], b"");
             assert_eq!(got.status, 200, "{key} through {node}: {}", got.text());
             assert!(got.body == *data, "{key} through {node}: other bytes");
         }

@@ -2550,6 +2550,27 @@ impl Cell {
         thread.join().unwrap()
     }
 
+    /// What `thread` came to, waited on under the watch until it ended, then joined: work that
+    /// blocks with no bound of its own, as a request through an S3 listener does, bounded by the
+    /// watch. A failure, the watch's or the thread's own, names `what` at its caller.
+    #[track_caller]
+    pub(crate) fn watched<T>(&mut self, what: &str, thread: JoinHandle<T>) -> T {
+        self.waiting_on(what, Duration::ZERO, |_| {
+            if thread.is_finished() { Some(()) } else { None }
+        });
+        match thread.join() {
+            Ok(came) => came,
+            Err(panicked) => {
+                let said = panicked
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panicked.downcast_ref::<&str>().copied())
+                    .unwrap_or("a panic with no message");
+                panic!("{what} at {}: {said}", std::panic::Location::caller())
+            }
+        }
+    }
+
     /// Waits until the gateway has done `done` of its operations.
     pub(crate) fn gateway_done(&mut self, done: u64) {
         self.until(|c| {

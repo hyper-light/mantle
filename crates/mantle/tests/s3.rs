@@ -32,9 +32,11 @@ mod relay;
 #[allow(dead_code)]
 #[path = "support/s3.rs"]
 mod s3;
+#[allow(dead_code)]
+#[path = "support/s3_watched.rs"]
+mod s3_watched;
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use cell::*;
 use mantle_s3::checksum::{self, Algorithm};
@@ -87,13 +89,18 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
     let (mut cell, ids, mut clients) = started();
     let n = clients.len();
     // A bucket made through one listener is the cell's: another lists it, a third heads it.
-    let made = clients[0].send("PUT", "/photos", &[], b"");
+    let made = clients[0].request(&mut cell, "PUT", "/photos", &[], b"");
     assert_eq!(made.status, 200, "{}", made.text());
-    let listed = clients[1].send("GET", "/", &[], b"");
+    let listed = clients[1].request(&mut cell, "GET", "/", &[], b"");
     assert_eq!(listed.status, 200, "{}", listed.text());
     assert_eq!(listed.element("Name").as_deref(), Some("photos"));
-    assert_eq!(clients[2].send("HEAD", "/photos", &[], b"").status, 200);
-    let again = clients[1].send("PUT", "/photos", &[], b"");
+    assert_eq!(
+        clients[2]
+            .request(&mut cell, "HEAD", "/photos", &[], b"")
+            .status,
+        200
+    );
+    let again = clients[1].request(&mut cell, "PUT", "/photos", &[], b"");
     assert_eq!(
         (again.status, again.element("Code").as_deref()),
         (409, Some("BucketAlreadyOwnedByYou")),
@@ -109,9 +116,9 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         .collect();
     for (i, data) in alone.iter().enumerate() {
         let target = format!("/photos/alone-{i}");
-        let put = clients[0].send("PUT", &target, &[], data);
+        let put = clients[0].request(&mut cell, "PUT", &target, &[], data);
         assert_eq!(put.status, 200, "{}", put.text());
-        assert!(clients[1].send("GET", &target, &[], b"").body == *data);
+        assert!(clients[1].request(&mut cell, "GET", &target, &[], b"").body == *data);
     }
     for &id in &ids[1..] {
         let (received, written, held, unkept) = cell.chunk_bytes(id);
@@ -143,22 +150,26 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         .iter()
         .cloned()
         .map(|(key, data)| {
-            let (key_pair, region) = (clients[0].key.clone(), clients[0].region.clone());
-            std::thread::spawn(move || {
-                let mut client = Client::new(at, key_pair, &region);
+            let mut client = Client::new(at, clients[0].key.clone(), &clients[0].region);
+            let what = format!(
+                "PUT /photos/{key} at once through node {}'s listener",
+                ids[0]
+            );
+            let thread = std::thread::spawn(move || {
                 let put = client.send("PUT", &format!("/photos/{key}"), &[], &data);
                 (key, put.status, put.text())
-            })
+            });
+            (what, thread)
         })
         .collect();
-    for thread in threads {
-        let (key, status, text) = thread.join().unwrap();
+    for (what, thread) in threads {
+        let (key, status, text) = cell.watched(&what, thread);
         assert_eq!(status, 200, "{key}: {text}");
     }
     for (key, data) in &at_once {
         assert!(
             clients[2]
-                .send("GET", &format!("/photos/{key}"), &[], b"")
+                .request(&mut cell, "GET", &format!("/photos/{key}"), &[], b"")
                 .body
                 == *data
         );
@@ -183,12 +194,31 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
     ];
     let streaming = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
     let body = s3::aws_chunked(&trailed, 64 << 10, ("x-amz-checksum-crc32", &crc));
-    let put = clients[1].send_as("PUT", "/photos/trailed", &chunked, &body, streaming);
+    let put = clients[1].request_as(
+        &mut cell,
+        "PUT",
+        "/photos/trailed",
+        &chunked,
+        &body,
+        streaming,
+    );
     assert_eq!(put.status, 200, "{}", put.text());
     assert_eq!(put.header("x-amz-checksum-crc32"), Some(crc.as_str()));
-    assert!(clients[2].send("GET", "/photos/trailed", &[], b"").body == trailed);
+    assert!(
+        clients[2]
+            .request(&mut cell, "GET", "/photos/trailed", &[], b"")
+            .body
+            == trailed
+    );
     let body = s3::aws_chunked(&trailed, 64 << 10, ("x-amz-checksum-crc32", &wrong));
-    let refused = clients[1].send_as("PUT", "/photos/mistrailed", &chunked, &body, streaming);
+    let refused = clients[1].request_as(
+        &mut cell,
+        "PUT",
+        "/photos/mistrailed",
+        &chunked,
+        &body,
+        streaming,
+    );
     assert_eq!(
         (refused.status, refused.element("Code").as_deref()),
         (400, Some("BadDigest")),
@@ -197,7 +227,7 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
     );
     assert_eq!(
         clients[2]
-            .send("HEAD", "/photos/mistrailed", &[], b"")
+            .request(&mut cell, "HEAD", "/photos/mistrailed", &[], b"")
             .status,
         404
     );
@@ -216,25 +246,31 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
             "/photos/{}",
             mantle_s3::sigv4::uri_encode(key.as_bytes(), false)
         );
-        let put = clients[i].send("PUT", &target, &[], data);
+        let put = clients[i].request(&mut cell, "PUT", &target, &[], data);
         assert_eq!(put.status, 200, "{}", put.text());
         assert_eq!(put.header("etag"), Some(etag(data).as_str()));
         let reader = &mut clients[(i + 1) % n];
-        let got = reader.send("GET", &target, &[], b"");
+        let got = reader.request(&mut cell, "GET", &target, &[], b"");
         assert_eq!(got.status, 200, "{}", got.text());
         assert!(
             got.body == *data,
             "{key} read back through another listener"
         );
         assert_eq!(got.header("etag"), Some(etag(data).as_str()));
-        let ranged = clients[(i + 2) % n].send("GET", &target, &[("range", "bytes=100-4195")], b"");
+        let ranged = clients[(i + 2) % n].request(
+            &mut cell,
+            "GET",
+            &target,
+            &[("range", "bytes=100-4195")],
+            b"",
+        );
         assert_eq!(ranged.status, 206, "{}", ranged.text());
         assert!(ranged.body == data[100..=4195], "{key}'s range");
         assert_eq!(
             ranged.header("content-range"),
             Some(format!("bytes 100-4195/{}", data.len()).as_str())
         );
-        let head = clients[(i + 2) % n].send("HEAD", &target, &[], b"");
+        let head = clients[(i + 2) % n].request(&mut cell, "HEAD", &target, &[], b"");
         assert_eq!(head.status, 200);
         assert_eq!(
             head.header("content-length"),
@@ -244,7 +280,7 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
 
     // ListObjectsV2 lists every key through every listener.
     for client in &mut clients {
-        let page = client.send("GET", "/photos?list-type=2", &[], b"");
+        let page = client.request(&mut cell, "GET", "/photos?list-type=2", &[], b"");
         assert_eq!(page.status, 200, "{}", page.text());
         assert_eq!(
             page.element("KeyCount"),
@@ -258,27 +294,45 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
     // Conditional writes: a key made only where none is, and replaced only at the ETag it has.
     let target = "/photos/conditional";
     let first = bytes(100, 1_000);
-    let made = clients[0].send("PUT", target, &[("if-none-match", "*")], &first);
+    let made = clients[0].request(&mut cell, "PUT", target, &[("if-none-match", "*")], &first);
     assert_eq!(made.status, 200, "{}", made.text());
-    let refused = clients[1].send("PUT", target, &[("if-none-match", "*")], &bytes(101, 10));
+    let refused = clients[1].request(
+        &mut cell,
+        "PUT",
+        target,
+        &[("if-none-match", "*")],
+        &bytes(101, 10),
+    );
     assert_eq!(
         (refused.status, refused.element("Code").as_deref()),
         (412, Some("PreconditionFailed")),
         "{}",
         refused.text()
     );
-    let wrong = clients[2].send("PUT", target, &[("if-match", "\"0123\"")], &bytes(102, 10));
+    let wrong = clients[2].request(
+        &mut cell,
+        "PUT",
+        target,
+        &[("if-match", "\"0123\"")],
+        &bytes(102, 10),
+    );
     assert_eq!(wrong.status, 412, "{}", wrong.text());
     let second = bytes(103, 2_000);
-    let replaced = clients[2].send("PUT", target, &[("if-match", &etag(&first))], &second);
+    let replaced = clients[2].request(
+        &mut cell,
+        "PUT",
+        target,
+        &[("if-match", &etag(&first))],
+        &second,
+    );
     assert_eq!(replaced.status, 200, "{}", replaced.text());
-    assert!(clients[0].send("GET", target, &[], b"").body == second);
+    assert!(clients[0].request(&mut cell, "GET", target, &[], b"").body == second);
 
     // A delete through one listener is every listener's.
-    let deleted = clients[1].send("DELETE", target, &[], b"");
+    let deleted = clients[1].request(&mut cell, "DELETE", target, &[], b"");
     assert_eq!(deleted.status, 204, "{}", deleted.text());
     for client in &mut clients {
-        let gone = client.send("GET", target, &[], b"");
+        let gone = client.request(&mut cell, "GET", target, &[], b"");
         assert_eq!(
             (gone.status, gone.element("Code").as_deref()),
             (404, Some("NoSuchKey")),
@@ -289,19 +343,25 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
 
     // A multipart upload whose parts go through different listeners, completed through a third.
     let target = "/photos/big";
-    let created = clients[0].send("POST", &format!("{target}?uploads"), &[], b"");
+    let created = clients[0].request(&mut cell, "POST", &format!("{target}?uploads"), &[], b"");
     assert_eq!(created.status, 200, "{}", created.text());
     let upload = created.element("UploadId").unwrap();
     let parts = [bytes(200, 5 << 20), bytes(201, 777_777)];
     let mut tags = Vec::new();
     for (number, data) in parts.iter().enumerate() {
         let part = format!("{target}?partNumber={}&uploadId={upload}", number + 1);
-        let sent = clients[number % n].send("PUT", &part, &[], data);
+        let sent = clients[number % n].request(&mut cell, "PUT", &part, &[], data);
         assert_eq!(sent.status, 200, "{}", sent.text());
         assert_eq!(sent.header("etag"), Some(etag(data).as_str()));
         tags.push(sent.header("etag").unwrap().to_owned());
     }
-    let listed = clients[1].send("GET", &format!("{target}?uploadId={upload}"), &[], b"");
+    let listed = clients[1].request(
+        &mut cell,
+        "GET",
+        &format!("{target}?uploadId={upload}"),
+        &[],
+        b"",
+    );
     assert_eq!(listed.status, 200, "{}", listed.text());
     assert_eq!(listed.text().matches("<Part>").count(), 2);
     let document: String = tags
@@ -315,7 +375,8 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         })
         .collect();
     let document = format!("<CompleteMultipartUpload>{document}</CompleteMultipartUpload>");
-    let completed = clients[2].send(
+    let completed = clients[2].request(
+        &mut cell,
         "POST",
         &format!("{target}?uploadId={upload}"),
         &[],
@@ -329,14 +390,14 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
         Some(format!("\"{expected}\""))
     );
     for client in &mut clients {
-        let got = client.send("GET", target, &[], b"");
+        let got = client.request(&mut cell, "GET", target, &[], b"");
         assert_eq!(got.status, 200);
         assert!(
             got.body == whole,
             "the completed object through {}",
             client.at
         );
-        let tail = client.send("GET", target, &[("range", "bytes=-1000")], b"");
+        let tail = client.request(&mut cell, "GET", target, &[("range", "bytes=-1000")], b"");
         assert_eq!(tail.status, 206);
         assert!(tail.body == whole[whole.len() - 1000..]);
     }
@@ -361,7 +422,7 @@ fn a_cell_of_three_serves_signed_s3_requests_through_every_nodes_listener() {
 
 #[test]
 fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
-    let (cell, ids, mut clients) = started();
+    let (mut cell, ids, mut clients) = started();
 
     // Past the connection budget a connection is answered `503 SlowDown` with `Connection:
     // close`, never closed with no answer, which the AWS CLI takes for a part done (research/72).
@@ -371,11 +432,11 @@ fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
     let mut held = Vec::new();
     for _ in 0..budget {
         let mut client = Client::new(at, clients[0].key.clone(), &clients[0].region);
-        assert_eq!(client.send("GET", "/", &[], b"").status, 200);
+        assert_eq!(client.request(&mut cell, "GET", "/", &[], b"").status, 200);
         held.push(client);
     }
     let mut past = Client::new(at, clients[0].key.clone(), &clients[0].region);
-    let refused = past.send("GET", "/", &[], b"");
+    let refused = past.request(&mut cell, "GET", "/", &[], b"");
     assert_eq!(
         refused.status,
         503,
@@ -392,22 +453,30 @@ fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
     drop(held);
 
     // The rest through the other listeners, whose connections the budget above did not count.
-    let made = clients[1].send("PUT", "/b", &[], b"");
+    let made = clients[1].request(&mut cell, "PUT", "/b", &[], b"");
     assert_eq!(made.status, 200, "{}", made.text());
 
     // Transfer-Encoding beside Content-Length: 400, and the connection closed (RFC 9112 §6.1).
-    let at = clients[2].at;
-    let mut smuggled = TcpStream::connect(at).unwrap();
-    smuggled
-        .write_all(
-            format!(
-                "PUT /b/k HTTP/1.1\r\nhost: {at}\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-    let mut said = Vec::new();
-    smuggled.read_to_end(&mut said).unwrap();
+    let mut smuggler = Client::new(clients[2].at, clients[2].key.clone(), &clients[2].region);
+    let said = smuggler.watched(
+        &mut cell,
+        "PUT /b/k with Transfer-Encoding beside Content-Length, read to its close",
+        |smuggler| {
+            let at = smuggler.at;
+            let smuggled = smuggler.stream();
+            smuggled
+                .write_all(
+                    format!(
+                        "PUT /b/k HTTP/1.1\r\nhost: {at}\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut said = Vec::new();
+            smuggled.read_to_end(&mut said).unwrap();
+            said
+        },
+    );
     let said = String::from_utf8_lossy(&said);
     assert!(said.starts_with("HTTP/1.1 400 "), "{said}");
     assert!(
@@ -437,8 +506,12 @@ fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
             asker.key.secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into();
         }
         let head = asker.head("PUT", target, &expect, &payload);
-        asker.stream().write_all(head.as_bytes()).unwrap();
-        let answer = asker.read_response(false);
+        let what = format!("PUT {target} refused before 100 Continue, read to its close");
+        let (answer, closed) = asker.watched(&mut cell, &what, move |asker| {
+            asker.stream().write_all(head.as_bytes()).unwrap();
+            let answer = asker.read_response(false);
+            (answer, asker.closed())
+        });
         assert_eq!(
             (answer.status, answer.element("Code").as_deref()),
             (status, Some(code)),
@@ -449,16 +522,13 @@ fn the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust() {
             answer.closes(),
             "{target}: a refusal with its body unread closes"
         );
-        assert!(
-            asker.closed(),
-            "{target}: the listener closed the connection"
-        );
+        assert!(closed, "{target}: the listener closed the connection");
     }
 
     // A bad signature on a request without a body: 403 SignatureDoesNotMatch, the connection kept.
     let mut forger = Client::new(clients[1].at, clients[1].key.clone(), &clients[1].region);
     forger.key.secret.push('x');
-    let forged = forger.send("GET", "/b?list-type=2", &[], b"");
+    let forged = forger.request(&mut cell, "GET", "/b?list-type=2", &[], b"");
     assert_eq!(
         (forged.status, forged.element("Code").as_deref()),
         (403, Some("SignatureDoesNotMatch")),
@@ -521,10 +591,20 @@ fn delete_document(objects: &[(&str, Option<&str>)], quiet: bool) -> (String, St
 /// refused without its integrity header. Every read back byte-identical.
 #[test]
 fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
-    let (_cell, _ids, mut clients) = started();
+    let (mut cell, _ids, mut clients) = started();
     let n = clients.len();
-    assert_eq!(clients[0].send("PUT", "/meta", &[], b"").status, 200);
-    assert_eq!(clients[1].send("PUT", "/other", &[], b"").status, 200);
+    assert_eq!(
+        clients[0]
+            .request(&mut cell, "PUT", "/meta", &[], b"")
+            .status,
+        200
+    );
+    assert_eq!(
+        clients[1]
+            .request(&mut cell, "PUT", "/other", &[], b"")
+            .status,
+        200
+    );
 
     // Metadata kept at PutObject, returned as S3 returns it: names lowercase, a name sent twice
     // joined, a value past US-ASCII in RFC 2047's form, an empty one kept (research/89 §1).
@@ -548,7 +628,7 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         ("x-amz-meta-empty", ""),
         ("x-amz-meta-nonascii", "ÄMÄZÕÑ S3"),
     ];
-    let put = clients[0].send("PUT", "/meta/layer", &sent, &data);
+    let put = clients[0].request(&mut cell, "PUT", "/meta/layer", &sent, &data);
     assert_eq!(put.status, 200, "{}", put.text());
     let expected = [
         (
@@ -572,7 +652,7 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         ),
     ];
     for (i, method) in ["GET", "HEAD"].into_iter().enumerate() {
-        let read = clients[(i + 1) % n].send(method, "/meta/layer", &[], b"");
+        let read = clients[(i + 1) % n].request(&mut cell, method, "/meta/layer", &[], b"");
         assert_eq!(read.status, 200, "{method}: {}", read.text());
         for (name, value) in expected {
             assert_eq!(read.header(name), Some(value), "{method} {name}");
@@ -582,7 +662,7 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         }
     }
     // A read's overrides, on a successful read alone (research/89 §1.5).
-    let overridden = clients[2].send(
+    let overridden = clients[2].request(&mut cell,
         "GET",
         "/meta/layer?response-content-type=text%2Fplain&response-cache-control=no-store&response-content-disposition=inline",
         &[],
@@ -595,27 +675,50 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     assert_eq!(overridden.header("content-encoding"), Some("gzip"));
     // An object put with none is served as S3's binary/octet-stream; a later PUT's metadata
     // replaces an earlier one's.
-    let plain = clients[0].send("PUT", "/meta/plain", &[("x-amz-meta-a", "1")], b"abc");
+    let plain = clients[0].request(
+        &mut cell,
+        "PUT",
+        "/meta/plain",
+        &[("x-amz-meta-a", "1")],
+        b"abc",
+    );
     assert_eq!(plain.status, 200);
-    let replaced = clients[1].send("PUT", "/meta/plain", &[], b"abcd");
+    let replaced = clients[1].request(&mut cell, "PUT", "/meta/plain", &[], b"abcd");
     assert_eq!(replaced.status, 200);
-    let head = clients[2].send("HEAD", "/meta/plain", &[], b"");
+    let head = clients[2].request(&mut cell, "HEAD", "/meta/plain", &[], b"");
     assert_eq!(head.header("content-type"), Some("binary/octet-stream"));
     assert_eq!(head.header("x-amz-meta-a"), None);
     // S3's 2 KB of user-defined metadata, a key counted past its prefix: at it kept, past it
     // refused, nothing written.
     let at_bound = "v".repeat(2048 - 1);
-    let fits = clients[0].send("PUT", "/meta/bound", &[("x-amz-meta-k", &at_bound)], b"x");
+    let fits = clients[0].request(
+        &mut cell,
+        "PUT",
+        "/meta/bound",
+        &[("x-amz-meta-k", &at_bound)],
+        b"x",
+    );
     assert_eq!(fits.status, 200, "{}", fits.text());
     let past = "v".repeat(2048);
-    let refused = clients[0].send("PUT", "/meta/past", &[("x-amz-meta-k", &past)], b"x");
+    let refused = clients[0].request(
+        &mut cell,
+        "PUT",
+        "/meta/past",
+        &[("x-amz-meta-k", &past)],
+        b"x",
+    );
     assert_eq!(
         (refused.status, refused.element("Code").as_deref()),
         (400, Some("MetadataTooLarge")),
         "{}",
         refused.text()
     );
-    assert_eq!(clients[1].send("HEAD", "/meta/past", &[], b"").status, 404);
+    assert_eq!(
+        clients[1]
+            .request(&mut cell, "HEAD", "/meta/past", &[], b"")
+            .status,
+        404
+    );
     // A streamed body's `aws-chunked` is no coding of the object (research/05 §1.8).
     let streamed = bytes(301, 90_001);
     let crc = checksum::checksum(Algorithm::Crc32, &streamed)
@@ -628,7 +731,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         ("x-amz-trailer", "x-amz-checksum-crc32"),
     ];
     let body = s3::aws_chunked(&streamed, 64 << 10, ("x-amz-checksum-crc32", &crc));
-    let put = clients[1].send_as(
+    let put = clients[1].request_as(
+        &mut cell,
         "PUT",
         "/meta/streamed",
         &chunked,
@@ -636,11 +740,12 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
     );
     assert_eq!(put.status, 200, "{}", put.text());
-    let got = clients[2].send("GET", "/meta/streamed", &[], b"");
+    let got = clients[2].request(&mut cell, "GET", "/meta/streamed", &[], b"");
     assert_eq!(got.header("content-encoding"), Some("gzip"));
     assert!(got.body == streamed);
     // A multipart upload's metadata, named at its creation, is its completed object's.
-    let created = clients[0].send(
+    let created = clients[0].request(
+        &mut cell,
         "POST",
         "/meta/parts?uploads",
         &[
@@ -652,7 +757,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     assert_eq!(created.status, 200, "{}", created.text());
     let upload = created.element("UploadId").unwrap();
     let part = bytes(302, 1_234);
-    let sent = clients[1].send(
+    let sent = clients[1].request(
+        &mut cell,
         "PUT",
         &format!("/meta/parts?partNumber=1&uploadId={upload}"),
         &[],
@@ -663,31 +769,38 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
         sent.header("etag").unwrap()
     );
-    let completed = clients[2].send(
+    let completed = clients[2].request(
+        &mut cell,
         "POST",
         &format!("/meta/parts?uploadId={upload}"),
         &[],
         document.as_bytes(),
     );
     assert_eq!(completed.status, 200, "{}", completed.text());
-    let head = clients[0].send("HEAD", "/meta/parts", &[], b"");
+    let head = clients[0].request(&mut cell, "HEAD", "/meta/parts", &[], b"");
     assert_eq!(head.header("content-type"), Some("text/csv"));
     assert_eq!(head.header("x-amz-meta-origin"), Some("upload"));
 
     // Tags (research/89 §3.8): a version's tag set is the empty one, which stock clients ask of
     // every source they copy in parts; a missing key's is 404; a write naming tags is refused, not
     // dropped, nothing written, and one naming the empty set is taken.
-    let tags = clients[1].send("GET", "/meta/layer?tagging", &[], b"");
+    let tags = clients[1].request(&mut cell, "GET", "/meta/layer?tagging", &[], b"");
     assert_eq!(tags.status, 200, "{}", tags.text());
     assert_eq!(elements(&tags.text(), "TagSet"), [""], "{}", tags.text());
-    let missing = clients[2].send("GET", "/meta/none?tagging", &[], b"");
+    let missing = clients[2].request(&mut cell, "GET", "/meta/none?tagging", &[], b"");
     assert_eq!(
         (missing.status, missing.element("Code").as_deref()),
         (404, Some("NoSuchKey")),
         "{}",
         missing.text()
     );
-    let tagged = clients[0].send("PUT", "/meta/tagged", &[("x-amz-tagging", "k=v")], b"x");
+    let tagged = clients[0].request(
+        &mut cell,
+        "PUT",
+        "/meta/tagged",
+        &[("x-amz-tagging", "k=v")],
+        b"x",
+    );
     assert_eq!(
         (tagged.status, tagged.element("Code").as_deref()),
         (501, Some("NotImplemented")),
@@ -695,69 +808,120 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         tagged.text()
     );
     assert_eq!(
-        clients[1].send("HEAD", "/meta/tagged", &[], b"").status,
+        clients[1]
+            .request(&mut cell, "HEAD", "/meta/tagged", &[], b"")
+            .status,
         404
     );
-    let created = clients[2].send(
+    let created = clients[2].request(
+        &mut cell,
         "POST",
         "/meta/tagged?uploads",
         &[("x-amz-tagging", "k=v")],
         b"",
     );
     assert_eq!(created.status, 501, "{}", created.text());
-    let untagged = clients[0].send("PUT", "/meta/untagged", &[("x-amz-tagging", "")], b"x");
+    let untagged = clients[0].request(
+        &mut cell,
+        "PUT",
+        "/meta/untagged",
+        &[("x-amz-tagging", "")],
+        b"x",
+    );
     assert_eq!(untagged.status, 200, "{}", untagged.text());
 
     // Versions (research/89 §2): each read and headed by its ID, one no version has 404
     // NoSuchVersion, one mantle never makes 400 InvalidArgument; a delete marker named 405 with
     // its Last-Modified; a version removed by its ID; every version listed.
     let enable = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
-    let versioned = clients[0].send("PUT", "/meta?versioning", &[], enable);
+    let versioned = clients[0].request(&mut cell, "PUT", "/meta?versioning", &[], enable);
     assert_eq!(versioned.status, 200, "{}", versioned.text());
     let first = bytes(310, 5_001);
     let second = bytes(311, 6_002);
-    let v1 = clients[0].send("PUT", "/meta/v", &[("x-amz-meta-n", "1")], &first);
-    let v2 = clients[1].send("PUT", "/meta/v", &[("x-amz-meta-n", "2")], &second);
+    let v1 = clients[0].request(
+        &mut cell,
+        "PUT",
+        "/meta/v",
+        &[("x-amz-meta-n", "1")],
+        &first,
+    );
+    let v2 = clients[1].request(
+        &mut cell,
+        "PUT",
+        "/meta/v",
+        &[("x-amz-meta-n", "2")],
+        &second,
+    );
     let (v1, v2) = (
         v1.header("x-amz-version-id").unwrap().to_owned(),
         v2.header("x-amz-version-id").unwrap().to_owned(),
     );
     assert_ne!(v1, v2);
-    let old = clients[2].send("GET", &format!("/meta/v?versionId={v1}"), &[], b"");
+    let old = clients[2].request(
+        &mut cell,
+        "GET",
+        &format!("/meta/v?versionId={v1}"),
+        &[],
+        b"",
+    );
     assert_eq!(old.status, 200, "{}", old.text());
     assert!(old.body == first, "the first version read by its ID");
     assert_eq!(old.header("x-amz-version-id"), Some(v1.as_str()));
     assert_eq!(old.header("x-amz-meta-n"), Some("1"));
-    let current = clients[0].send("GET", "/meta/v", &[], b"");
+    let current = clients[0].request(&mut cell, "GET", "/meta/v", &[], b"");
     assert!(current.body == second);
-    let headed = clients[1].send("HEAD", &format!("/meta/v?versionId={v2}"), &[], b"");
+    let headed = clients[1].request(
+        &mut cell,
+        "HEAD",
+        &format!("/meta/v?versionId={v2}"),
+        &[],
+        b"",
+    );
     assert_eq!(headed.status, 200);
     assert_eq!(headed.header("x-amz-meta-n"), Some("2"));
-    let tags = clients[2].send("GET", &format!("/meta/v?tagging&versionId={v1}"), &[], b"");
+    let tags = clients[2].request(
+        &mut cell,
+        "GET",
+        &format!("/meta/v?tagging&versionId={v1}"),
+        &[],
+        b"",
+    );
     assert_eq!(tags.status, 200, "{}", tags.text());
     assert_eq!(tags.header("x-amz-version-id"), Some(v1.as_str()));
-    let absent = clients[2].send("GET", "/meta/v?versionId=0000000000001", &[], b"");
+    let absent = clients[2].request(
+        &mut cell,
+        "GET",
+        "/meta/v?versionId=0000000000001",
+        &[],
+        b"",
+    );
     assert_eq!(
         (absent.status, absent.element("Code").as_deref()),
         (404, Some("NoSuchVersion")),
         "{}",
         absent.text()
     );
-    let invalid = clients[0].send("GET", "/meta/v?versionId=not-one", &[], b"");
+    let invalid = clients[0].request(&mut cell, "GET", "/meta/v?versionId=not-one", &[], b"");
     assert_eq!(
         (invalid.status, invalid.element("Code").as_deref()),
         (400, Some("InvalidArgument")),
         "{}",
         invalid.text()
     );
-    let marked = clients[1].send("DELETE", "/meta/v", &[], b"");
+    let marked = clients[1].request(&mut cell, "DELETE", "/meta/v", &[], b"");
     assert_eq!(marked.status, 204);
     assert_eq!(marked.header("x-amz-delete-marker"), Some("true"));
     let marker = marked.header("x-amz-version-id").unwrap().to_owned();
-    let gone = clients[2].send("GET", "/meta/v", &[], b"");
+    let gone = clients[2].request(&mut cell, "GET", "/meta/v", &[], b"");
     assert_eq!(gone.status, 404);
     assert_eq!(gone.header("x-amz-delete-marker"), Some("true"));
-    let named = clients[0].send("GET", &format!("/meta/v?versionId={marker}"), &[], b"");
+    let named = clients[0].request(
+        &mut cell,
+        "GET",
+        &format!("/meta/v?versionId={marker}"),
+        &[],
+        b"",
+    );
     assert_eq!(
         (named.status, named.element("Code").as_deref()),
         (405, Some("MethodNotAllowed")),
@@ -766,7 +930,7 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     );
     assert_eq!(named.header("x-amz-delete-marker"), Some("true"));
     assert!(named.header("last-modified").is_some());
-    let listed = clients[1].send("GET", "/meta?versions&prefix=v", &[], b"");
+    let listed = clients[1].request(&mut cell, "GET", "/meta?versions&prefix=v", &[], b"");
     assert_eq!(listed.status, 200, "{}", listed.text());
     let ids = elements(&listed.text(), "VersionId");
     assert_eq!(
@@ -781,22 +945,46 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         ["true", "false", "false"]
     );
     // The delete marker removed by its ID undeletes the key; a version removed by its ID goes.
-    let unmarked = clients[2].send("DELETE", &format!("/meta/v?versionId={marker}"), &[], b"");
+    let unmarked = clients[2].request(
+        &mut cell,
+        "DELETE",
+        &format!("/meta/v?versionId={marker}"),
+        &[],
+        b"",
+    );
     assert_eq!(unmarked.status, 204);
     assert_eq!(unmarked.header("x-amz-delete-marker"), Some("true"));
     assert_eq!(unmarked.header("x-amz-version-id"), Some(marker.as_str()));
-    assert!(clients[0].send("GET", "/meta/v", &[], b"").body == second);
-    let removed = clients[0].send("DELETE", &format!("/meta/v?versionId={v1}"), &[], b"");
+    assert!(
+        clients[0]
+            .request(&mut cell, "GET", "/meta/v", &[], b"")
+            .body
+            == second
+    );
+    let removed = clients[0].request(
+        &mut cell,
+        "DELETE",
+        &format!("/meta/v?versionId={v1}"),
+        &[],
+        b"",
+    );
     assert_eq!(removed.status, 204);
     assert_eq!(removed.header("x-amz-version-id"), Some(v1.as_str()));
-    let lost = clients[1].send("GET", &format!("/meta/v?versionId={v1}"), &[], b"");
+    let lost = clients[1].request(
+        &mut cell,
+        "GET",
+        &format!("/meta/v?versionId={v1}"),
+        &[],
+        b"",
+    );
     assert_eq!(lost.status, 404, "{}", lost.text());
 
     // CopyObject (research/89 §3): within the bucket and across, its metadata the source's under
     // COPY and the request's under REPLACE, of a named version, held to the source's conditions;
     // the copy's ETag its bytes' MD5, every byte the source's.
     let source = bytes(320, 3 << 20);
-    let made = clients[0].send(
+    let made = clients[0].request(
+        &mut cell,
         "PUT",
         "/meta/src",
         &[("content-type", "image/png"), ("x-amz-meta-from", "source")],
@@ -804,7 +992,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     );
     assert_eq!(made.status, 200);
     let source_version = made.header("x-amz-version-id").unwrap().to_owned();
-    let copied = clients[1].send(
+    let copied = clients[1].request(
+        &mut cell,
         "PUT",
         "/other/copy",
         &[("x-amz-copy-source", "/meta/src")],
@@ -822,7 +1011,7 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         copied.header("x-amz-copy-source-version-id"),
         Some(source_version.as_str())
     );
-    let read = clients[2].send("GET", "/other/copy", &[], b"");
+    let read = clients[2].request(&mut cell, "GET", "/other/copy", &[], b"");
     assert!(read.body == source, "a copy across buckets read back");
     assert_eq!(read.header("content-type"), Some("image/png"));
     assert_eq!(read.header("x-amz-meta-from"), Some("source"));
@@ -831,7 +1020,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     let stated = mantle_s3::time::parse_iso8601(&copied.element("LastModified").unwrap())
         .and_then(|(seconds, _)| mantle_s3::time::http_date(seconds));
     assert_eq!(read.header("last-modified"), stated.as_deref());
-    let replaced = clients[0].send(
+    let replaced = clients[0].request(
+        &mut cell,
         "PUT",
         "/meta/replaced",
         &[
@@ -843,12 +1033,13 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         b"",
     );
     assert_eq!(replaced.status, 200, "{}", replaced.text());
-    let head = clients[1].send("HEAD", "/meta/replaced", &[], b"");
+    let head = clients[1].request(&mut cell, "HEAD", "/meta/replaced", &[], b"");
     assert_eq!(head.header("content-type"), Some("text/plain"));
     assert_eq!(head.header("x-amz-meta-new"), Some("yes"));
     assert_eq!(head.header("x-amz-meta-from"), None);
     // A version copied by its ID.
-    let restored = clients[2].send(
+    let restored = clients[2].request(
+        &mut cell,
         "PUT",
         "/other/restored",
         &[("x-amz-copy-source", &format!("meta/v?versionId={v2}"))],
@@ -859,11 +1050,17 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         restored.header("x-amz-copy-source-version-id"),
         Some(v2.as_str())
     );
-    assert!(clients[0].send("GET", "/other/restored", &[], b"").body == second);
+    assert!(
+        clients[0]
+            .request(&mut cell, "GET", "/other/restored", &[], b"")
+            .body
+            == second
+    );
     // The source's conditions: a matching if-match copies, a mismatched one and a matching
     // if-none-match fail 412, an if-modified-since after the source fails 412 (research/89 §3.3).
     let tag = etag(&source);
-    let held = clients[1].send(
+    let held = clients[1].request(
+        &mut cell,
         "PUT",
         "/other/held",
         &[
@@ -885,7 +1082,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
             "Fri, 01 Jan 2100 00:00:00 GMT",
         ),
     ] {
-        let failed = clients[2].send(
+        let failed = clients[2].request(
+            &mut cell,
             "PUT",
             "/other/failed",
             &[("x-amz-copy-source", "meta/src"), condition],
@@ -899,11 +1097,14 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         );
     }
     assert_eq!(
-        clients[0].send("HEAD", "/other/failed", &[], b"").status,
+        clients[0]
+            .request(&mut cell, "HEAD", "/other/failed", &[], b"")
+            .status,
         404
     );
     // Onto itself: refused under COPY, taken under REPLACE, which changes its metadata.
-    let itself = clients[0].send(
+    let itself = clients[0].request(
+        &mut cell,
         "PUT",
         "/meta/src",
         &[("x-amz-copy-source", "meta/src")],
@@ -915,7 +1116,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         "{}",
         itself.text()
     );
-    let renamed = clients[1].send(
+    let renamed = clients[1].request(
+        &mut cell,
         "PUT",
         "/meta/src",
         &[
@@ -926,7 +1128,7 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         b"",
     );
     assert_eq!(renamed.status, 200, "{}", renamed.text());
-    let head = clients[2].send("HEAD", "/meta/src", &[], b"");
+    let head = clients[2].request(&mut cell, "HEAD", "/meta/src", &[], b"");
     assert_eq!(head.header("x-amz-meta-from"), Some("itself"));
     assert_eq!(head.header("etag"), Some(tag.as_str()));
     // What names no source: a missing key, a missing bucket, a source not encoded as one.
@@ -936,7 +1138,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         ("meta", 400, "InvalidArgument"),
         ("meta/src?versionId=0000000000001", 404, "NoSuchVersion"),
     ] {
-        let failed = clients[0].send(
+        let failed = clients[0].request(
+            &mut cell,
             "PUT",
             "/other/none",
             &[("x-amz-copy-source", copy_source)],
@@ -949,7 +1152,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
             failed.text()
         );
     }
-    let directive = clients[1].send(
+    let directive = clients[1].request(
+        &mut cell,
         "PUT",
         "/other/none",
         &[
@@ -964,10 +1168,16 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     // parts, completed and read back as their bytes; a malformed range, one past the source, and
     // a range of a source of 5 MiB or less refused.
     let big = bytes(330, (5 << 20) + 12_345);
-    assert_eq!(clients[0].send("PUT", "/meta/big", &[], &big).status, 200);
-    let created = clients[1].send("POST", "/other/assembled?uploads", &[], b"");
+    assert_eq!(
+        clients[0]
+            .request(&mut cell, "PUT", "/meta/big", &[], &big)
+            .status,
+        200
+    );
+    let created = clients[1].request(&mut cell, "POST", "/other/assembled?uploads", &[], b"");
     let upload = created.element("UploadId").unwrap();
-    let ranged = clients[2].send(
+    let ranged = clients[2].request(
+        &mut cell,
         "PUT",
         &format!("/other/assembled?partNumber=1&uploadId={upload}"),
         &[
@@ -982,14 +1192,16 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         Some(etag(&big[..5 << 20]))
     );
     assert!(ranged.element("LastModified").is_some());
-    let whole = clients[0].send(
+    let whole = clients[0].request(
+        &mut cell,
         "PUT",
         &format!("/other/assembled?partNumber=2&uploadId={upload}"),
         &[("x-amz-copy-source", "meta/plain")],
         b"",
     );
     assert_eq!(whole.status, 200, "{}", whole.text());
-    let parts = clients[1].send(
+    let parts = clients[1].request(
+        &mut cell,
         "GET",
         &format!("/other/assembled?uploadId={upload}"),
         &[],
@@ -1005,7 +1217,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         ("bytes=0-bar", 400, "InvalidArgument"),
         ("bytes=0-99999999", 416, "InvalidRange"),
     ] {
-        let failed = clients[2].send(
+        let failed = clients[2].request(
+            &mut cell,
             "PUT",
             &format!("/other/assembled?partNumber=3&uploadId={upload}"),
             &[
@@ -1021,7 +1234,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
             failed.text()
         );
     }
-    let small_range = clients[0].send(
+    let small_range = clients[0].request(
+        &mut cell,
         "PUT",
         &format!("/other/assembled?partNumber=3&uploadId={upload}"),
         &[
@@ -1041,14 +1255,15 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         unescaped(ranged.element("ETag")).unwrap(),
         unescaped(whole.element("ETag")).unwrap()
     );
-    let completed = clients[1].send(
+    let completed = clients[1].request(
+        &mut cell,
         "POST",
         &format!("/other/assembled?uploadId={upload}"),
         &[],
         document.as_bytes(),
     );
     assert_eq!(completed.status, 200, "{}", completed.text());
-    let assembled = clients[2].send("GET", "/other/assembled", &[], b"");
+    let assembled = clients[2].request(&mut cell, "GET", "/other/assembled", &[], b"");
     let mut expected = big[..5 << 20].to_vec();
     expected.extend_from_slice(b"abcd");
     assert!(assembled.body == expected, "the part copies read back");
@@ -1059,14 +1274,15 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     for key in ["d/1", "d/2", "d/3"] {
         assert_eq!(
             clients[0]
-                .send("PUT", &format!("/other/{key}"), &[], b"x")
+                .request(&mut cell, "PUT", &format!("/other/{key}"), &[], b"x")
                 .status,
             200
         );
     }
     let (document, md5) =
         delete_document(&[("d/1", None), ("d/2", None), ("d/missing", None)], false);
-    let deleted = clients[1].send(
+    let deleted = clients[1].request(
+        &mut cell,
         "POST",
         "/other?delete",
         &[("content-md5", &md5)],
@@ -1080,13 +1296,19 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         deleted.text()
     );
     assert!(!deleted.text().contains("<Error>"));
-    assert_eq!(clients[2].send("HEAD", "/other/d/1", &[], b"").status, 404);
+    assert_eq!(
+        clients[2]
+            .request(&mut cell, "HEAD", "/other/d/1", &[], b"")
+            .status,
+        404
+    );
     // Under versioning a simple delete makes a marker, which the result names; a version named
     // goes; quiet says nothing of either.
-    let made = clients[0].send("PUT", "/meta/m", &[], b"one");
+    let made = clients[0].request(&mut cell, "PUT", "/meta/m", &[], b"one");
     let m1 = made.header("x-amz-version-id").unwrap().to_owned();
     let (document, md5) = delete_document(&[("m", None)], false);
-    let marked = clients[1].send(
+    let marked = clients[1].request(
+        &mut cell,
         "POST",
         "/meta?delete",
         &[("content-md5", &md5)],
@@ -1100,7 +1322,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     );
     assert!(marked.element("DeleteMarkerVersionId").is_some());
     let (document, md5) = delete_document(&[("m", Some(&m1)), ("d/never", None)], true);
-    let quiet = clients[2].send(
+    let quiet = clients[2].request(
+        &mut cell,
         "POST",
         "/meta?delete",
         &[("content-md5", &md5)],
@@ -1109,11 +1332,18 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     assert_eq!(quiet.status, 200, "{}", quiet.text());
     assert!(!quiet.text().contains("<Deleted>"), "{}", quiet.text());
     assert!(!quiet.text().contains("<Error>"), "{}", quiet.text());
-    let lost = clients[0].send("GET", &format!("/meta/m?versionId={m1}"), &[], b"");
+    let lost = clients[0].request(
+        &mut cell,
+        "GET",
+        &format!("/meta/m?versionId={m1}"),
+        &[],
+        b"",
+    );
     assert_eq!(lost.status, 404);
     // A version ID mantle never makes fails its key alone, quiet or not.
     let (document, md5) = delete_document(&[("d/3", None), ("d/3", Some("bad"))], true);
-    let mixed = clients[1].send(
+    let mixed = clients[1].request(
+        &mut cell,
         "POST",
         "/other?delete",
         &[("content-md5", &md5)],
@@ -1126,21 +1356,27 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
         "{}",
         mixed.text()
     );
-    assert_eq!(clients[2].send("HEAD", "/other/d/3", &[], b"").status, 404);
+    assert_eq!(
+        clients[2]
+            .request(&mut cell, "HEAD", "/other/d/3", &[], b"")
+            .status,
+        404
+    );
     // A checksum header in Content-MD5's place serves; neither is refused; one of another body
     // is BadDigest.
     let (document, _) = delete_document(&[("d/2", None)], false);
     let crc = checksum::checksum(Algorithm::Crc32, document.as_bytes())
         .unwrap()
         .to_base64();
-    let by_crc = clients[0].send(
+    let by_crc = clients[0].request(
+        &mut cell,
         "POST",
         "/other?delete",
         &[("x-amz-checksum-crc32", &crc)],
         document.as_bytes(),
     );
     assert_eq!(by_crc.status, 200, "{}", by_crc.text());
-    let bare = clients[1].send("POST", "/other?delete", &[], document.as_bytes());
+    let bare = clients[1].request(&mut cell, "POST", "/other?delete", &[], document.as_bytes());
     assert_eq!(
         (bare.status, bare.element("Code").as_deref()),
         (400, Some("InvalidRequest")),
@@ -1150,7 +1386,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     let other_md5 = checksum::checksum(Algorithm::Md5, b"another document")
         .unwrap()
         .to_base64();
-    let wrong = clients[2].send(
+    let wrong = clients[2].request(
+        &mut cell,
         "POST",
         "/other?delete",
         &[("content-md5", &other_md5)],
@@ -1165,7 +1402,8 @@ fn metadata_versions_copies_and_batch_deletes_answer_as_s3_does() {
     let keys: Vec<String> = (0..1001).map(|i| format!("k{i}")).collect();
     let listed: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), None)).collect();
     let (document, md5) = delete_document(&listed, true);
-    let crowded = clients[0].send(
+    let crowded = clients[0].request(
+        &mut cell,
         "POST",
         "/other?delete",
         &[("content-md5", &md5)],

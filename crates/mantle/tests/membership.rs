@@ -38,6 +38,9 @@ mod relay;
 #[allow(dead_code)]
 #[path = "support/s3.rs"]
 mod s3;
+#[allow(dead_code)]
+#[path = "support/s3_watched.rs"]
+mod s3_watched;
 use cell::*;
 use std::io::Read as _;
 use std::net::TcpStream;
@@ -146,7 +149,9 @@ fn client_settings(who: &Identity, targets: &[Target]) -> ClientSettings {
 }
 
 /// One S3 request to the listener at `at`, signed with SigV4: its status and body, or none where
-/// the connection failed (a node killed). No deadline: a node held still answers once it goes on.
+/// the connection failed (a node killed). No deadline of its own: a node held still answers once it
+/// goes on, and the test waits on the load under the cell's watch (`lead`, `acknowledged`,
+/// `Steady::end`).
 fn s3_request(
     who: &Identity,
     at: SocketAddr,
@@ -341,10 +346,12 @@ impl Steady {
         }
     }
 
-    fn end(&mut self) {
+    /// Ends the load once its round under way is done, waited on under the cell's watch.
+    #[track_caller]
+    fn end(&mut self, cell: &mut Cell) {
         let _ = self.leads.send(Lead::End);
         if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
+            cell.watched("the load's last round", thread);
         }
         self.take();
     }
@@ -456,7 +463,7 @@ fn every_object_reads_back(cell: &mut Cell, load: &mut Steady, through: &[u64], 
         let (listen, region, _) = cell.s3[&node].clone();
         let at = cell.s3_bound.get(&node).map_or(listen, |(at, _)| *at);
         let mut client = s3::Client::new(at, access.clone(), &region);
-        let response = client.send("GET", &format!("/{BUCKET}/{}", key_of(*n)), &[], &[]);
+        let response = client.request(cell, "GET", &format!("/{BUCKET}/{}", key_of(*n)), &[], &[]);
         assert_eq!(
             response.status,
             200,
@@ -661,7 +668,7 @@ fn a_cell_grows_from_one_to_five_and_back_to_two_voters_under_load() {
     });
     acknowledged(&mut cell, &mut load, 4);
     every_object_reads_back(&mut cell, &mut load, &members, "two voters, three leaving");
-    load.end();
+    load.end(&mut cell);
     every_object_reads_back(&mut cell, &mut load, &staying, "the end");
 }
 
@@ -775,7 +782,7 @@ fn a_member_with_nothing_to_move_leaves_whole_and_one_stated_gone_is_refused() {
         }))
     });
     acknowledged(&mut cell, &mut load, 6);
-    load.end();
+    load.end(&mut cell);
     every_object_reads_back(
         &mut cell,
         &mut load,

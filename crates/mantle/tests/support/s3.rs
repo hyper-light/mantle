@@ -1,7 +1,8 @@
 //! A signed S3 client of the listener's own, for its tests: each request signed with SigV4 by the
 //! operator's profile key (`mantle_s3::sigv4`, the functions S3's own clients' signatures are
 //! checked against), written over a keep-alive TCP connection opened again after a response that
-//! closed it, and its response read whole.
+//! closed it, and its response read whole. A read of a response blocks with no bound of its own, so
+//! a test of a cell asks each request under the cell's watch (`support/s3_watched.rs`).
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -187,7 +188,8 @@ impl Client {
         head
     }
 
-    /// Sends a request whose body's SHA-256 is signed, and reads its response.
+    /// Sends a request whose body's SHA-256 is signed, and reads its response, on this thread with
+    /// no bound of its own (`Client::request` asks one under a cell's watch).
     pub(crate) fn send(
         &mut self,
         method: &str,

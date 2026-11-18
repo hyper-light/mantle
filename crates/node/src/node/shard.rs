@@ -328,6 +328,73 @@ pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
     Ok(made_room)
 }
 
+/// The node's shard's owner of the replicas its own task drives, and the handles it gave the
+/// replicas that left it for another shard's (node.md §2.9), which their ranges' `Kept` still
+/// hold. hyper-durable's handle is a slot and a generation that wraps at `u32` (`Owner::remove`),
+/// so a slot emptied and filled again 2^32 times gives a handle equal to one it gave before: were
+/// that one a far range's, the node would take the new replica for that range. Every insert here
+/// passes [`Here::insert`], which gives none of those handles.
+pub(crate) struct Here<E: Engine, S: LogStore> {
+    owner: Owner<Answers<S>, RangeMachine<E>, Unbounded>,
+    /// The handles of the replicas that left ([`Here::leave`]): one a range, as a range leaves
+    /// once, before its first drive, so at most the ranges the node hosts.
+    left: Vec<Handle>,
+}
+
+impl<E: Engine + 'static, S: LogStore> Here<E, S> {
+    pub(crate) fn new(owner: Owner<Answers<S>, RangeMachine<E>, Unbounded>) -> Self {
+        Self {
+            owner,
+            left: Vec::new(),
+        }
+    }
+
+    /// Takes `replica` into a free slot, queued for its first drive, under a handle no far range
+    /// holds: one equal to such a handle is taken out and put in again, which moves its slot's
+    /// generation on. Each pass gives a handle no earlier pass of this insert gave, so of
+    /// `left.len() + 1` passes one gives a handle none left with. Refused `Full` when no slot is
+    /// free.
+    pub(crate) fn insert(&mut self, replica: Replica<E, S>) -> Result<Handle, NodeError> {
+        let mut handle = self.owner.insert(replica).map_err(|_| NodeError::Full)?;
+        for _ in 0..self.left.len() {
+            if !self.left.contains(&handle) {
+                return Ok(handle);
+            }
+            let replica = self.owner.remove(handle).ok_or(NodeError::Bounds(
+                "a handle just given names nothing".into(),
+            ))?;
+            handle = self.owner.insert(replica).map_err(|_| NodeError::Full)?;
+        }
+        if self.left.contains(&handle) {
+            let _ = self.owner.remove(handle);
+            return Err(NodeError::Aliased);
+        }
+        Ok(handle)
+    }
+
+    /// Gives back the replica at `handle`, which leaves for another shard's owner; its handle is
+    /// one no insert gives again.
+    pub(crate) fn leave(&mut self, handle: Handle) -> Option<Replica<E, S>> {
+        let replica = self.owner.remove(handle)?;
+        self.left.push(handle);
+        Some(replica)
+    }
+}
+
+impl<E: Engine, S: LogStore> std::ops::Deref for Here<E, S> {
+    type Target = Owner<Answers<S>, RangeMachine<E>, Unbounded>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+
+impl<E: Engine, S: LogStore> std::ops::DerefMut for Here<E, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.owner
+    }
+}
+
 /// Refused, typed, when `replica` has writes out: each write records the waker of the task that
 /// submitted it, so their answers would wake the shard it left. A replica moves before its first
 /// drive, when it has made none.
@@ -2117,5 +2184,47 @@ mod tests {
         drop(lanes);
         rt.shutdown().unwrap();
         drop(log);
+    }
+
+    /// No insert into the node's shard's owner gives a handle a range that left it holds. A slot
+    /// filled again 2^32 times would give one; here a second arena of one slot gives the handles
+    /// the node's owner's slot gives in turn, the first two taken as held by ranges that left: the
+    /// insert passes both for the slot's third. A replica that leaves holds its handle, which then
+    /// names nothing, and the next insert gives another.
+    #[test]
+    fn no_insert_into_the_nodes_owner_gives_a_handle_a_far_range_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let replica = campaigning(&log, &range);
+        let waker = Waker::noop();
+        let mut other = Owner::new(vec![waker.clone()]);
+        let mut handles = Vec::new();
+        let mut replica = Some(replica);
+        for _ in 0..3 {
+            let Ok(handle) = other.insert(replica.take().unwrap()) else {
+                panic!("the second arena's one slot is free");
+            };
+            replica = other.remove(handle);
+            handles.push(handle);
+        }
+        let replica = replica.unwrap();
+        assert!(handles[0] != handles[1] && handles[1] != handles[2]);
+
+        let mut here = Here::new(Owner::new(vec![waker.clone()]));
+        here.left = vec![handles[0], handles[1]];
+        let handle = here.insert(replica).unwrap();
+        assert_eq!(handle, handles[2], "the slot's first handle none left with");
+        assert!(here.get(handle).is_some());
+
+        let replica = here.leave(handle).unwrap();
+        assert!(here.left.contains(&handle));
+        assert!(
+            here.get(handle).is_none(),
+            "a handle that left names nothing"
+        );
+        let again = here.insert(replica).unwrap();
+        assert!(!here.left.contains(&again));
+        assert!(here.get(again).is_some());
     }
 }

@@ -282,6 +282,8 @@ pub enum NodeError {
     WritesOut(u128),
     #[error("shard {0} gave its ranges back not within the transport's idle timeout")]
     ShardSilent(usize),
+    #[error("the node's arena gave only handles that ranges on other shards hold")]
+    Aliased,
 }
 
 impl From<Refusal> for NodeError {
@@ -835,7 +837,9 @@ impl<E: Engine + 'static, L: NodeLog> Taking<'_, E, L> {
 pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     id: u64,
     log: L,
-    owner: Owner<Answers<L::Store>, RangeMachine<E>, Unbounded>,
+    /// The replicas the node's own task drives; a range moved to another shard leaves it
+    /// ([`shard::Here`]).
+    owner: shard::Here<E, L::Store>,
     ranges: Vec<Kept>,
     /// The shard that runs each range, by its place in `ranges` (node.md §2.9).
     spread: spread::Spread,
@@ -1183,7 +1187,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             plane(&stated).map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
 
         let hosting = std::mem::take(&mut settings.ranges);
-        let mut owner = Owner::new(vec![waker.clone(); hosting.len()]);
+        let mut owner = shard::Here::new(Owner::new(vec![waker.clone(); hosting.len()]));
         let mut ranges = Vec::with_capacity(hosting.len());
         // The node runs every range in its one task, on the shard that task runs on (node.md §1.2,
         // as built 2026-11-17): one shard, the least a spread holds, so the rule places each range
@@ -1206,9 +1210,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Elections::Suspicion,
             )
             .map_err(at(Step::Storage))?;
-            let handle = owner
-                .insert(shell)
-                .map_err(|_| at(Step::Budgets)(NodeError::Full))?;
+            let handle = owner.insert(shell).map_err(at(Step::Budgets))?;
             owner.schedule(handle);
             spread
                 .place()
@@ -1517,7 +1519,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some(kept) = self.ranges.get_mut(place) else {
                 continue;
             };
-            let Some(replica) = self.owner.remove(kept.handle) else {
+            let Some(replica) = self.owner.leave(kept.handle) else {
                 continue;
             };
             if let Some(old) = kept.wake.take() {

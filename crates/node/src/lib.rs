@@ -52,6 +52,7 @@ pub mod node;
 pub mod place;
 pub mod process;
 pub mod read;
+pub mod rejoin;
 pub mod secret;
 pub mod storage;
 pub(crate) mod window;

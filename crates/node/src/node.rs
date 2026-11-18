@@ -5315,7 +5315,7 @@ fn answer_command(commanded: &mut [Commanded], group: u128, applied: &Applied) {
 /// The node's log, on a file in its directory: created empty for a new node, which sizes it as
 /// it writes.
 fn open_log(dir: &Path, node: u64, config: LogConfig) -> Result<Log<DeviceFile>, NodeError> {
-    let path = dir.join("log");
+    let path = dir.join(crate::layout::LOG);
     let fresh = !path.exists();
     let file = DeviceFile::open(
         &path,

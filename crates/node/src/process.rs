@@ -155,6 +155,7 @@ use crate::names::{Answered, Names};
 use crate::node::{
     GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Step, Wall,
 };
+use crate::rejoin::{self, Configured, RejoinError, Resume};
 use crate::secret::{self, SecretError};
 use crate::storage::{Locks, NodeLock, Storage, StorageError, VolumeSettings};
 use mantle_protocol::classes::Role;
@@ -212,6 +213,13 @@ pub enum ProcessError {
     /// nothing under it.
     #[error("retired: the cell wrote this node off, its certificate's fingerprint {0}")]
     Retired(String),
+    /// A step of the node's rejoin (membership.md §5.1 steps 4 and 5) that could not be taken.
+    #[error("the rejoin: {0}")]
+    Rejoin(#[from] RejoinError),
+    /// The node took its new identity (membership.md §5.1 step 5), the node its configuration now
+    /// names: its join as a new member (step 6) is the next start's, and that start a member's.
+    #[error("rejoined as node {0}: its next start joins the cell as a new member")]
+    Rejoined(u64),
 }
 
 /// The signals that stop the node in order (node.md §1.7): SIGTERM, which a service manager or a
@@ -1341,8 +1349,11 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     // Before any thread allocates: a freed large block's memory goes back to the OS, which a range's
     // budget following the machine reads as room (docs/research/65 §6).
     mantle_engine::port::mmap::return_freed_blocks();
-    let config = ProcessConfig::read(config).map_err(step(Step::Configuration))?;
-    refuse_retired(&config.dir)?;
+    let file = config;
+    let config = ProcessConfig::read(file).map_err(step(Step::Configuration))?;
+    resume_rejoin(process_rejoining(file, &config), |file| {
+        ProcessConfig::read(file).map(|config| process_rejoining(file, &config))
+    })?;
     let keys = config
         .gateway
         .as_ref()
@@ -1517,7 +1528,9 @@ fn since(now: &Histogram, then: &Histogram, q_ppm: u32) -> Option<u64> {
 pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
     mantle_engine::port::mmap::return_freed_blocks();
     let stated = read_stated(config).map_err(step(Step::Configuration))?;
-    refuse_retired(&stated.dir)?;
+    resume_rejoin(stated_rejoining(config, &stated), |file| {
+        read_stated(file).map(|stated| stated_rejoining(file, &stated))
+    })?;
     let identity = identity(
         (&stated.certificate, &stated.key, &stated.authority),
         &stated.peers,
@@ -1553,21 +1566,63 @@ pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
     )
 }
 
-/// Refuses the start of a node the cell wrote off (docs/design/membership.md §5.1 step 2): its
-/// directory `dir` holds the rejoin marker, so before anything opens, measures, dials or writes, it
-/// says `retired` and the process ends with the marker's fingerprint. Taking a new identity is the
-/// rejoin's (§5.1 steps 3 to 6); until then the marker stands.
-fn refuse_retired(dir: &Path) -> Result<(), ProcessError> {
-    let Some(fingerprint) = Layout::new(dir)
-        .retired()
-        .map_err(|e| ProcessError::History(e.to_string()))?
-    else {
+/// Takes a start of the node whose configuration `configured` read where its rejoin stands
+/// (docs/design/membership.md §5.1's resume table, `rejoin::state`), each configuration after it
+/// read by `read`. No marker: the start goes on. Any other place says `retired`, then:
+///
+/// - the marker and no next certificate, the ask (step 3): before anything opens, measures, dials
+///   or writes, the start ends with the marker's fingerprint, the marker kept, until the cell's
+///   issuer and the ask are built (slices 4 to 6);
+/// - a next certificate, or the configuration naming it: under the node directory's and every
+///   volume's lock, the wipe and the switch to their end (steps 4 and 5), and the start ends
+///   naming the new node, whose join (step 6) is the next start's.
+fn resume_rejoin(
+    configured: Configured,
+    read: impl Fn(&Path) -> Result<Configured, ProcessError>,
+) -> Result<(), ProcessError> {
+    let stands = rejoin::state(&configured)?;
+    if stands == Resume::Start {
         return Ok(());
-    };
+    }
     let mut out = std::io::stdout().lock();
     writeln!(out, "retired").map_err(|e| ProcessError::Say(e.to_string()))?;
     out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
-    Err(ProcessError::Retired(hex(&fingerprint)))
+    drop(out);
+    if let Resume::Ask(fingerprint) = stands {
+        return Err(ProcessError::Retired(hex(&fingerprint)));
+    }
+    let _node = Locks::node(&configured.dir).map_err(step(Step::Locks))?;
+    let _volumes =
+        Locks::take(configured.volumes.iter().map(PathBuf::as_path)).map_err(step(Step::Locks))?;
+    let done = rejoin::resume(|| read(&configured.file))?;
+    match rejoin::state(&done)? {
+        Resume::Start => Err(ProcessError::Rejoined(done.id)),
+        stands => Err(RejoinError::Order(stands, "the join").into()),
+    }
+}
+
+/// What the rejoin reads of `mantle node`'s configuration `config`, read from `file`.
+fn process_rejoining(file: &Path, config: &ProcessConfig) -> Configured {
+    Configured {
+        file: file.to_path_buf(),
+        id: config.id,
+        dir: config.dir.clone(),
+        certificate: config.certificate.clone(),
+        ranges: config.ranges.iter().map(|(group, _)| *group).collect(),
+        volumes: config.volumes.iter().map(|v| v.dir.clone()).collect(),
+    }
+}
+
+/// What the rejoin reads of `mantle serve`'s configuration `stated`, read from `file`.
+fn stated_rejoining(file: &Path, stated: &Stated) -> Configured {
+    Configured {
+        file: file.to_path_buf(),
+        id: stated.id,
+        dir: stated.dir.clone(),
+        certificate: stated.certificate.clone(),
+        ranges: stated.ranges.iter().map(|(group, _)| *group).collect(),
+        volumes: stated.volumes.iter().map(|(dir, _)| dir.clone()).collect(),
+    }
 }
 
 /// `bytes` as lowercase hex.
@@ -2128,7 +2183,7 @@ fn device(identity: &mantle_disk::identity::Identity) -> Device {
 }
 
 /// Range `group`'s engine store in the node's directory `dir`.
-fn store_path(dir: &Path, group: u128) -> PathBuf {
+pub(crate) fn store_path(dir: &Path, group: u128) -> PathBuf {
     dir.join(format!("range-{group:032x}.store"))
 }
 
@@ -4654,28 +4709,38 @@ mod tests {
         assert!(!retirement.judge(removed, 1, all.into_iter(), (2_000, PATIENCE)));
     }
 
-    /// A directory holding the rejoin marker is refused its start before anything is written in
-    /// it: no run raised, so the node opens no log, dials no member and writes no liveness record
-    /// (membership.md §5.1 step 2); one without the marker starts.
+    /// A start whose directory holds the rejoin marker and no next certificate is refused before
+    /// anything is written in it: no run raised, so the node opens no log, dials no member and
+    /// writes no liveness record (membership.md §5.1 step 2), the ask (step 3) not built yet. With
+    /// the cell's certificate beside the next key, the start wipes and switches (steps 4 and 5) and
+    /// ends naming the new node, and the next start is a member's.
     #[test]
-    fn a_retired_node_starts_nothing() {
+    fn a_retired_node_starts_nothing_until_it_takes_its_new_identity() {
         let dir = tempfile::tempdir().unwrap();
-        refuse_retired(dir.path()).unwrap();
-        let fingerprint = [0xa5u8; mantle_meta::record::FINGERPRINT];
-        Layout::new(dir.path()).retire(&fingerprint).unwrap();
-        let before: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        match refuse_retired(dir.path()) {
-            Err(ProcessError::Retired(said)) => assert_eq!(said, "a5".repeat(32)),
+        let file = crate::rejoin::tests::laid_out(dir.path(), 5);
+        let read = |file: &Path| read_stated(file).map(|stated| stated_rejoining(file, &stated));
+        let listed = || -> Vec<_> {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect()
+        };
+        let before = listed();
+        let fingerprint = Layout::new(dir.path()).retired().unwrap().unwrap();
+        match resume_rejoin(read(&file).unwrap(), read) {
+            Err(ProcessError::Retired(said)) => assert_eq!(said, hex(&fingerprint)),
             other => panic!("not refused as retired: {other:?}"),
         }
-        let after: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(before, after);
+        assert_eq!(before, listed());
+        crate::rejoin::next_key(&read(&file).unwrap()).unwrap();
+        let (der, _) = crate::rejoin::tests::certificate(9);
+        crate::rejoin::keep_certificate(&read(&file).unwrap(), &der).unwrap();
+        match resume_rejoin(read(&file).unwrap(), read) {
+            Err(ProcessError::Rejoined(9)) => {}
+            other => panic!("not rejoined as node 9: {other:?}"),
+        }
+        assert_eq!(Layout::new(dir.path()).retired().unwrap(), None);
         assert_eq!(Layout::new(dir.path()).run().unwrap(), None);
+        resume_rejoin(read(&file).unwrap(), read).unwrap();
     }
 }

@@ -29,7 +29,7 @@ const LOCK: &str = "LOCK";
 /// The volume's file.
 const VOLUME: &str = "volume";
 /// A volume being laid out, renamed to [`VOLUME`] once whole.
-const VOLUME_NEW: &str = "volume.new";
+pub(crate) const VOLUME_NEW: &str = "volume.new";
 
 /// A chunk volume the node keeps, as its configuration states it.
 #[derive(Debug, Clone)]

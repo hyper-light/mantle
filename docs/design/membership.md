@@ -469,6 +469,32 @@ A start finds where it stopped from its files alone: no marker, a normal start; 
 `next.der`, step 3 again with the kept key; `next.der` with the configuration naming the old
 identity, steps 4 and 5; the configuration naming the new one, the rest of step 5, then step 6.
 
+*As built (slice 3, 2026-11-18;* `crates/node/src/rejoin.rs`*).* The configuration names old or new
+by the fingerprint of the certificate it names against the marker's, not by how its path is spelled.
+An identity is kept in one of two places in `identity/` beside the configuration, `node.der` and
+`node.key` or `next.der` and `next.key`: the configuration names one, and the next identity is
+written to the other, so a node written off a second time writes its next identity where its first
+switch left room, and "`next.der`" above is the place the configuration does not name. A certificate
+there that the marker names is the old identity's, not the cell's answer, and the start asks again.
+Each of steps 4 and 5 is an act done whole and durable before the next, chosen from the files alone
+(`rejoin::act`), and a start runs them under the node directory's and every volume's lock, at most
+as many as there are (the inventory's deletions, the switch, the old certificate and key, the
+marker): the wipe deletes one file an act, its log, each range's store the configuration names, its
+`run`, `stopped` and `live`, and each volume's `mantle/volume` and `mantle/volume.new`; once none is
+left it flushes the node's directory and each volume's `mantle/`, so a deletion a crash left
+unflushed cannot come back under the new identity, then switches, rewriting the configuration's
+`id`, `certificate` and `key` lines and keeping every other (the seeds are slice 6's, with the
+answer that carries them); then it deletes the old place's certificate and key, flushes `identity/`,
+and removes the marker last. The switch refuses, the configuration untouched, unless the next
+certificate names a node and the next key reads, owner-only, as a node's. An identity the
+configuration names elsewhere, at a path its operator wrote, is left there: nothing removes a path a
+configuration's value names. The ask and the join are stops until slices 4 to 6: at the ask the
+start says `retired` and ends `Retired` with the marker's fingerprint, before anything opens; after
+the switch it ends `Rejoined` naming the new node, whose next start is a member's. The writer of
+files whole and durable moved from the binary to `mantle_node::files`, which `mantle init` and the
+rejoin both reach: the node crate keeps its directory's layout, so the binary driving steps 4 and 5
+would have needed every name of it.
+
 **What stays forbidden.** The old identity is never admitted again: its grant stays spent in its
 issuer's window and its member written off. A re-grant draws a new id and refuses the old key. The
 issuer signs node certificates alone, never a CA, a gateway's or a client's, and the directory
@@ -508,7 +534,7 @@ comes back by the authority holder's grant, as before (§2). `ban ID` withdraws 
 |---|---|---|
 | 1 | The transport tells the side a peer's handshake refused that it was refused: the refusing end closes with a code its peer's endpoint maps to `Refusal::Identity` of its own identity | `vendor/hyper-transport/src/endpoint.rs` (the refusal at `refuse_connection` after `Directory::identify`), its tests |
 | 2 | The node learns it is retired (step 1) and stops serving (step 2): the marker, `retired`, no more redials or liveness records | `crates/node/src/process.rs` (`Retirement`, beside `Departure`; the start's refusal), `crates/node/src/layout.rs` (the marker, a record of the node's directory, which the node's process writes and so its crate keeps) |
-| 3 | The wipe (step 4) and the identity's switch (step 5), as functions over a node directory with each crash point's files, not yet triggered | `crates/mantle/src/files.rs`, `crates/mantle/src/disk.rs`, `crates/node/src/process.rs` |
+| 3 | The wipe (step 4) and the identity's switch (step 5), as functions over a node directory with each crash point's files, not yet triggered | `crates/node/src/rejoin.rs`, `crates/node/src/files.rs` (from `crates/mantle/src/files.rs`), `crates/node/src/process.rs`, `crates/node/src/layout.rs` |
 | 4 | The root range's records: the ledger, the issuer's window, the setting; `Regrant`, `ban`, `rejoin` and each refusal | `crates/meta/src/root.rs`, `crates/node/src/command.rs`, `crates/node/src/process.rs` (the lines) |
 | 5 | The online issuer: the issuer's certificate, `mantle init`'s and `mantle init issuer`'s, the leader's signing, rule 4 and the enrollment protocol's admission | `crates/cert/src/lib.rs`, `crates/mantle/src/init.rs`, `crates/node/src/directory.rs`, `crates/node/src/node/members.rs` |
 | 6 | The rejoin: steps 3 and 6 joined to the rest, and the end-to-end tests | `crates/node/src/process.rs`, `crates/mantle/tests/repair.rs`, `crates/mantle/tests/membership.rs` |

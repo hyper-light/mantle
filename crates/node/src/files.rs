@@ -1,5 +1,5 @@
-//! Files `mantle init` keeps, and the node's own, each written whole and durable under a temporary
-//! name, then renamed over its place and its directory flushed (CLAUDE.md §6).
+//! Files `mantle init` keeps, and a node's rejoin (`crate::rejoin`), each written whole and durable
+//! under a temporary name, then renamed over its place and its directory flushed (CLAUDE.md §6).
 //! Keys (encryption.md §2: the root key "32 bytes created at initialization with owner-only
 //! permissions"; the node's and the authority's private keys) are never readable by another
 //! principal, not even for a moment: each is created as `mantle serve` reads it (`crate::secret`),

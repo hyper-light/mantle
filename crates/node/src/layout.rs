@@ -14,16 +14,18 @@ use std::path::{Path, PathBuf};
 
 use mantle_meta::record::FINGERPRINT;
 
+/// The node's log's file in its directory (`node::open_log`).
+pub(crate) const LOG: &str = "log";
 /// The run record's file in the node's directory.
-const RUN: &str = "run";
+pub(crate) const RUN: &str = "run";
 /// The run record's bytes: one count.
 const RUN_BYTES: usize = 8;
 /// The readiness lock's file: held exclusively by the node from the moment the cell's root range
 /// enlisted it in its run until its process ends, which releases the lock however it ends, for a
 /// supervisor's readiness check (`mantle status`; research/78 [13], [14], [15]).
-const LIVE: &str = "live";
+pub(crate) const LIVE: &str = "live";
 /// The stop record's file in the node's directory.
-const STOPPED: &str = "stopped";
+pub(crate) const STOPPED: &str = "stopped";
 /// The stop record's bytes: the run that stopped, the node's time run then in nanoseconds, and its
 /// orderly stops.
 const STOPPED_BYTES: usize = 24;
@@ -56,6 +58,8 @@ pub enum LayoutError {
     Live(std::io::Error),
     #[error("the node's rejoin marker holds {0} bytes, not one certificate's fingerprint")]
     MalformedRejoin(usize),
+    #[error("the node's rejoin marker: {0}")]
+    Unretire(String),
 }
 
 /// The node's readiness lock, held: the cell's root range enlisted the node in this run, and the
@@ -203,6 +207,20 @@ impl Layout {
             .try_into()
             .map_err(|_| LayoutError::MalformedRejoin(bytes.len()))?;
         Ok(Some(fingerprint))
+    }
+
+    /// Removes the rejoin marker, once the node took its new identity (membership.md §5.1 step 5):
+    /// gone durably when this returns, its directory flushed (CLAUDE.md §6). One removed already is
+    /// removed again as nothing, and its directory flushed again, which a crash after the removal
+    /// and before the flush needs.
+    pub fn unretire(&self) -> Result<(), LayoutError> {
+        let path = self.dir.join(REJOIN);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(LayoutError::Unretire(e.to_string())),
+        }
+        hyper_block::file::sync_dir(&self.dir).map_err(|e| LayoutError::Unretire(e.to_string()))
     }
 }
 

@@ -544,6 +544,12 @@ native request and reply this suite builds: 216 vectors, generated from 44c6d21e
 | a read's query, 30 cases over its 19 kinds (lean-doors d092770a) | `crates/node/tests/encoding_allocs.rs` `every_query_is_written_at_its_length` | 1, 0–4 (a ListObjectsV2 query 1, 4) | 1, 0 each |
 | a read's answer, 52 cases over its kinds: empty, one, many, the longest its bound allows | same, `every_answer_is_written_at_its_length` | 1–13,378 allocs, 0–16 reallocs (13,378 extents 13,378, 16; 10,000 parts 10,001, 16; 1,000 keys 1, 12) | 1, 0; 2, 0 where it carries a record whole, a signer 3, 0 |
 | a command's reply: one answer, eight, 65,536 | same, `every_command_reply_is_written_at_its_length` | 2, 1; 9, 3; 65,537, 16 | 1, 0 each |
+| a range's configuration row: none, one member, joint, 1,000 members a list (lean-doors c4d1956f) | `crates/range/src/conf.rs` `a_configuration_is_written_at_its_length` | 1, 2–12 | 1, 0 each |
+| a snapshot's image: no rows, one, 10,000, a 64 MiB row | `crates/range/src/image.rs` `an_image_is_written_at_its_length` | 1, 1–20 | 1, 0 each, moved into the shell's buffer |
+| a term's row: 0, 1, u64::MAX | `crates/range/src/machine.rs` `a_term_is_written_at_its_length` | 1, 1 | 1, 0 |
+| a range's Raft frame in `send`'s reused buffer: heartbeats, appends of 1, 100 and the largest entry (the replication bound), a 1 MiB snapshot (lean-doors 3890ff4b) | `crates/node/tests/encoding_allocs.rs` `a_raft_frame_is_written_at_its_length_in_its_reused_buffer` | first frame 1, 2; each longer than any before 0, 1; else 0, 0 | 1, 0 where longer than any before (a buffer made at it), else 0, 0 |
+| a journal record: standard input, a file with and without its identity, every field at its longest (lean-doors 5aa0dcee) | `crates/mantle/src/journal.rs` `a_record_is_written_at_its_length` | 1, 3–6 (standard input 3, a file 4, every field at its longest 6) | 1, 0 each |
+| an object's ETag; a continuation token of no key, 12 bytes and 1,024 (lean-doors 09154221) | `crates/s3/tests/allocations.rs` `an_etag_is_one_string_at_its_length`, `a_continuation_token_is_two_buffers_at_their_lengths` | 1, 2; 2, 0–1 | 1, 0; 2, 0 |
 
 ## Steps 6 and 7, measured
 

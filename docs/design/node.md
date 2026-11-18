@@ -311,7 +311,17 @@ measures the second, and derives the rest by these rules:
   CPU the process runs at once (hyper-rt `Facts::cpus_at_once`), each device's issuer, with a
   worker a read of its depth where a pool carries it (macOS, Windows;
   `Issuer::device_threads`), each volume's writer, cleaner and scrubber), each at
-  Rust's default stack of 2 MiB, reserved whole; and each range's member
+  Rust's default stack of 2 MiB, reserved whole; the runtime beside those stacks
+  (`derive::runtime_bytes`: its own 867 bytes, its watchdog's; each shard, hyper-rt sizing every
+  one for the first's role (`derive::shard_shape`, as `process::runtime` sizes them), at 11,875
+  bytes, 206 a task slot, 84 a timer, 397 a readiness waiter and 16 a slot of its waiters' table,
+  the power of two at or past twice them, and 64 a control entry, as many as the host's
+  calibration gives a shard (the `ring` basis line); and with an S3 listener its lane to each
+  shard past the first, 1,576 bytes and 88 for each connection the listener holds at once
+  (`listener::tasks`). At ten shards and 256 connections served, 3.6 MB stated against 2.6 MB
+  counted on macOS arm64: a waiter's 397 holds Windows' table of its outstanding polls, 188 of
+  them, derived from its sizes; a lane's 88, Windows' socket of 8 octets where a descriptor is 4);
+  and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:
   what it keeps of each member of its configuration; the entries not yet durable, a leader's
   uncommitted proposals or a follower's window and one entry past, at twice their bytes for the
@@ -327,6 +337,8 @@ measures the second, and derives the rest by these rules:
   (`derive::plane_bytes`); and the liveness stream's estimator rings, one a peer and two of the
   node's own, each at its longest window (`derive::liveness_bytes`)). Each is pinned by a test of
   the running code (`tests/volume_memory.rs`, `tests/floor_memory.rs`, `tests/threads.rs`,
+  `tests/shard_memory.rs` each runtime figure counted apart and the whole runtime and its lanes at
+  1 to 10 shards, up to 256 connections and 1,024 control entries,
   `tests/range_memory.rs` over stores that hold nothing of their own, `tests/range_log_memory.rs`
   over the node's logs, `tests/transport_memory.rs` two endpoints at one, two and four peers and
   at the floor's budget and eight times it).
@@ -2050,7 +2062,8 @@ control queue would drop it with the request, a queue whose depth can be one. A 
 serves every connection on it. The TLS sessions every connection's handshake keeps and resumes
 are timed on the host's clock (`sessions::now`), which every shard reads alike, where a shard's
 own clock counts from that shard's start. hyper-rt sizes every shard alike, so each holds the
-first's tasks, timers and sockets (`process::runtime`). On a loopback address it serves
+first's tasks, timers and sockets (`process::runtime`), and the floor counts each shard so and
+each lane at the connections it may hold (§1.4, `derive::runtime_bytes`). On a loopback address it serves
 plain HTTP; elsewhere TLS 1.3 and 1.2 with the endpoint's P-256 certificate, hyper-tls's default
 suites, of which a P-256 key takes the ECDHE-ECDSA AES-GCM ones for TLS 1.2 (research/84). A
 hyper-tls connection holds no configuration (vendor/hyper-tls/VENDORED.md §2), so each connection

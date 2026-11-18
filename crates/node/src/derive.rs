@@ -654,6 +654,9 @@ struct Held {
     /// (`listener::CONNECTION_BYTES`) and the slots of the TLS sessions it leaves
     /// (`listener::SESSION_BYTES`); none for a node with no S3 endpoint.
     listener: u64,
+    /// The runtime's shards, sized for those connections, and the listener's lanes
+    /// ([`runtime_bytes`]).
+    runtime: u64,
 }
 
 /// Why the settings cannot be derived: a fact that admits no unit of some class of work.
@@ -1217,6 +1220,141 @@ pub fn stacks(threads: u64) -> Option<u64> {
     threads.checked_mul(STACK)
 }
 
+/// What the node's runtime holds of its own beside its shards: its watchdog's thread and its lists
+/// of shards. Measured, as each figure below, by hyper-measure's counting allocator across the
+/// process's threads as hyper-rt's `Runtime::start` returns (`tests/shard_memory.rs`, macOS arm64,
+/// 2026-11-17, the test profile): 16,058 bytes at one shard of four tasks, four timers, eight
+/// waiters and four entries, 15,191 of them the shard's, each shard past it adding as many.
+pub const RUNTIME_BYTES: u64 = 867;
+
+/// What each shard holds at no task, timer, waiter or control entry: its registry entry, with the
+/// watchdog's board and its table of slow polls (hyper-rt `slow::ENTRIES`, a 4 KiB page), its desk,
+/// its driver's buffer of 64 events, its loop and its thread's handle. Measured: 11,859 on macOS
+/// arm64, the 15,191 of the shard above less its tasks, timers, waiters and entries at the figures
+/// below, the driver's 64 events 32-byte kevents there; Linux's 64 epoll events are 12 or 16 bytes
+/// each, so it holds less. And the 16 octets of a group of control bytes Windows' table of
+/// outstanding polls takes ([`SHARD_INTEREST_BYTES`]), its 64 events 32-byte `OVERLAPPED_ENTRY`s
+/// as macOS's: derived from those structures' sizes, not measured there.
+pub const SHARD_BYTES: u64 = 11_875;
+
+/// What each task slot of a shard holds: its slot on the loop, its cell on the desk and its entry
+/// in the registry. Measured on macOS arm64: 205 a slot from 5 slots to 257, a few bytes more past
+/// (209,116 at 1,024 against 209,100), 205.1 a slot at 4,096; 206 bounds every count measured. No
+/// part of it is the driver's, so no platform holds more.
+pub const SHARD_TASK_BYTES: u64 = 206;
+
+/// What each timer of a shard holds: its place on the wheel and in the list fired. Measured on
+/// macOS arm64: 84 a timer from 5 to 4,096, the same at each. No part of it is the driver's.
+pub const SHARD_TIMER_BYTES: u64 = 84;
+
+/// What each readiness waiter of a shard holds beside its table's slots
+/// ([`SHARD_INTEREST_SLOT_BYTES`]): its node and free place in the waiters' table (hyper-rt
+/// `Interests::new`) and its part of the registry's. Measured on macOS arm64: 208 a waiter, and a
+/// bit or so more past 64 (240.12 a waiter with the slots at 4,096, the slots' 32 of it), 209
+/// bounding it; kqueue and epoll reserve nothing for a waiter (`Driver::reserve_handles`). Windows'
+/// IOCP driver reserves a hashbrown table for two outstanding polls a waiter
+/// (`IocpDriver::reserve_handles`): at most 32/7 buckets a waiter, the power of two at or past 8/7
+/// of them, each a 40-byte `(i32, Watch)` and a control byte, 187.4 bytes, 188 counted: derived from
+/// its sizes, not measured there. 397 in all, the most of any platform.
+pub const SHARD_INTEREST_BYTES: u64 = 397;
+
+/// What each slot of a shard's table of waiters' handles holds: 16 bytes, the table the power of two
+/// at or past twice the waiters (hyper-rt `Interests::new`), measured on macOS arm64 as the step at
+/// each power of two (+32,984 from 1,024 waiters to 1,025, 1,024 more slots and a waiter's 208).
+pub const SHARD_INTEREST_SLOT_BYTES: u64 = 16;
+
+/// What each entry of a shard's control queue holds, and the poll of its batch the loop reserves
+/// for it, a batch at most as many polls as entries (hyper-rt `RuntimeConfig::calibrate_batch`):
+/// measured on macOS arm64, 40 an entry and 24 a poll of the batch, from 5 entries to 1,024.
+pub const SHARD_RING_BYTES: u64 = 64;
+
+/// What the S3 listener's lane to a shard past the first holds besides its connections: the lane,
+/// its channel's and count's own state, and its taker's task as it is handed to the shard.
+/// Measured on the listener's thread around `Listener::spread` (`tests/shard_memory.rs`, macOS
+/// arm64): 2,456 a lane at one connection served, 1,576 less its 11 connections' places. The
+/// taker's request is freed on the shard that takes it, so it is counted though it is not held.
+pub const LANE_BYTES: u64 = 1_576;
+
+/// What a lane holds for each connection it may hold (`listener::tasks`): a slot of its channel
+/// holding a connection's socket and its places in the listener's and the lane's counts, and a
+/// place for a sender waiting. Measured on macOS arm64: 80 a connection from 1 to 1,001. Windows'
+/// socket is 8 octets where a Unix descriptor is 4, so its slot is at most 8 octets more: 88,
+/// derived from the sizes.
+pub const LANE_CONNECTION_BYTES: u64 = 88;
+
+/// What each of the node's shards is sized for, hyper-rt sizing every shard alike
+/// (`process::runtime`): the first's role, the largest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardShape {
+    /// The node's task and the launcher that spawns it, and with an S3 listener a task for each
+    /// connection it holds at once, served or answered refused (`listener::tasks`).
+    pub tasks: usize,
+    /// The timers the node's task holds at once (`process::TIMERS`), and one for each of those
+    /// connections.
+    pub timers: usize,
+    /// Two readiness waiters for each task (hyper-rt `interests_for`), or for each socket where
+    /// more: the node's endpoint and plane, each peer's connection, and the listener and each of
+    /// its connections.
+    pub interests: usize,
+}
+
+/// The shape of each of the node's shards with `peers` peers, and with an S3 listener serving
+/// `listening` connections where it has one ([`ShardShape`]).
+pub fn shard_shape(listening: Option<u64>, peers: usize) -> Option<ShardShape> {
+    let connections = match listening {
+        Some(served) => usize::try_from(crate::listener::tasks(served)).ok()?,
+        None => 0,
+    };
+    let tasks = connections.checked_add(2)?;
+    let sockets = peers.checked_add(2)?.checked_add(match listening {
+        Some(_) => connections.checked_add(1)?,
+        None => 0,
+    })?;
+    Some(ShardShape {
+        tasks,
+        timers: crate::process::TIMERS.checked_add(connections)?,
+        interests: hyper_rt::runtime::interests_for(tasks).max(sockets.checked_mul(2)?),
+    })
+}
+
+/// What the node's runtime holds of its `shards` shards, each of `shape` with `ring` control
+/// entries, beside their threads' stacks ([`stacks`]): its own ([`RUNTIME_BYTES`]); each shard's
+/// fixed bytes, its tasks', timers', waiters', waiters' table's and control entries'; and where an
+/// S3 listener serves `listening` connections, its lane to each shard past the first, each holding
+/// as many as the listener holds at once (`listener::tasks`).
+pub fn runtime_bytes(
+    shards: usize,
+    shape: &ShardShape,
+    ring: usize,
+    listening: Option<u64>,
+) -> Option<u64> {
+    let count = |n: usize| u64::try_from(n).ok();
+    let slots = shape
+        .interests
+        .max(1)
+        .checked_mul(2)?
+        .checked_next_power_of_two()?;
+    let shard = SHARD_BYTES
+        .checked_add(SHARD_TASK_BYTES.checked_mul(count(shape.tasks)?)?)?
+        .checked_add(SHARD_TIMER_BYTES.checked_mul(count(shape.timers)?)?)?
+        .checked_add(SHARD_INTEREST_BYTES.checked_mul(count(shape.interests)?)?)?
+        .checked_add(SHARD_INTEREST_SLOT_BYTES.checked_mul(count(slots)?)?)?
+        .checked_add(SHARD_RING_BYTES.checked_mul(count(ring)?)?)?;
+    let lane = match listening {
+        Some(served) => LANE_CONNECTION_BYTES
+            .checked_mul(crate::listener::tasks(served))?
+            .checked_add(LANE_BYTES)?,
+        None => 0,
+    };
+    let shards = count(shards)?;
+    // The shards past the first, each with a lane: none past a lone shard.
+    let lanes = shards.saturating_sub(1).checked_mul(lane)?;
+    shards
+        .checked_mul(shard)?
+        .checked_add(RUNTIME_BYTES)?
+        .checked_add(lanes)
+}
+
 /// A class of what a node holds at its floor (node.md §1.4), in the order the floor counts them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -1235,6 +1373,9 @@ pub enum Class {
     /// The transport beside its budget, its plane and its liveness stream
     /// ([`transport_bytes_beside`], [`plane_bytes`], [`liveness_bytes`]).
     Transport,
+    /// The runtime's shards, each sized for the first's role, and the S3 listener's lanes to the
+    /// shards past the first ([`runtime_bytes`]).
+    Runtime,
     /// The threads the node starts, their stacks reserved whole ([`threads`], [`stacks`]).
     Threads,
 }
@@ -1248,6 +1389,7 @@ impl std::fmt::Display for Class {
             Self::Ranges => "ranges",
             Self::Log => "log",
             Self::Transport => "transport",
+            Self::Runtime => "runtime",
             Self::Threads => "threads",
         })
     }
@@ -1500,6 +1642,9 @@ pub struct Measured {
     pub memory: MemoryFacts,
     /// The CPUs the process runs at once (hyper-rt `Facts::cpus_at_once`): its shards.
     pub cores: usize,
+    /// The entries of each shard's control queue, from the host's calibration (hyper-rt
+    /// `RuntimeConfig::from_calibration`: Little's law at its wake's p99 over a syscall's median).
+    pub ring: usize,
     /// The OS's base page.
     pub page: u64,
     /// The node directory's device, which holds its log and its ranges' stores.
@@ -1705,6 +1850,14 @@ pub fn derive(
          its S3 connections on the rest (node.md §1.2)",
     );
     said.add(
+        "ring",
+        measured.ring,
+        Kind::Measured,
+        "the entries of each shard's control queue, from the host's calibration: Little's law at \
+         its wake's p99 over a syscall's median (hyper-rt RuntimeConfig::from_calibration); the \
+         floor counts each shard's (derive::runtime_bytes)",
+    );
+    said.add(
         "page",
         measured.page,
         Kind::Measured,
@@ -1903,12 +2056,23 @@ pub fn derive(
         } else {
             0
         };
+        // The S3 listener serves as many connections as the node runs operations, none where it
+        // hosts no objects (`process::run_node`).
+        let listening = match stated.s3 {
+            Some(_) if hosts => Some(u64::try_from(objects).map_err(|_| overflow("the listener"))?),
+            Some(_) => Some(0),
+            None => None,
+        };
+        let runtime = shard_shape(listening, stated.peers.len())
+            .and_then(|shape| runtime_bytes(measured.cores, &shape, measured.ring, listening))
+            .ok_or(overflow("the node's runtime"))?;
         Ok(Held {
             asked,
             bounds,
             beside,
             ranges_bytes,
             listener,
+            runtime,
         })
     };
     let held_by = |objects: usize| held_at(objects, transfers);
@@ -1938,7 +2102,7 @@ pub fn derive(
                       objects_bytes: u64,
                       volume_bytes: u64,
                       stacks_held: u64|
-     -> Result<[(Class, u64); 7], DeriveError> {
+     -> Result<[(Class, u64); 8], DeriveError> {
         Ok([
             (Class::Objects, objects_bytes),
             (Class::Volumes, volume_bytes),
@@ -1953,6 +2117,7 @@ pub fn derive(
                     .and_then(|bytes| bytes.checked_add(held.listener))
                     .ok_or(overflow("the transport's memory"))?,
             ),
+            (Class::Runtime, held.runtime),
             (Class::Threads, stacks_held),
         ])
     };
@@ -2035,7 +2200,8 @@ pub fn derive(
                 .transport_bytes
                 .checked_add(held.beside)?
                 .checked_add(held.ranges_bytes)?
-                .checked_add(held.listener)
+                .checked_add(held.listener)?
+                .checked_add(held.runtime)
         };
         let one = held_by(1)?;
         let two = held_by(2)?;
@@ -2066,6 +2232,7 @@ pub fn derive(
         beside,
         ranges_bytes,
         listener,
+        runtime,
     } = held_by(objects)?;
     let transport_bytes = bounds.transport_bytes;
     let objects_bytes = if hosts {
@@ -2090,6 +2257,7 @@ pub fn derive(
             beside,
             ranges_bytes,
             listener,
+            runtime,
         },
         objects_bytes,
     )?;
@@ -2876,6 +3044,11 @@ fn say_floor(
                      connections, as many as the operations, each at its measured bytes and \
                      its sessions' slots (listener::CONNECTION_BYTES, listener::SESSION_BYTES)"
                 }
+                Class::Runtime => {
+                    "the runtime's shards, one a CPU, each sized for the first's tasks, timers, \
+                     waiters and control entries, and the S3 listener's lane to each shard past \
+                     the first, each at its measured bytes (derive::runtime_bytes)"
+                }
                 Class::Threads => {
                     "the threads the node starts, each a 2 MiB stack reserved whole \
                      (derive::threads)"
@@ -3271,6 +3444,62 @@ mod tests {
             Some(6 + 4 + issuer(1) + issuer(4) + 3 + 2)
         );
         assert_eq!(stacks(10), Some(20 << 20));
+    }
+
+    /// Each shard is sized for the first's role: the node's task and launcher, the timers its task
+    /// holds, and with an S3 listener a task, a timer and a socket for each connection it holds at
+    /// once, two waiters a socket; the runtime holds each shard at those, and a lane to each shard
+    /// past the first holding as many connections.
+    #[test]
+    fn the_runtime_holds_each_shard_at_the_firsts_shape_and_a_lane_past_the_first() {
+        assert_eq!(
+            shard_shape(None, 4),
+            Some(ShardShape {
+                tasks: 2,
+                timers: 3,
+                interests: 2 * 6,
+            })
+        );
+        // 256 served and 10 answered refused.
+        let shape = shard_shape(Some(256), 4).unwrap();
+        assert_eq!(
+            shape,
+            ShardShape {
+                tasks: 268,
+                timers: 269,
+                interests: 2 * (4 + 2 + 267),
+            }
+        );
+        let shard = SHARD_BYTES
+            + 268 * SHARD_TASK_BYTES
+            + 269 * SHARD_TIMER_BYTES
+            + 546 * SHARD_INTEREST_BYTES
+            + 2048 * SHARD_INTEREST_SLOT_BYTES
+            + 16 * SHARD_RING_BYTES;
+        let lane = LANE_BYTES + 266 * LANE_CONNECTION_BYTES;
+        assert_eq!(
+            runtime_bytes(1, &shape, 16, Some(256)),
+            Some(RUNTIME_BYTES + shard)
+        );
+        assert_eq!(
+            runtime_bytes(10, &shape, 16, Some(256)),
+            Some(RUNTIME_BYTES + 10 * shard + 9 * lane)
+        );
+        // No listener, no lane.
+        let alone = shard_shape(None, 4).unwrap();
+        assert_eq!(
+            runtime_bytes(10, &alone, 16, None),
+            Some(
+                RUNTIME_BYTES
+                    + 10 * (SHARD_BYTES
+                        + 2 * SHARD_TASK_BYTES
+                        + 3 * SHARD_TIMER_BYTES
+                        + 12 * SHARD_INTEREST_BYTES
+                        + 32 * SHARD_INTEREST_SLOT_BYTES
+                        + 16 * SHARD_RING_BYTES)
+            )
+        );
+        assert_eq!(runtime_bytes(usize::MAX, &shape, 16, Some(256)), None);
     }
 
     /// A range's member holds more for each read it is asked, up to the core's bound on reads,
@@ -3885,6 +4114,7 @@ mod tests {
         Measured {
             memory: machine(16 << 30, None),
             cores: 8,
+            ring: 16,
             page: 16_384,
             meta: device("meta".into()),
             volumes: (0..volumes)
@@ -4259,6 +4489,7 @@ mod tests {
                 "ranges",
                 "log",
                 "transport",
+                "runtime",
                 "threads",
             ]
             .iter()

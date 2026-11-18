@@ -1979,9 +1979,18 @@ fn measure(stated: &Stated) -> Result<Measured, ProcessError> {
             formatted,
         });
     }
+    // Each shard's control entries, as the runtime derives them (`runtime`), from the host's
+    // calibration, kept in the node's directory once measured.
+    let calibration = calibration(
+        &stated.dir,
+        crate::derive::probe_budget().map_err(|e| ProcessError::Runtime(e.to_string()))?,
+    )?;
+    let ring =
+        RuntimeConfig::from_calibration(&calibration, &constants(&calibration)?, 1, 1).ring_entries;
     Ok(Measured {
         memory: facts.memory,
         cores: shards(&facts),
+        ring,
         page: facts.page.base,
         meta,
         volumes,
@@ -2050,7 +2059,7 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
 /// a stop of 346 ms on macOS (diag/roll-stop-bound), a CPU spent for the whole stop. Each of the
 /// S3 listener's connection tasks holds one more while it waits on its client
 /// (`listener::tasks`).
-const TIMERS: usize = 3;
+pub(crate) const TIMERS: usize = 3;
 
 /// The node's shards: one for each CPU the process runs at once, its cores capped by the whole CPUs
 /// its CPU budget buys (hyper-rt `Facts::cpus_at_once`: its affinity and its cgroup's quota), and
@@ -2072,39 +2081,31 @@ fn shards(facts: &hyper_rt::machine::facts::Facts) -> usize {
 /// handed connections and each connection.
 fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
-    let constants = calibration
+    let constants = constants(&calibration)?;
+    // The shape the node's floor counts each shard at (`derive::runtime_bytes`).
+    let shape = crate::derive::shard_shape(listening, config.peers.len())
+        .ok_or_else(|| ProcessError::Runtime("the node's shards' tasks".into()))?;
+    let mut runtime =
+        RuntimeConfig::from_calibration(&calibration, &constants, shape.tasks, shape.timers);
+    runtime.shards = u16::try_from(shards(&calibration.facts))
+        .map_err(|_| ProcessError::Runtime("the node's shards".into()))?;
+    runtime.pin = false;
+    runtime.cores.clear();
+    runtime.interests_per_shard = shape.interests;
+    Ok(runtime)
+}
+
+/// The runtime's constants from `calibration`, no core reserved and no objective of the node's own.
+fn constants(
+    calibration: &Calibration,
+) -> Result<hyper_rt::machine::calibration::Constants, ProcessError> {
+    calibration
         .constants(&Policy {
             reserved_cores: 0,
             lateness_tolerance_ns: None,
             latency_objective_ns: None,
         })
-        .map_err(|unmet| ProcessError::Runtime(format!("{unmet:?}")))?;
-    let s3 = listening.is_some();
-    let connections = match listening {
-        Some(served) => usize::try_from(crate::listener::tasks(served))
-            .map_err(|_| ProcessError::Runtime("the S3 listener's connections".into()))?,
-        None => 0,
-    };
-    // The node's task and its launcher, which holds a slot of its own as it spawns the node's.
-    let tasks = connections
-        .checked_add(2)
-        .ok_or_else(|| ProcessError::Runtime("the node's tasks".into()))?;
-    let timers = TIMERS
-        .checked_add(connections)
-        .ok_or_else(|| ProcessError::Runtime("the node's timers".into()))?;
-    let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, timers);
-    runtime.shards = u16::try_from(shards(&calibration.facts))
-        .map_err(|_| ProcessError::Runtime("the node's shards".into()))?;
-    runtime.pin = false;
-    runtime.cores.clear();
-    let listening = if s3 { connections.saturating_add(1) } else { 0 };
-    let sockets = config
-        .peers
-        .len()
-        .saturating_add(2)
-        .saturating_add(listening);
-    runtime.interests_per_shard = runtime.interests_per_shard.max(sockets.saturating_mul(2));
-    Ok(runtime)
+        .map_err(|unmet| ProcessError::Runtime(format!("{unmet:?}")))
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, ProcessError> {

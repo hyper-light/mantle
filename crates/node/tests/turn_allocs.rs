@@ -120,11 +120,12 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// steps of growth. 52 more since hyper-raft 17371e2, whose liveness stream's sender floor takes
 /// the stream's own proof (the cell at rest's count): the clients' run asks 10 more liveness
 /// writes and sends 6 fewer heartbeats, its plane carries 144 fewer Raft frames, and it ends
-/// 61.8 ms sooner on the virtual clock.
+/// 61.8 ms sooner on the virtual clock. On Linux, 34,388 then and 34,440 since: CI run
+/// 44239790476's linux-aarch64 crates leg counted 34,440 at 0ae45327.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_388
+        34_440
     } else {
         34_389
     };

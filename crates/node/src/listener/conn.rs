@@ -296,7 +296,7 @@ impl Connection {
             Parts::of(head, octets).map_or_else(|_| "/".to_owned(), |p| p.path.to_owned());
         let fields = self.fields();
         let response = respond::error(
-            &respond::slowed(door::Slowed::Connections),
+            &respond::slowed(self.door.slowed(door::Slowed::Connections)),
             Resource::Text(&resource),
             &ids,
             is_head,
@@ -435,7 +435,7 @@ impl Connection {
             door::Signed::Principal(signer) => signer,
             door::Signed::Unknown => return Err(unknown()),
             door::Signed::Refused(status) => return Err(respond::refusal(status)),
-            door::Signed::Slowed(cause) => return Err(respond::slowed(cause)),
+            door::Signed::Slowed(cause) => return Err(respond::slowed(self.door.slowed(cause))),
         };
         let key = request::Key::Principal {
             signer: &signer,
@@ -530,13 +530,13 @@ impl Connection {
         (version, head): (Version, bool),
     ) -> Result<bool, ()> {
         let mut unread = has_body(framing) && body.is_some();
-        let slow = || respond::slowed(door::Slowed::Door);
+        let slow = |submitter: &Submitter| respond::slowed(submitter.slowed(door::Slowed::Door));
         let (Ok((pieces, taken)), Ok((answers, mut replies))) = (
             channel::<Piece>(BODY_PIECES),
             channel::<Answer>(REPLY_PIECES),
         ) else {
             return self
-                .refuse(&slow(), resource, ids, (version, head), unread)
+                .refuse(&slow(&self.door), resource, ids, (version, head), unread)
                 .await;
         };
         let request = door::Request {
@@ -549,7 +549,7 @@ impl Connection {
         // A door at its bound refuses before any of the body is read (node.md §4.5).
         if self.door.submit(request).is_err() {
             return self
-                .refuse(&slow(), resource, ids, (version, head), unread)
+                .refuse(&slow(&self.door), resource, ids, (version, head), unread)
                 .await;
         }
         let mut body = body;
@@ -604,7 +604,7 @@ impl Connection {
                 // The host slowed it in place of a head: its cause, unless the listener refused
                 // the body first.
                 Ok(Answer::Slowed(cause)) => {
-                    let why = refused.unwrap_or_else(|| respond::slowed(cause));
+                    let why = refused.unwrap_or_else(|| respond::slowed(self.door.slowed(cause)));
                     return self
                         .refuse(&why, resource, ids, (version, head), unread)
                         .await;

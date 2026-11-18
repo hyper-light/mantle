@@ -1049,6 +1049,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// Bytes of exchanges' bodies this node has read and written: its transfers' progress
     /// ([`Node::moved`]).
     moved: u64,
+    /// The native requests this node answered `SlowDown`, a count for each cause in
+    /// `door::Slowed::ALL`'s order ([`Node::slowed`]).
+    slowed: [u64; crate::door::Slowed::ALL.len()],
     /// The bytes of chunks peers put here over QUIC, as their exchanges' bodies were read, and of
     /// chunks this node put on its own volumes in-process ([`Node::chunk_bytes`]).
     chunks_received: u64,
@@ -1452,6 +1455,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             dial_only: Some(dial_only),
             table: None,
             moved: 0,
+            slowed: [0; crate::door::Slowed::ALL.len()],
             chunks_received: 0,
             chunks_written: 0,
             chunks_unkept: 0,
@@ -2143,6 +2147,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written).
     pub fn moved(&self) -> u64 {
         self.moved
+    }
+
+    /// The requests this node answered `SlowDown` since it opened, on either door, a count for
+    /// each cause in `door::Slowed::ALL`'s order: the native door's as the host replied, and the
+    /// S3 door's as its listener answered.
+    pub fn slowed(&self) -> [u64; crate::door::Slowed::ALL.len()] {
+        let mut counts = self.slowed;
+        if let Some(doorway) = &self.doorway {
+            for (count, door) in counts.iter_mut().zip(doorway.slowed()) {
+                *count = count.saturating_add(door);
+            }
+        }
+        counts
     }
 
     /// The entries this node's members proposed as their ranges' leader since it opened, and the

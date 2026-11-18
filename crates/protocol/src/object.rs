@@ -214,8 +214,9 @@ pub const HEAD_BYTES: usize = 1 + 4 + 16 + 8 + 8 + 1;
 /// Where a request's head keeps the time its client will still wait: past the kind, the fields'
 /// length and the identity.
 const REMAINING_AT: usize = 1 + 4 + 16;
-/// The bytes of a reply's head: the status, the size and the fields' length.
-pub const REPLY_HEAD_BYTES: usize = 1 + 8 + 4;
+/// The bytes of a reply's head: the status, a `SlowDown`'s cause, the size and the fields'
+/// length.
+pub const REPLY_HEAD_BYTES: usize = 1 + 1 + 8 + 4;
 /// The longer of the two, the longest head a client of objects sends or receives.
 pub const MAX_HEAD: usize = if HEAD_BYTES > REPLY_HEAD_BYTES {
     HEAD_BYTES
@@ -1692,7 +1693,8 @@ pub enum Status {
     EntityTooLarge,
     /// S3's `400 IncompleteBody`: the body ended before its length.
     IncompleteBody,
-    /// S3's `503 SlowDown`: the node holds as many operations as it keeps; nothing was done.
+    /// S3's `503 SlowDown`: a cause that passes, which clients ask again; nothing was done. A
+    /// node's reply says which beside it ([`Reply::slowed`]).
     SlowDown,
     /// The head does not decode, or names a bucket or key past S3's bounds.
     Malformed,
@@ -1870,6 +1872,135 @@ impl Status {
 
     fn of(code: u8) -> Option<Self> {
         STATUSES.into_iter().find(|s| s.code() == code)
+    }
+}
+
+/// Why a node answered a request `SlowDown`, each a cause that passes, which clients ask again
+/// (node.md §4.5): carried beside the status in a reply's head on the native door, and in the
+/// `<Message>` of the S3 door's `503 SlowDown`, so a refusal on either door names the path that
+/// answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slowed {
+    /// Past the connections the S3 listener serves at once.
+    Connections,
+    /// The S3 listener's door held as many requests as it keeps, the node was gone, or its
+    /// channels for the request could not be made.
+    Door,
+    /// The node held as many key lookups as its door holds requests.
+    Lookups,
+    /// The node was stopping, or had no room for an operation its door handed it.
+    Stopping,
+    /// The access key's read of the root range waited its range's budget without a leader that
+    /// could serve it (node.md §5.4).
+    KeyLeaderless,
+    /// A read or command of the operation waited its range's budget without a leader that could
+    /// serve it (node.md §5.4).
+    Leaderless,
+    /// Fewer of a block's chunks could be read than rebuild it.
+    Unreadable,
+    /// No volume the placement offered took one of a block's chunks.
+    Unplaced,
+    /// The operation's work was held past a stock client's patience (research/77 D2).
+    Patience,
+    /// A native request the host had no room for, while as many waited for room as it parks.
+    Queued,
+    /// A native request that waited for the host's room past its client's deadline or patience.
+    Waited,
+    /// A native request whose operation, learned from its fields, holds more bytes than its head
+    /// charged and the host has room for.
+    Crowded,
+}
+
+impl Slowed {
+    /// Every cause, in the order of their codes.
+    pub const ALL: [Self; 12] = [
+        Self::Connections,
+        Self::Door,
+        Self::Lookups,
+        Self::Stopping,
+        Self::KeyLeaderless,
+        Self::Leaderless,
+        Self::Unreadable,
+        Self::Unplaced,
+        Self::Patience,
+        Self::Queued,
+        Self::Waited,
+        Self::Crowded,
+    ];
+
+    /// The cause's code beside a reply's status: its place in [`Slowed::ALL`] from one, zero
+    /// standing for none.
+    fn code(self) -> u8 {
+        match self {
+            Self::Connections => 1,
+            Self::Door => 2,
+            Self::Lookups => 3,
+            Self::Stopping => 4,
+            Self::KeyLeaderless => 5,
+            Self::Leaderless => 6,
+            Self::Unreadable => 7,
+            Self::Unplaced => 8,
+            Self::Patience => 9,
+            Self::Queued => 10,
+            Self::Waited => 11,
+            Self::Crowded => 12,
+        }
+    }
+
+    fn of(code: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.code() == code)
+    }
+
+    /// The cause's place in [`Slowed::ALL`], where a count of each keeps it.
+    pub fn index(self) -> usize {
+        usize::from(self.code()).saturating_sub(1)
+    }
+
+    /// The cause's name in a node's lines (`slowed NAME COUNT`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Connections => "connections",
+            Self::Door => "door",
+            Self::Lookups => "lookups",
+            Self::Stopping => "stopping",
+            Self::KeyLeaderless => "key-leaderless",
+            Self::Leaderless => "leaderless",
+            Self::Unreadable => "unreadable",
+            Self::Unplaced => "unplaced",
+            Self::Patience => "patience",
+            Self::Queued => "queued",
+            Self::Waited => "waited",
+            Self::Crowded => "crowded",
+        }
+    }
+
+    /// What the cause says, a sentence: after `SlowDown: ` in a native client's failure, and
+    /// after S3's own words in the S3 door's `<Message>`.
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Connections => "Past the connections the node serves at once.",
+            Self::Door => "The node's door was full, or the node gone.",
+            Self::Lookups => "The node held as many key lookups as it keeps.",
+            Self::Stopping => "The node was stopping.",
+            Self::KeyLeaderless => {
+                "The access key's read of the root range found no leader that serves it within its budget."
+            }
+            Self::Leaderless => {
+                "A range's read or command found no leader that serves it within its budget."
+            }
+            Self::Unreadable => "Fewer of a block's chunks could be read than rebuild it.",
+            Self::Unplaced => "No volume offered took a block's chunk.",
+            Self::Patience => "The operation's work was held past a client's patience.",
+            Self::Queued => {
+                "The node had no room for the request, and as many waited for room as it keeps."
+            }
+            Self::Waited => {
+                "The request waited for the node's room past its client's deadline or patience."
+            }
+            Self::Crowded => {
+                "The operation's bytes, learned from its fields, passed the room the node had."
+            }
+        }
     }
 }
 
@@ -2053,10 +2184,12 @@ pub struct Stored {
     pub value: Vec<u8>,
 }
 
-/// A reply: its head's status and size, and the fields its body opens with.
+/// A reply: its head's status, cause and size, and the fields its body opens with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
     pub status: Status,
+    /// Why it is `SlowDown`, beside that status alone; none beside any other.
+    pub slowed: Option<Slowed>,
     /// The object's size, a get's or a head's.
     pub size: u64,
     /// The version's id: a put's, a delete's marker's, or the one a get or head read; empty
@@ -2630,6 +2763,7 @@ impl Reply {
     pub fn status(status: Status) -> Self {
         Self {
             status,
+            slowed: None,
             size: 0,
             version: String::new(),
             etag: String::new(),
@@ -2646,12 +2780,27 @@ impl Reply {
         }
     }
 
+    /// A reply of `SlowDown` for `cause`.
+    pub fn slowed(cause: Slowed) -> Self {
+        Self {
+            slowed: Some(cause),
+            ..Self::status(Status::SlowDown)
+        }
+    }
+
     /// The reply's head and the fields that open its body: the fields counted first, then
     /// written into one buffer at their length (`mantle_codec::encode`'s rule), so it never grows.
+    /// A cause beside a status other than `SlowDown` is refused: the head says one decision.
     pub fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
+        let cause = match (self.status, self.slowed) {
+            (_, None) => 0,
+            (Status::SlowDown, Some(cause)) => cause.code(),
+            (status, Some(_)) => return Err(ObjectError::Cause(status)),
+        };
         let fields = mantle_codec::encode(0, |f| self.put_fields(f))?.into_vec();
         let mut w = Writer::with_capacity(REPLY_HEAD_BYTES);
         w.u8(self.status.code());
+        w.u8(cause);
         w.u64(self.size);
         w.u32(u32::try_from(fields.len()).map_err(|_| ObjectError::TooLong(fields.len()))?);
         Ok((w.into_vec(), fields))
@@ -2742,10 +2891,12 @@ impl Reply {
     }
 }
 
-/// A reply's head: its status and size, and how long the fields that open its body are.
+/// A reply's head: its status, a `SlowDown`'s cause and its size, and how long the fields that
+/// open its body are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplyHead {
     pub status: Status,
+    pub slowed: Option<Slowed>,
     pub size: u64,
     fields: u32,
 }
@@ -2759,8 +2910,16 @@ impl ReplyHead {
     pub fn decode(head: &[u8]) -> Result<Self, ObjectError> {
         let mut r = Reader::new(head);
         let reply = (|| {
+            let status = Status::of(r.u8()?)?;
+            // A cause stands beside `SlowDown` alone, and is one the protocol names.
+            let slowed = match (status, r.u8()?) {
+                (_, 0) => None,
+                (Status::SlowDown, code) => Some(Slowed::of(code)?),
+                _ => return None,
+            };
             Some(Self {
-                status: Status::of(r.u8()?)?,
+                status,
+                slowed,
                 size: r.u64()?,
                 fields: r.u32()?,
             })
@@ -2856,6 +3015,7 @@ impl ReplyHead {
             let source_version = take_text(&mut r, MAX_TAG)?;
             Some(Reply {
                 status: self.status,
+                slowed: self.slowed,
                 size: self.size,
                 version,
                 etag,
@@ -2886,6 +3046,8 @@ pub enum ObjectError {
     Fields(usize),
     #[error("a field of {0} bytes, past its bound")]
     TooLong(usize),
+    #[error("a SlowDown's cause beside the status {0:?}")]
+    Cause(Status),
 }
 
 #[cfg(test)]
@@ -3413,8 +3575,12 @@ mod tests {
         for status in STATUSES {
             replies.push(Reply::status(status));
         }
+        for cause in Slowed::ALL {
+            replies.push(Reply::slowed(cause));
+        }
         replies.push(Reply {
             status: Status::Done,
+            slowed: None,
             size: 7,
             version: "0123456789ABC".into(),
             etag: "d41d8cd98f00b204e9800998ecf8427e-10000".into(),
@@ -3661,12 +3827,54 @@ mod tests {
         };
         assert!(over.encode().is_err());
         let unknown = u8::try_from(STATUSES.len()).unwrap();
-        assert!(ReplyHead::decode(&[unknown, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(ReplyHead::decode(&[unknown, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
         let mut long = Reply::status(Status::Done).encode().unwrap().0;
-        long[9..].copy_from_slice(&(u32::try_from(MAX_REPLY_FIELDS).unwrap() + 1).to_le_bytes());
+        long[10..].copy_from_slice(&(u32::try_from(MAX_REPLY_FIELDS).unwrap() + 1).to_le_bytes());
         assert!(ReplyHead::decode(&long).is_err());
         let (head, fields) = Reply::status(Status::NotModified).encode().unwrap();
         let decoded = ReplyHead::decode(&head).unwrap();
         assert!(decoded.reply(&fields[1..]).is_err());
+    }
+
+    /// Each cause a node answers `SlowDown` for reads back beside that status, each its own code
+    /// and words; a cause beside any other status, or one the protocol does not name, is refused
+    /// both ways, so the head says one decision.
+    #[test]
+    fn each_slowdowns_cause_reads_back_beside_it_and_beside_nothing_else() {
+        let mut words = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        for (at, cause) in Slowed::ALL.into_iter().enumerate() {
+            assert_eq!(cause.index(), at);
+            assert!(
+                words.insert(cause.words()),
+                "{cause:?} says another's words"
+            );
+            assert!(names.insert(cause.name()), "{cause:?} has another's name");
+            let reply = Reply::slowed(cause);
+            let (head, fields) = reply.encode().unwrap();
+            assert_eq!(head.len(), REPLY_HEAD_BYTES);
+            let decoded = ReplyHead::decode(&head).unwrap();
+            assert_eq!(
+                (decoded.status, decoded.slowed),
+                (Status::SlowDown, Some(cause))
+            );
+            assert_eq!(decoded.reply(&fields), Ok(reply));
+        }
+        // A cause beside another status is not written, nor read.
+        let beside = Reply {
+            slowed: Some(Slowed::Door),
+            ..Reply::status(Status::Failed)
+        };
+        assert_eq!(beside.encode(), Err(ObjectError::Cause(Status::Failed)));
+        let mut head = Reply::slowed(Slowed::Door).encode().unwrap().0;
+        head[0] = Status::Failed.code();
+        assert!(ReplyHead::decode(&head).is_err());
+        // A code past the last cause names none.
+        let mut head = Reply::slowed(Slowed::Door).encode().unwrap().0;
+        head[1] = u8::try_from(Slowed::ALL.len()).unwrap() + 1;
+        assert!(ReplyHead::decode(&head).is_err());
+        // A `SlowDown` with no cause beside it reads back as one.
+        let (head, _) = Reply::status(Status::SlowDown).encode().unwrap();
+        assert_eq!(ReplyHead::decode(&head).unwrap().slowed, None);
     }
 }

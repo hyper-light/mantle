@@ -140,9 +140,6 @@ pub(crate) struct Job {
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
-    /// Why it was answered `SlowDown`, where it was: the S3 door names it in its reply
-    /// (`door::Slowed`).
-    slowed: Option<door::Slowed>,
 }
 
 impl Job {
@@ -831,18 +828,19 @@ fn complete_status(error: &CompleteError) -> Status {
     }
 }
 
-/// The status a put's failure is answered with (node.md §4.4).
-fn put_status(error: &PutError) -> Status {
-    match error {
+/// The reply a put's failure is answered with (node.md §4.4): a block no volume offered took,
+/// `SlowDown` for that cause.
+fn put_failed(error: &PutError) -> Reply {
+    Reply::status(match error {
         PutError::IncompleteBody => Status::IncompleteBody,
         PutError::EntityTooLarge { .. } => Status::EntityTooLarge,
         PutError::BadDigest | PutError::BadChecksum => Status::BadDigest,
-        PutError::Unplaced(_) => Status::SlowDown,
+        PutError::Unplaced(_) => return Reply::slowed(door::Slowed::Unplaced),
         PutError::Full(_) => Status::InsufficientStorage,
         PutError::InvalidPartNumber(_) => Status::InvalidArgument,
         PutError::Name(outcome) => name_status(outcome),
         _ => Status::Failed,
-    }
+    })
 }
 
 /// A put's checksum as its reply carries it: a full-object value (05 §3.3).
@@ -1025,12 +1023,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             });
             return;
         }
+        // Not parked and no room: a stopping node's, or one whose parked requests are as many as
+        // it keeps.
+        let slowed = if room {
+            None
+        } else if self.stopping() {
+            Some(door::Slowed::Stopping)
+        } else {
+            Some(door::Slowed::Queued)
+        };
         self.start_object(
             exchange,
             peer,
             head,
             (deadline_ns, now, charge, window),
-            room,
+            slowed,
         );
     }
 
@@ -1056,12 +1063,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             self.parked.pop_front();
             let head = first.head.ok_or(ObjectError::Fields(0));
+            let slowed = if !over {
+                None
+            } else if self.stopping() {
+                Some(door::Slowed::Stopping)
+            } else {
+                Some(door::Slowed::Waited)
+            };
             self.start_object(
                 first.exchange,
                 first.peer,
                 head,
                 (first.deadline_ns, now, first.charge, first.window),
-                !over,
+                slowed,
             );
         }
     }
@@ -1085,14 +1099,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The job of an object's request on `exchange` from `peer`, at `now`, its client's deadline
     /// and its charge as its head says: one that reads its fields first where the host admits it
-    /// (`room`), else the reply it gets at once.
+    /// (no `slowed`), else the reply it gets at once, `SlowDown` for `slowed`'s cause where it is
+    /// a request the host would run.
     fn start_object(
         &mut self,
         exchange: ExchangeId,
         peer: PeerId,
         head: Result<Head, ObjectError>,
         (deadline_ns, now, charge, window): (Option<u64>, u64, u64, usize),
-        room: bool,
+        slowed: Option<door::Slowed>,
     ) {
         // A client's operations act for the account its certificate names; one whose
         // connections have all gone since asking is no longer known, and nothing is taken.
@@ -1103,12 +1118,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return;
         };
         let mut admitted_ns = None;
-        let work = match (head, self.gateway.as_ref()) {
-            (_, None) => Work::Draining(Box::new(Reply::status(Status::Failed))),
-            (Err(_), Some(_)) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
-            // A node stopping begins no operation (node.md §1.7): its client asks another.
-            (Ok(_), Some(_)) if !room => Work::Draining(Box::new(Reply::status(Status::SlowDown))),
-            (Ok(head), Some(_)) => {
+        let work = match (head, self.gateway.as_ref(), slowed) {
+            (_, None, _) => Work::Draining(Box::new(Reply::status(Status::Failed))),
+            (Err(_), Some(_), _) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
+            // A node stopping begins no operation (node.md §1.7), and one with no room for it
+            // answers it at once: its client asks another, or again.
+            (Ok(_), Some(_), Some(cause)) => Work::Draining(Box::new(Reply::slowed(cause))),
+            (Ok(head), Some(_), None) => {
                 admitted_ns = Some(now);
                 let fields = usize::try_from(head.fields()).unwrap_or(0);
                 Work::Fields(head, Vec::with_capacity(fields))
@@ -1131,7 +1147,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label: None,
-            slowed: None,
         });
     }
 
@@ -1154,7 +1169,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let room = self.gateway.is_some() && !self.stopping() && self.admits(charge);
         let work = match self.gateway.as_ref() {
             None => Work::Draining(Box::new(Reply::status(Status::Failed))),
-            Some(_) if !room => Work::Draining(Box::new(Reply::status(Status::SlowDown))),
+            // Taken past the limit, the door holds no request while the host has no room: a
+            // stopping node's (`take_door`).
+            Some(_) if !room => Work::Draining(Box::new(Reply::slowed(door::Slowed::Stopping))),
             Some(_) => {
                 admitted_ns = Some(now);
                 let block = self.open_block(&op);
@@ -1189,13 +1206,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label,
-            // Taken past the limit, the door holds no request while the host has no room: a
-            // stopping node's (`take_door`).
-            slowed: if room {
-                None
-            } else {
-                Some(door::Slowed::Stopping)
-            },
         });
     }
 
@@ -1524,7 +1534,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = match op {
                 Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
-                Ok(_) if crowded => Work::Draining(Box::new(Reply::status(Status::SlowDown))),
+                Ok(_) if crowded => Work::Draining(Box::new(Reply::slowed(door::Slowed::Crowded))),
                 Ok(op) => {
                     if more > 0
                         && let Some(admission) = self.admission.as_mut()
@@ -2399,10 +2409,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 putting.put = Some(put);
                 Ok(())
             }
-            Err(error) => match put_status(&error) {
-                Status::SlowDown => self.slow_job(at, door::Slowed::Unplaced),
-                status => self.fail_job(at, status),
-            },
+            Err(error) => self.reply_job(at, put_failed(&error)),
         }
     }
 
@@ -2445,7 +2452,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             }),
                             ..Reply::status(Status::Offset)
                         },
-                        Err(error) => Reply::status(put_status(error)),
+                        Err(error) => put_failed(error),
                     });
                     // What its blocks took to be recorded and its body to come, for the windows the
                     // node's next puts hold (`crate::window`).
@@ -2915,12 +2922,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(None);
         }
         if let Some(Err(e)) = get.outcome() {
-            let status = get_status(e);
+            let failed = get_failed(e);
             getting.held = None;
-            match status {
-                Status::SlowDown => self.slow_job(at, door::Slowed::Unreadable)?,
-                _ => self.fail_job(at, status)?,
-            }
+            self.reply_job(at, failed)?;
             return Ok(Some(false));
         }
         if !get.ready() && get.outcome().is_none() {
@@ -3852,15 +3856,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // The digests a copy is held to are its source's own, never a client's: bytes that
             // miss them are the store's failure, not the request's `400 BadDigest`.
             (Some(Err(PutError::BadDigest | PutError::BadChecksum)), _) => {
-                Some(Err(Status::Failed))
+                Some(Err(Reply::status(Status::Failed)))
             }
-            (Some(Err(error)), _) => Some(Err(put_status(error))),
-            (None, Some(Err(error))) => Some(Err(get_status(error))),
+            (Some(Err(error)), _) => Some(Err(put_failed(error))),
+            (None, Some(Err(error))) => Some(Err(get_failed(error))),
             _ => None,
         };
         match over {
-            Some(Err(status)) => {
-                self.fail_job(at, status)?;
+            Some(Err(failed)) => {
+                self.reply_job(at, failed)?;
                 return self.drain_job(at);
             }
             Some(Ok(stored)) => {
@@ -4268,10 +4272,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 copying.stage = CopyStage::Run;
                 Ok(())
             }
-            (_, Err(error)) => match put_status(&error) {
-                Status::SlowDown => self.slow_job(at, door::Slowed::Unplaced),
-                status => self.fail_job(at, status),
-            },
+            (_, Err(error)) => self.reply_job(at, put_failed(&error)),
             (Err(_), _) => self.fail_job(at, Status::Failed),
         }
     }
@@ -4460,12 +4461,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.reply_job(at, Reply::status(status))
     }
 
-    /// Ends job `at` `SlowDown` for `cause`, which the S3 door names in its reply.
+    /// Ends job `at` `SlowDown` for `cause`, which its reply names on either door.
     fn slow_job(&mut self, at: usize, cause: door::Slowed) -> Result<(), NodeError> {
-        if let Some(job) = self.jobs.get_mut(at) {
-            job.slowed = Some(cause);
-        }
-        self.fail_job(at, Status::SlowDown)
+        self.reply_job(at, Reply::slowed(cause))
     }
 
     /// The outcomes of asks whose job ended before they came, dropped as they come: an outcome no
@@ -4508,9 +4506,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Ok(false);
                 };
                 // A reply slowed for a cause says it (`door::Slowed`); any other, its head.
-                let head = match job.slowed {
-                    Some(cause) if reply.status == Status::SlowDown => door::Answer::Slowed(cause),
-                    _ => door::Answer::Head(reply),
+                let head = match reply.slowed {
+                    Some(cause) => door::Answer::Slowed(cause),
+                    None => door::Answer::Head(reply),
                 };
                 job.work = Work::Answering(VecDeque::from([head, door::Answer::End]));
                 return self.answer_local(at);
@@ -4546,9 +4544,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Ok((head, fields)) = reply.encode() else {
             return Ok(true);
         };
+        let slowed = reply.slowed;
         let length = u64::try_from(fields.len()).unwrap_or(u64::MAX);
         if endpoint.reply(exchange, &head, Some(length)).is_err() {
             return Ok(true);
+        }
+        // A native request answered `SlowDown`, counted for its cause as it goes: the node says
+        // the counts in its lines, as the listener counts the S3 door's.
+        if let Some(count) = slowed.and_then(|cause| self.slowed.get_mut(cause.index())) {
+            *count = count.saturating_add(1);
         }
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = Work::Replying(fields, 0);
@@ -5391,12 +5395,12 @@ fn md5_of_etag(etag: &str) -> Option<[u8; 16]> {
     Some(md5)
 }
 
-/// The status a get's failure is answered with: too few of a block's chunks read is a cause
-/// that passes, `503 SlowDown`, which clients ask again; any other `500`.
-fn get_status(error: &GetError) -> Status {
+/// The reply a get's failure is answered with: too few of a block's chunks read is a cause that
+/// passes, `503 SlowDown`, which clients ask again; any other `500`.
+fn get_failed(error: &GetError) -> Reply {
     match error {
-        GetError::Unreadable(_) => Status::SlowDown,
-        _ => Status::Failed,
+        GetError::Unreadable(_) => Reply::slowed(door::Slowed::Unreadable),
+        _ => Reply::status(Status::Failed),
     }
 }
 
@@ -5605,7 +5609,6 @@ mod tests {
             charge: 0,
             window: 1,
             label: None,
-            slowed: None,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);

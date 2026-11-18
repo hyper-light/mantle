@@ -128,9 +128,14 @@ pub fn reason(status: u16) -> &'static str {
     }
 }
 
-/// The answer of an S3 request slowed for `cause`: `503 SlowDown`, its message naming the cause.
+/// The answer of an S3 request slowed for `cause`: `503 SlowDown`, its message S3's words and then
+/// the cause's.
 pub fn slowed(cause: crate::door::Slowed) -> Refused {
-    Refused::new("SlowDown", 503, cause.message())
+    Refused::new(
+        "SlowDown",
+        503,
+        format!("Please reduce your request rate. {}", cause.words()),
+    )
 }
 
 /// S3's code, status and message for a host's refusal (node.md §4.4; 05 §11.2).

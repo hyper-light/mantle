@@ -42,7 +42,7 @@ use mantle_client::{
 };
 use mantle_protocol::object::{
     self as native, Headers, List, ListVersions, Listing, MAX_OBJECTS, Metadata, Op, Progress,
-    Reply, Status, Target,
+    Reply, Slowed, Status, Target,
 };
 use mantle_s3::copy::{Directive, Source as CopySource};
 
@@ -177,8 +177,8 @@ pub enum Error {
     Config(PathBuf, String),
     Usage(String),
     Client(ClientError),
-    /// A node answered, and not done: what was asked, and its status.
-    Answered(String, Status),
+    /// A node answered, and not done: what was asked, its status, and a `SlowDown`'s cause.
+    Answered(String, Status, Option<Slowed>),
     File(PathBuf, std::io::Error),
     Runtime(String),
     Output(std::io::Error),
@@ -197,6 +197,13 @@ pub enum Error {
     Corrupt(String),
 }
 
+impl Error {
+    /// A node's `reply`, not done, to what was asked: its status, and a `SlowDown`'s cause.
+    pub(crate) fn answered(what: &str, reply: &Reply) -> Self {
+        Self::Answered(what.to_owned(), reply.status, reply.slowed)
+    }
+}
+
 impl From<JournalError> for Error {
     fn from(e: JournalError) -> Self {
         Self::Journal(e)
@@ -209,7 +216,11 @@ impl fmt::Display for Error {
             Self::Config(path, why) => write!(f, "{}: {why}", path.display()),
             Self::Usage(why) => f.write_str(why),
             Self::Client(e) => write!(f, "{e}"),
-            Self::Answered(what, status) => write!(f, "{what}: {status:?}"),
+            Self::Answered(what, status, None) => write!(f, "{what}: {status:?}"),
+            // A `SlowDown` names its cause, the path that answered it (node.md §4.5).
+            Self::Answered(what, status, Some(cause)) => {
+                write!(f, "{what}: {status:?}: {}", cause.words())
+            }
             Self::File(path, e) => write!(f, "{}: {e}", path.display()),
             Self::Runtime(why) => write!(f, "the runtime: {why}"),
             Self::Output(e) => write!(f, "writing output: {e}"),
@@ -473,7 +484,7 @@ fn done(what: &str, reply: Reply) -> Result<Reply, Error> {
     if reply.status == Status::Done {
         Ok(reply)
     } else {
-        Err(Error::Answered(what.to_owned(), reply.status))
+        Err(Error::answered(what, &reply))
     }
 }
 
@@ -671,7 +682,7 @@ async fn list_buckets(client: &mut Client, out: &mut impl Write) -> Result<(), E
         };
         let reply = done("ListBuckets", client.call(&op, NO_DEADLINE).await?)?;
         let Some(Listing::Buckets(page)) = reply.listing else {
-            return Err(Error::Answered("ListBuckets".into(), reply.status));
+            return Err(Error::answered("ListBuckets", &reply));
         };
         for (bucket, created) in &page.buckets {
             line(out, format_args!("{} {bucket}", date(*created)))?;
@@ -696,7 +707,7 @@ async fn list_keys(client: &mut Client, at: &Location, out: &mut impl Write) -> 
         });
         let reply = done("ListObjectsV2", client.call(&op, NO_DEADLINE).await?)?;
         let Some(Listing::Keys(page)) = reply.listing else {
-            return Err(Error::Answered("ListObjectsV2".into(), reply.status));
+            return Err(Error::answered("ListObjectsV2", &reply));
         };
         for prefix in &page.common_prefixes {
             line(out, format_args!("PRE {prefix}"))?;
@@ -734,7 +745,7 @@ async fn list_versions(
         });
         let reply = done("ListObjectVersions", client.call(&op, NO_DEADLINE).await?)?;
         let Some(Listing::Versions(page)) = reply.listing else {
-            return Err(Error::Answered("ListObjectVersions".into(), reply.status));
+            return Err(Error::answered("ListObjectVersions", &reply));
         };
         for v in &page.versions {
             let latest = if v.latest { "latest" } else { "-" };
@@ -801,7 +812,7 @@ async fn remove(
             };
             let reply = done("DeleteObjects", client.call(&op, NO_DEADLINE).await?)?;
             let Some(Listing::Deleted(results)) = reply.listing else {
-                return Err(Error::Answered("DeleteObjects".into(), reply.status));
+                return Err(Error::answered("DeleteObjects", &reply));
             };
             for result in &results {
                 match result.status {
@@ -819,7 +830,7 @@ async fn remove(
             }
         }
         return match failed {
-            Some(status) => Err(Error::Answered("DeleteObjects".into(), status)),
+            Some(status) => Err(Error::Answered("DeleteObjects".into(), status, None)),
             None => Ok(()),
         };
     };
@@ -864,7 +875,7 @@ async fn list_parts(
         };
         let reply = done("ListParts", client.call(&op, NO_DEADLINE).await?)?;
         let Some(Listing::Parts(page)) = reply.listing else {
-            return Err(Error::Answered("ListParts".into(), reply.status));
+            return Err(Error::answered("ListParts", &reply));
         };
         for part in &page.parts {
             line(
@@ -896,7 +907,7 @@ async fn list_uploads(
         };
         let reply = done("ListMultipartUploads", client.call(&op, NO_DEADLINE).await?)?;
         let Some(Listing::Uploads(page)) = reply.listing else {
-            return Err(Error::Answered("ListMultipartUploads".into(), reply.status));
+            return Err(Error::answered("ListMultipartUploads", &reply));
         };
         for listed in &page.uploads {
             line(
@@ -1172,7 +1183,7 @@ async fn copy_in_cell(
         let reply = client.call(&op, NO_DEADLINE).await?;
         if reply.status != Status::Done {
             abort_upload(client, to, &upload).await?;
-            return Err(Error::Answered("UploadPartCopy".into(), reply.status));
+            return Err(Error::answered("UploadPartCopy", &reply));
         }
         parts.push((number, reply.etag));
         first = last.saturating_add(1);
@@ -1249,13 +1260,21 @@ where
         Status::BadDigest => {
             abort_upload(client, at, &record.upload).await?;
             journal.forget(&record)?;
-            Err(Error::Answered("the upload".into(), Status::BadDigest))
+            Err(Error::Answered(
+                "the upload".into(),
+                Status::BadDigest,
+                None,
+            ))
         }
         Status::NoSuchUpload => {
             journal.forget(&record)?;
-            Err(Error::Answered("the upload".into(), Status::NoSuchUpload))
+            Err(Error::Answered(
+                "the upload".into(),
+                Status::NoSuchUpload,
+                None,
+            ))
         }
-        status => Err(Error::Answered("the upload".into(), status)),
+        _ => Err(Error::answered("the upload", &reply)),
     }
 }
 
@@ -1273,7 +1292,7 @@ async fn abort_upload(client: &mut Client, at: &Location, upload: &str) -> Resul
     let reply = client.call(&op, NO_DEADLINE).await?;
     match reply.status {
         Status::Done | Status::NoSuchUpload => Ok(()),
-        status => Err(Error::Answered("AbortMultipartUpload".into(), status)),
+        _ => Err(Error::answered("AbortMultipartUpload", &reply)),
     }
 }
 
@@ -1695,6 +1714,29 @@ impl Sink for Stdout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node's `SlowDown` names its cause after the status, as the CLI prints its failure
+    /// (`mantle: the upload: SlowDown: ...`), each cause its own words; any other status, and a
+    /// `SlowDown` with none beside it, is the status alone.
+    #[test]
+    fn a_slowdowns_failure_names_its_cause() {
+        let mut said = std::collections::BTreeSet::new();
+        for cause in Slowed::ALL {
+            let text = Error::answered("the upload", &Reply::slowed(cause)).to_string();
+            assert_eq!(text, format!("the upload: SlowDown: {}", cause.words()));
+            assert!(said.insert(text), "{cause:?} says another's");
+        }
+        let queued = Error::answered("the upload", &Reply::slowed(Slowed::Queued)).to_string();
+        assert_eq!(
+            queued,
+            "the upload: SlowDown: The node had no room for the request, and as many waited for \
+             room as it keeps."
+        );
+        let failed = Error::answered("the upload", &Reply::status(Status::Failed));
+        assert_eq!(failed.to_string(), "the upload: Failed");
+        let bare = Error::answered("the upload", &Reply::status(Status::SlowDown));
+        assert_eq!(bare.to_string(), "the upload: SlowDown");
+    }
 
     #[test]
     fn a_place_is_the_cells_a_file_or_standard_io() {

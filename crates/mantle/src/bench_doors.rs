@@ -93,7 +93,7 @@ use mantle_disk::histogram::Histogram;
 use mantle_disk::rounds::{self, Judgment, Policy};
 use mantle_http::write::Length;
 use mantle_node::process::RangeShards;
-use mantle_protocol::object::{Headers, List, Listing, Op, Reply, Status};
+use mantle_protocol::object::{Headers, List, Listing, Op, Reply, Slowed, Status};
 use mantle_s3::checksum::{self, Algorithm, Hasher};
 use mantle_s3::list::Resume;
 use mantle_s3::{crypto, sigv4};
@@ -388,8 +388,9 @@ enum Came {
     /// The server answered with a refusal (an HTTP status past 2xx), or an operation needed what a
     /// refused one would have made: a failure, which against an endpoint may exclude its phase.
     Refused(String),
-    /// Refused `SlowDown` (503): asked again as the AWS SDKs ask a throttled request again.
-    Slowed,
+    /// Refused `SlowDown` (503): asked again as the AWS SDKs ask a throttled request again. A
+    /// native reply's cause beside it, which the S3 door says in its message instead.
+    Slowed(Option<Slowed>),
     /// Its exchange ended unanswered (`ClientError::Lost`, said): asked again with its identity,
     /// which the node answers from what it made.
     Lost(String),
@@ -410,7 +411,7 @@ fn answered(
     use mantle_client::ClientError;
     use mantle_client::Refusal;
     match asked {
-        Ok(reply) if reply.status == Status::SlowDown => Ok(Err(Came::Slowed)),
+        Ok(reply) if reply.status == Status::SlowDown => Ok(Err(Came::Slowed(reply.slowed))),
         Ok(reply) => Ok(Ok(reply)),
         // Its exchange ended unanswered, or its connection ended under it before it was answered:
         // asked again with its identity (`Work::again_after`), as the node answers a request
@@ -1443,7 +1444,10 @@ async fn client<A: Ask>(mut logical: Logical, work: Rc<A>, shared: Rc<RefCell<Sh
                     .as_mut()
                     .is_some_and(|rounds| rounds.completed(ended));
             let unanswered = shared.rounds.is_some()
-                && matches!(came, Ok(Came::Unanswered(_) | Came::Lost(_) | Came::Slowed));
+                && matches!(
+                    came,
+                    Ok(Came::Unanswered(_) | Came::Lost(_) | Came::Slowed(_))
+                );
             if enough || unanswered || came.is_err() {
                 shared.schedule.stop();
             }
@@ -1483,7 +1487,7 @@ async fn client<A: Ask>(mut logical: Logical, work: Rc<A>, shared: Rc<RefCell<Sh
                     false
                 }
                 // Settled into `Unanswered` before it is tallied (`Work::settled`): counted so.
-                Ok(Came::Slowed) => {
+                Ok(Came::Slowed(_)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.unanswered = tally.unanswered.saturating_add(1);
                     false
@@ -1645,13 +1649,13 @@ impl Work {
     /// whose exchange ended unanswered at once, each up to mantle-client's attempts in all. Counts
     /// the asking in `again` and in the phase's.
     async fn again_after(&self, came: &Came, j: u64, again: &mut u32) -> Result<bool, Error> {
-        let retry = matches!(came, Came::Slowed | Came::Lost(_));
+        let retry = matches!(came, Came::Slowed(_) | Came::Lost(_));
         if !retry || again.saturating_add(1) >= mantle_client::ATTEMPTS {
             return Ok(false);
         }
         *again = again.saturating_add(1);
         harness(|| self.again.set(self.again.get().saturating_add(1)));
-        if matches!(came, Came::Slowed) {
+        if matches!(came, Came::Slowed(_)) {
             let cap = SLOWED_BASE_NS
                 .saturating_mul(
                     1u64.checked_shl(again.saturating_sub(1))
@@ -1676,7 +1680,11 @@ impl Work {
     fn settled(&self, came: Came, again: u32) -> Came {
         let asked = again.saturating_add(1);
         match came {
-            Came::Slowed => Came::Unanswered(format!("SlowDown, asked {asked} times")),
+            // The last attempt's cause, where a native reply said it.
+            Came::Slowed(None) => Came::Unanswered(format!("SlowDown, asked {asked} times")),
+            Came::Slowed(Some(cause)) => {
+                Came::Unanswered(format!("SlowDown, asked {asked} times: {}", cause.words()))
+            }
             Came::Lost(why) => Came::Unanswered(format!("unanswered ({why}), asked {asked} times")),
             came => came,
         }
@@ -2061,7 +2069,7 @@ impl Work {
         let reads = matches!(self.kind, Kind::Get | Kind::Range | Kind::Head);
         let refused = |answer: &Answer, body: &Kept| {
             if answer.status == 503 {
-                return Came::Slowed;
+                return Came::Slowed(None);
             }
             let text = String::from_utf8_lossy(&body.0);
             let said = format!(
@@ -2428,7 +2436,7 @@ impl Work {
                     .await?;
                 let text = String::from_utf8_lossy(&kept.0);
                 if answer.status == 503 {
-                    return Ok(Err(Came::Slowed));
+                    return Ok(Err(Came::Slowed(None)));
                 }
                 if answer.status != 200 {
                     return Ok(Err(Came::Refused(format!(
@@ -4098,7 +4106,7 @@ impl Bench<'_> {
                         | Came::Differed(why)
                         | Came::Unanswered(why)
                         | Came::Lost(why) => why,
-                        Came::Slowed => "SlowDown".to_owned(),
+                        Came::Slowed(_) => "SlowDown".to_owned(),
                         Came::Skipped => "not asked".to_owned(),
                     };
                     let unput = format!("its object {key} was not put: {why}");

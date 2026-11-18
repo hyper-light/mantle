@@ -53,7 +53,7 @@ fn done(what: &str, reply: Reply) -> Result<Reply, Error> {
     if reply.status == Status::Done {
         Ok(reply)
     } else {
-        Err(Error::Answered(what.to_owned(), reply.status))
+        Err(Error::answered(what, &reply))
     }
 }
 
@@ -134,7 +134,7 @@ pub async fn run(client: &mut Client, command: Command, out: &mut impl Write) ->
             let op = Op::GetPrincipal { name };
             let reply = done("GetPrincipal", client.call(&op, NO_DEADLINE).await?)?;
             let Some(Listing::Principals(page)) = reply.listing else {
-                return Err(Error::Answered("GetPrincipal".into(), reply.status));
+                return Err(Error::answered("GetPrincipal", &reply));
             };
             for p in &page.principals {
                 line(out, format_args!("principal {}", p.name))?;
@@ -175,7 +175,7 @@ async fn every(
         };
         let reply = done("ListPrincipals", client.call(&op, NO_DEADLINE).await?)?;
         let Some(Listing::Principals(page)) = reply.listing else {
-            return Err(Error::Answered("ListPrincipals".into(), reply.status));
+            return Err(Error::answered("ListPrincipals", &reply));
         };
         for p in &page.principals {
             each(p)?;
@@ -209,7 +209,7 @@ async fn key(
     };
     let reply = done("CreateKey", client.call(&op, NO_DEADLINE).await?)?;
     let Some(Listing::Issued(issued)) = reply.listing else {
-        return Err(Error::Answered("CreateKey".into(), reply.status));
+        return Err(Error::answered("CreateKey", &reply));
     };
     let Issued {
         id,

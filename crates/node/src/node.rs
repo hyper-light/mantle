@@ -1747,12 +1747,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let (handle, max) = (kept.handle, kept.max_entry_bytes);
         entry.at_ns = self.wall.now_ns();
         if let Some(far) = self.far.iter().find(|far| far.group == group) {
-            let lanes = self
-                .shards
-                .iter()
-                .find(|lanes| lanes.shard() == far.shard)
-                .ok_or(NodeError::ShardEnded(far.shard))?;
-            lanes.send(shard::In::Propose(group, entry.clone(), max))?;
+            shard::propose(&self.shards, far, entry, max)?;
             self.proposed_entries = self.proposed_entries.saturating_add(1);
             self.proposed_commands = self
                 .proposed_commands
@@ -3509,21 +3504,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// A command's or a read's head, checked before its body is read: what its body is read as,
-    /// `led` of the group of a range this node leads, or the answer that says why not (no such
-    /// range, or where the leader is), given once the body is read whole.
+    /// A command's or a read's head, checked before its body is read: what its body is read as
+    /// ([`requested`]), by what this node's member of its range shows, wherever its replica is
+    /// driven (node.md §2.9).
     fn take_request(&mut self, exchange: ExchangeId, led: fn(u128) -> Arriving) -> Arriving {
         let endpoint = self.driver.endpoint();
         let Ok(group) = command::group_of(endpoint.head(exchange).unwrap_or_default()) else {
             return Arriving::Status(command::Status::Malformed);
         };
-        let Some(replica) = self.kept(group).and_then(|k| self.owner.get(k.handle)) else {
-            return Arriving::Status(command::Status::NoRange);
-        };
-        if !replica.is_leader() {
-            return Arriving::Redirect(group);
-        }
-        led(group)
+        requested(self.seen(group), group, led)
     }
 
     /// Proposes the entry a command's body holds, as the range's leader, and keeps the command
@@ -3564,6 +3553,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Err(NodeError::Range(mantle_range::ReplicaError::EntryTooLarge { .. })) => {
                 self.answer_status(exchange, command::Status::Malformed, 0)
             }
+            // A far range's shard that ended took the range with it: the node stops (node.md §2.9).
+            Err(error @ NodeError::ShardEnded(_)) => Err(error),
             Err(_) => {
                 let leader = self.leader_of(group);
                 if leader == self.id {
@@ -4298,6 +4289,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 asking.outs.insert(place, out);
                 asking.refused_entry(id, command::Status::Malformed, &mut self.commands_done);
             }
+            Err(error @ NodeError::ShardEnded(_)) => return Err(error),
             Err(_) => {
                 // The member takes no entry now: the time without a leader that serves it counted.
                 out.leaderless_since.get_or_insert(now);
@@ -4978,6 +4970,19 @@ fn paused_until(local: u64, (backoff, pauses): (&mut Duration, &mut u32), now: u
     *pauses = pauses.wrapping_add(1);
     *backoff = bounds::backed_off(*backoff);
     now.saturating_add(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// What a command's or a read's body for `group` is read as, by what this node's member of its
+/// range shows (`Node::seen`): `led` where it leads, its body proposed or asked where its replica
+/// is driven, on the node's shard or over another's lane (`Node::propose`, `Node::ask_read`;
+/// node.md §2.9); redirected to the leader it knows where it does not; refused `NoRange` where
+/// the node keeps no member of it. Each answer is given once the body is read whole.
+fn requested(seen: Option<shard::Seen>, group: u128, led: fn(u128) -> Arriving) -> Arriving {
+    match seen {
+        None => Arriving::Status(command::Status::NoRange),
+        Some(seen) if !seen.leading => Arriving::Redirect(group),
+        Some(_) => led(group),
+    }
 }
 
 /// An answer a range applied, given to the command waiting for it, if one is: the first whose

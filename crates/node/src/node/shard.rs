@@ -366,6 +366,24 @@ pub(crate) fn ask_read<E: Engine + 'static, S: LogStore>(
     }
 }
 
+/// Proposes `entry` to `far`'s range on its shard ([`In::Propose`]), at most `max` bytes. One whose
+/// lane has no room is refused `LaneFull`, as one its replica would refuse: a peer's command is
+/// answered `Refused` while the range leads here, which its asker asks again after its pause, and
+/// the node's own pauses (`Node::propose_command`, `Node::propose_own`). A shard with no lanes, or
+/// whose task ended, is refused `ShardEnded`.
+pub(crate) fn propose<E: Engine + 'static, S: LogStore>(
+    shards: &[Lanes<E, S>],
+    far: &Far,
+    entry: &Entry,
+    max: u64,
+) -> Result<(), NodeError> {
+    shards
+        .iter()
+        .find(|lanes| lanes.shard() == far.shard)
+        .ok_or(NodeError::ShardEnded(far.shard))?
+        .send(In::Propose(far.group, entry.clone(), max))
+}
+
 /// Asks `far`'s shard to hand its lead over ([`In::Transfer`]), past the voter `failed`: whether it
 /// was asked. One whose lane has no room is not, as one its core refuses: the range elects once
 /// this node is gone (`node::stop`). A shard with no lanes, or whose task ended, stops the node.
@@ -1912,6 +1930,92 @@ mod tests {
         assert!(matches!(
             lanes.send(measured()),
             Err(NodeError::ShardEnded(1))
+        ));
+    }
+
+    /// A peer's command and read of a far range this node leads, as its shard last showed it, are
+    /// read as the range's own (`Node::take_request`): the command proposed over the shard's lane
+    /// and its answer given to the command waiting for it, the read asked there and served back by
+    /// its id. One of the range shown not leading is redirected to its leader, and one of a range
+    /// the node keeps no member of is refused `NoRange`.
+    #[test]
+    fn a_peers_command_and_read_of_a_far_range_are_served_through_its_lanes() {
+        use super::super::{Arriving, CommandOrigin, Commanded, answer_command, requested};
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (lanes, moved, _) = leading(&rt, &log, &range);
+        let mut shards = vec![lanes];
+        let mut far = far(moved);
+        assert!(!far.seen.leading);
+        assert!(requested(Some(far.seen), GROUP, Arriving::Command) == Arriving::Redirect(GROUP));
+        assert!(
+            requested(None, GROUP, Arriving::Read)
+                == Arriving::Status(crate::command::Status::NoRange)
+        );
+        // As its shard showed it once it led (`leading`).
+        far.seen.leading = true;
+
+        assert!(requested(Some(far.seen), GROUP, Arriving::Command) == Arriving::Command(GROUP));
+        propose(&shards, &far, &put(), range.settings.max_entry_bytes).unwrap();
+        let mut commanded = vec![Commanded {
+            origin: CommandOrigin::Own(0),
+            group: GROUP,
+            commands: vec![(0, 1, None)],
+        }];
+        let Out::Applied(group, applied) =
+            next(&mut shards[0], "the command applied", deadline(), |out| {
+                !matches!(out, Out::Applied(..))
+            })
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        answer_command(&mut commanded, group, &applied);
+        assert!(commanded[0].commands[0].2.is_some(), "the command answered");
+
+        assert!(requested(Some(far.seen), GROUP, Arriving::Read) == Arriving::Read(GROUP));
+        let query = Query::Current {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        assert!(ask_read(&shards, &far, 5, &query).unwrap());
+        let Out::Served(group, id, served) =
+            next(&mut shards[0], "the read served", deadline(), |out| {
+                !matches!(out, Out::Served(..))
+            })
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        assert_eq!((group, id), (GROUP, 5));
+        assert!(matches!(served, Served::Read(_)));
+        drop(shards);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// A proposal to a far range's shard whose lane holds all it takes is refused `LaneFull`, as
+    /// one its replica refuses, which a peer's command hears as `Refused` and asks again after its
+    /// pause; one to a shard the node has no lanes to stops the node, typed.
+    #[test]
+    fn a_full_lane_refuses_a_proposal_as_its_replica_would() {
+        let (lanes, _ends) = unstarted(1);
+        lanes.send(measured()).unwrap();
+        let shards = vec![lanes];
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let mut far = far(Seen::of(&campaigning(&log, &range)));
+        far.seen.leading = true;
+        let max = range.settings.max_entry_bytes;
+        assert!(matches!(
+            propose(&shards, &far, &put(), max),
+            Err(NodeError::LaneFull(1))
+        ));
+        far.shard = 2;
+        assert!(matches!(
+            propose(&shards, &far, &put(), max),
+            Err(NodeError::ShardEnded(2))
         ));
     }
 }

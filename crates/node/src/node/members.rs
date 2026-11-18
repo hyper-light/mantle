@@ -82,6 +82,56 @@ impl Cell {
     }
 }
 
+/// The root range's rows the membership reads, as its member held them after an entry it applied:
+/// read on the node's shard where its task drives the root range, and on the root range's shard,
+/// and handed over (`shard::Out::Rows`), where another shard does (node.md §2.9).
+pub(crate) struct Rows {
+    /// The entry the root range's member had applied when they were read.
+    pub(crate) applied: u64,
+    /// Each member and its row, in the order of their ids: at most the table's nodes.
+    pub(crate) members: Vec<(u64, Membership)>,
+    /// Each member's presence, in the order of `members`.
+    presences: Vec<Presence>,
+    grants: Grants,
+    /// The nodes the volume table holds a volume of, sorted: at most the table's volumes.
+    holding: Vec<u64>,
+}
+
+impl Rows {
+    /// The rows of `engine`, the root range's, which applied through `applied`. The volumes are
+    /// read only where a member joined or a grant was made: a cell made before grants reads none.
+    pub(crate) fn read<E: Engine>(engine: &mut E, applied: u64) -> Result<Self, NodeError> {
+        let meta = |e: mantle_meta::error::MetaError| NodeError::Bounds(e.to_string());
+        let census = root::census(engine).map_err(meta)?;
+        let nodes = usize::try_from(census.nodes).unwrap_or(usize::MAX);
+        let members = root::memberships(engine, nodes).map_err(meta)?;
+        let presences = members
+            .iter()
+            .map(|(id, _)| root::presence(engine, *id))
+            .collect::<Result<Vec<Presence>, _>>()
+            .map_err(meta)?;
+        let grants: Grants = root::grants(engine).map_err(meta)?;
+        let mut holding: Vec<u64> = Vec::new();
+        if !members.is_empty() || grants.top != 0 {
+            let most = usize::try_from(census.volumes).unwrap_or(usize::MAX);
+            holding = root::volumes(engine, None, most)
+                .map_err(meta)?
+                .into_iter()
+                .map(|p| p.node)
+                .collect();
+            holding.sort_unstable();
+            holding.dedup();
+        }
+        Ok(Self {
+            applied,
+            members,
+            presences,
+            grants,
+            holding,
+        })
+    }
+}
+
 /// Whether a member's identity is admitted: serving or leaving, or removed while the root range
 /// keeps it as a learner (`root_learner`), so it can be heard saying its storage holds the commit
 /// that removed it, which the root range's leader waits for before it drops it (membership.md §4
@@ -162,41 +212,39 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Reads the members again where the root range's member applied an entry since the last
-    /// read, and keeps the directory and the peers to them.
+    /// read, and keeps the directory and the peers to them: from its engine where the node's own
+    /// task drives the root range, and as its shard last handed them over where another shard
+    /// does ([`Rows`]), once each.
     fn read_members(&mut self) -> Result<(), NodeError> {
-        let Some((handle, _)) = self.root_range() else {
+        let Some((handle, group)) = self.root_range() else {
             return Ok(());
         };
-        let Some(shell) = self.owner.get_mut(handle) else {
-            return Ok(());
+        let rows = if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+            let Some(rows) = far.rows.take() else {
+                return Ok(());
+            };
+            *rows
+        } else {
+            let Some(shell) = self.owner.get_mut(handle) else {
+                return Ok(());
+            };
+            let applied = shell.applied().index;
+            if self.cell.as_ref().is_some_and(|c| c.applied == applied) {
+                return Ok(());
+            }
+            Rows::read(shell.machine_mut().engine_mut(), applied)?
         };
-        let applied = shell.applied().index;
-        if self.cell.as_ref().is_some_and(|c| c.applied == applied) {
-            return Ok(());
-        }
-        let meta = |e: mantle_meta::error::MetaError| NodeError::Bounds(e.to_string());
-        let engine = shell.machine_mut().engine_mut();
-        let census = root::census(engine).map_err(meta)?;
-        let nodes = usize::try_from(census.nodes).unwrap_or(usize::MAX);
-        let members = root::memberships(engine, nodes).map_err(meta)?;
-        let presences = members
-            .iter()
-            .map(|(id, _)| root::presence(engine, *id))
-            .collect::<Result<Vec<Presence>, _>>()
-            .map_err(meta)?;
-        let grants: Grants = root::grants(engine).map_err(meta)?;
+        let Rows {
+            applied,
+            members,
+            presences,
+            grants,
+            holding,
+        } = rows;
         if members.is_empty() && grants.top == 0 && self.cell.is_none() {
             // No member has joined: a cell made before grants, or one whose founders have yet to.
             return Ok(());
         }
-        let most = usize::try_from(census.volumes).unwrap_or(usize::MAX);
-        let mut holding: Vec<u64> = root::volumes(engine, None, most)
-            .map_err(meta)?
-            .into_iter()
-            .map(|p| p.node)
-            .collect();
-        holding.sort_unstable();
-        holding.dedup();
         let admitted_rows: Vec<Admitted> = members
             .iter()
             .map(|(id, row)| Admitted {

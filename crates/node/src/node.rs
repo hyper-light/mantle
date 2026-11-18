@@ -1542,6 +1542,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 configured,
                 // A replacement the node was told before the range moved goes with it.
                 replacing: kept.replacing.take().map(|replacement| (replacement, true)),
+                rows: None,
             });
         }
         self.shards.push(lanes);
@@ -1638,6 +1639,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             shard::Out::Configured(group, configured) => {
                 if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
                     far.configured = configured;
+                }
+            }
+            shard::Out::Rows(group, rows) => {
+                if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+                    far.rows = Some(rows);
                 }
             }
             shard::Out::Replaced(group, replacement) => {

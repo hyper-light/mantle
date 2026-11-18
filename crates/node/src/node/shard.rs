@@ -8,11 +8,12 @@
 //! first drive, Raft messages, proposals, reads, the stream's changes and measurements, and the
 //! membership's targets and replacements ([`In`]); out of it, Raft messages, applied answers,
 //! flushes, each range's peers, its expected election, what it shows after a drive that changed it
-//! ([`Seen`], [`Configured`]), its reads served and its replacements done ([`Out`]). The node's
-//! shard sends without waiting, a full lane refused, typed (`NodeError::LaneFull`); the shard waits
-//! for room on its way out, its replicas' next turn held until the node's shard takes what they
-//! gave. A shard whose task ended took its ranges with it, which nothing else holds, so the node
-//! stops (`NodeError::ShardEnded`) and its next start recovers them from the log (node.md §1.7).
+//! ([`Seen`], [`Configured`]), the root range's rows, its reads served and its replacements done
+//! ([`Out`]). The node's shard sends without waiting, a full lane refused, typed
+//! (`NodeError::LaneFull`); the shard waits for room on its way out, its replicas' next turn held
+//! until the node's shard takes what they gave. A shard whose task ended took its ranges with it,
+//! which nothing else holds, so the node stops (`NodeError::ShardEnded`) and its next start
+//! recovers them from the log (node.md §1.7).
 
 use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
@@ -38,6 +39,7 @@ use mantle_range::{Applied, ConfState, LogStore, RangeMachine};
 
 use super::NodeError;
 use super::answers::Answers;
+use super::members::Rows;
 use crate::read::{Query, Read};
 
 /// A range's replica, as the node's shard and a range's shard hold it.
@@ -117,6 +119,9 @@ pub(crate) enum Out {
     Configured(u128, Configured),
     /// A replacement ([`In::Replace`]) that ended while the range led here.
     Replaced(u128, Replacement),
+    /// The root range's rows the membership reads, after a drive in which it applied an entry, and
+    /// at its first.
+    Rows(u128, Box<Rows>),
     /// Why the shard stopped: its task ends after it.
     Stopped(NodeError),
 }
@@ -240,6 +245,9 @@ pub(crate) struct Far {
     /// The replacement the node was told of it ([`In::Replace`]) until its shard reports it done,
     /// and whether its lane has yet to take it: one, a later superseding it.
     pub(crate) replacing: Option<(Replacement, bool)>,
+    /// The root range's rows its shard last handed over ([`Out::Rows`]) that the node has yet to
+    /// read: the latest, superseding those before.
+    pub(crate) rows: Option<Box<Rows>>,
 }
 
 /// What a range's member applied of its configuration, whether a change of it is pending, and,
@@ -799,6 +807,10 @@ struct Kept {
     configured: Configured,
     /// The replacement the node's shard asked of it ([`In::Replace`]), until it is done.
     replacing: Option<Replacement>,
+    /// Whether it is the root range, whose rows the shard hands over ([`Out::Rows`]), and the
+    /// entry it had applied when it last did.
+    root: bool,
+    rows_at: Option<u64>,
 }
 
 /// A read a range's replica took and has yet to serve: its range, its context and its query.
@@ -851,6 +863,7 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                 let peers = sorted(replica.peers());
                 let seen = Seen::of(&replica);
                 let configured = Configured::of(&replica);
+                let root = replica.machine().layer() == mantle_meta::apply::Layer::Root;
                 let handle = self.owner.insert(*replica).map_err(|_| NodeError::Full)?;
                 self.ranges.push(Kept {
                     group,
@@ -860,6 +873,8 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     seen,
                     configured,
                     replacing: None,
+                    root,
+                    rows_at: None,
                 });
             }
             In::Step {
@@ -1212,6 +1227,18 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     kept.configured = Configured::of(replica);
                     self.gave
                         .push(Out::Configured(kept.group, kept.configured.clone()));
+                }
+            }
+            // The root range's rows, read again once it applied an entry, as the node's shard
+            // reads its own (`Node::read_members`); one its engine fails to read stops the node.
+            if kept.root
+                && let Some(replica) = self.owner.get_mut(handle)
+            {
+                let applied = replica.applied().index;
+                if kept.rows_at != Some(applied) {
+                    let rows = Rows::read(replica.machine_mut().engine_mut(), applied)?;
+                    kept.rows_at = Some(applied);
+                    self.gave.push(Out::Rows(kept.group, Box::new(rows)));
                 }
             }
         }
@@ -1933,6 +1960,7 @@ mod tests {
                 learners: Vec::new(),
             },
             replacing: None,
+            rows: None,
         }
     }
 
@@ -2620,5 +2648,62 @@ mod tests {
         drop((leader, member));
         rt.shutdown().unwrap();
         drop((log, other_log));
+    }
+
+    /// A far root range's rows, which the membership reads, reach the node's shard at its first
+    /// drive and again after each drive in which it applied an entry ([`Out::Rows`]), each as of
+    /// the entry it applied; a range of another layer hands over none.
+    #[test]
+    fn a_far_root_ranges_rows_reach_the_nodes_shard_as_it_applies() {
+        let rt = started(2, 2);
+        let (dir, name_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut range = one_member();
+        range.layer = Layer::Root;
+        let log = log_in(dir.path(), &range);
+        let replica = campaigning(&log, &range);
+        let mut lanes = Lanes::start(rt.holder_of(rt.shard_ids()[1]).unwrap(), 1, 1, 8).unwrap();
+        lanes.send(In::Adopt(GROUP, Box::new(replica))).unwrap();
+        let (mut first, mut applied, until) = (None, 0, deadline());
+        while first.is_none() || applied == 0 {
+            match next(&mut lanes, "the rows of an entry applied", until, |_| false) {
+                Out::Rows(group, rows) => {
+                    assert_eq!(group, GROUP);
+                    assert!(rows.members.is_empty(), "a cell made before grants");
+                    first.get_or_insert(rows.applied);
+                    applied = rows.applied;
+                }
+                Out::Seen(_, seen) if seen.applied > applied && first.is_some() => {
+                    // The drive that applied it hands its rows over after what it shows.
+                    let Out::Rows(_, rows) = next(&mut lanes, "its rows", until, |out| {
+                        !matches!(out, Out::Rows(..))
+                    }) else {
+                        panic!("`next` gives only what it does not skip")
+                    };
+                    assert_eq!(rows.applied, seen.applied);
+                    applied = rows.applied;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(first, Some(0), "its first drive hands its rows over");
+        drop(lanes);
+
+        let name = one_member();
+        let name_log = log_in(name_dir.path(), &name);
+        let (mut lanes, _, _) = leading(&rt, &name_log, &name);
+        lanes
+            .send(In::Propose(GROUP, put(), name.settings.max_entry_bytes))
+            .unwrap();
+        let until = deadline();
+        loop {
+            match next(&mut lanes, "a name range's entry applied", until, |_| false) {
+                Out::Rows(..) => panic!("a name range hands over no root rows"),
+                Out::Applied(..) => break,
+                _ => {}
+            }
+        }
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop((log, name_log));
     }
 }

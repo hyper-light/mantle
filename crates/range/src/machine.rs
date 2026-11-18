@@ -146,6 +146,11 @@ impl<E: Engine> RangeMachine<E> {
         &self.engine
     }
 
+    /// The layer whose rows the range holds.
+    pub fn layer(&self) -> Layer {
+        self.layer
+    }
+
     /// The engine for a read, which takes it whole: an engine's read moves its cache.
     pub fn engine_mut(&mut self) -> &mut E {
         &mut self.engine

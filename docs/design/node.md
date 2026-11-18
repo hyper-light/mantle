@@ -1646,6 +1646,31 @@ its lane, which the learner installs from its own, the snapshot's end reported i
 which then sends it entries. Left for 2c: the host's own reads of a far range (`Node::read`), and
 its membership, stop and repair.
 
+*As built (2026-11-18), step 2d: a peer's requests of a far range, a lost peer, and the owner's
+handles* (`crates/node/src/node/shard.rs`, `Node::take_request`, `Node::unkey`). A peer's command
+or read is read by what the node's member of its range shows (`requested` over `Node::seen`), so
+a far range that leads as its shard last showed it takes it as the node's own do: its body is
+proposed over the lane (`shard::propose`, `In::Propose`) or asked there (`shard::ask_read`), and
+a range shown not leading redirects. A full lane refuses a proposal `LaneFull`, as the range's
+replica would refuse it, which a peer hears as `Refused` and asks again after its pause and the
+node's own entry pauses; a shard that ended stops the node from a proposal as from a read. A
+peer's lost connection (`Node::unkey`) is told to each shard whose far ranges share their group
+with the peer (`In::Unreachable`), which reports it to each such range (`report_unreachable`): its
+leader gives up the window it sent that peer ahead of its answers and probes it again (hyper-raft's
+`MsgUnreachable`, etcd raft's `ReportUnreachable`). Held on the lanes, each peer once, while the
+lane is full, and told at the next turn's take (`Lanes::tell_lost`), as a snapshot's end is:
+dropped, the leader would wait on that window until the peer's answers after a new connection undo
+it, and holding costs one entry a peer, at most the node's peers. A range that moved keeps its
+handle in shard 0's owner, which then names nothing; the handle is a slot and a generation that
+wraps at `u32`, so that owner (`shard::Here`) keeps the handles that left and its insert never
+gives one of them, taking a replica out and in again past each (at most once a handle), refused
+typed (`NodeError::Aliased`) past that. Tested (`node::shard`): a peer's command and read of a far
+range are served through its lanes, and a full lane refuses a proposal; a lost peer is told once
+its lane has room, each once, and a far range's shard takes one and goes on; and no insert gives a
+handle a range that left holds. Left: the membership's reads and steps of a far range (the root
+range's rows, configurations, transfers and caught-up checks), its replacement, its repair, and
+the host's table reads (2e).
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

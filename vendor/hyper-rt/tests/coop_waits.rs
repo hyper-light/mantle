@@ -357,6 +357,24 @@ fn a_channel_send_is_charged_as_it_goes_on_never_as_it_waits() {
     });
 }
 
+/// Do: a channel's reserve waiting for room (its receiver takes nothing), then one with room. Expect: as for
+/// a send: no charge while it waits, and charged where it goes on, refused past its share with the room
+/// left for the next poll.
+#[test]
+fn a_channel_reserve_is_charged_as_it_goes_on_never_as_it_waits() {
+    waits_uncharged("a channel's reserve", || async {
+        let (sender, _receiver) = channel::<u32>(1).unwrap();
+        sender.try_send(0).unwrap();
+        let mut wait = sender.reserve();
+        steps_beside(&mut wait).await
+    });
+    goes_on_charged("a channel's reserve", || async {
+        let (sender, _receiver) = channel::<u32>(1).unwrap();
+        let mut ready = sender.reserve();
+        twice(&mut ready).await
+    });
+}
+
 /// Do: a watched word's change waited for, then one changed. Expect: as for a notification.
 #[test]
 fn a_watched_change_is_charged_as_it_goes_on_never_as_it_waits() {

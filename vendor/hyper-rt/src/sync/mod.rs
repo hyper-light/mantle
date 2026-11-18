@@ -489,6 +489,172 @@ impl<T> Sender<T> {
             place: None,
         }
     }
+
+    /// Waits as a task until a send would go on now, before the value is made (Tokio's
+    /// `mpsc::Sender::reserve`, docs.rs/tokio/latest/tokio/sync/mpsc/struct.Sender.html#method.reserve):
+    /// a [`SendPermit`] once the channel has room, `Closed` once the receiver is gone, `Full` when every
+    /// place for a waiting sender is held. It waits as [`Sender::send`] does, in a place of its own, and is
+    /// charged as a send is, where it goes on (docs/runtime.md §3.14); the permit's send is not charged
+    /// again. The room is looked at, not claimed from the ring, which has no place to hold without a value
+    /// in it: a grant of room to its place is the permit's against every other waiting sender, and a racing
+    /// sender's send may still take the room first. A channel's one sender finds the room there, as only
+    /// its own sends fill the channel.
+    pub fn reserve(&self) -> Reserve<'_, T> {
+        Reserve {
+            sender: self,
+            place: None,
+        }
+    }
+}
+
+/// The wait of [`Sender::reserve`].
+///
+/// It holds a place among the waiting senders while the channel is full, as a [`Send`] does; one dropped
+/// while waiting frees its place, and hands on a grant it had (`Room::leave`), so a dropped reserve holds no
+/// room. Once there is room, a grant to its place seen then goes to the permit with the place; a place not
+/// granted is let go then, a grant that lands as it goes handed on.
+#[derive(Debug)]
+pub struct Reserve<'a, T> {
+    sender: &'a Sender<T>,
+    /// The place held among the waiting senders, while one is.
+    place: Option<usize>,
+}
+
+/// Room for one send, from [`Sender::reserve`] (Tokio's `mpsc::Permit`). Its send does not wait; dropped
+/// unused, it hands on the grant it holds, waking the next waiting sender (`Room::leave`).
+#[derive(Debug)]
+pub struct SendPermit<'a, T> {
+    sender: &'a Sender<T>,
+    /// The place whose grant the permit holds, if its reserve was granted room.
+    place: Option<usize>,
+}
+
+impl<T> SendPermit<'_, T> {
+    /// Sends `value` without waiting: `Closed` when the receiver is gone, and `Full` only when a racing
+    /// sender took the room ([`Sender::reserve`]). A grant the permit holds is spent by a value that went
+    /// in, and handed on otherwise.
+    pub fn send(mut self, value: T) -> Result<(), SyncError<T>> {
+        let sent = self.sender.try_send(value);
+        if let Some(place) = self.place.take() {
+            self.sender.shared.get().room.leave(place, sent.is_ok());
+        }
+        sent
+    }
+}
+
+impl<T> Drop for SendPermit<'_, T> {
+    fn drop(&mut self) {
+        if let Some(place) = self.place.take() {
+            self.sender.shared.get().room.leave(place, false);
+        }
+    }
+}
+
+impl<T> Unpin for Reserve<'_, T> {}
+
+impl<'a, T> Reserve<'a, T> {
+    /// Lets the place go, if one is held, handing on a grant it had.
+    fn leave(&mut self) {
+        if let Some(place) = self.place.take() {
+            self.sender.shared.get().room.leave(place, false);
+        }
+    }
+
+    /// [`Reserve::poll`] on the shard `here`, the task's word taken from it; a waker that is not the
+    /// polling task's is refused `NotOnShardThread`.
+    fn poll_on(
+        &mut self,
+        here: &crate::shard::ShardContext,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<SendPermit<'a, T>, SyncError<()>>> {
+        let Some(word) = crate::waker::polling_task_in(here, cx.waker()) else {
+            self.leave();
+            return Poll::Ready(Err(SyncError::NotOnShardThread(())));
+        };
+        if let Some(ended) = self.go_on(here, cx) {
+            return ended;
+        }
+        let room = &self.sender.shared.get().room;
+        let place = match self.place {
+            Some(place) => {
+                if room.granted(place) {
+                    // Granted, and the room went to a racing sender: wait again in the same place.
+                    room.wait_again(place);
+                }
+                place
+            }
+            None => match room.hold() {
+                Some(place) => {
+                    self.place = Some(place);
+                    place
+                }
+                None => return Poll::Ready(Err(SyncError::Full(()))),
+            },
+        };
+        room.register_task(place, word.word());
+        // Room made before the place showed waiting is seen here; room made after it is granted to the
+        // place.
+        if let Some(ended) = self.go_on(here, cx) {
+            return ended;
+        }
+        if room.granted(place) {
+            // A grant landed before this task's word did, so its wake went nowhere: be polled again.
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
+    /// One look at the channel: where a send would go on, a charge of the task's turn (`crate::coop`),
+    /// then the permit, with the place if it was granted; `None` while there is no room.
+    fn go_on(
+        &mut self,
+        here: &crate::shard::ShardContext,
+        cx: &mut Context<'_>,
+    ) -> Option<Poll<Result<SendPermit<'a, T>, SyncError<()>>>> {
+        let sender = self.sender;
+        if !sender.goes_on() {
+            return None;
+        }
+        if crate::coop::proceed_in(here, cx).is_pending() {
+            return Some(Poll::Pending);
+        }
+        if words_have(sender.shared.words(), RECEIVER_GONE) {
+            self.leave();
+            return Some(Poll::Ready(Err(SyncError::Closed(()))));
+        }
+        let room = &sender.shared.get().room;
+        let place = match self.place.take() {
+            Some(place) if room.granted(place) => Some(place),
+            Some(place) => {
+                room.leave(place, false);
+                None
+            }
+            None => None,
+        };
+        Some(Poll::Ready(Ok(SendPermit { sender, place })))
+    }
+}
+
+impl<T> Drop for Reserve<'_, T> {
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
+impl<'a, T> Future for Reserve<'a, T> {
+    type Output = Result<SendPermit<'a, T>, SyncError<()>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // One lookup of the thread's shard serves the task's word and the charge.
+        let this = &mut *self;
+        crate::registry::with_here(|here| match here {
+            Some(here) => this.poll_on(here, cx),
+            None => {
+                this.leave();
+                Poll::Ready(Err(SyncError::NotOnShardThread(())))
+            }
+        })
+    }
 }
 
 /// The wait of [`Sender::send`].

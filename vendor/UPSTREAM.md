@@ -87,11 +87,17 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `51335dc` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twenty-five commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+**Every crate at `e9fa471` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twenty-six commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
 branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
-commit, `51335dc`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.16, hyper-rt ORIGIN.md): the
-compute pool, Kiln's, taken there. CPU-heavy jobs leave the shards for a pool of the CPUs the process
+commit, `e9fa471`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14 and §8): a channel's
+`Sender::reserve`, after Tokio's `mpsc::Sender::reserve` and `Permit`, waits for room before the
+value is made, in a place of its own among the waiting senders, charged where it goes on; its
+`SendPermit` sends without waiting, keeps a grant of room from every other waiting sender, and
+hands the grant on, waking the next, when dropped unused. The room is looked at, not claimed, so a
+channel's one sender always finds it: the listener's `stream` reserves the host's queue's room
+before it copies a body's next piece. The one before it, `51335dc`, changes hyper-rt alone
+(hyper-raft docs/runtime.md §3.16, hyper-rt ORIGIN.md): the compute pool, Kiln's, taken there. CPU-heavy jobs leave the shards for a pool of the CPUs the process
 is granted less its shards (`compute::workers_for` over `Facts::cpus_at_once`), its threads below the
 shards (Linux's batch policy at nice +10, macOS's utility QoS class, Windows' below-normal level, set
 and read back in the OS-interface file `prioritysys.rs`); a job in pieces gives its thread to a job
@@ -101,7 +107,7 @@ takes every number from the runtime's own (room for a job of every task the shar
 their step quantum). It adds `crossbeam-deque` 0.8, with `crossbeam-epoch` and `crossbeam-utils`, to
 hyper-rt's dependencies, by the owner's approval of 2026-11-18. Nothing in mantle starts the pool yet:
 S6b moves the durability model onto it. Its new constants have their rows in
-docs/design/constants.md. The one before it, `d4bd299`, changes hyper-quic and hyper-transport's
+docs/design/constants.md. The one before that, `d4bd299`, changes hyper-quic and hyper-transport's
 `Endpoint::new_seeded` doc: an endpoint
 given a seed draws its connection IDs from it, each one's random part and the key they are hashed
 under unless a `RestartKey` chose it, from a stream apart from the endpoint's own, so its other draws

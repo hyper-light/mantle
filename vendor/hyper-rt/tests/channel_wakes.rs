@@ -1,6 +1,9 @@
 //! A bounded channel's waiting senders (mantle's review of hyper-rt, finding 3): a send cancelled while it
 //! waited for room does not spend the wake meant for the sender behind it; one granted room and cancelled
-//! before using it hands the room on; and senders racing for one slot all get their values through.
+//! before using it hands the room on; and senders racing for one slot all get their values through. A
+//! reserve waits for room before its value is made: its permit sends without waiting, a permit dropped
+//! unused hands its room on, a reserve dropped while waiting holds no place, waiting reserves are granted
+//! in their places' order, and a receiver's drop ends a reserve.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,7 +21,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use hyper_rt::combine::race2;
 use hyper_rt::futures::{cancel, sleep, spawn_detached, yield_now};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
-use hyper_rt::sync::{channel, channel_with};
+use hyper_rt::sync::{SyncError, channel, channel_with};
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -172,6 +175,164 @@ fn senders_racing_for_one_slot_all_get_through() {
         }
         assert_eq!(seen, SENDERS);
         assert_eq!(sum, (0..SENDERS).sum::<u32>());
+    })
+    .unwrap();
+}
+
+/// A reserve on a full channel waits before its value is made; granted room, its permit's send goes in
+/// without waiting. On a channel with room the reserve ends at once and its send goes in.
+#[test]
+fn a_reserve_waits_for_room_and_its_permit_sends_without_waiting() {
+    static MADE: AtomicU32 = AtomicU32::new(0);
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = channel::<u32>(1).unwrap();
+        tx.reserve().await.unwrap().send(5).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), Some(5));
+        tx.try_send(0).unwrap();
+        let a = tx.clone();
+        spawn_detached(async move {
+            let permit = a.reserve().await.unwrap();
+            MADE.store(1, Ordering::Release);
+            permit.send(1).unwrap();
+        })
+        .unwrap();
+        yield_now().await;
+        yield_now().await;
+        assert_eq!(
+            MADE.load(Ordering::Acquire),
+            0,
+            "no value is made while the channel is full"
+        );
+        assert_eq!(rx.recv().await.unwrap(), 0);
+        let next = hyper_rt::futures::within(PATIENCE_NS, rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(next.expect("the permit's value went in").unwrap(), 1);
+        assert_eq!(MADE.load(Ordering::Acquire), 1);
+    })
+    .unwrap();
+}
+
+/// A permit granted room and dropped unused hands the room on: the sender waiting behind it is woken and
+/// sends.
+#[test]
+fn a_permit_dropped_unused_hands_its_room_to_the_next_waiter() {
+    static DROPPED: AtomicU32 = AtomicU32::new(0);
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = channel_with::<u32>(1, 2).unwrap();
+        tx.try_send(0).unwrap();
+        let (a, b) = (tx.clone(), tx.clone());
+        spawn_detached(async move {
+            let permit = a.reserve().await.unwrap();
+            drop(permit);
+            DROPPED.store(1, Ordering::Release);
+        })
+        .unwrap();
+        spawn_detached(async move {
+            b.send(2).await.unwrap();
+        })
+        .unwrap();
+        yield_now().await;
+        yield_now().await;
+        // Both wait: the reserve first. The take grants the room to its place; its permit drops unused.
+        assert_eq!(rx.try_recv().unwrap(), Some(0));
+        let next = hyper_rt::futures::within(PATIENCE_NS, rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(next.expect("the room passed to the send").unwrap(), 2);
+        assert_eq!(DROPPED.load(Ordering::Acquire), 1);
+    })
+    .unwrap();
+}
+
+/// A reserve dropped while it waits frees its place: with one place for a waiting sender, a send after it
+/// waits there, rather than being told `Full`, and gets the next room.
+#[test]
+fn a_reserve_dropped_while_waiting_holds_no_place() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = channel_with::<u32>(1, 1).unwrap();
+        tx.try_send(0).unwrap();
+        let gave_up = race2(tx.reserve(), sleep(1_000_000)).await;
+        assert!(matches!(gave_up, hyper_rt::combine::Either::Second(_)));
+        let b = tx.clone();
+        spawn_detached(async move {
+            b.send(2).await.unwrap();
+        })
+        .unwrap();
+        yield_now().await;
+        yield_now().await;
+        assert_eq!(rx.recv().await.unwrap(), 0);
+        let next = hyper_rt::futures::within(PATIENCE_NS, rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(next.expect("the send held the freed place").unwrap(), 2);
+    })
+    .unwrap();
+}
+
+/// Reserves waiting on a full channel are granted room in their places' order, one take each, and a permit
+/// holding its grant keeps the room from the sender waiting behind it.
+#[test]
+fn waiting_reserves_are_granted_room_in_order() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = channel_with::<u32>(1, 3).unwrap();
+        tx.try_send(0).unwrap();
+        for value in 1..=3 {
+            let sender = tx.clone();
+            spawn_detached(async move {
+                let permit = sender.reserve().await.unwrap();
+                // Held across a turn: the senders behind it wait on.
+                yield_now().await;
+                permit.send(value).unwrap();
+            })
+            .unwrap();
+        }
+        yield_now().await;
+        yield_now().await;
+        for expected in 0..=3 {
+            let next = hyper_rt::futures::within(PATIENCE_NS, rx.recv())
+                .await
+                .unwrap();
+            assert_eq!(
+                next.expect("each waiter granted in turn").unwrap(),
+                expected
+            );
+        }
+    })
+    .unwrap();
+}
+
+/// A receiver's drop ends a waiting reserve `Closed`, and a reserve after it ends so at once.
+#[test]
+fn a_reserve_ends_closed_once_the_receiver_is_gone() {
+    static ENDED: AtomicU32 = AtomicU32::new(0);
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let (tx, rx) = channel::<u32>(1).unwrap();
+        tx.try_send(0).unwrap();
+        let a = tx.clone();
+        spawn_detached(async move {
+            let ended = a.reserve().await;
+            assert!(matches!(ended, Err(SyncError::Closed(()))));
+            ENDED.store(1, Ordering::Release);
+        })
+        .unwrap();
+        yield_now().await;
+        yield_now().await;
+        assert_eq!(ENDED.load(Ordering::Acquire), 0, "the reserve waits");
+        drop(rx);
+        yield_now().await;
+        yield_now().await;
+        assert_eq!(
+            ENDED.load(Ordering::Acquire),
+            1,
+            "the receiver's drop ended it"
+        );
+        assert!(matches!(tx.reserve().await, Err(SyncError::Closed(()))));
     })
     .unwrap();
 }

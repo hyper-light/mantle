@@ -1795,3 +1795,23 @@ allocations of 1,044,480 bytes) where 349 had been made. Tests: `allocs.rs`'s
 
 Tests: `both_ends_read_the_idle_timeout_they_negotiated` (each side's value, the other's, one side
 none and both none; it does not build without the accessor).
+
+## 51. A handshake's progress, read (2026-11-13)
+
+- **Patch Q35: `Connection::handshake_progress`.** A count that only grows as the handshake
+  advances: the CRYPTO bytes newly read in order (RFC 9000 §19.6, as the crypto stream hands them
+  to TLS), the CRYPTO bytes of this side's that the peer newly acknowledged in the Initial and
+  Handshake spaces (past the furthest end acknowledged in that space, `PacketSpace::crypto_acked`,
+  so that a copy's acknowledgement counts nothing), and one for each space whose keys were
+  installed (RFC 9001 §4.1.4). A repeated datagram (dropped as a duplicate), a CRYPTO frame sent
+  again, a PING and an acknowledgement of anything other than new CRYPTO data move it not at all.
+  `on_packet_acked` now takes the acknowledged packet's space. No behaviour changes.
+- **Why.** An endpoint that holds a bounded number of connections must tell a handshake that is
+  advancing, however slowly, from one whose peer answers every packet but never finishes:
+  whether the peer is heard says nothing of that, and `ConnectionStats` counts every CRYPTO frame
+  received and every byte acknowledged, a PING's and a copy's included. shards' listeners (shards
+  D180) let a handshake that made no progress for a whole window give its place to a newcomer.
+
+Tests: `a_handshakes_progress_moves_with_new_crypto_and_keys_alone` (the server's count grows
+as it reads the ClientHello and as the handshake completes, and stays as the ClientHello's
+datagram comes again and as a PING is answered; it does not build without the accessor).

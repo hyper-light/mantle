@@ -297,14 +297,26 @@ fn transport() -> TransportConfig {
     transport
 }
 
-/// A connected client and server with mantle's windows.
+/// A connected client and server with mantle's windows, their first key update made.
 fn net() -> Net {
+    keyed(handshaken(None))
+}
+
+/// A client and server through their handshake with mantle's windows, each endpoint's randomness
+/// drawn from `seed` where one is given.
+fn handshaken(seed: Option<u8>) -> Net {
     let (cert, key) = certificate();
     let mut server_config =
         ServerConfig::with_single_cert(vec![cert.clone()], key.clone_key()).unwrap();
     server_config.transport_config(transport());
-    let server = Endpoint::new(EndpointConfig::default(), Some(server_config), true, None).unwrap();
-    let client = Endpoint::new(EndpointConfig::default(), None, true, None).unwrap();
+    let (mut server_endpoint, mut client_endpoint) =
+        (EndpointConfig::default(), EndpointConfig::default());
+    if let Some(seed) = seed {
+        server_endpoint.rng_seed(Some([seed; 32]));
+        client_endpoint.rng_seed(Some([seed.wrapping_add(1); 32]));
+    }
+    let server = Endpoint::new(server_endpoint, Some(server_config), true, None).unwrap();
+    let client = Endpoint::new(client_endpoint, None, true, None).unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(cert).unwrap();
     let mut client_config = ClientConfig::with_root_certificates(roots).unwrap();
@@ -317,6 +329,17 @@ fn net() -> Net {
         .unwrap();
     net.connect(config);
     net.handshake();
+    net
+}
+
+/// Makes the connection's first key update now. hyper-quic, after quic-go, makes it at a random
+/// short-header packet, the 10th to the 999th (`Connection::key_phase_size`), and that update puts
+/// both peers' next at their keys' confidentiality limit: made before any transfer, no count holds
+/// a key update whatever the draw (`a_key_update_makes_the_next_keys_once` counts one).
+fn keyed(mut net: Net) -> Net {
+    net.client.conn().force_key_update();
+    net.client.conn().ping();
+    net.exchange();
     net
 }
 
@@ -452,6 +475,45 @@ fn a_received_datagram_is_handled_without_allocating() {
         (2, 2),
         "the server's handling of every datagram of a transfer: {:?}",
         net.steps.receive
+    );
+}
+
+/// A transfer's count holds no key update, whatever the endpoints' randomness draws for the first:
+/// these seeds put it inside the counted transfer until `keyed` made it first, and the server's
+/// receive then counted the next phase's keys, 8 allocations, beside the new stream's 2.
+#[test]
+fn no_draw_of_the_first_key_update_falls_inside_a_count() {
+    for seed in [64u8, 83, 96, 118, 164, 167, 219, 228] {
+        let mut net = keyed(handshaken(Some(seed)));
+        transfer(&mut net, Write::Borrowed, false);
+        transfer(&mut net, Write::Borrowed, true);
+        let receive = net.steps.receive;
+        assert_eq!(
+            (receive.allocations, receive.reallocations),
+            (2, 2),
+            "seed {seed}: {receive:?}"
+        );
+    }
+}
+
+/// A key update makes the next phase's keys, once: the server derives them through hyper-tls as it
+/// opens the first packet of the phase the client moved to, 8 allocations, and allocates for
+/// nothing else in the exchange. Seeded, so the update is the one this test forces and not a draw
+/// made during the handshake.
+#[test]
+fn a_key_update_makes_the_next_keys_once() {
+    let mut net = handshaken(Some(1));
+    net.client.conn().force_key_update();
+    net.client.conn().ping();
+    net.counting = true;
+    net.exchange();
+    net.counting = false;
+    let receive = net.steps.receive;
+    eprintln!("the server's receive of a key update: {receive:?}");
+    assert_eq!(
+        (receive.allocations, receive.reallocations),
+        (8, 0),
+        "{receive:?}"
     );
 }
 

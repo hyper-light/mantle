@@ -87,10 +87,26 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `ba33c1e` (hyper-raft branch `land/mantle-general-3`, on `main`'s `045cf3f`),
-with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. It is the landing candidate of
-mantle's general changes to the shared crates, which goes to hyper-raft `main` once hyper-raft's
-gates and every consumer's suite pass on it: `doors-wire-bytes` (`33733b5`) and `doors-step8`
+**Every crate at `17371e2` (hyper-raft branch `land/mantle-general-4`: `land/mantle-general-3`'s
+`ba33c1e` and four topics, on `main`'s `045cf3f`), with no local delta**, taken by
+`scripts/snapshot-hyper-raft.py`. The branch is in the hyper-raft repository's own objects and not
+yet pushed to its origin. It is the landing candidate of mantle's general changes to the shared
+crates, which goes to hyper-raft `main` once hyper-raft's gates and every consumer's suite pass on
+it. Over `ba33c1e` it brings hyper-liveness's sender's floor never below the stream's own proof,
+from the poll that asked a liveness write to the poll that takes its durability (`65cdd84`;
+hyper-raft docs/timing.md, "The floor's flush"): with the floor below that proof, a stream whose
+flushes return at once (tmpfs, a device with power-loss protection) asked a flush at every poll
+and sent 3 heartbeats to 10,683 slots skipped, and hyper-liveness's member tests grew until the
+OOM killer took them (adacachy2, /tmp a tmpfs). It brings hyper-quic's patch Q35,
+`Connection::handshake_progress` (`e0613f5`, hyper-quic VENDORED.md §51), which changes no
+behaviour and which mantle does not call: it is the one commit past `main` that Kiln, Hex and
+Shards vendor, so every consumer's suite can run on this candidate. And it brings two changes of
+no behaviour: hyper-quic's `tests/allocs.rs` making a connection's first key update before it
+counts (`31a9ea7`), where a key update drawn inside the counted transfer failed the count in about
+2% of runs, and hyper-transport's comment that the judge's unread-stream arm comes before a
+progress note (`b3a12ca`, the review of `844cad0`, cherry-picked as `17371e2`). Before it, every
+crate was at `ba33c1e` (hyper-raft branch `land/mantle-general-3`, on `main`'s `045cf3f`), with no
+local delta: `doors-wire-bytes` (`33733b5`) and `doors-step8`
 (`c97fb1a`), below; hyper-tls's certificates decoded by brotli-decompressor 6.1.1 behind an unwind
 boundary and upstream rustls's fixes for RUSTSEC-2026-0346 to -0349 (`294678c`, `772d5b2`);
 hyper-log's full log always having room for the frame that frees a segment, and a sweep that does

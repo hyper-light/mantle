@@ -5265,6 +5265,49 @@ fn preferred_address() {
     pair.connect();
 }
 
+/// A handshake's progress moves only as it advances (patch Q35): the server's grows as it reads
+/// the ClientHello and installs keys, again as the client acknowledges its flight and sends its
+/// own, and not at all for the ClientHello's datagram delivered again or a PING answered.
+#[test]
+fn a_handshakes_progress_moves_with_new_crypto_and_keys_alone() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    let hello = pair.server.inbound.front().unwrap().clone();
+    pair.drive_server();
+    let server_ch = *pair.server.connections.keys().next().unwrap();
+    let read_hello = pair.server_conn_mut(server_ch).handshake_progress();
+    assert!(
+        read_hello > 0,
+        "its ClientHello read and its keys installed"
+    );
+
+    pair.server.inbound.push_back(hello);
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).handshake_progress(),
+        read_hello,
+        "the same datagram again"
+    );
+
+    pair.drive();
+    let done = pair.server_conn_mut(server_ch).handshake_progress();
+    assert!(
+        done > read_hello,
+        "its flight acknowledged and the client's read"
+    );
+    assert!(!pair.client_conn_mut(client_ch).is_handshaking());
+
+    pair.server_conn_mut(server_ch).ping();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).handshake_progress(),
+        done,
+        "a PING answered"
+    );
+}
+
 /// Both ends read the idle timeout they negotiated once the handshake is done (patch Q34): the
 /// lesser of the two `max_idle_timeout`s (RFC 9000 §10.1), the other side's where one side has
 /// none, and none where neither has one (§18.2).

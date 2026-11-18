@@ -55,6 +55,8 @@ pub(super) struct PacketSpace {
     pub(super) crypto_stream: Assembler,
     /// Current offset of outgoing cryptographic handshake stream
     pub(super) crypto_offset: u64,
+    /// The furthest end of this side's CRYPTO data the peer has acknowledged (patch Q35)
+    pub(super) crypto_acked: u64,
 
     /// The time the most recently sent retransmittable packet was sent.
     pub(super) time_of_last_ack_eliciting_packet: Option<Instant>,
@@ -99,6 +101,7 @@ impl PacketSpace {
 
             crypto_stream: Assembler::new(),
             crypto_offset: 0,
+            crypto_acked: 0,
 
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,

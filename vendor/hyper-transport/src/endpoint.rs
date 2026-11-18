@@ -4380,7 +4380,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             // A stream its peer does not read ends by its own bytes, whatever else the connection
             // carries (focal's audit F38): found unread, it is given a window more to be read, and
-            // its reset gives back the connection's credit it holds.
+            // its reset gives back the connection's credit it holds. This comes before a note, so
+            // a peer saying it is at work never masks its not reading; a body its owner paused is
+            // not unread (its arm clears `unread_since`) and is judged by the notes that follow.
             match (unread_now, exchange.unread_since) {
                 (Some(written), None) => {
                     exchange.unread_since = Some((now, written));

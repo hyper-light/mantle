@@ -424,6 +424,13 @@ pub struct Liveness {
     pending: Option<u64>,
     /// When the stream asked the liveness write that is out, if one is: a write pending as well.
     flush_asked: Option<u64>,
+    /// The stream's own proof, from the poll that asked a liveness write to the poll that takes its
+    /// durability: what a heartbeat waits on, the flush `Flushes` names (from waking to send, the
+    /// write and the full flush), where a write's own start and durability leave out the time
+    /// before the device took it and after it answered. `proof_from` holds the ask of a write
+    /// durable since the last poll, which folds it.
+    proofs: Flushes,
+    proof_from: Option<u64>,
     /// The widest freshness its pairs held at the last poll: how long its detectors trust a peer
     /// past its latest heartbeat, what a stall of the disk's would have been suspected after.
     widest_freshness: Option<Duration>,
@@ -635,6 +642,8 @@ impl Liveness {
             own_disk_slow: false,
             pending: None,
             flush_asked: None,
+            proofs: Flushes::new(),
+            proof_from: None,
             widest_freshness: None,
             durable: Durable::default(),
             flushing: false,
@@ -861,7 +870,7 @@ impl Liveness {
         self.flush_tail.on_flush(started_ns, durable_ns);
         if write == Write::Liveness {
             self.flushing = false;
-            self.flush_asked = None;
+            self.proof_from = self.flush_asked.take();
         }
         // Any completion is the device's progress: the stretch the stream waited ends with it.
         if let Some((since, None)) = self.stall
@@ -1047,6 +1056,11 @@ impl Liveness {
             self.late_most = self.late_most.max(now_ns.saturating_sub(at));
             self.asked = None;
         }
+        // A liveness write durable since the last poll: its proof took from its ask to now.
+        if let Some(asked) = self.proof_from.take() {
+            // A full fold keeps its mean.
+            let _ = self.proofs.on_flush(asked, now_ns);
+        }
         self.expose(now_ns);
         let mut wants_flush = false;
         let granularity = self.granularity();
@@ -1153,7 +1167,8 @@ impl Liveness {
             .min()
     }
 
-    /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured. Judged
+    /// The sender's stability floor, `E[flush] + G`, `E[flush]` the larger of a log write's mean
+    /// flush and the stream's own proof's (`proofs`): `None` before a flush is measured. Judged
     /// apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), its heartbeats wait on no
     /// flush, and `E[flush]` is the mean of the flushes within their tail as each came: a stall's,
     /// past it, measures nothing a heartbeat costs. With every flush in it, the one that ended a
@@ -1169,7 +1184,13 @@ impl Liveness {
         let flush = if self.apart {
             self.steady.mean().or_else(|| self.flushes.mean())
         } else {
-            self.flushes.mean()
+            // A heartbeat's proof is proven only by a durability that falls after the slot before
+            // it, and the poll that would send it comes a whole proof after the ask: with the
+            // floor below the proof, every slot passed before its proof came, and a stream whose
+            // flushes returned at once (tmpfs: 0.4 to 5 µs, its proofs tens of µs) asked a flush
+            // at every poll and sent nothing (hyper-liveness tests/processes.rs on adacachy2,
+            // 10,683 slots skipped to 3 heartbeats sent). Never below a log write's flush.
+            self.flushes.mean().max(self.proofs.mean())
         }?;
         Some(flush.saturating_add(granularity.unwrap_or(Duration::ZERO)))
     }

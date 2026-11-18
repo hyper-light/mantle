@@ -795,8 +795,11 @@ fn a_node_asleep_is_waited_for_and_writes_go_around_it() {
 /// A node killed (SIGKILL) and stated gone, as a supervisor states a machine it knows dead
 /// (membership.md §5): every volume of it gone with it, so its chunks are rebuilt on the others, no
 /// place on its volumes is kept, and the table forgets them; started again on its volume, its
-/// identity is refused at every node. A node that joins while objects are written is enlisted and
-/// offered new blocks, every object reading back and every block whole. The cell's own judgment, a
+/// identity is refused at every node, it says it is retired and ends. Started once more, it
+/// rejoins (§5.1): asked, the cell grants it a new identity, it wipes its volumes and joins as a
+/// new member, its volumes new to the table and taking new chunks, its old id written off still.
+/// A node that joins while objects are written is enlisted and offered new blocks, every object
+/// reading back and every block whole. The cell's own judgment, a
 /// member gone once absent past the durability model's repair time, is `members::gone_by`'s and
 /// tested there: a repair time a test waits out is one a node of a host held that long passes while
 /// it runs, judged gone as well.
@@ -846,7 +849,9 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
     // each pair ends refused on the side that dials it, the lower id (`Node::dials`). A dial of
     // it is refused at its dialer's own handshake, and a connection refused before the node
     // stated gone, its server, identified it names no peer to that node, so its own link to a
-    // peer that dials it need not say so.
+    // peer that dials it need not say so. Refused past its patience, it is retired and ends
+    // (membership.md §5.1 steps 1 and 2), as the test expects.
+    cell.refusing = Some(gone);
     cell.start(gone);
     cell.introduce();
     cell.waiting_on(
@@ -862,10 +867,46 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
             if refused { Some(()) } else { None }
         },
     );
-    let exited = cell.stop(gone);
+    let exited = cell.ended();
+    assert!(!exited.success(), "the retired node exited {exited}");
     assert!(
-        exited.success(),
-        "the refused node stopped in order exited {exited}"
+        cell.retired.contains(&gone),
+        "the refused node said no `retired`"
+    );
+    // Started once more, it asks the cell for a new identity (step 3), is granted one, wipes its
+    // volumes and switches (steps 4 and 5), and joins as the new member (step 6): its volumes new
+    // to the table, none of its old ones, and its old id written off still at every node.
+    cell.start(gone);
+    cell.introduce();
+    assert!(
+        cell.retired.contains(&gone),
+        "the rejoining start said no `retired`"
+    );
+    let new = cell.rejoined.get(&gone).copied().unwrap();
+    assert_ne!(new, gone);
+    cell.enlisted(gone);
+    let fresh = volumes_of(&mut cell, g, new);
+    assert!(
+        !fresh.is_empty(),
+        "the rejoined node {new} enlisted no volume"
+    );
+    assert!(
+        fresh.is_disjoint(&theirs),
+        "{new} took its old volumes back"
+    );
+    assert!(volumes_of(&mut cell, g, gone).is_empty());
+    cell.until(|c| {
+        let serves = others.iter().all(|o| {
+            c.standings
+                .get(&(*o, new))
+                .is_some_and(|(state, _)| state == "serving")
+        });
+        if serves { Some(()) } else { None }
+    });
+    assert!(
+        others
+            .iter()
+            .all(|o| { c_standing(&cell, *o, gone).is_none_or(|state| state != "serving") })
     );
     let back = settled(&mut cell, |r| r.waiting == 0 && r.short == 0);
 
@@ -888,6 +929,20 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let keys: Vec<String> = objects.keys().cloned().collect();
     whole_on_disk(&mut cell, g, "b", &keys);
+    // The rejoined member's volumes took new chunks, as new capacity placement fills.
+    let taken = keys.iter().any(|key| {
+        blocks_of(&mut cell, g, "b", key)
+            .iter()
+            .any(|(_, _, places)| places.iter().any(|p| fresh.contains(&p.volume)))
+    });
+    assert!(taken, "the rejoined node {new}'s volumes took no chunk");
+}
+
+/// What node `observer`'s member of the root range last said of member `member`'s state.
+fn c_standing(cell: &Cell, observer: u64, member: u64) -> Option<&str> {
+    cell.standings
+        .get(&(observer, member))
+        .map(|(state, _)| state.as_str())
 }
 
 /// A node that leaves while objects are written: its volumes take no new chunk, every chunk they

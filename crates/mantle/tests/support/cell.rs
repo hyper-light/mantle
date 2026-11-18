@@ -553,6 +553,16 @@ pub(crate) enum Line {
     Left,
     /// An operator's statement that a member is gone, answered: the member and the answer.
     Gone(u64, String),
+    /// The node learned the cell wrote it off, or started so (membership.md §5.1 steps 1 and 2).
+    Retired,
+    /// The node's ask for a new identity took none: `unreachable`, or `refused REASON` (step 3).
+    Unrejoined(String),
+    /// The node took its new identity, the node it now is (step 5), and starts as it (step 6).
+    Rejoined(u64),
+    /// An operator's ban of a member, answered: the member and the answer (§5.1).
+    Ban(u64, String),
+    /// The cell's `rejoin` setting as the node's member of the root range holds it.
+    Setting(String),
 }
 
 /// Ids as a `config` line says them, comma-separated, `-` for none.
@@ -670,6 +680,12 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         )),
         ["left"] => Some(Line::Left),
         ["gone", id, outcome @ ..] => Some(Line::Gone(id.parse().ok()?, outcome.join(" "))),
+        ["retired"] => Some(Line::Retired),
+        ["rejoin", "unreachable"] => Some(Line::Unrejoined("unreachable".into())),
+        ["rejoin", "refused", reason] => Some(Line::Unrejoined(format!("refused {reason}"))),
+        ["rejoin", setting @ ("automatic" | "off")] => Some(Line::Setting((*setting).to_owned())),
+        ["rejoined", id] => Some(Line::Rejoined(id.parse().ok()?)),
+        ["ban", id, outcome @ ..] => Some(Line::Ban(id.parse().ok()?, outcome.join(" "))),
         [
             "repair",
             leading,
@@ -825,7 +841,12 @@ pub(crate) fn movement(line: &Line) -> Option<Movement> {
         | Line::Standing(..)
         | Line::Config(..)
         | Line::Left
-        | Line::Gone(..) => None,
+        | Line::Gone(..)
+        | Line::Retired
+        | Line::Unrejoined(..)
+        | Line::Rejoined(..)
+        | Line::Ban(..)
+        | Line::Setting(..) => None,
     }
 }
 
@@ -1322,6 +1343,15 @@ pub(crate) struct Cell {
     pub(crate) left: BTreeSet<u64>,
     /// Each operator's statement of a member gone, as the node it was stated to answered it.
     pub(crate) gone: BTreeMap<u64, String>,
+    /// The nodes whose latest process said it was retired, and what its ask for a new identity
+    /// came to where it took none; the node each directory's process runs as once a rejoin gave
+    /// it a new identity, by the id the test started it as; each operator's ban, as the node it
+    /// was stated to answered it; and the cell's `rejoin` setting as each running node holds it.
+    pub(crate) retired: BTreeSet<u64>,
+    pub(crate) unrejoined: BTreeMap<u64, String>,
+    pub(crate) rejoined: BTreeMap<u64, u64>,
+    pub(crate) bans: BTreeMap<u64, String>,
+    pub(crate) settings: BTreeMap<u64, String>,
     pub(crate) _root: tempfile::TempDir,
 }
 
@@ -1711,6 +1741,11 @@ impl Cell {
             standings: BTreeMap::new(),
             left: BTreeSet::new(),
             gone: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            unrejoined: BTreeMap::new(),
+            rejoined: BTreeMap::new(),
+            bans: BTreeMap::new(),
+            settings: BTreeMap::new(),
             _root: root,
         }
     }
@@ -1850,6 +1885,11 @@ impl Cell {
             standings: BTreeMap::new(),
             left: BTreeSet::new(),
             gone: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            unrejoined: BTreeMap::new(),
+            rejoined: BTreeMap::new(),
+            bans: BTreeMap::new(),
+            settings: BTreeMap::new(),
             _root: root,
         };
         // One at a time, each listening before the next starts (`Cell::start`).
@@ -1871,6 +1911,49 @@ impl Cell {
     /// forwarding its lines, and waits until it listens.
     #[track_caller]
     pub(crate) fn spawn_process(&mut self, id: u64, stderr: Stderr) {
+        self.spawn_only(id, stderr);
+        self.listening(id);
+    }
+
+    /// Starts node `id`'s process, which the test expects to end before it listens (a rejoin the
+    /// cell refuses, membership.md §5.1 step 3): how it exited, waited on as any fact the cell
+    /// reports.
+    #[track_caller]
+    pub(crate) fn start_ending(&mut self, id: u64) -> std::process::ExitStatus {
+        self.refusing = Some(id);
+        self.spawn_only(id, Stderr::Echoed);
+        self.ended()
+    }
+
+    /// A copy of node `id`'s directory, as a disk copied whole while no process runs it, under a
+    /// key of the test's past every directory's: the key. Its configuration names its paths from
+    /// its own directory, so the copy is a node of its own directory and the same identity.
+    pub(crate) fn copy_of(&mut self, id: u64) -> u64 {
+        let from = self.dirs[&id].clone();
+        let to = self._root.path().join(format!("copy-of-{id}"));
+        // Directory by directory, each copied apart from the others.
+        let mut left = std::collections::VecDeque::from([(from, to.clone())]);
+        while let Some((from, to)) = left.pop_front() {
+            std::fs::create_dir_all(&to).unwrap();
+            for entry in std::fs::read_dir(&from).unwrap() {
+                let entry = entry.unwrap();
+                let (at, into) = (entry.path(), to.join(entry.file_name()));
+                if entry.file_type().unwrap().is_dir() {
+                    left.push_back((at, into));
+                } else {
+                    std::fs::copy(&at, &into).unwrap();
+                }
+            }
+        }
+        let key = self.dirs.keys().max().unwrap() + 1;
+        self.dirs.insert(key, to.clone());
+        self.made.insert(key, to.join("config"));
+        key
+    }
+
+    /// [`Cell::spawn_process`] without the wait for it to listen.
+    #[track_caller]
+    fn spawn_only(&mut self, id: u64, stderr: Stderr) {
         // What its last process said its detectors started from is that process's, not this one's.
         self.histories.remove(&id);
         let config = self.config_of(id);
@@ -1897,6 +1980,9 @@ impl Cell {
         self.standings.retain(|(node, _), _| *node != id);
         self.leaving.remove(&id);
         self.left.remove(&id);
+        self.retired.remove(&id);
+        self.unrejoined.remove(&id);
+        self.settings.remove(&id);
         let (tell, generation) = (self.tell.clone(), self.generations);
         self.generations += 1;
         std::thread::spawn(move || {
@@ -1924,7 +2010,6 @@ impl Cell {
                 generation,
             },
         );
-        self.listening(id);
     }
 
     /// Waits until node `id`'s process listens, or fails once it ends first. A process's start
@@ -2219,7 +2304,12 @@ impl Cell {
                 | Line::Standing(..)
                 | Line::Config(..)
                 | Line::Left
-                | Line::Gone(..) => None,
+                | Line::Gone(..)
+                | Line::Retired
+                | Line::Unrejoined(..)
+                | Line::Rejoined(..)
+                | Line::Ban(..)
+                | Line::Setting(..) => None,
             })
             .chain(self.clients.values().copied())
             .chain(self.transfers.values().map(|(_, serve)| *serve))
@@ -2579,6 +2669,21 @@ impl Cell {
                     Line::Gone(member, outcome) => {
                         self.gone.insert(member, outcome);
                     }
+                    Line::Retired => {
+                        self.retired.insert(id);
+                    }
+                    Line::Unrejoined(why) => {
+                        self.unrejoined.insert(id, why);
+                    }
+                    Line::Rejoined(new) => {
+                        self.rejoined.insert(id, new);
+                    }
+                    Line::Ban(member, outcome) => {
+                        self.bans.insert(member, outcome);
+                    }
+                    Line::Setting(setting) => {
+                        self.settings.insert(id, setting);
+                    }
                     Line::Stopped(waits) => {
                         // Each wait the node's loop holds at once has a timer of its own: a sleep
                         // that found none waited for one to free, and each release ended the
@@ -2665,6 +2770,8 @@ impl Cell {
                     .relay
                     .as_ref()
                     .map_or((*quic, *plane), |relay| relay.front(*id, *peer));
+                // A directory whose process rejoined runs as the node its new identity names.
+                let peer = self.rejoined.get(peer).unwrap_or(peer);
                 writeln!(running.input, "learn {peer} {quic} {plane}").unwrap();
             }
             running.input.flush().unwrap();

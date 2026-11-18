@@ -719,9 +719,10 @@ fn stands(cell: &Cell, observers: &[u64], member: u64, state: &str) -> bool {
 
 /// A node with nothing to move, no volume, joins a cell of three and leaves it in order: it is a
 /// voter of every range, then of none, removed, says it left and exits 0, and the cell forgets it.
-/// Another, joined and then stated gone by an operator on a founder's standard input, is removed
-/// and forgotten, and its identity is refused at every founder from then. Every object reads back
-/// byte for byte through both doors before and after.
+/// Another, joined and then stated gone by an operator on a founder's standard input, is retired
+/// at once and ends, removed and forgotten, and its identity is refused at every founder from
+/// then; started again, it rejoins as a new member (membership.md §5.1), its old id delisted
+/// still. Every object reads back byte for byte through both doors before and after.
 #[test]
 fn a_member_with_nothing_to_move_leaves_whole_and_one_stated_gone_is_refused() {
     let mut cell = Cell::made(three_of_five);
@@ -773,28 +774,12 @@ fn a_member_with_nothing_to_move_leaves_whole_and_one_stated_gone_is_refused() {
     acknowledged(&mut cell, &mut load, 6);
     every_object_reads_back(&mut cell, &mut load, &founders, "after a member left whole");
 
-    // Another joins, and an operator states it gone.
-    let doomed = cell.grant("quic=127.0.0.1:0,plane=127.0.0.1:0,domain=doomed");
-    cell.start(doomed);
-    cell.introduce();
-    cell.enlisted(doomed);
-    let mut all = founders.clone();
-    all.push(doomed);
-    cell.configured(&all, |voters, _| all.iter().all(|m| votes(voters, *m)));
-    cell.say_to(founders[0], format!("gone {doomed}\n").as_bytes());
-    cell.until(|c| c.gone.get(&doomed).map(|said| said.contains("Gone")));
-    cell.configured(&founders, |voters, learners| {
-        !votes(voters, doomed) && !learners.contains(&doomed)
-    });
-    cell.until(|c| holds(stands(c, &founders, doomed, "delisted")));
-    // Its identity refused at every founder: each link it keeps ends refused.
-    cell.until_by(Progress::Links("Identity"), |c| {
-        holds(founders.iter().all(|f| {
-            c.links
-                .get(&(doomed, *f))
-                .is_some_and(|link| link.ends_with("Identity"))
-        }))
-    });
+    // Another joins, and an operator states it gone: it is retired at once and ends.
+    let doomed = joined(&mut cell, &founders);
+    gone_retired(&mut cell, &founders, doomed);
+    // Started again, it rejoins as a new member, its old id written off still.
+    let new = rejoins(&mut cell, &founders, doomed);
+    votes_everywhere(&mut cell, &founders, (doomed, new));
     acknowledged(&mut cell, &mut load, 6);
     load.end(&mut cell);
     every_object_reads_back(
@@ -802,6 +787,189 @@ fn a_member_with_nothing_to_move_leaves_whole_and_one_stated_gone_is_refused() {
         &mut load,
         &founders,
         "after a member was stated gone",
+    );
+}
+
+/// A node granted to join the cell, started, enlisted and a voter of every range beside
+/// `founders`: its id.
+fn joined(cell: &mut Cell, founders: &[u64]) -> u64 {
+    let id = cell.grant("quic=127.0.0.1:0,plane=127.0.0.1:0,domain=doomed");
+    cell.start(id);
+    cell.introduce();
+    cell.enlisted(id);
+    let mut all = founders.to_vec();
+    all.push(id);
+    cell.configured(&all, |voters, _| all.iter().all(|m| votes(voters, *m)));
+    id
+}
+
+/// Node `doomed`, running, stated gone on `founders[0]`'s standard input: its own replica holding
+/// it gone, it is retired at once (membership.md §5.1 step 1), says so and ends, as the test
+/// expects; the founders drop its votes and delist it once it holds nothing.
+fn gone_retired(cell: &mut Cell, founders: &[u64], doomed: u64) {
+    cell.refusing = Some(doomed);
+    cell.say_to(founders[0], format!("gone {doomed}\n").as_bytes());
+    cell.until(|c| c.gone.get(&doomed).map(|said| said.contains("Gone")));
+    let exited = cell.ended();
+    assert!(
+        !exited.success(),
+        "the written-off node {doomed} exited {exited}"
+    );
+    assert!(cell.retired.contains(&doomed), "{doomed} said no `retired`");
+    cell.configured(founders, |voters, learners| {
+        !votes(voters, doomed) && !learners.contains(&doomed)
+    });
+    cell.until(|c| holds(stands(c, founders, doomed, "delisted")));
+}
+
+/// The directory of node `old`, written off, started again: it says it is retired, asks the cell
+/// for a new identity (membership.md §5.1 step 3), is granted one, switches to it (step 5) and
+/// joins as a new member (step 6), serving at every founder, while its old id stays delisted at
+/// each. The new member's id.
+fn rejoins(cell: &mut Cell, founders: &[u64], old: u64) -> u64 {
+    cell.start(old);
+    cell.introduce();
+    assert!(
+        cell.retired.contains(&old),
+        "{old}'s start said no `retired`"
+    );
+    let new = cell.rejoined.get(&old).copied().unwrap_or_else(|| {
+        panic!(
+            "{old} listens with no new identity: {:?}",
+            cell.unrejoined.get(&old)
+        )
+    });
+    assert_ne!(new, old);
+    cell.enlisted(old);
+    cell.until(|c| holds(stands(c, founders, new, "serving")));
+    assert!(
+        stands(cell, founders, old, "delisted"),
+        "{old} is not delisted at every founder once {new} serves"
+    );
+    new
+}
+
+/// Waits until the rejoined member `new`, whose directory the test started as `key`, votes in
+/// every range beside `founders`, as each of them and its own process apply it: the harness keys
+/// a process's lines by the directory it started, whatever node it now runs as.
+fn votes_everywhere(cell: &mut Cell, founders: &[u64], (key, new): (u64, u64)) {
+    let mut observers = founders.to_vec();
+    observers.push(key);
+    let mut members = founders.to_vec();
+    members.push(new);
+    cell.configured(&observers, |voters, _| {
+        members.iter().all(|m| votes(voters, *m))
+    });
+}
+
+/// The directory the test keeps as `key`, of node `old`, written off and not to be granted again,
+/// started again: it says it is retired, its ask is refused or answered by no member
+/// (membership.md §5.1 step 3), and it ends failing with its configuration naming its old identity
+/// still, its disks as the write-off left them.
+fn refused_rejoin(cell: &mut Cell, key: u64, old: u64) {
+    let exited = cell.start_ending(key);
+    assert!(!exited.success(), "the refused node {old} exited {exited}");
+    assert!(cell.retired.contains(&key), "{old} said no `retired`");
+    let why = cell.unrejoined.get(&key).cloned();
+    assert!(
+        why.as_deref()
+            .is_some_and(|why| why == "unreachable" || why.starts_with("refused ")),
+        "{old}'s ask said {why:?}"
+    );
+    assert!(
+        !cell.rejoined.contains_key(&key),
+        "{old} took a new identity"
+    );
+    let config = std::fs::read_to_string(cell.config_of(key)).unwrap();
+    assert!(
+        config.lines().any(|l| l.trim() == format!("id = {old}")),
+        "{old}'s configuration names another node"
+    );
+}
+
+/// membership.md §5.1: a node the cell wrote off, started again, comes back on its own as a new
+/// member: a new id, granted by the cell's issuer, a voter of every range beside the founders,
+/// and its old id delisted still.
+#[test]
+fn a_written_off_node_rejoins_as_a_new_member() {
+    let mut cell = Cell::made(three_of_five);
+    let founders: Vec<u64> = cell.dirs.keys().copied().collect();
+    for founder in &founders {
+        cell.enlisted(*founder);
+    }
+    let doomed = joined(&mut cell, &founders);
+    gone_retired(&mut cell, &founders, doomed);
+    let new = rejoins(&mut cell, &founders, doomed);
+    votes_everywhere(&mut cell, &founders, (doomed, new));
+}
+
+/// membership.md §5.1, *Hands are judged by a person*: a written-off node banned before it starts
+/// again is never granted a new identity; it ends refused, its disks kept for whoever decides.
+#[test]
+fn a_banned_node_does_not_rejoin() {
+    let mut cell = Cell::made(three_of_five);
+    let founders: Vec<u64> = cell.dirs.keys().copied().collect();
+    for founder in &founders {
+        cell.enlisted(*founder);
+    }
+    let doomed = joined(&mut cell, &founders);
+    gone_retired(&mut cell, &founders, doomed);
+    cell.say_to(founders[0], format!("ban {doomed}\n").as_bytes());
+    let banned = cell.until(|c| c.bans.get(&doomed).cloned());
+    assert!(banned.contains("Banned"), "ban {doomed}: {banned}");
+    refused_rejoin(&mut cell, doomed, doomed);
+}
+
+/// membership.md §5.1, *What an operator can turn off*: in a cell whose setting is `rejoin off`,
+/// a written-off node started again is granted nothing and ends refused.
+#[test]
+fn with_rejoin_off_no_written_off_node_rejoins() {
+    let mut cell = Cell::made(three_of_five);
+    let founders: Vec<u64> = cell.dirs.keys().copied().collect();
+    for founder in &founders {
+        cell.enlisted(*founder);
+    }
+    let doomed = joined(&mut cell, &founders);
+    gone_retired(&mut cell, &founders, doomed);
+    cell.say_to(founders[0], b"rejoin off\n");
+    cell.until(|c| {
+        holds(
+            founders
+                .iter()
+                .all(|f| c.settings.get(f).is_some_and(|s| s == "off")),
+        )
+    });
+    refused_rejoin(&mut cell, doomed, doomed);
+}
+
+/// membership.md §5.1, *Once*: a written-off identity is re-granted at most once, so a copy of a
+/// retired node's directory started once the node rejoined is refused (`Regranted`, or no member
+/// admitting it once the new member's join dropped the entry), and the cell holds one new member,
+/// not two.
+#[test]
+fn a_copied_disk_gets_one_member_not_two() {
+    let mut cell = Cell::made(three_of_five);
+    let founders: Vec<u64> = cell.dirs.keys().copied().collect();
+    for founder in &founders {
+        cell.enlisted(*founder);
+    }
+    let doomed = joined(&mut cell, &founders);
+    gone_retired(&mut cell, &founders, doomed);
+    let copy = cell.copy_of(doomed);
+    let new = rejoins(&mut cell, &founders, doomed);
+    refused_rejoin(&mut cell, copy, doomed);
+    let joined: BTreeSet<u64> = cell
+        .standings
+        .iter()
+        .filter(|((observer, member), (state, _))| {
+            *observer == founders[0] && state == "serving" && !founders.contains(member)
+        })
+        .map(|((_, member), _)| *member)
+        .collect();
+    assert_eq!(
+        joined,
+        BTreeSet::from([new]),
+        "the cell serves other members than the founders and {new}"
     );
 }
 

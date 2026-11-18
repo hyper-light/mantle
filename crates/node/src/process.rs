@@ -2955,11 +2955,11 @@ fn status_line(lines: &mut String, group: u128, now: &Status) -> std::fmt::Resul
 
 /// The cell's repair as this node runs it (docs/design/repair.md §5): `repair LEADING SETTLED
 /// ROOT_APPLIED BLOCK_APPLIED REBUILT TIMING COMMANDS UNPLACED UNREADABLE CORRUPT WAITING SHORT LOST
-/// RUNNING`, each flag 0 or 1, said each time it changes.
+/// TAKERS RUNNING`, each flag 0 or 1, said each time it changes.
 fn repair_line(lines: &mut String, r: &crate::node::RepairStatus) -> Result<(), std::fmt::Error> {
     writeln!(
         lines,
-        "repair {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        "repair {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
         u8::from(r.leading),
         u8::from(r.settled),
         r.root_applied,
@@ -2973,6 +2973,7 @@ fn repair_line(lines: &mut String, r: &crate::node::RepairStatus) -> Result<(), 
         r.waiting,
         r.short,
         r.lost,
+        r.takers,
         r.running,
     )
 }
@@ -2991,6 +2992,34 @@ async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `repair` line says each count in its place, the domains its last pass found taking chunks
+    /// among them: the fact a test of a joining node waits on, which the root range's commit the
+    /// test last heard can predate (repair.rs's domain spread onto a joiner, CI run 43992405910).
+    #[test]
+    fn a_repair_line_says_the_domains_its_last_pass_found_taking_chunks() {
+        let status = crate::node::RepairStatus {
+            leading: true,
+            settled: true,
+            root_applied: 27,
+            block_applied: 17,
+            rebuilt: 6,
+            timing: 1,
+            commands: 2,
+            unplaced: 3,
+            unreadable: 4,
+            corrupt: 5,
+            waiting: 7,
+            short: 8,
+            lost: 9,
+            takers: 3,
+            running: 10,
+            ended_ns: 11,
+        };
+        let mut lines = String::new();
+        repair_line(&mut lines, &status).unwrap();
+        assert_eq!(lines, "repair 1 1 27 17 6 1 2 3 4 5 7 8 9 3 10\n");
+    }
 
     /// A turn's link and status lines, written into the buffer the serve loop keeps: byte for byte
     /// the lines each said from a `String` of its own, and once the buffer has grown nothing is

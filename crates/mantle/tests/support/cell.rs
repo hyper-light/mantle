@@ -510,7 +510,8 @@ fn ids_said(text: &str) -> Option<Vec<u64>> {
 }
 
 /// A `repair` line: whether the node runs the cell's repair, whether its last pass ended with
-/// nothing it could do at the root and Block ranges' applied indexes it began at, and its counts.
+/// nothing it could do at the root and Block ranges' applied indexes it began at, and its counts,
+/// the failure domains that took chunks as that pass began among them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Repairing {
     pub(crate) leading: bool,
@@ -526,6 +527,7 @@ pub(crate) struct Repairing {
     pub(crate) waiting: u64,
     pub(crate) short: u64,
     pub(crate) lost: u64,
+    pub(crate) takers: u64,
     pub(crate) running: u64,
 }
 
@@ -614,6 +616,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             waiting,
             short,
             lost,
+            takers,
             running,
         ] => {
             let flag = |f: &str| match f {
@@ -635,6 +638,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
                 waiting: waiting.parse().ok()?,
                 short: short.parse().ok()?,
                 lost: lost.parse().ok()?,
+                takers: takers.parse().ok()?,
                 running: running.parse().ok()?,
             }))
         }

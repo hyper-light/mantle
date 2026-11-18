@@ -62,6 +62,10 @@ pub struct RepairStatus {
     pub waiting: u64,
     pub short: u64,
     pub lost: u64,
+    /// The failure domains the last pass found taking chunks as it began: a pass that began with
+    /// more than the one before sweeps every block for the domain rule, so a settled pass that saw a
+    /// joining node's domain has spread onto it what that rule moves.
+    pub takers: u64,
     /// Repairs out now.
     pub running: usize,
     /// When, on the wall clock, the last pass ended.
@@ -108,6 +112,8 @@ struct Pass {
     waiting: u64,
     short: u64,
     lost: u64,
+    /// The failure domains taking chunks as it began.
+    takers: u64,
     /// The blocks with a place on each volume it walks, counted at its first level.
     counting: std::collections::BTreeMap<u128, u64>,
     /// Whether its walk is over and it waits for its repairs and commands to be answered.
@@ -542,6 +548,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if moved {
             let grew = takers.iter().any(|d| !repair.takers.contains(d));
             let sweep = !repair.swept || grew;
+            // At most one a volume, which `most` counts.
+            let taking = u64::try_from(takers.len())
+                .map_err(|_| NodeError::Bounds("the domains that take chunks".into()))?;
             repair.swept |= sweep;
             repair.takers = takers;
             let mut volumes: Vec<u128> = facts
@@ -567,6 +576,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 waiting: 0,
                 short: 0,
                 lost: 0,
+                takers: taking,
                 counting: std::collections::BTreeMap::new(),
                 walked: false,
             });
@@ -728,6 +738,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             status.waiting = pass.waiting;
             status.short = pass.short;
             status.lost = pass.lost;
+            status.takers = pass.takers;
             repair.pass = None;
             return Ok(None);
         }

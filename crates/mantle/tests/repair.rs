@@ -961,8 +961,14 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
     cell.start(joining);
     cell.introduce();
     cell.enlisted(joining);
+    // The joiner's domain takes chunks once the root range holds its volume active and its node
+    // seen, which can commit past the root range's last commit the test heard as it enlisted: the
+    // fact waited on is a settled pass that found its domain among the three taking chunks, which
+    // swept every block for the domain rule (repair.md §5).
     let mark = root_commit(&cell);
-    let at = settled_after(&mut cell, mark, |r| r.waiting == 0 && r.short == 0);
+    let at = settled_after(&mut cell, mark, |r| {
+        r.waiting == 0 && r.short == 0 && r.takers == 3
+    });
     let doubling = spread(&mut cell).1;
     if doubling != 0 {
         // Whether each node held the joiner present: a domain takes chunks only while its node is.
@@ -972,8 +978,9 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
             .filter(|((_, member), _)| *member == joining)
             .collect();
         panic!(
-            "{doubling} blocks still double a domain, the pass begun at {mark} or later settled as \
-             {at:?}; the joiner {joining} as each node holds it: {joiner:?}"
+            "{doubling} blocks still double a domain, the pass begun at {mark} or later with three \
+             domains taking chunks settled as {at:?}; the joiner {joining} as each node holds it: \
+             {joiner:?}"
         );
     }
     objects.extend(put_objects(&mut cell, "b", "after", &SIZES, 13));

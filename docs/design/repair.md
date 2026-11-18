@@ -191,9 +191,14 @@ leader starts again from what the range holds.
   one that no block names (§2.2).
 
 `mantle serve` says the service's state as it changes: `repair LEADING SETTLED ROOT_APPLIED
-BLOCK_APPLIED REBUILT TIMING COMMANDS UNPLACED UNREADABLE CORRUPT WAITING SHORT LOST RUNNING`, where
-`WAITING`, `SHORT` and `LOST` are the last pass's blocks waiting for an away node, readable by fewer
-than their data chunks, and of those lost for good. Tests and operators wait on these facts.
+BLOCK_APPLIED REBUILT TIMING COMMANDS UNPLACED UNREADABLE CORRUPT WAITING SHORT LOST TAKERS RUNNING`,
+where `WAITING`, `SHORT` and `LOST` are the last pass's blocks waiting for an away node, readable by
+fewer than their data chunks, and of those lost for good, and `TAKERS` the failure domains that took
+chunks as it began. Tests and operators wait on these facts. A joining node's domain takes chunks
+once the root range holds its volume active and its node seen, which may commit after the joining
+node said it enlisted: a settled pass that saw that domain, `TAKERS` counting it, swept every block
+for the domain rule, where a pass merely begun past the root range's last commit a test heard may
+predate it.
 
 **Placement** (`mantle_node::place::offer`) offers only volumes that take chunks now, active and their
 node seen, so a sleeping machine is passed over rather than tried and timed out, as Dynamo's sloppy

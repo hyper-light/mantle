@@ -785,9 +785,49 @@ pub(crate) fn movement(line: &Line) -> Option<Movement> {
 /// workload client tells.
 pub(crate) enum Heard {
     Line(u64, u64, Line),
-    /// A process's output ended, by the node and the process's generation: the process ended.
-    Ended(u64, u64),
+    /// A process's output ended, by the node and the process's generation: the process ended. The
+    /// last lines it said on standard error where the cell echoed it ([`Stderr::Echoed`]).
+    Ended(u64, u64, Vec<String>),
     Told(Told),
+}
+
+/// What the cell does with a node process's standard error.
+pub(crate) enum Stderr {
+    /// Echoed to the test's own as it comes, its last [`STDERR_LINES`] kept for the panic of an end
+    /// the cell did not ask for, which says why the process ended.
+    Echoed,
+    /// Left whole in its pipe, which the caller reads once the process ends.
+    Piped,
+}
+
+/// The lines of a node's standard error the panic of its unasked end carries: a node that refuses
+/// to run says why in one line, its step and its cause, and the lines before it what it reached.
+const STDERR_LINES: usize = 20;
+
+/// Reads `stderr` to its end on a thread of its own: each line echoed to the test's standard error
+/// as the node said it, and the last [`STDERR_LINES`] of them what the thread answers. Bytes that are
+/// not UTF-8 are echoed and kept lossily, so the pipe is drained to its end and the node never
+/// waits on a full one.
+fn echoed(stderr: std::process::ChildStderr) -> JoinHandle<Vec<String>> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut last = std::collections::VecDeque::with_capacity(STDERR_LINES);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let _ = std::io::stderr().write_all(&line);
+            let text = String::from_utf8_lossy(&line);
+            if last.len() == STDERR_LINES {
+                last.pop_front();
+            }
+            last.push_back(text.trim_end_matches(['\r', '\n']).to_owned());
+        }
+        last.into()
+    })
 }
 
 /// The files of the cell's authority, each node's certificate and key, and the clients'.
@@ -1724,13 +1764,13 @@ impl Cell {
     /// it listens.
     #[track_caller]
     pub(crate) fn start(&mut self, id: u64) {
-        self.spawn_process(id, Stdio::inherit());
+        self.spawn_process(id, Stderr::Echoed);
     }
 
-    /// Starts node `id`'s process on its directory, its standard error to `stderr`, a thread
+    /// Starts node `id`'s process on its directory, its standard error as `stderr` says, a thread
     /// forwarding its lines, and waits until it listens.
     #[track_caller]
-    pub(crate) fn spawn_process(&mut self, id: u64, stderr: Stdio) {
+    pub(crate) fn spawn_process(&mut self, id: u64, stderr: Stderr) {
         // What its last process said its detectors started from is that process's, not this one's.
         self.histories.remove(&id);
         let config = self.config_of(id);
@@ -1740,11 +1780,15 @@ impl Cell {
             .arg(&config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr)
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
+        let said = match stderr {
+            Stderr::Echoed => Some(echoed(child.stderr.take().unwrap())),
+            Stderr::Piped => None,
+        };
         self.volumes.remove(&id);
         self.enlisted.remove(&id);
         self.bases.remove(&id);
@@ -1764,7 +1808,12 @@ impl Cell {
                     return;
                 }
             }
-            let _ = tell.send(Heard::Ended(id, generation));
+            // Its standard error ends as its output does, with the process: what it said last
+            // is all said once its reader ends.
+            let last = said
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default();
+            let _ = tell.send(Heard::Ended(id, generation, last));
         });
         self.running.insert(
             id,
@@ -1847,7 +1896,7 @@ impl Cell {
     #[track_caller]
     pub(crate) fn start_refused(&mut self, id: u64) -> String {
         self.refusing = Some(id);
-        self.spawn_process(id, Stdio::piped());
+        self.spawn_process(id, Stderr::Piped);
         self.introduce();
         let mut running = self.until(|c| c.refused.take());
         self.refusing = None;
@@ -2350,8 +2399,8 @@ impl Cell {
                     }
                 }
             }
-            // A process ended that the cell did not kill: it failed.
-            Heard::Ended(id, generation) => {
+            // A process ended that the cell did not kill: it failed, and its last words say why.
+            Heard::Ended(id, generation, last) => {
                 if self
                     .running
                     .get(&id)
@@ -2359,7 +2408,12 @@ impl Cell {
                 {
                     // A process the test starts to be refused ends as the test expects.
                     if self.refusing != Some(id) {
-                        panic!("node {id} ended: {:?}", self.status);
+                        panic!(
+                            "node {id} ended: {:?}; the last {} lines of its standard error:\n{}",
+                            self.status,
+                            last.len(),
+                            last.join("\n")
+                        );
                     }
                     self.refused = self.running.remove(&id);
                     self.status.retain(|(node, _), _| *node != id);

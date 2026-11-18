@@ -130,6 +130,7 @@ fn leading(cell: &Cell) -> Option<Repairing> {
 /// Waits until the node running the cell's repair says its last pass ended with nothing it could
 /// do, the pass begun at the root range's index `mark` or later, and `done` holds of it: the facts
 /// the test waits on.
+#[track_caller]
 fn settled_after(
     cell: &mut Cell,
     mark: u64,
@@ -142,6 +143,7 @@ fn settled_after(
 
 /// [`settled_after`] at the root range's commit as the running nodes last said it: past every
 /// statement the cell's nodes made to it so far, a lost volume's or a joining node's.
+#[track_caller]
 fn settled(cell: &mut Cell, done: impl FnMut(&Repairing) -> bool) -> Repairing {
     let mark = root_commit(cell);
     settled_after(cell, mark, done)
@@ -162,6 +164,7 @@ fn root_commit(cell: &Cell) -> u64 {
 }
 
 /// The volume table as the root range holds it.
+#[track_caller]
 fn table(cell: &mut Cell, g: Groups) -> Vec<Placed> {
     let mut table = Vec::new();
     let mut after = None;
@@ -179,6 +182,7 @@ fn table(cell: &mut Cell, g: Groups) -> Vec<Placed> {
 }
 
 /// The volumes the table gives node `id`.
+#[track_caller]
 fn volumes_of(cell: &mut Cell, g: Groups, id: u64) -> BTreeSet<u128> {
     table(cell, g)
         .iter()
@@ -206,6 +210,7 @@ fn follower(cell: &Cell) -> u64 {
 }
 
 /// Node `id` asked to leave, waited on until it says it is leaving.
+#[track_caller]
 fn leave(cell: &mut Cell, id: u64) {
     {
         let input = &mut cell.running.get_mut(&id).unwrap().input;
@@ -222,7 +227,9 @@ fn leave(cell: &mut Cell, id: u64) {
 }
 
 /// Waits until the volume table names no volume of node `id`: each drained, written off and
-/// forgotten.
+/// forgotten. Each read of the table is the wait's own probe, which moves its watch only where a
+/// node moved the cell meanwhile (`Cell::until`).
+#[track_caller]
 fn forgotten(cell: &mut Cell, g: Groups, id: u64) {
     cell.until(|c| {
         if table(c, g).iter().any(|p| p.node == id) {
@@ -235,6 +242,7 @@ fn forgotten(cell: &mut Cell, g: Groups, id: u64) {
 
 /// The blocks of `key`'s current version, each its header and places, through its file's
 /// extents and, for an object of parts, each part's file's.
+#[track_caller]
 fn blocks_of(
     cell: &mut Cell,
     g: Groups,
@@ -289,8 +297,9 @@ fn blocks_of(
 }
 
 /// What a block's places hold on disk: each place's chunk read whole from its volume, which
-/// verifies it, by a client the founders pin as a gateway. Chunks of a gone volume, or one the
-/// table forgot, are none.
+/// verifies it, by a client the founders pin as a gateway, each read told as its progress and
+/// waited on under the cell's watch. Chunks of a gone volume, or one the table forgot, are none.
+#[track_caller]
 fn on_disk(
     cell: &mut Cell,
     places: &[ChunkPlace],
@@ -301,8 +310,11 @@ fn on_disk(
         .iter()
         .filter_map(|p| Some((*node_of.get(&p.volume)?, p.volume, p.key)))
         .collect();
-    let (settings, bound) = (cell.pki.client_settings(CLIENT + 2), cell.bound_quic());
-    let outcomes = std::thread::spawn(move || {
+    let settings = cell.pki.client_settings(CLIENT + 2);
+    let (id, done) = (settings.id, gets.len() as u64);
+    cell.client_begins(id);
+    let (bound, tell) = (cell.bound_quic(), cell.tell.clone());
+    let thread = std::thread::spawn(move || {
         client_runtime(settings.nodes.len() + 1)
             .block_on(async move {
                 let mut client = Client::open(settings).await.unwrap();
@@ -310,7 +322,7 @@ fn on_disk(
                     client.learn(node, quic).unwrap();
                 }
                 let mut read = Vec::with_capacity(gets.len());
-                for (node, volume, key) in gets {
+                for (done, (node, volume, key)) in (1..).zip(gets) {
                     let got = client
                         .get_chunk(node, (volume, key), (0, len), u64::MAX)
                         .await;
@@ -321,13 +333,13 @@ fn on_disk(
                             _ => None,
                         },
                     ));
+                    let _ = tell.send(Heard::Told(Told::Progress(id, done, client.patience())));
                 }
                 read
             })
             .unwrap()
-    })
-    .join()
-    .unwrap();
+    });
+    let outcomes = cell.joined(id, done, thread);
     let read: BTreeMap<u128, Option<Vec<u8>>> = outcomes.into_iter().collect();
     places
         .iter()
@@ -362,6 +374,7 @@ fn rebuilds(header: &BlockHeader, chunks: &BTreeMap<u16, Vec<u8>>) -> bool {
 /// each chunk on a volume of its own with one place on each running node at most; each chunk's
 /// places that read giving the chunk, and the chunks the block's own places hold rebuilding it.
 /// Returns how many blocks and places it checked.
+#[track_caller]
 fn whole_on_disk(cell: &mut Cell, g: Groups, bucket: &str, keys: &[String]) -> (usize, usize) {
     let placed = table(cell, g);
     let node_of: BTreeMap<u128, u64> = placed.iter().map(|p| (p.volume, p.node)).collect();
@@ -440,6 +453,7 @@ fn listeners(cell: &Cell) -> BTreeMap<u64, S3> {
 
 /// Puts `n` objects of `sizes` in turn through the S3 listener of each running node and the
 /// native door, half each, into `bucket`, named `prefix-i`; every one acknowledged.
+#[track_caller]
 fn put_objects(cell: &mut Cell, bucket: &str, prefix: &str, sizes: &[usize], seed: u64) -> Objects {
     let mut objects = Objects::new();
     let mut s3 = listeners(cell);
@@ -450,10 +464,8 @@ fn put_objects(cell: &mut Cell, bucket: &str, prefix: &str, sizes: &[usize], see
         let data = object_bytes(seed * 1000 + i as u64, size);
         let node = nodes[i % nodes.len()];
         if i % 2 == 0 {
-            let put =
-                s3.get_mut(&node)
-                    .unwrap()
-                    .send("PUT", &format!("/{bucket}/{key}"), &[], &data);
+            let target = format!("/{bucket}/{key}");
+            let put = s3_send(cell, &mut s3, node, ("PUT", target), data.clone());
             assert_eq!(put.status, 200, "{key}: {}", put.text());
         } else {
             native.push((
@@ -479,16 +491,15 @@ fn put_objects(cell: &mut Cell, bucket: &str, prefix: &str, sizes: &[usize], see
 /// Every object of `objects` read back whole through each running node's S3 listener and its
 /// native door: byte-exact, or, where `lost` holds of its key, refused typed and never answered
 /// with bytes.
+#[track_caller]
 fn read_back(cell: &mut Cell, bucket: &str, objects: &Objects, lost: &BTreeSet<String>) {
     let mut s3 = listeners(cell);
     let nodes: Vec<u64> = s3.keys().copied().collect();
     let mut gets = Vec::new();
     for (key, data) in objects {
         for &node in &nodes {
-            let got = s3
-                .get_mut(&node)
-                .unwrap()
-                .send("GET", &format!("/{bucket}/{key}"), &[], b"");
+            let target = format!("/{bucket}/{key}");
+            let got = s3_send(cell, &mut s3, node, ("GET", target), Vec::new());
             if lost.contains(key) {
                 assert!(
                     got.status == 500 || got.status == 503,
@@ -537,6 +548,7 @@ fn read_back(cell: &mut Cell, bucket: &str, objects: &Objects, lost: &BTreeSet<S
 /// A cell made and started, every running founder enlisted and, where every founder runs, judging
 /// its links, and a bucket. A range's leader measures its patience toward each voter, a founder not
 /// yet started among them, so a cell started in part is ready once its running founders enlisted.
+#[track_caller]
 fn ready(cell: &mut Cell, bucket: &str) {
     let ids: Vec<u64> = cell.running.keys().copied().collect();
     for id in ids {
@@ -546,12 +558,40 @@ fn ready(cell: &mut Cell, bucket: &str) {
         cell.judging();
     }
     let mut s3 = listeners(cell);
-    let made = s3
-        .values_mut()
-        .next()
-        .unwrap()
-        .send("PUT", &format!("/{bucket}"), &[], b"");
+    let node = *s3.keys().next().unwrap();
+    let made = s3_send(
+        cell,
+        &mut s3,
+        node,
+        ("PUT", format!("/{bucket}")),
+        Vec::new(),
+    );
     assert_eq!(made.status, 200, "{}", made.text());
+}
+
+/// What node `node`'s listener answered `method` on `target` with `body`, asked by its client in
+/// `s3` on a thread of its own and waited on under the cell's watch, as the native door's
+/// operations are.
+#[track_caller]
+fn s3_send(
+    cell: &mut Cell,
+    s3: &mut BTreeMap<u64, S3>,
+    node: u64,
+    (method, target): (&'static str, String),
+    body: Vec<u8>,
+) -> s3::Response {
+    let what = format!("{method} {target} through node {node}'s listener");
+    let mut client = s3.remove(&node).unwrap();
+    let thread = std::thread::spawn(move || {
+        let response = client.send(method, &target, &[], &body);
+        (client, response)
+    });
+    cell.waiting_on(&what, Duration::ZERO, |_| {
+        if thread.is_finished() { Some(()) } else { None }
+    });
+    let (client, response) = thread.join().unwrap();
+    s3.insert(node, client);
+    response
 }
 
 /// Object sizes across the layout: an empty one, under a segment, past one, past a block's chunk.
@@ -574,14 +614,7 @@ fn three_nodes_rebuild_a_volume_lost_mid_write_and_one_lost_at_rest() {
     // lost; each acknowledged is the cell's.
     let lost = ids[2];
     let dirs = volume_dirs(&cell, lost);
-    let writer = {
-        let (settings, bound) = (
-            cell.pki.object_settings(object_client(CLIENT + 1)),
-            cell.bound_quic(),
-        );
-        let first = ids[0];
-        std::thread::spawn(move || tolerant_puts(settings, bound, first, "b", "during", 12, 2))
-    };
+    let writer = Puts::start(&mut cell, ids[0], "during", 12, 2);
     cell.kill(lost);
     for dir in &dirs {
         lose_volume(dir);
@@ -589,7 +622,7 @@ fn three_nodes_rebuild_a_volume_lost_mid_write_and_one_lost_at_rest() {
     cell.start(lost);
     cell.introduce();
     cell.enlisted(lost);
-    let acknowledged = writer.join().unwrap();
+    let acknowledged = writer.acknowledged(&mut cell);
     objects.extend(acknowledged);
     let repaired = settled(&mut cell, |r| {
         r.waiting == 0 && r.short == 0 && r.rebuilt > 0
@@ -708,6 +741,7 @@ fn five_nodes_survive_two_lost_volumes_and_refuse_what_more_losses_took() {
 }
 
 /// Nodes `ids` killed, each volume of theirs lost, and started again at once.
+#[track_caller]
 fn lose_at_once(cell: &mut Cell, ids: &[u64]) {
     let dirs: Vec<(u64, Vec<PathBuf>)> =
         ids.iter().map(|id| (*id, volume_dirs(cell, *id))).collect();
@@ -852,18 +886,11 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
         .keys()
         .find(|id| !cell.running.contains_key(id) && **id != gone)
         .unwrap();
-    let writer = {
-        let (settings, bound) = (
-            cell.pki.object_settings(object_client(CLIENT + 1)),
-            cell.bound_quic(),
-        );
-        let first = others[0];
-        std::thread::spawn(move || tolerant_puts(settings, bound, first, "b", "joining", 12, 8))
-    };
+    let writer = Puts::start(&mut cell, others[0], "joining", 12, 8);
     cell.start(joining);
     cell.introduce();
     cell.enlisted(joining);
-    objects.extend(writer.join().unwrap());
+    objects.extend(writer.acknowledged(&mut cell));
     assert!(!volumes_of(&mut cell, g, joining).is_empty());
     settled(&mut cell, |r| {
         r.waiting == 0 && r.short == 0 && r.root_applied > back.root_applied
@@ -887,20 +914,13 @@ fn a_node_leaving_mid_write_moves_everything_off_and_is_forgotten() {
     let mut objects = put_objects(&mut cell, "b", "before", &SIZES, 11);
     let ids: Vec<u64> = cell.running.keys().copied().collect();
     let leaving = ids[4];
-    let writer = {
-        let (settings, bound) = (
-            cell.pki.object_settings(object_client(CLIENT + 1)),
-            cell.bound_quic(),
-        );
-        let first = ids[0];
-        std::thread::spawn(move || tolerant_puts(settings, bound, first, "b", "leaving", 12, 12))
-    };
+    let writer = Puts::start(&mut cell, ids[0], "leaving", 12, 12);
     leave(&mut cell, leaving);
     // Its end is the leave's last step (membership.md §4 step 5): once its volumes are forgotten,
     // the root range removes and delists it, its peers refuse it and it ends. Taken as expected
     // from here, and waited for once the table has forgotten its volumes.
     cell.refusing = Some(leaving);
-    objects.extend(writer.join().unwrap());
+    objects.extend(writer.acknowledged(&mut cell));
     forgotten(&mut cell, g, leaving);
     let exited = cell.ended();
     assert!(exited.success(), "the node that left exited {exited}");
@@ -992,6 +1012,7 @@ fn chunks_a_leaving_node_doubled_on_a_domain_spread_onto_a_joiner() {
 }
 
 /// Puts through the S3 listeners of `nodes` alone.
+#[track_caller]
 fn put_objects_on(
     cell: &mut Cell,
     nodes: &[u64],
@@ -1006,10 +1027,8 @@ fn put_objects_on(
         let key = format!("{prefix}-{i}");
         let data = object_bytes(seed * 1000 + i as u64, size);
         let node = nodes[i % nodes.len()];
-        let put = s3
-            .get_mut(&node)
-            .unwrap()
-            .send("PUT", &format!("/{bucket}/{key}"), &[], &data);
+        let target = format!("/{bucket}/{key}");
+        let put = s3_send(cell, &mut s3, node, ("PUT", target), data.clone());
         assert_eq!(put.status, 200, "{key} through {node}: {}", put.text());
         objects.insert(key, data);
     }
@@ -1017,32 +1036,62 @@ fn put_objects_on(
 }
 
 /// Reads through the S3 listeners of `nodes` alone.
+#[track_caller]
 fn read_back_through(cell: &mut Cell, nodes: &[u64], bucket: &str, objects: &Objects) {
     let mut s3 = listeners(cell);
     for (key, data) in objects {
-        for node in nodes {
-            let got = s3
-                .get_mut(node)
-                .unwrap()
-                .send("GET", &format!("/{bucket}/{key}"), &[], b"");
+        for &node in nodes {
+            let target = format!("/{bucket}/{key}");
+            let got = s3_send(cell, &mut s3, node, ("GET", target), Vec::new());
             assert_eq!(got.status, 200, "{key} through {node}: {}", got.text());
             assert!(got.body == *data, "{key} through {node}: other bytes");
         }
     }
 }
 
-/// Puts `count` objects named `prefix-i` through node `node`'s native door with no deadline of
-/// their own, each kept where the node acknowledged it and let go where it refused it or its answer
-/// was lost: what the cell acknowledged, by key.
+/// Puts under way on a thread of their own ([`Puts::start`]): their client, how many, and the
+/// thread.
+struct Puts {
+    id: u64,
+    count: u64,
+    thread: JoinHandle<Objects>,
+}
+
+impl Puts {
+    /// `count` objects named `prefix-i` put into bucket `b` through node `node`'s native door
+    /// ([`tolerant_puts`]) by the object client of `CLIENT + 1`, each told the cell as its progress.
+    fn start(cell: &mut Cell, node: u64, prefix: &'static str, count: u64, seed: u64) -> Self {
+        let settings = cell.pki.object_settings(object_client(CLIENT + 1));
+        let id = settings.id;
+        cell.client_begins(id);
+        let (bound, tell) = (cell.bound_quic(), cell.tell.clone());
+        let thread = std::thread::spawn(move || {
+            tolerant_puts(settings, bound, node, ("b", prefix), (count, seed), tell)
+        });
+        Self { id, count, thread }
+    }
+
+    /// What the cell acknowledged of them, waited on under its watch until their client told the
+    /// last done.
+    #[track_caller]
+    fn acknowledged(self, cell: &mut Cell) -> Objects {
+        cell.joined(self.id, self.count, self.thread)
+    }
+}
+
+/// Puts `count` objects named `prefix-i` into `bucket` through node `node`'s native door with no
+/// deadline of their own, each kept where the node acknowledged it and let go where it refused it
+/// or its answer was lost, and each told on `tell` as the client's progress: what the cell
+/// acknowledged, by key.
 fn tolerant_puts(
     settings: ClientSettings,
     bound: Vec<(u64, SocketAddr)>,
     node: u64,
-    bucket: &str,
-    prefix: &str,
-    count: u64,
-    seed: u64,
+    (bucket, prefix): (&str, &str),
+    (count, seed): (u64, u64),
+    tell: Sender<Heard>,
 ) -> Objects {
+    let id = settings.id;
     let bucket = bucket.to_owned();
     let prefix = prefix.to_owned();
     client_runtime(settings.nodes.len() + 1)
@@ -1065,6 +1114,7 @@ fn tolerant_puts(
                 {
                     acknowledged.insert(key, data);
                 }
+                let _ = tell.send(Heard::Told(Told::Progress(id, i + 1, client.patience())));
             }
             acknowledged
         })

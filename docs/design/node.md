@@ -1818,6 +1818,26 @@ summed (measurement.md §12). Tested: the answer says them by name (`process::te
 reads them back (`transfer::cell`) and sums each server's growth (`bench_doors`), and a full lane's
 refused proposal is counted under its kind alone (`node::shard`).
 
+*Open (2026-11-18): S3 connections beside a node's ranges.* Under `range_shards = spread` a shard
+that runs ranges also takes S3 connections: the listener hands each to the shard past the first
+with the fewest open (`listener::shards::least`), passing over one the watchdog sees held past its
+limit, and a range's task there waits on the device (`permit_blocking`). Neither rule is changed
+yet, for three reasons. Ladder r40's fall was the native door's, whose requests the node's task
+drives on the first shard (step 6 not built), which S3 connections never reach, so neither rule
+explains it; the HTTP door's ladder over `spread` is the measure that decides. Holding S3 off the
+shards that run ranges trades those device waits for the S3 capacity those shards would serve, in
+a share the host decides, five shards of 31 past the first on 32 cores but five of seven on eight,
+so it is a rule only once that ladder measures both. And the reverse, ranges kept off the shards
+that serve S3, is no rule: ranges are placed once, at open, and connections at each accept, so only
+the listener's rule can follow both. Next, from the code: a range shard's task is submitted at the
+default class (`Lanes::start`, `submit_to_holder`), where the node's task is spawned Critical so
+its consensus, log and transport go ahead of the connections beside it (`run_on_first_shard`;
+hyper-raft docs/runtime.md §3.15). A range shard's task spawned Critical alike, through a launcher
+on its shard as the node's is, which `derive::shard_shape` must then count among a shard's tasks,
+comes first; then the HTTP door's ladder over `spread`, S3 over every shard against S3 over the
+shards with no range where any remain (`listen`'s holders less those `Node::ranges_on` names),
+chooses the listener's rule.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

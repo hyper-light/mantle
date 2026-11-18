@@ -83,6 +83,22 @@ pub(crate) const DEVICE_PATIENCE: Duration = mantle_protocol::bounds::STOCK_PATI
 /// millisecond is jHiccup's resolution, the interval its meter thread sleeps and times each wake
 /// over (github.com/giltene/jHiccup, `HiccupMeter.java`, `resolutionMs = 1.0`).
 pub(crate) const HOLD_TICK: Duration = Duration::from_millis(1);
+
+/// The most a wait goes on, however the cell moves meanwhile ([`Cell::waiting_on`]): a client's
+/// whole patience for one operation, past which no client of the cell waits for what it asked. It
+/// asks an operation at most `ATTEMPTS` times in a row with nothing taken, each attempt's dial, its
+/// dial again once its name is looked up again and its exchange ending once the stock patience
+/// passes with nothing moving (`Client::period_ns`, research/77 D2), and each pause between
+/// attempts at most `SLOWED_MOST` (`Client::slowed_wait`). A link a node dials ends within it as
+/// well: its dial's handshake within the idle timeout, under the stock patience, and its next dial
+/// within its stated reconnect, under the idle timeout (`bounds::pause`). A fact the cell has not
+/// stated by then, the cell moving all along, is one it moves without reaching.
+pub(crate) fn wait_bound() -> Duration {
+    let waits_per_attempt = 3;
+    (mantle_protocol::bounds::STOCK_PATIENCE * waits_per_attempt + mantle_client::SLOWED_MOST)
+        * mantle_client::ATTEMPTS
+}
+
 /// RFC 5280 §4.1.2.5: the notAfter of a certificate with no well-defined expiration.
 pub(crate) const NO_EXPIRY: u64 = 253_402_300_799;
 /// Writes before the leader is killed and after: enough to pass the range's log group's room
@@ -2231,15 +2247,17 @@ impl Cell {
 
     /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing, past
     /// the time the host held the watch: each wait at most `HOLD_TICK`, and a wait that ends late
-    /// moves the watch's end by its lateness, so each spends exactly the span it scheduled. A
-    /// failure names the wait by its caller and says what the cell said last.
+    /// moves the watch's end by its lateness, so each spends exactly the span it scheduled. Fails
+    /// too once [`wait_bound`] passes, past the time the host held the watch over the whole wait,
+    /// however the cell moves meanwhile: a cell that keeps moving without `done` ever holding
+    /// holds no wait open. A failure names the wait by its caller and says what the cell said last.
     #[track_caller]
     pub(crate) fn until<T>(&mut self, done: impl FnMut(&mut Self) -> Option<T>) -> T {
         self.waiting_on("the wait", Duration::ZERO, done)
     }
 
-    /// [`Cell::until`] for `what`, as its failure names it, its quiet period longer by
-    /// `allowance`.
+    /// [`Cell::until`] for `what`, as its failure names it, its quiet period and its bound each
+    /// longer by `allowance`.
     #[track_caller]
     pub(crate) fn waiting_on<T>(
         &mut self,
@@ -2248,6 +2266,10 @@ impl Cell {
         mut done: impl FnMut(&mut Self) -> Option<T>,
     ) -> T {
         let at = std::panic::Location::caller();
+        let bound = wait_bound() + allowance;
+        let began = Instant::now();
+        // The host's holds over the whole wait, which no movement forgets, as the watch's are.
+        let mut host_held = Duration::ZERO;
         self.moved();
         loop {
             let watch = (
@@ -2259,6 +2281,12 @@ impl Cell {
             if let Some(found) = done(self) {
                 return found;
             }
+            assert!(
+                began.elapsed() <= bound + host_held,
+                "{what} at {at}: not so within {bound:?}, besides {host_held:?} the host held the \
+                 watch, though the cell moved: {}",
+                self.seen()
+            );
             // What `done` waited on itself, a read it asked under a watch of its own, is not the
             // cell moving toward the fact waited on: this watch goes on from where it was, moved
             // only where a node moved the cell meanwhile.
@@ -2282,25 +2310,37 @@ impl Cell {
             match self.heard.recv_timeout(wait) {
                 Ok(heard) => self.take(heard),
                 Err(RecvTimeoutError::Timeout) if !left.is_zero() => {
-                    self.host_held += Instant::now().saturating_duration_since(woke_by);
+                    let late = Instant::now().saturating_duration_since(woke_by);
+                    self.host_held += late;
+                    host_held += late;
                 }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
                     "{what} at {at}: quiet for {quiet:?} with nothing moved, besides {:?} held still \
-                     for the devices and {:?} the host held the watch: {:?}, progress {:?}, links \
-                     {:?}, log {:?}, room {:?}, longest polls {:?}, stalls {:?}, repairs {:?}",
+                     for the devices and {:?} the host held the watch: {}",
                     self.held_for,
                     self.host_held,
-                    self.status,
-                    self.progress,
-                    self.links,
-                    self.log,
-                    self.room,
-                    self.polls,
-                    self.stalls,
-                    self.repairs
+                    self.seen()
                 ),
             }
         }
+    }
+
+    /// What the cell said last, for a wait's failure: each range's status at each node, the
+    /// clients' progress, each node's link to each peer, its log, its room, its longest poll, its
+    /// stalls and its repair.
+    fn seen(&self) -> String {
+        format!(
+            "{:?}, progress {:?}, links {:?}, log {:?}, room {:?}, longest polls {:?}, stalls {:?}, \
+             repairs {:?}",
+            self.status,
+            self.progress,
+            self.links,
+            self.log,
+            self.room,
+            self.polls,
+            self.stalls,
+            self.repairs
+        )
     }
 
     /// Takes what was heard and not yet taken, without waiting.

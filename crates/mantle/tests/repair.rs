@@ -842,18 +842,25 @@ fn a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks()
     read_back(&mut cell, "b", &objects, &BTreeSet::new());
     let (_, places) = whole_on_disk(&mut cell, g, "b", &keys);
     assert!(places > 0);
-    // Started again on its volume, it finds its identity refused: each link it keeps to a node
-    // that runs ends refused.
+    // Started again on its volume, its identity is refused at every node that runs: the link of
+    // each pair ends refused on the side that dials it, the lower id (`Node::dials`). A dial of
+    // it is refused at its dialer's own handshake, and a connection refused before the node
+    // stated gone, its server, identified it names no peer to that node, so its own link to a
+    // peer that dials it need not say so.
     cell.start(gone);
     cell.introduce();
-    cell.until(|c| {
-        let refused = others.iter().all(|peer| {
-            c.links
-                .get(&(gone, *peer))
-                .is_some_and(|link| link.ends_with("Identity"))
-        });
-        if refused { Some(()) } else { None }
-    });
+    cell.waiting_on(
+        "each running node's refusal of the node stated gone",
+        Duration::ZERO,
+        |c| {
+            let refused = others.iter().all(|peer| {
+                c.links
+                    .get(&(gone.min(*peer), gone.max(*peer)))
+                    .is_some_and(|link| link.ends_with("Identity"))
+            });
+            if refused { Some(()) } else { None }
+        },
+    );
     let exited = cell.stop(gone);
     assert!(
         exited.success(),

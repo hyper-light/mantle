@@ -5083,11 +5083,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             }
             let answers: Vec<Answer> = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
-            let mut body = Vec::new();
-            if command::encode_answers(&mut body, &answers).is_err() {
+            let Ok(body) = command::encode_answers(&answers) else {
                 self.answer_status(exchange, command::Status::TooLarge, self.id)?;
                 continue;
-            }
+            };
             self.reply_body(exchange, body)?;
         }
         // A read whose range this node no longer leads may never be confirmed here.

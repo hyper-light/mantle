@@ -817,6 +817,15 @@ impl Extent {
         sealed(|w| self.put(w))
     }
 
+    /// Writes the value as `encode` seals it, behind its length (a u32), with no buffer of its own:
+    /// how a message that carries it writes it in place, its length counted first.
+    pub fn put_record(&self, w: &mut Writer) -> Result<(), RecordError> {
+        put_record(w, |w| {
+            self.put(w);
+            Ok(())
+        })
+    }
+
     /// Writes the value's fields, which `encode` seals.
     pub(crate) fn put(&self, w: &mut Writer) {
         w.u64(self.length);
@@ -850,6 +859,15 @@ impl Extent {
 impl BlockHeader {
     pub fn encode(&self) -> Vec<u8> {
         sealed(|w| self.put(w))
+    }
+
+    /// Writes the value as `encode` seals it, behind its length (a u32), with no buffer of its own:
+    /// how a message that carries it writes it in place, its length counted first.
+    pub fn put_record(&self, w: &mut Writer) -> Result<(), RecordError> {
+        put_record(w, |w| {
+            self.put(w);
+            Ok(())
+        })
     }
 
     /// Writes the value's fields, which `encode` seals.
@@ -1191,6 +1209,15 @@ impl BlockOrigin {
 impl ChunkPlace {
     pub fn encode(&self) -> Vec<u8> {
         sealed(|w| self.put(w))
+    }
+
+    /// Writes the value as `encode` seals it, behind its length (a u32), with no buffer of its own:
+    /// how a message that carries it writes it in place, its length counted first.
+    pub fn put_record(&self, w: &mut Writer) -> Result<(), RecordError> {
+        put_record(w, |w| {
+            self.put(w);
+            Ok(())
+        })
     }
 
     /// Writes the value's fields, which `encode` seals.
@@ -1914,6 +1941,12 @@ fn take_runs(r: &mut Reader<'_>) -> Option<Runs> {
 impl Part {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
         record(|w| self.put(w))
+    }
+
+    /// Writes the value as `encode` seals it, behind its length (a u32), with no buffer of its own:
+    /// how a message that carries it writes it in place, its length counted first.
+    pub fn put_record(&self, w: &mut Writer) -> Result<(), RecordError> {
+        put_record(w, |w| self.put(w))
     }
 
     /// Writes the value's fields, which `encode` seals.

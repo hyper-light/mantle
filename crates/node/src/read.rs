@@ -298,13 +298,18 @@ fn take_text(r: &mut Reader<'_>, most: usize) -> Option<String> {
 }
 
 impl Query {
+    /// The query's bytes, in one buffer made at their length, which `put` counts first
+    /// (`mantle_codec::encode`).
     pub fn encode(&self) -> Result<Vec<u8>, ReadError> {
-        let mut w = Writer::default();
+        Ok(mantle_codec::encode(0, |w| self.put(w))?.into_vec())
+    }
+
+    fn put(&self, w: &mut Writer) -> Result<(), ReadError> {
         match self {
             Self::Current { bucket, key } => {
                 w.u8(CURRENT);
-                put_text(&mut w, bucket);
-                put_text(&mut w, key);
+                put_text(w, bucket);
+                put_text(w, key);
             }
             Self::Volumes { after } => {
                 w.u8(VOLUMES);
@@ -332,16 +337,16 @@ impl Query {
             }
             Self::Bucket { bucket } => {
                 w.u8(BUCKET);
-                put_text(&mut w, bucket);
+                put_text(w, bucket);
             }
             Self::Gate { bucket, generation } => {
                 w.u8(GATE);
-                put_text(&mut w, bucket);
+                put_text(w, bucket);
                 w.u64(*generation);
             }
             Self::List(list) => {
                 w.u8(LIST);
-                object::put_list(&mut w, list).map_err(|_| ReadError::Query)?;
+                object::put_list(w, list).map_err(|_| ReadError::Query)?;
             }
             Self::Owned {
                 owner,
@@ -350,13 +355,13 @@ impl Query {
                 max,
             } => {
                 w.u8(OWNED);
-                put_text(&mut w, owner);
-                put_text(&mut w, prefix);
+                put_text(w, owner);
+                put_text(w, prefix);
                 match after {
                     None => w.u8(0),
                     Some(after) => {
                         w.u8(1);
-                        put_text(&mut w, after);
+                        put_text(w, after);
                     }
                 }
                 w.u32(*max);
@@ -368,13 +373,13 @@ impl Query {
                 budget,
             } => {
                 w.u8(PROBE);
-                put_text(&mut w, bucket);
+                put_text(w, bucket);
                 w.u64(*generation);
                 match from {
                     None => w.u8(0),
                     Some(from) => {
                         w.u8(1);
-                        put_record(&mut w, from)?;
+                        put_record(w, from)?;
                     }
                 }
                 w.u32(*budget);
@@ -385,9 +390,9 @@ impl Query {
                 upload,
             } => {
                 w.u8(UPLOAD);
-                put_text(&mut w, bucket);
-                put_text(&mut w, key);
-                put_text(&mut w, upload);
+                put_text(w, bucket);
+                put_text(w, key);
+                put_text(w, upload);
             }
             Self::Parts {
                 bucket,
@@ -397,9 +402,9 @@ impl Query {
                 max,
             } => {
                 w.u8(PARTS);
-                put_text(&mut w, bucket);
-                put_text(&mut w, key);
-                put_text(&mut w, upload);
+                put_text(w, bucket);
+                put_text(w, key);
+                put_text(w, upload);
                 w.u16(*after);
                 w.u32(*max);
             }
@@ -412,15 +417,15 @@ impl Query {
                 max,
             } => {
                 w.u8(UPLOADS);
-                put_text(&mut w, bucket);
-                put_text(&mut w, prefix);
-                put_text(&mut w, delimiter);
+                put_text(w, bucket);
+                put_text(w, prefix);
+                put_text(w, delimiter);
                 for marker in [key_marker, id_marker] {
                     match marker {
                         None => w.u8(0),
                         Some(marker) => {
                             w.u8(1);
-                            put_text(&mut w, marker);
+                            put_text(w, marker);
                         }
                     }
                 }
@@ -428,8 +433,8 @@ impl Query {
             }
             Self::Version { bucket, key, named } => {
                 w.u8(VERSION);
-                put_text(&mut w, bucket);
-                put_text(&mut w, key);
+                put_text(w, bucket);
+                put_text(w, key);
                 match named {
                     Named::Null => w.u8(0),
                     Named::Order(order) => {
@@ -440,21 +445,21 @@ impl Query {
             }
             Self::Versions(list) => {
                 w.u8(VERSIONS);
-                object::put_list_versions(&mut w, list).map_err(|_| ReadError::Query)?;
+                object::put_list_versions(w, list).map_err(|_| ReadError::Query)?;
             }
             Self::Mark { bucket, key, id } => {
                 w.u8(MARK);
-                put_text(&mut w, bucket);
-                put_text(&mut w, key);
+                put_text(w, bucket);
+                put_text(w, key);
                 w.u128(*id);
             }
             Self::Signer { id } => {
                 w.u8(SIGNER);
-                put_text(&mut w, id);
+                put_text(w, id);
             }
             Self::Principal { name } => {
                 w.u8(PRINCIPAL);
-                put_text(&mut w, name);
+                put_text(w, name);
             }
             Self::Principals { after, max } => {
                 w.u8(PRINCIPALS);
@@ -462,13 +467,13 @@ impl Query {
                     None => w.u8(0),
                     Some(after) => {
                         w.u8(1);
-                        put_text(&mut w, after);
+                        put_text(w, after);
                     }
                 }
                 w.u32(*max);
             }
         }
-        Ok(w.into_vec())
+        Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ReadError> {
@@ -1167,14 +1172,63 @@ impl<E: Rows> list::Keys for Index<'_, E> {
 }
 
 impl Read {
+    /// The answer's bytes, in one buffer made at their length, which `put` counts first
+    /// (`mantle_codec::encode`). A record the answer carries whole, or a signer's two, is sealed by
+    /// its own encoder first, at its own length (`sealed`); a page's records are written in place.
     pub fn encode(&self) -> Result<Vec<u8>, ReadError> {
-        let mut w = Writer::default();
+        let (first, second) = self.sealed()?;
+        Ok(mantle_codec::encode(0, |w| self.put(w, &first, &second))?.into_vec())
+    }
+
+    /// The records the answer carries whole, each sealed by its own encoder: the one it ends with,
+    /// or a signer's key and principal; none for the rest.
+    fn sealed(&self) -> Result<(Vec<u8>, Vec<u8>), ReadError> {
+        Ok(match self {
+            Self::Current(Some((_, version))) | Self::Version(Some((_, version))) => {
+                (version.encode()?, Vec::new())
+            }
+            Self::Probe(Routed::Moved(lineage)) | Self::Gate(Routed::Moved(lineage)) => {
+                (lineage.encode()?, Vec::new())
+            }
+            Self::Mark(Some(mark)) => (mark.encode(), Vec::new()),
+            Self::Upload(Some(upload)) => (upload.encode()?, Vec::new()),
+            Self::Bucket(Some(row)) => (row.encode()?, Vec::new()),
+            Self::Gate(Routed::Here(Some(gate))) => (gate.encode(), Vec::new()),
+            Self::Header(Some(header)) => (header.encode()?, Vec::new()),
+            Self::Signer(Some(signer)) => {
+                let (row, held) = signer.as_ref();
+                (row.encode()?, held.encode()?)
+            }
+            Self::Current(None)
+            | Self::Volumes { .. }
+            | Self::Header(None)
+            | Self::Extents(_)
+            | Self::Block(_)
+            | Self::Bucket(None)
+            | Self::Gate(Routed::Here(None))
+            | Self::NoBucket
+            | Self::Keys(_)
+            | Self::Owned(_)
+            | Self::Probe(Routed::Here(_))
+            | Self::Upload(None)
+            | Self::Parts(_)
+            | Self::Uploads(_)
+            | Self::Version(None)
+            | Self::Versions(_)
+            | Self::Mark(None)
+            | Self::Signer(None)
+            | Self::Principals(_) => (Vec::new(), Vec::new()),
+        })
+    }
+
+    /// Writes the answer, `first` and `second` the records `sealed` made of it.
+    fn put(&self, w: &mut Writer, first: &[u8], second: &[u8]) -> Result<(), ReadError> {
         match self {
             Self::Current(None) => w.u8(0),
-            Self::Current(Some((order, version))) => {
+            Self::Current(Some((order, _))) | Self::Version(Some((order, _))) => {
                 w.u8(1);
                 w.u64(*order);
-                w.bytes(&version.encode()?);
+                w.bytes(first);
             }
             Self::Volumes { volumes, more } => {
                 w.u8(u8::from(*more));
@@ -1183,7 +1237,7 @@ impl Read {
                     w.u128(p.volume);
                     w.u64(p.node);
                     w.u64(p.bytes);
-                    put_text(&mut w, &p.domain);
+                    put_text(w, &p.domain);
                 }
             }
             Self::Header(None)
@@ -1193,40 +1247,35 @@ impl Read {
             Self::NoBucket => w.u8(2),
             Self::Keys(page) => {
                 w.u8(1);
-                object::put_page(&mut w, page).map_err(|_| ReadError::Answer)?;
+                object::put_page(w, page).map_err(|_| ReadError::Answer)?;
             }
             Self::Owned(page) => {
-                object::put_buckets(&mut w, page).map_err(|_| ReadError::Answer)?;
+                object::put_buckets(w, page).map_err(|_| ReadError::Answer)?;
             }
             Self::Probe(Routed::Here(Probe::Found)) => w.u8(0),
             Self::Probe(Routed::Here(Probe::Clear)) => w.u8(1),
             Self::Probe(Routed::Here(Probe::Paused(from))) => {
                 w.u8(2);
-                put_record(&mut w, from)?;
+                put_record(w, from)?;
             }
-            Self::Probe(Routed::Moved(lineage)) => {
+            Self::Probe(Routed::Moved(_)) => {
                 w.u8(3);
-                w.bytes(&lineage.encode()?);
+                w.bytes(first);
             }
             Self::Upload(None) | Self::Parts(None) | Self::Version(None) | Self::Mark(None) => {
                 w.u8(0)
             }
-            Self::Version(Some((order, version))) => {
-                w.u8(1);
-                w.u64(*order);
-                w.bytes(&version.encode()?);
-            }
             Self::Versions(page) => {
                 w.u8(1);
-                object::put_versions(&mut w, page).map_err(|_| ReadError::Answer)?;
+                object::put_versions(w, page).map_err(|_| ReadError::Answer)?;
             }
-            Self::Mark(Some(mark)) => {
+            Self::Mark(Some(_))
+            | Self::Upload(Some(_))
+            | Self::Bucket(Some(_))
+            | Self::Gate(Routed::Here(Some(_)))
+            | Self::Header(Some(_)) => {
                 w.u8(1);
-                w.bytes(&mark.encode());
-            }
-            Self::Upload(Some(upload)) => {
-                w.u8(1);
-                w.bytes(&upload.encode()?);
+                w.bytes(first);
             }
             Self::Parts(Some((parts, more))) => {
                 w.u8(1);
@@ -1234,56 +1283,43 @@ impl Read {
                 w.u32(u32::try_from(parts.len()).map_err(|_| ReadError::Answer)?);
                 for (number, part) in parts {
                     w.u16(*number);
-                    put_record(&mut w, &part.encode()?)?;
+                    part.put_record(w)?;
                 }
             }
             Self::Uploads(page) => {
                 w.u8(1);
-                object::put_uploads(&mut w, page).map_err(|_| ReadError::Answer)?;
+                object::put_uploads(w, page).map_err(|_| ReadError::Answer)?;
             }
-            Self::Bucket(Some(row)) => {
-                w.u8(1);
-                w.bytes(&row.encode()?);
-            }
-            Self::Gate(Routed::Here(Some(gate))) => {
-                w.u8(1);
-                w.bytes(&gate.encode());
-            }
-            Self::Gate(Routed::Moved(lineage)) => {
+            Self::Gate(Routed::Moved(_)) => {
                 w.u8(2);
-                w.bytes(&lineage.encode()?);
-            }
-            Self::Header(Some(header)) => {
-                w.u8(1);
-                w.bytes(&header.encode()?);
+                w.bytes(first);
             }
             Self::Extents(extents) => {
                 w.u32(u32::try_from(extents.len()).map_err(|_| ReadError::Answer)?);
                 for (offset, extent) in extents {
                     w.u64(*offset);
-                    put_record(&mut w, &extent.encode())?;
+                    extent.put_record(w)?;
                 }
             }
             Self::Block(Some((header, places))) => {
                 w.u8(1);
-                put_record(&mut w, &header.encode())?;
+                header.put_record(w)?;
                 w.u32(u32::try_from(places.len()).map_err(|_| ReadError::Answer)?);
                 for place in places {
-                    put_record(&mut w, &place.encode())?;
+                    place.put_record(w)?;
                 }
             }
             Self::Signer(None) => w.u8(0),
-            Self::Signer(Some(signer)) => {
-                let (row, held) = signer.as_ref();
+            Self::Signer(Some(_)) => {
                 w.u8(1);
-                put_record(&mut w, &row.encode()?)?;
-                put_record(&mut w, &held.encode()?)?;
+                put_record(w, first)?;
+                put_record(w, second)?;
             }
             Self::Principals(page) => {
-                object::put_principals(&mut w, page).map_err(|_| ReadError::Answer)?;
+                object::put_principals(w, page).map_err(|_| ReadError::Answer)?;
             }
         }
-        Ok(w.into_vec())
+        Ok(())
     }
 
     /// The answer to `query` that `bytes` holds.

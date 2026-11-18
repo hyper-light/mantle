@@ -227,6 +227,7 @@ pub struct Client {
     /// Waits paused for so far: the draw each pause's jitter takes (`bounds::pause`).
     waits: u32,
     asks: Asks,
+    /// The body of the request being asked: its entry or its query, as encoded, at its length.
     body: Vec<u8>,
     /// When, on the shard's clock, the client last drove its endpoint: the end of its last wait
     /// for an event. It runs no task of its own, so between its calls its connections send
@@ -419,8 +420,7 @@ impl Client {
         entry: &Entry,
         deadline_ns: u64,
     ) -> Result<Vec<Answer>, ClientError> {
-        self.body.clear();
-        self.body.extend_from_slice(&entry.encode()?);
+        self.body = entry.encode()?;
         // A command no session holds (a registration) applies again if asked again: its exchange is
         // never cut by a period, only by its connection's loss (the module's rules).
         let guarded = entry.commands.iter().all(|c| c.session != 0);
@@ -438,8 +438,7 @@ impl Client {
         query: &Query,
         deadline_ns: u64,
     ) -> Result<Read, ClientError> {
-        self.body.clear();
-        self.body.extend_from_slice(&query.encode()?);
+        self.body = query.encode()?;
         let reply = self.request(Kind::Read, group, (deadline_ns, true)).await?;
         Ok(Read::decode(query, &reply)?)
     }

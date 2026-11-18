@@ -165,96 +165,99 @@ impl Entry {
 
 impl Answer {
     pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
-        let w = mantle_codec::encode(0, |w| {
-            match self {
-                Answer::Registered { session } => {
-                    w.u8(0);
-                    w.u64(*session);
-                }
-                Answer::SessionExpired => w.u8(1),
-                Answer::SessionsFull { until_ns } => {
-                    w.u8(8);
-                    w.u64(*until_ns);
-                }
-                Answer::WrongLayer => w.u8(2),
-                Answer::Repeated => w.u8(7),
-                Answer::Superseded => w.u8(10),
-                Answer::RowTooLarge => w.u8(11),
-                Answer::AnswersFull => w.u8(12),
-                Answer::Bucket(o) => {
-                    w.u8(3);
-                    put_bucket_outcome(w, o);
-                }
-                Answer::Name(o) => {
-                    w.u8(4);
-                    put_name_outcome(w, o)?;
-                }
-                Answer::File(o) => {
-                    w.u8(5);
-                    match o {
-                        file::Outcome::Written { deadline_ns } => {
-                            w.u8(0);
-                            w.u64(*deadline_ns);
-                        }
-                        file::Outcome::Deleted => w.u8(1),
-                        file::Outcome::Conflict => w.u8(2),
-                        file::Outcome::Invalid => w.u8(3),
-                        file::Outcome::Settled => w.u8(4),
-                        file::Outcome::Expired => w.u8(5),
-                        file::Outcome::BlocksChecked(verdicts) => {
-                            w.u8(6);
-                            put_verdicts(w, verdicts)?;
-                        }
-                        file::Outcome::Released => w.u8(7),
+        Ok(mantle_codec::encode(0, |w| self.put(w))?.into_vec())
+    }
+
+    /// Writes the answer as `encode` makes it, with no buffer of its own: how a reply that carries
+    /// answers writes each in place, counted first.
+    pub fn put(&self, w: &mut Writer) -> Result<(), RecordError> {
+        match self {
+            Answer::Registered { session } => {
+                w.u8(0);
+                w.u64(*session);
+            }
+            Answer::SessionExpired => w.u8(1),
+            Answer::SessionsFull { until_ns } => {
+                w.u8(8);
+                w.u64(*until_ns);
+            }
+            Answer::WrongLayer => w.u8(2),
+            Answer::Repeated => w.u8(7),
+            Answer::Superseded => w.u8(10),
+            Answer::RowTooLarge => w.u8(11),
+            Answer::AnswersFull => w.u8(12),
+            Answer::Bucket(o) => {
+                w.u8(3);
+                put_bucket_outcome(w, o);
+            }
+            Answer::Name(o) => {
+                w.u8(4);
+                put_name_outcome(w, o)?;
+            }
+            Answer::File(o) => {
+                w.u8(5);
+                match o {
+                    file::Outcome::Written { deadline_ns } => {
+                        w.u8(0);
+                        w.u64(*deadline_ns);
                     }
-                }
-                Answer::Block(o) => {
-                    w.u8(6);
-                    match o {
-                        block::Outcome::Written { deadline_ns } => {
-                            w.u8(0);
-                            w.u64(*deadline_ns);
-                        }
-                        block::Outcome::Moved => w.u8(1),
-                        block::Outcome::Deleted => w.u8(2),
-                        block::Outcome::Conflict => w.u8(3),
-                        block::Outcome::Invalid => w.u8(4),
-                        block::Outcome::NoSuchBlock => w.u8(5),
-                        block::Outcome::Settled => w.u8(6),
-                        block::Outcome::Released => w.u8(7),
-                        block::Outcome::Expired => w.u8(8),
-                        block::Outcome::Unkept => w.u8(9),
-                        block::Outcome::Full => w.u8(10),
+                    file::Outcome::Deleted => w.u8(1),
+                    file::Outcome::Conflict => w.u8(2),
+                    file::Outcome::Invalid => w.u8(3),
+                    file::Outcome::Settled => w.u8(4),
+                    file::Outcome::Expired => w.u8(5),
+                    file::Outcome::BlocksChecked(verdicts) => {
+                        w.u8(6);
+                        put_verdicts(w, verdicts)?;
                     }
-                }
-                Answer::Root(o) => {
-                    w.u8(9);
-                    match o {
-                        root::Outcome::Enlisted => w.u8(0),
-                        root::Outcome::Conflict => w.u8(1),
-                        root::Outcome::Full => w.u8(2),
-                        root::Outcome::Kept => w.u8(3),
-                        root::Outcome::Unknown => w.u8(4),
-                        root::Outcome::Principal(o) => {
-                            w.u8(5);
-                            put_principal_outcome(w, o)?;
-                        }
-                        root::Outcome::Joined => w.u8(6),
-                        root::Outcome::Leaving => w.u8(7),
-                        root::Outcome::Gone => w.u8(8),
-                        root::Outcome::Removed => w.u8(9),
-                        root::Outcome::Stale { top } => {
-                            w.u8(10);
-                            w.u64(*top);
-                        }
-                        root::Outcome::Holding => w.u8(11),
-                        root::Outcome::Delisted => w.u8(12),
-                    }
+                    file::Outcome::Released => w.u8(7),
                 }
             }
-            Ok(())
-        })?;
-        Ok(w.into_vec())
+            Answer::Block(o) => {
+                w.u8(6);
+                match o {
+                    block::Outcome::Written { deadline_ns } => {
+                        w.u8(0);
+                        w.u64(*deadline_ns);
+                    }
+                    block::Outcome::Moved => w.u8(1),
+                    block::Outcome::Deleted => w.u8(2),
+                    block::Outcome::Conflict => w.u8(3),
+                    block::Outcome::Invalid => w.u8(4),
+                    block::Outcome::NoSuchBlock => w.u8(5),
+                    block::Outcome::Settled => w.u8(6),
+                    block::Outcome::Released => w.u8(7),
+                    block::Outcome::Expired => w.u8(8),
+                    block::Outcome::Unkept => w.u8(9),
+                    block::Outcome::Full => w.u8(10),
+                }
+            }
+            Answer::Root(o) => {
+                w.u8(9);
+                match o {
+                    root::Outcome::Enlisted => w.u8(0),
+                    root::Outcome::Conflict => w.u8(1),
+                    root::Outcome::Full => w.u8(2),
+                    root::Outcome::Kept => w.u8(3),
+                    root::Outcome::Unknown => w.u8(4),
+                    root::Outcome::Principal(o) => {
+                        w.u8(5);
+                        put_principal_outcome(w, o)?;
+                    }
+                    root::Outcome::Joined => w.u8(6),
+                    root::Outcome::Leaving => w.u8(7),
+                    root::Outcome::Gone => w.u8(8),
+                    root::Outcome::Removed => w.u8(9),
+                    root::Outcome::Stale { top } => {
+                        w.u8(10);
+                        w.u64(*top);
+                    }
+                    root::Outcome::Holding => w.u8(11),
+                    root::Outcome::Delisted => w.u8(12),
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {

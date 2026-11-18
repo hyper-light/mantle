@@ -9,6 +9,7 @@
 //! | request | the group, u128 little-endian | the entry |
 //! | reply | the status, u8; the leader the node knows, u64 little-endian (0: none); for a redirect, how long until the node acts on its leader's silence, nanoseconds, u64 little-endian (0: not yet measured) | answered: each answer's length, u32 little-endian, then the answer |
 
+use mantle_codec::Writer;
 use mantle_meta::record::RecordError;
 use mantle_meta::wire::Answer;
 
@@ -144,15 +145,20 @@ pub fn read_reply_head(head: &[u8]) -> Result<ReplyHead, CommandError> {
     })
 }
 
-/// Appends `answers` to `out` as a reply's body.
-pub fn encode_answers(out: &mut Vec<u8>, answers: &[Answer]) -> Result<(), CommandError> {
-    for answer in answers {
-        let encoded = answer.encode()?;
-        let len = u32::try_from(encoded.len()).map_err(|_| RecordError::TooLarge(encoded.len()))?;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&encoded);
-    }
-    Ok(())
+/// A reply's body of `answers`, in one buffer made at its length, which the answers are counted
+/// for first (`mantle_codec::encode`): each answer behind its length, written in place.
+pub fn encode_answers(answers: &[Answer]) -> Result<Vec<u8>, CommandError> {
+    let body = mantle_codec::encode(0, |w| {
+        for answer in answers {
+            let mut count = Writer::counting();
+            answer.put(&mut count)?;
+            let len = u32::try_from(count.len()).map_err(|_| RecordError::TooLarge(count.len()))?;
+            w.u32(len);
+            answer.put(w)?;
+        }
+        Ok::<_, CommandError>(())
+    })?;
+    Ok(body.into_vec())
 }
 
 /// The answers a reply's body holds.
@@ -214,8 +220,7 @@ mod tests {
             Answer::Repeated,
             Answer::SessionsFull { until_ns: 5 },
         ];
-        let mut body = Vec::new();
-        encode_answers(&mut body, &answers).unwrap();
+        let body = encode_answers(&answers).unwrap();
         assert_eq!(decode_answers(&body), Ok(answers));
         assert_eq!(
             decode_answers(&body[..body.len() - 1]),

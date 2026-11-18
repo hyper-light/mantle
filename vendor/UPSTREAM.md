@@ -87,10 +87,17 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `e9fa471` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twenty-six commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+**Every crate at `20aa3a6` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twenty-seven commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
 branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
-commit, `e9fa471`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14 and §8): a channel's
+commit, `20aa3a6`, changes hyper-transport and hyper-quic (hyper-raft docs/transport.md, hyper-quic
+VENDORED.md §53), for slice 1 of membership.md §5.1: a directory's refusal of an identity closes
+with the TLS alert `access_denied` (RFC 8446 §6.2) as a QUIC transport close's CRYPTO_ERROR (RFC
+9001 §4.8), which a peer reads in Handshake packets, where an application's close code is replaced
+(RFC 9000 §10.2.3); a dialer refusing its server sends its own flight first, so the server
+authenticates who refused it and is told `Closed { peer, refusal: Identity }`. A side that did not
+dial is told `Identity` for that alert alone, a dialer for any alert of its peer, as before. The one
+before it, `e9fa471`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14 and §8): a channel's
 `Sender::reserve`, after Tokio's `mpsc::Sender::reserve` and `Permit`, waits for room before the
 value is made, in a place of its own among the waiting senders, charged where it goes on; its
 `SendPermit` sends without waiting, keeps a grant of room from every other waiting sender, and

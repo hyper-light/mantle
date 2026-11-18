@@ -502,6 +502,10 @@ struct Conn<R> {
     listed: bool,
     /// The connection was lost and its owner told.
     lost: bool,
+    /// This side dialed and its directory refused the server's identity as its handshake
+    /// completed: the close ([`IDENTITY_REFUSED`]) waits until its own flight is sent, so the
+    /// server authenticates who refused it and can name it (`Endpoint::poll_transmit_batch`).
+    refusing: bool,
     /// The room of the socket it receives on alone, once its driver connected one to its peer
     /// ([`Endpoint::set_peer_room`]); until then its windows are the shared socket's.
     room: Option<Room>,
@@ -841,13 +845,28 @@ fn unprompted_by(quic: &Connection, probes: u64) -> Unprompted {
 /// `0x01ff`, the alert in the low byte).
 const CRYPTO_ERRORS: std::ops::RangeInclusive<u64> = 0x0100..=0x01ff;
 
-/// What a connection's loss says of why it ended, when either side said: a TLS alert from either
-/// side is a certificate refused ([`Refusal::Identity`]); the peer's CONNECTION_REFUSED (RFC 9000
-/// §20.1), sent for an attempt its pending places or its budget could not take, is its pending
-/// bound ([`Refusal::Pending`]); the peer's application close carries its refusal's code
-/// ([`Refusal::code`]). A close that names no refusal, a timeout, a reset and this side's own close
-/// say nothing.
-fn refusal_of(reason: &ConnectionError) -> Option<Refusal> {
+/// The TLS alert a peer's identity is refused with, once its certificate verified and the
+/// directory named no peer by it, or not the one dialed: `access_denied`, "a valid certificate or
+/// PSK was received, but when access control was applied, the sender decided not to proceed with
+/// negotiation" (RFC 8446 §6.2, code 49). It crosses as the CRYPTO_ERROR `0x0100 + 49` of a QUIC
+/// transport close (RFC 9001 §4.8, RFC 9000 §20.1), which unlike an application's close is sent
+/// as it is in Handshake packets (RFC 9000 §10.2.3), so a peer whose handshake is not complete
+/// reads it. One alert alone means it: the peer's verifier refusing a certificate it cannot verify
+/// sends `bad_certificate`, `unknown_ca` and their kind, and a version or protocol it does not
+/// speak `protocol_version` or `no_application_protocol`, so a refused side tells its identity
+/// refused from the rest.
+const IDENTITY_REFUSED: u8 = 49;
+
+/// What a connection's loss says of why it ended, when either side said: a TLS alert this side's
+/// handshake raised, or one from the peer of a connection this side dialed, is a certificate
+/// refused ([`Refusal::Identity`]); on a connection the peer dialed only the peer's
+/// [`IDENTITY_REFUSED`] is, its other alerts being a certificate it could not verify or a version
+/// it does not speak, not its directory's word on this side's identity; the peer's
+/// CONNECTION_REFUSED (RFC 9000 §20.1), sent for an attempt its pending places or its budget could
+/// not take, is its pending bound ([`Refusal::Pending`]); the peer's application close carries its
+/// refusal's code ([`Refusal::code`]). A close that names no refusal, a timeout, a reset and this
+/// side's own close say nothing.
+fn refusal_of(reason: &ConnectionError, dialed: bool) -> Option<Refusal> {
     match reason {
         ConnectionError::TransportError(error)
             if CRYPTO_ERRORS.contains(&u64::from(error.code)) =>
@@ -855,7 +874,8 @@ fn refusal_of(reason: &ConnectionError) -> Option<Refusal> {
             Some(Refusal::Identity)
         }
         ConnectionError::ConnectionClosed(close)
-            if CRYPTO_ERRORS.contains(&u64::from(close.error_code)) =>
+            if CRYPTO_ERRORS.contains(&u64::from(close.error_code))
+                && (dialed || close.error_code == TransportErrorCode::crypto(IDENTITY_REFUSED)) =>
         {
             Some(Refusal::Identity)
         }
@@ -1097,10 +1117,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             let sent = conn
                 .quic
                 .poll_transmit(now, max_datagrams.max(1), out, self.quic.configs());
+            // A server's identity this side refused is closed once this side's flight is sent, or
+            // once nothing more of it can be: its close is sent at the connection's next turn.
+            let refused = conn.refusing && (sent.is_none() || !conn.quic.crypto_pending());
+            if refused {
+                conn.refusing = false;
+                conn.quic.close_alert(now, IDENTITY_REFUSED);
+            }
             // What it sent may be sources its coding keeps
             self.core.charge_fec(conn);
             // Sending, or finding nothing to send, moves the connection's timers.
             self.rearm_later(key);
+            if refused {
+                self.queue_sending(key);
+            }
             if let Some(transmit) = sent {
                 self.endpoint_events(key);
                 self.queue_sending(key);
@@ -2379,6 +2409,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             set_back: None,
             listed: false,
             lost: false,
+            refusing: false,
             room: None,
             share: Share::default(),
             served: 0,
@@ -2830,7 +2861,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         match event {
             QuicEvent::Connected => return self.connected(now, key, conn),
             QuicEvent::ConnectionLost { reason } => {
-                let refusal = refusal_of(&reason);
+                let refusal = refusal_of(&reason, conn.dialed.is_some());
                 self.lost_for(key, conn, refusal);
             }
             QuicEvent::Stream(event) => self.on_stream(now, key, conn, event),
@@ -2998,8 +3029,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         conn: &mut Conn<C::Role>,
         refusal: Refusal,
     ) -> Option<usize> {
-        conn.quic
-            .close(now, VarInt::from_u32(refusal.code()), bytes::Bytes::new());
+        match (refusal, conn.dialed) {
+            // The server's identity, refused as this side's handshake completed: its flight goes
+            // first, so the server reads the refusal from a peer it authenticated.
+            (Refusal::Identity, Some(_)) => conn.refusing = true,
+            (Refusal::Identity, None) => conn.quic.close_alert(now, IDENTITY_REFUSED),
+            _ => conn
+                .quic
+                .close(now, VarInt::from_u32(refusal.code()), bytes::Bytes::new()),
+        }
         if let Some(peer) = conn.dialed {
             conn.lost = true;
             self.dial_failed(peer, Some(refusal));
@@ -5308,5 +5346,40 @@ fn priority<C: Classes>(rank: u8) -> i32 {
 fn bind_stream(by_stream: &mut Vec<(StreamId, u64)>, stream: StreamId, id: u64) {
     if let Err(at) = by_stream.binary_search_by_key(&stream, |(held, _)| *held) {
         by_stream.insert(at, (stream, id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closed_with(alert: u8) -> ConnectionError {
+        ConnectionError::ConnectionClosed(hyper_quic::ConnectionClose {
+            error_code: TransportErrorCode::crypto(alert),
+            frame_type: None,
+            reason: Bytes::new(),
+        })
+    }
+
+    /// RFC 8446 §6.2's `unknown_ca`, what a verifier sends for a certificate under no root it
+    /// holds.
+    const UNKNOWN_CA: u8 = 48;
+
+    #[test]
+    fn only_the_identity_alert_refuses_the_identity_of_a_side_that_did_not_dial() {
+        assert_eq!(
+            refusal_of(&closed_with(IDENTITY_REFUSED), false),
+            Some(Refusal::Identity)
+        );
+        assert_eq!(refusal_of(&closed_with(UNKNOWN_CA), false), None);
+        // A dialer is told any alert of its peer as a certificate refused, as it was.
+        assert_eq!(
+            refusal_of(&closed_with(IDENTITY_REFUSED), true),
+            Some(Refusal::Identity)
+        );
+        assert_eq!(
+            refusal_of(&closed_with(UNKNOWN_CA), true),
+            Some(Refusal::Identity)
+        );
     }
 }

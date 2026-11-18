@@ -415,6 +415,151 @@ fn a_server_whose_certificate_does_not_verify_is_unreachable_for_its_identity() 
     assert!(asker.connected.is_empty());
 }
 
+/// Node 1's book, in which node 2 is written off: named, so node 1 dials it, and its certificate,
+/// though it verifies under the authority, names no peer.
+fn wrote_off_two(pair: &Pair) -> Book {
+    let mut book = Book::default();
+    book.add(&pair.one.0, 1, Role::Node);
+    book.written_off(2);
+    book
+}
+
+#[test]
+fn a_server_whose_identity_its_dialer_refuses_is_told_who_refused_it() {
+    let pair = Pair::new();
+    let now = now();
+    let a = pair.node::<Mantle>(1, Role::Node, wrote_off_two(&pair), limits(), 64 << 20, now);
+    let b = pair.node::<Mantle>(
+        2,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        64 << 20,
+        now,
+    );
+    let mut net = Net::new(now, a, b);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let mut asker = Asker::new();
+    let mut server = Vec::new();
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.extend(events(&mut net.b));
+        !asker.unreachable.is_empty()
+            && server
+                .iter()
+                .any(|event| matches!(event, Event::Closed { .. } | Event::Unreachable { .. }))
+    });
+    // The dialer refused the server's identity, and is told so as before.
+    assert_eq!(asker.unreachable, vec![(2, Some(Refusal::Identity))]);
+    assert!(asker.connected.is_empty(), "{:?}", asker.connected);
+    // Its flight went before its refusal, so the server authenticated who refused it: its
+    // connection was up (its first epoch), then closed for its own identity. An owner that had
+    // not polled in between hears the close alone.
+    let told: Vec<String> = server.iter().map(|event| format!("{event:?}")).collect();
+    let closed: Vec<_> = server
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                Event::Connected {
+                    peer: 1,
+                    epoch: 1,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            closed.as_slice(),
+            [Event::Closed {
+                peer: 1,
+                epoch: 1,
+                refusal: Some(Refusal::Identity),
+            }]
+        ),
+        "{told:?}"
+    );
+}
+
+#[test]
+fn a_dial_whose_identity_the_server_refuses_is_told_so() {
+    let pair = Pair::new();
+    let now = now();
+    // Node 2, written off at node 1, dials it.
+    let a = pair.node::<Mantle>(
+        2,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        64 << 20,
+        now,
+    );
+    let b = pair.node::<Mantle>(1, Role::Node, wrote_off_two(&pair), limits(), 64 << 20, now);
+    let mut net = Net::new(now, a, b);
+    let address = net.b_address;
+    net.a.connect(now, 1, address).unwrap();
+    let mut asker = Asker::new();
+    let mut server = Vec::new();
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.extend(events(&mut net.b));
+        !asker.unreachable.is_empty() || !asker.closed.is_empty()
+    });
+    let told: Vec<_> = asker.unreachable.iter().chain(&asker.closed).collect();
+    assert_eq!(told, vec![&(1, Some(Refusal::Identity))]);
+    // The refusing side admitted nothing, and told its owner nothing.
+    assert!(server.is_empty(), "{:?}", server.len());
+    assert_eq!(net.b.stats().admission.refused_identity, 1);
+}
+
+#[test]
+fn a_certificate_refused_for_its_authority_is_not_told_its_server_as_its_identity_refused() {
+    let pair = Pair::new();
+    let now = now();
+    // Node 1 trusts another authority than the one that issued node 2's certificate: its own
+    // verifier refuses node 2 within the handshake, with `unknown_ca` (RFC 8446 §6.2).
+    let stranger = Pki::new();
+    let config = Config {
+        tls: Tls::mutual(&credentials(&stranger.root, &pair.one.0, &pair.one.1), true).unwrap(),
+        role: Role::Node,
+        limits: limits(),
+        congestion: Default::default(),
+    };
+    let a = Endpoint::<Mantle, _, _>::new(
+        config,
+        Fixed::new(64 << 20, 64),
+        pair.book(Role::Node, Role::Node),
+        now,
+    )
+    .unwrap();
+    let b = pair.node::<Mantle>(
+        2,
+        Role::Node,
+        pair.book(Role::Node, Role::Node),
+        limits(),
+        64 << 20,
+        now,
+    );
+    let mut net = Net::new(now, a, b);
+    let address = net.b_address;
+    net.a.connect(now, 2, address).unwrap();
+    let mut asker = Asker::new();
+    let mut server = Vec::new();
+    // Until the dial failed and the server's handshake for it ended.
+    net.until(TURNS, |net| {
+        asker.drive(&mut net.a);
+        server.extend(events(&mut net.b));
+        !asker.unreachable.is_empty() && net.b.stats().admission.pending == 0
+    });
+    assert_eq!(asker.unreachable, vec![(2, Some(Refusal::Identity))]);
+    // The server never authenticated its dialer, and a certificate refused for its authority is
+    // not its identity refused: it is told nothing.
+    let told: Vec<String> = server.iter().map(|event| format!("{event:?}")).collect();
+    assert!(server.is_empty(), "{told:?}");
+}
+
 #[test]
 fn a_dial_refused_at_the_peers_identity_bound_is_told_it_was_full() {
     let pair = Pair::new();

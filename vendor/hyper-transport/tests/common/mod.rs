@@ -325,6 +325,12 @@ impl Book {
         self.entries.push((certificate.to_vec(), peer, role));
         self.names.push((peer, name(peer)));
     }
+
+    /// `peer` written off: named, so it can be dialed, and its certificate, which verifies under
+    /// the authority, names no peer here, so its identity is refused at every handshake.
+    pub fn written_off(&mut self, peer: PeerId) {
+        self.names.push((peer, name(peer)));
+    }
 }
 
 impl Directory for Book {

@@ -288,8 +288,11 @@ pub enum Event<C: Classes> {
         /// Why, when either side said, as [`Event::Unreachable`] tells it: a TLS client's
         /// handshake is complete before the server has verified its certificate (RFC 8446 §4.4.4,
         /// RFC 9001 §4.1.2), so a dial whose certificate the peer refuses, by TLS or by its
-        /// directory, is up and then closed with [`Refusal::Identity`]; a connection the peer's
-        /// admission replaced closes with its bound ([`Refusal::Connections`]).
+        /// directory, is up and then closed with [`Refusal::Identity`]; a dialer whose directory
+        /// refuses the server sends its own flight before its refusal, so the server's connection
+        /// to it is up and then closed with [`Refusal::Identity`] too, the server told its own
+        /// identity refused by a peer it authenticated; a connection the peer's admission replaced
+        /// closes with its bound ([`Refusal::Connections`]).
         refusal: Option<Refusal>,
     },
     /// A dial to `peer` ended before it authenticated, or authenticated as someone else. Told for

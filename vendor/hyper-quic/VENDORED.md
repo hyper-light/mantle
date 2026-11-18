@@ -1842,3 +1842,27 @@ Tests: `endpoints_seeded_alike_issue_the_same_connection_ids` and
 `a_seeded_endpoint_keeps_a_chosen_generator_key` (both fail on the code before, each endpoint's IDs
 the thread's), `unseeded_endpoints_issue_unpredictable_connection_ids` and
 `seeded_ids_leave_the_endpoints_own_draws_where_they_were`.
+
+## 53. A close with a TLS alert, and the handshake data still owed (2026-11-18, found by mantle)
+
+- **Patch Q37: `Connection::close_alert`.** Closes the connection at once with a TLS alert, as a
+  handshake's own verifier does: a transport CONNECTION_CLOSE carrying CRYPTO_ERROR `0x0100 +
+  alert` (RFC 9001 §4.8, RFC 9000 §20.1). A transport close is sent as it is in every packet number
+  space the peer may read, where an application's close is replaced by APPLICATION_ERROR in Initial
+  and Handshake packets (RFC 9000 §10.2.3), so a peer whose handshake is not complete reads the
+  alert too.
+- **Patch Q38: `Connection::crypto_pending`.** Whether CRYPTO data waits to be sent in any packet
+  number space. A closed connection sends only its close (RFC 9000 §10.2.1), so a client closed as
+  its handshake completes never sends its own flight (Certificate, CertificateVerify, Finished, RFC
+  8446 §4.4); an owner that wants the server to authenticate it first closes once this is false.
+  No behaviour changes.
+- **Why.** hyper-transport refuses a peer's identity once its directory has read the certificate
+  the handshake verified, after the handshake. Refused with an application close, a server refused
+  by its dialer read APPLICATION_ERROR, with no code, before it had authenticated the dialer, and
+  was told nothing: a node mantle's cell had written off never learned it from the members that
+  dialed it (mantle membership.md §5.1). hyper-transport now closes with `access_denied` (RFC 8446
+  §6.2), its dialer's flight sent first.
+
+Tests: hyper-transport's `a_server_whose_identity_its_dialer_refuses_is_told_who_refused_it` (the
+server is told nothing on the code before), `a_dial_whose_identity_the_server_refuses_is_told_so`
+and `a_certificate_refused_for_its_authority_is_not_told_its_server_as_its_identity_refused`.

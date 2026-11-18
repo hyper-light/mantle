@@ -1932,6 +1932,29 @@ impl Connection {
         )
     }
 
+    /// Close a connection immediately with TLS alert `alert`, as a handshake's own verifier would:
+    /// a CONNECTION_CLOSE carrying CRYPTO_ERROR `0x0100 + alert` (RFC 9001 §4.8, RFC 9000 §20.1).
+    /// A transport close is sent as it is in every packet number space the peer may read, where an
+    /// application's close is replaced by APPLICATION_ERROR in Initial and Handshake packets (RFC
+    /// 9000 §10.2.3), so a peer whose handshake is not complete reads the alert too.
+    pub fn close_alert(&mut self, now: Instant, alert: u8) {
+        self.close_inner(
+            now,
+            Close::Connection(frame::ConnectionClose {
+                error_code: TransportErrorCode::crypto(alert),
+                frame_type: None,
+                reason: Bytes::new(),
+            }),
+        )
+    }
+
+    /// Whether handshake data waits to be sent in any packet number space: a client whose
+    /// handshake has just completed owes its server its flight (Certificate, CertificateVerify,
+    /// Finished, RFC 8446 §4.4) until this is false, and a closed connection sends none of it.
+    pub fn crypto_pending(&self) -> bool {
+        SpaceId::iter().any(|space| !self.spaces.get(space).pending.crypto.is_empty())
+    }
+
     fn close_inner(&mut self, now: Instant, reason: Close) {
         let was_closed = self.state.is_closed();
         if !was_closed {

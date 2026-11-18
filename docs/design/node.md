@@ -1760,6 +1760,18 @@ placed on its second, checked on open, and the same laws hold over one shard and
 holds a stream word through a full lane and tells it in order; `node::spread` counts the shards
 that run ranges as the rule fills them.
 
+*Measured, and placement held to the first shard (2026-11-18).* Ladder r40 (lean-doors
+`ec7519e1`, `adas-mac-studio.local-2`, closed ladder of 1 B operations through the native door,
+`mantle bench doors`) placed each node's ranges over its shards against r28 (`54fda898`, every range
+on the first shard): HEAD rose from 29,391/s to 63,189/s best (128 clients), but PUT fell from
+2,779/s best at 1,024 clients to 641/s at 128, the ladder ending at 256 with 86 PUTs left
+unanswered after `SlowDown`, and GET from 8,551/s to 2,190/s. A far range's proposal or read the
+range refuses (a full lane, a range not leading) is dropped and left to its asker's patience
+(step 2b, step 4's slots not yet built), and a range's shard also serves S3 connections while it
+waits on the device (`permit_blocking`). So `process::serve` places a node's ranges over its first
+shard alone (`NodeSettings::shards` one) until a far range's refusal is answered and the ladder
+measures placement over the shards past r28; the cluster suite still runs nodes over two shards.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

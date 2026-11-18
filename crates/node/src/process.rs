@@ -2226,11 +2226,12 @@ async fn serve(
     let connections = gateway
         .as_ref()
         .map_or(0, |g| u64::try_from(g.objects).unwrap_or(u64::MAX));
-    // The runtime's shards that take tasks, which the node places its ranges over: its first, the
-    // node's, and each past it.
-    let shards = NonZeroUsize::MIN
-        .checked_add(others.len())
-        .ok_or_else(|| step(Step::Network)(ProcessError::Runtime("the node's shards".into())))?;
+    // The shards the node places its ranges over: its first alone, until a far range's refused
+    // proposal or read is answered rather than left to its asker's patience (node.md §2.9). Placed
+    // over every shard, ladder r40 (lean-doors ec7519e1, adas-mac-studio.local-2, 1 B, native door)
+    // served PUTs at 641/s best, at 128 clients, and left 86 unanswered at 256, where r28 (54fda898,
+    // ranges on the first shard) served 2,779/s at 1,024; GETs fell from 8,551/s to 2,190/s.
+    let shards = NonZeroUsize::MIN;
     let settings = NodeSettings {
         id: config.id,
         dir: config.dir.clone(),

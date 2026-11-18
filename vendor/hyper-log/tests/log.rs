@@ -4367,3 +4367,115 @@ fn a_write_sent_behind_a_refused_one_is_refused_too() {
     let view = log.view(1).unwrap().unwrap();
     assert_eq!((view.last, view.hard_state), (2, Some(hard(1, 2))));
 }
+
+/// The persist area's slots in pieces of the simulated device's 512-byte sector under the
+/// 4,096-byte block of `config(16, _)` (mantle durability.md §7.7): past the two whole slots of
+/// 64 groups' records, 8,192 bytes each, and each 8,192 bytes, 16 pieces of four rows.
+const PIECES_SLOTS: [u64; 2] = [16_384, 24_576];
+/// The whole slots' offsets, as a binary before pieces lays them.
+const WHOLE_SLOTS: [u64; 2] = [0, 8_192];
+
+/// The record in pieces of the slot at `at` of `image`.
+fn pieced(image: &[u8], at: u64) -> hyper_log::format::Pieced {
+    let pieces = hyper_log::format::Pieces::new(Alignment::new(512).unwrap(), false).unwrap();
+    let at = at as usize;
+    pieces.decode(&image[at..at + 8_192]).unwrap()
+}
+
+/// Writes `bytes` at `at` of `file`, padded to the block, then flushes.
+fn write_flushed(file: &SimFile, bytes: &[u8], at: u64) {
+    let mut buf = AlignedBuf::zeroed(bytes.len(), file.layout_block()).unwrap();
+    buf.extend_from_slice(bytes).unwrap();
+    file.write_all_at(buf.padded().unwrap(), at).unwrap();
+    file.sync_data().unwrap();
+}
+
+/// A log of whole persist records (format 3), as a binary before pieces leaves it, opens and moves
+/// its area to pieces of the device's unit, carrying each slot's record into its slot in pieces,
+/// and writes in pieces from then on. Its last frame damaged at rest, the open restores it from
+/// the record it carried. The mark at the area's start is the record a binary before pieces
+/// refuses.
+#[test]
+fn a_log_of_whole_records_opens_and_writes_in_pieces() {
+    let file = sim(46);
+    let cfg = config_now(16, 8);
+    let log = Log::create(file, cfg, ID).unwrap();
+    let unit = Alignment::new(512).unwrap();
+    assert_eq!(log.laid().pieces, Some(unit));
+    assert!(
+        log.laid().device.stated(),
+        "the simulated device states its sector"
+    );
+    for index in 1..=2 {
+        let update = Update {
+            entries: Some(entries(index, &[index])),
+            ..Update::default()
+        };
+        log.write(1, update).unwrap();
+    }
+    let file = closed(log);
+    // The area as a binary before pieces leaves it: each slot's record whole at its old offset,
+    // nothing else.
+    let image = file.durable_image().unwrap();
+    assert_eq!(
+        hyper_log::format::pieces_marked(&image, ID, false),
+        Some(unit)
+    );
+    write_flushed(&file, &vec![0u8; AREA as usize], 0);
+    for (from, to) in PIECES_SLOTS.into_iter().zip(WHOLE_SLOTS) {
+        let hyper_log::format::Pieced::Whole(record) = pieced(&image, from) else {
+            panic!("the slot at {from} holds a whole record in pieces");
+        };
+        write_flushed(&file, &record.encode().unwrap(), to);
+    }
+    // The last frame is damaged at rest.
+    let last = valid_frames(&file.durable_image().unwrap())
+        .into_iter()
+        .max_by_key(|f| f.2)
+        .unwrap();
+    assert_eq!(last.2, 2);
+    file.inject(Fault::BitFlip {
+        offset: last.0 + 70,
+        bit: 0,
+        stored: true,
+    })
+    .unwrap();
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(recovery.laid.pieces, Some(unit), "moved to pieces");
+    assert_eq!(recovery.tail, Tail::Lost { sequence: 2 });
+    assert_eq!(recovery.restored, vec![1]);
+    log.write(
+        2,
+        Update {
+            hard_state: Some(HardState {
+                term: 1,
+                vote: 1,
+                commit: 0,
+                held: None,
+            }),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    let file = closed(log);
+    let image = file.durable_image().unwrap();
+    assert_eq!(
+        hyper_log::format::pieces_marked(&image, ID, false),
+        Some(unit)
+    );
+    let newest = valid_frames(&image).into_iter().map(|f| f.2).max().unwrap();
+    let hyper_log::format::Pieced::Whole(record) =
+        pieced(&image, PIECES_SLOTS[(newest % 2) as usize])
+    else {
+        panic!("the newest frame's record reads whole in pieces");
+    };
+    assert_eq!(record.sequence, newest);
+    // A binary before pieces reads the mark as a sealed record in this unsealed log.
+    let mark = hyper_log::format::Persist::decode(&image).unwrap();
+    assert_eq!((mark.log, mark.sealed), (ID, true));
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(recovery.laid.pieces, Some(unit));
+    assert_eq!(recovery.tail, Tail::Torn);
+    assert_eq!(log.view(1).unwrap().unwrap().last, 1);
+    assert!(log.view(2).unwrap().is_some());
+}

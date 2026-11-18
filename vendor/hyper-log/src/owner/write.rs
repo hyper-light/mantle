@@ -945,7 +945,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             } else {
                 target.offset
             };
-            Ok((frame, at, record, self.record_at(sequence)?, confirm))
+            Ok((frame, at, record, self.record_at(sequence), confirm))
         });
         match job {
             Ok((frame, at, record, record_at, confirm)) => {
@@ -1179,12 +1179,16 @@ impl<F: BlockFile + 'static> Owner<F> {
         b.persist.groups.extend(updates.map(writer::persisted));
         b.record_bytes.clear();
         b.persist.sealed = self.seal.is_some();
-        b.persist
-            .encode_into(&mut b.record_bytes)
-            .ok_or(LogError::TooLarge(b.persist.groups.len()))?;
-        let mac = match &self.seal {
-            Some(seal) => Some(seal.mac(b.record_bytes.as_slice())?),
-            None => None,
+        // In pieces where the log's area is laid so (format 5), each a unit the device writes
+        // whole; whole otherwise, a sealed log's MAC after it (mantle durability.md §7.7).
+        let encoded = match self.p.area.pieces() {
+            Some(pieces) => pieces.encode_into(&b.persist, &mut b.record_bytes),
+            None => b.persist.encode_into(&mut b.record_bytes),
+        };
+        encoded.ok_or(LogError::TooLarge(b.persist.groups.len()))?;
+        let mac = match (&self.seal, self.p.area.pieces()) {
+            (Some(seal), None) => Some(seal.mac(b.record_bytes.as_slice())?),
+            (None, _) | (Some(_), Some(_)) => None,
         };
         let len = b
             .record_bytes
@@ -1202,9 +1206,8 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// The file offset of the persist slot of the frame of `sequence`.
-    fn record_at(&self, sequence: u64) -> Result<u64, LogError> {
-        let slot = crate::recover::persist_slot(&self.p.config, self.p.align, self.seal.is_some())?;
-        Ok(crate::recover::persist_at(slot, sequence))
+    fn record_at(&self, sequence: u64) -> u64 {
+        self.p.area.at(sequence)
     }
 
     /// The frame is on the device: published, the frame before answered, and the loop goes on,
@@ -1431,8 +1434,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             return false;
         }
         // The confirmation was laid out with the frame, while its updates were whole.
-        let (Some(record), Ok(record_at)) = (frame.confirm.take(), self.record_at(frame.sequence))
-        else {
+        let record_at = self.record_at(frame.sequence);
+        let Some(record) = frame.confirm.take() else {
             self.fence();
             self.unanswerable(frame);
             return false;

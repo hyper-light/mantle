@@ -87,9 +87,25 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `9580588` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and four commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is in
-the hyper-raft repository's own objects and not yet pushed to its origin. Its third and fourth
+**Every crate at `3df5efa` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and seven commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
+in the hyper-raft repository's own objects and not yet pushed to its origin. Its seventh commit,
+`3df5efa`, changes hyper-log alone (mantle docs/design/durability.md §7.7, step 2b-ii): an unsealed
+log writes and reads its persist records in pieces of the device's atomic write unit (format 5), its
+frame's record, its confirmation and a lost frame's copy (which fills its slot, so no later frame's
+pieces hide it), each one write then a full flush, frames
+still answered only once confirmed. The slots in pieces lie past the whole ones, at offsets the
+larger of the unit and the file's block divides; the area's start holds the mark of pieces, a whole
+record of the other kind that a binary before format 5 refuses; a log of whole records moves to
+pieces at its open, carrying its records; `Recovery::laid` and `Log::laid` report the device's unit,
+its source and whether the OS stated it, with the area's. Sealed logs keep format 4. The equivalence
+test's hashes are regenerated: the images differ only in the persist area, and no transcript line
+but the crash images' hashes. New constant `PIECES_MARK_LEN`, with its row and the mark decoder's
+widths in docs/design/constants.md. Its sixth commit, `df77855`, changes hyper-block alone:
+`BlockFile::atomic_unit`, a `DeviceFile` asking the OS, a simulated file stating its sector, any
+other file `AtomicUnit::DEFAULT`. Its fifth commit, `e848f80`, changes a hyper-rt test alone: the
+coop class test marks its trail with atomics, so hyper-raft's contracts check, which allows no
+`RefCell` in hyper-rt, passes again. Before them, every crate was at `9580588`. Its third and fourth
 commits, `79c74de` and `9580588`, change hyper-block alone (mantle docs/design/durability.md §7.2
 and §7.7, step 2b-i): `atomic::atomic_unit(file, path)` reads the atomic write unit of the device
 under a file from the OS, an `AtomicUnit` of the unit (an `Alignment`, as `Pieces::new` takes it)

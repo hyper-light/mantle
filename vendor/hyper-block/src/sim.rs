@@ -10,6 +10,7 @@ use std::cell::{RefCell, RefMut};
 use hyper_sim::storage::{Device, StorageError};
 
 use crate::DiskError;
+use crate::atomic::AtomicUnit;
 use crate::block::BlockFile;
 use crate::buf::Alignment;
 
@@ -28,6 +29,8 @@ pub const MAX_SIM_LEN: u64 = hyper_sim::storage::MAX_LEN;
 pub struct SimFile {
     disk: RefCell<Disk>,
     align: Alignment,
+    /// What a crash tears writes at: the simulated device's atomic write unit.
+    sector: Alignment,
 }
 
 impl SimFile {
@@ -38,6 +41,7 @@ impl SimFile {
         Ok(Self {
             disk: RefCell::new(Disk::new(align, sector, seed)?),
             align,
+            sector,
         })
     }
 
@@ -215,6 +219,11 @@ pub(crate) fn sim_error(what: &str) -> DiskError {
 impl BlockFile for SimFile {
     fn alignment(&self) -> Alignment {
         self.align
+    }
+
+    /// The sector a crash tears writes at, stated as a device states its physical block.
+    fn atomic_unit(&self) -> Result<AtomicUnit, DiskError> {
+        Ok(AtomicUnit::of_sector(self.sector))
     }
 
     fn len(&self) -> Result<u64, DiskError> {

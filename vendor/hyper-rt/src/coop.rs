@@ -197,7 +197,6 @@ impl Future for GiveWay {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     use super::{Class, class, set_class};
@@ -235,6 +234,16 @@ mod tests {
                 .iter()
                 .map(|m| char::from(m.load(Ordering::Relaxed)))
                 .collect()
+        }
+    }
+
+    /// A task's class as a trail's letter: `c`ritical, `n`ormal, `b`ackground, `-` off a task.
+    fn letter(class: Option<Class>) -> u8 {
+        match class {
+            Some(Class::Critical) => b'c',
+            Some(Class::Normal) => b'n',
+            Some(Class::Background) => b'b',
+            None => b'-',
         }
     }
 
@@ -310,13 +319,13 @@ mod tests {
         let mut rt = LocalRuntime::new(&config()).unwrap();
         let seen = rt
             .block_on(async move {
-                let classes = shared(RefCell::new(Vec::new()));
+                let classes = Trail::new(8);
                 let outer = classes;
                 spawn_detached_as(Class::Critical, async move {
-                    outer.borrow_mut().push(class());
+                    outer.mark(letter(class()));
                     let inner = outer;
                     spawn_detached(async move {
-                        inner.borrow_mut().push(class());
+                        inner.mark(letter(class()));
                     })
                     .unwrap();
                 })
@@ -327,7 +336,7 @@ mod tests {
                 for _ in 0..4 {
                     let again = classes;
                     let _ = spawn(async move {
-                        again.borrow_mut().push(class());
+                        again.mark(letter(class()));
                     })
                     .unwrap();
                 }
@@ -335,23 +344,12 @@ mod tests {
                     yield_now().await;
                 }
                 let root = class();
-                let seen = classes.borrow().clone();
-                (root, seen)
+                (root, classes.read())
             })
             .unwrap();
         let (root, seen) = seen;
         assert_eq!(root, Some(Class::Normal), "a root starts Normal");
-        assert_eq!(
-            seen,
-            vec![
-                Some(Class::Critical),
-                Some(Class::Normal),
-                Some(Class::Normal),
-                Some(Class::Normal),
-                Some(Class::Normal),
-                Some(Class::Normal),
-            ]
-        );
+        assert_eq!(seen, "cnnnnn", "Critical, then Normal for the rest");
         assert_eq!(class(), None, "off a task");
     }
 

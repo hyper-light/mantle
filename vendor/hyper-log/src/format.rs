@@ -1181,6 +1181,53 @@ impl Persist {
     }
 }
 
+/// Bytes of the mark that a log's persist area holds records in pieces: a whole persist record of
+/// no groups, its CRC after it ([`persist_len`] of none).
+pub const PIECES_MARK_LEN: usize = PERSIST_HEADER_LEN + 4;
+
+/// The mark that log `log`'s persist area holds its records in pieces laid in `unit` (format 5,
+/// durability.md §7.7): a whole persist record of the other kind than the log's (format 4 in an
+/// unsealed log, 3 in a sealed one), of no groups, sequence and confirmation 0, whose first
+/// padding byte is the base-2 logarithm of the unit, under the record's CRC. It lies at the start
+/// of the area, where every binary reads a slot. A binary from before format 5 reads it as a record
+/// of the other kind and refuses the log, as it refuses a sealed record in an unsealed log and the
+/// reverse, rather than read the pieces after it as no record.
+pub fn pieces_mark(log: u128, sealed: bool, unit: Alignment) -> Option<[u8; PIECES_MARK_LEN]> {
+    let mut w = Writer::with_capacity(PIECES_MARK_LEN);
+    w.bytes(&PERSIST_MAGIC);
+    w.u8(if sealed { FORMAT } else { FORMAT_SEALED });
+    w.u8(u8::try_from(unit.get().trailing_zeros()).ok()?);
+    w.zeros(2);
+    w.u128(log);
+    w.u64(0);
+    w.u64(0);
+    w.u32(0);
+    let crc = crate::codec::crc32c(w.as_slice());
+    w.u32(crc);
+    w.as_slice().try_into().ok()
+}
+
+/// The unit the persist area of log `log` is laid in, if `bytes` begin with its mark of pieces
+/// ([`pieces_mark`]) and the mark's checksum holds.
+pub fn pieces_marked(bytes: &[u8], log: u128, sealed: bool) -> Option<Alignment> {
+    let whole = bytes.get(..PIECES_MARK_LEN)?;
+    let (body, crc) = whole.split_at(PIECES_MARK_LEN.checked_sub(4)?);
+    if crate::codec::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
+        return None;
+    }
+    let mut r = Reader::new(body);
+    if r.take(4)? != PERSIST_MAGIC || r.u8()? != if sealed { FORMAT } else { FORMAT_SEALED } {
+        return None;
+    }
+    let unit = 1usize.checked_shl(u32::from(r.u8()?))?;
+    r.take(2)?;
+    let mark = (r.u128()?, r.u64()?, r.u64()?, r.u32()?);
+    if mark != (log, 0, 0, 0) {
+        return None;
+    }
+    Alignment::new(unit).ok()
+}
+
 /// How a persist record is cut into pieces for a device whose atomic write unit is `unit`: format
 /// 5, and 6 in a sealed log (mantle docs/design/durability.md §7.2). Piece `i` lies `i` units into
 /// the record's slot: its header, its rows, its CRC over both, a sealed log's MAC, then zeros to

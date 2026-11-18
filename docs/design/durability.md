@@ -384,8 +384,42 @@ answered. Two cases reach it:
    pieces and its decoding, a slot's newest record whole, torn with the rows its landed pieces
    hold, or `LogError::Damaged`. 2b-i, built (hyper-raft `mantle-frame-flush`): the device's
    atomic write unit read from the OS as §7.2 states, with whether the OS stated it or it is the
-   default (hyper-block `atomic::atomic_unit`). 2b-ii: the writer and the open taking the pieces in
-   that unit.
+   default (hyper-block `atomic::atomic_unit`). 2b-ii, built (hyper-raft `mantle-frame-flush`):
+   the writer and the open take the pieces in that unit, for an unsealed log.
+   - The open and the create ask the file for its device's unit (`BlockFile::atomic_unit`), and
+     report it, where it was read and whether the OS stated it, with the unit the records are laid
+     in (`Recovery::laid`, `Log::laid`), so a node on the 512-byte default shows.
+   - A frame's record, its confirmation rewritten in place and the copy of a lost frame's record
+     before its restore are each written in pieces, one write then the platform's full flush, as
+     before. Frames are still answered only once confirmed. The copy fills its slot with zeros past
+     its pieces: the slot may hold the pieces of a later frame's longer record that never became
+     durable, which would read as the slot's newest record, torn, and hide the copy. Each of the
+     writer's records names a later frame or confirmation than its slot holds, so it reads as the
+     newest without.
+   - The two slots in pieces lie past the two whole slots, each at an offset the larger of the
+     unit and the file's block divides, their length a multiple of it: a piece stays one unit
+     while the write meets a direct file's alignment where that is larger (512 against 4,096).
+     Logs of whole records (format 3, 4 sealed) keep their offsets. An area that cannot hold both
+     slots keeps whole records, and a unit that holds no row is refused.
+   - The area's start holds the mark of pieces: a whole persist record of the other kind than the
+     log's, of no groups, its padding byte the unit's base-2 logarithm. A binary from before
+     format 5 reads it as a sealed record in an unsealed log and refuses the log by that format
+     check, where it would otherwise read the pieces as no record.
+   - An unsealed log of whole records moves to pieces at its open: each slot in pieces written
+     whole, zeros and the pieces of the record its whole slot holds, so a slot holds only zeros and
+     pieces as the decoder assumes; one flush; then the mark and a flush. A crash before the mark
+     is durable leaves the whole records for the next open.
+   - Slots are read in the unit the mark records. A torn record is no record, the tail
+     `Torn`; a damaged piece is `LogError::Damaged`. New records keep the recorded unit when the
+     device's differs, since the slots lie where that unit put them: a log moved to a device of a
+     larger unit stays safe, its pieces inside the device's unit; one moved to a smaller unit could
+     tear a piece, which reads as damage and is refused, never as a lost answer. Re-laying such an
+     area in the device's unit at the open is left to 2b-iii.
+   - A sealed log keeps whole records (format 4) until its pieces carry MACs (2b-iii): without one
+     per piece, a piece would be a record no key vouches for.
+
+   2b-iii: sealed pieces with a MAC each (format 6), re-laying an area whose recorded unit is
+   larger than the device's, and hyper-log's ORIGIN.md.
 3. Each frame records whether it was answered at its flush; the open restores an `Undetermined`
    frame so answered as `Lost` is, and the simulation's faults of §7.6 run against it.
 4. The writer answers a frame at its flush where §7.5 allows, and the flushes a PUT are counted.

@@ -11,6 +11,7 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::DiskError;
+use crate::atomic::AtomicUnit;
 use crate::buf::Alignment;
 use crate::file::DeviceFile;
 
@@ -47,6 +48,13 @@ pub trait BlockFile: Send {
     /// what is laid out at it is transferable; by default the alignment itself.
     fn layout_block(&self) -> Alignment {
         self.alignment()
+    }
+
+    /// The atomic write unit of the device holding the file, and where it was read
+    /// ([`crate::atomic::atomic_unit`]). A file the OS cannot be asked about, one in memory or a
+    /// simulation's, answers [`AtomicUnit::DEFAULT`], the unit of a device that states none.
+    fn atomic_unit(&self) -> Result<AtomicUnit, DiskError> {
+        Ok(AtomicUnit::DEFAULT)
     }
 
     /// The file's length, or a device node's capacity.
@@ -177,6 +185,10 @@ pub trait BlockFile: Send {
 impl BlockFile for DeviceFile {
     fn alignment(&self) -> Alignment {
         DeviceFile::alignment(self)
+    }
+
+    fn atomic_unit(&self) -> Result<AtomicUnit, DiskError> {
+        crate::atomic::atomic_unit(self.std_file(), self.path())
     }
 
     fn layout_block(&self) -> Alignment {

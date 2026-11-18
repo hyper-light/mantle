@@ -52,6 +52,7 @@ use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::task::Waker;
 use std::thread::JoinHandle;
 
+use hyper_block::atomic::AtomicUnit;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{Alignment, Pool};
 
@@ -215,6 +216,31 @@ pub struct Recovery {
     pub restored: Vec<u128>,
     /// What the open found of the frame after the last that reads.
     pub tail: Tail,
+    /// The device's atomic write unit and how the log's persist records are laid.
+    pub laid: Laid,
+}
+
+/// The device's atomic write unit as the OS gave it, and the unit the log's persist records are
+/// laid in pieces of (mantle docs/design/durability.md §7.7). A node on a device that states no
+/// unit, its unit the conservative default, shows here with `device.stated()` false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Laid {
+    /// The device's atomic write unit and where it was read.
+    pub device: AtomicUnit,
+    /// The unit the persist records are laid in pieces of (format 5), the one the persist area's
+    /// mark records: it stays the area's when the device's differs, since the slots lie where it
+    /// put them. `None` where the records are whole: a sealed log's (format 4) until its pieces
+    /// carry MACs, or one whose persist area does not hold its slots in pieces (format 3).
+    pub pieces: Option<Alignment>,
+}
+
+impl Default for Laid {
+    fn default() -> Self {
+        Self {
+            device: AtomicUnit::DEFAULT,
+            pieces: None,
+        }
+    }
 }
 
 /// The frame after the last that reads, as its persist records leave it (mantle
@@ -394,6 +420,10 @@ pub(crate) struct Params {
     /// Whether the file writes the slots it grows by with zeros ahead of their frames
     /// (`BlockFile::fills_new_space`), as its file said when the log's threads started.
     pub(crate) fills: bool,
+    /// The device's atomic write unit and how the persist records are laid.
+    pub(crate) laid: Laid,
+    /// Where the persist records lie and how they are laid.
+    pub(crate) area: recover::Area,
 }
 
 /// `update` for `group` in parts that each fit a frame of `room` payload bytes
@@ -670,8 +700,9 @@ impl<F: BlockFile + 'static> Log<F> {
             }
         };
         // Formatting reads and writes the file, the caller's code, inside an unwind boundary.
-        let state = match device::guarded(|| recover::create(&file, &config, id, sealer.as_mut())) {
-            Ok(state) => state,
+        let made = device::guarded(|| recover::create(&file, &config, id, sealer.as_mut()));
+        let (state, laid) = match made {
+            Ok(made) => made,
             Err(error) => {
                 if let (Some(gate), Some(first)) = (gate.as_mut(), first) {
                     gate.give(first);
@@ -682,7 +713,7 @@ impl<F: BlockFile + 'static> Log<F> {
         if let (Some(gate), Some(first)) = (gate.as_mut(), first) {
             gate.hold(first);
         }
-        let (log, _) = Self::start(file, config, id, state, Vec::new(), sealer, gate)?;
+        let (log, _) = Self::start(file, config, id, (state, laid), Vec::new(), sealer, gate)?;
         Ok(log)
     }
 
@@ -785,7 +816,8 @@ impl<F: BlockFile + 'static> Log<F> {
                 }
             }
         };
-        let (mut log, pending) = Self::start(file, config, id, state, restores, sealer, gate)?;
+        let opened = (state, recovery.laid);
+        let (mut log, pending) = Self::start(file, config, id, opened, restores, sealer, gate)?;
         for p in pending {
             if let Err(error) = p.wait() {
                 return Err(Refused {
@@ -803,7 +835,7 @@ impl<F: BlockFile + 'static> Log<F> {
         file: F,
         config: Config,
         id: u128,
-        state: state::State,
+        (state, laid): (state::State, Laid),
         restores: Vec<recover::Restore>,
         sealer: Option<seal::Sealer>,
         gate: Option<growth::Gate>,
@@ -812,7 +844,7 @@ impl<F: BlockFile + 'static> Log<F> {
             Ok(align) => align,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        match Self::prepare(align, config, id, restores, sealer.is_some()) {
+        match Self::prepare(align, config, id, restores, (sealer.is_some(), laid)) {
             Ok(prepared) => {
                 let log = Self::spawn(
                     file,
@@ -836,9 +868,10 @@ impl<F: BlockFile + 'static> Log<F> {
         config: Config,
         id: u128,
         restores: Vec<recover::Restore>,
-        sealed: bool,
+        (sealed, laid): (bool, Laid),
     ) -> Result<Prepared<F>, LogError> {
         let room_bytes = frame_room(&config, align, sealed)?;
+        let area = recover::Area::of(&config, align, sealed, laid.pieces)?;
         let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(u64::try_from(PIPELINE_FRAMES).ok()?))
             .ok_or(LogError::Config("a queue of three frames past u64"))?;
@@ -850,6 +883,8 @@ impl<F: BlockFile + 'static> Log<F> {
             queue_bytes,
             tag: if sealed { format::TAG_LEN } else { 0 },
             fills: false,
+            laid,
+            area,
         };
         let waiters = config
             .max_groups
@@ -1161,6 +1196,12 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Asks the owner and waits for its answer.
     fn ask(&self, query: Query) -> Result<Answer, LogError> {
         ask(&self.lines.inbox, query)
+    }
+
+    /// The device's atomic write unit as the OS gave it, and how the log's persist records are
+    /// laid (mantle docs/design/durability.md §7.7).
+    pub fn laid(&self) -> Laid {
+        self.p.laid
     }
 
     /// The log's id: what it was created with, and what its file must name to open.

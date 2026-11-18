@@ -76,6 +76,16 @@ impl AtomicUnit {
         source: Source::Default,
     };
 
+    /// A unit a device states as its physical block: a simulated device's sector, which its
+    /// crashes tear writes at.
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn of_sector(unit: Alignment) -> Self {
+        Self {
+            unit,
+            source: Source::PhysicalBlock,
+        }
+    }
+
     /// The unit: a write of it, at an offset it divides, lands whole or not at all.
     pub fn unit(self) -> Alignment {
         self.unit

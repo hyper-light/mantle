@@ -26,6 +26,11 @@
 //! (hyper-raft `docs/durable.md` §6.3); these histories run under `Waits::Never`, so those 32 lines
 //! are mantle-log's again (compared line by line), and every hash is the one recorded before
 //! 863deb6.
+//! Since an unsealed log's persist records are laid in pieces of the device's atomic write unit
+//! (format 5, mantle docs/design/durability.md §7.7), its persist area holds the mark of pieces at
+//! its start and the records in slots past the whole ones: every image's bytes differ there and
+//! nowhere else, so the 96 crash lines' hashes and the images' changed, and every other line of the
+//! 24 transcripts, 4,032 of 4,128, is the one before (compared line by line).
 //! Set `HYPER_LOG_EQUIVALENCE_OUT` to a directory to write each seed's transcript and image there
 //! for a byte-for-byte comparison.
 #![allow(
@@ -58,32 +63,32 @@ const ROUNDS: u64 = 40;
 const CYCLES: u64 = 4;
 const SEEDS: u64 = 24;
 
-/// Per seed: the FNV-1a hash of mantle-log's transcript and of its canonical device image.
+/// Per seed: the FNV-1a hash of the transcript and of the canonical device image.
 const EXPECTED: [(u64, u64); SEEDS as usize] = [
-    (0x906a67331c9d09d2, 0xa59b28f5117c72e7),
-    (0x22ce32370ebbf2d9, 0x37c91059400167d1),
-    (0x26f9c847b470eb2d, 0x389b60b2ae74162e),
-    (0x84174f7347e6f2b4, 0x902b3bf80494cfb6),
-    (0x04fe729512f48912, 0x59712aabb9469dd4),
-    (0x5384ff27f0f3bfd4, 0x92779d1bdf003713),
-    (0xe929c0c797751a48, 0x2098d0e461d846a5),
-    (0x92108df4e1022385, 0x544e0599b8027b4e),
-    (0x459643ca5796cdb4, 0xb11b3d0c3c497157),
-    (0x9ba55172740d97a9, 0xfee4794dbc7d15a5),
-    (0x94843888647c9e0d, 0x6fcad7aebd3a87bc),
-    (0xea29d2b9ddd30824, 0xf6443323c924e499),
-    (0x7e66f75a1574d578, 0x3466cc969a23552f),
-    (0x4d4e35bc9ea74050, 0x2133a0c20d9ee3df),
-    (0xee7f00ab2b3b8635, 0xeea30aa46b18dab3),
-    (0x7a728c946f12ea3d, 0x241b70be1a02b5b2),
-    (0x940bed374324108d, 0x9d551184ece639ee),
-    (0x7fd71fe59ac03362, 0x93947d209a0827ed),
-    (0xfa68427f54f43ec5, 0x114b4320f2b27932),
-    (0x6a3bbec6851c64d3, 0xadd01214c8165833),
-    (0xe61f04b0a7624aad, 0x679009dafe29ce7b),
-    (0xbef9207ce5fe0fe7, 0x1b8169c4075d3eae),
-    (0x513fd96a9a5a8f77, 0x0cd03343310c3921),
-    (0xc539b6b55b9af87e, 0xb04ddb384550cdbe),
+    (0x76d14e998fd12f3f, 0x38ec9e2b39d92c7e),
+    (0x9283ddaf793be3b8, 0x0e65770661645bba),
+    (0x25e25824be008f90, 0x009d8444f955ae60),
+    (0x85bd48f535398bd2, 0xf599c0b36956a572),
+    (0x3a9a233e663f3533, 0x5aa0880235502eea),
+    (0xd9b73506fd04ad29, 0x089db3afe19656d0),
+    (0x449ad56a5b629511, 0x04f625932af39aa7),
+    (0x8747696fc58a96dc, 0x376186f82d82973c),
+    (0xda21b93bcfb89a9d, 0x58263b2e87dbccdf),
+    (0xd561dd651bb6bf08, 0x491cb50456cc4861),
+    (0x1c368099ba4a728e, 0xd8cb24edbf9e7cde),
+    (0x8293e6b46a8384ef, 0xe21b7485453d9ed4),
+    (0x48116af6d25662e1, 0x2e86aa7ceeb4c5fe),
+    (0xe971d42356280c16, 0x97bb9f91f6eaa150),
+    (0x71cb34573314b297, 0xd535b80411185ad0),
+    (0x37b8b256c023a8d4, 0x15eb86151eac5cd7),
+    (0x04d96457aafe7af1, 0x21ed3dc5dbe4fc1d),
+    (0x1a233fa6dcbe031e, 0x98ed36acb8f39b76),
+    (0x8904daa83d6482e5, 0x52277d80c53b4d0f),
+    (0x3372886e9bed2444, 0xcfc289ae78eb4fbb),
+    (0xccc5321a04080890, 0x57cf54947427b698),
+    (0x2809c503c1568859, 0x1e31c6710b681202),
+    (0x6447956f6442d955, 0xd435847bedf19620),
+    (0x5f8c72440c40eb73, 0x0b22676995b02073),
 ];
 
 fn config() -> Config {

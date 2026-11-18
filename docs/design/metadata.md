@@ -107,11 +107,14 @@ placement and repair judge by (repair.md §2).
 Every transaction runs inside one range, as ZippyDB's do [01 §1.5]: no operation spans
 ranges atomically. An operation that touches several layers writes them bottom up, blocks
 before files before names, so a name is committed only once everything it points to
-exists. A failure between steps leaves rows nothing points to; the collector between
-layers removes them, as Tectonic's does [01 §1.6].
+exists. A PUT writes its file beside the blocks it has yet to record, since no reader reaches a
+file before its name, and commits the name once both are written (gateway.md §2.2). A failure
+between steps leaves rows nothing points to; the collector between layers removes them, as
+Tectonic's does [01 §1.6].
 
-- **PutObject.** The gateway writes the chunks (chunk-store.md), then the Block rows, then
-  the File rows, then commits the version in the Name range. The Name commit is the write's
+- **PutObject.** The gateway writes the chunks (chunk-store.md), then the Block rows and the
+  File rows at once, then commits the version in the Name range once both are written and every
+  block is held at least to the file's write (gateway.md §2.2). The Name commit is the write's
   linearization point: preconditions (`If-Match`, `If-None-Match`) are evaluated there,
   against the key's current version at commit (05 §2.2; conditional.rs), and the version's
   order is assigned there.
@@ -325,7 +328,8 @@ layers removes them, as Tectonic's does [01 §1.6].
     - *Checked.* `crates/meta/tests/orphan_sweep.rs` runs 2,000 generated schedules across a
       Block range, a File range and Name ranges that split and merge. Gateways write a chunk
       and its block, renew it, then write the file, then hand it over, stopping at any stage
-      or coming late to the next; uploaders create uploads, write parts, complete them, have
+      or coming late to the next, or write the block and the file at once, either arriving
+      first, and hand the file over only once its block is held at least to its write; uploaders create uploads, write parts, complete them, have
       completions refused, retry completions that committed with a composite made again, and
       abort; deletes release files; two file sweeps run at once, every request of theirs
       delivered at some later step, and a sweep that stops has its request arrive after it;
@@ -339,7 +343,8 @@ layers removes them, as Tectonic's does [01 §1.6].
       mark is left. With the Name range's deadline check removed, the File range's, either
       check's recorded time, the release's deadline check, the refusal to renew a released
       block, the adoption check, or adoption itself, the simulation loses a file or a block's
-      chunk, or leaks one; `a_delayed_sweep_never_releases_a_file_another_settled` replays
+      chunk, or leaks one, and with the gateway's check of a block written beside its file
+      removed, a version names a block taken apart (gateway.md §2.2); `a_delayed_sweep_never_releases_a_file_another_settled` replays
       audit B01's schedule.
 - **Operations** (research/30 §3.4, D2; gateway.md §2.1). A version, part or completion whose
   request carries an operation identity is committed in one transaction with an operation row,

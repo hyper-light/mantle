@@ -1,8 +1,9 @@
 //! Writing an object or a part (docs/design/gateway.md §2): the body sealed as it streams and
 //! cut into blocks of whole segments; each block coded into chunks written at once to distinct
 //! volumes, then recorded in the Block range and renewed there while the body streams on; the
-//! file written in the File range once every block is; and the version or part committed in
-//! the Name range, the write's linearization point.
+//! file written in the File range once the body has ended and every block's chunks are durable,
+//! beside the writes of the blocks not yet recorded; and the version or part committed in the
+//! Name range once the file and every block are, the write's linearization point.
 //!
 //! A [`Put`] names each request and moves on with its answer, doing no I/O, as the bucket
 //! coordinator does. Its requests go out many at once, each with an id its answer names, and
@@ -276,6 +277,8 @@ struct Going {
     full: bool,
     /// Each chunk's volume, and whether the chunk is durable there.
     at: Vec<Option<(u128, bool)>>,
+    /// Every chunk is durable and the block's write is asked of the Block range.
+    recording: bool,
     /// When, in the caller's time, it went down.
     down_ns: u64,
 }
@@ -309,10 +312,11 @@ enum Phase {
     Body,
     /// The body ended; its blocks are still going down.
     Ended,
-    /// Every block is recorded: the renewals due then are the last, and the file is written
-    /// once they answer.
+    /// Every block is recorded or its write asked: the renewals due then are the last, and the
+    /// file is written once they answer.
     Closing,
-    /// The file's write is asked.
+    /// The file's write is asked, beside the writes of the blocks still to be recorded; the Name
+    /// write waits for every one to answer (docs/design/gateway.md §2.2).
     File,
     /// The Name write is asked.
     Name,
@@ -326,9 +330,11 @@ pub fn most_chunks(window: usize, scheme: Scheme) -> Option<usize> {
 
 /// The most commands a put holds out at once under `layout`: the write of each block going down
 /// and a renewal of each block recorded, a block of the largest body S3 takes each at most
-/// (`MAX_UPLOAD`); its file's write and its name's command go alone, after them.
+/// (`MAX_UPLOAD`), and its file's write, which goes beside the blocks' writes once no renewal is
+/// out (docs/design/gateway.md §2.2); its name's command goes alone, after them. Saturating: a
+/// count past `u64` is one no node has room for, which `u64::MAX` says as well.
 pub fn most_commands(layout: &Layout) -> u64 {
-    layout.blocks(MAX_UPLOAD)
+    layout.blocks(MAX_UPLOAD).saturating_add(1)
 }
 
 /// The most bytes a put holds with `window` blocks going down under `layout`, its blocks the
@@ -419,6 +425,9 @@ pub struct Put {
     roomless: Vec<(u64, usize)>,
     next_id: Id,
     phase: Phase,
+    /// The file's deadline, once the File range has written it: the Name write waits for the
+    /// blocks still to be recorded.
+    file_deadline_ns: Option<u64>,
     outcome: Option<Result<Stored, PutError>>,
     /// A part's time as its commit was asked.
     part_ns: Option<u64>,
@@ -546,6 +555,7 @@ impl Put {
             asked: BTreeMap::new(),
             next_id: 0,
             phase: Phase::Body,
+            file_deadline_ns: None,
             outcome: None,
             part_ns: None,
             committed: None,
@@ -877,6 +887,7 @@ impl Put {
                 next: 0,
                 full: true,
                 at: vec![None; width],
+                recording: false,
                 down_ns: self.now_ns,
             },
         );
@@ -934,7 +945,8 @@ impl Put {
             }
             (Asked::Renew { .. }, Answer::Block(outcome)) => Err(PutError::Block(outcome)),
             (Asked::File, Answer::File(file::Outcome::Written { deadline_ns })) => {
-                self.commit(Some(deadline_ns))
+                self.file_deadline_ns = Some(deadline_ns);
+                self.commit_when_held()
             }
             (Asked::File, Answer::File(outcome)) => Err(PutError::File(outcome)),
             (Asked::Name, Answer::Name(outcome)) => self.done(outcome),
@@ -989,6 +1001,7 @@ impl Put {
                 })
             })
             .collect::<Result<Vec<_>, PutError>>()?;
+        going.recording = true;
         let command = block::Command::Write {
             block: going.id,
             header: going.header,
@@ -1000,7 +1013,7 @@ impl Put {
         };
         let asked_ns = self.now_ns;
         self.ask(Asked::Block { index, asked_ns }, Request::Block(command));
-        Ok(())
+        self.file_if_written()
     }
 
     /// Sends a refused chunk to the next volume the placement offered, which holds none of the
@@ -1046,7 +1059,8 @@ impl Put {
         if let Some(full) = self.waiting.take() {
             self.go(full)?;
         }
-        self.file_if_written()
+        self.file_if_written()?;
+        self.commit_when_held()
     }
 
     /// When a block whose write or renewal was asked at `asked_ns` is due for renewal: a
@@ -1088,14 +1102,22 @@ impl Put {
         Ok(())
     }
 
-    /// Once the body has ended and every block is recorded, renews the blocks due one last
-    /// time, so the file is asked for with each block renewed as recently as at any time
-    /// before. The renewals are not repeated while they answer: one that takes longer than a
-    /// quarter of the handover would find the next due already.
+    /// Once the body has ended and every block is recorded or its chunks durable and its write
+    /// asked, renews the blocks due one last time, so the file is asked for with each block
+    /// renewed as recently as at any time before. The renewals are not repeated while they
+    /// answer: one that takes longer than a quarter of the handover would find the next due
+    /// already. The file's write does not wait for the blocks' writes, which go beside it
+    /// (docs/design/gateway.md §2.2).
     fn file_if_written(&mut self) -> Result<(), PutError> {
         let blocks = self.layout.blocks(self.body.length);
-        let all = u64::try_from(self.recorded.len()).map_err(|_| PutError::Overflow)?;
-        if self.phase != Phase::Ended || all != blocks {
+        let all = self
+            .recorded
+            .len()
+            .checked_add(self.going.len())
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or(PutError::Overflow)?;
+        if self.phase != Phase::Ended || all != blocks || self.going.values().any(|g| !g.recording)
+        {
             return Ok(());
         }
         self.phase = Phase::Closing;
@@ -1108,20 +1130,34 @@ impl Put {
         if self.phase != Phase::Closing || self.recorded.values().any(|r| r.renewing) {
             return Ok(());
         }
-        let extents = self
+        let mut blocks = Vec::new();
+        let count = self
             .recorded
-            .values()
-            .map(|r| Extent {
-                length: r.len,
-                target: Target::Block(r.id),
+            .len()
+            .checked_add(self.going.len())
+            .ok_or(PutError::Overflow)?;
+        blocks
+            .try_reserve_exact(count)
+            .map_err(|_| PutError::Overflow)?;
+        blocks.extend(self.recorded.iter().map(|(&i, r)| (i, r.id, r.len)));
+        blocks.extend(self.going.iter().map(|(&i, g)| (i, g.id, g.len)));
+        blocks.sort_unstable_by_key(|&(i, _, _)| i);
+        let extents = blocks
+            .into_iter()
+            .map(|(_, id, length)| Extent {
+                length,
+                target: Target::Block(id),
             })
             .collect();
+        // The blocks recorded bound the file's write by their deadlines, as the Block range
+        // answered them; a block whose write is still out has no deadline yet, and bounds it once
+        // it answers instead (`commit_when_held`).
         let blocks_deadline_ns = self
             .recorded
             .values()
             .map(|r| r.deadline_ns)
             .min()
-            .ok_or(PutError::Overflow)?;
+            .unwrap_or(u64::MAX);
         let referrer = match &self.commit {
             Commit::Object(p) => Referrer {
                 bucket: p.bucket.clone(),
@@ -1146,6 +1182,31 @@ impl Put {
         self.phase = Phase::File;
         self.ask(Asked::File, Request::File(command));
         Ok(())
+    }
+
+    /// Commits once the File range has written the file and the Block range recorded every
+    /// block, and only if no block's deadline, as the Block range last answered it, comes before
+    /// the File range's time at the file's write, its deadline less the handover. The sweep
+    /// releases a block only once the File range, at a time past that block's deadline, found
+    /// its file unwritten, so a file written by then was written after it, at a later time:
+    /// written no later than every block's deadline, it names none the sweep may release. A
+    /// block written beside the file was not bounded by the file's write, so this is the check
+    /// that write would have made; failing it, the PUT fails as that write would have been
+    /// refused, its file and blocks left to the sweeps (docs/design/gateway.md §2.2).
+    fn commit_when_held(&mut self) -> Result<(), PutError> {
+        let Some(deadline_ns) = self.file_deadline_ns else {
+            return Ok(());
+        };
+        if self.phase != Phase::File || !self.going.is_empty() {
+            return Ok(());
+        }
+        let written_ns = deadline_ns
+            .checked_sub(self.handover_ns)
+            .ok_or(PutError::Overflow)?;
+        if self.recorded.values().any(|r| r.deadline_ns < written_ns) {
+            return Err(PutError::File(file::Outcome::Expired));
+        }
+        self.commit(Some(deadline_ns))
     }
 
     /// Commits the version or part, with the file's handover deadline, or with no file for an
@@ -1267,4 +1328,223 @@ fn chunk(
         bytes: bytes.clone(),
         crc,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use mantle_meta::name::Preconditions;
+    use mantle_meta::record::{Version, Versioning, Wrapper};
+    use mantle_s3::seal::WrappingKey;
+
+    use super::*;
+
+    const HANDOVER: u64 = 1_000;
+
+    struct Counter(u128);
+
+    impl Ids for Counter {
+        fn block(&mut self) -> Result<u128, PutError> {
+            self.0 += 1;
+            Ok(self.0)
+        }
+    }
+
+    /// A PUT of a one-byte object in three copies, its body ended and every chunk of its one
+    /// block durable, and the requests it asks then.
+    fn durable() -> (Put, Vec<(Id, Request)>) {
+        let commit = Commit::Object(name::Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: 0,
+            ordered_ns: None,
+            version: Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".into(),
+                headers: Vec::new(),
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            },
+            default: None,
+            id: 0,
+            deadline_ns: 0,
+        });
+        let data = DataKey::generate().unwrap();
+        let bytes = data.wrap(&WrappingKey::generate().unwrap()).unwrap();
+        let keys = Keys {
+            file: 7,
+            data,
+            wrapped: WrappedKey {
+                by: Wrapper::Root(1),
+                bytes,
+            },
+        };
+        let body = Body {
+            length: 1,
+            checksum: None,
+            content_md5: false,
+        };
+        let holding = Holding {
+            handover_ns: HANDOVER,
+            window: 1,
+        };
+        let layout = Layout::new(Scheme::Copies(3)).unwrap();
+        let mut put =
+            Put::new(commit, body, keys, layout, holding, Box::new(Counter(0)), 0).unwrap();
+        assert_eq!(put.feed(b"x").unwrap(), 1);
+        put.end(&Expected::default()).unwrap();
+        let (id, place) = put.poll().unwrap();
+        let Request::Place { width, .. } = place else {
+            panic!("{place:?}");
+        };
+        let volumes = (0..u128::try_from(width).unwrap()).collect();
+        put.answer(id, Answer::Volumes(volumes)).unwrap();
+        let chunks: Vec<_> = std::iter::from_fn(|| put.poll()).collect();
+        assert_eq!(chunks.len(), width);
+        for (id, chunk) in chunks {
+            assert!(matches!(chunk, Request::Chunk { .. }), "{chunk:?}");
+            put.answer(id, Answer::Stored).unwrap();
+        }
+        let asked = std::iter::from_fn(|| put.poll()).collect();
+        (put, asked)
+    }
+
+    /// The block's write and the file's, asked at once once the chunks are durable.
+    fn block_and_file(asked: &[(Id, Request)]) -> (Id, Id) {
+        let [
+            (block, Request::Block(block::Command::Write { .. })),
+            (
+                file,
+                Request::File(file::Command::Write {
+                    blocks_deadline_ns, ..
+                }),
+            ),
+        ] = asked
+        else {
+            panic!("{asked:?}");
+        };
+        // The block has no deadline yet to bound the file's write by.
+        assert_eq!(*blocks_deadline_ns, u64::MAX);
+        (*block, *file)
+    }
+
+    fn written(at_ns: u64) -> block::Outcome {
+        block::Outcome::Written {
+            deadline_ns: at_ns + HANDOVER,
+        }
+    }
+
+    fn file_written(at_ns: u64) -> file::Outcome {
+        file::Outcome::Written {
+            deadline_ns: at_ns + HANDOVER,
+        }
+    }
+
+    /// The Name write goes once both the block's and the file's writes answered, in either
+    /// order, never before, carrying the file's deadline.
+    #[test]
+    fn the_name_goes_only_once_the_block_and_the_file_both_answered() {
+        for file_first in [false, true] {
+            let (mut put, asked) = durable();
+            let (block, file) = block_and_file(&asked);
+            let answers = [
+                (block, Answer::Block(written(10))),
+                (file, Answer::File(file_written(20))),
+            ];
+            let [first, second] = if file_first {
+                [answers[1].clone(), answers[0].clone()]
+            } else {
+                answers
+            };
+            put.answer(first.0, first.1).unwrap();
+            assert!(put.poll().is_none(), "the Name went before both answered");
+            put.answer(second.0, second.1).unwrap();
+            let Some((id, Request::Name(command))) = put.poll() else {
+                panic!("no Name write once both answered");
+            };
+            let name::Command::Put(p) = *command else {
+                panic!("{command:?}");
+            };
+            assert_eq!(p.deadline_ns, 20 + HANDOVER);
+            assert_eq!(p.version.file, Some(7));
+            put.answer(
+                id,
+                Answer::Name(name::Outcome::Put {
+                    version: "v".into(),
+                }),
+            )
+            .unwrap();
+            assert!(matches!(put.outcome(), Some(Ok(_))));
+        }
+    }
+
+    /// A block's or a file's write refused, answered before or after the other, ends the PUT:
+    /// no Name write goes, and what was written is left to the sweeps.
+    #[test]
+    fn a_refused_block_or_file_leaves_no_name() {
+        let refusals = [
+            (true, Answer::Block(block::Outcome::Conflict)),
+            (true, Answer::Block(block::Outcome::Invalid)),
+            (false, Answer::File(file::Outcome::Expired)),
+            (false, Answer::File(file::Outcome::Conflict)),
+        ];
+        for (of_block, refusal) in refusals {
+            for refused_first in [false, true] {
+                let (mut put, asked) = durable();
+                let (block, file) = block_and_file(&asked);
+                let (refused, other) = if of_block {
+                    (
+                        (block, refusal.clone()),
+                        (file, Answer::File(file_written(20))),
+                    )
+                } else {
+                    ((file, refusal.clone()), (block, Answer::Block(written(10))))
+                };
+                if refused_first {
+                    assert!(put.answer(refused.0, refused.1).is_err());
+                    assert_eq!(put.answer(other.0, other.1), Err(PutError::Over));
+                } else {
+                    put.answer(other.0, other.1).unwrap();
+                    assert!(put.answer(refused.0, refused.1).is_err());
+                }
+                assert!(put.poll().is_none(), "a request went after a refusal");
+                assert!(matches!(put.outcome(), Some(Err(_))));
+            }
+        }
+    }
+
+    /// A block whose deadline, as the Block range answered it, comes before the File range's
+    /// time at the file's write may have been released before the file was written: the PUT
+    /// fails as the file's write would have been refused, and no Name write goes. A block held
+    /// to the file's time or later commits.
+    #[test]
+    fn a_block_held_less_long_than_the_files_write_fails_the_put() {
+        for (block_ns, commits) in [(0, false), (1_499, false), (1_500, true), (1_501, true)] {
+            let (mut put, asked) = durable();
+            let (block, file) = block_and_file(&asked);
+            // The file was written at 2,500, so its deadline is 3,500; the block's deadline is
+            // `block_ns` past the handover.
+            put.answer(file, Answer::File(file_written(2_500))).unwrap();
+            let answered = put.answer(block, Answer::Block(written(block_ns)));
+            if commits {
+                answered.unwrap();
+                assert!(matches!(put.poll(), Some((_, Request::Name(_)))));
+            } else {
+                assert_eq!(answered, Err(PutError::File(file::Outcome::Expired)));
+                assert!(
+                    put.poll().is_none(),
+                    "a Name went for a block held too short"
+                );
+            }
+        }
+    }
 }

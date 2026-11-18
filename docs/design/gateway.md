@@ -90,10 +90,12 @@ point:
    acknowledged only once durable on every copy its scheme stores (CLAUDE.md §6): the gateway
    waits for every chunk, where Tectonic acknowledges at a quorum and repairs the last chunk
    offline (01 §1.8), which needs repair to run.
-5. **The file is written** in the File range once every block is recorded, naming the blocks,
-   the key wrapped, the object key it is for, and a deadline no later than its blocks'
-   earliest.
-6. **The version is committed** in the Name range, carrying the file and its deadline.
+5. **The file is written** in the File range once the body has ended and every block's chunks
+   are durable, naming the blocks, the key wrapped, the object key it is for, and a deadline no
+   later than the earliest of its recorded blocks'; the writes of the blocks not yet recorded go
+   beside it (§2.2).
+6. **The version is committed** in the Name range once the file and every block are recorded,
+   each block held at least to the file's write (§2.2), carrying the file and its deadline.
    Preconditions, versioning and Object Lock are judged there (metadata.md §2); a node's host
    gives the request's `If-Match` and `If-None-Match` to the commit as the tags they name
    (`mantle_s3::conditional::named`), and its checksum and `Content-MD5` to the body's end, which
@@ -351,6 +353,106 @@ tools leave uploads behind, and their bytes reported per bucket and principal. m
 default expiry for data a client may still mean to finish. A ranged GET carrying `versionId` or a
 strong `If-Match` is answered only from that version, so a resumed download is never stitched
 from a newer one (audit §16.4).
+
+### 2.2 The file written beside its blocks
+
+Status: decided 2026-11-17 (the owner's decision 3 of research/71, step 9), built in
+`crates/gateway/src/put.rs`. Sources: research/96 (soft updates' ordering rules, GMSP00; Parallel
+Commits, TSM+20), research/71 (step 9), metadata.md §2.
+
+A one-byte PUT's critical path was the slowest replica's chunk, one volume flush, then the Block
+command, then the File command, then the Name command, each a log frame flushed and confirmed: 7
+flushes, 117 ms at the median on the Linux box (research/71, step 9). The order is the metadata
+layer's: a name is committed only once everything it points to exists (metadata.md §2). Soft
+updates states that rule as "Never point to a structure before it has been initialized" (96 §1,
+GMSP00 §2), and it orders a pointer after what it points to, nothing more.
+
+**Decision: the File write goes beside the Block writes; the Name write waits for both.** Once the
+body has ended and every block's chunks are durable, the gateway asks the file's write together
+with the writes of the blocks not yet recorded, and asks the Name write only once all of them have
+answered. Blocks recorded before, while the body streamed, are renewed for the last time first, as
+before (§2, "Deadlines"). A one-block PUT's path becomes its chunks, then the Block and File
+commands at once, then the Name command: 5 flushes where there were 7.
+
+*Why the invariant holds.* Readers reach a file only through a name, and a file's blocks only
+through its file (metadata.md §2), so the name is the one pointer a reader follows into the PUT:
+it still waits for everything it points to, and no committed name refers to a file or block that
+is not committed. The file's row points to its blocks before they are recorded, but no reader
+follows it then. One process does read it: the block sweep, which asks the File range whether a
+block's file names it, and releases the block, its chunks reclaimed there and then, when the File
+range answers, at a time past the block's deadline, that the file is not written (metadata.md §2,
+"Blocks never named"). That is soft updates' second rule, never reuse a resource before every
+pointer to it is gone (96 §1), and it held because the file's write carried its blocks' earliest
+deadline and the File range refused it past that. A block whose write goes beside the file's has
+no deadline yet to carry, so the gateway makes the same check once both answer: the File range
+wrote the file at its deadline less the handover, and if any block's deadline, as the Block range
+last answered it, comes before that time, the PUT fails as the file's write would have been
+refused, `PutError::File(Expired)`, and no name is asked. The check is exact: the sweep releases a
+block only after the File range found the file unwritten at a time past the block's deadline, and
+the File range's time only rises, so a file written after that was written later still; a file
+written no later than every block's deadline names none the sweep released or ever will, since once
+it is written the File range answers that it names them. The check compares two numbers the ranges
+answered and reads no clock, so it holds under any clock offset; it fails only where the File
+range's time is past a block's deadline, a handover after the block's write, where the file's write
+was refused before. With the check removed, the simulation hands over a file whose block the sweep
+took apart (`without_the_check_a_version_names_a_released_block`).
+
+*What a crash leaves, at every step.*
+
+| Stops after | Left | Collected by |
+|---|---|---|
+| some or all chunks, before either write lands | chunks no block names | the per-volume reconciliation, as before (§2) |
+| the file written, a block's write lost or refused | a file no name holds, naming a block never recorded, and that block's chunks | the file sweep releases the file past its deadline, and the collector reclaims it, finding the block's rows gone as a repeated step does (metadata.md §2, "Reclaiming"); the chunks as above |
+| a block recorded, the file's write lost or refused | a block no file names | the block sweep, past its deadline, as before |
+| both written, before the name | a file and blocks no name holds | the file sweep, then the collector with the blocks, as before |
+| both written, the check failed | the same, a block perhaps released already | the same: removing a released block's rows again is a repeated step |
+| a block's write landing after its file was reclaimed | a block whose file is gone | the block sweep: the File range finds no file, and the block is released past its deadline |
+| the name asked | the name's outcome, as before | unchanged |
+
+The leftovers are the classes the sweeps collect already; the one new state, a file naming a block
+not yet recorded, is reached by no reader and reclaimed as a file whose blocks went first. Soft
+updates leaves the same kind of residue, "unused blocks" and "unreferenced inodes", reclaimed by a
+background fsck while the system serves (96 §1, GMSP00 §3.3).
+
+*Readers* see nothing new: GET, HEAD and listings read names, then files, then blocks, and a name
+still commits last. *The operation record* is written in the Name commit's transaction
+(metadata.md §2, "Operations"), and the Name command is unchanged, so its five obligations, one
+effect, one answer, no stale replacement, each file released once and rows carried with their key,
+are untouched; the simulation judges them with the new gateways among the old. *The sweeps* keep
+their rules: the file sweep asks the Name range about a file never handed over, and the block sweep
+asks the File range, each as before.
+
+*Checked.* `put.rs`'s unit tests: the Name write goes only once both the Block and the File writes
+answered, in either order; a refusal of either, answered first or last, ends the PUT with no Name
+write; a block held less long than the file's write fails the PUT, and one held to it commits.
+`crates/meta/tests/orphan_sweep.rs` draws gateways that write their block and their file at once,
+either arriving first and the other at a later step, among the old gateways, the sweeps, the
+collector, splits, merges and leaders whose clocks run behind (`any_action`), and spells out a
+schedule where the file arrives after the sweep released the block; with the check removed, a
+version names a block taken apart.
+
+**Not chosen.**
+- *The name at once with the file and blocks*, readers resolving or waiting on a name whose file
+  may not commit. That is Parallel Commits: a staging record whose commit is conditional on every
+  write, and readers that follow each intent to it and block, or abort a write in flight, until
+  they know (96 §2, TSM+20 §3.1.1, §3.2). Here the readers include a precondition judged by a
+  later write, the null version's replacement, which releases the file it held in the same
+  transaction, Object Lock's checks, and an operation's row, which records the first delivery's
+  answer; each would have to resolve a provisional version. The Name commit is the PUT's
+  linearization point (§2), and making it provisional changes the Name layer, not the PUT's order.
+  It would save one more command round, 2 of the 5 flushes.
+- *A deadline the gateway draws from its own clock*, carried by the file's write in place of its
+  blocks'. A block's deadline is the Block range's time plus the handover, and a gateway whose
+  clock runs ahead of that range's would carry a later one: the File range would take a file whose
+  block the sweep had released. It is safe only under a bound on clocks, where the design's
+  deadlines bound waiting and never correctness (metadata.md §2, "The deadline's length").
+- *The Block command carrying the file's bound*, the Block range holding a block at least until a
+  deadline the gateway chose. Exact as well, but a new command on the Block range's log, with a tag
+  of its own so that entries written before decode as they did; the gateway's check needs no new
+  field.
+
+*Not yet measured.* The PUT ladder at 1 B, 64 KiB and 8 MiB through both doors against research/71's
+step 9, and crash tests that stop a gateway between the Block and File writes and the Name.
 
 ## 3. Reading an object
 

@@ -605,8 +605,8 @@ impl Spread {
 /// The asks a node of `gateway` holds at most, each operation it hosts the most of the schemes
 /// its blocks may take (`schemes`): a put's window of chunks at their width, or a get's spans and
 /// the whole chunks a failed span adds (`put::most_chunks`, `get::most_chunks`); a put's command
-/// for each block of the largest body S3 takes (`put::most_commands`); one read an operation; and
-/// one command besides, the node's own enlistment.
+/// for each block of the largest body S3 takes and its file's write (`put::most_commands`); one
+/// read an operation; and one command besides, the node's own enlistment.
 pub fn asks(gateway: &Gateway, schemes: &[Scheme]) -> Result<Asks, DeriveError> {
     let overflow = |what| DeriveError::Overflow(what);
     let (mut chunks, mut commands) = (0usize, 0u64);
@@ -3415,7 +3415,8 @@ mod tests {
 
     /// A node's asks hold its operations at their most under every scheme a block may take: the
     /// widest put's chunks or the get that adds the most whole chunks to its spans, the put of the
-    /// largest body's commands, one read each, and its enlistment.
+    /// largest body's commands with its file's write beside them, one read each, and its
+    /// enlistment.
     #[test]
     fn the_asks_hold_each_operation_at_its_most_under_any_scheme() {
         let g = gateway(8, 0).unwrap();
@@ -3437,7 +3438,10 @@ mod tests {
             .map(|&s| Layout::new(s).unwrap().blocks(mantle_s3::body::MAX_UPLOAD))
             .max()
             .unwrap();
-        assert_eq!(a.commands, g.objects * usize::try_from(blocks).unwrap() + 1);
+        assert_eq!(
+            a.commands,
+            g.objects * (usize::try_from(blocks).unwrap() + 1) + 1
+        );
         assert_eq!(a.reads, g.objects);
     }
 

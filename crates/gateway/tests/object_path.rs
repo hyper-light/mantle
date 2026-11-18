@@ -2031,8 +2031,9 @@ fn blocks_go_down_together_as_the_window_admits() {
 
 /// A PUT holds out at most its window's blocks' chunks at once (`put::most_chunks`), and a
 /// command for each block of its body: the last block's write with a renewal of each block
-/// recorded before it, every one due, reaches that. `put::most_commands` takes the largest body
-/// S3 takes.
+/// recorded before it, every one due, reaches that, its file's write waiting for the renewals.
+/// `put::most_commands` takes the largest body S3 takes, and its file's write beside every
+/// block's.
 #[test]
 fn a_put_holds_out_its_windows_chunks_and_a_command_a_block_at_most() {
     let mut cell = Cell::new(4);
@@ -2043,7 +2044,7 @@ fn a_put_holds_out_its_windows_chunks_and_a_command_a_block_at_most() {
     let blocks = layout.blocks(len as u64);
     let bytes = body(len, 37);
     let mut put = new_put(&cell, object("k"), len as u64, layout, keys(150, &wrapping));
-    let (mut at, mut ended, mut writes, mut renewed) = (0usize, false, 0u64, false);
+    let (mut at, mut ended, mut places, mut renewed) = (0usize, false, 0u64, false);
     let (mut chunks_out, mut commands_out) = (0usize, 0u64);
     loop {
         while at < len && put.wants_body() {
@@ -2060,19 +2061,20 @@ fn a_put_holds_out_its_windows_chunks_and_a_command_a_block_at_most() {
         if asked.is_empty() {
             break;
         }
-        writes += asked
+        let last_chunks = places == blocks
+            && asked
+                .iter()
+                .any(|(_, r)| matches!(r, Request::Chunk { .. }));
+        places += asked
             .iter()
-            .filter(|(_, r)| matches!(r, Request::Block(block::Command::Write { .. })))
+            .filter(|(_, r)| matches!(r, Request::Place { .. }))
             .count() as u64;
-        if writes == blocks && !renewed {
-            // The last block's write is out: time passes to every recorded block's renewal,
-            // within its handover.
+        if last_chunks && !renewed {
+            // The last block's chunks are out: time passes to every recorded block's renewal,
+            // within its handover, and the renewals go out beside the last block's write.
             renewed = true;
             cell.clock += HANDOVER / 2;
             put.tick(cell.clock).unwrap();
-            while let Some(request) = put.poll() {
-                asked.push(request);
-            }
         }
         let chunks = asked
             .iter()

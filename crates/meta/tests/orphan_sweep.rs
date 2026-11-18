@@ -12,8 +12,10 @@
 //! Block range, a File range and Name ranges that split and merge while it happens, under
 //! schedules proptest chooses. A gateway writes a block's chunk to a volume and the block,
 //! renews the block's deadline while its body would still stream in, then writes the file that
-//! names the block, then hands the file to its key's Name range; it may stop for good at any
-//! stage, or come late to the next. Uploaders write parts and complete uploads with composite
+//! names the block, then hands the file to its key's Name range; or writes the block and the file
+//! at once, either arriving first, and hands the file over only once the block is held at least
+//! to the file's write (docs/design/gateway.md §2.2); it may stop for good at any stage, or come
+//! late to the next. Uploaders write parts and complete uploads with composite
 //! files of them, have completions refused, retry completions that committed with a composite
 //! made again, and abort. Deletes release files. Two file sweeps run at once, each request
 //! delivered at some later step, and a stopped sweep's request arrives after it; the block
@@ -120,6 +122,10 @@ enum Variant {
     /// A completion keeps no row: a retry is rebuilt from the version it finds, as a write
     /// carrying no operation is (`name::complete`).
     Rebuilt,
+    /// A gateway that writes its block and its file at once hands the file over without
+    /// checking that the block's deadline is no earlier than the file's write
+    /// (docs/design/gateway.md §2.2).
+    Unbounded,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +133,14 @@ enum Action {
     /// A gateway writes a chunk and its block, for a file of a key.
     Write {
         key: usize,
+    },
+    /// A gateway writes its block and its file at once, as a PUT does once its chunks are
+    /// durable (docs/design/gateway.md §2.2): the one named first arrives now, the other at the
+    /// gateway's next step, and the file hands over at the step after only if the block's
+    /// deadline is no earlier than the file's write.
+    WriteAtOnce {
+        key: usize,
+        file_first: bool,
     },
     /// A gateway takes its next step: writes its file, or hands it over.
     Advance(usize),
@@ -317,6 +331,17 @@ fn action() -> impl Strategy<Value = Action> {
     ]
 }
 
+/// The actions of `action`, and a gateway writing its block and its file at once, as often as
+/// `Write` is drawn there. Kept apart from `action`, whose schedules each piece of the operation
+/// record removed is caught within (`each_piece_of_the_operation_record_removed_is_caught`).
+fn any_action() -> impl Strategy<Value = Action> {
+    prop_oneof![
+        19 => action(),
+        1 => (0usize..4, any::<bool>())
+            .prop_map(|(key, file_first)| Action::WriteAtOnce { key, file_first }),
+    ]
+}
+
 /// A client's operation: the principal authentication established, the identity the client
 /// drew, the key it writes and what it writes there, the versioning it writes under, its
 /// horizon, and its last effect.
@@ -378,6 +403,13 @@ enum Stage {
     Block { block: u128, deadline_ns: u64 },
     /// Its file is written, with its deadline; it is not handed over.
     File { deadline_ns: u64 },
+    /// Its block's write and its file's are out at once, each with its deadline once it has
+    /// arrived.
+    AtOnce {
+        block: u128,
+        block_deadline_ns: Option<u64>,
+        file_deadline_ns: Option<u64>,
+    },
 }
 
 struct Gateway {
@@ -779,6 +811,7 @@ impl World {
     fn step(&mut self, action: &Action) {
         match *action {
             Action::Write { key } => self.start(KEYS[key], None),
+            Action::WriteAtOnce { key, file_first } => self.start_at_once(KEYS[key], file_first),
             Action::Operate {
                 key,
                 principal,
@@ -1167,6 +1200,90 @@ impl World {
     /// `op` if it carries one.
     fn start(&mut self, key: &'static str, op: Option<usize>) {
         let (file, block) = (self.id(), self.id());
+        let deadline_ns = self.write_block(file, block);
+        let versioning = match op {
+            Some(op) => self.ops[op].versioning,
+            None => versioning(usize::try_from(file % 2).unwrap()),
+        };
+        self.gateways.push(Gateway {
+            key,
+            file,
+            versioning,
+            stage: Stage::Block { block, deadline_ns },
+            op,
+        });
+    }
+
+    /// A gateway that writes its block and its file at once, the one named first now.
+    fn start_at_once(&mut self, key: &'static str, file_first: bool) {
+        let (file, block) = (self.id(), self.id());
+        let mut g = Gateway {
+            key,
+            file,
+            versioning: versioning(usize::try_from(file % 2).unwrap()),
+            stage: Stage::AtOnce {
+                block,
+                block_deadline_ns: None,
+                file_deadline_ns: None,
+            },
+            op: None,
+        };
+        if file_first {
+            self.write_file_at_once(&mut g);
+        } else {
+            self.write_block_at_once(&mut g);
+        }
+        self.gateways.push(g);
+    }
+
+    fn write_block_at_once(&mut self, g: &mut Gateway) {
+        if let Stage::AtOnce {
+            block,
+            block_deadline_ns: ref mut deadline @ None,
+            ..
+        } = g.stage
+        {
+            *deadline = Some(self.write_block(g.file, block));
+        }
+    }
+
+    /// The file's write, bounded by no block's deadline, since its block's write is out beside
+    /// it: the gateway checks the block's once both have answered.
+    fn write_file_at_once(&mut self, g: &mut Gateway) {
+        if let Stage::AtOnce {
+            block,
+            file_deadline_ns: ref mut deadline @ None,
+            ..
+        } = g.stage
+        {
+            let outcome = self.file(file::Command::Write {
+                file: g.file,
+                extents: vec![Extent {
+                    length: 1,
+                    target: Target::Block(block),
+                }],
+                referrer: Referrer {
+                    bucket: BUCKET.into(),
+                    incarnation: 1,
+                    key: g.key.into(),
+                },
+                key: None,
+                handover_ns: HANDOVER,
+                blocks_deadline_ns: u64::MAX,
+                at_ns: self.proposed(),
+            });
+            let file::Outcome::Written { deadline_ns } = outcome else {
+                panic!("{outcome:?}");
+            };
+            self.written.insert(g.file);
+            *deadline = Some(deadline_ns);
+        }
+    }
+
+    /// Writes a chunk of `block` and records the block for `file`, answering its deadline. The
+    /// chunk goes with its block: a chunk no block names is reconciled per volume, which this
+    /// simulation does not model.
+    fn write_block(&mut self, file: u128, block: u128) -> u64 {
         let place = ChunkPlace {
             volume: block % 3,
             key: ChunkKey {
@@ -1193,17 +1310,7 @@ impl World {
         let block::Outcome::Written { deadline_ns } = outcome else {
             panic!("{outcome:?}");
         };
-        let versioning = match op {
-            Some(op) => self.ops[op].versioning,
-            None => versioning(usize::try_from(file % 2).unwrap()),
-        };
-        self.gateways.push(Gateway {
-            key,
-            file,
-            versioning,
-            stage: Stage::Block { block, deadline_ns },
-            op,
-        });
+        deadline_ns
     }
 
     /// The identity a gateway hands over for operation `op`: the client's, scoped to the
@@ -1500,6 +1607,38 @@ impl World {
                 if !self.handover(&g, deadline_ns) {
                     self.gateways.push(g);
                 }
+            }
+            Stage::AtOnce {
+                block_deadline_ns: Some(block_ns),
+                file_deadline_ns: Some(file_ns),
+                ..
+            } => {
+                // The File range wrote the file at its deadline less the handover. A block held
+                // to an earlier time may have been released before the file was written, and the
+                // gateway gives up, leaving both to the sweeps (`put::Put`'s check).
+                if block_ns < file_ns - HANDOVER && self.variant != Variant::Unbounded {
+                    return;
+                }
+                g.stage = Stage::File {
+                    deadline_ns: file_ns,
+                };
+                if !self.handover(&g, file_ns) {
+                    self.gateways.push(g);
+                }
+            }
+            Stage::AtOnce {
+                block_deadline_ns: None,
+                ..
+            } => {
+                self.write_block_at_once(&mut g);
+                self.gateways.push(g);
+            }
+            Stage::AtOnce {
+                file_deadline_ns: None,
+                ..
+            } => {
+                self.write_file_at_once(&mut g);
+                self.gateways.push(g);
             }
         }
     }
@@ -2319,7 +2458,7 @@ proptest! {
 
     #[test]
     fn what_a_gateway_never_handed_over_is_released_and_nothing_handed_over_is(
-        actions in prop::collection::vec(action(), 1..STEPS),
+        actions in prop::collection::vec(any_action(), 1..STEPS),
     ) {
         let mut world = World::new();
         for action in &actions {
@@ -2503,6 +2642,43 @@ fn a_renewal_keeps_a_block_unless_the_sweep_released_it_first() {
     w.check();
     w.finish();
     assert!(w.recorded().is_empty());
+}
+
+/// A gateway writes its block and its file at once, and the file arrives only after the block
+/// sweep, the File range finding no file past the block's deadline, released the block. The
+/// gateway finds the block held to an earlier time than the file's write and gives up, and the
+/// sweeps collect both (docs/design/gateway.md §2.2).
+fn released_before_its_file(variant: Variant) {
+    let mut w = World::with(variant);
+    w.act(&Action::WriteAtOnce {
+        key: 0,
+        file_first: false,
+    });
+    w.act(&Action::Wait);
+    w.act(&Action::Wait);
+    for _ in 0..6 {
+        w.act(&Action::BlockSweep);
+    }
+    w.act(&Action::Advance(0));
+    let file = *w.written.first().expect("the file's write was refused");
+    w.act(&Action::Advance(0));
+    w.check();
+    assert!(w.gateways.is_empty());
+    assert!(!w.referenced().contains(&file), "the file was handed over");
+    w.finish();
+}
+
+#[test]
+fn a_file_written_after_its_block_was_released_is_never_handed_over() {
+    released_before_its_file(Variant::Whole);
+}
+
+/// Without the gateway's check of the block's deadline against the file's write, the file is
+/// handed over and a version names a block the sweep took apart.
+#[test]
+#[should_panic(expected = "of held file")]
+fn without_the_check_a_version_names_a_released_block() {
+    released_before_its_file(Variant::Unbounded);
 }
 
 /// Two sweeps read the same page. The first finds the file taken, settles it and is done;

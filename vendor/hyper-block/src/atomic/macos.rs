@@ -1,5 +1,5 @@
-//! macOS: the block sizes the storage device under a file's volume publishes in the I/O Registry,
-//! read without opening the device.
+//! macOS: the block sizes and the write cache state the storage device under a file's volume
+//! publishes in the I/O Registry, read without opening the device.
 //!
 //! fstatfs(2) names the device the volume is mounted from (`f_mntfromname`, `/dev/disk3s5`).
 //! IOBSDNameMatching and IOServiceGetMatchingService find the device's IOMedia object by that BSD
@@ -10,6 +10,12 @@
 //! answers from the same property found by the same search (IOMediaBSDClient.cpp), but only on a
 //! disk node, which is root's and the operator group's, mode 0640; the registry is read by any
 //! user (mantle research/02 §3.2–3.5).
+//!
+//! The write cache state is the block storage device's "WriteCacheState"
+//! (`kIOBlockStorageDeviceWriteCacheStateKey`, IOBlockStorageDevice.h: "the property used to get
+//! or set the write cache state of the block storage device"), a boolean that is true where the
+//! write cache is enabled and false where it is disabled (`getWriteCacheState`, the same header),
+//! found by the same search.
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -41,6 +47,8 @@ const SERVICE_PLANE: &CStr = c"IOService";
 const PHYSICAL_BLOCK_SIZE: &CStr = c"Physical Block Size";
 /// `kIOPropertyLogicalBlockSizeKey` (IOStorageDeviceCharacteristics.h).
 const LOGICAL_BLOCK_SIZE: &CStr = c"Logical Block Size";
+/// `kIOBlockStorageDeviceWriteCacheStateKey` (IOBlockStorageDevice.h).
+const WRITE_CACHE_STATE: &CStr = c"WriteCacheState";
 /// What `f_mntfromname` begins with for a volume mounted from a device: the device's node in
 /// /dev. A volume mounted from elsewhere, a network share or devfs, names no device (statfs(2)).
 const DEV: &str = "/dev/";
@@ -52,6 +60,8 @@ unsafe extern "C" {
     fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
     fn CFNumberGetTypeID() -> CFTypeID;
     fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, out: *mut c_void) -> u8;
+    fn CFBooleanGetTypeID() -> CFTypeID;
+    fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -90,6 +100,17 @@ pub(super) fn sizes(file: &File) -> io::Result<Sizes> {
     })
 }
 
+/// The write cache state the block storage device under `file`'s volume publishes: whether its
+/// write cache is enabled; `None` where the volume is mounted from no device, the registry holds
+/// no entry for it, or the device publishes no state.
+pub(crate) fn write_cache(file: &File) -> io::Result<Option<bool>> {
+    let stat = rustix::fs::fstatfs(file)?;
+    let Some(entry) = bsd_name(&stat.f_mntfromname).and_then(|name| media(&name)) else {
+        return Ok(None);
+    };
+    Ok(boolean(&entry, WRITE_CACHE_STATE))
+}
+
 /// The BSD name of the device a volume is mounted from (`disk3s5` of `/dev/disk3s5`).
 fn bsd_name(from: &[c_char]) -> Option<CString> {
     let bytes: Vec<u8> = from
@@ -105,9 +126,11 @@ fn bsd_name(from: &[c_char]) -> Option<CString> {
 struct Owned(CFTypeRef);
 
 impl Owned {
-    /// Takes a Create or Copy result; null, which owns nothing, is `None`.
+    /// Takes a Create or Copy result; null, which owns nothing, is `None`. The value is made only
+    /// for a non-null result: one made and dropped for null would release null, which traps in
+    /// CoreFoundation.
     fn new(cf: CFTypeRef) -> Option<Self> {
-        (!cf.is_null()).then_some(Self(cf))
+        if cf.is_null() { None } else { Some(Self(cf)) }
     }
 }
 
@@ -143,18 +166,23 @@ fn media(name: &CStr) -> Option<Entry> {
         }
         IOServiceGetMatchingService(MAIN_PORT, matching)
     };
-    (service != 0).then_some(Entry(service))
+    // The entry is made only for a found object, so no release is made of none.
+    if service == 0 {
+        None
+    } else {
+        Some(Entry(service))
+    }
 }
 
-/// The number `key` names on `entry` or its nearest parent that has it, where it fits 32 bits.
-fn number(entry: &Entry, key: &CStr) -> Option<u32> {
+/// The value `key` names on `entry` or its nearest parent that has it.
+fn search(entry: &Entry, key: &CStr) -> Option<Owned> {
     // SAFETY: `key` is a NUL-terminated UTF-8 string that outlives the call; the result is a new
     // string or null, which `Owned` takes.
     let key =
         Owned::new(unsafe { CFStringCreateWithCString(std::ptr::null(), key.as_ptr(), UTF8) })?;
     // SAFETY: `entry` holds a live registry object, the plane's name is NUL-terminated and `key`
     // is a live CFString; the result is a new reference or null, which `Owned` takes.
-    let value = Owned::new(unsafe {
+    Owned::new(unsafe {
         IORegistryEntrySearchCFProperty(
             entry.0,
             SERVICE_PLANE.as_ptr(),
@@ -162,7 +190,23 @@ fn number(entry: &Entry, key: &CStr) -> Option<u32> {
             std::ptr::null(),
             ITERATE_RECURSIVELY | ITERATE_PARENTS,
         )
-    })?;
+    })
+}
+
+/// The boolean `key` names on `entry` or its nearest parent that has it.
+fn boolean(entry: &Entry, key: &CStr) -> Option<bool> {
+    let value = search(entry, key)?;
+    // SAFETY: `value` is a live Core Foundation object; asking its type reads nothing else.
+    if unsafe { CFGetTypeID(value.0) != CFBooleanGetTypeID() } {
+        return None;
+    }
+    // SAFETY: `value` is a live CFBoolean, its type checked above.
+    Some(unsafe { CFBooleanGetValue(value.0) } != 0)
+}
+
+/// The number `key` names on `entry` or its nearest parent that has it, where it fits 32 bits.
+fn number(entry: &Entry, key: &CStr) -> Option<u32> {
+    let value = search(entry, key)?;
     // SAFETY: `value` is a live Core Foundation object; asking its type reads nothing else.
     if unsafe { CFGetTypeID(value.0) != CFNumberGetTypeID() } {
         return None;

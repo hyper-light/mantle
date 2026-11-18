@@ -87,9 +87,20 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `537311c` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twelve commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
-in the hyper-raft repository's own objects and not yet pushed to its origin. Its twelfth commit,
+**Every crate at `f3dae3b` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and fifteen commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
+in the hyper-raft repository's own objects and not yet pushed to its origin. Its last three commits
+are step 5 of mantle docs/design/durability.md §7.7. `33fc359` changes hyper-block alone: the macOS
+registry search made its owned value before testing the result, so a key no entry had released
+null, which traps in CoreFoundation; each value is now made only for a found object. `319ecde`
+changes hyper-block alone: the device's write cache is read from the OS (`write_cache::write_cache`:
+Linux's queue `write_cache` with `fua`, Windows' STORAGE_WRITE_CACHE_PROPERTY asked of the file's
+volume with no access rights, macOS's "WriteCacheState" in the I/O Registry, else fcntl(2)'s
+F_FULLFSYNC rule; write-back where the OS describes nothing), typed `WriteThrough`,
+`PowerProtected` or `WriteBack` with its source and whether the OS stated it, and carried beside
+the atomic write unit (`BlockFile::write_cache`: `DeviceFile`, `SegmentedFile`). `f3dae3b` changes
+hyper-durable's benches and the e2e and comparison crates, which are not snapshotted: their wrapper
+files pass it through. Nothing is answered differently yet. Its twelfth commit,
 `537311c`, changes hyper-log alone (mantle docs/design/durability.md §7.7, step 3c): the writer's
 persist record, and its confirmation, say the frame was answered at its flush (`format::AT_FLUSH`)
 where the record is in pieces and every update in the frame allows it (`Update::at_flush`); frames

@@ -507,7 +507,45 @@ outside the torn quorum held the entry whole, and the marks ended by it.
 4. The writer answers a frame at its flush where §7.5 allows, and the flushes a PUT are counted.
    Before any frame is answered at its flush, binaries of 2b, which read the bit's byte as padding
    and would cut such a frame as the torn tail, must refuse the log, as the mark made binaries
-   before them refuse it (step 2b-ii).
+   before them refuse it (step 2b-ii). The device facts §7.5 names are step 5's write cache and
+   step 2b-i's atomic write unit.
+5. The device's write cache is read from the OS beside its atomic write unit, for step 4. Built
+   (hyper-raft `mantle-frame-flush`): hyper-block `write_cache::write_cache` answers a
+   `DeviceCache`, a `WriteCache` (`WriteThrough`, `PowerProtected`, `WriteBack`) with its `Source`
+   and whether the OS stated it (`stated`).
+   - Linux: the `write_cache` of the queue the atomic unit is read from, "write back" or "write
+     through" (Documentation/ABI/stable/sysfs-block; research/02 §2.4), the kernel's view, which
+     also decides whether the kernel sends the device flushes at all
+     (Documentation/block/writeback_cache_control.rst), with `fua` beside it. Any other text is a
+     typed corruption.
+   - Windows: `IOCTL_STORAGE_QUERY_PROPERTY` for `StorageDeviceWriteCacheProperty`, asked of the
+     file's volume, opened by its volume GUID path with no access rights, which CreateFileW allows
+     "to query device attributes without accessing a device", so without privilege; a node is
+     asked itself. In `STORAGE_WRITE_CACHE_PROPERTY` (Microsoft Learn), no cache, a write-through
+     one and a disabled write-back one are write-through; an enabled write-back one is
+     power-protected where `NVCacheEnabled` says "the device has a battery backup for the write
+     cache", else write-back; a type the system cannot report, or a device that does not answer,
+     is the default. The structure has no `IsPowerProtected` field: its battery backup is
+     `NVCacheEnabled`.
+   - macOS: the block storage device's "WriteCacheState" (`kIOBlockStorageDeviceWriteCacheStateKey`,
+     IOBlockStorageDevice.h: true where its write cache is enabled), read from the I/O Registry
+     without root, as the atomic unit's sizes are. Where the device publishes none, fcntl(2)'s
+     rule stands: F_FULLFSYNC "asks the drive to flush all buffered data to the permanent storage
+     device", so the cache is write-back. The M-series Mac this was built on (APPLE SSD AP8192Z,
+     `IOEmbeddedNVMeBlockDevice`) publishes none on any entry from the volume to the controller:
+     `WriteBack`, from `FullFsync`, not stated (2026-11-18).
+   - A device the OS does not describe: write-back. Answering a write before its flush is safe
+     only where the OS says the cache keeps it; a flush is safe on every device.
+   - A power-protected cache counts as write-through: what loses a completed write is the cache's
+     volatility, "I/O completion ... before data actually has hit the non-volatile storage"
+     (writeback_cache_control.rst), and a battery-backed cache keeps what it holds.
+   - Every file carries it as it carries the atomic unit (`BlockFile::write_cache`): a
+     `DeviceFile` asks the OS, a `SegmentedFile` answers its base's device's, every wrapper of a
+     real file passes its file's through, and every other file answers the default. Nothing is
+     answered differently yet.
+   - The macOS registry search released null where no entry had the key, which traps in
+     CoreFoundation; every key the atomic unit reads is published on an Apple SSD, so nothing hit
+     it before "WriteCacheState". Fixed at its cause (hyper-raft `33fc359`).
 
 ## 8. Open
 

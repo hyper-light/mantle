@@ -14,6 +14,7 @@ use crate::DiskError;
 use crate::atomic::AtomicUnit;
 use crate::buf::Alignment;
 use crate::file::DeviceFile;
+use crate::write_cache::DeviceCache;
 
 /// The open file the kernel moves a file's bytes through ([`BlockFile::kernel_file`]).
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +56,14 @@ pub trait BlockFile: Send {
     /// simulation's, answers [`AtomicUnit::DEFAULT`], the unit of a device that states none.
     fn atomic_unit(&self) -> Result<AtomicUnit, DiskError> {
         Ok(AtomicUnit::DEFAULT)
+    }
+
+    /// The write cache of the device holding the file, and where it was read
+    /// ([`crate::write_cache::write_cache`]). A file the OS cannot be asked about, one in memory or
+    /// a simulation's, answers [`DeviceCache::DEFAULT`], the volatile write-back cache of a device
+    /// that states none.
+    fn write_cache(&self) -> Result<DeviceCache, DiskError> {
+        Ok(DeviceCache::DEFAULT)
     }
 
     /// The file's length, or a device node's capacity.
@@ -189,6 +198,10 @@ impl BlockFile for DeviceFile {
 
     fn atomic_unit(&self) -> Result<AtomicUnit, DiskError> {
         crate::atomic::atomic_unit(self.std_file(), self.path())
+    }
+
+    fn write_cache(&self) -> Result<DeviceCache, DiskError> {
+        crate::write_cache::write_cache(self.std_file(), self.path())
     }
 
     fn layout_block(&self) -> Alignment {

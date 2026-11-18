@@ -3,8 +3,9 @@
 //! `147f035` (`ORIGIN.md`).
 //!
 //! Identifying and measuring a device stays in mantle-disk: a caller that knows the device's
-//! alignment, queue and measured depth hands them in. The one fact read here is the device's
-//! atomic write unit (`atomic`), which the log lays its records in on every consumer, whether or
+//! alignment, queue and measured depth hands them in. The facts read here are the device's atomic
+//! write unit (`atomic`), which the log lays its records in, and its write cache (`write_cache`),
+//! which decides where the log may answer a frame at its own flush, on every consumer, whether or
 //! not it has mantle-disk.
 
 #![cfg_attr(
@@ -47,6 +48,7 @@ pub mod segmented;
 pub mod sim;
 pub mod threads;
 mod unwind;
+pub mod write_cache;
 
 /// What a device operation fails with.
 #[derive(Debug, thiserror::Error)]

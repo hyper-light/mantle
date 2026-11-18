@@ -47,6 +47,7 @@ use crate::block::{BlockFile, Durable};
 use crate::buf::{AlignedBuf, Alignment};
 use crate::file::{CachingRequest, DeviceFile, sync_dir};
 use crate::resident::{Epoch, Resident};
+use crate::write_cache::DeviceCache;
 
 /// One chunk for each bit of a slot's index: chunk `c` holds `2^c` slots, so the chunks hold every
 /// index a `usize` can name.
@@ -710,6 +711,16 @@ impl BlockFile for SegmentedFile {
         })
     }
 
+    /// The base's device's, as its atomic write unit is.
+    fn write_cache(&self) -> Result<DeviceCache, DiskError> {
+        self.with(|open| {
+            open.segment(0)
+                .ok_or_else(|| beyond(&self.base, "a segmented file with no base"))?
+                .file
+                .write_cache()
+        })
+    }
+
     fn len(&self) -> Result<u64, DiskError> {
         self.with(|open| {
             open.discover_all()?;
@@ -1020,6 +1031,26 @@ mod tests {
         let device = crate::atomic::atomic_unit(alone.std_file(), &base).unwrap();
         assert_eq!(file.atomic_unit().unwrap(), device);
         assert_eq!(file.try_clone().unwrap().atomic_unit().unwrap(), device);
+    }
+
+    /// A segmented file answers the write cache of its base's device, as the OS states it for the
+    /// base opened alone, through its owner and through a handle made from it, rather than the
+    /// default of a device that states none.
+    #[test]
+    fn a_segmented_file_reports_its_devices_write_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let file = create(&base, 4);
+        let alone = DeviceFile::open(
+            &base,
+            false,
+            CachingRequest::Buffered,
+            Alignment::new(ALIGN).unwrap(),
+        )
+        .unwrap();
+        let device = crate::write_cache::write_cache(alone.std_file(), &base).unwrap();
+        assert_eq!(file.write_cache().unwrap(), device);
+        assert_eq!(file.try_clone().unwrap().write_cache().unwrap(), device);
     }
 
     /// Do: add 37 segments to a file bounded to 1,000, writing a page into each, and reopen it.

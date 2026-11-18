@@ -30,7 +30,7 @@
 //! this answer (mantle CLAUDE.md §5) is the power-cut tests of the log that lays pieces in it.
 
 #[cfg(target_vendor = "apple")]
-mod macos;
+pub(crate) mod macos;
 
 use std::fs::File;
 #[cfg(any(target_os = "linux", target_os = "android", test))]
@@ -138,7 +138,7 @@ fn query(file: &File, path: &Path) -> Result<AtomicUnit, DiskError> {
 /// The sysfs queue directory of the block device holding `file`; `None` for a device sysfs does
 /// not list, an anonymous one (major 0: tmpfs, overlayfs, FUSE, a btrfs subvolume).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn queue_of(file: &File) -> std::io::Result<Option<PathBuf>> {
+pub(crate) fn queue_of(file: &File) -> std::io::Result<Option<PathBuf>> {
     use rustix::fs::{FileType, fstat, major, minor};
     let stat = fstat(file)?;
     // A block device node is the device itself; the file system holding the node, devtmpfs, is no
@@ -190,7 +190,7 @@ const ATTRIBUTE_READ: u64 = 12;
 /// The decimal a sysfs attribute of `queue` holds; `None` where the kernel has no such attribute
 /// (the atomic-write limits came in Linux 6.11).
 #[cfg(any(target_os = "linux", target_os = "android", test))]
-fn attribute(queue: &Path, name: &str) -> Result<Option<u32>, DiskError> {
+pub(crate) fn attribute(queue: &Path, name: &str) -> Result<Option<u32>, DiskError> {
     let path = queue.join(name);
     let io = |source| DiskError::Io {
         op: "read a sysfs attribute",

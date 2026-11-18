@@ -23,7 +23,9 @@ mod s3;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::task::Waker;
+use std::time::Duration;
 
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::facts::Facts;
@@ -37,6 +39,7 @@ use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door;
 use mantle_node::listener::{Listener, REFUSING, Settings, tasks};
 use mantle_node::process::AccessKey;
+use mantle_protocol::bounds::STOCK_PATIENCE;
 
 /// The connections the tests' listener serves: one stock client's, as many as it answers refused
 /// past them.
@@ -129,13 +132,21 @@ fn the_listener_answers_over_tls_1_3_and_1_2_with_the_endpoint_chain() {
             let client = std::thread::spawn(move || {
                 let said = [&version::TLS13, &version::TLS12]
                     .into_iter()
-                    .map(|version| ask(at, &authority, version, &asked))
+                    .map(|version| {
+                        let (authority, asked) = (authority.clone(), asked.clone());
+                        within(
+                            &format!("the exchange over {version:?}"),
+                            STOCK_PATIENCE,
+                            move || ask(at, &authority, version, &asked),
+                        )
+                    })
                     .collect();
                 told.blocking_send(said).unwrap();
             });
             let said = match race2(listener.serve(), heard.recv()).await {
                 Either::Second(Ok(said)) => said,
-                Either::Second(Err(e)) => panic!("the client: {e:?}"),
+                // The client failed: its own failure, which names its wait, is the test's.
+                Either::Second(Err(_)) => std::panic::resume_unwind(client.join().unwrap_err()),
                 Either::First(e) => panic!("the listener ended: {e}"),
             };
             client.join().unwrap();
@@ -212,7 +223,8 @@ fn beside<T: Send + 'static>(client: impl FnOnce(SocketAddr) -> T + Send + 'stat
             });
             let said = match race2(listener.serve(), heard.recv()).await {
                 Either::Second(Ok(said)) => said,
-                Either::Second(Err(e)) => panic!("the client: {e:?}"),
+                // The client failed: its own failure, which names its wait, is the test's.
+                Either::Second(Err(_)) => std::panic::resume_unwind(thread.join().unwrap_err()),
                 Either::First(e) => panic!("the listener ended: {e}"),
             };
             thread.join().unwrap();
@@ -237,7 +249,7 @@ fn a_connection_past_the_budget_is_answered_slow_down() {
             .collect();
         let statuses: Vec<u16> = held
             .iter_mut()
-            .map(|client| client.send("GET", "/", &[], b"").status)
+            .map(|client| asked(client, "a request held open", STOCK_PATIENCE, get))
             .collect();
         let past = answer(at, &key);
         drop(held);
@@ -257,8 +269,8 @@ fn a_connection_past_the_budget_is_answered_slow_down() {
 /// A connection whose client says nothing for a stock client's patience is let go, its slot with
 /// it (node.md §4.5): every slot is held by a connection that asked once and went quiet, each is
 /// closed by the listener, and a new connection's request is then served (`403`, the listener's
-/// own answer), not answered refused. Each socket reads at most twice the patience, so a listener
-/// that never lets go fails here rather than hangs.
+/// own answer), not answered refused. Each close is waited on for at most twice the patience, so a
+/// listener that never lets go fails here rather than hangs.
 #[test]
 fn a_connection_quiet_for_a_stock_clients_patience_is_let_go() {
     let (closed, fresh) = beside(|at| {
@@ -267,21 +279,20 @@ fn a_connection_quiet_for_a_stock_clients_patience_is_let_go() {
             .map(|_| s3::Client::new(at, key.clone(), "us-east-1"))
             .collect();
         for client in &mut held {
-            assert_eq!(client.send("GET", "/", &[], b"").status, 403);
-            client
-                .stream()
-                .set_read_timeout(Some(2 * mantle_protocol::bounds::STOCK_PATIENCE))
-                .unwrap();
+            assert_eq!(asked(client, "a request", STOCK_PATIENCE, get), 403);
         }
         let closed = held
             .iter_mut()
-            .map(|client| client.closed())
+            .map(|client| {
+                let close = "the listener's close of a quiet connection";
+                asked(client, close, 2 * STOCK_PATIENCE, s3::Client::closed)
+            })
             .filter(|&closed| closed)
             .count();
         let fresh = answer(at, &key);
         // A client that finds its pooled connection closed asks on a new one, as stock clients
         // do, and is served again.
-        let again = held[0].send("GET", "/", &[], b"").status;
+        let again = asked(&mut held[0], "a request again", STOCK_PATIENCE, get);
         (closed, (fresh, again))
     });
     assert_eq!(closed, usize::try_from(CONNECTIONS).unwrap());
@@ -291,14 +302,69 @@ fn a_connection_quiet_for_a_stock_clients_patience_is_let_go() {
     assert_eq!(again, 403);
 }
 
+/// `GET /` by `client`, and the status it is answered.
+fn get(client: &mut s3::Client) -> u16 {
+    client.send("GET", "/", &[], b"").status
+}
+
+/// What `ask` came to of `client`, the client moved to a thread of its own and back, waited on
+/// for at most `bound` (`within`): `s3::Client`'s exchanges block with no bound of their own.
+#[track_caller]
+fn asked<T: Send + 'static>(
+    client: &mut s3::Client,
+    what: &str,
+    bound: Duration,
+    ask: impl FnOnce(&mut s3::Client) -> T + Send + 'static,
+) -> T {
+    let fresh = s3::Client::new(client.at, client.key.clone(), &client.region);
+    let mut moved = std::mem::replace(client, fresh);
+    let (moved, came) = within(what, bound, move || {
+        let came = ask(&mut moved);
+        (moved, came)
+    });
+    *client = moved;
+    came
+}
+
+/// What `ask` came to, asked on a thread of its own and waited on for at most `bound`, so an
+/// exchange the listener stops answering fails the test rather than holding it: for an exchange, a
+/// stock client's patience (`bounds::STOCK_PATIENCE`), as long as such a client waits on the
+/// listener between bytes and as `answer` waits on each read; for a quiet connection's close,
+/// which the listener owes once that patience has passed, twice it, as the test states. A failure,
+/// the wait's or the thread's own, names `what` at the test's own line.
+#[track_caller]
+fn within<T: Send + 'static>(
+    what: &str,
+    bound: Duration,
+    ask: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let at = std::panic::Location::caller();
+    let (told, heard) = sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        // Once the wait failed, nothing hears what it came to.
+        let _ = told.send(ask());
+    });
+    match heard.recv_timeout(bound) {
+        Ok(came) => came,
+        Err(RecvTimeoutError::Timeout) => panic!("{what} at {at}: no end within {bound:?}"),
+        Err(RecvTimeoutError::Disconnected) => {
+            let panicked = thread.join().unwrap_err();
+            let said = panicked
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panicked.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic with no message");
+            panic!("{what} at {at}: {said}")
+        }
+    }
+}
+
 /// One request on a connection of its own, signed with `key`, and the response it gets, read
 /// whole; or how the connection ended without one.
 fn answer(at: SocketAddr, key: &s3::Key) -> Result<s3::Response, String> {
     let client = s3::Client::new(at, key.clone(), "us-east-1");
     let mut stream = TcpStream::connect(at).map_err(|e| format!("connect: {e}"))?;
-    stream
-        .set_read_timeout(Some(mantle_protocol::bounds::STOCK_PATIENCE))
-        .unwrap();
+    stream.set_read_timeout(Some(STOCK_PATIENCE)).unwrap();
     let head = client.head("GET", "/", &[], mantle_s3::sigv4::EMPTY_SHA256);
     stream
         .write_all(head.as_bytes())

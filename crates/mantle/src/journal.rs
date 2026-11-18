@@ -19,6 +19,8 @@
 //! open, as many as one page of ListMultipartUploads lists, so `mantle multipart uploads` shows
 //! every upload the journal names; a copy past them is refused until one is finished or aborted.
 
+use std::borrow::Cow;
+use std::convert::Infallible;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,9 @@ pub const MAX_OPEN: usize = MAX_PAGE_PARTS;
 
 /// What begins every record, and its format.
 const MAGIC: &[u8; 4] = b"MNJ1";
+
+/// The bytes of the CRC-32C every record ends in.
+const CRC_BYTES: usize = 4;
 
 /// Why the journal did not do what it was asked.
 #[derive(Debug)]
@@ -128,21 +133,37 @@ pub struct Record {
 }
 
 impl Record {
+    /// The record's bytes, made at their length: its fields counted first, then written once,
+    /// the checksum after them. A path is read as text once, for both.
     fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
+        let path = match &self.origin {
+            Origin::File { path, .. } => path.to_string_lossy(),
+            Origin::Standard => Cow::Borrowed(""),
+        };
+        let Ok(mut w) = mantle_codec::encode(CRC_BYTES, |w| {
+            self.put(w, &path);
+            Ok::<_, Infallible>(())
+        });
+        let crc = mantle_crc::crc32c(w.as_slice());
+        w.u32(crc);
+        w.into_vec()
+    }
+
+    /// The record's fields, the checksum aside, its source's path as `path`.
+    fn put(&self, w: &mut Writer, path: &str) {
         w.bytes(MAGIC);
-        text(&mut w, &self.bucket);
-        text(&mut w, &self.key);
+        text(w, &self.bucket);
+        text(w, &self.key);
         match &self.origin {
             Origin::Standard => w.u8(0),
             Origin::File {
-                path,
                 length,
                 modified_ns,
                 identity,
+                ..
             } => {
                 w.u8(1);
-                text(&mut w, &path.to_string_lossy());
+                text(w, path);
                 w.u64(*length);
                 w.u64(*modified_ns);
                 match identity {
@@ -156,10 +177,7 @@ impl Record {
             }
         }
         w.u128(self.id);
-        text(&mut w, &self.upload);
-        let crc = mantle_crc::crc32c(w.as_slice());
-        w.u32(crc);
-        w.into_vec()
+        text(w, &self.upload);
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
@@ -365,6 +383,96 @@ mod tests {
             journal.find("b", "a\nkey", &Origin::Standard),
             Err(JournalError::Corrupt(_))
         ));
+    }
+
+    /// `Record::encode` as it was before Lean doors step 7, in a writer that grows.
+    fn reference(record: &Record) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.bytes(MAGIC);
+        text(&mut w, &record.bucket);
+        text(&mut w, &record.key);
+        match &record.origin {
+            Origin::Standard => w.u8(0),
+            Origin::File {
+                path,
+                length,
+                modified_ns,
+                identity,
+            } => {
+                w.u8(1);
+                text(&mut w, &path.to_string_lossy());
+                w.u64(*length);
+                w.u64(*modified_ns);
+                match identity {
+                    None => w.u8(0),
+                    Some((device, inode)) => {
+                        w.u8(1);
+                        w.u64(*device);
+                        w.u64(*inode);
+                    }
+                }
+            }
+        }
+        w.u128(record.id);
+        text(&mut w, &record.upload);
+        let crc = mantle_crc::crc32c(w.as_slice());
+        w.u32(crc);
+        w.into_vec()
+    }
+
+    /// The allocations and reallocations `f` makes on this thread, on the counting allocator the
+    /// unit tests run on (main.rs).
+    fn counted<T>(f: impl FnOnce() -> T) -> (T, (u64, u64)) {
+        hyper_measure::alloc::begin();
+        let out = f();
+        let counts = hyper_measure::alloc::end();
+        (out, (counts.allocations, counts.reallocations))
+    }
+
+    /// A record is one buffer made at its length, the bytes the encoder before Lean doors step 7
+    /// wrote: from standard input, from a file with its identity and without, and with every
+    /// field at its longest (a bucket and a key at S3's bounds, a path at Linux's PATH_MAX).
+    #[test]
+    fn a_record_is_written_at_its_length() {
+        use mantle_s3::route::{MAX_BUCKET, MAX_KEY};
+        let file = |path: &str, identity| Origin::File {
+            path: PathBuf::from(path),
+            length: 5 << 30,
+            modified_ns: u64::MAX,
+            identity,
+        };
+        let longest = Record {
+            bucket: "b".repeat(MAX_BUCKET),
+            key: "k".repeat(MAX_KEY),
+            origin: file(&"p".repeat(4096), Some((u64::MAX, u64::MAX))),
+            id: u128::MAX,
+            upload: "u".repeat(128),
+        };
+        let cases = [
+            ("standard input", record(Origin::Standard)),
+            ("a file", record(file("/tmp/source", Some((1, 2))))),
+            ("a file without identity", record(file("/tmp/source", None))),
+            ("longest", longest),
+        ];
+        let mut wrong = Vec::new();
+        for (what, r) in cases {
+            let (expected, before) = counted(|| reference(&r));
+            let (bytes, made) = counted(|| r.encode());
+            println!(
+                "record {what}: before {before:?}, now {made:?}, {} bytes",
+                bytes.len()
+            );
+            if made != (1, 0) || bytes.capacity() != bytes.len() {
+                wrong.push(format!(
+                    "{what}: (allocations, reallocations) {made:?}, capacity {} for {} bytes",
+                    bytes.capacity(),
+                    bytes.len()
+                ));
+            }
+            assert_eq!(bytes, expected, "{what}");
+            assert_eq!(Record::decode(&bytes), Some(r), "{what}");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Past its bound the journal refuses a new record, and keeps taking the ones it holds.

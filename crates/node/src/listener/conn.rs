@@ -51,7 +51,7 @@ fn patience_ns() -> u64 {
 pub const PIECE: usize = hyper_transport::RECEIVE_CHUNK;
 
 /// A body's pieces in flight to the host: one the driver takes while the next is read.
-const BODY_PIECES: usize = 2;
+pub const BODY_PIECES: usize = 2;
 
 /// A reply's answers in flight from the host: its head, or a get's piece while the last is sent.
 const REPLY_PIECES: usize = 2;

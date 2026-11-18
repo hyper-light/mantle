@@ -2735,6 +2735,18 @@ response's field lines are written once, checked as written, into a buffer the c
 across its requests, and its head and its document, or a GET's head and its first bytes, go in one
 vectored write.
 
+*Since 2026-11-18 (the Lean doors plan's step 6 bound).* A request holds at most
+`listener::REQUEST_BYTES` above its connection at rest, whose read buffer, head buffer and
+response head buffers it keeps across its requests: one head (`mantle_http::MAX_HEAD`, 8 KB) for
+what the door makes of a head and answers it with, one body segment (`PIECE`) and one TLS record
+at its largest (`TLS_RECORD`, 2^14 octets and TLS 1.2's 2,048 of expansion, RFC 8446 §5.1–5.2
+and RFC 5246 §6.2.3), 92,156 octets. A TLS connection encrypts a response a record at a time,
+each sent before the next is made, where hyper-tls's default would encrypt 64 KiB ahead of the
+socket. A put whose body is longer than a segment holds `BODY_PIECES` more, read ahead into the
+host's queue, beside the one it holds while that queue is full: the connection copies a piece
+before the queue has room for it, as hyper-rt's channel takes a value only to send it.
+`tests/listener_memory.rs` counts each request from its connection at rest to its answer.
+
 ### 4.4 Errors
 
 Each driver's error maps to S3's answer, and a failure whose outcome is unknown is never

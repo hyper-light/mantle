@@ -42,7 +42,7 @@ use hyper_tls::{ServerConfig, version};
 use crate::door::Submitter;
 use crate::process::AccessKey;
 
-pub use conn::PIECE;
+pub use conn::{BODY_PIECES, PIECE};
 use sessions::Sessions;
 
 /// The connections one stock client opens to an endpoint at once by default, the AWS CLI's
@@ -84,6 +84,26 @@ pub const CONNECTION_BYTES: u64 = 382_052;
 /// either side of each doubling of its table to 2^17 buckets
 /// (`sessions::tests::the_store_is_reserved_whole_within_its_stated_bytes_and_never_grows`).
 pub const SESSION_BYTES: u64 = 1_143;
+
+/// The most plaintext one TLS record carries: 2^14 octets (RFC 8446 §5.1; RFC 5246 §6.2.1). A
+/// connection encrypts a response's bytes a record of it at a time (`io::Tls::new`).
+pub(crate) const RECORD_PLAINTEXT: usize = 1 << 14;
+
+/// One TLS record at its largest on the wire: its 5-octet header (RFC 8446 §5.1), and
+/// [`RECORD_PLAINTEXT`] with the most its protection adds, 256 octets under TLS 1.3 (RFC 8446
+/// §5.2) and 2,048 under TLS 1.2 (RFC 5246 §6.2.3), the larger taken: hyper-tls's `MAX_WIRE_SIZE`
+/// (`msgs/message`), which its deframer's buffer is held to.
+pub const TLS_RECORD: usize = 5 + RECORD_PLAINTEXT + 2048;
+
+/// The most one request holds above its connection at rest, whose read buffer ([`PIECE`]), head
+/// buffer and response head buffers are kept across its requests: one head
+/// ([`mantle_http::MAX_HEAD`], S3's 8 KB) for what the door makes of a request's head and answers
+/// it with (its field table, route, principal and operation, its signature's string to sign, the
+/// host's reply and the channels between the two), one body segment ([`PIECE`]), the piece a
+/// put's body is copied into, and one TLS record ([`TLS_RECORD`]). Pinned by
+/// `tests/listener_memory.rs`
+/// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`).
+pub const REQUEST_BYTES: usize = mantle_http::MAX_HEAD + PIECE + TLS_RECORD;
 
 /// The connections past those it serves ([`Settings::connections`]) the listener answers `503
 /// SlowDown`, `Connection: close`, rather than closes: as many as one more stock client opens at

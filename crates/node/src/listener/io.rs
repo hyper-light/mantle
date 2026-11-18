@@ -51,8 +51,13 @@ pub struct Tls {
 }
 
 impl Tls {
+    /// The connection's records are encrypted one at a time: a write takes at most one record's
+    /// plaintext (`listener::RECORD_PLAINTEXT`) and is sent before the next is taken, so it holds
+    /// one record unsent (`listener::TLS_RECORD`), where hyper-tls's default would encrypt 64 KiB
+    /// of a response's bytes ahead of the socket.
     pub fn new(stream: TcpStream, config: ServerConfig) -> Result<Self, IoError> {
-        let connection = ServerConnection::new(&config).map_err(IoError::Tls)?;
+        let mut connection = ServerConnection::new(&config).map_err(IoError::Tls)?;
+        connection.set_buffer_limit(Some(super::RECORD_PLAINTEXT));
         Ok(Self {
             stream,
             connection,
@@ -151,6 +156,11 @@ impl Io {
                 let mut at = 0usize;
                 while let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) {
                     let took = tls.connection.writer().write(rest).map_err(IoError::Io)?;
+                    // After a flush the connection takes a record's plaintext; none taken would
+                    // never end.
+                    if took == 0 {
+                        return Err(IoError::Stalled);
+                    }
                     at = at.checked_add(took).ok_or(IoError::Stalled)?;
                     tls.flush().await?;
                 }
@@ -187,6 +197,9 @@ impl Io {
                     let mut at = 0usize;
                     while let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) {
                         let took = tls.connection.writer().write(rest).map_err(IoError::Io)?;
+                        if took == 0 {
+                            return Err(IoError::Stalled);
+                        }
                         at = at.checked_add(took).ok_or(IoError::Stalled)?;
                         tls.flush().await?;
                     }

@@ -363,3 +363,326 @@ fn a_listener_connection_holds_its_stated_bytes() {
         );
     }
 }
+
+/// A request a client asks of one connection, twice: once to bring the connection to its rest
+/// with every buffer it keeps across requests made, then again, counted.
+#[derive(Clone, Copy, Debug)]
+enum Method {
+    Put,
+    Get,
+    Head,
+    Delete,
+}
+
+/// The object a GET is answered from: a static slice, so the host's bytes are no allocation of
+/// the listener's thread, as a node's are its own window's (node.md §4.3).
+static OBJECT: [u8; 4 * PIECE] = [0x5a; 4 * PIECE];
+
+/// The client's TLS, by version, or plain HTTP.
+#[derive(Clone, Copy, Debug)]
+enum Over {
+    Plain,
+    Tls13,
+    Tls12,
+}
+
+/// A response read whole: its status.
+fn answered<R: std::io::Read + ?Sized>(stream: &mut R, head_only: bool) -> u16 {
+    let mut read = Vec::new();
+    let mut byte = [0u8; 1];
+    while !read.ends_with(b"\r\n\r\n") {
+        let n = stream.read(&mut byte).unwrap();
+        assert!(n > 0, "closed before its head: {read:?}");
+        read.push(byte[0]);
+    }
+    let text = String::from_utf8(read).unwrap();
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap();
+    let length = text
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length: ")
+                .map(|v| v.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    if !head_only {
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).unwrap();
+    }
+    status
+}
+
+/// The request's head and body, signed.
+fn asked(at: SocketAddr, method: Method, size: usize) -> (String, Vec<u8>) {
+    let key = access();
+    let signer = s3::Client::new(
+        at,
+        s3::Key {
+            id: key.id.clone(),
+            secret: key.secret.clone(),
+        },
+        "us-east-1",
+    );
+    let body = match method {
+        Method::Put => vec![0x5a; size],
+        _ => Vec::new(),
+    };
+    let payload = mantle_s3::sigv4::hex(&mantle_s3::crypto::sha256(&body).unwrap());
+    let length = body.len().to_string();
+    let (name, headers): (&str, &[(&str, &str)]) = match method {
+        Method::Put => ("PUT", &[("content-length", length.as_str())]),
+        Method::Get => ("GET", &[]),
+        Method::Head => ("HEAD", &[]),
+        Method::Delete => ("DELETE", &[]),
+    };
+    (signer.head(name, "/bucket/key", headers, &payload), body)
+}
+
+/// One client on one connection: the request twice, each answer read whole; told when the first
+/// is, the second asked only once it is let go, and the connection then held until the listener
+/// ends.
+fn asker(
+    at: SocketAddr,
+    authority: Option<Vec<u8>>,
+    over: Over,
+    (method, size): (Method, usize),
+    (warm, go, done): (
+        std::sync::mpsc::SyncSender<u16>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<u16>,
+    ),
+) {
+    let tcp = TcpStream::connect(at).unwrap();
+    let head_only = matches!(method, Method::Head);
+    let exchange = |stream: &mut dyn ReadWrite| {
+        for round in 0..2 {
+            if round == 1 {
+                go.recv().unwrap();
+            }
+            let (head, body) = asked(at, method, size);
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+            let status = answered(stream, head_only);
+            let told = if round == 0 { &warm } else { &done };
+            told.send(status).unwrap();
+        }
+        let _ = stream.read(&mut [0u8; 1]);
+    };
+    match authority {
+        None => exchange(&mut { tcp }),
+        Some(authority) => {
+            let mut roots = RootCertStore::empty();
+            roots.add(CertificateDer::from(authority)).unwrap();
+            let versions: &[&hyper_tls::SupportedProtocolVersion] = match over {
+                Over::Tls12 => &[&version::TLS12],
+                _ => &[&version::TLS13],
+            };
+            let mut config = ClientConfig::builder_with_provider(
+                &hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER,
+            )
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let connection =
+                ClientConnection::new(&mut config, ServerName::try_from("127.0.0.1").unwrap())
+                    .unwrap();
+            exchange(&mut StreamOwned::new(connection, config, tcp));
+        }
+    }
+}
+
+/// A connection's stream, plain or under TLS.
+trait ReadWrite: std::io::Read + Write {}
+impl<T: std::io::Read + Write> ReadWrite for T {}
+
+/// The host's side of one request, as a node's driver answers it: a put's body taken piece by
+/// piece and each piece let go as it comes, as the driver takes it into its own window; a get's
+/// bytes the static object's, in pieces.
+async fn host(method: Method, size: usize, mut request: Box<door::Request>) {
+    use mantle_protocol::object::{Reply, Status};
+    let reply = |size: u64| Reply {
+        size,
+        etag: "0123456789abcdef0123456789abcdef".into(),
+        ..Reply::status(Status::Done)
+    };
+    match method {
+        Method::Put => {
+            request.reply.send(door::Answer::Ready).await.unwrap();
+            loop {
+                match request.body.recv().await.unwrap() {
+                    Piece::Bytes(piece) => drop(piece),
+                    Piece::End(_) => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            let head = door::Answer::Head(Box::new(reply(0)));
+            request.reply.send(head).await.unwrap();
+        }
+        Method::Get => {
+            let head = door::Answer::Head(Box::new(reply(u64::try_from(size).unwrap())));
+            request.reply.send(head).await.unwrap();
+            for piece in OBJECT[..size].chunks(PIECE) {
+                let bytes = bytes::Bytes::from_static(piece);
+                request
+                    .reply
+                    .send(door::Answer::Bytes(bytes))
+                    .await
+                    .unwrap();
+            }
+            request.reply.send(door::Answer::End).await.unwrap();
+        }
+        Method::Head => {
+            let head = door::Answer::Head(Box::new(reply(u64::try_from(size).unwrap())));
+            request.reply.send(head).await.unwrap();
+        }
+        Method::Delete => {
+            let head = door::Answer::Head(Box::new(Reply::status(Status::Done)));
+            request.reply.send(head).await.unwrap();
+        }
+    }
+}
+
+/// The next request at the door, within a stock client's patience.
+async fn next(doorway: &mut door::Doorway, since: Instant) -> Box<door::Request> {
+    loop {
+        match doorway.take() {
+            Some(door::Asked::Op(request)) => return request,
+            Some(door::Asked::Key(_)) => panic!("a root key's request asked the node for a key"),
+            None if since.elapsed() > STOCK_PATIENCE => panic!("no request within patience"),
+            None => hyper_rt::futures::sleep(1_000_000).await.unwrap(),
+        }
+    }
+}
+
+/// What the client says next, within a stock client's patience.
+async fn told(from: &std::sync::mpsc::Receiver<u16>, since: Instant) -> u16 {
+    loop {
+        match from.try_recv() {
+            Ok(status) => return status,
+            Err(_) if since.elapsed() > STOCK_PATIENCE => panic!("no answer within patience"),
+            Err(_) => hyper_rt::futures::sleep(1_000_000).await.unwrap(),
+        }
+    }
+}
+
+/// The listener thread's counts from one connection at rest, its kept buffers made by the same
+/// request before, to the second request's answer read whole by its client.
+fn one_request(over: Over, method: Method, size: usize) -> (alloc::Counts, u16) {
+    let chain = (!matches!(over, Over::Plain)).then(chain);
+    let mut runtime = runtime();
+    let (counts, status, client) = runtime
+        .block_on(async move {
+            let (mut doorway, submitter) = door::doorway(1, Waker::noop().clone()).unwrap();
+            let authority = chain.as_ref().map(|c| c.authority.clone());
+            let settings = Settings {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                region: "us-east-1".into(),
+                domains: Vec::new(),
+                access: vec![access()],
+                tls: chain.map(|c| (c.leaf, c.key)),
+                node: 1,
+                connections: 1,
+            };
+            let listener = Listener::bind(settings, submitter).unwrap();
+            let at = listener.local_addr().unwrap();
+            let (warm, warmed) = sync_channel(1);
+            let (go, gone) = sync_channel(1);
+            let (done, answered) = sync_channel(1);
+            let client = std::thread::spawn(move || {
+                asker(at, authority, over, (method, size), (warm, gone, done));
+            });
+            let started = Instant::now();
+            let serve = async {
+                let first = next(&mut doorway, started).await;
+                host(method, size, first).await;
+                let first = told(&warmed, started).await;
+                alloc::begin();
+                go.send(()).unwrap();
+                let second = next(&mut doorway, started).await;
+                host(method, size, second).await;
+                let second = told(&answered, started).await;
+                let counts = alloc::end();
+                (counts, first, second)
+            };
+            match race2(listener.serve(), serve).await {
+                Either::Second((counts, first, second)) => {
+                    assert_eq!(first, second, "{over:?} {method:?} {size}");
+                    (counts, second, client)
+                }
+                Either::First(e) => panic!("the listener ended: {e}"),
+            }
+        })
+        .unwrap();
+    drop(runtime);
+    client.join().unwrap();
+    (counts, status)
+}
+
+/// A request, from its connection at rest to its answer read whole, holds no more than
+/// `listener::REQUEST_BYTES` above that rest (one head, one body segment, one TLS record), over plain
+/// HTTP, TLS 1.3 and TLS 1.2: a PUT and a GET of 1 octet, of a body spanning several TLS records
+/// within one segment, and of one many segments long; a HEAD and a DELETE. Its connection is
+/// brought to rest by the same request before the count, so every buffer it keeps across requests
+/// is made; and the request leaves nothing behind. The host is the test's own, on the listener's
+/// thread (`host`): a put's pieces are let go as it takes them, as a driver takes them into its
+/// own window, and a get's bytes are a static slice, as a node's are its own window's, so what is
+/// counted is the door's: its request, its pieces, its TLS records, and the host's reply it
+/// answers from.
+///
+/// A put whose body is longer than a segment also holds the pieces it read ahead into the host's
+/// queue, `listener::BODY_PIECES` of them, beside the one it holds while that queue is full: the
+/// connection copies its next piece before the queue has room for it, as `hyper_rt`'s channel
+/// takes a value only to send it. Those are stated apart here, and counted in what a connection
+/// holds (`listener::CONNECTION_BYTES`).
+#[test]
+fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
+    use mantle_node::listener::{BODY_PIECES, REQUEST_BYTES};
+    let records = 3 * (1 << 14) + 1;
+    let many = 4 * PIECE;
+    let ahead = BODY_PIECES * PIECE;
+    for over in [Over::Plain, Over::Tls13, Over::Tls12] {
+        for (method, size) in [
+            (Method::Put, 1),
+            (Method::Put, records),
+            (Method::Put, PIECE),
+            (Method::Put, many),
+            (Method::Get, 1),
+            (Method::Get, records),
+            (Method::Get, many),
+            (Method::Head, many),
+            (Method::Delete, 0),
+        ] {
+            let (counts, status) = one_request(over, method, size);
+            let bound = match method {
+                Method::Put if size > PIECE => REQUEST_BYTES + ahead,
+                _ => REQUEST_BYTES,
+            };
+            eprintln!(
+                "{over:?} {method:?} {size}: status {status}, peak {} of {bound}, live after {}, \
+                 {} allocations, {} reallocations",
+                counts.peak, counts.live, counts.allocations, counts.reallocations
+            );
+            assert!(
+                matches!(status, 200 | 204),
+                "{over:?} {method:?} {size}: {status}"
+            );
+            assert!(
+                usize::try_from(counts.peak).unwrap() <= bound,
+                "{over:?} {method:?} {size}: a peak of {} past {bound}",
+                counts.peak
+            );
+            assert!(
+                counts.live <= 0,
+                "{over:?} {method:?} {size}: {} left past the answer",
+                counts.live
+            );
+        }
+    }
+}

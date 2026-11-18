@@ -57,7 +57,7 @@ const SESSION: usize =
 #[derive(Clone, Copy)]
 struct Slot {
     id: [u8; ID],
-    /// When the full handshake this session descends from was made, on the shard's clock.
+    /// When the full handshake this session descends from was made, on the host's clock ([`now`]).
     origin: u64,
     len: usize,
     value: [u8; SESSION],
@@ -206,22 +206,28 @@ impl Kept {
     }
 }
 
+/// The time on the host's clock, which every shard reads alike: connections on any of the node's
+/// shards keep and resume sessions in the one store, so each session's time must mean the same on
+/// all of them. hyper-rt's `shard_clock_ns` is the host's continuous clock, which counts time
+/// asleep: `mach_continuous_time` on macOS, `CLOCK_BOOTTIME` on Linux, the interrupt time on
+/// Windows (`hyper_rt::machine::clock`), where a shard's own clock (`futures::now_ns`) counts from
+/// that shard's start.
+fn now() -> u64 {
+    hyper_rt::machine::clock::shard_clock_ns()
+}
+
 impl StoresServerSessions for Kept {
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        self.put_at(&key, &value, hyper_rt::futures::now_ns())
+        self.put_at(&key, &value, now())
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let (value, _) = self
-            .store
-            .lock()
-            .ok()?
-            .find(key, hyper_rt::futures::now_ns(), false)?;
+        let (value, _) = self.store.lock().ok()?.find(key, now(), false)?;
         Some(value)
     }
 
     fn take(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        self.find_at(key, hyper_rt::futures::now_ns(), true)
+        self.find_at(key, now(), true)
     }
 
     fn can_cache(&self) -> bool {
@@ -257,6 +263,28 @@ mod tests {
 
     fn store(slots: usize) -> &'static Mutex<Sessions> {
         Box::leak(Box::new(Mutex::new(Sessions::new(slots))))
+    }
+
+    /// The store's clock is the host's on every shard: read on each shard of two, between two reads
+    /// of the host's clock on this thread, it falls between them, where a shard's own clock counts
+    /// from that shard's start, milliseconds against the host's time since boot.
+    #[test]
+    fn the_stores_clock_is_the_hosts_on_every_shard() {
+        let rt = crate::listener::shards::tests::started(2, 2);
+        for shard in rt.shard_ids().to_vec() {
+            let (told, heard) = std::sync::mpsc::sync_channel(1);
+            let before = hyper_rt::machine::clock::shard_clock_ns();
+            rt.spawn_on(shard, async move {
+                told.try_send((hyper_rt::futures::shard_id(), now()))
+                    .unwrap();
+            })
+            .unwrap();
+            let (on, read) = heard.recv().unwrap();
+            let after = hyper_rt::machine::clock::shard_clock_ns();
+            assert_eq!(on, Some(shard));
+            assert!(before <= read && read <= after, "{before} {read} {after}");
+        }
+        rt.shutdown().unwrap();
     }
 
     /// What one handshake came to: the kind each side says it was, the version, whether the client

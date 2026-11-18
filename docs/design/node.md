@@ -287,8 +287,9 @@ measures the second, and derives the rest by these rules:
   whole; a page buffer, a point read's page, a checkpoint page and an extent's run), each extent's
   allocator count, free or pending slot, map bit and map word apart, charged with the extent's
   resident metadata from what memory remains (`shard_db::measured_per_extent`); and the threads
-  the node starts (`derive::threads`: its own, which starts its shard and waits for its end,
-  its shard's, standard input's and output's, the log's two, each device's issuer, with a
+  the node starts (`derive::threads`: its own, which starts its shards and waits for the node's
+  end, standard input's and output's, the log's two, the runtime's watchdog, a shard's for each
+  CPU the process runs at once (hyper-rt `Facts::cpus_at_once`), each device's issuer, with a
   worker a read of its depth where a pool carries it (macOS, Windows;
   `Issuer::device_threads`), each volume's writer, cleaner and scrubber), each at
   Rust's default stack of 2 MiB, reserved whole; and each range's member
@@ -2001,9 +2002,30 @@ every length and mutated, parsed with none, since 2026-11-06). `mantle bench htt
 (measurements/2026-10-25-http-codec.md).
 
 *As built (2026-10-25), the listener* (`crates/node/src/listener`). `mantle serve` binds it where
-its S3 keys say (§1.5) and accepts on the node's one shard beside the node's own task, each
+its S3 keys say (§1.5) and accepts on the node's first shard beside the node's own task, each
 connection a task of its own, so the runtime wakes the one whose socket or channel moved; the
-runtime holds a task for each connection the budget admits (§4.5). On a loopback address it serves
+runtime holds a task for each connection the budget admits (§4.5).
+
+*As built (2026-11-18), connections placed across the shards* (`crates/node/src/listener/shards.rs`;
+audit 2026-11-12 §6). The node runs a shard for each CPU the process runs at once: its cores,
+capped by the whole CPUs its CPU budget buys, affinity and cgroup quota included (hyper-rt
+`Facts::cpus_at_once`), and one where the budget buys less than a whole CPU. Its ranges, its log,
+its transport and its QUIC door stay on the first shard, which keeps one durable owner, one log
+writer and one UDP endpoint; the S3 connections go to the others. **The placement rule:** the
+listener accepts on the first shard and hands each connection it admits, served or answered
+refused, to the other shard with the fewest of its connections open, the first of those tied,
+through a channel of that shard's own bounded at the connections the listener holds at once
+(`listener::tasks`), so a channel never refuses one for want of room. A task on that shard takes
+each, adopts its socket and starts its connection there, so the connection's future is made on
+the shard that runs it, as hyper-rt's `tcp::serve` hands a connection off. A shard's count is a
+budget of its own, a slot of which each handed connection's stream carries and gives back as it
+drops, wherever the connection ends. A channel that refuses a connection anyway, its taker gone
+with its shard, hands it back whole, and the first shard serves it: a spawn through a shard's
+control queue would drop it with the request, a queue whose depth can be one. A node of one shard
+serves every connection on it. The TLS sessions every connection's handshake keeps and resumes
+are timed on the host's clock (`sessions::now`), which every shard reads alike, where a shard's
+own clock counts from that shard's start. hyper-rt sizes every shard alike, so each holds the
+first's tasks, timers and sockets (`process::runtime`). On a loopback address it serves
 plain HTTP; elsewhere TLS 1.3 and 1.2 with the endpoint's P-256 certificate, hyper-tls's default
 suites, of which a P-256 key takes the ECDHE-ECDSA AES-GCM ones for TLS 1.2 (research/84). A
 hyper-tls connection holds no configuration (vendor/hyper-tls/VENDORED.md §2), so each connection

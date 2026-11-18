@@ -1184,15 +1184,20 @@ pub fn liveness_bytes(peers: usize) -> Option<u64> {
 
 /// The threads a node starts beside the process's own, which waits for it to end: its own, which
 /// the process's own leaves at once on a stop that ends it so (`process::start`), and which starts
-/// its shard and waits for the node's end there (`process::run_on_first_shard`); its shard's; its
-/// standard input's and output's, its log's and its log's device's; for each device holding
-/// volumes, its issuer (`hyper_block::issuer::Issuer::start_device`), on Linux one thread whatever
-/// the device's depth, the kernel holding its transfers, and elsewhere that thread and a worker for
-/// each read its profile measured at the device at once (`Issuer::device_threads`); and for each
-/// volume its writer and its cleaner, and its scrubber where it scrubs. `devices` are those
-/// devices' depths, `volumes` whether each scrubs.
-pub fn threads(devices: &[usize], volumes: &[bool]) -> Option<u64> {
+/// its shards and waits for the node's end on the first (`process::run_on_first_shard`); its
+/// standard input's and output's, its log's and its log's device's; its runtime's watchdog, one a
+/// runtime (hyper-rt `Runtime::start`, `watch::Watchdog`); its `shards` shards', one for each CPU
+/// the process runs at once (`process::runtime`); for each device holding volumes, its
+/// issuer (`hyper_block::issuer::Issuer::start_device`), on Linux one thread whatever the device's
+/// depth, the kernel holding its transfers, and elsewhere that thread and a worker for each read
+/// its profile measured at the device at once (`Issuer::device_threads`); and for each volume its
+/// writer and its cleaner, and its scrubber where it scrubs. `devices` are those devices' depths,
+/// `volumes` whether each scrubs.
+pub fn threads(shards: usize, devices: &[usize], volumes: &[bool]) -> Option<u64> {
+    // The node's own, its standard input's and output's, its log's and its log's device's, and
+    // its runtime's watchdog.
     let mut threads = 6u64;
+    threads = threads.checked_add(u64::try_from(shards).ok()?)?;
     for &depth in devices {
         let issuer = hyper_block::issuer::Issuer::device_threads(depth)?;
         threads = threads.checked_add(u64::try_from(issuer).ok()?)?;
@@ -1489,7 +1494,7 @@ pub struct VolumeFacts {
 pub struct Measured {
     /// The machine's memory and the OS's limit for the process (hyper-rt `MemoryFacts`).
     pub memory: MemoryFacts,
-    /// The cores the process may run on.
+    /// The CPUs the process runs at once (hyper-rt `Facts::cpus_at_once`): its shards.
     pub cores: usize,
     /// The OS's base page.
     pub page: u64,
@@ -1691,8 +1696,9 @@ pub fn derive(
         "cores",
         measured.cores,
         Kind::Measured,
-        "the cores the process may run on (hyper-rt Facts::cores); the node runs its ranges on \
-         one shard (node.md §1.2)",
+        "the CPUs the process runs at once, its cores capped by the whole CPUs its CPU budget buys \
+         (hyper-rt Facts::cpus_at_once): a shard each; the node runs its ranges on the first and \
+         its S3 connections on the rest (node.md §1.2)",
     );
     said.add(
         "page",
@@ -1918,7 +1924,8 @@ pub fn derive(
         .map(|(_, depth)| depth)
         .collect();
     let scrubs = vec![true; stated.volumes.len()];
-    let started = threads(&depths, &scrubs).ok_or(overflow("the node's threads"))?;
+    let started =
+        threads(measured.cores, &depths, &scrubs).ok_or(overflow("the node's threads"))?;
     let log_held = log_bytes(&log_config).ok_or(overflow("the log's memory"))?;
     let stacks_held = stacks(started).ok_or(overflow("the threads' stacks"))?;
     // Every class at its floor: the operations' at `objects_bytes` and what they hold beside in
@@ -1974,7 +1981,8 @@ pub fn derive(
         .into_iter()
         .map(|(_, depth)| depth)
         .collect();
-        let deep_threads = threads(&deep_depths, &scrubs).ok_or(overflow("the node's threads"))?;
+        let deep_threads =
+            threads(measured.cores, &deep_depths, &scrubs).ok_or(overflow("the node's threads"))?;
         let served = if hosts {
             usize::try_from(serving.operations).map_err(|_| overflow("a stock client"))?
         } else {
@@ -3237,10 +3245,11 @@ mod tests {
         assert_eq!(a.reads, g.objects);
     }
 
-    /// The node's own six threads, and each device's issuer and workers and each volume's
-    /// writer, cleaner and scrubber where it scrubs, each a 2 MiB stack.
+    /// The node's own six threads, its runtime's watchdog among them, and a thread a shard, and
+    /// each device's issuer and workers and each volume's writer, cleaner and scrubber where it
+    /// scrubs, each a 2 MiB stack.
     #[test]
-    fn the_threads_are_the_nodes_own_and_its_storages() {
+    fn the_threads_are_the_nodes_own_its_shards_and_its_storages() {
         // A device's issuer: one thread on Linux, the kernel holding its depth; elsewhere a worker
         // for each transfer at once besides.
         let issuer = |depth: u64| {
@@ -3250,11 +3259,12 @@ mod tests {
                 depth + 1
             }
         };
-        assert_eq!(threads(&[], &[]), Some(6));
-        assert_eq!(threads(&[2], &[true]), Some(6 + issuer(2) + 3));
+        assert_eq!(threads(1, &[], &[]), Some(7));
+        assert_eq!(threads(8, &[], &[]), Some(6 + 8));
+        assert_eq!(threads(1, &[2], &[true]), Some(7 + issuer(2) + 3));
         assert_eq!(
-            threads(&[1, 4], &[true, false]),
-            Some(6 + issuer(1) + issuer(4) + 3 + 2)
+            threads(4, &[1, 4], &[true, false]),
+            Some(6 + 4 + issuer(1) + issuer(4) + 3 + 2)
         );
         assert_eq!(stacks(10), Some(20 << 20));
     }

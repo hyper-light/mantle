@@ -120,6 +120,7 @@ use std::time::Duration;
 
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, LogStats, Waits};
+use hyper_rt::SlotHolder;
 use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt::machine::calibration::{Calibration, Policy};
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
@@ -1632,13 +1633,23 @@ fn run_node(
     let runtime = runtime(&config, listening).map_err(step(Step::Network))?;
     let rt = Runtime::start(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
+    // The shards past the first, which the S3 listener hands its connections to, each named by
+    // the registration holding it: a lane submitted to it reaches this runtime's shard and never
+    // a later holder of its slot. A shard already gone takes none.
+    let others: Vec<SlotHolder> = rt
+        .shard_ids()
+        .split_first()
+        .map_or(&[][..], |(_, others)| others)
+        .iter()
+        .filter_map(|shard| rt.holder_of(*shard))
+        .collect();
     let ran = run_on_first_shard(rt, move || {
         serve(
             config,
             storage,
             gateway,
             (credentials, peers, (grant, fingerprint)),
-            (resolved, s3),
+            (resolved, s3, others),
             (asked, at_once),
         )
     })?;
@@ -1695,11 +1706,13 @@ where
 /// Plain HTTP on a loopback address, TLS with the endpoint's certificate elsewhere. Its door holds
 /// a request for each connection the listener admits, so it refuses none for room: each waits
 /// there until the host has room for it (node.md §4.5). A node that hosts no objects has no
-/// operation to hand it.
+/// operation to hand it. It hands its connections to the shards `others` names
+/// (`Listener::spread`).
 fn listen<E: Engine + 'static>(
     node: &mut Node<E>,
     keys: S3Keys,
     (id, hosts, connections): (u64, bool, u64),
+    others: &[SlotHolder],
 ) -> Result<crate::listener::Listener, ProcessError> {
     let refused = |e: String| ProcessError::Listener(e);
     if !hosts {
@@ -1716,7 +1729,7 @@ fn listen<E: Engine + 'static>(
         Some((keys.certificate, keys.key))
     };
     let door = node.open_door(waiting)?;
-    crate::listener::Listener::bind(
+    let mut listener = crate::listener::Listener::bind(
         crate::listener::Settings {
             listen,
             region: keys.region,
@@ -1728,7 +1741,11 @@ fn listen<E: Engine + 'static>(
         },
         door,
     )
-    .map_err(|e| refused(e.to_string()))
+    .map_err(|e| refused(e.to_string()))?;
+    listener
+        .spread(others)
+        .map_err(|e| refused(e.to_string()))?;
+    Ok(listener)
 }
 
 /// What the file at `path` states for `mantle serve`: only [`STATED_KEYS`] and
@@ -1960,7 +1977,7 @@ fn measure(stated: &Stated) -> Result<Measured, ProcessError> {
     }
     Ok(Measured {
         memory: facts.memory,
-        cores: facts.cores.len(),
+        cores: shards(&facts),
         page: facts.page.base,
         meta,
         volumes,
@@ -2031,12 +2048,24 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
 /// (`listener::tasks`).
 const TIMERS: usize = 3;
 
-/// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
-/// what the node holds: its one task, the launcher that spawns it there ([`run_on_first_shard`]),
-/// the timers the task holds at once ([`TIMERS`]), and a socket for its endpoint, each connection
-/// and its plane, each read and written; with an S3 listener, a task and a timer for each
-/// connection it holds at once, served or answered refused (`listener::tasks`), and a socket for
-/// the listener and each of those connections.
+/// The node's shards: one for each CPU the process runs at once, its cores capped by the whole CPUs
+/// its CPU budget buys (hyper-rt `Facts::cpus_at_once`: its affinity and its cgroup's quota), and
+/// one where the budget buys less than a whole CPU, the least that runs the node.
+fn shards(facts: &hyper_rt::machine::facts::Facts) -> usize {
+    facts.cpus_at_once().max(1)
+}
+
+/// The node's shards ([`shards`]), calibrated on this machine (hyper-rt
+/// `RuntimeConfig::from_calibration`). The first runs the node's task, its ranges, log, transport
+/// and doors; with an S3 listener, the rest each run the connections it hands them
+/// (`listener::Listener::spread`). hyper-rt sizes every shard alike, so each is sized for the
+/// first's role, the largest: the node's one task, the launcher that spawns it there
+/// ([`run_on_first_shard`]), the timers the task holds at once ([`TIMERS`]), and a socket for its
+/// endpoint, each connection and its plane, each read and written; with an S3 listener, a task and
+/// a timer for each connection it holds at once, served or answered refused (`listener::tasks`),
+/// as each falls back to the first shard where the shard it was handed to refuses it, and a socket
+/// for the listener and each of those connections. Another shard holds at most its taker of
+/// handed connections and each connection.
 fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
@@ -2060,7 +2089,8 @@ fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConf
         .checked_add(connections)
         .ok_or_else(|| ProcessError::Runtime("the node's timers".into()))?;
     let mut runtime = RuntimeConfig::from_calibration(&calibration, &constants, tasks, timers);
-    runtime.shards = 1;
+    runtime.shards = u16::try_from(shards(&calibration.facts))
+        .map_err(|_| ProcessError::Runtime("the node's shards".into()))?;
     runtime.pin = false;
     runtime.cores.clear();
     let listening = if s3 { connections.saturating_add(1) } else { 0 };
@@ -2109,7 +2139,8 @@ fn engine(
     Ok(stored)
 }
 
-/// The node, its talk on standard input and output, and its S3 listener where `s3` states one.
+/// The node, its talk on standard input and output, and its S3 listener where `s3` states one,
+/// which hands its connections to the shards `others` names.
 async fn serve(
     config: ProcessConfig,
     storage: Storage,
@@ -2119,7 +2150,7 @@ async fn serve(
         Vec<Peer>,
         (Option<u64>, [u8; mantle_meta::record::FINGERPRINT]),
     ),
-    (resolved, s3): (Resolved, Option<S3Keys>),
+    (resolved, s3, others): (Resolved, Option<S3Keys>, Vec<SlotHolder>),
     (asked, at_once): (Asked, SyncSender<Ended>),
 ) -> Result<(), ProcessError> {
     let Asked {
@@ -2237,7 +2268,7 @@ async fn serve(
     let mut looking: Option<Looking> = None;
     let listener = match s3 {
         Some(keys) => {
-            let listener = listen(&mut node, keys, (config.id, hosts, connections))
+            let listener = listen(&mut node, keys, (config.id, hosts, connections), &others)
                 .map_err(step(Step::Network))?;
             let at = listener
                 .local_addr()

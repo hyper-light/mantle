@@ -5,7 +5,9 @@
 //! The listener accepts on the node's shard under its connection budget, past which a connection
 //! is answered `503 SlowDown` and closed from a reserve of its own (never closed with no answer,
 //! which a stock client can take for a part done), and runs each connection as a task of its own,
-//! so the runtime wakes the one whose socket or channel moved. A connection whose client says
+//! so the runtime wakes the one whose socket or channel moved: on the node's other shard with the
+//! fewest connections open, where the node has others, and on its own where it has none or the
+//! one chosen refuses it ([`shards`]). A connection whose client says
 //! nothing for a stock client's patience is let go, its slot with it. A connection serves its
 //! requests one at a time, in order (RFC 9112 §9.3), each through [`conn`]: its head parsed, its
 //! route and signature checked ([`request`]), its operation handed over, its body read only as the
@@ -23,13 +25,14 @@ mod io;
 mod request;
 mod respond;
 mod sessions;
+mod shards;
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
-use hyper_rt::RtError;
 use hyper_rt::sync::Notify;
-use hyper_rt::tcp::{ConnectionBudget, TcpListener, TcpStream};
+use hyper_rt::tcp::{ConnectionBudget, ConnectionSlot, OwnedStream, TcpListener, TcpStream};
+use hyper_rt::{RtError, SlotHolder};
 use hyper_tls::crypto::CryptoProvider;
 use hyper_tls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use hyper_tls::server::{ClientHello, ResolvesServerCert};
@@ -129,6 +132,8 @@ pub enum ListenError {
     Key(hyper_tls::Error),
     #[error("the sessions of {0} connections, past what this machine addresses")]
     Sessions(u64),
+    #[error("a shard's lane: {0:?}")]
+    Lane(RtError),
 }
 
 /// What every connection reads: the region, the keys, the endpoint's certified key, the sessions
@@ -218,7 +223,18 @@ pub struct Listener {
     refusing: ConnectionBudget,
     endpoint: &'static Endpoint,
     door: Submitter,
+    /// The node's other shards, each connection handed to one ([`Listener::spread`]); none serves
+    /// every connection on the listener's own.
+    lanes: Vec<shards::Lane<Handed>>,
 }
+
+/// A connection handed to another shard: its socket, its place in that shard's lane, and its slot
+/// in the listener's budgets as it was admitted.
+type Handed = (
+    OwnedStream,
+    ConnectionSlot,
+    (ConnectionSlot, conn::Admitted),
+);
 
 impl Listener {
     /// Binds `settings.listen` under the connection budget, the endpoint's key loaded once for
@@ -268,7 +284,42 @@ impl Listener {
             refusing,
             endpoint,
             door,
+            lanes: Vec::new(),
         })
+    }
+
+    /// Hands every connection from now on to the shards `holders` name, each through a lane that
+    /// holds as many as the listener holds at once ([`tasks`]), so none is ever refused for want of
+    /// room; a lane that refuses one anyway, its shard gone, hands it back, and it is served on the
+    /// listener's own shard ([`shards`]). Refused when a lane cannot be made, its shard gone or its
+    /// control queue full.
+    pub fn spread(&mut self, holders: &[SlotHolder]) -> Result<(), ListenError> {
+        let capacity = tasks(self.budget.max());
+        let mut lanes = Vec::new();
+        lanes.try_reserve_exact(holders.len()).map_err(|_| {
+            ListenError::Lane(RtError::Capacity {
+                what: "the listener's lanes",
+                bound: holders.len(),
+            })
+        })?;
+        for holder in holders {
+            let endpoint = self.endpoint;
+            let door = self.door.clone();
+            let start = move |(socket, placed, admitted): Handed| {
+                if let Ok(stream) = TcpStream::from_parts(socket, Some(placed)) {
+                    begin(stream, endpoint, &door, admitted);
+                }
+            };
+            lanes.push(shards::Lane::new(*holder, capacity, start).map_err(ListenError::Lane)?);
+        }
+        self.lanes = lanes;
+        Ok(())
+    }
+
+    /// The connections open on each lane's shard, in the lanes' order.
+    #[cfg(test)]
+    fn lanes_open(&self) -> Vec<u64> {
+        self.lanes.iter().map(shards::Lane::open).collect()
     }
 
     /// Where it listens.
@@ -294,8 +345,10 @@ impl Listener {
         }
     }
 
-    /// A connection's task, served within the budget or answered `503 SlowDown` past it. One past
-    /// both budgets, or that the shard has no room for, is closed as it comes, with its slot.
+    /// A connection's task, served within the budget or answered `503 SlowDown` past it: on the
+    /// shard whose lane has the fewest connections open ([`shards::least`]), or on this one where
+    /// the listener has no lane or the lane refuses it. One past both budgets, or that the shard
+    /// has no room for, is closed as it comes, with its slot.
     fn start(&self, stream: TcpStream) {
         let admitted = match self.budget.try_take() {
             Some(slot) => (slot, conn::Admitted::Served),
@@ -304,23 +357,42 @@ impl Listener {
                 None => return,
             },
         };
-        let io = match self.endpoint.certified {
-            None => io::Io::Plain(stream),
-            Some(certified) => match tls_config(certified, &self.endpoint.sessions)
-                .map_err(io::IoError::Tls)
-                .and_then(|config| io::Tls::new(stream, config))
-            {
-                Ok(tls) => io::Io::Tls(Box::new(tls)),
-                Err(_) => return,
-            },
+        let Some((lane, placed)) =
+            shards::least(&self.lanes).and_then(|lane| Some((lane, lane.place()?)))
+        else {
+            return begin(stream, self.endpoint, &self.door, admitted);
         };
-        let _ = hyper_rt::futures::spawn_detached(conn::serve(
-            io,
-            self.endpoint,
-            self.door.clone(),
-            admitted,
-        ));
+        // The listener's socket counts no connection of its own (`bind`): the stream carries no
+        // slot, and its place in the lane rides in its stead.
+        let (socket, _) = stream.into_parts();
+        // Refused, it is served here, its place in the lane given back.
+        if let Err((socket, _, admitted)) = lane.hand((socket, placed, admitted))
+            && let Ok(stream) = TcpStream::from_parts(socket, None)
+        {
+            begin(stream, self.endpoint, &self.door, admitted);
+        }
     }
+}
+
+/// Starts a connection's task on this shard, its TLS session made here: a connection whose TLS
+/// cannot be set up is closed, with its slot.
+fn begin(
+    stream: TcpStream,
+    endpoint: &'static Endpoint,
+    door: &Submitter,
+    admitted: (ConnectionSlot, conn::Admitted),
+) {
+    let io = match endpoint.certified {
+        None => io::Io::Plain(stream),
+        Some(certified) => match tls_config(certified, &endpoint.sessions)
+            .map_err(io::IoError::Tls)
+            .and_then(|config| io::Tls::new(stream, config))
+        {
+            Ok(tls) => io::Io::Tls(Box::new(tls)),
+            Err(_) => return,
+        },
+    };
+    let _ = hyper_rt::futures::spawn_detached(conn::serve(io, endpoint, door.clone(), admitted));
 }
 
 /// Whether `error` is the process out of descriptors or socket buffers (hyper-rt `tcp::serve`).
@@ -341,5 +413,77 @@ fn exhausted(error: &RtError) -> bool {
     {
         use windows_sys::Win32::Networking::WinSock::{WSAEMFILE, WSAENOBUFS};
         matches!(*code, WSAEMFILE | WSAENOBUFS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::sync::mpsc::sync_channel;
+    use std::task::Waker;
+
+    use hyper_rt::combine::race2;
+
+    use super::*;
+
+    /// A listener spread over its runtime's second shard hands that shard the connection it
+    /// accepts on the first: the connection's request is answered, and while its client holds it
+    /// open its stream holds a place in the second shard's lane, which only the second shard's
+    /// taker gives a stream it adopts.
+    #[test]
+    fn a_spread_listener_serves_its_connection_on_the_other_shard() {
+        // The launcher, the listener's task and a connection's on each shard.
+        let rt = shards::tests::started(2, 3);
+        let (first, second) = (rt.shard_ids()[0], rt.shard_ids()[1]);
+        let holder = rt.holder_of(second).unwrap();
+        let (bound, at) = sync_channel(1);
+        let (ask, mut asked) = hyper_rt::sync::channel::<()>(1).unwrap();
+        let (told, heard) = sync_channel(1);
+        let launch = async move {
+            let serving = async move {
+                let (_doorway, door) = crate::door::doorway(1, Waker::noop().clone()).unwrap();
+                let mut listener = Listener::bind(
+                    Settings {
+                        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        region: "us-east-1".into(),
+                        domains: Vec::new(),
+                        access: Vec::new(),
+                        tls: None,
+                        node: 1,
+                        connections: 1,
+                    },
+                    door,
+                )
+                .unwrap();
+                listener.spread(&[holder]).unwrap();
+                bound.try_send(listener.local_addr().unwrap()).unwrap();
+                let probe = async {
+                    while asked.recv().await.is_ok() {
+                        told.try_send(listener.lanes_open()).unwrap();
+                    }
+                };
+                let _ = race2(listener.serve(), probe).await;
+            };
+            hyper_rt::futures::spawn_detached(serving).unwrap();
+        };
+        rt.spawn_on(first, launch).unwrap();
+        let at = at.recv().unwrap();
+        let mut client = std::net::TcpStream::connect(at).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut answer = Vec::new();
+        let mut read = [0u8; 512];
+        while !answer.windows(4).any(|end| end == b"\r\n\r\n") {
+            let n = client.read(&mut read).unwrap();
+            assert!(n > 0, "closed before its answer: {answer:?}");
+            answer.extend_from_slice(&read[..n]);
+        }
+        assert!(answer.starts_with(b"HTTP/1.1 "), "{answer:?}");
+        ask.try_send(()).unwrap();
+        assert_eq!(heard.recv().unwrap(), vec![1]);
+        drop(client);
+        drop(ask);
+        rt.shutdown().unwrap();
     }
 }

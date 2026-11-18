@@ -16,10 +16,12 @@
 #
 # DIR/bin holds the arms: mantle-A1 and mantle-A2 (one timed release build, copied twice, the A/A),
 # mantle-C (the `count-allocs` build of the same commit), hyper-quic-geo_open_loop, and COMMIT. The
-# comparators are COMPARE's (its COMPARATORS.md), each machine's own builds: S3 servers through the
-# HTTP door with mantle-A1 as the harness, secnetperf and quinn-perf beside bare hyper-quic for
-# QUIC. Raw outputs go to DIR/raw, named MACHINE_CONDITION_ARM_rROUND (a tail case adds -tail to
-# its arm); each case's data goes under the machine's WORK and is removed after the case.
+# comparators are COMPARE's (its COMPARATORS.md), each machine's own builds (the Mac's and the
+# VM's made by scripts/compare/setup.sh, the VM's image by scripts/compare/mantle-bench.Dockerfile):
+# S3 servers through the HTTP door with mantle-A1 as the harness, secnetperf and quinn-perf beside
+# bare hyper-quic for QUIC. Raw outputs go to DIR/raw, named MACHINE_CONDITION_ARM_rROUND (a tail
+# case adds -tail to its arm); each case's data goes under the machine's WORK and is removed after
+# the case.
 #
 # Environment: CYCLES (Williams cycles, 1), FULL_CONDITIONS (every size and the set),
 # MID_CONDITIONS (64 KiB, 8 MiB and the set; the rest LEAN), TAIL_CONDITIONS (the conditions that
@@ -41,9 +43,14 @@ case $MACHINE in
     WORK=/home/adalundhe/.cache/claude-scratch/doors/work
     COMPARE=${COMPARE:-/home/adalundhe/Projects/mantle-compare}
     ;;
-  mac | vm)
+  mac)
     WORK=/Users/adalundhe/.cache/claude-scratch/doors/work
     COMPARE=${COMPARE:-/Users/adalundhe/mantle-compare}
+    ;;
+  vm)
+    # The VM's Linux builds have a root of their own beside the Mac's (scripts/compare/setup.sh).
+    WORK=/Users/adalundhe/.cache/claude-scratch/doors/work
+    COMPARE=${COMPARE:-/Users/adalundhe/mantle-compare/vm}
     ;;
   *) echo "MACHINE is box, mac or vm, not $MACHINE" >&2; exit 2 ;;
 esac

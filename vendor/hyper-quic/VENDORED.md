@@ -1815,3 +1815,30 @@ none and both none; it does not build without the accessor).
 Tests: `a_handshakes_progress_moves_with_new_crypto_and_keys_alone` (the server's count grows
 as it reads the ClientHello and as the handshake completes, and stays as the ClientHello's
 datagram comes again and as a PING is answered; it does not build without the accessor).
+
+## 52. A seeded endpoint's connection IDs drawn from its seed (2026-11-18, found by mantle)
+
+- **Patch Q36: `ConnectionIdGenerator::generate_cid` takes the generator it draws from, and
+  `ConnectionIdGenerator::rekey`.** Upstream's generators drew each ID's random part from the
+  thread's generator (`rand::rng()`), as `HashedConnectionIdGenerator::new` drew its key, whatever
+  seed the endpoint was given (`EndpointConfig::rng_seed`). An endpoint given a seed now draws its
+  IDs from a generator keyed by the seed with `CID_STREAM` XORed in (`cid_seed`): first the
+  generator's key, where it drew one at random (`rekey`; a key the caller chose with `from_key`, as
+  hyper-transport's `RestartKey` does, is kept), then each ID's random part. That stream is apart
+  from the endpoint's own, so every other draw stays where it was, as §42 keeps the endpoint's
+  draws where they were for BBR's. An endpoint given no seed draws from the thread's generator as
+  upstream's does, so its IDs cannot be linked (RFC 9000 §5.1).
+- **Why.** The endpoint finds its connections in an `FxHashMap` of their IDs, whose layout is the
+  IDs' own. A removed entry's bucket is marked deleted rather than free where a probe may have
+  passed it, which the layout decides, and an insertion that finds no free bucket grows the table
+  where it holds more than half its capacity and rehashes it in place otherwise. In mantle's
+  deterministic simulation of a serving cell (`turn_allocs`), about one run in 16 a node's table
+  grew from 32 buckets to 64 in `Endpoint::new_cid`, reached from `send_new_identifiers`: 2,120
+  bytes, 64 entries of 32 and 72 control bytes, and 34,390 allocations where every other run counted
+  34,389. hyper-transport's `Endpoint::new_seeded` said the IDs were drawn from the seed; they were
+  not.
+
+Tests: `endpoints_seeded_alike_issue_the_same_connection_ids` and
+`a_seeded_endpoint_keeps_a_chosen_generator_key` (both fail on the code before, each endpoint's IDs
+the thread's), `unseeded_endpoints_issue_unpredictable_connection_ids` and
+`seeded_ids_leave_the_endpoints_own_draws_where_they_were`.

@@ -53,6 +53,10 @@ pub struct Endpoint {
     index: ConnectionIndex,
     connections: Slab<ConnectionMeta>,
     local_cid_generator: Box<dyn ConnectionIdGenerator>,
+    /// What an endpoint given a seed draws its connection IDs from, keyed by the seed
+    /// (`cid_seed`); `None` draws them from the thread's generator, seeded by the operating system,
+    /// so that they cannot be linked (RFC 9000 §5.1)
+    cid_rng: Option<StdRng>,
     config: EndpointConfig,
     /// The server and client configurations this endpoint and its connections share, the one new
     /// incoming connections are accepted under among them
@@ -93,6 +97,11 @@ impl Endpoint {
     /// be removed in a future release, so prefer setting it to `None` and configuring rng seeds
     /// using [`EndpointConfig::rng_seed`].
     ///
+    /// A seed also keys the endpoint's connection IDs: each one's random part, and the generator's
+    /// key where it drew one at random ([`ConnectionIdGenerator::rekey`]), are drawn from it, so
+    /// that the IDs are the same from one run of the seed to the next. Without one, they are drawn
+    /// from the thread's generator, as upstream's are.
+    ///
     /// Fails if no seed is given and the system's random number generator cannot give one, where
     /// upstream panicked.
     pub fn new(
@@ -101,10 +110,17 @@ impl Endpoint {
         allow_mtud: bool,
         rng_seed: Option<[u8; 32]>,
     ) -> Result<Self, RngUnavailable> {
-        let rng = match rng_seed.or(config.rng_seed) {
+        let seed = rng_seed.or(config.rng_seed);
+        let rng = match seed {
             Some(seed) => StdRng::from_seed(seed),
             None => StdRng::try_from_rng(&mut SysRng).map_err(|_| RngUnavailable)?,
         };
+        let mut local_cid_generator = config.cid_generator.clone_box();
+        let cid_rng = seed.map(|seed| {
+            let mut cid_rng = StdRng::from_seed(cid_seed(seed));
+            local_cid_generator.rekey(&mut cid_rng);
+            cid_rng
+        });
         let mut configs = Configs::new(config.config_slots);
         // The slab is empty and has at least one slot, so the insertion cannot be refused
         configs
@@ -117,7 +133,8 @@ impl Endpoint {
             rng,
             index: ConnectionIndex::default(),
             connections: Slab::new(),
-            local_cid_generator: config.cid_generator.clone_box(),
+            local_cid_generator,
+            cid_rng,
             config,
             configs,
             allow_mtud,
@@ -681,7 +698,7 @@ impl Endpoint {
         /// The least `k` with `(3/4)^k < 2^-64`: `64 / log2(4/3)`, rounded up
         const MAX_CID_ATTEMPTS: usize = 155;
         for _ in 0..MAX_CID_ATTEMPTS {
-            let cid = self.local_cid_generator.generate_cid();
+            let cid = generate_cid(self.local_cid_generator.as_mut(), &mut self.cid_rng);
             if cid.is_empty() {
                 // Zero-length CID; nothing to track
                 return Some(cid);
@@ -1347,7 +1364,7 @@ impl Endpoint {
         // with established connections. In the unlikely event that a collision occurs
         // between two connections in the initial phase, both will fail fast and may be
         // retried by the application layer.
-        let loc_cid = self.local_cid_generator.generate_cid();
+        let loc_cid = generate_cid(self.local_cid_generator.as_mut(), &mut self.cid_rng);
 
         let payload = TokenPayload::Retry {
             address: incoming.addresses.remote,
@@ -1514,7 +1531,7 @@ impl Endpoint {
         // We don't need to worry about CID collisions in initial closes because the peer
         // shouldn't respond, and if it does, and the CID collides, we'll just drop the
         // unexpected response.
-        let local_id = self.local_cid_generator.generate_cid();
+        let local_id = generate_cid(self.local_cid_generator.as_mut(), &mut self.cid_rng);
         let number = PacketNumber::U8(0);
         let header = Header::Initial(InitialHeader {
             dst_cid: *remote_id,
@@ -1987,6 +2004,34 @@ fn authenticate_first_packet(first_decode: PartialDecode, crypto: &Keys) -> Opti
     Some(packet)
 }
 
+/// A connection ID from `generator`, drawn from `seeded`, an endpoint's `cid_rng`, where the endpoint
+/// was given a seed, else from the thread's generator
+fn generate_cid(
+    generator: &mut dyn ConnectionIdGenerator,
+    seeded: &mut Option<StdRng>,
+) -> ConnectionId {
+    match seeded {
+        Some(rng) => generator.generate_cid(rng),
+        None => generator.generate_cid(&mut rand::rng()),
+    }
+}
+
+/// Separates the stream a seeded endpoint draws its connection IDs from from the one it draws
+/// everything else from: the seed with these bytes XORed in keys the IDs' generator (`cid_seed`), as
+/// HMAC keys its inner and outer hashes from one key with two constants (RFC 2104 §2). Drawn from
+/// the endpoint's own generator, every draw after them would move, as BBR's would (VENDORED.md §42).
+/// Any constant other than zero separates the streams; these bytes spell its purpose.
+const CID_STREAM: [u8; 32] = *b"hyper-quic local connection IDs.";
+
+/// The key of a seeded endpoint's connection IDs' generator: `seed` with [`CID_STREAM`] XORed in
+fn cid_seed(seed: [u8; 32]) -> [u8; 32] {
+    let mut key = seed;
+    for (byte, label) in key.iter_mut().zip(CID_STREAM) {
+        *byte ^= label;
+    }
+    key
+}
+
 /// The system's random number generator could not seed an endpoint's
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[error("the system's random number generator is unavailable")]
@@ -2131,4 +2176,69 @@ struct FourTuple {
     remote: SocketAddr,
     // A single socket can only listen on a single port, so no need to store it explicitly
     local_ip: Option<IpAddr>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cid_generator::HashedConnectionIdGenerator;
+
+    /// The first IDs an endpoint built from `config` with `seed` issues to one connection.
+    fn issued(config: EndpointConfig, seed: Option<[u8; 32]>) -> Vec<ConnectionId> {
+        let mut endpoint = Endpoint::new(config, None, true, seed).unwrap();
+        (0..8)
+            .map(|_| endpoint.new_cid(ConnectionHandle(0)).unwrap())
+            .collect()
+    }
+
+    /// Two endpoints seeded alike issue the same IDs, though each configuration drew its own
+    /// generator key from the thread's generator: the seed keys the IDs and draws their random
+    /// parts. Another seed issues others.
+    #[test]
+    fn endpoints_seeded_alike_issue_the_same_connection_ids() {
+        let seed = Some([7; 32]);
+        let first = issued(EndpointConfig::default(), seed);
+        assert_eq!(first, issued(EndpointConfig::default(), seed));
+        assert_ne!(first, issued(EndpointConfig::default(), Some([8; 32])));
+    }
+
+    /// Endpoints given no seed draw their IDs from the thread's generator, so no two issue the
+    /// same ones (RFC 9000 §5.1).
+    #[test]
+    fn unseeded_endpoints_issue_unpredictable_connection_ids() {
+        let config = EndpointConfig::default();
+        assert_ne!(issued(config.clone(), None), issued(config, None));
+    }
+
+    /// A seeded endpoint keeps a generator key its configuration chose (a restarted endpoint's,
+    /// `HashedConnectionIdGenerator::from_key`): its IDs validate under that key, and its seed
+    /// still draws their random parts alike.
+    #[test]
+    fn a_seeded_endpoint_keeps_a_chosen_generator_key() {
+        let keyed = || {
+            let mut config = EndpointConfig::default();
+            config.cid_generator(Box::new(HashedConnectionIdGenerator::from_key(42)));
+            config
+        };
+        let ids = issued(keyed(), Some([7; 32]));
+        let generator = HashedConnectionIdGenerator::from_key(42);
+        for id in &ids {
+            generator.validate(id).unwrap();
+        }
+        assert_eq!(ids, issued(keyed(), Some([7; 32])));
+    }
+
+    /// Drawing the IDs takes nothing from the endpoint's own generator, so its other draws (the
+    /// reserved transport parameter, tokens, each connection's seed) are where they were.
+    #[test]
+    fn seeded_ids_leave_the_endpoints_own_draws_where_they_were() {
+        let seed = [7; 32];
+        let mut endpoint =
+            Endpoint::new(EndpointConfig::default(), None, true, Some(seed)).unwrap();
+        for _ in 0..8 {
+            endpoint.new_cid(ConnectionHandle(0)).unwrap();
+        }
+        let mut alone = StdRng::from_seed(seed);
+        assert_eq!(endpoint.rng.next_u64(), alone.next_u64());
+    }
 }

@@ -670,7 +670,7 @@ impl ClientConfig {
             transport: Default::default(),
             crypto,
             initial_dst_cid_provider: Box::new(|| {
-                RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
+                RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid(&mut rand::rng())
             }),
             version: 1,
         }

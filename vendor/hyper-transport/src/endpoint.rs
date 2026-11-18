@@ -903,11 +903,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     /// [`Endpoint::new`], with the QUIC layer's own randomness drawn from `seed` where the
-    /// system's would be: its connection identifiers, reset tokens and the reserved transport
-    /// parameter whose random length moves a handshake's sizes (hyper-quic
-    /// `ReservedTransportParameter::random`). For a simulation whose run must be the same from
-    /// one seed (`docs/sim.md` §3.9); TLS draws its own, which move no size where its signatures
-    /// are of fixed length.
+    /// system's would be: the connection IDs it issues, each one's random part and the key they
+    /// are hashed under (hyper-quic `Endpoint::new`), whose values lay out the table it finds its
+    /// connections in and so move when that table grows; the padding of its stateless resets, its
+    /// tokens' nonces and each connection's own draws; and the reserved transport parameter whose
+    /// random length moves a handshake's sizes (hyper-quic `ReservedTransportParameter::random`).
+    /// For a simulation whose run must be the same from one seed (`docs/sim.md` §3.9). Still the
+    /// system's, moving no size: the key its reset tokens are signed with and the destination ID a
+    /// dial first sends to (`docs/transport.md` §4z); TLS draws its own, which move no size where
+    /// its signatures are of fixed length.
     pub fn new_seeded(
         config: Config<C::Role>,
         budget: B,

@@ -87,10 +87,16 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `a6a701f` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twenty-three commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+**Every crate at `d4bd299` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twenty-four commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
 branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
-three commits are step 4c of mantle docs/design/durability.md §7.7. `a6a701f` changes hyper-log's
+commit, `d4bd299`, changes hyper-quic and hyper-transport's `Endpoint::new_seeded` doc: an endpoint
+given a seed draws its connection IDs from it, each one's random part and the key they are hashed
+under unless a `RestartKey` chose it, from a stream apart from the endpoint's own, so its other draws
+are where they were; one given none draws them from the thread's generator as before (RFC 9000
+§5.1). The IDs lay out the table a node finds its connections in, which in about one run in 16 of
+`crates/node/tests/turn_allocs.rs`'s serving cell grew by an allocation (hyper-quic VENDORED.md §52).
+The three before it are step 4c of mantle docs/design/durability.md §7.7. `a6a701f` changes hyper-log's
 tests alone: a real direct file whose device is stated to write through, decision (B) taken in the
 test, answers `Kept` where its writes reach the device and `Buffered` where not, and `Unmeasured`
 under `AtFlush::DECIDED`, which is unchanged. `74242cd` changes hyper-durable's benches and the e2e

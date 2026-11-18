@@ -127,7 +127,16 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// appended at another length each run and the hello's buffer grew in other steps: 2,311 to 2,318
 /// reallocations in 45 runs on this Mac, every allocation the same. A client given a seed draws its
 /// TLS's from it (`mantle_node::client`'s `Seeded`), so its hellos are the seed's and the run's
-/// reallocations the same every run: 2,316 here.
+/// reallocations the same every run: 2,316 here. A node's QUIC endpoint drew its connection IDs
+/// from the thread's generator though it was seeded, and the table it finds its connections in is
+/// laid out by their values: about one run in 16, its deletions left a node's table to grow from 32
+/// buckets to 64 (2,120 bytes) where other layouts rehashed it in place, and the run counted 34,390.
+/// The IDs are the seed's since hyper-raft d4bd299 (hyper-quic VENDORED.md §52), and every run
+/// counts 34,389 allocations, 2,316 reallocations and 15,409,464 bytes: 32 runs alone and 72 with
+/// 6 or 12 at once on this Mac. The bytes are 1,008 more than with the thread's IDs, 336 for each
+/// of the three clients' endpoints made inside the count: hyper-quic's endpoint holds its IDs'
+/// generator, 2,632 bytes where it was 2,312, and its configuration's and its own hashed generators
+/// are 32 bytes where they were 24.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {

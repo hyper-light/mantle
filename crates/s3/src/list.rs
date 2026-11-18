@@ -434,10 +434,8 @@ pub fn continuation_token(next: &Resume) -> String {
         Resume::After(key) => (b'a', key),
         Resume::Past(key) => (b'p', key),
     };
-    let mut bytes = Vec::new();
-    bytes.push(tag);
-    bytes.extend_from_slice(key.as_bytes());
-    URL_SAFE_NO_PAD.encode(bytes)
+    // The tag and the key in one buffer made at their length, then encoded into one string.
+    URL_SAFE_NO_PAD.encode([&[tag][..], key.as_bytes()].concat())
 }
 
 /// Where a continuation token starts the page; `None` if it is not one of mantle's.

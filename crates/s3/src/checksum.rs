@@ -338,18 +338,18 @@ pub fn content_md5(text: &str) -> Option<[u8; 16]> {
     BASE64.decode(text.trim()).ok()?.try_into().ok()
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// An MD5 in lowercase hex, written on the stack and copied once into a string made at its
+/// length.
+fn hex(bytes: &[u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::new();
-    for &b in bytes {
-        out.push(char::from(
-            HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
-        ));
-        out.push(char::from(
-            HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0'),
-        ));
+    let mut out = [0u8; 32];
+    let (pairs, _) = out.as_chunks_mut::<2>();
+    for ([high, low], &b) in pairs.iter_mut().zip(bytes) {
+        *high = HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0');
+        *low = HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0');
     }
-    out
+    // Hex digits are ASCII, so the text is borrowed whole and copied once.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]

@@ -175,3 +175,71 @@ fn a_listings_document_allocates_nothing_a_key() {
         assert_eq!(document.capacity(), document.len());
     }
 }
+
+/// `checksum::etag` as it was before Lean doors step 7: each hex digit pushed onto a string that
+/// grows.
+fn reference_etag(md5: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::new();
+    for &b in md5 {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 15)]));
+    }
+    out
+}
+
+/// An object's ETag is one string made at its length, the MD5's 32 hex characters, as the encoder
+/// before Lean doors step 7 wrote them.
+#[test]
+fn an_etag_is_one_string_at_its_length() {
+    for md5 in [
+        [0u8; 16],
+        [0xa5; 16],
+        std::array::from_fn(|i| u8::try_from(i).unwrap() * 17),
+    ] {
+        let (expected, before) = counted(|| reference_etag(&md5));
+        let (etag, made) = counted(|| mantle_s3::checksum::etag(&md5));
+        println!("etag {expected}: before {before:?}, now {made:?}");
+        assert_eq!((made, etag.capacity()), ((1, 0), etag.len()), "{expected}");
+        assert_eq!(etag, expected);
+    }
+}
+
+/// A listing's continuation token is its tag and key in one buffer at their length, encoded into
+/// one string at its length, the token the encoder before Lean doors step 7 wrote: no key, a key,
+/// and a key at S3's 1,024-byte bound.
+#[test]
+fn a_continuation_token_is_two_buffers_at_their_lengths() {
+    use base64::Engine as _;
+    use mantle_s3::list::{Resume, continuation_start, continuation_token};
+    let resumes = [
+        Resume::After(String::new()),
+        Resume::Past("photos/2026/".into()),
+        Resume::After("k".repeat(mantle_s3::route::MAX_KEY)),
+    ];
+    for resume in resumes {
+        let (tag, key) = match &resume {
+            Resume::After(key) => (b'a', key),
+            Resume::Past(key) => (b'p', key),
+        };
+        // `continuation_token` as it was before Lean doors step 7: its bytes in a buffer that grew.
+        let (expected, before) = counted(|| {
+            let mut bytes = Vec::new();
+            bytes.push(tag);
+            bytes.extend_from_slice(key.as_bytes());
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        });
+        let (token, made) = counted(|| continuation_token(&resume));
+        println!(
+            "token of {} bytes: before {before:?}, now {made:?}",
+            key.len()
+        );
+        assert_eq!(
+            (made, token.capacity()),
+            ((2, 0), token.len()),
+            "{resume:?}"
+        );
+        assert_eq!(token, expected);
+        assert_eq!(continuation_start(&token), Some(resume));
+    }
+}

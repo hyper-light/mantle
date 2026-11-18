@@ -1707,10 +1707,26 @@ an entry (`Out::Rows`), kept on `Far` until the node's next read (`Node::read_me
 superseding the rest; a shard knows the root range by its machine's layer (`RangeMachine::layer`).
 The read costs what the node's own does, once a drive rather than once a turn, and one lane
 message. Tested too: a far root range hands its rows over at its first drive and as of each entry
-it applies, and a name range hands over none. Left for 2e: the host's volume table of a far root
-range (`Node::table`, which finds no root range here and refuses), the Block range's reads that
-repair makes (`handle_of(Layer::Block)` in `repair.rs`: a volume's blocks, the next block to
-repair, a block's places), and repair's steps.
+it applies, and a name range hands over none. The host's volume table of a far root range
+(`Node::table`) is asked of its shard rather than handed over after each entry, as the table holds
+every volume of the cell and the host reads it far less often than the range applies: `In::Table`
+asks it once the range shows it applied past the table the node holds, one ask at a time
+(`shard::ask_table`), and the shard answers from the range's engine as of the entry it applied
+(`Out::Table`: at most the table's census of volumes, the read the node's own path makes). The node
+reads the table it holds meanwhile, read before the range moved (`Node::spread_to`), and builds
+the next from the answer at its next read (`Table::of`); a full lane leaves the table unasked, asked
+again at the next read. Repair's reads of a far Block range's rows (the next block, the next block
+on a volume, a block's places; `shard::BlockRead`) are asked of its shard one at a time
+(`In::Block`, `shard::read_block`) and answered from its engine (`Out::Block`: one block, or one
+block's places). Each answer is taken once, at the turn it comes, and let go at that turn's end if
+the walk took it not, so none is read a turn past its arrival. The walk waits at the read
+meanwhile, its answer waking the node: a block whose places are asked is held as a deferred block,
+and the retiring of empty volumes keeps the service from idling until it went through every one.
+A full lane leaves the read unasked, asked again at repair's next turn. Tested too: a far root
+range's table is answered as of the entry it applied, not asked while the range applied nothing
+past it, and asked again and answered with the volume an entry enlisted once it applied; repair's
+three reads of a far Block range answer as its engine answers them on the node's shard, one at a
+time; and a full lane refuses the table and each read, `LaneFull`, unasked.
 
 ## 3. Transport
 

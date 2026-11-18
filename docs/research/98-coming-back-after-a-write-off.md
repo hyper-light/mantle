@@ -52,13 +52,19 @@ expire immediately after use." "By default the SPIRE Server acts as its own cert
 been provisioned with an x509 identity through an out-of-band mechanism. It verifies that the
 certificate is rooted to a trusted set of CAs and issues a signature-based proof-of-possession
 challenge to the agent plugin to verify that the node is in possession of the private key." "The
-SPIFFE ID produced by the plugin is based on the certificate fingerprint".
+SPIFFE ID produced by the plugin is based on the certificate fingerprint". "To prove possession of
+the private key, the agent signs a digest of the server and agent nonces."
 `plugin_server_nodeattestor_jointoken.md`: "The `join_token` plugin attests a node based on a
 pre-shared, one-time-use join token." `plugin_server_upstreamauthority_disk.md`: "The `disk` plugin
 loads CA credentials from disk, using them to generate intermediate signing certificates for the
 server's signing authority." `spire_server.md`: `spire-server agent ban`, "Ban attested node given
 its spiffeID. A banned attested node is not able to re-attest."; `spire-server agent evict`,
-"De-attesting an already attested node given its spiffeID."; and "Banned nodes are not pruned."
+"De-attesting an already attested node given its spiffeID."; and "Non-reattestable nodes are not
+pruned unless `prune_tofu_nodes` is set to `true`. Banned nodes are not pruned." Which attestors
+re-attest is the source's: `pkg/server/plugin/nodeattestor/x509pop/x509pop.go` answers an
+attestation with `CanReattest: true`
+(https://github.com/spiffe/spire/blob/main/pkg/server/plugin/nodeattestor/x509pop/x509pop.go);
+a join token is "one-time-use", so a node attested by one attests again only with a new token.
 
 [5] RFC 8555, Automatic Certificate Management Environment (ACME),
 https://www.rfc-editor.org/rfc/rfc8555.txt. §7.5: "This process assures the server of two things:
@@ -125,8 +131,8 @@ a new identity by invoking a cluster membership change."
 | Kubernetes renewal (`selfnodeclient`) [1] | it holds the key of a certificate the cluster still honors | the certificate's first issuance | no: renewal needs a live certificate |
 | SPIRE join token [3][4] | it holds a one-time secret | the token's distribution; spent at first use | no: "expire immediately after use" |
 | SPIRE `x509pop` [4] | it holds the key of a certificate rooted in a trusted CA, named by its fingerprint | the out-of-band provisioning of that certificate | yes after `evict`, never after `ban` |
-| SPIRE TPM or cloud document [3] | a key that never left a chip, or a platform's statement about the instance | the chip's or the platform's maker | yes, while the platform vouches |
-| ACME [5] | it holds the account key and controls the identifier now | the validation channel | each order validates again |
+| SPIRE TPM or cloud document [3] | a key that never left a chip, or a platform's statement about the instance | the chip's or the platform's maker | as its attestor allows, unless banned |
+| ACME [5] | it holds the account key and controls the identifier now | the validation channel | by proving control again |
 | TLS 1.3 client certificate [6] | it holds the certificate's key, over this handshake's transcript | the certificate's issuer | as the verifier admits |
 
 None of the schemes that run on any machine tells a machine from a copy of its disk: a bearer
@@ -138,8 +144,8 @@ expiry and group disabling [1][2], SPIRE's ban [4], CockroachDB's permanent deco
 The schemes that admit a node again on its own are those whose proof is a credential the node
 already held: Kubernetes renews with the certificate it has [1], and SPIRE re-attests an evicted
 `x509pop` node by proof of possession of its provisioned certificate [4]. Proof of possession is
-fresh in both: a signature over a challenge the server chose [4], or over the TLS 1.3 transcript
-[6], so a recorded request does not replay, as ACME's nonces stop replays [5].
+fresh in both: a signature over the server's and the agent's nonces [4], or over the TLS 1.3
+transcript [6], so a recorded request does not replay, as ACME's nonces stop replays [5].
 
 ## 2. Issuing online with the root offline
 
@@ -150,7 +156,8 @@ signs subordinate CAs, not leaves [8]. RFC 5280 bounds what a subordinate may si
 pathLenConstraint of zero lets it sign end-entity certificates and no further CA [7].
 
 An online signer's key, wherever it sits, is a credential like any other: taken, it signs. In
-Kubernetes and SPIRE a signature is the whole admission. A system whose admission is also a
+Kubernetes and SPIRE a certificate the online CA signed is what authenticates its holder [1][3]. A
+system whose admission is also a
 committed record of its own (mantle's root range spends grants and holds each member's fingerprint,
 membership.md §2) can make a signature necessary but not sufficient: the verifier admits a
 subordinate's certificate only at a fingerprint the record holds.
@@ -161,7 +168,10 @@ Every system read forbids coming back as the removed member. etcd's removed memb
 contact with the cluster, and its machine returns as a new member added in its place [9];
 CockroachDB's decommissioned node "cannot be recommissioned" and the operator starts "a new node"
 [10]; Ceph's destroyed OSD loses its keys, and a disk that held an OSD is zapped before it is used
-again [11]. Raft's reason is the log's: a server's persistent state belongs to its identity, and a
+again [11]. Ceph alone keeps something of the old member: a replacement takes the destroyed OSD's
+number and CRUSH entry, "the replaced OSD’s ID and CRUSH map entry must be kept intact after the
+OSD is destroyed for replacement" [11], under new keys on a zapped disk, so the number is a slot in
+its placement map and the credential is new. Raft's reason is the log's: a server's persistent state belongs to its identity, and a
 server without it returns only under a new one [12]; equally, state written under an old identity
 is never presented under a new one.
 

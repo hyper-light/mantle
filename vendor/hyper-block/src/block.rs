@@ -71,8 +71,9 @@ pub trait BlockFile: Send {
     /// proves this one reached the device (mantle docs/design/durability.md §7.5, condition (a)).
     /// A buffered write completes in the OS's page cache, and a write into space not yet written
     /// changes metadata the file system's journal commits only at the next flush (fallocate(2)).
-    /// False by default: a file says it only where its path to the device is built and cited; a
-    /// simulated device's writes are its own.
+    /// False by default: a file says it only where its path to the device is built and cited, a
+    /// [`DeviceFile`] by its platform's direct path as it was opened
+    /// ([`DeviceFile::writes_reach_device`]); a simulated device's writes are its own.
     fn writes_reach_device(&self) -> bool {
         false
     }
@@ -257,6 +258,10 @@ impl BlockFile for DeviceFile {
 
     fn fills_new_space(&self) -> bool {
         DeviceFile::fills_new_space(self)
+    }
+
+    fn writes_reach_device(&self) -> bool {
+        DeviceFile::writes_reach_device(self)
     }
 
     /// On Linux a file's and a device node's reads, writes and flush are the kernel's `pread`,

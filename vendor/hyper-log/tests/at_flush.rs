@@ -14,8 +14,13 @@
     clippy::disallowed_types
 )]
 
+use hyper_block::DiskError;
+use hyper_block::atomic::AtomicUnit;
+use hyper_block::block::BlockFile;
 use hyper_block::buf::Alignment;
+use hyper_block::file::{Caching, CachingRequest, DeviceFile};
 use hyper_block::sim::{Crash, Fault, SimFile};
+use hyper_block::write_cache::{DeviceCache, Source, WriteCache};
 use hyper_log::{
     Answers, AtFlush, Config, Entries, Entry, Log, LogError, StatedCache, Tail, Update, Waits,
     With, WriteBackFrames,
@@ -273,4 +278,116 @@ fn crash_at(seed: u64, cut: u64, answers: bool, crash: Crash) {
     );
     // The log goes on answering at the flush after the crash.
     each_costs(&log, (view.last + 1, view.last + 1), true, 1);
+}
+
+/// A real file whose device is stated to keep a completed write, as Linux's queue `write_cache`
+/// "write through" states it: every other fact, whether its completed writes are the device's
+/// among them (`BlockFile::writes_reach_device`), is the file's own.
+#[derive(Debug)]
+struct StatedThrough(DeviceFile);
+
+impl BlockFile for StatedThrough {
+    fn alignment(&self) -> Alignment {
+        BlockFile::alignment(&self.0)
+    }
+
+    fn layout_block(&self) -> Alignment {
+        BlockFile::layout_block(&self.0)
+    }
+
+    fn atomic_unit(&self) -> Result<AtomicUnit, DiskError> {
+        BlockFile::atomic_unit(&self.0)
+    }
+
+    fn write_cache(&self) -> Result<DeviceCache, DiskError> {
+        Ok(DeviceCache::new(
+            WriteCache::WriteThrough,
+            Source::Sysfs { fua: Some(true) },
+        ))
+    }
+
+    fn writes_reach_device(&self) -> bool {
+        BlockFile::writes_reach_device(&self.0)
+    }
+
+    fn len(&self) -> Result<u64, DiskError> {
+        BlockFile::len(&self.0)
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+        BlockFile::read_exact_at(&self.0, buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        BlockFile::write_all_at(&self.0, buf, offset)
+    }
+
+    fn sync_data(&self) -> Result<(), DiskError> {
+        BlockFile::sync_data(&self.0)
+    }
+
+    fn fills_new_space(&self) -> bool {
+        BlockFile::fills_new_space(&self.0)
+    }
+}
+
+/// A real file asked for direct I/O, its device stated to write through, decision (B) taken: its
+/// log answers at the flush (`Kept`) where the platform's direct path makes the file's completed
+/// write the device's (`DeviceFile::writes_reach_device`: Linux's `O_DIRECT` on ext4 or XFS,
+/// Windows' `FILE_FLAG_NO_BUFFERING`), its mark saying so from the log's first flush, and once
+/// confirmed (`Buffered`) where it does not: macOS's `F_NOCACHE`, which promises no write the
+/// device's, and every buffered file. Under today's decisions the same file answers once
+/// confirmed, unmeasured, and its mark says nothing.
+#[test]
+fn a_direct_file_on_a_stated_write_through_cache_is_kept_where_its_writes_reach_the_device() {
+    let dir = tempfile::tempdir().unwrap();
+    for request in [CachingRequest::PreferDirect, CachingRequest::Buffered] {
+        let file = real(dir.path(), request, "trusted");
+        let reaches = as_its_platform_promises(&file);
+        let kept = if reaches {
+            Answers::Kept
+        } else {
+            Answers::Buffered
+        };
+        answered(StatedThrough(file), TRUSTED, kept);
+        let file = real(dir.path(), request, "decided");
+        answered(StatedThrough(file), AtFlush::DECIDED, Answers::Unmeasured);
+    }
+}
+
+/// A new file in `dir`, opened as `request` asks.
+fn real(dir: &std::path::Path, request: CachingRequest, name: &str) -> DeviceFile {
+    let path = dir.join(format!("{request:?}-{name}"));
+    DeviceFile::open(&path, true, request, Alignment::new(BLOCK).unwrap()).unwrap()
+}
+
+/// Whether `file`'s completed writes are the device's, checked against what its platform
+/// promises of it as it was opened: never through a buffered handle or on macOS, and on Windows
+/// wherever the handle is unbuffered.
+fn as_its_platform_promises(file: &DeviceFile) -> bool {
+    let reaches = file.writes_reach_device();
+    if file.caching() == Caching::Buffered || cfg!(target_vendor = "apple") {
+        assert!(
+            !reaches,
+            "{:?}: no completed write is the device's",
+            file.caching()
+        );
+    }
+    if cfg!(windows) {
+        assert_eq!(reaches, file.caching() == Caching::Direct);
+    }
+    reaches
+}
+
+/// A log made on `file` under `policy` answers as `answers`, its mark saying whether it answers at
+/// the flush from its first flush; after a frame and an open, it answers so still.
+fn answered(file: StatedThrough, policy: AtFlush, answers: Answers) {
+    let log = Log::create_with(file, config(), ID, with(policy)).unwrap();
+    assert_eq!(log.laid().cache.cache(), WriteCache::WriteThrough);
+    assert_eq!(log.laid().answers, answers);
+    assert_eq!(log.laid().pieces.unwrap().at_flush, answers.at_flush());
+    log.write(GROUP, update(1, true)).unwrap();
+    let (log, recovery) = Log::open_with(log.close().unwrap(), config(), ID, with(policy)).unwrap();
+    assert_eq!(recovery.laid.answers, answers);
+    assert_eq!(log.view(GROUP).unwrap().unwrap().last, 1);
 }

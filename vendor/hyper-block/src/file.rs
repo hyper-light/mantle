@@ -3,7 +3,9 @@
 //!
 //! Direct I/O per platform: Linux `O_DIRECT` (open(2)), macOS `F_NOCACHE` (fcntl(2)), Windows
 //! `FILE_FLAG_NO_BUFFERING` (CreateFileW, "File Buffering"). A file system that refuses it is
-//! opened buffered and says so in [`DeviceFile::caching`].
+//! opened buffered and says so in [`DeviceFile::caching`]. Whether a write the handle completes is
+//! the device's own completion is what each platform's direct path promises of the handle as it
+//! was opened ([`DeviceFile::writes_reach_device`]).
 //!
 //! Durability per platform is what `std::fs::File::sync_data` issues, verified in the std
 //! source (library/std/src/sys/fs/{unix,windows}.rs): `fdatasync(2)` on Linux,
@@ -72,6 +74,9 @@ pub struct DeviceFile {
     /// Opened for overlapped I/O (Windows, [`DeviceFile::open_shared`]): its transfers wait on an
     /// event of their own rather than on the handle (`crate::overlapped`). Never set elsewhere.
     overlapped: bool,
+    /// Whether a write the handle completes is the device's own completion
+    /// ([`DeviceFile::writes_reach_device`]), asked of the OS once, at open.
+    reaches: bool,
 }
 
 /// What a read from memory needs of a file, borrowed apart from the handle state it updates.
@@ -191,6 +196,9 @@ impl DeviceFile {
                 .map_err(wrap("ask whether reads from memory are taken"))?,
         };
         let fills = caching == Caching::Direct && sys::journals_allocation(&file);
+        // The handle as it was opened, not as it was asked for: a refused or in-memory direct
+        // open is buffered, and a buffered write completes in the OS's cache.
+        let reaches = caching == Caching::Direct && sys::direct_writes_reach_device(&file, node);
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -202,6 +210,7 @@ impl DeviceFile {
             epoch: crate::resident::Epoch::new(),
             fills,
             overlapped,
+            reaches,
         })
     }
 
@@ -230,9 +239,10 @@ impl DeviceFile {
             // file system's answer to whether it can.
             resident: self.resident.duplicate(),
             epoch: crate::resident::Epoch::new(),
-            // The same file, on the same file system.
+            // The same file, on the same file system, through the same open file description.
             fills: self.fills,
             overlapped: self.overlapped,
+            reaches: self.reaches,
         })
     }
 
@@ -264,6 +274,47 @@ impl DeviceFile {
     /// either; a device node has no file system to commit for it.
     pub fn fills_new_space(&self) -> bool {
         self.fills
+    }
+
+    /// Whether a write the handle completes over space the file holds written is the device's own
+    /// completion, no cache of the OS's in front of it (`BlockFile::writes_reach_device`; mantle
+    /// docs/design/durability.md §7.5, condition (a)). It says nothing of the device's own cache:
+    /// what keeps a completed write there is the device's write-through or power-protected cache
+    /// ([`crate::write_cache`]), which is why the two are read together. Per platform, for the
+    /// handle as it was opened, never as it was asked for:
+    ///
+    /// - Linux: a direct handle (`O_DIRECT`) on a block device, or on a file of ext2, ext3, ext4 or
+    ///   XFS that statx(2) says takes direct I/O ([`direct_file_reaches_device`]). open(2) promises
+    ///   that "File I/O is done directly to/from user-space buffers", past the page cache, and no
+    ///   more: O_DIRECT "makes an effort to transfer data synchronously, but does not give the
+    ///   guarantees of the O_SYNC flag that data and necessary metadata are transferred", says
+    ///   nothing of the device's volatile cache, and a misaligned transfer may "fall back to
+    ///   buffered I/O" (every transfer of a direct handle here is checked aligned first). The
+    ///   kernel's own direct write takes that completion as durable on a device without a
+    ///   volatile cache: its datasync write-through "requires either FUA writes through the
+    ///   device's write cache, or a normal write to a device without a volatile write cache", for
+    ///   "a pure overwrite that doesn't require any metadata updates" (fs/iomap/direct-io.c).
+    ///   `O_DSYNC` on the open, or `RWF_DSYNC` on a write (pwritev2(2), "a per-write equivalent of
+    ///   the O_DSYNC open(2) flag"), would make each write durable on its own, "as though each
+    ///   write(2) was followed by a call to fdatasync(2)", whatever the cache: a FUA write or a
+    ///   flush per write, which only [`DeviceFile::write_durable_at`] pays here.
+    /// - macOS: never. fcntl(2)'s `F_NOCACHE` "Turns data caching off/on" and promises nothing of
+    ///   where a completed write is: XNU's cluster layer writes past the cache only a write of 16
+    ///   KiB or more at a page-aligned offset from a page-aligned buffer and copies any other
+    ///   through it (`bsd/vfs/vfs_cluster.c`, `cluster_write_direct`, `MIN_DIRECT_WRITE_SIZE`),
+    ///   APFS's own path is closed, and fsync(2) leaves data in the drive's cache, which only
+    ///   `F_FULLFSYNC` "asks the drive to flush".
+    /// - Windows: a handle opened with `FILE_FLAG_NO_BUFFERING`, which disables "system caching of
+    ///   data being read from or written to the file": the caller's buffer "is ... effectively
+    ///   the only file buffer that exists for this operation" ("File Buffering"), and the flag
+    ///   "does not affect hard disk caching" (CreateFileW). The file's metadata "may still be
+    ///   cached" (CreateFileW), so only an overwrite of written space is the disk's alone.
+    ///   `FILE_FLAG_WRITE_THROUGH` beside it would also have the system request "a write-through
+    ///   of the hard disk's local hardware cache to persistent media", which "Not all hard disk
+    ///   hardware supports" (CreateFileW, "Caching Behavior"); no handle here is opened with it.
+    /// - Elsewhere, and every buffered handle: never.
+    pub fn writes_reach_device(&self) -> bool {
+        self.reaches
     }
 
     /// Writes all of `buf` at `offset` and makes that write durable before it returns. On Linux a
@@ -749,6 +800,28 @@ fn journals_allocation(f_type: i128) -> bool {
     f_type == EXT_SUPER_MAGIC || f_type == XFS_SUPER_MAGIC
 }
 
+/// Whether a write completed through a direct handle on a regular file of statfs(2) type `f_type`
+/// is the device's own completion, where statx(2) answered `STATX_DIOALIGN` with `dio_offset_align`
+/// (`None` where it did not: a kernel before 6.1, or a file system that does not say).
+///
+/// The file system writes an overwrite of written blocks in place, changing no metadata: ext2,
+/// ext3, ext4 and XFS ([`journals_allocation`]), whose direct writes the kernel issues through
+/// iomap. Not btrfs, f2fs or bcachefs, which write an overwrite out of place, so its blocks are
+/// found again only through metadata the next flush commits; not a network or user-space file
+/// system, whose direct write completes at its server (open(2): "O_DIRECT I/O will bypass the
+/// page cache only on the client; the server may still cache the I/O"); not tmpfs, which is
+/// opened buffered (`sys::in_memory`). And the file takes direct I/O: statx(2) reports "the
+/// alignment ... required for file offsets ... for direct I/O (O_DIRECT) on this file, or 0 if
+/// direct I/O is not supported on this file", which ext4 answers 0 for a file it writes through
+/// the page cache whatever the handle asks, under data journaling, fs-verity or inline data
+/// (`ext4_dio_alignment`, fs/ext4/inode.c; `ext4_dio_write_iter`, fs/ext4/file.c: "Fallback to
+/// buffered I/O if the inode does not support direct I/O"). A kernel that does not say, before
+/// 6.1, is taken not to.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn direct_file_reaches_device(f_type: i128, dio_offset_align: Option<u32>) -> bool {
+    journals_allocation(f_type) && dio_offset_align.is_some_and(|align| align != 0)
+}
+
 #[cfg(unix)]
 mod sys {
     use std::fs::File;
@@ -952,6 +1025,44 @@ mod sys {
         None
     }
 
+    /// Whether a write completed through this direct handle is the device's own
+    /// (`DeviceFile::writes_reach_device`): on a block device, where a direct write is the block
+    /// layer's own transfer, always; a regular file by its file system and statx(2)'s word on it
+    /// ([`super::direct_file_reaches_device`]); any other node, or a file the kernel does not
+    /// describe, never.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn direct_writes_reach_device(file: &File, node: bool) -> bool {
+        use rustix::fs::{AtFlags, StatxFlags};
+        use std::os::unix::fs::FileTypeExt;
+        if node {
+            return file
+                .metadata()
+                .is_ok_and(|m| m.file_type().is_block_device());
+        }
+        let Ok(fs) = rustix::fs::fstatfs(file) else {
+            return false;
+        };
+        let dio = rustix::fs::statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::DIOALIGN)
+            .ok()
+            .filter(|s| StatxFlags::from_bits_retain(s.stx_mask).contains(StatxFlags::DIOALIGN))
+            .map(|s| s.stx_dio_offset_align);
+        super::direct_file_reaches_device(i128::from(fs.f_type), dio)
+    }
+
+    /// macOS promises no direct path to the device (`DeviceFile::writes_reach_device`): fcntl(2)'s
+    /// `F_NOCACHE` only turns data caching off, and XNU copies a write short of a page through the
+    /// cache anyway.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn direct_writes_reach_device(_file: &File, _node: bool) -> bool {
+        false
+    }
+
+    /// No direct handle is opened elsewhere ([`open_direct`]).
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    pub(super) fn direct_writes_reach_device(_file: &File, _node: bool) -> bool {
+        false
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(super) fn open_direct(path: &Path, create: bool, _overlapped: bool) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1090,6 +1201,15 @@ mod sys {
 
     pub(super) fn written_in_place_marked(_file: &File) -> Option<bool> {
         None
+    }
+
+    /// A handle opened with `FILE_FLAG_NO_BUFFERING`, as every direct one is ([`open_direct`]):
+    /// no system cache holds its data, the caller's buffer "effectively the only file buffer that
+    /// exists for this operation" ("File Buffering"), the disk's own cache untouched (CreateFileW),
+    /// so a completed write is the disk's (`DeviceFile::writes_reach_device`). A device node
+    /// opened so likewise.
+    pub(super) fn direct_writes_reach_device(_file: &File, _node: bool) -> bool {
+        true
     }
 
     pub(super) fn open_direct(path: &Path, create: bool, overlapped: bool) -> io::Result<File> {
@@ -1545,5 +1665,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(file.caching(), Caching::Buffered);
+        assert!(!file.writes_reach_device());
+    }
+
+    /// Do: ask Linux's rule of each file system and each statx(2) answer, on any host. Expect: a
+    /// direct write reaches the device only on ext2, ext3, ext4 or XFS, which overwrite in place,
+    /// and only where statx(2) says the file takes direct I/O: ext4's 0 (data journaling,
+    /// fs-verity, inline data) and a kernel before 6.1, which does not say, never; btrfs, which
+    /// overwrites out of place, NFS, whose server completes a direct write, and tmpfs, never.
+    #[test]
+    fn linux_takes_a_direct_write_as_the_devices_only_where_it_overwrites_in_place_past_the_cache()
+    {
+        // statfs(2) types, include/uapi/linux/magic.h: BTRFS_SUPER_MAGIC, NFS_SUPER_MAGIC,
+        // TMPFS_MAGIC.
+        const BTRFS: i128 = 0x9123_683E;
+        const NFS: i128 = 0x6969;
+        const TMPFS: i128 = 0x0102_1994;
+        for f_type in [EXT_SUPER_MAGIC, XFS_SUPER_MAGIC] {
+            assert!(direct_file_reaches_device(f_type, Some(512)));
+            assert!(direct_file_reaches_device(f_type, Some(4096)));
+            assert!(!direct_file_reaches_device(f_type, Some(0)));
+            assert!(!direct_file_reaches_device(f_type, None));
+        }
+        for f_type in [BTRFS, NFS, TMPFS] {
+            assert!(!direct_file_reaches_device(f_type, Some(4096)));
+            assert!(!direct_file_reaches_device(f_type, None));
+        }
+    }
+
+    /// Do: open a file asking for direct transfers and one buffered, in this host's temporary
+    /// directory, and duplicate each. Expect: a buffered handle's writes never reach the device;
+    /// a direct one's as its platform's direct path promises of the handle as it was opened:
+    /// never on macOS, whose `F_NOCACHE` promises no write the device's; on Linux where the
+    /// handle is direct and the rule above takes its file system and statx(2)'s answer; on
+    /// Windows wherever the handle is unbuffered. A duplicate answers as its original.
+    #[test]
+    fn a_files_writes_reach_its_device_only_as_its_platform_opened_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str, request| {
+            DeviceFile::open(&dir.path().join(name), true, request, align()).unwrap()
+        };
+        let buffered = open("buffered", CachingRequest::Buffered);
+        assert!(!buffered.writes_reach_device());
+        assert!(!buffered.try_clone().unwrap().writes_reach_device());
+        let direct = open("direct", CachingRequest::PreferDirect);
+        assert_eq!(
+            direct.try_clone().unwrap().writes_reach_device(),
+            direct.writes_reach_device()
+        );
+        if direct.caching() == Caching::Buffered {
+            assert!(!direct.writes_reach_device());
+        }
+        #[cfg(target_vendor = "apple")]
+        assert!(!direct.writes_reach_device());
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{AtFlags, StatxFlags};
+            let f_type = i128::from(rustix::fs::fstatfs(direct.std_file()).unwrap().f_type);
+            let dio = rustix::fs::statx(
+                direct.std_file(),
+                "",
+                AtFlags::EMPTY_PATH,
+                StatxFlags::DIOALIGN,
+            )
+            .ok()
+            .filter(|s| StatxFlags::from_bits_retain(s.stx_mask).contains(StatxFlags::DIOALIGN))
+            .map(|s| s.stx_dio_offset_align);
+            assert_eq!(
+                direct.writes_reach_device(),
+                direct.caching() == Caching::Direct && direct_file_reaches_device(f_type, dio),
+                "file system {f_type:#x}, statx direct-I/O alignment {dio:?}"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            direct.writes_reach_device(),
+            direct.caching() == Caching::Direct
+        );
     }
 }

@@ -410,10 +410,15 @@ The owner's two decisions are stated where the writer reads them, each a typed e
 
 So no device answers a frame at its flush today. Under (B) a frame is answered at its flush only
 under condition (a): a write the file completes is the device's own completion
-(`BlockFile::writes_reach_device`: false for every real file until its direct path is built and
-cited, true for the simulated device that keeps every completed write, hyper-block
-`SimFile::keeping`), and the frame overwrites a slot the file holds written, so its write completes
-before its record's is issued and a record that landed proves its frame did. A frame that grows the
+(`BlockFile::writes_reach_device`: for a real file what its platform's direct path promises of the
+handle as it was opened, step 4c, true for Linux's `O_DIRECT` on a block device or on ext2, ext3,
+ext4 or XFS where statx(2) says the file takes direct I/O and for Windows'
+`FILE_FLAG_NO_BUFFERING`, never for macOS's `F_NOCACHE` or a buffered handle; true for the
+simulated device that keeps every completed write, hyper-block `SimFile::keeping`), and the frame
+overwrites a slot the file holds written, so its write completes before its record's is issued and
+a record that landed proves its frame did. Neither fact speaks for the device's own cache: a
+completed direct write may sit in a volatile one, which is why condition (a) needs the cache the OS
+states keeps it, and why decision (B) is the owner's. A frame that grows the
 file stays confirmed: the file system's journal commits that write's metadata only at the next
 flush (fallocate(2)). Condition (b), a frame and its record in one atomic write, is not reachable
 in this log's layout: the record lies in the persist area and the frame in a segment, two ranges of
@@ -607,11 +612,75 @@ either decision a frame holding a one- or two-voter group stays confirmed (`Upda
      either; a binary from before refuses the mark the writer itself set, at a create and at an
      open of a log made before the decision.
    - Not built: condition (b), unreachable in this layout (§7.5); a real file's
-     `writes_reach_device`, which needs each platform's direct path cited (Linux `O_DIRECT`, macOS
-     `F_NOCACHE`, Windows `FILE_FLAG_NO_BUFFERING`), so decision (B) answers no real device at the
-     flush until it is; the measurement (a) needs (§7.5); and the node's count of log flushes per
-     PUT on the simulated device, which needs the node to open its log with a decision and the
-     simulation's store on `SimFile::keeping`.
+     `writes_reach_device`, built in 4c; the measurement (a) needs (§7.5); and the node's count of
+     log flushes per PUT on the simulated device, which needs the node to open its log with a
+     decision and the simulation's store on `SimFile::keeping`.
+
+   4c, built (hyper-raft `mantle-frame-flush` `70e150f`, `74242cd`, `a6a701f`): a real file's
+   `writes_reach_device`, so that decision (B) can reach a real device. hyper-block's
+   `DeviceFile::writes_reach_device` answers whether a write the handle completes over written
+   space is the device's own completion, no cache of the OS's in front of it, for the handle as it
+   was opened, never as it was asked for: a `PreferDirect` open that the file system refused, or
+   that landed on tmpfs (`sys::in_memory`), is buffered and answers false. The answer says nothing
+   of the device's cache; the device's stated cache (step 5) is read beside it. Per platform
+   (sources: research/02 §2.7-§2.10, §3.7-§3.8, §4.5-§4.6):
+   - Linux, true for a direct handle on a block device, or on a file of ext2, ext3, ext4 or XFS
+     that statx(2) says takes direct I/O. open(2) promises of `O_DIRECT` that "File I/O is done
+     directly to/from user-space buffers", past the page cache, and no more: it "makes an effort to
+     transfer data synchronously, but does not give the guarantees of the O_SYNC flag that data and
+     necessary metadata are transferred", says nothing of the device's volatile cache, and lets a
+     misaligned transfer "fall back to buffered I/O" (hyper-block checks every direct transfer
+     aligned first). The kernel's own direct write takes the completion of "a normal write to a
+     device without a volatile write cache" as written through, for "a pure overwrite that doesn't
+     require any metadata updates" (fs/iomap/direct-io.c), which is condition (a) on a stated
+     write-through cache. Only file systems that overwrite in place qualify (ext2-4 and XFS, by
+     statfs(2) type, the set `fills_new_space` names): btrfs, f2fs and bcachefs overwrite out of
+     place, a network file system's server completes the write ("the server may still cache the
+     I/O"), and a file system not named is taken not to. And ext4 writes some files' direct
+     transfers through the page cache (data journaling, fs-verity, inline data:
+     `ext4_dio_alignment`, `ext4_dio_write_iter`), which statx(2) reports as a direct-I/O
+     alignment of 0, "direct I/O is not supported on this file"; a kernel before 6.1 cannot be
+     asked and answers false. `O_DSYNC`, or `RWF_DSYNC` a write (pwritev2(2)), would make each
+     write durable on its own, "as though each write(2) was followed by a call to fdatasync(2)",
+     whatever the cache: a FUA write or a flush each, which only `write_durable_at` pays.
+   - macOS, never. fcntl(2)'s `F_NOCACHE` "Turns data caching off/on" and promises nothing of where
+     a completed write is: XNU's cluster layer writes past the cache only a write of 16 KiB or more
+     at a page-aligned offset from an aligned buffer, and copies any other through it
+     (`vfs_cluster.c`), a log's 4 KiB frame among them; APFS's own path is closed; and fsync(2)
+     leaves data in the drive's cache, which only `F_FULLFSYNC` "asks the drive to flush". This
+     Mac's direct and buffered files both answer false.
+   - Windows, true for a handle opened with `FILE_FLAG_NO_BUFFERING`, which disables "system
+     caching of data being read from or written to the file", the caller's buffer "effectively the
+     only file buffer that exists for this operation" ("File Buffering"), and "does not affect hard
+     disk caching" (CreateFileW). Its metadata "may still be cached" (CreateFileW), so only an
+     overwrite of written space is the disk's alone. `FILE_FLAG_WRITE_THROUGH` beside it would also
+     request "a write-through of the hard disk's local hardware cache to persistent media", which
+     "Not all hard disk hardware supports" (CreateFileW, "Caching Behavior"); no handle is opened
+     with it.
+   - Every other platform, and every buffered handle: never.
+   - A duplicate answers as its original, a `SegmentedFile` its base's, asked once at open as its
+     device's atomic write unit and cache are, and the wrappers of hyper-raft's benches, e2e and
+     comparison pass their file's through. mantle's log runs on a `DeviceFile` (`crates/node`'s
+     `open_log`), which asks the OS.
+   - Tests, all passing on this Mac (hyper-block `file::tests`, `segmented::tests`; hyper-log
+     `tests/at_flush.rs`): Linux's rule over each file system and statx(2) answer, run on every
+     host; each platform's answer for a direct and a buffered open, the platform's own run on its
+     host (macOS here: false for both); a segmented file answering its base's at create, after a
+     segment is added, at open and through a second handle; and a real direct file whose device is
+     stated to write through, decision (B) taken in the test: `Kept`, its mark set from the first
+     flush, where the file's writes reach the device, `Buffered` where not (macOS's direct file and
+     every buffered one, as run here), and `Unmeasured` under `AtFlush::DECIDED`, which is
+     unchanged.
+   - What decision (B) would do now: on Linux, a log on a direct file of ext4 or XFS whose queue
+     states "write through" answers `Kept`, and a frame of three-voter groups in a slot the file
+     holds written whole (`fills_new_space`, true there) is answered at its flush, one flush and no
+     confirmation; a block device node answers `Kept` and no frame at its flush, as nothing is
+     written ahead on a node (`fills_new_space` false). On Windows, a direct file on a device
+     stating write-through or a battery-backed cache answers `Kept`, but no frame there is
+     answered at its flush yet, as NTFS's space is not written ahead (`fills_new_space` false) and
+     condition (a) answers only a frame overwriting a slot written whole. On macOS, `Buffered`,
+     every frame once confirmed; this Mac's SSD states no cache (`WriteBack`), so (B) would not
+     reach it either. A device stating a volatile cache stays `WriteBack` under (B) everywhere.
 5. The device's write cache is read from the OS beside its atomic write unit, for step 4. Built
    (hyper-raft `mantle-frame-flush`): hyper-block `write_cache::write_cache` answers a
    `DeviceCache`, a `WriteCache` (`WriteThrough`, `PowerProtected`, `WriteBack`) with its `Source`

@@ -493,9 +493,11 @@ pub struct SegmentedFile {
     base: PathBuf,
     align: Alignment,
     bound: usize,
-    /// The base's layout block and whether new space is zeroed, asked once, at open.
+    /// The base's layout block, whether new space is zeroed and whether its completed writes are
+    /// the device's, asked once, at open.
     layout: Alignment,
     fills: bool,
+    reaches: bool,
     /// This handle's reads from memory of each segment it read so.
     marks: Chunked<OnceLock<Mark>>,
     /// Shadow mode for resident reads, given to each segment as this handle reaches it
@@ -626,6 +628,7 @@ impl SegmentedFile {
             bound,
             layout: first.file.layout_block(),
             fills: first.file.fills_new_space(),
+            reaches: first.file.writes_reach_device(),
             marks: Chunked::new(),
             shadow: false,
             epoch: Epoch::new(),
@@ -881,6 +884,12 @@ impl BlockFile for SegmentedFile {
         self.fills
     }
 
+    /// The base's, as its device's atomic write unit and cache are: every segment lies beside it,
+    /// in its directory, on its file system, opened with the caching the base was asked for.
+    fn writes_reach_device(&self) -> bool {
+        self.reaches
+    }
+
     fn grows_by_segments(&self) -> bool {
         true
     }
@@ -919,6 +928,7 @@ impl BlockFile for SegmentedFile {
                 bound: self.bound,
                 layout: self.layout,
                 fills: self.fills,
+                reaches: self.reaches,
                 marks: Chunked::new(),
                 shadow: self.shadow,
                 epoch: Epoch::new(),
@@ -1390,5 +1400,36 @@ mod tests {
         assert_eq!(both(&mut file), (2, 2, 0));
         file.epoch.move_on();
         assert_eq!(both(&mut file), (4, 2, 0));
+    }
+
+    /// Do: create a segmented file asking for direct transfers and one buffered, add a segment
+    /// to each, open each again and take a second handle. Expect: each answers whether its writes
+    /// reach the device as its base, opened alone, does (`DeviceFile::writes_reach_device`), at
+    /// create, after a segment is added, at open, and through every handle; a buffered one never.
+    #[test]
+    fn a_segmented_file_answers_whether_its_writes_reach_the_device_as_its_base_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let align = Alignment::new(ALIGN).unwrap();
+        for (name, caching) in [
+            ("direct", CachingRequest::PreferDirect),
+            ("buffered", CachingRequest::Buffered),
+        ] {
+            let base = dir.path().join(name);
+            let file = SegmentedFile::create(&base, caching, align, 4).unwrap();
+            let alone = DeviceFile::open(&base, false, caching, align)
+                .unwrap()
+                .writes_reach_device();
+            if caching == CachingRequest::Buffered {
+                assert!(!alone);
+            }
+            assert_eq!(file.writes_reach_device(), alone, "{name}");
+            file.add(ALIGN as u64).unwrap();
+            assert_eq!(file.writes_reach_device(), alone, "{name}");
+            assert_eq!(file.try_clone().unwrap().writes_reach_device(), alone);
+            drop(file);
+            let file = SegmentedFile::open(&base, caching, align, 4).unwrap();
+            assert_eq!(file.writes_reach_device(), alone, "{name}");
+            assert_eq!(file.try_clone().unwrap().writes_reach_device(), alone);
+        }
     }
 }

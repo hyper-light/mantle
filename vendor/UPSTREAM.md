@@ -87,10 +87,20 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `2b50efd` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twenty commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch
-is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last three
-commits are step 4b of mantle docs/design/durability.md §7.7. `2b50efd` changes hyper-log alone: the
+**Every crate at `a6a701f` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twenty-three commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
+three commits are step 4c of mantle docs/design/durability.md §7.7. `a6a701f` changes hyper-log's
+tests alone: a real direct file whose device is stated to write through, decision (B) taken in the
+test, answers `Kept` where its writes reach the device and `Buffered` where not, and `Unmeasured`
+under `AtFlush::DECIDED`, which is unchanged. `74242cd` changes hyper-durable's benches and the e2e
+and comparison crates, which are not snapshotted: their wrapper files pass their file's
+`writes_reach_device` through. `70e150f` changes hyper-block alone: `DeviceFile::writes_reach_device`
+answers, for the handle as it was opened, whether a write it completes is the device's own: Linux's
+`O_DIRECT` on a block device, or on a file of ext2-4 or XFS that statx(2) says takes direct I/O;
+Windows' `FILE_FLAG_NO_BUFFERING`; never macOS's `F_NOCACHE`, a buffered handle or another
+platform's; a duplicate answers as its original and a `SegmentedFile` its base's. No new constants.
+The three before those are step 4b. `2b50efd` changes hyper-log alone: the
 device reads the owner's words that another frame follows for a frame answered at its flush too, so
 a word left unread never fills the room a later confirmed frame's word needs, which would cost that
 frame a confirmation of its own. `f9248d5` changes hyper-log alone: the owner's

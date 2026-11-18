@@ -382,15 +382,22 @@ layers removes them, as Tectonic's does [01 §1.6].
   principal, kind of write, upload and part number, and answering `Answered` through both doors;
   the server's maximum horizon (STATUS item 9); the collector's driver for `Forget`, since nodes
   run no collector yet; `Expired` for a native attempt past its horizon, which needs each attempt
-  to carry its operation's deadline, as a write carries its file's; and, in the orphan-sweep
-  simulation, parts, uploads and completions as operations. *As built in the simulation
-  (2026-11-17):* `tests/orphan_sweep.rs` draws put and delete operations of two principals,
-  one of which may carry the other's identity on its key, with a horizon of a gateway's
-  handover span or the clock's last instant; gateways attempt them at any step, each put
-  attempt with a file of its own, and copies of attempts handed over arrive at any later step,
-  among the sweeps, the collector, its `Forget`, splits, merges and leaders whose clocks run
-  behind. After every step it judges the five obligations, and with the row, the gateway's
-  scope or the horizon check removed, a schedule of its own budget, drawn from a fixed seed,
+  to carry its operation's deadline, as a write carries its file's. *As built in the simulation
+  (2026-11-17):* `tests/orphan_sweep.rs` draws put, delete, upload, part and completion
+  operations of two principals, one of which may carry the other's identity on its key, with a
+  horizon of a gateway's handover span or the clock's last instant. The gateway scopes an
+  identity by principal and kind of write, a part's also by its upload and part number and a
+  completion's by its upload; an upload's is scoped by its key in the range itself, which keys
+  every row by its object key. A native client's parts carry its upload's identity, a client
+  may carry one identity on every upload it creates or carry a part's or completion's to
+  another upload of the key, and only the scope keeps those apart. Gateways attempt every
+  operation at any step, each put and part attempt with a file of its own and each completion
+  attempt with a composite and an ETag of its own, and copies of attempts handed over arrive at
+  any later step, among the sweeps, the collector, its `Forget`, splits, merges and leaders
+  whose clocks run behind. After every step it judges the five obligations, every attempt
+  within its first effect's horizon answered from the row, so a retried completion is never
+  rebuilt; and with the row, the scope by principal, by part number or by upload, the horizon
+  check, or a completion's row removed, a schedule of its own budget, drawn from a fixed seed,
   breaks one.
 - **Resumable native uploads** (research/30 §3.5, D3). A native upload is a multipart upload
   whose parts, runs, are numbered by the range as the gateway hands them over, each committed

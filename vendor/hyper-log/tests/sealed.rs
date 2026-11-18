@@ -684,6 +684,7 @@ fn a_sealed_log_writes_its_persist_records_in_pieces_and_a_forged_piece_is_tampe
         unit,
         block: Some(Alignment::new(BLOCK).unwrap()),
         at_end: false,
+        at_flush: false,
     };
     assert_eq!(log.laid().pieces, Some(mark));
     let hard = |vote| HardState {

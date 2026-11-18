@@ -55,6 +55,7 @@ use std::thread::JoinHandle;
 use hyper_block::atomic::AtomicUnit;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{Alignment, Pool};
+use hyper_block::write_cache::{DeviceCache, WriteCache};
 
 pub use derive::{Facts, Unfit};
 pub use error::LogError;
@@ -227,13 +228,18 @@ pub struct Recovery {
     pub laid: Laid,
 }
 
-/// The device's atomic write unit as the OS gave it, and how the log's persist records are laid
-/// in pieces of a unit (mantle docs/design/durability.md §7.7). A node on a device that states no
-/// unit, its unit the conservative default, shows here with `device.stated()` false.
+/// The device's atomic write unit and write cache as the OS gave them, how the log's persist
+/// records are laid in pieces of a unit, and how the log answers its frames (mantle
+/// docs/design/durability.md §7.5, §7.7). A node on a device that states no unit, its unit the
+/// conservative default, shows here with `device.stated()` false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Laid {
     /// The device's atomic write unit and where it was read.
     pub device: AtomicUnit,
+    /// The device's write cache and where it was read (`BlockFile::write_cache`).
+    pub cache: DeviceCache,
+    /// How the log answers a frame's updates, and why: from the records' laying and the cache.
+    pub answers: Answers,
     /// How the persist records are laid in pieces (format 5, 6 sealed), as the persist area's mark
     /// records it: its unit stays the area's where the device's is larger, and its block where the
     /// file's differs but takes the slots, since the slots lie where they were put; a device whose
@@ -245,9 +251,57 @@ pub struct Laid {
 
 impl Default for Laid {
     fn default() -> Self {
+        Self::of(AtomicUnit::DEFAULT, DeviceCache::DEFAULT, None)
+    }
+}
+
+impl Laid {
+    /// The facts of a log on a device of atomic write unit `device` and write cache `cache`, its
+    /// records laid in pieces as `pieces` says, or whole where `None`; it answers as they allow.
+    pub fn of(device: AtomicUnit, cache: DeviceCache, pieces: Option<format::Mark>) -> Self {
         Self {
-            device: AtomicUnit::DEFAULT,
-            pieces: None,
+            device,
+            cache,
+            answers: Answers::of(pieces, cache),
+            pieces,
+        }
+    }
+}
+
+/// How a log answers a frame's updates, and why: the policy a node reports (mantle
+/// docs/design/durability.md §7.5, §7.7 step 4). A frame is answered once confirmed, by the next
+/// frame's persist record or its own confirmation, each durable after the frame's flush; answering
+/// at the frame's own flush needs a device that rules out a frame torn after its record landed,
+/// which this log has not established. Each variant says what keeps this log from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answers {
+    /// Once confirmed: the persist records are whole (format 3, 4 sealed), which cannot say a
+    /// frame was answered at its flush, since a torn whole record and a damaged one read alike.
+    Whole,
+    /// Once confirmed: the device's write cache is volatile, or the OS describes none
+    /// (`WriteCache::WriteBack`), so a power cut across a quorum can tear a frame after its record
+    /// landed and leave its group waiting (§7.5); frames there stay confirmed until the owner
+    /// decides from the simulation's count.
+    WriteBack,
+    /// Once confirmed: the OS states a completed write is kept (`WriteCache::WriteThrough`, or a
+    /// `PowerProtected` cache), so a record written only after its frame's write completed would
+    /// prove the frame landed; but the claim is not yet checked by measuring the device (mantle
+    /// CLAUDE.md §5). Linux's `write_cache` is the kernel's view, which an administrator can set
+    /// and which also drops the flushes it would send (Documentation/ABI/stable/sysfs-block,
+    /// Documentation/block/writeback_cache_control.rst).
+    Unmeasured,
+}
+
+impl Answers {
+    /// How a log answers whose records are laid in pieces as `pieces` says, or whole where
+    /// `None`, on a device whose write cache is `cache`.
+    pub fn of(pieces: Option<format::Mark>, cache: DeviceCache) -> Self {
+        if pieces.is_none() {
+            return Self::Whole;
+        }
+        match cache.cache() {
+            WriteCache::WriteBack => Self::WriteBack,
+            WriteCache::WriteThrough | WriteCache::PowerProtected => Self::Unmeasured,
         }
     }
 }

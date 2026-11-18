@@ -1222,19 +1222,35 @@ pub struct Mark {
     /// Whether the slots lie at the area's end, where a re-lay put them clear of the slots it
     /// moved from, rather than past the two whole slots.
     pub at_end: bool,
+    /// Whether the log may hold frames answered at their own flush (durability.md §7.7, step 4):
+    /// set before the first such frame is answered, and kept by every re-lay and every mark
+    /// written again. A binary from before it reads such a frame's [`AT_FLUSH`] byte as padding,
+    /// and would cut the frame, torn after its record landed, as the torn tail; it reads this
+    /// mark as none and refuses the log ([`pieces_mark`]).
+    pub at_flush: bool,
 }
+
+/// The bit of a mark of pieces' sequence field ([`pieces_mark`]) that says its slots lie at the
+/// area's end: 1, as every mark that said it was written (2b-iii).
+const MARK_AT_END: u64 = 1;
+/// The bit of a mark of pieces' sequence field that says the log may hold frames answered at their
+/// flush ([`Mark::at_flush`]): the next, so that a binary that read only 0 or 1 there refuses it.
+const MARK_AT_FLUSH: u64 = 2;
 
 /// The mark that log `log`'s persist area holds its records in pieces as `mark` says (format 5,
 /// 6 sealed; durability.md §7.7): a whole persist record of the other kind than the log's (format 4
 /// in an unsealed log, 3 in a sealed one), of no groups, whose first padding byte is the base-2
-/// logarithm of the unit, its sequence 1 where the slots lie at the area's end and 0 where they lie
-/// past the whole slots, and what it confirms the file's block in bytes, all under the record's
-/// CRC. It lies at the start of the area, where every binary reads a slot. A binary from before
-/// format 5 reads it as a record of the other kind and refuses the log, as it refuses a sealed
-/// record in an unsealed log and the reverse (a sealed log's refusal being tampering), rather than
-/// read the pieces after it as no record. A binary of format 5 from before the block was recorded
-/// reads a mark only of sequence and confirmation 0, so it refuses these the same way, rather than
-/// lay the slots by a block of its own. `None` when the mark records no block.
+/// logarithm of the unit, its sequence the bits of how the slots lie (1 where they lie at the
+/// area's end, past the whole slots without it) and whether the log may hold frames answered at
+/// their flush (2), and what it confirms the file's block in bytes, all under the record's CRC.
+/// It lies at the start of the area, where every binary reads a slot. A binary from before format
+/// 5 reads it as a record of the other kind and refuses the log, as it refuses a sealed record in
+/// an unsealed log and the reverse (a sealed log's refusal being tampering), rather than read the
+/// pieces after it as no record. A binary of format 5 from before the block was recorded reads a
+/// mark only of sequence and confirmation 0, so it refuses these the same way, rather than lay the
+/// slots by a block of its own; and one from before frames were answered at their flush reads a
+/// mark only of sequence 0 or 1, so it refuses a log that may hold such frames the same way,
+/// rather than cut one as the torn tail. `None` when the mark records no block.
 pub fn pieces_mark(log: u128, sealed: bool, mark: Mark) -> Option<[u8; PIECES_MARK_LEN]> {
     let block = u64::try_from(mark.block?.get()).ok()?;
     let mut w = Writer::with_capacity(PIECES_MARK_LEN);
@@ -1243,7 +1259,9 @@ pub fn pieces_mark(log: u128, sealed: bool, mark: Mark) -> Option<[u8; PIECES_MA
     w.u8(u8::try_from(mark.unit.get().trailing_zeros()).ok()?);
     w.zeros(2);
     w.u128(log);
-    w.u64(u64::from(mark.at_end));
+    let at_end = if mark.at_end { MARK_AT_END } else { 0 };
+    let at_flush = if mark.at_flush { MARK_AT_FLUSH } else { 0 };
+    w.u64(at_end | at_flush);
     w.u64(block);
     w.u32(0);
     let crc = crate::codec::crc32c(w.as_slice());
@@ -1265,22 +1283,21 @@ pub fn pieces_marked(bytes: &[u8], log: u128, sealed: bool) -> Option<Mark> {
     }
     let unit = Alignment::new(1usize.checked_shl(u32::from(r.u8()?))?).ok()?;
     r.take(2)?;
-    let (at, at_end, block, groups) = (r.u128()?, r.u64()?, r.u64()?, r.u32()?);
+    let (at, laid, block, groups) = (r.u128()?, r.u64()?, r.u64()?, r.u32()?);
     (at == log && groups == 0).then_some(())?;
-    laid_by(unit, at_end, block)
+    laid_by(unit, laid, block)
 }
 
-/// A mark of pieces of `unit` whose sequence field is `at_end` and whose confirmation field is
-/// `block` ([`pieces_mark`]): 0 and 0 in a mark from before the block was recorded. `None` where
-/// they are neither.
-fn laid_by(unit: Alignment, at_end: u64, block: u64) -> Option<Mark> {
-    let at_end = match at_end {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
+/// A mark of pieces of `unit` whose sequence field holds the bits `laid` and whose confirmation
+/// field is `block` ([`pieces_mark`]): 0 and 0 in a mark from before the block was recorded.
+/// `None` where they are neither, or `laid` holds a bit no mark has.
+fn laid_by(unit: Alignment, laid: u64, block: u64) -> Option<Mark> {
+    if laid & !(MARK_AT_END | MARK_AT_FLUSH) != 0 {
+        return None;
+    }
+    let (at_end, at_flush) = (laid & MARK_AT_END != 0, laid & MARK_AT_FLUSH != 0);
     let block = match block {
-        0 if !at_end => None,
+        0 if laid == 0 => None,
         0 => return None,
         bytes => Some(Alignment::new(usize::try_from(bytes).ok()?).ok()?),
     };
@@ -1288,6 +1305,7 @@ fn laid_by(unit: Alignment, at_end: u64, block: u64) -> Option<Mark> {
         unit,
         block,
         at_end,
+        at_flush,
     })
 }
 

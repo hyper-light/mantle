@@ -16,9 +16,10 @@ use std::collections::{BTreeMap, HashMap};
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::sim::{Crash, Fault, SimFile};
+use hyper_block::write_cache::{DeviceCache, Source, WriteCache};
 use hyper_log::{
-    Class, Config, Entries, Entry, HardState, Log, LogError, LogStats, Proposal, Refused, Start,
-    Tail, Update, View, Waits,
+    Answers, Class, Config, Entries, Entry, HardState, Log, LogError, LogStats, Proposal, Refused,
+    Start, Tail, Update, View, Waits,
 };
 use proptest::prelude::*;
 
@@ -4141,6 +4142,93 @@ fn a_completion_wakes_only_its_submitter() {
     assert!(woken.try_recv().is_err(), "a wake with no answer");
 }
 
+/// A simulated file whose device states, as Linux's `write_cache` "write through" does, that it
+/// keeps a completed write; it counts its flushes.
+struct WritesThrough {
+    file: SimFile,
+    flushed: std::sync::mpsc::SyncSender<()>,
+}
+
+impl BlockFile for WritesThrough {
+    fn alignment(&self) -> Alignment {
+        self.file.alignment()
+    }
+
+    fn atomic_unit(&self) -> Result<hyper_block::atomic::AtomicUnit, hyper_block::DiskError> {
+        self.file.atomic_unit()
+    }
+
+    fn write_cache(&self) -> Result<DeviceCache, hyper_block::DiskError> {
+        Ok(DeviceCache::new(
+            WriteCache::WriteThrough,
+            Source::Sysfs { fua: Some(true) },
+        ))
+    }
+
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        self.file.len()
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.file.read_exact_at(buf, offset)
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.file.write_all_at(buf, offset)
+    }
+
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+        let _ = self.flushed.try_send(());
+        self.file.sync_data()
+    }
+}
+
+/// The log reports how it answers its frames and why (mantle durability.md §7.5, §7.7 step 4),
+/// from the device's write cache read at create and at open: once confirmed everywhere until
+/// answering at the flush is built on a measured device. A simulated device states no cache, the
+/// write-back default; a log of whole records cannot say a frame was answered at its flush; and a
+/// device the OS says writes through is unmeasured, its frames still confirmed: each write a
+/// frame's flush and its confirmation's.
+#[test]
+fn a_log_reports_how_it_answers_its_frames() {
+    let log = Log::create(sim(56), config_now(16, 8), ID).unwrap();
+    assert_eq!(log.laid().cache, DeviceCache::DEFAULT);
+    assert_eq!(log.laid().answers, Answers::WriteBack);
+    let whole = Config {
+        max_groups: 80,
+        ..config_now(4, 8)
+    };
+    let log = Log::create(sim(57), whole, ID).unwrap();
+    assert_eq!(log.laid().pieces, None);
+    assert_eq!(log.laid().answers, Answers::Whole);
+    let (flushed, flushes) = std::sync::mpsc::sync_channel(1 << 10);
+    let file = WritesThrough {
+        file: sim(58),
+        flushed,
+    };
+    let log = Log::create(file, config_now(16, 8), ID).unwrap();
+    assert_eq!(log.laid().cache.cache(), WriteCache::WriteThrough);
+    assert!(log.laid().cache.stated());
+    assert_eq!(log.laid().answers, Answers::Unmeasured);
+    while flushes.try_recv().is_ok() {}
+    for index in 1..=3 {
+        let update = Update {
+            entries: Some(entries(index, &[1])),
+            at_flush: true,
+            ..Update::default()
+        };
+        log.write(1, update).unwrap();
+        let made = flushes.try_iter().count();
+        assert_eq!(
+            made, 2,
+            "write {index}: its frame's flush and confirmation's"
+        );
+    }
+    let (log, recovery) = Log::open(closed(log), config_now(16, 8), ID).unwrap();
+    assert_eq!(recovery.laid.answers, Answers::Unmeasured);
+    assert_eq!(log.laid(), recovery.laid);
+}
+
 /// A file that tells which thread flushed it.
 struct Flushing {
     file: SimFile,
@@ -4414,6 +4502,7 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
         unit,
         block: Some(Alignment::new(BLOCK).unwrap()),
         at_end: false,
+        at_flush: false,
     };
     assert_eq!(log.laid().pieces, Some(mark));
     assert!(

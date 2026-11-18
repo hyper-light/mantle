@@ -83,6 +83,11 @@ impl DeviceCache {
         source: Source::Default,
     };
 
+    /// The cache `source` states: a device a wrapper or a simulation describes for itself.
+    pub const fn new(cache: WriteCache, source: Source) -> Self {
+        Self { cache, source }
+    }
+
     /// The cache.
     pub fn cache(self) -> WriteCache {
         self.cache

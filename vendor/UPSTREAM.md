@@ -87,10 +87,19 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `f3dae3b` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and fifteen commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
-in the hyper-raft repository's own objects and not yet pushed to its origin. Its last three commits
-are step 5 of mantle docs/design/durability.md §7.7. `33fc359` changes hyper-block alone: the macOS
+**Every crate at `abfca69` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and seventeen commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch
+is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last two commits
+are step 4a of mantle docs/design/durability.md §7.7. `abfca69` changes hyper-log alone: the open
+and the create read the device's write cache where they read its atomic write unit, and `Laid`
+carries it with `Answers`, how the log answers a frame's updates and why (`Whole`, `WriteBack`,
+`Unmeasured`), every frame still answered once confirmed; and the mark of pieces says, in its
+sequence field's next bit, that the log may hold frames answered at their flush (`Mark::at_flush`),
+which a binary of `f3dae3b` or before reads as no mark and so refuses the log; this binary reads it
+and every re-lay keeps it, and nothing sets it yet. New constants `MARK_AT_END` and `MARK_AT_FLUSH`,
+with their rows in docs/design/constants.md. `a43ad9f` changes hyper-block alone: a wrapper or a
+simulation states its own device's cache (`DeviceCache::new`). Its fifteenth commit, `f3dae3b`, and
+the two before it are step 5 of mantle docs/design/durability.md §7.7. `33fc359` changes hyper-block alone: the macOS
 registry search made its owned value before testing the result, so a key no entry had released
 null, which traps in CoreFoundation; each value is now made only for a found object. `319ecde`
 changes hyper-block alone: the device's write cache is read from the OS (`write_cache::write_cache`:

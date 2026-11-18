@@ -355,6 +355,9 @@ pub(crate) struct Area {
     block: Alignment,
     /// Whether the slots in pieces lie at the area's end.
     at_end: bool,
+    /// Whether the log may hold frames answered at their own flush, as its mark says
+    /// ([`format::Mark::at_flush`]).
+    at_flush: bool,
 }
 
 impl Area {
@@ -367,6 +370,7 @@ impl Area {
             pieces: None,
             block: align,
             at_end: false,
+            at_flush: false,
         })
     }
 
@@ -421,6 +425,7 @@ impl Area {
             pieces: Some(pieces),
             block: align,
             at_end,
+            at_flush: false,
         }))
     }
 
@@ -442,10 +447,17 @@ impl Area {
                 sealed,
                 mark.at_end,
             )?
+            .map(|area| area.answered_at_flush(mark.at_flush))
             .ok_or(LogError::Config(
                 "the persist area does not hold its records in pieces",
             )),
         }
+    }
+
+    /// The area, its mark saying the log may hold frames answered at their flush where
+    /// `at_flush`: a re-lay keeps what the mark it lays from says.
+    fn answered_at_flush(self, at_flush: bool) -> Self {
+        Self { at_flush, ..self }
     }
 
     /// The mark of this area's pieces; `None` where its records are whole.
@@ -454,6 +466,7 @@ impl Area {
             unit: p.unit(),
             block: Some(self.block),
             at_end: self.at_end,
+            at_flush: self.at_flush,
         })
     }
 
@@ -746,9 +759,11 @@ fn laid_area<F: BlockFile>(
         }
         return Ok(area);
     }
-    let to = Area::in_pieces(config, align, device, sealed, !mark.at_end)?.ok_or(
-        LogError::Config("the persist area does not hold its records laid again"),
-    )?;
+    let to = Area::in_pieces(config, align, device, sealed, !mark.at_end)?
+        .map(|to| to.answered_at_flush(mark.at_flush))
+        .ok_or(LogError::Config(
+            "the persist area does not hold its records laid again",
+        ))?;
     relay(file, (&area, &to), (id, sealer), tears)?;
     Ok(to)
 }
@@ -782,6 +797,9 @@ pub(crate) fn create<F: BlockFile>(
         return Err(LogError::Foreign("a new log needs an empty file"));
     }
     let device = file.atomic_unit()?;
+    // The device's write cache beside its atomic write unit: with the records' laying, how the
+    // log answers its frames (`Answers`, durability.md §7.5).
+    let cache = file.write_cache()?;
     // A new log lays its records in pieces where its persist area holds them: the file is empty,
     // so the slots read as zeros, and the mark is written under the log's first flush.
     let pieces = Area::in_pieces(config, align, device.unit(), sealer.is_some(), false)?;
@@ -848,10 +866,7 @@ pub(crate) fn create<F: BlockFile>(
         write_mark(file, id, sealer.is_some(), pieces)?;
     }
     file.sync_data()?;
-    let laid = Laid {
-        device,
-        pieces: pieces.as_ref().and_then(Area::mark),
-    };
+    let laid = Laid::of(device, cache, pieces.as_ref().and_then(Area::mark));
     let state = State {
         groups: HashMap::new(),
         damaged: HashMap::new(),
@@ -1428,6 +1443,9 @@ pub(crate) fn open<F: BlockFile>(
     let sealed = sealer.is_some();
     check(config, align, sealed)?;
     let device = file.atomic_unit()?;
+    // The device's write cache beside its atomic write unit: with the records' laying, how the
+    // log answers its frames (`Answers`, durability.md §7.5).
+    let cache = file.write_cache()?;
     let shape = Shape::of(file, config, id)?;
     let heads = headers(file, &shape, sealer.as_deref_mut())?;
     let mac = sealer.as_deref().map(Sealer::frame_mac);
@@ -1485,10 +1503,7 @@ pub(crate) fn open<F: BlockFile>(
         head_offset,
         frames: replay.frames,
     };
-    let laid = Laid {
-        device,
-        pieces: area.mark(),
-    };
+    let laid = Laid::of(device, cache, area.mark());
     let (state, recovery) =
         opened.into_state(heads, &last, shape.slots, &restores, (tail, laid))?;
     Ok((state, recovery, restores))
@@ -2056,6 +2071,7 @@ mod tests {
             unit: align(4096),
             block: Some(align(512)),
             at_end: true,
+            at_flush: false,
         };
         for sealed in [false, true] {
             let bytes = format::pieces_mark(ID, sealed, mark).unwrap();
@@ -2395,6 +2411,7 @@ mod tests {
                 unit: align(512),
                 block: Some(align(4096)),
                 at_end: true,
+                at_flush: false,
             })
         );
         assert_eq!(
@@ -2419,6 +2436,81 @@ mod tests {
         assert_eq!(
             found.read(&file, found.at(2), ID, None).unwrap(),
             Some(even)
+        );
+    }
+    /// A log that may hold frames answered at their flush says so in its mark, which a binary
+    /// from before (hyper-raft f3dae3b6 and earlier, whose mark's sequence was only 0 or 1) reads
+    /// as no mark: it then reads the area's start as a whole record of the other kind and refuses
+    /// the log, as a binary before pieces does, rather than cut such a frame as the torn tail. This
+    /// binary reads the mark, and a re-lay keeps it.
+    #[test]
+    fn a_binary_before_answers_at_the_flush_refuses_a_log_that_may_hold_them() {
+        for (sealed, at_end) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mark = format::Mark {
+                unit: align(4096),
+                block: Some(align(512)),
+                at_end,
+                at_flush: true,
+            };
+            let bytes = format::pieces_mark(ID, sealed, mark).unwrap();
+            assert_eq!(format::pieces_marked(&bytes, ID, sealed), Some(mark));
+            let laid = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+            assert!(laid > 1, "a binary before reads sequence {laid} as a mark");
+            let read = Persist::decode(&bytes).expect("a whole record to a binary before");
+            assert_eq!((read.log, read.sealed, read.groups.len()), (ID, !sealed, 0));
+            let refused = if sealed {
+                check_record(&read, &bytes, Some(&sealer()))
+            } else {
+                check_record(&read, &bytes, None)
+            };
+            match (sealed, refused) {
+                (true, Err(LogError::Tampered(_))) | (false, Err(LogError::Foreign(_))) => {}
+                (_, refused) => panic!("sealed {sealed}: {refused:?}"),
+            }
+        }
+        // A mark of no recorded block names no frame answered at its flush: such a mark is
+        // written only with its block.
+        let mut none = format::pieces_mark(
+            ID,
+            false,
+            format::Mark {
+                unit: align(512),
+                block: Some(align(512)),
+                at_end: false,
+                at_flush: true,
+            },
+        )
+        .unwrap();
+        none[32..40].fill(0);
+        let crc = crate::codec::crc32c(&none[..44]);
+        none[44..48].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(format::pieces_marked(&none, ID, false), None);
+        // Laid by 512 and marked, opened on a file of 4,096-byte blocks, which lays the slots
+        // again at the area's end: the new mark keeps what the old one said.
+        let cfg = config(16 * 4096, 64);
+        let small = device(512, 512, 31, None, &cfg);
+        let by_512 = Area::in_pieces(&cfg, align(512), align(512), false, false)
+            .unwrap()
+            .unwrap()
+            .answered_at_flush(true);
+        let odd = record(3, 7);
+        by_512.write(&small, &odd, by_512.at(3), None).unwrap();
+        write_mark(&small, ID, false, &by_512).unwrap();
+        small.sync_data().unwrap();
+        assert_eq!(marked(&small, ID, false).unwrap(), by_512.mark());
+        let large = device(4096, 512, 32, Some(&small.durable_image().unwrap()), &cfg);
+        let found = laid_area(&large, &cfg, (ID, None), align(512)).unwrap();
+        let kept = format::Mark {
+            unit: align(512),
+            block: Some(align(4096)),
+            at_end: true,
+            at_flush: true,
+        };
+        assert_eq!(found.mark(), Some(kept));
+        assert_eq!(marked(&large, ID, false).unwrap(), Some(kept));
+        assert_eq!(
+            found.read(&large, found.at(3), ID, None).unwrap(),
+            Some(odd)
         );
     }
 }

@@ -64,7 +64,7 @@ use hyper_transport::{
     Authenticated, Config, Directory, Endpoint, Epoch, Event, ExchangeId, Fixed, Progress,
 };
 use mantle_protocol::bounds::{self, Stated};
-use mantle_protocol::classes::{self, Bounds, Class, Kind, NodeClasses, Role};
+use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object::{self, Headers, ObjectError, Op, Reply, ReplyHead, Status};
 use mantle_s3::body::MIN_PART;
 use mantle_s3::checksum::{Algorithm, Checksum, Hasher};
@@ -1549,7 +1549,7 @@ impl Client {
                         hasher: None,
                     });
                     if let Some(done) = self
-                        .read_reply(exchange, reading, &mut sink, deadline_ns, upload.is_none())
+                        .read_reply(exchange, reading, &mut sink, deadline_ns)
                         .await?
                     {
                         return Ok(Attempt::Replied(Box::new(done)));
@@ -1558,7 +1558,7 @@ impl Client {
                 Event::BodyReady { exchange: e } if e == exchange => {
                     if let Some(reading) = reply.as_mut()
                         && let Some(done) = self
-                            .read_reply(exchange, reading, &mut sink, deadline_ns, upload.is_none())
+                            .read_reply(exchange, reading, &mut sink, deadline_ns)
                             .await?
                     {
                         return Ok(Attempt::Replied(Box::new(done)));
@@ -1604,14 +1604,24 @@ impl Client {
                     {
                         known.stalled = known.stalled.saturating_add(1);
                     }
-                    return Ok(ended(why, sent, (fields_len(fields), body)));
+                    return Ok(ended(
+                        why,
+                        sent,
+                        (fields_len(fields), body),
+                        reply.is_some(),
+                    ));
                 }
                 Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal }
                     if peer == node =>
                 {
                     self.lost(peer);
                     let why = refusal.unwrap_or(Refusal::Closed);
-                    return Ok(ended(why, sent, (fields_len(fields), body)));
+                    return Ok(ended(
+                        why,
+                        sent,
+                        (fields_len(fields), body),
+                        reply.is_some(),
+                    ));
                 }
                 _ => {}
             }
@@ -1685,13 +1695,20 @@ impl Client {
     /// Reads what the reply's body holds: its fields, decoded once whole, then a get's bytes into
     /// the sink, each piece written before the next is read. Once the body is whole and its
     /// checksum verified, the reply, a get's bytes held to the checksum kept.
+    ///
+    /// Each piece is read into the client's own, which [`memory`] charges, never into a second
+    /// grant of the transport's: its budget also holds the grants of connections closed and not
+    /// yet drained and what its receive ring grew by, both more while a node goes away, and a
+    /// reply's read was refused `Budget` for a piece it did not need, a get's after a founder's
+    /// restart (a57eaea7) and a put's as a founder's pod was deleted (the kind cell, CI
+    /// 44349745026). A put's bytes the piece held and the transport had not taken are never sent
+    /// once its node began an answer (`ended`).
     async fn read_reply<K: Sink>(
         &mut self,
         exchange: ExchangeId,
         reading: &mut Reading,
         sink: &mut Option<&mut K>,
         deadline_ns: u64,
-        use_owned_piece: bool,
     ) -> Result<Option<Reply>, ClientError> {
         let fields = usize::try_from(reading.head.fields()).unwrap_or(usize::MAX);
         loop {
@@ -1699,39 +1716,23 @@ impl Client {
                 self.driver.endpoint().end(exchange);
                 return Err(ClientError::Deadline);
             }
-            // The client's piece is already charged by `memory`. A source may still own
-            // unsent bytes in it, but a get needs no second grant from a busy transport.
-            let mut piece = if use_owned_piece {
-                self.piece
-                    .try_reserve_exact(PIECE.saturating_sub(self.piece.len()))
-                    .map_err(|_| ClientError::Bounds("the client's piece".into()))?;
-                hyper_transport::Reservation::new(
-                    u64::try_from(PIECE).unwrap_or(u64::MAX),
-                    std::mem::take(&mut self.piece),
-                )
-            } else {
-                self.driver
-                    .endpoint()
-                    .reserve(Class::Transfer, u64::try_from(PIECE).unwrap_or(u64::MAX))?
-            };
+            self.piece
+                .try_reserve_exact(PIECE.saturating_sub(self.piece.len()))
+                .map_err(|_| ClientError::Bounds("the client's piece".into()))?;
+            let mut piece = hyper_transport::Reservation::new(
+                u64::try_from(PIECE).unwrap_or(u64::MAX),
+                std::mem::take(&mut self.piece),
+            );
             let read = self.driver.endpoint().read_body(exchange, &mut piece);
             let length = piece.bytes().len();
-            let transport_piece = if use_owned_piece {
-                self.piece = piece.into_buffer();
-                // Restore before awaiting the sink, including when that wait is cancelled.
-                self.piece.resize(PIECE, 0);
-                None
-            } else {
-                Some(piece)
-            };
-            let bytes = match transport_piece.as_ref() {
-                Some(piece) => piece.bytes(),
-                None => self
-                    .piece
-                    .get(..length)
-                    .ok_or(ClientError::Reply("a reply piece past the client's buffer"))?,
-            };
-            let poured = Self::take_piece(
+            self.piece = piece.into_buffer();
+            // Restored before the sink is awaited, including when that wait is cancelled.
+            self.piece.resize(PIECE, 0);
+            let bytes = self
+                .piece
+                .get(..length)
+                .ok_or(ClientError::Reply("a reply piece past the client's buffer"))?;
+            Self::take_piece(
                 (&mut self.driver, &mut self.nodes),
                 exchange,
                 reading,
@@ -1739,11 +1740,7 @@ impl Client {
                 (&mut self.fields, fields, sink),
                 deadline_ns,
             )
-            .await;
-            if let Some(piece) = transport_piece {
-                self.driver.endpoint().release(piece);
-            }
-            poured?;
+            .await?;
             match read {
                 Ok(0) => break,
                 Ok(_) => {}
@@ -2408,13 +2405,21 @@ impl Held {
 }
 
 /// What an exchange that ended unanswered with `refusal` came to, `sent` of its body's bytes taken
-/// by the transport. Refused at the node's admission, or its certificate refused, the node took
-/// nothing: TLS 1.3's client authenticates after the server's Finished (RFC 8446 §4.4), so a
-/// connection the client took as up may be refused with its first request sent. Such a request is
-/// asked again where none of the source's bytes were handed over, and else refused, as a once-read
-/// source cannot give them again. Any other end is lost, whole once every byte was sent.
-fn ended(refusal: Refusal, sent: u64, (fields, body): (u64, u64)) -> Attempt {
-    if untaken(refusal) && sent <= fields {
+/// by the transport, and whether its node had begun an answer (`answered`). Refused at the node's
+/// admission, or its certificate refused, the node took nothing: TLS 1.3's client authenticates
+/// after the server's Finished (RFC 8446 §4.4), so a connection the client took as up may be
+/// refused with its first request sent. Such a request is asked again where none of the source's
+/// bytes were handed over, and else refused, as a once-read source cannot give them again. A node
+/// that began an answer took the request, and its reply was read into the piece that held the
+/// source's bytes not yet handed over (`Client::read_reply`): it is lost, whatever the refusal.
+/// Any other end is lost, whole once every byte was sent.
+fn ended(refusal: Refusal, sent: u64, (fields, body): (u64, u64), answered: bool) -> Attempt {
+    if answered {
+        Attempt::Lost {
+            refusal,
+            whole: sent >= body,
+        }
+    } else if untaken(refusal) && sent <= fields {
         Attempt::Untaken(refusal)
     } else if untaken(refusal) || refusal == Refusal::Identity {
         Attempt::Refused(refusal)
@@ -2457,6 +2462,7 @@ mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mantle_protocol::classes::Class;
 
     /// Other connections can occupy the transport while a reply is read. The client's own
     /// already-accounted piece must still read the reply without a second transport grant.
@@ -2521,6 +2527,83 @@ mod tests {
             "reply under transport pressure: {answer:?}"
         );
         assert_eq!(read, length);
+    }
+
+    /// A node gone mid-exchange, as a founder whose pod is deleted stops, while the transport's free
+    /// bytes are held below a piece past one connection's charge, as the grants of connections not
+    /// yet drained and its receive ring's growth hold them as a node goes: the put lost with it,
+    /// asked again as the transfer harness asks a lost one, finishes on the next node within the
+    /// client's attempts, its reply read into the client's own piece.
+    #[test]
+    fn a_put_whose_node_went_mid_exchange_finishes_on_the_next_with_less_than_a_piece_free() {
+        use crate::test_support::{CLIENT, Made, NODE, Script};
+        const NEXT: PeerId = 2;
+        let (mut nodes, credentials) = crate::test_support::cell(&[NODE, NEXT]);
+        let capacity = least_transport(2).unwrap();
+        let (gone_node, next_node) = (nodes.remove(0), nodes.remove(0));
+        let (tell, bound) = std::sync::mpsc::channel();
+        let gone = crate::test_support::serve(move |done| {
+            let script = Script {
+                gone_mid_request: true,
+                ..Script::default()
+            };
+            crate::test_support::scripted(gone_node, capacity, (0, None), script, tell, done)
+        });
+        let gone_at = bound.recv().unwrap();
+        let (tell, bound) = std::sync::mpsc::channel();
+        let next = crate::test_support::serve(move |done| {
+            crate::test_support::stub(next_node, capacity, (0, None), tell, done)
+        });
+        let next_at = bound.recv().unwrap();
+        let length = u64::try_from(PIECE / 16).unwrap();
+        let (asked, answer) = crate::test_support::runtime(sockets(2).unwrap())
+            .block_on(async move {
+                let mut client = Client::open(Settings {
+                    id: CLIENT,
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    credentials,
+                    nodes: vec![(NODE, gone_at), (NEXT, next_at)],
+                    names: Vec::new(),
+                    transport_bytes: capacity,
+                })
+                .await
+                .unwrap();
+                let endpoint = client.driver.endpoint();
+                let room = endpoint.connection_charge() + u64::try_from(PIECE / 2).unwrap();
+                let held = capacity - endpoint.budget().used() - room;
+                let occupied = endpoint.reserve(Class::Transfer, held).unwrap();
+                let put = Op::Put {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    id: identity().unwrap(),
+                    length,
+                    headers: object::Headers::default(),
+                    checksum: None,
+                    md5: None,
+                    trailing: Some(TRAILER),
+                    metadata: Vec::new(),
+                };
+                let mut asked = 0;
+                let answer = loop {
+                    asked += 1;
+                    let mut source = Made { at: 0, length };
+                    match client.put(&put, &mut source, u64::MAX).await {
+                        Err(ClientError::Lost { .. }) if asked < ATTEMPTS => {}
+                        answer => break answer.map(|reply| reply.status),
+                    }
+                };
+                client.driver.endpoint().release(occupied);
+                drop(client);
+                (asked, answer)
+            })
+            .unwrap();
+        gone.join().unwrap();
+        assert!(next.join().unwrap(), "the next node's connection came up");
+        assert!(
+            matches!(answer, Ok(Status::Done)),
+            "a put whose node went: {answer:?}"
+        );
+        assert_eq!(asked, 2, "lost once with the node that went, then answered");
     }
 
     /// Cancelling a get while its sink holds a piece leaves that piece available to the
@@ -2627,24 +2710,49 @@ mod tests {
             Refusal::Events,
             Refusal::Unsent,
         ] {
-            assert!(matches!(ended(refusal, 0, (10, 100)), Attempt::Untaken(_)));
-            assert!(matches!(ended(refusal, 10, (10, 100)), Attempt::Untaken(_)));
-            assert!(matches!(ended(refusal, 11, (10, 100)), Attempt::Refused(_)));
+            assert!(matches!(
+                ended(refusal, 0, (10, 100), false),
+                Attempt::Untaken(_)
+            ));
+            assert!(matches!(
+                ended(refusal, 10, (10, 100), false),
+                Attempt::Untaken(_)
+            ));
+            assert!(matches!(
+                ended(refusal, 11, (10, 100), false),
+                Attempt::Refused(_)
+            ));
         }
         // A certificate refused: nothing taken, and asking again changes nothing.
         for sent in [0, 11, 100] {
             assert!(matches!(
-                ended(Refusal::Identity, sent, (10, 100)),
+                ended(Refusal::Identity, sent, (10, 100), false),
                 Attempt::Refused(Refusal::Identity)
             ));
         }
         for refusal in [Refusal::Closed, Refusal::Stalled] {
             assert!(matches!(
-                ended(refusal, 0, (10, 100)),
+                ended(refusal, 0, (10, 100), false),
                 Attempt::Lost { whole: false, .. }
             ));
             assert!(matches!(
-                ended(refusal, 100, (10, 100)),
+                ended(refusal, 100, (10, 100), false),
+                Attempt::Lost { whole: true, .. }
+            ));
+        }
+        // A node that began its answer took the request, whatever ended it.
+        for refusal in [
+            Refusal::Busy,
+            Refusal::Unsent,
+            Refusal::Identity,
+            Refusal::Closed,
+        ] {
+            assert!(matches!(
+                ended(refusal, 10, (10, 100), true),
+                Attempt::Lost { whole: false, .. }
+            ));
+            assert!(matches!(
+                ended(refusal, 100, (10, 100), true),
                 Attempt::Lost { whole: true, .. }
             ));
         }

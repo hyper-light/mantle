@@ -116,6 +116,12 @@ pub(crate) fn runtime(sockets: usize) -> LocalRuntime {
 
 /// The node's and the client's credentials under a cell's authority.
 pub(crate) fn credentials() -> (Credentials, Credentials) {
+    let (mut nodes, client) = cell(&[NODE]);
+    (nodes.remove(0), client)
+}
+
+/// Each of `nodes`' credentials, in their order, and the client's, under one cell's authority.
+pub(crate) fn cell(nodes: &[PeerId]) -> (Vec<Credentials>, Credentials) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -132,15 +138,21 @@ pub(crate) fn credentials() -> (Credentials, Credentials) {
         key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.pkcs8().to_vec())),
         roots: vec![CertificateDer::from(authority.clone())],
     };
-    let node_key = KeyPair::generate().unwrap();
-    let node = mantle_cert::node(
-        &authority_key,
-        "cell",
-        node_key.public_key(),
-        &mantle_protocol::node_name(NODE),
-        (validity, Serial::draw().unwrap()),
-    )
-    .unwrap();
+    let nodes = nodes
+        .iter()
+        .map(|id| {
+            let key = KeyPair::generate().unwrap();
+            let node = mantle_cert::node(
+                &authority_key,
+                "cell",
+                key.public_key(),
+                &mantle_protocol::node_name(*id),
+                (validity, Serial::draw().unwrap()),
+            )
+            .unwrap();
+            issue(node, &key)
+        })
+        .collect();
     let client_key = KeyPair::generate().unwrap();
     let client = mantle_cert::client(
         &authority_key,
@@ -150,7 +162,7 @@ pub(crate) fn credentials() -> (Credentials, Credentials) {
         (validity, Serial::draw().unwrap()),
     )
     .unwrap();
-    (issue(node, &node_key), issue(client, &client_key))
+    (nodes, issue(client, &client_key))
 }
 
 /// The stub node's directory: a client by its certificate's names, as a node admits one.
@@ -195,6 +207,9 @@ pub(crate) struct Script {
     /// Its client's connections it serves on past their close, each close told on `bound` again,
     /// as a node outlives a client's connection its idle timeout closed.
     pub(crate) outlive: u32,
+    /// Its client's connection closed as the first request comes, and the stub gone: a node that
+    /// went mid-exchange, as a founder whose pod is deleted stops (the kind cell's disruption).
+    pub(crate) gone_mid_request: bool,
 }
 
 /// The native upload's requests the stub took, by kind, and the exchanges its client cut; and
@@ -475,6 +490,12 @@ fn run(
                             if served {
                                 serving = None;
                             }
+                        }
+                        Event::Request { .. } if script.gone_mid_request => {
+                            let clock = driver.clock().unwrap();
+                            driver.endpoint().disconnect(clock, CLIENT);
+                            driver.flush().unwrap();
+                            return (seen, true);
                         }
                         Event::Request { exchange, body, .. } => {
                             let head =

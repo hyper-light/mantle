@@ -406,11 +406,18 @@ took apart (`without_the_check_a_version_names_a_released_block`).
 | a block recorded, the file's write lost or refused | a block no file names | the block sweep, past its deadline, as before |
 | both written, before the name | a file and blocks no name holds | the file sweep, then the collector with the blocks, as before |
 | both written, the check failed | the same, a block perhaps released already | the same: removing a released block's rows again is a repeated step |
-| a block's write landing after its file was reclaimed | a block whose file is gone | the block sweep: the File range finds no file, and the block is released past its deadline |
+| a block's write landing after the collector began reclaiming its file | a block its file names no more | the block sweep: the collector releases the file to it before reading any of its blocks (`file::Command::Release`), so the File range answers that the file names none, and the block is released past its deadline |
 | the name asked | the name's outcome, as before | unchanged |
 
 The leftovers are the classes the sweeps collect already; the one new state, a file naming a block
-not yet recorded, is reached by no reader and reclaimed as a file whose blocks went first. Soft
+not yet recorded, is reached by no reader and reclaimed as a file whose blocks went first. The
+collector cannot tell a block removed before from one whose write has yet to land, so it first
+removes the file's rows naming its blocks, the rows the block sweep reads. Without that step a
+block landing after the collector found it unrecorded, and asked about before the file's rows
+went, was settled as the file's and then reclaimed by no one (CI run 44286448798;
+`orphan_sweep.rs`'s `a_block_landing_after_the_collector_passed_it_is_released`). Soft updates
+orders a free after the pointer to it is gone (96 §1); here the pointer is the one the block
+sweep follows. Soft
 updates leaves the same kind of residue, "unused blocks" and "unreferenced inodes", reclaimed by a
 background fsck while the system serves (96 §1, GMSP00 §3.3).
 

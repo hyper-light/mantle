@@ -2718,3 +2718,71 @@ fn a_delayed_sweep_never_releases_a_file_another_settled() {
     w.check();
     w.finish();
 }
+
+/// A gateway writes its file before its block (CI run 44286448798, as proptest shrank it): file
+/// 8 names block 9, whose write lands only once the file sweep has released the file and the
+/// collector, reclaiming it, has found the block unrecorded and passed it. The block sweep asks
+/// about the block before the collector deletes the file. Had the file still named the block,
+/// the sweep would have settled it as the file's, and with the file's rows gone nothing would
+/// have reclaimed it; the collector released the file to the block sweep before reading its
+/// blocks, so the sweep releases the block past its deadline (docs/design/gateway.md §2.2).
+#[test]
+fn a_block_landing_after_the_collector_passed_it_is_released() {
+    let schedule = [
+        Action::Sweep(0),
+        Action::Write { key: 0 },
+        Action::WriteAtOnce {
+            key: 0,
+            file_first: false,
+        },
+        Action::Write { key: 0 },
+        Action::WriteAtOnce {
+            key: 0,
+            file_first: true,
+        },
+        Action::Split { range: 0, cut: 0 },
+        Action::Write { key: 0 },
+        Action::Split { range: 0, cut: 0 },
+        Action::Split { range: 0, cut: 0 },
+        Action::LateSweep(0),
+        Action::Sweep(0),
+        Action::Sweep(0),
+        Action::Write { key: 0 },
+        Action::Split { range: 0, cut: 0 },
+        Action::Sweep(0),
+        Action::CollectorStops,
+        Action::Collect,
+        Action::Collect,
+        Action::Collect,
+    ];
+    let mut w = World::new();
+    for action in &schedule {
+        w.act(action);
+        w.check();
+    }
+    assert_eq!(w.released(), BTreeSet::from([8]));
+    // The collector goes on until it has passed every block of the file, its next step the
+    // file's rows: a step or two, the steps each block takes at most.
+    let passed = |w: &World| {
+        w.collector.as_ref().is_some_and(|c| {
+            c.file == 8
+                && matches!(
+                    c.reclaimer.next(),
+                    Some(reclaim::Request::FileCommand(file::Command::Delete { .. }))
+                )
+        })
+    };
+    for _ in 0..2 {
+        if !passed(&w) {
+            w.act(&Action::Collect);
+            w.check();
+        }
+    }
+    assert!(passed(&w), "the collector never passed file 8's blocks");
+    assert!(
+        !w.recorded().contains(&9),
+        "block 9 landed before the collector passed it"
+    );
+    // The gateway's block write lands, and the sweeps and the collector run to their end.
+    w.finish();
+}

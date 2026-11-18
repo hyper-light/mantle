@@ -205,6 +205,7 @@ impl Answer {
                             w.u8(6);
                             put_verdicts(w, verdicts)?;
                         }
+                        file::Outcome::Released => w.u8(7),
                     }
                 }
                 Answer::Block(o) => {
@@ -280,6 +281,7 @@ impl Answer {
                     4 => file::Outcome::Settled,
                     5 => file::Outcome::Expired,
                     6 => file::Outcome::BlocksChecked(take_verdicts(&mut r)?),
+                    7 => file::Outcome::Released,
                     _ => return None,
                 }),
                 6 => Answer::Block(match r.u8()? {
@@ -384,6 +386,10 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
                         w.u128(block);
                         w.u64(deadline_ns);
                     }
+                }
+                file::Command::Release { file } => {
+                    w.u8(4);
+                    w.u128(*file);
                 }
             }
         }
@@ -714,6 +720,7 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                     at_ns,
                 }
             }
+            4 => file::Command::Release { file: r.u128()? },
             _ => return None,
         }),
         4 => Command::Block(match r.u8()? {
@@ -2940,6 +2947,8 @@ mod tests {
             })
             .collect();
         commands.extend(operated);
+        // Last, so every command before keeps the session its golden vector was written with.
+        commands.push(Command::File(file::Command::Release { file: u128::MAX }));
         commands
     }
 
@@ -3212,6 +3221,7 @@ mod tests {
             ]
             .map(Answer::Root),
         );
+        answers.push(Answer::File(file::Outcome::Released));
         answers
     }
 

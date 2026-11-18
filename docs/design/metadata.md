@@ -171,7 +171,9 @@ Tectonic's does [01 §1.6].
     removing any one release, releasing a listed part, removing a mark before its deadline,
     or leaving a write with no file unmarked fails it.
     - *Reclaiming.* The collector takes the queue oldest first, once a file has been released
-    longer than the grace period, and removes what it holds bottom up: each block's chunks
+    longer than the grace period, and removes what it holds bottom up: first the file's rows
+    naming its blocks, so the block sweep finds it naming none, and a block whose write lands
+    after the collector passed it is that sweep's (gateway.md §2.2); then each block's chunks
     from their volumes, then the block's rows; each part file it names given back to the Name
     range, which releases the part for reclaiming in its turn only if this file adopted it
     (below); then the file, then its mark, at the Name range that holds its key by then, once
@@ -308,9 +310,10 @@ Tectonic's does [01 §1.6].
       it wrote, a handover past the Block range's time, while its body streams, as an HDFS
       writer renews its lease (22 §3.6). The block sweep (`BlockSweep`) asks the File range of
       each block's file, one file at a time, which answers from the file itself: a file is
-      written once, whole, so one written names what it ever will, and one not written by a
-      block's deadline never will. A file keeps a row for each block it names, written with
-      it and removed with it, and answering reads that row for each block asked. Answering by
+      written once, whole, so one written names what it ever will until the collector releases
+      it, and one not written by a block's deadline never will. A file keeps a row for each
+      block it names, written with it and removed when the collector releases it, and
+      answering reads that row for each block asked. Answering by
       a scan of the file's extents cost a page of blocks from distinct files one scan each:
       60.8 ms for one block of each of 512 files of 646 blocks, the most a PUT's file names
       (audit B08), against 393 µs by the rows, and one such file over pages of 64, 983 µs

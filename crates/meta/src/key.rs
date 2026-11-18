@@ -532,6 +532,11 @@ pub fn file_named(file: u128, block: u128) -> Vec<u8> {
     id_row_and(file, NAMED, &block.to_be_bytes())
 }
 
+/// The first key of a file's rows naming its blocks, and the key just past the last.
+pub fn file_named_all(file: u128) -> (Vec<u8>, Vec<u8>) {
+    (id_row(file, NAMED), id_row(file, NAMED.saturating_add(1)))
+}
+
 /// The end an extent's key names.
 pub fn extent_end(k: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(id_row_tail(k, EXTENT)?.try_into().ok()?))

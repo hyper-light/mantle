@@ -1,7 +1,14 @@
-//! Reclaiming a file the Name layer released (docs/design/metadata.md §2): each block's chunks
-//! from their volumes, then the block's rows; each part file it names given back to the Name
-//! range, which releases it only if this file adopted it; then the file's rows, then its mark,
-//! wherever its key now is, and last its row in the Name range's queue.
+//! Reclaiming a file the Name layer released (docs/design/metadata.md §2): first the File
+//! range's rows saying it names its blocks, so the block sweep finds it naming none; then each
+//! block's chunks from their volumes, then the block's rows; each part file it names given back
+//! to the Name range, which releases it only if this file adopted it; then the file's rows, then
+//! its mark, wherever its key now is, and last its row in the Name range's queue.
+//!
+//! A block the reclaimer finds unrecorded was removed before, or its write, sent beside the
+//! file's, has yet to land (docs/design/gateway.md §2.2). Landing after the file was released
+//! to the block sweep, it is that sweep's to release past its deadline; had the file still named
+//! it, the sweep would settle it as the file's, and once the file's rows went no one would
+//! reclaim it.
 //!
 //! A [`Reclaimer`] names its next [`Request`] and moves on with the [`Answer`], doing no I/O
 //! itself, as the coordinator does. Every step can be repeated: a chunk or a row already gone
@@ -68,6 +75,8 @@ pub enum ReclaimError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
+    /// Releasing the file to the block sweep, before any of its blocks is read.
+    Release,
     /// Reading the file's next extents, or moving on to its next pending one.
     Next,
     ReadBlock(u128),
@@ -105,7 +114,7 @@ impl Reclaimer {
     /// that carried none.
     pub fn new(released: name::Released, budget: usize) -> Self {
         let phase = if released.holder.file {
-            Phase::Next
+            Phase::Release
         } else {
             Phase::Unmark
         };
@@ -136,6 +145,7 @@ impl Reclaimer {
     /// The request to send next; `None` once the file is reclaimed.
     pub fn next(&self) -> Option<Request> {
         Some(match &self.phase {
+            Phase::Release => Request::FileCommand(file::Command::Release { file: self.file }),
             Phase::Next => Request::Extents {
                 file: self.file,
                 from: self.from,
@@ -175,6 +185,13 @@ impl Reclaimer {
     /// Moves on with what the request [`Reclaimer::next`] named answered.
     pub fn step(&mut self, answer: Answer) -> Result<(), ReclaimError> {
         match (&self.phase, answer) {
+            (Phase::Release, Answer::FileOutcome(outcome)) => match outcome {
+                file::Outcome::Released => {
+                    self.phase = Phase::Next;
+                    Ok(())
+                }
+                _ => Err(ReclaimError::Unexpected),
+            },
             (Phase::Next, Answer::Extents(extents)) => {
                 match extents.last() {
                     None => self.ended = true,
@@ -193,7 +210,8 @@ impl Reclaimer {
             (Phase::ReadBlock(block), Answer::Block(read)) => {
                 let block = *block;
                 match read {
-                    // Removed before: a reclaimer that stopped after its block step.
+                    // Removed before, by a reclaimer that stopped after its block step; or not
+                    // yet recorded, the block sweep's once it lands (the module's docs).
                     None => self.advance(),
                     Some((_, places)) => {
                         self.chunks = places;
@@ -789,6 +807,18 @@ mod tests {
             4,
         );
         assert_eq!(reclaimer.step(Answer::Chunk), Err(ReclaimError::Mismatch));
+        // The file is released to the block sweep before anything of it is read.
+        assert_eq!(
+            reclaimer.next(),
+            Some(Request::FileCommand(file::Command::Release { file: 5 }))
+        );
+        assert_eq!(
+            reclaimer.step(Answer::FileOutcome(file::Outcome::Deleted)),
+            Err(ReclaimError::Unexpected)
+        );
+        reclaimer
+            .step(Answer::FileOutcome(file::Outcome::Released))
+            .unwrap();
         reclaimer
             .step(Answer::Extents(vec![(
                 0,

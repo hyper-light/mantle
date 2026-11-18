@@ -48,6 +48,13 @@ pub enum Command {
         blocks: Vec<(u128, u64)>,
         at_ns: u64,
     },
+    /// The collector reclaims `file`, which the Name layer released: from now on it names none
+    /// of its blocks to the block sweep. The collector asks this before it reads a block, so a
+    /// block whose write lands after the collector found it unrecorded is released by the block
+    /// sweep, not settled as the file's (docs/design/gateway.md §2.2).
+    Release {
+        file: u128,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,9 +75,11 @@ pub enum Outcome {
     /// The range's time has passed a block's deadline: the gateway makes the blocks again.
     Expired,
     /// Each block asked about: named by the file (`Held`); not, and never to be, since the file
-    /// names other extents or the block's deadline has passed with no file written
-    /// (`Released`); or not yet (`Young`).
+    /// names other extents or was released, or the block's deadline has passed with no file
+    /// written (`Released`); or not yet (`Young`).
     BlocksChecked(Vec<Verdict>),
+    /// The file names none of its blocks to the block sweep, now or since before.
+    Released,
 }
 
 /// A file whose handover the sweep has yet to settle.
@@ -109,6 +118,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
             blocks,
             at_ns,
         } => check_blocks(engine, *file, blocks, *at_ns)?,
+        Command::Release { file } => (Outcome::Released, unname(engine, *file)?),
     };
     engine.apply(index, writes)?;
     Ok(outcome)
@@ -211,6 +221,21 @@ fn remove<E: Rows>(engine: &mut E, file: u128) -> Result<Vec<Write>, MetaError> 
     Ok(writes)
 }
 
+/// Writes that remove `file`'s rows naming its blocks: at most one per extent, `MAX_EXTENTS`.
+fn unname<E: Rows>(engine: &mut E, file: u128) -> Result<Vec<Write>, MetaError> {
+    let mut writes = Vec::new();
+    let (mut from, to) = key::file_named_all(file);
+    while let Some((k, _)) = engine.next(&from, &to)? {
+        if writes.len() >= MAX_EXTENTS {
+            return Err(MetaError::Corrupt);
+        }
+        from.clone_from(&k);
+        from.push(0);
+        writes.push(Write::Delete(k));
+    }
+    Ok(writes)
+}
+
 /// Writes that take `files` out of the unsettled queue; a file already out, or removed,
 /// needs none.
 fn settle<E: Rows>(engine: &mut E, files: &[u128]) -> Result<Vec<Write>, MetaError> {
@@ -224,9 +249,10 @@ fn settle<E: Rows>(engine: &mut E, files: &[u128]) -> Result<Vec<Write>, MetaErr
 }
 
 /// Whether `file` names each of `blocks`, each with its deadline. A file is written once, whole,
-/// so one written names what it will ever name; one not written by the range's time past a
-/// block's deadline never will, since its write would be refused. The check records that time
-/// as a write's, so every later write reads a time at least as late.
+/// so one written names what it will ever name, until the collector releases it and it names
+/// none; one not written by the range's time past a block's deadline never will, since its
+/// write would be refused. The check records that time as a write's, so every later write
+/// reads a time at least as late.
 fn check_blocks<E: Rows>(
     engine: &mut E,
     file: u128,
@@ -420,6 +446,39 @@ mod tests {
             apply(&mut m, 6, &write(4, vec![extent(1, 4)], 50)).unwrap(),
             Outcome::Written { deadline_ns: 401 }
         );
+    }
+
+    /// A file the collector releases names none of its blocks to the block sweep from then on,
+    /// before their deadlines too, while its extents stay for the collector to read; releasing
+    /// it again, or one removed, changes nothing.
+    #[test]
+    fn a_released_file_names_none_of_its_blocks() {
+        let mut m = Model::default();
+        let written = apply(&mut m, 1, &write(1, vec![extent(1, 7), extent(1, 8)], 10)).unwrap();
+        assert_eq!(written, Outcome::Written { deadline_ns: 110 });
+        let check = Command::CheckBlocks {
+            file: 1,
+            blocks: vec![(7, 500), (8, 500)],
+            at_ns: 20,
+        };
+        assert_eq!(
+            apply(&mut m, 2, &check).unwrap(),
+            Outcome::BlocksChecked(vec![Verdict::Held, Verdict::Held])
+        );
+        let release = Command::Release { file: 1 };
+        assert_eq!(apply(&mut m, 3, &release).unwrap(), Outcome::Released);
+        assert_eq!(
+            apply(&mut m, 4, &check).unwrap(),
+            Outcome::BlocksChecked(vec![Verdict::Released, Verdict::Released])
+        );
+        assert_eq!(extents(&mut m, 1, 0, 10).unwrap().len(), 2);
+        assert_eq!(apply(&mut m, 5, &release).unwrap(), Outcome::Released);
+        assert_eq!(
+            apply(&mut m, 6, &Command::Delete { file: 1 }).unwrap(),
+            Outcome::Deleted
+        );
+        assert_eq!(apply(&mut m, 7, &release).unwrap(), Outcome::Released);
+        assert_eq!(m.next(&[key::DATA], &[u8::MAX]).unwrap(), None);
     }
 
     #[test]

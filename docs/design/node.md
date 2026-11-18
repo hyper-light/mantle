@@ -1597,8 +1597,7 @@ its next turn held. `Node::turn` takes at most a lane's capacity from each lane
 shard gives, or its end, wakes the node's task; a lane whose shard's task ended stops the node,
 `NodeError::ShardEnded`, and its next start recovers the ranges from the log. A proposal a far
 range refuses is lost as one its leader drops, its asker's patience ending it, until step 4 answers
-each ask in its slot. Production starts no shard's task: the table places every range on the
-node's own shard until step 5, so a turn does what it did. Tested (`node::shard`): a one-member
+each ask in its slot. Until step 5 (below), production started no shard's task. Tested (`node::shard`): a one-member
 range moved before its first drive to the second shard of a two-shard runtime is driven by that
 shard's task and answers a proposal; a replica with a write out is refused a move; a full lane
 refuses, typed; and a shard whose task ended, its lane's end dropped or its runtime shut down, is
@@ -1727,6 +1726,39 @@ range's table is answered as of the entry it applied, not asked while the range 
 past it, and asked again and answered with the volume an entry enlisted once it applied; repair's
 three reads of a far Block range answer as its engine answers them on the node's shard, one at a
 time; and a full lane refuses the table and each read, `LaneFull`, unasked.
+
+*As built (2026-11-18), step 5: the rule over the runtime's shards* (`Node::spread`,
+`process::serve`, `derive::shard_shape`, `bounds::Stated::lanes`). A node's process places its
+ranges over its runtime's shards that take tasks (`NodeSettings::shards`: its first and each past
+it a holder names), and moves each range placed past the first to its shard after `Node::open` and
+before the node's first turn (`Node::spread`, each shard's `Node::spread_to`); a shard placed no
+range starts no task. A refusal stops the start, typed, at its network step: a shard placed ranges
+with no holder (`ShardEnded`), a replica with a write out (`WritesOut`, which no replica has
+before its first drive) or a shard with more ranges than its lane holds (`LaneFull`, which the
+sizing below rules out); its ranges would be placed where nothing drives them. A shard's task
+states, as the node's own shard does, that it may wait on the device (`permit_blocking`): its
+replicas apply through the engine's synchronous calls (§1.2). Sizing, derived: hyper-rt sizes every
+shard alike, so a shard's tasks are the larger of the first's (the node's task, its launcher and
+each S3 connection, which falls back to it) and another's (its ranges' task, the listener's taker
+and each connection handed to it), both the connections and two with a listener, and its timers
+the larger of the first's (the node's task's and each connection's) and another's (its ranges'
+task's wait and each connection's). A lane holds the exchanges the transport admits at once
+(`parked_most`), at least four a range (each peer's two connections, each two streams a range,
+§3.3), so never fewer than the ranges on any one shard. The memory floor's runtime counts each
+shard past the first that runs ranges with its two lanes (`node::shard_lanes_bytes`: a ring place
+and a room place for each value, at the types a process runs). `lanes_per_peer` is a lane for each
+shard that runs ranges, at most one a range (`node::lanes`), and the transport's messages' bytes
+count each peer's frames for each lane it may open; the node's task still sends every range's
+messages, its own and those its shards hand back, on its one lane, so the lanes a peer may open
+bound what a peer sends, not what this node does. A word of the stream (a change, or its belief of
+a peer a range came to share its group with) a shard's lane has no room for is held, in order, and
+told at the next turn's take, at most a lane's capacity held (`Lanes::tell_stream`): the cluster
+suite over two shards found a lane full of Raft messages under a cut leader's return stopping the
+node, `LaneFull`, where the stream's change met it. Tested: the cluster suite runs each node over
+`MANTLE_NODE_SHARDS` shards of a hyper-rt runtime, the node's task on its first and its range
+placed on its second, checked on open, and the same laws hold over one shard and two; `node::shard`
+holds a stream word through a full lane and tells it in order; `node::spread` counts the shards
+that run ranges as the rule fills them.
 
 ## 3. Transport
 

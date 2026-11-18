@@ -19,15 +19,49 @@ pub const MAX_SKEW_SECS: i64 = 15 * 60;
 pub const MAX_EXPIRES_SECS: i64 = 604_800;
 
 /// A request as it arrived.
-#[derive(Debug, Clone, Copy)]
-pub struct Request<'a> {
+#[derive(Debug)]
+pub struct Request<'a, H: ?Sized = [(&'a str, &'a str)]> {
     pub method: &'a str,
     /// The path as sent, still percent-encoded, starting with `/`.
     pub path: &'a str,
     /// The query string as sent, without the `?`.
     pub query: &'a str,
     /// Every header as sent, names in any case.
-    pub headers: &'a [(&'a str, &'a str)],
+    pub headers: &'a H,
+}
+
+impl<H: ?Sized> Clone for Request<'_, H> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<H: ?Sized> Copy for Request<'_, H> {}
+
+/// A request's header fields as sent, names in any case, read in order each time they are asked
+/// for: a list of pairs, or a door's head read where it lies, which keeps no table of its fields
+/// (a pair of `&str` is 32 octets on a 64-bit target, to a field line's 3).
+pub trait Fields {
+    /// Each field's name and value, in the order sent.
+    fn each(&self) -> impl Iterator<Item = (&str, &str)> + Clone;
+}
+
+impl Fields for [(&str, &str)] {
+    fn each(&self) -> impl Iterator<Item = (&str, &str)> + Clone {
+        self.iter().map(|&(name, value)| (name, value))
+    }
+}
+
+impl<const N: usize> Fields for [(&str, &str); N] {
+    fn each(&self) -> impl Iterator<Item = (&str, &str)> + Clone {
+        self.as_slice().each()
+    }
+}
+
+impl Fields for Vec<(&str, &str)> {
+    fn each(&self) -> impl Iterator<Item = (&str, &str)> + Clone {
+        self.as_slice().each()
+    }
 }
 
 /// How the body is protected, as `x-amz-content-sha256` declares.
@@ -244,8 +278,8 @@ impl Scope<'_> {
 /// Verifies a request signed in its `Authorization` header or as a presigned URL. `region`
 /// is the region this endpoint serves; `secret` finds an access key's secret; `now` is Unix
 /// seconds.
-pub fn verify<S: AsRef<str>>(
-    request: &Request<'_>,
+pub fn verify<S: AsRef<str>, H: Fields + ?Sized>(
+    request: &Request<'_, H>,
     region: &str,
     now: i64,
     secret: impl Fn(&str) -> Option<S>,
@@ -283,7 +317,7 @@ impl Claim<'_> {
 /// The access key a request's signature claims, its form checked as [`verify`] checks it, before
 /// any secret is asked for: the `Authorization` header's `Credential`, or a presigned URL's
 /// `X-Amz-Credential`. A request with neither is unsigned, [`AuthError::Missing`].
-pub fn access_key(request: &Request<'_>) -> Result<String, AuthError> {
+pub fn access_key<H: Fields + ?Sized>(request: &Request<'_, H>) -> Result<String, AuthError> {
     if let Some(authorization) = header(request.headers, "authorization") {
         return header_claim(authorization).map(|claim| claim.access_key.to_owned());
     }
@@ -352,8 +386,8 @@ fn presigned_claim(params: &[(String, String)]) -> Result<Claim<'_>, AuthError> 
     )
 }
 
-fn verify_header<S: AsRef<str>>(
-    request: &Request<'_>,
+fn verify_header<S: AsRef<str>, H: Fields + ?Sized>(
+    request: &Request<'_, H>,
     authorization: &str,
     region: &str,
     now: i64,
@@ -394,8 +428,8 @@ fn verify_header<S: AsRef<str>>(
     })
 }
 
-fn verify_presigned<S: AsRef<str>>(
-    request: &Request<'_>,
+fn verify_presigned<S: AsRef<str>, H: Fields + ?Sized>(
+    request: &Request<'_, H>,
     region: &str,
     now: i64,
     secret: &impl Fn(&str) -> Option<S>,
@@ -504,15 +538,15 @@ fn check_scope(
 
 /// S3 requires every `x-amz-*` header of a request to be signed, `x-amz-content-sha256`
 /// excepted (05 §1.2.4); an unsigned one could change what the request does.
-fn check_signed_amz_headers(
-    request: &Request<'_>,
+fn check_signed_amz_headers<H: Fields + ?Sized>(
+    request: &Request<'_, H>,
     signed: &str,
     exempt: &str,
     malformed: fn(&'static str) -> AuthError,
 ) -> Result<(), AuthError> {
     // Names compared case-insensitively against the signed names, which are lowercase: as the
     // name lowercased would compare exactly.
-    for (name, _) in request.headers {
+    for (name, _) in request.headers.each() {
         let amz = name
             .get(..6)
             .is_some_and(|start| start.eq_ignore_ascii_case("x-amz-"));
@@ -563,8 +597,8 @@ fn signed_string(timestamp: &str, scope: Scope<'_>, canonical: &[u8; 32]) -> Vec
 
 /// The canonical request (05 §1.2): method, URI, query, headers, signed headers, payload.
 /// `skip` names a query parameter left out, the signature of a presigned URL.
-pub fn canonical_request(
-    request: &Request<'_>,
+pub fn canonical_request<H: Fields + ?Sized>(
+    request: &Request<'_, H>,
     signed_headers: &[&str],
     payload: &str,
     skip: Option<&str>,
@@ -577,8 +611,8 @@ pub fn canonical_request(
 
 /// The canonical request's SHA-256, written into the digest as it is formed: no buffer holds
 /// it. `signed` is the signed headers' names as the claim lists them, `;`-separated.
-fn canonical_hash(
-    request: &Request<'_>,
+fn canonical_hash<H: Fields + ?Sized>(
+    request: &Request<'_, H>,
     signed: &str,
     payload: &str,
     skip: Option<&str>,
@@ -608,9 +642,9 @@ impl Canonical for Text<'_> {
     }
 }
 
-fn write_canonical(
+fn write_canonical<H: Fields + ?Sized>(
     out: &mut impl Canonical,
-    request: &Request<'_>,
+    request: &Request<'_, H>,
     signed: &str,
     payload: &str,
     skip: Option<&str>,
@@ -631,9 +665,9 @@ fn write_canonical(
         out.put(b":")?;
         let mut values = request
             .headers
-            .iter()
+            .each()
             .filter(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| *v);
+            .map(|(_, v)| v);
         let first = values.next().ok_or(AuthError::Mismatch)?;
         put_collapsed(out, first)?;
         for value in values {
@@ -897,11 +931,11 @@ fn body_of(payload: &str) -> Option<Body> {
     })
 }
 
-fn header<'a>(headers: &[(&str, &'a str)], name: &str) -> Option<&'a str> {
+fn header<'a, H: Fields + ?Sized>(headers: &'a H, name: &str) -> Option<&'a str> {
     headers
-        .iter()
+        .each()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, v)| *v)
+        .map(|(_, v)| v)
 }
 
 fn query_has(query: &str, name: &str) -> bool {
@@ -1145,7 +1179,7 @@ mod tests {
             let mut with_auth = headers.to_vec();
             with_auth.push(("Authorization", &authorization));
             let request = Request {
-                headers: &with_auth,
+                headers: with_auth.as_slice(),
                 ..request
             };
             let verified = verify(&request, "us-east-1", now(), secret).unwrap();
@@ -1159,7 +1193,7 @@ mod tests {
     /// an unsigned request claims none (05 §1).
     #[test]
     fn the_claimed_key_is_read_as_verify_reads_it() {
-        let unsigned = Request {
+        let unsigned: Request<'_> = Request {
             method: "GET",
             path: "/",
             query: "",
@@ -1180,7 +1214,7 @@ mod tests {
         ] {
             let headers = [("Host", "h"), ("Authorization", authorization)];
             let request = Request {
-                headers: &headers,
+                headers: headers.as_slice(),
                 ..unsigned
             };
             assert!(access_key(&request).is_err(), "{refused}");
@@ -1316,7 +1350,7 @@ mod tests {
             ("Content-Length", "66824"),
         ];
         let signed = "content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class";
-        let request = Request {
+        let request: Request<'_> = Request {
             method: "PUT",
             path: "/examplebucket/chunkObject.txt",
             query: "",
@@ -1336,7 +1370,7 @@ mod tests {
         let mut with_auth = headers.to_vec();
         with_auth.push(("Authorization", &authorization));
         let request = Request {
-            headers: &with_auth,
+            headers: with_auth.as_slice(),
             ..request
         };
         let verified = verify(&request, "us-east-1", now(), secret).unwrap();
@@ -1381,7 +1415,7 @@ mod tests {
             ("x-amz-trailer", "x-amz-checksum-crc32c"),
         ];
         let signed = "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class;x-amz-trailer";
-        let request = Request {
+        let request: Request<'_> = Request {
             method: "PUT",
             path: "/examplebucket/chunkObject.txt",
             query: "",

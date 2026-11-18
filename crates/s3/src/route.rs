@@ -9,7 +9,7 @@
 //! CNAME rule only when configured to: otherwise a request to an address the deployment did
 //! not expect would silently name a bucket.
 
-use crate::sigv4::percent_decode;
+use crate::sigv4::{Fields, percent_decode};
 
 /// The endpoint's addressing.
 #[derive(Debug, Clone, Default)]
@@ -154,7 +154,7 @@ pub fn route(
     host: Option<&str>,
     path: &str,
     query: &str,
-    headers: &[(&str, &str)],
+    headers: &(impl Fields + ?Sized),
 ) -> Result<Route, RouteError> {
     let (bucket, key) = target(endpoint, host, path)?;
     // A preflight asks about the request it precedes, whose parameters it may carry: it is
@@ -174,7 +174,7 @@ pub fn route(
         return Err(RouteError::NotImplemented(name));
     }
     let copy = headers
-        .iter()
+        .each()
         .any(|(n, _)| n.eq_ignore_ascii_case("x-amz-copy-source"));
     let operation = match (&bucket, &key) {
         (None, _) if method == "GET" => Operation::ListBuckets,
@@ -522,8 +522,11 @@ mod tests {
         }
     }
 
+    /// A request with no fields.
+    const NONE: [(&str, &str); 0] = [];
+
     fn r(method: &str, host: &str, path: &str, query: &str) -> Result<Route, RouteError> {
-        route(&endpoint(), method, Some(host), path, query, &[])
+        route(&endpoint(), method, Some(host), path, query, &NONE)
     }
 
     fn op(method: &str, path: &str, query: &str) -> Operation {
@@ -569,7 +572,7 @@ mod tests {
             cname: true,
             ..endpoint()
         };
-        let route = route(&cname, "GET", Some("Images.Other.org"), "/k", "", &[]).unwrap();
+        let route = route(&cname, "GET", Some("Images.Other.org"), "/k", "", &NONE).unwrap();
         assert_eq!(route.bucket.as_deref(), Some("images.other.org"));
     }
 

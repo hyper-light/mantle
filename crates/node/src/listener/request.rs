@@ -14,7 +14,7 @@ use mantle_s3::chunked::Decoder;
 use mantle_s3::list::{self as s3list, Resume};
 use mantle_s3::policy::{self, Requester};
 use mantle_s3::route::{self, Operation, Query, Route};
-use mantle_s3::sigv4::{self, Body, Verified};
+use mantle_s3::sigv4::{self, Body, Fields, Verified};
 
 use super::Endpoint;
 use crate::door::Signer;
@@ -57,7 +57,12 @@ impl Refused {
     }
 }
 
-/// A request's parts as its head holds them, each borrowed from the head's octets.
+/// A request's parts as its head holds them, each borrowed from the head's octets. Its fields are
+/// read where the head holds them each time they are asked for ([`Fields`]), so what the door
+/// makes of them does not grow with their count: a table of them, a pair of `&str` a field (32
+/// octets on a 64-bit target), would hold more than ten times a head's own octets, a field line
+/// running as short as 3 (`X:` and a lone LF, RFC 9112 §2.2); 60,160 for a head of 8 KB padded
+/// with 1,880 empty fields (`tests/listener_memory.rs`).
 pub struct Parts<'h> {
     pub method: &'h str,
     /// The path as sent, still percent-encoded.
@@ -65,7 +70,8 @@ pub struct Parts<'h> {
     /// The query as sent, without its `?`.
     pub query: &'h str,
     pub host: Option<&'h str>,
-    pub headers: Vec<(&'h str, &'h str)>,
+    head: &'h Head,
+    buf: &'h [u8],
 }
 
 impl<'h> Parts<'h> {
@@ -78,25 +84,36 @@ impl<'h> Parts<'h> {
         };
         let origin = text(head.origin(buf))?;
         let (path, query) = origin.split_once('?').unwrap_or((origin, ""));
-        let mut headers = Vec::with_capacity(head.fields(buf).size_hint().0);
         for (name, value) in head.fields(buf) {
-            headers.push((text(name)?, text(value)?));
+            text(name)?;
+            text(value)?;
         }
         Ok(Self {
             method: text(head.method(buf))?,
             path,
             query,
             host: head.host(buf).map(text).transpose()?,
-            headers,
+            head,
+            buf,
         })
     }
 
     /// The first field named `name`, case-insensitively, as SigV4 and the router read it.
     pub fn header(&self, name: &str) -> Option<&'h str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| *v)
+        self.head.field(self.buf, name).map(utf8)
+    }
+}
+
+/// A field's octets as the text [`Parts::of`] found them to be.
+fn utf8(octets: &[u8]) -> &str {
+    std::str::from_utf8(octets).unwrap_or_default()
+}
+
+impl Fields for Parts<'_> {
+    fn each(&self) -> impl Iterator<Item = (&str, &str)> + Clone {
+        self.head
+            .fields(self.buf)
+            .map(|(name, value)| (utf8(name), utf8(value)))
     }
 }
 
@@ -210,7 +227,7 @@ pub fn routed(parts: &Parts<'_>, endpoint: &Endpoint) -> Result<Route, Refused> 
         parts.host,
         parts.path,
         parts.query,
-        &parts.headers,
+        parts,
     )
     .map_err(|e| Refused::of(e.code(), &e))
 }
@@ -220,12 +237,12 @@ pub fn claimed(parts: &Parts<'_>) -> Result<String, Refused> {
     sigv4::access_key(&request_of(parts)).map_err(|e| Refused::of(e.code(), &e))
 }
 
-fn request_of<'p>(parts: &'p Parts<'p>) -> sigv4::Request<'p> {
+fn request_of<'p>(parts: &'p Parts<'p>) -> sigv4::Request<'p, Parts<'p>> {
     sigv4::Request {
         method: parts.method,
         path: parts.path,
         query: parts.query,
-        headers: &parts.headers,
+        headers: parts,
     }
 }
 
@@ -505,7 +522,7 @@ fn copy_conditions(parts: &Parts<'_>, range: bool) -> Headers {
 /// The content headers and user-defined metadata a request's headers name, as a version keeps
 /// them (research/89 §1).
 fn stored(parts: &Parts<'_>) -> Result<native::Metadata, Refused> {
-    metadata::of_request(parts.headers.iter().copied()).map_err(|e| Refused::of(e.code(), e))
+    metadata::of_request(parts.each()).map_err(|e| Refused::of(e.code(), e))
 }
 
 /// The source `x-amz-copy-source` names (research/89 §3.1).
@@ -911,7 +928,7 @@ fn single(header: Option<&Checksum>, trailing: Option<Algorithm>) -> Result<(), 
 /// header, each value its algorithm's width.
 fn digests(parts: &Parts<'_>) -> Result<(Option<Checksum>, Option<[u8; 16]>), Refused> {
     let mut checksum = None;
-    for (name, value) in &parts.headers {
+    for (name, value) in parts.each() {
         let Some(algorithm) = Algorithm::from_header(name) else {
             continue;
         };

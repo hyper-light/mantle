@@ -2025,7 +2025,7 @@ mod tests {
                 ("x-amz-content-sha256", EMPTY_SHA256),
                 ("x-amz-date", when),
             ];
-            let request = Request {
+            let request: Request<'_> = Request {
                 method: "GET",
                 path: "/bucket/key",
                 query: "",
@@ -2043,7 +2043,7 @@ mod tests {
             );
             let mut all = headers.to_vec();
             all.push(("authorization", authorization.as_str()));
-            let request = Request {
+            let request: Request<'_> = Request {
                 headers: &all,
                 ..request
             };

@@ -2758,6 +2758,14 @@ socket. A put whose body is longer than a segment holds `BODY_PIECES` more, read
 host's queue, beside the one it holds while that queue is full: the connection copies a piece
 before the queue has room for it, as hyper-rt's channel takes a value only to send it.
 `tests/listener_memory.rs` counts each request from its connection at rest to its answer.
+What the door makes of a head does not grow with its fields' count: they are read where the head
+holds them (`request::Parts`, `mantle_s3::sigv4::Fields`), no table of them made, which at 32
+octets a field held 60,160 for a head padded to 8 KB with 1,880 empty fields; and the metadata a
+version keeps copies only the fields it keeps, each name judged in place. A head so padded, its
+lines ended by CRLF or by a lone LF (the most fields a head carries), holds what the same request
+unpadded does. A warmed request reallocates none of the door's buffers; a TLS put whose body
+fills a record reallocates hyper-tls's deframer's four times, its buffer grown from one 4,096
+octet read toward a record a read at a time (`a_warmed_request_reallocates_none_of_the_doors_buffers`).
 
 ### 4.4 Errors
 

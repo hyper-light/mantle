@@ -416,8 +416,34 @@ fn answered<R: std::io::Read + ?Sized>(stream: &mut R, head_only: bool) -> u16 {
     status
 }
 
-/// The request's head and body, signed.
-fn asked(at: SocketAddr, method: Method, size: usize) -> (String, Vec<u8>) {
+/// How a request's head is padded past the fields its client signs: not at all, or with as many
+/// empty fields as fit within S3's 8 KB (`mantle_http::MAX_HEAD`), each `a:` and its line's end:
+/// CRLF, or the lone LF a line may end at (RFC 9112 §2.2), the shortest field line and so the
+/// most fields a head can carry.
+#[derive(Clone, Copy, Debug)]
+enum Padded {
+    No,
+    Crlf,
+    Lf,
+}
+
+/// `head` with as many of `line` as fit within `mantle_http::MAX_HEAD` before its empty line.
+fn pad(mut head: String, line: &str) -> String {
+    let fields = (mantle_http::MAX_HEAD - head.len()) / line.len();
+    eprintln!(
+        "a head of {} octets padded with {fields} fields of {line:?}",
+        head.len()
+    );
+    head.truncate(head.len() - "\r\n".len());
+    for _ in 0..fields {
+        head.push_str(line);
+    }
+    head.push_str("\r\n");
+    head
+}
+
+/// The request's head and body, signed, its head padded as `padded` says.
+fn asked(at: SocketAddr, method: Method, size: usize, padded: Padded) -> (String, Vec<u8>) {
     let key = access();
     let signer = s3::Client::new(
         at,
@@ -439,7 +465,13 @@ fn asked(at: SocketAddr, method: Method, size: usize) -> (String, Vec<u8>) {
         Method::Head => ("HEAD", &[]),
         Method::Delete => ("DELETE", &[]),
     };
-    (signer.head(name, "/bucket/key", headers, &payload), body)
+    let head = signer.head(name, "/bucket/key", headers, &payload);
+    let head = match padded {
+        Padded::No => head,
+        Padded::Crlf => pad(head, "a:\r\n"),
+        Padded::Lf => pad(head, "a:\n"),
+    };
+    (head, body)
 }
 
 /// One client on one connection: the request twice, each answer read whole; told when the first
@@ -449,7 +481,7 @@ fn asker(
     at: SocketAddr,
     authority: Option<Vec<u8>>,
     over: Over,
-    (method, size): (Method, usize),
+    (method, size, padded): (Method, usize, Padded),
     (warm, go, done): (
         std::sync::mpsc::SyncSender<u16>,
         std::sync::mpsc::Receiver<()>,
@@ -463,7 +495,7 @@ fn asker(
             if round == 1 {
                 go.recv().unwrap();
             }
-            let (head, body) = asked(at, method, size);
+            let (head, body) = asked(at, method, size, padded);
             stream.write_all(head.as_bytes()).unwrap();
             stream.write_all(&body).unwrap();
             stream.flush().unwrap();
@@ -574,7 +606,10 @@ async fn told(from: &std::sync::mpsc::Receiver<u16>, since: Instant) -> u16 {
 
 /// The listener thread's counts from one connection at rest, its kept buffers made by the same
 /// request before, to the second request's answer read whole by its client.
-fn one_request(over: Over, method: Method, size: usize) -> (alloc::Counts, u16) {
+fn one_request(
+    over: Over,
+    (method, size, padded): (Method, usize, Padded),
+) -> (alloc::Counts, u16) {
     let chain = (!matches!(over, Over::Plain)).then(chain);
     let mut runtime = runtime();
     let (counts, status, client) = runtime
@@ -596,7 +631,13 @@ fn one_request(over: Over, method: Method, size: usize) -> (alloc::Counts, u16) 
             let (go, gone) = sync_channel(1);
             let (done, answered) = sync_channel(1);
             let client = std::thread::spawn(move || {
-                asker(at, authority, over, (method, size), (warm, gone, done));
+                asker(
+                    at,
+                    authority,
+                    over,
+                    (method, size, padded),
+                    (warm, gone, done),
+                );
             });
             let started = Instant::now();
             let serve = async {
@@ -641,6 +682,10 @@ fn one_request(over: Over, method: Method, size: usize) -> (alloc::Counts, u16) 
 /// connection copies its next piece before the queue has room for it, as `hyper_rt`'s channel
 /// takes a value only to send it. Those are stated apart here, and counted in what a connection
 /// holds (`listener::CONNECTION_BYTES`).
+///
+/// A head padded to S3's 8 KB with empty fields, CRLF-ended (about 1,880 of them) or ended by a
+/// lone LF (the most a head carries, about 2,500), holds no more: the door reads a head's fields
+/// where the head holds them and copies only those a version keeps.
 #[test]
 fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
     use mantle_node::listener::{BODY_PIECES, REQUEST_BYTES};
@@ -648,40 +693,86 @@ fn a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest() {
     let many = 4 * PIECE;
     let ahead = BODY_PIECES * PIECE;
     for over in [Over::Plain, Over::Tls13, Over::Tls12] {
-        for (method, size) in [
-            (Method::Put, 1),
-            (Method::Put, records),
-            (Method::Put, PIECE),
-            (Method::Put, many),
-            (Method::Get, 1),
-            (Method::Get, records),
-            (Method::Get, many),
-            (Method::Head, many),
-            (Method::Delete, 0),
+        for (method, size, padded) in [
+            (Method::Put, 1, Padded::No),
+            (Method::Put, 1, Padded::Crlf),
+            (Method::Put, 1, Padded::Lf),
+            (Method::Put, records, Padded::No),
+            (Method::Put, records, Padded::Crlf),
+            (Method::Put, records, Padded::Lf),
+            (Method::Put, PIECE, Padded::No),
+            (Method::Put, many, Padded::No),
+            (Method::Get, 1, Padded::No),
+            (Method::Get, records, Padded::No),
+            (Method::Get, many, Padded::No),
+            (Method::Head, many, Padded::No),
+            (Method::Delete, 0, Padded::No),
         ] {
-            let (counts, status) = one_request(over, method, size);
+            let (counts, status) = one_request(over, (method, size, padded));
             let bound = match method {
                 Method::Put if size > PIECE => REQUEST_BYTES + ahead,
                 _ => REQUEST_BYTES,
             };
+            let case = format!("{over:?} {method:?} {size} {padded:?}");
             eprintln!(
-                "{over:?} {method:?} {size}: status {status}, peak {} of {bound}, live after {}, \
-                 {} allocations, {} reallocations",
+                "{case}: status {status}, peak {} of {bound}, live after {}, {} allocations, {} \
+                 reallocations",
                 counts.peak, counts.live, counts.allocations, counts.reallocations
             );
-            assert!(
-                matches!(status, 200 | 204),
-                "{over:?} {method:?} {size}: {status}"
-            );
+            assert!(matches!(status, 200 | 204), "{case}: {status}");
             assert!(
                 usize::try_from(counts.peak).unwrap() <= bound,
-                "{over:?} {method:?} {size}: a peak of {} past {bound}",
+                "{case}: a peak of {} past {bound}",
                 counts.peak
             );
             assert!(
                 counts.live <= 0,
-                "{over:?} {method:?} {size}: {} left past the answer",
+                "{case}: {} left past the answer",
                 counts.live
+            );
+        }
+    }
+}
+
+/// A warmed request reallocates none of the door's buffers, from its connection at rest to its
+/// answer read whole, over plain HTTP, TLS 1.3 and TLS 1.2: a HEAD, a GET, a PUT of 1 octet, of
+/// several TLS records and of many segments, and a DELETE; each buffer the door makes is made at
+/// the length it is known to need. What reallocates is hyper-tls's: its deframer grows its buffer
+/// from one read (4,096 octets) toward a record at its largest (`listener::TLS_RECORD`, its
+/// `MAX_WIRE_SIZE`) a read at a time, four times for a put whose body fills a record, and lets it
+/// back to one read once drained (`msgs/deframer/buffers.rs`, `prepare_read`). The host is the
+/// test's own (`host`), so what a node's driver reallocates is not counted here.
+#[test]
+fn a_warmed_request_reallocates_none_of_the_doors_buffers() {
+    use mantle_node::listener::TLS_RECORD;
+    // hyper-tls's deframer's read (`prepare_read`'s `READ_SIZE`), and a record's plaintext at its
+    // largest (RFC 8446 §5.1).
+    const READ: usize = 4096;
+    const PLAINTEXT: usize = 1 << 14;
+    let records = 3 * PLAINTEXT + 1;
+    let many = 4 * PIECE;
+    let deframer = u64::try_from((TLS_RECORD - READ).div_ceil(READ)).unwrap();
+    for over in [Over::Plain, Over::Tls13, Over::Tls12] {
+        for (method, size) in [
+            (Method::Head, many),
+            (Method::Get, many),
+            (Method::Put, 1),
+            (Method::Put, records),
+            (Method::Put, many),
+            (Method::Delete, 0),
+        ] {
+            let (counts, status) = one_request(over, (method, size, Padded::No));
+            let expected = match (over, method) {
+                (Over::Tls13 | Over::Tls12, Method::Put) if size >= PLAINTEXT => deframer,
+                _ => 0,
+            };
+            assert!(
+                matches!(status, 200 | 204),
+                "{over:?} {method:?} {size}: {status}"
+            );
+            assert_eq!(
+                counts.reallocations, expected,
+                "{over:?} {method:?} {size}: reallocations past hyper-tls's deframer's"
             );
         }
     }

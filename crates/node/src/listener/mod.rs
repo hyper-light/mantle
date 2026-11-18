@@ -98,11 +98,13 @@ pub const TLS_RECORD: usize = 5 + RECORD_PLAINTEXT + 2048;
 /// The most one request holds above its connection at rest, whose read buffer ([`PIECE`]), head
 /// buffer and response head buffers are kept across its requests: one head
 /// ([`mantle_http::MAX_HEAD`], S3's 8 KB) for what the door makes of a request's head and answers
-/// it with (its field table, route, principal and operation, its signature's string to sign, the
-/// host's reply and the channels between the two), one body segment ([`PIECE`]), the piece a
-/// put's body is copied into, and one TLS record ([`TLS_RECORD`]). Pinned by
-/// `tests/listener_memory.rs`
-/// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`).
+/// it with (its route, principal and operation, the metadata a version keeps, its signature's
+/// string to sign, the host's reply and the channels between the two; its fields are read where
+/// the head holds them, no table of them made, so none of this grows with their count), one body
+/// segment ([`PIECE`]), the piece a put's body is copied into, and one TLS record
+/// ([`TLS_RECORD`]). Pinned by `tests/listener_memory.rs`
+/// (`a_request_holds_no_more_than_its_stated_bound_above_its_connections_rest`), a head padded to
+/// its 8 KB with the most fields it carries among its cases.
 pub const REQUEST_BYTES: usize = mantle_http::MAX_HEAD + PIECE + TLS_RECORD;
 
 /// The connections past those it serves ([`Settings::connections`]) the listener answers `503

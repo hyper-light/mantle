@@ -1605,6 +1605,39 @@ refuses, typed; and a shard whose task ended, its lane's end dropped or its runt
 reported ended once what it gave is taken. Left: a far range's reads, snapshots and status (2b),
 and its membership, stop, repair and the host's reads of it (2c).
 
+*As built (2026-11-18), step 2b: a far range's status, reads, answers and compaction*
+(`crates/node/src/node/shard.rs`, `Node::seen`). What the node reads of a range's member, its
+term, leader, leading, commit, applied, stall, writes, fence, held reads, timing and whether its
+detectors trust a quorum (`shard::Seen`), is read from the replica where the node's own task
+drives it, and where another shard does, as that shard reported it after the range's latest drive
+that changed it (`Out::Seen`, and taken when the range moves). Reported rather than asked: the
+node reads it on its hot path (`is_leader` for each command it replies, `leader_of` for each
+redirect), and a report costs the shard a compare per drive where an ask would cost a round trip
+per read; so `status`, `is_leader`, `applied`, `patience`, `leader_of`, `judged_quorum`,
+`caught_up` and `applied_total` serve far ranges unchanged. A peer's read of a far range is asked
+over the lane (`In::Read`: its context and its query) when the range leads as last shown; the
+shard asks its replica (`Replica::read`), keeps the query while a quorum confirms it, at most a
+lane's capacity of them, answers it from the range's engine once the range applied through it,
+and hands the answer back by its id (`Out::Served`), which the node replies as `serve_reads`
+replies its own; a read its replica refuses, the shard holds no room for, or whose range stopped
+leading before it was confirmed (its core then never gives it back) comes back refused, and the
+node refuses or redirects it as `ask_read` does. An answer a far range applied is given to the
+command waiting for it as it comes (`answer_command`), and the turn's drive replies it. A round
+of compaction (`Node::compact_if_stalled`), asked when a range anywhere stalls for room in the log,
+as its shard last showed it, or the stream's write is owed, runs on each shard with that shard's
+waker (`In::Compact`, `shard::compact`, the node's own ranges compacting with the same function),
+since one log holds every range's entries and room any range frees serves each; a shard's round
+that started one is counted (`Out::Compacted`). Each new lane message keeps the lanes' bounds. A
+full lane: a read is refused, its asker asking again after its pause, as a busy leader refuses
+one; a round of compaction is asked again at the next turn; the shard's reports and served reads
+wait for room, as all it gives does. Tested (`node::shard`): a far range's leading, term, leader
+and applied entries are seen from the node's shard; a read is served from its engine through the
+lanes, and one of a range the shard holds not is refused; a far range's applied answer reaches the
+command waiting for it; and a round of compaction runs on the range's shard, its write answered
+there. Left for 2c: a far range's snapshots (reporting a sent snapshot's end to its replica, which
+waits in hyper-raft's snapshot state until told, and a full lane must not lose that report), the
+host's own reads of a far range (`Node::read`), and its membership, stop and repair.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

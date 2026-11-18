@@ -5,9 +5,9 @@
 //! there in an owner of its own (`hyper_durable::Owner`), made with that task's waker, so a range's
 //! log answers wake the shard that drives it, and keeps that shard's deadlines. The two talk over
 //! two bounded lanes of hyper-rt's channel: into the shard, each replica moved there before its
-//! first drive, Raft messages, proposals, and the stream's changes and measurements ([`In`]); out
-//! of it, Raft messages, applied answers, flushes, each range's peers and its expected election
-//! ([`Out`]). The node's shard sends without waiting, a full lane refused, typed
+//! first drive, Raft messages, proposals, reads, and the stream's changes and measurements
+//! ([`In`]); out of it, Raft messages, applied answers, flushes, each range's peers, its expected
+//! election, what it shows after a drive that changed it ([`Seen`]) and its reads served ([`Out`]). The node's shard sends without waiting, a full lane refused, typed
 //! (`NodeError::LaneFull`); the shard waits for room on its way out, its replicas' next turn held
 //! until the node's shard takes what they gave. A shard whose task ended took its ranges with it,
 //! which nothing else holds, so the node stops (`NodeError::ShardEnded`) and its next start
@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use hyper_durable::{Driven, Handle, Output, Owner, ReplicaError, Unbounded};
@@ -27,13 +27,16 @@ use hyper_rt::SlotHolder;
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel};
 use hyper_timing::{Ballot, ExchangeRtt, Trust};
+use hyper_transport::Classes;
 use mantle_meta::engine::Engine;
 use mantle_meta::wire::Entry;
 use mantle_protocol::bounds;
+use mantle_protocol::classes::{self, NodeClasses};
 use mantle_range::{Applied, LogStore, RangeMachine};
 
 use super::NodeError;
 use super::answers::Answers;
+use crate::read::{Query, Read};
 
 /// A range's replica, as the node's shard and a range's shard hold it.
 pub(crate) type Replica<E, S> = hyper_durable::Replica<Answers<S>, RangeMachine<E>, Unbounded>;
@@ -58,6 +61,13 @@ pub(crate) enum In<E: Engine, S: LogStore> {
     Belief(u128, Belief),
     /// What the stream measured, each range's timing derived from it (`Replica::measure`).
     Measure(Box<Measured>),
+    /// A read of a range, its context `id`: asked of its replica (`Replica::read`), and once a
+    /// quorum confirmed the range's leader and it applied through the read, `query` answered from
+    /// its engine ([`Out::Served`]).
+    Read { group: u128, id: u64, query: Query },
+    /// A range waits for room in the node's log, or the node owes the stream a write the log
+    /// refused for room: every range compacts ([`compact`]).
+    Compact,
 }
 
 /// What a shard's ranges gave, for the node's shard.
@@ -74,6 +84,12 @@ pub(crate) enum Out {
     Pairs(u128, Vec<PeerId>),
     /// A range's expected election from what the stream measured, which its pairs are charged.
     Elected(u128, Duration),
+    /// What a range shows after a drive that changed it, and when it was moved.
+    Seen(u128, Seen),
+    /// A read the node's shard asked of a range ([`In::Read`]), by its id, and how it was served.
+    Served(u128, u64, Served),
+    /// A round of compaction ([`In::Compact`]) that started at least one.
+    Compacted,
     /// Why the shard stopped: its task ends after it.
     Stopped(NodeError),
 }
@@ -182,12 +198,111 @@ impl Belief {
 }
 
 /// A range another shard drives, as the node's shard keeps it: its shard, the peers the stream
-/// keeps pairs with for it, and its latest expected election.
+/// keeps pairs with for it, its latest expected election, and what it showed last.
 pub(crate) struct Far {
     pub(crate) group: u128,
     pub(crate) shard: usize,
     pub(crate) peers: Vec<PeerId>,
     pub(crate) election: Option<Duration>,
+    pub(crate) seen: Seen,
+}
+
+/// What a range's member shows of itself: what the node's status, its leadership and its applied
+/// entries read (`Node::status`, `Node::is_leader`). Read from the replica where the node's own
+/// task drives it; where another shard does, as that shard reported it after the range's latest
+/// drive that changed it, so the node's reads of it take no round trip (node.md §2.9).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub(crate) term: u64,
+    pub(crate) leader: u64,
+    pub(crate) leading: bool,
+    pub(crate) commit: u64,
+    pub(crate) applied: u64,
+    pub(crate) stalled: bool,
+    pub(crate) in_flight: usize,
+    pub(crate) writes: hyper_durable::Writes,
+    pub(crate) fenced: bool,
+    pub(crate) reads_held: usize,
+    pub(crate) reads_confirming: usize,
+    pub(crate) timing: Option<Timing>,
+    /// Whether the member and the members its detectors trust are a quorum, or it campaigns not
+    /// (`Raft::campaign_state`).
+    pub(crate) trusted_quorum: bool,
+}
+
+impl Seen {
+    /// What `replica` shows now.
+    pub(crate) fn of<E: Engine + 'static, S: LogStore>(replica: &Replica<E, S>) -> Self {
+        let raft = &replica.core().raft;
+        Self {
+            term: replica.term(),
+            leader: replica.leader(),
+            leading: replica.is_leader(),
+            commit: replica.logged_commit(),
+            applied: replica.applied().index,
+            stalled: replica.is_stalled(),
+            in_flight: replica.in_flight(),
+            writes: replica.writes(),
+            fenced: replica.fenced().is_some(),
+            reads_held: raft.reads_held(),
+            reads_confirming: raft.pending_read_count(),
+            timing: raft.timing(),
+            trusted_quorum: raft
+                .campaign_state()
+                .is_none_or(|state| state.trusted_quorum),
+        }
+    }
+}
+
+/// How a range's shard served a read the node's shard asked of it.
+pub(crate) enum Served {
+    /// Its replica took no read: it does not lead, or the shard holds as many reads as it takes,
+    /// or it stopped leading before a quorum confirmed the read, which is then never served.
+    Refused,
+    /// The range's engine failed the query; the range is fenced at its next write.
+    Failed,
+    /// The query's answer, read from the range's engine once the read was confirmed and the range
+    /// applied through it.
+    Read(Box<Read>),
+}
+
+/// Compacts each of `handles`' ranges in `owner` through what its engine made durable, freeing the
+/// log's room, the compaction's write waking `waker`'s task: the node's own for the ranges its task
+/// drives, a shard's for that shard's (node.md §6.2). A range with a write out is passed over: that
+/// write may yet be refused for room, and hyper-log takes a compaction's start even then, as it
+/// frees room, durable behind the refused write, which fences the range; its answer brings the next
+/// try. A stalled range whose compaction had nothing to free makes its writes again at its next
+/// drive (another range's compaction may have freed it). While a range is stalled every range is
+/// driven again, as it always has been; else only those whose compaction started, or a node waiting
+/// with nothing to compact would turn every range again at every turn. Whether any started.
+pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
+    owner: &mut Owner<Answers<S>, RangeMachine<E>, Unbounded>,
+    handles: impl Iterator<Item = Handle>,
+    any_stalled: bool,
+    now: u64,
+    waker: &Waker,
+) -> Result<bool, NodeError> {
+    let mut made_room = false;
+    for handle in handles {
+        let Some(shell) = owner.get_mut(handle) else {
+            continue;
+        };
+        let stalled = shell.is_stalled();
+        if !stalled && shell.in_flight() > 0 {
+            continue;
+        }
+        let compacted = shell
+            .compact(0, now, waker)
+            .map_err(mantle_range::ReplicaError::from)?;
+        made_room |= compacted;
+        if stalled && !compacted {
+            shell.resume();
+        }
+        if any_stalled || compacted {
+            owner.schedule(handle);
+        }
+    }
+    Ok(made_room)
 }
 
 /// Refused, typed, when `replica` has writes out: each write records the waker of the task that
@@ -300,6 +415,15 @@ struct Kept {
     wake: Option<u64>,
     /// The peers last told the node's shard ([`Out::Pairs`]).
     peers: Vec<PeerId>,
+    /// What the range showed when last told the node's shard ([`Out::Seen`]).
+    seen: Seen,
+}
+
+/// A read a range's replica took and has yet to serve: its range, its context and its query.
+struct Reading {
+    group: u128,
+    id: u64,
+    query: Query,
 }
 
 /// A shard's ranges in the owner of its task.
@@ -313,6 +437,17 @@ struct Shard<E: Engine, S: LogStore> {
     /// replicas' one `Ready` each and a few words of each, handed on before the next turn.
     gave: Vec<Out>,
     driven: Vec<(Handle, Driven)>,
+    /// The reads the replicas took and have yet to serve, at most `reads_most`: a lane's capacity,
+    /// the exchanges the transport admits at once, each of which asks at most one.
+    reading: Vec<Reading>,
+    reads_most: usize,
+    /// The reads' contexts the replicas gave back this turn, each with its range; kept for its
+    /// storage, at most the reads taken.
+    served: Vec<(u128, Vec<u8>)>,
+    /// The task's waker, which a compaction's write wakes, and whether the node's shard asked a
+    /// round of compaction ([`In::Compact`]) the shard has yet to make.
+    waker: Waker,
+    compact: bool,
 }
 
 impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
@@ -328,12 +463,14 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
         match sent {
             In::Adopt(group, replica) => {
                 let peers = sorted(replica.peers());
+                let seen = Seen::of(&replica);
                 let handle = self.owner.insert(*replica).map_err(|_| NodeError::Full)?;
                 self.ranges.push(Kept {
                     group,
                     handle,
                     wake: None,
                     peers,
+                    seen,
                 });
             }
             In::Step {
@@ -409,8 +546,93 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     }
                 }
             }
+            In::Read { group, id, query } => {
+                let handle = self.at(group);
+                let room = self.reading.len() < self.reads_most;
+                let asked = handle
+                    .filter(|_| room)
+                    .and_then(|handle| self.owner.get_mut(handle))
+                    .is_some_and(|replica| replica.read(id.to_le_bytes().to_vec()).is_ok());
+                match handle {
+                    Some(handle) if asked => {
+                        self.owner.schedule(handle);
+                        self.reading.push(Reading { group, id, query });
+                    }
+                    _ => self.gave.push(Out::Served(group, id, Served::Refused)),
+                }
+            }
+            In::Compact => self.compact = true,
         }
         Ok(())
+    }
+
+    /// The round of compaction the node's shard asked, after a turn ([`compact`]): its ranges
+    /// with the shard's waker, each driven again while one is stalled.
+    fn compact(&mut self, now: u64) -> Result<(), NodeError> {
+        if !std::mem::take(&mut self.compact) {
+            return Ok(());
+        }
+        let any_stalled = self.ranges.iter().any(|kept| {
+            self.owner
+                .get(kept.handle)
+                .is_some_and(|replica| replica.is_stalled())
+        });
+        let handles = self.ranges.iter().map(|kept| kept.handle);
+        if compact(&mut self.owner, handles, any_stalled, now, &self.waker)? {
+            self.gave.push(Out::Compacted);
+        }
+        Ok(())
+    }
+
+    /// Serves the reads the replicas gave back this turn, each confirmed and applied through: its
+    /// query answered from its range's engine now, in at most what a reply's body carries past its
+    /// head. Then refuses each read whose range no longer leads, which its core will not give back
+    /// (node.md §5.1, as `Node::reply_commands` redirects the node's own).
+    fn serve(&mut self) {
+        let room = crate::read::reply_room(NodeClasses::frame_bound(classes::Class::Request));
+        for (group, context) in self.served.drain(..) {
+            let Ok(id) = <[u8; 8]>::try_from(context.as_slice()).map(u64::from_le_bytes) else {
+                continue;
+            };
+            let Some(at) = self
+                .reading
+                .iter()
+                .position(|reading| reading.id == id && reading.group == group)
+            else {
+                continue;
+            };
+            let reading = self.reading.swap_remove(at);
+            let replica = self
+                .ranges
+                .iter()
+                .find(|kept| kept.group == group)
+                .and_then(|kept| self.owner.get_mut(kept.handle));
+            let served = match replica.map(|replica| {
+                reading
+                    .query
+                    .answer(replica.machine_mut().engine_mut(), room)
+            }) {
+                Some(Ok(read)) => Served::Read(Box::new(read)),
+                _ => Served::Failed,
+            };
+            self.gave.push(Out::Served(group, id, served));
+        }
+        let mut at = 0;
+        while let Some(reading) = self.reading.get(at) {
+            let leads = self
+                .ranges
+                .iter()
+                .find(|kept| kept.group == reading.group)
+                .and_then(|kept| self.owner.get(kept.handle))
+                .is_some_and(|replica| replica.is_leader());
+            if leads {
+                at = at.saturating_add(1);
+                continue;
+            }
+            let reading = self.reading.swap_remove(at);
+            self.gave
+                .push(Out::Served(reading.group, reading.id, Served::Refused));
+        }
     }
 
     /// Queues the replicas whose deadline came, and those with a write out, which a log's answer
@@ -457,6 +679,7 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             out,
             gave,
             driven,
+            served,
             ..
         } = self;
         owner.turn(now, out, |handle, outcome, out| {
@@ -469,6 +692,9 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             }
             for answer in out.answers.drain(..) {
                 gave.push(Out::Applied(group, answer));
+            }
+            for (context, _) in out.reads.drain(..) {
+                served.push((group, context));
             }
             match outcome {
                 Ok(d) => driven.push((handle, d)),
@@ -508,7 +734,16 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                 kept.peers = sorted(replica.peers());
                 self.gave.push(Out::Pairs(kept.group, kept.peers.clone()));
             }
+            // What it shows, told again once a drive changed it.
+            if let Some(replica) = self.owner.get(handle) {
+                let seen = Seen::of(replica);
+                if seen != kept.seen {
+                    kept.seen = seen;
+                    self.gave.push(Out::Seen(kept.group, seen));
+                }
+            }
         }
+        self.serve();
         match fenced {
             // A fenced range stops the node, as one on the node's shard does (`Node::drive`).
             Some(e) => Err(NodeError::Range(e.into())),
@@ -556,12 +791,17 @@ async fn run<E: Engine + 'static, S: LogStore>(
 ) {
     let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
     let mut shard = Shard {
-        owner: Owner::new(vec![waker; slots]),
+        owner: Owner::new(vec![waker.clone(); slots]),
         ranges: Vec::with_capacity(slots),
         deadlines: BTreeSet::new(),
         out: Output::default(),
         gave: Vec::new(),
         driven: Vec::new(),
+        reading: Vec::with_capacity(capacity),
+        reads_most: capacity,
+        served: Vec::new(),
+        waker,
+        compact: false,
     };
     let mut arrived = None;
     loop {
@@ -579,7 +819,7 @@ async fn run<E: Engine + 'static, S: LogStore>(
         let now = hyper_rt::futures::now_ns();
         if stopped.is_none() {
             shard.schedule_due(now);
-            stopped = shard.drive(now).err();
+            stopped = shard.drive(now).and_then(|()| shard.compact(now)).err();
         }
         for out in shard.gave.drain(..) {
             if given.send(out).await.is_err() {
@@ -798,6 +1038,185 @@ mod tests {
         assert_eq!((answer.session, answer.serial), (0, 1));
         assert!(answer.index > 0);
         assert!(flushed > 0, "its writes were made durable on its shard");
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// A one-member range moved to the second shard of two before its first drive: its lanes,
+    /// once its shard showed it leading, and what it showed when it moved.
+    fn leading(rt: &Runtime, log: &Log<DeviceFile>, range: &Range) -> (Lanes<Model, Stored>, Seen) {
+        let replica = campaigning(log, range);
+        let moved = Seen::of(&replica);
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let mut lanes = Lanes::start(holder, 1, 1, 8).unwrap();
+        lanes.send(In::Adopt(GROUP, Box::new(replica))).unwrap();
+        loop {
+            match lanes.from.blocking_recv().unwrap() {
+                Out::Seen(group, seen) if seen.leading => {
+                    assert_eq!(group, GROUP);
+                    return (lanes, moved);
+                }
+                Out::Stopped(error) => panic!("the shard stopped: {error}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// What the shard gives next past what `skip` passes over; a stop fails the test.
+    fn next(lanes: &mut Lanes<Model, Stored>, mut skip: impl FnMut(&Out) -> bool) -> Out {
+        loop {
+            match lanes.from.blocking_recv().unwrap() {
+                Out::Stopped(error) => panic!("the shard stopped: {error}"),
+                out if skip(&out) => {}
+                out => return out,
+            }
+        }
+    }
+
+    /// What a far range shows reaches the node's shard after each drive that changed it: its
+    /// leading, its term and leader, then the entry it applied, with no ask of the node's.
+    #[test]
+    fn a_far_ranges_status_is_seen_from_the_nodes_shard() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (mut lanes, moved) = leading(&rt, &log, &range);
+        assert!(!moved.leading);
+        lanes
+            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
+            .unwrap();
+        let Out::Applied(_, answer) = next(&mut lanes, |out| !matches!(out, Out::Applied(..)))
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        let Out::Seen(group, seen) = next(&mut lanes, |out| !matches!(out, Out::Seen(..))) else {
+            panic!("`next` gives only what it does not skip")
+        };
+        assert_eq!(group, GROUP);
+        assert!(seen.leading);
+        assert_eq!(seen.leader, 1);
+        assert!(seen.term >= moved.term && seen.term > 0);
+        assert!(seen.applied >= answer.index);
+        assert!(seen.commit >= seen.applied);
+        assert!(!seen.fenced);
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// A read of a far range is asked of its replica on its shard and served there from its
+    /// engine, its answer handed back by its id; one of a range the shard holds not is refused.
+    #[test]
+    fn a_far_ranges_read_is_served_through_the_lanes() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (mut lanes, _) = leading(&rt, &log, &range);
+        let query = Query::Current {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        lanes
+            .send(In::Read {
+                group: GROUP,
+                id: 7,
+                query: query.clone(),
+            })
+            .unwrap();
+        let Out::Served(group, id, served) =
+            next(&mut lanes, |out| !matches!(out, Out::Served(..)))
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        assert_eq!((group, id), (GROUP, 7));
+        // No bucket `b` was made: the range's engine says so.
+        assert!(matches!(served, Served::Read(read) if *read == Read::NoBucket));
+        lanes
+            .send(In::Read {
+                group: GROUP + 1,
+                id: 8,
+                query,
+            })
+            .unwrap();
+        let Out::Served(group, id, served) =
+            next(&mut lanes, |out| !matches!(out, Out::Served(..)))
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        assert_eq!((group, id), (GROUP + 1, 8));
+        assert!(matches!(served, Served::Refused));
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// A command proposed to a far range is answered to the command waiting for it, as the node's
+    /// shard takes the range's applied answer (`Node::took`).
+    #[test]
+    fn a_far_ranges_answer_reaches_its_command() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (mut lanes, _) = leading(&rt, &log, &range);
+        let mut commanded = vec![super::super::Commanded {
+            origin: super::super::CommandOrigin::Own(0),
+            group: GROUP,
+            commands: vec![(0, 1, None)],
+        }];
+        lanes
+            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
+            .unwrap();
+        let Out::Applied(group, applied) = next(&mut lanes, |out| !matches!(out, Out::Applied(..)))
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        super::super::answer_command(&mut commanded, group, &applied);
+        assert!(commanded[0].commands[0].2.is_some());
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// A round of compaction the node's shard asks runs on the far range's shard: the range,
+    /// with an entry applied and no write out, starts one, and the compaction's write, answered,
+    /// wakes that shard's task, which shows the range with it made and none out.
+    #[test]
+    fn compaction_runs_on_a_far_ranges_shard() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (mut lanes, _) = leading(&rt, &log, &range);
+        lanes
+            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
+            .unwrap();
+        let Out::Applied(_, answer) = next(&mut lanes, |out| !matches!(out, Out::Applied(..)))
+        else {
+            panic!("`next` gives only what it does not skip")
+        };
+        // Asked once the range shows its entry applied and no write out, and again each time it
+        // shows none out after a write passed it over.
+        loop {
+            match next(&mut lanes, |_| false) {
+                Out::Compacted => break,
+                Out::Seen(_, seen) if seen.applied >= answer.index && seen.in_flight == 0 => {
+                    lanes.send(In::Compact).unwrap();
+                }
+                _ => {}
+            }
+        }
+        loop {
+            if let Out::Seen(_, seen) = next(&mut lanes, |out| !matches!(out, Out::Seen(..)))
+                && seen.writes.starts > 0
+                && seen.in_flight == 0
+            {
+                break;
+            }
+        }
         drop(lanes);
         rt.shutdown().unwrap();
         drop(log);

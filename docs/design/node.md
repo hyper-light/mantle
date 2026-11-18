@@ -149,6 +149,13 @@ task, with the node's ranges, log, transport and QUIC door, stays on the first s
 connections go to the others, passing over a shard the runtime's watchdog sees stalled and one
 gone (§4.1). The replicas are not yet placed across the shards (§2.1).
 
+*As built (2026-11-17), the node's task Critical.* The node's task is spawned in hyper-rt's
+Critical class (`coop::Class`; hyper-raft docs/runtime.md §3.15), and the listener and every S3
+connection stay Normal, the class every other spawn takes: woken by a peer's frame, a timer or its
+log, the task goes ahead of the connections queued on its shard, and each class with work keeps an
+equal share of the shard's time, the lead the shard's quantum, so neither starves the other. What
+it buys in heartbeat and commit latency under S3 load is not measured yet.
+
 A granted core is what `std::thread::available_parallelism` reports: the operating system's
 answer, affinity masks and quotas included where it reports them. Three pools of that size
 oversubscribe the cores when all three are busy at once; the operating system shares time

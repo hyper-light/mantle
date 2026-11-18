@@ -1664,7 +1664,10 @@ fn run_node(
 /// `tcp::serve` makes a connection's handler on the shard that serves it: the future need not be
 /// `Send`. Its output comes back on a channel of one slot, the one value sent on it: the output, or
 /// the launcher's refusal to spawn it. A task that ends without either, unwound or its shard
-/// lost, drops its sender, which ends the wait.
+/// lost, drops its sender, which ends the wait. The task is Critical (`hyper_rt::coop::Class`): it
+/// runs the node's consensus, log and transport, so woken it goes ahead of the S3 connections the
+/// shard serves beside it, which stay Normal, the class every other spawn takes, the shares of the
+/// shard's time staying equal (hyper-raft docs/runtime.md §3.15).
 fn run_on_first_shard<M, F, T>(rt: Runtime, make: M) -> Result<T, ProcessError>
 where
     M: FnOnce() -> F + Send + 'static,
@@ -1678,7 +1681,8 @@ where
         let task = async move {
             let _ = tell.try_send(Ok(made.await));
         };
-        if let Err(e) = hyper_rt::futures::spawn_detached(task) {
+        if let Err(e) = hyper_rt::futures::spawn_detached_as(hyper_rt::coop::Class::Critical, task)
+        {
             let _ = refused.try_send(Err(e));
         }
     };
@@ -3991,6 +3995,24 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// The node's task is spawned Critical, so its consensus, log and transport go ahead of the
+    /// connections its shard serves; what it spawns, those connections among them, stays Normal.
+    #[test]
+    fn the_nodes_task_is_spawned_critical_and_what_it_spawns_normal() {
+        use hyper_rt::coop::Class;
+        let ran = run_on_first_shard(started(1, 3), || async {
+            let (tell, heard) = hyper_rt::sync::oneshot().unwrap();
+            hyper_rt::futures::spawn_detached(async move {
+                let _ = tell.send(hyper_rt::coop::class());
+            })
+            .unwrap();
+            let spawned = heard.await.ok().flatten();
+            (hyper_rt::coop::class(), spawned)
+        })
+        .unwrap();
+        assert_eq!(ran, (Some(Class::Critical), Some(Class::Normal)));
     }
 
     /// The node's task runs on its runtime's first shard, made there, so it need not be `Send`; and

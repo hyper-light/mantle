@@ -35,7 +35,11 @@
 //! ([`slow_columns`]), each entry of the servers' tables that grew over the phase said on a line
 //! of its own after the phase's, `doors DOOR OP SIZE CONDITION slow`, then its server, spawn
 //! site, label, polls, how long they held the shard in all and at most and whose time they were,
-//! each a name and a value. The servers' peak live heap over the
+//! each a name and a value; and the polls hyper-rt's watchdog saw hold a server's shard past its
+//! limit ([`stalls_grown`]), every server's shards' summed (`stalls`), so a phase says whether any
+//! shard stalled, each shard that did said on a line of its own after the phase's, `doors DOOR OP
+//! SIZE CONDITION stall`, then its server, its shard and its stalls. The servers' peak live heap
+//! over the
 //! phase, above what they held as it began, is given per request, over the most requests the
 //! harness had out at once, and per connection, over the connections the phase held. Logical
 //! clients are tasks on one hyper-rt shard, each holding one connection and the buffers its
@@ -2598,6 +2602,55 @@ fn slow_columns(grown: Option<&[Grown<'_>]>, ops: u64) -> String {
     )
 }
 
+/// A server's shard that stalled over a phase: the polls hyper-rt's watchdog saw hold it past its
+/// limit (`Counted::stalls`), its count's growth from the server's answer at the phase's start to
+/// its answer at the end.
+#[derive(Debug, PartialEq, Eq)]
+struct Stalled {
+    server: usize,
+    shard: usize,
+    stalls: u64,
+}
+
+/// Each server's shards' stalls over a phase, shard by shard, from its answers `before` and `after`
+/// (a server a slot in each): a shard the start's answer did not count counted whole, one gone by
+/// the end or that grew none left out. At most every server's shards, each answer's bounded as it
+/// is read (`Counted::parse`). None where a server answered no stalls (an endpoint's).
+fn stalls_grown(before: &[Counted], after: &[Counted]) -> Option<Vec<Stalled>> {
+    let mut grown = Vec::new();
+    for (server, (was, now)) in before.iter().zip(after).enumerate() {
+        let (was, now) = (was.stalls.as_ref()?, now.stalls.as_ref()?);
+        for (shard, count) in now.iter().enumerate() {
+            let Some(count) = count else { continue };
+            let then = was.get(shard).copied().flatten().unwrap_or_default();
+            let stalls = count.saturating_sub(then);
+            if stalls > 0 {
+                grown.push(Stalled {
+                    server,
+                    shard,
+                    stalls,
+                });
+            }
+        }
+    }
+    Some(grown)
+}
+
+/// A phase line's column of the servers' stalls ([`stalls_grown`]): the polls the watchdog saw
+/// hold a shard past its limit over the phase, every server's shards' summed, so a phase says
+/// whether any shard stalled; a dash where a server answered none.
+fn stall_column(grown: Option<&[Stalled]>) -> String {
+    match grown {
+        Some(grown) => format!(
+            " stalls {}",
+            grown
+                .iter()
+                .fold(0u64, |sum, shard| sum.saturating_add(shard.stalls))
+        ),
+        None => " stalls -".to_owned(),
+    }
+}
+
 /// `value / ops` to a tenth, or `-` where there is no value or no operation.
 fn per(value: Option<f64>, ops: u64) -> String {
     match value {
@@ -3006,12 +3059,13 @@ impl<'o> Bench<'o> {
         let open = matches!(self.options.load, Load::Open(_));
         let t = &m.tally;
         let slow = slow_grown(&before.counts, &after.counts);
+        let stalled = stalls_grown(&before.counts, &after.counts);
         writeln!(
             out,
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
-             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}",
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}{}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -3073,6 +3127,7 @@ impl<'o> Bench<'o> {
             t.failed,
             write_path(&before.counts, &after.counts, ops),
             slow_columns(slow.as_deref(), ops),
+            stall_column(stalled.as_deref()),
         )?;
         self.step_line(out, m)?;
         for e in slow.iter().flatten() {
@@ -3091,6 +3146,19 @@ impl<'o> Bench<'o> {
                 e.longest_ns.map_or_else(|| "-".to_owned(), micros),
                 e.task,
                 e.host,
+            )?;
+        }
+        for s in stalled.iter().flatten() {
+            writeln!(
+                out,
+                "doors {} {} {} {} stall server {} shard {} stalls {}",
+                self.named(m.door),
+                m.kind.name(),
+                m.size,
+                self.options.condition,
+                s.server,
+                s.shard,
+                s.stalls,
             )?;
         }
         for kind in Failure::ALL {
@@ -4753,6 +4821,61 @@ mod tests {
         assert_eq!(slow_grown(&pids, &pids), None);
         assert_eq!(slow_grown(&before, &pids), None);
         assert_eq!(slow_columns(None, 40), " slow_polls/op - slowest_label -");
+    }
+
+    /// A phase's stalls are each server's shards' growth over it, shard by shard: a shard grown is
+    /// its count's difference, one new to the phase is counted whole, one that grew none or was
+    /// gone by the end is left out. The column sums every server's, so a phase says whether any
+    /// shard stalled: `0` where none did, a dash where a server answered none.
+    #[test]
+    fn a_phases_stalls_are_each_shards_growth() {
+        let stalls = |shards: Vec<Option<u64>>| Counted {
+            stalls: Some(shards),
+            ..Counted::default()
+        };
+        let before = [
+            stalls(vec![Some(1), Some(0), Some(4)]),
+            stalls(vec![Some(0), Some(2)]),
+        ];
+        let after = [
+            // The first grew none, the second two, the third gone.
+            stalls(vec![Some(1), Some(2), None]),
+            // The second grew one, and a third new to the phase stalled three times.
+            stalls(vec![Some(0), Some(3), Some(3)]),
+        ];
+        let grown = stalls_grown(&before, &after).unwrap();
+        assert_eq!(
+            grown,
+            [
+                Stalled {
+                    server: 0,
+                    shard: 1,
+                    stalls: 2,
+                },
+                Stalled {
+                    server: 1,
+                    shard: 1,
+                    stalls: 1,
+                },
+                Stalled {
+                    server: 1,
+                    shard: 2,
+                    stalls: 3,
+                },
+            ]
+        );
+        assert_eq!(stall_column(Some(&grown)), " stalls 6");
+
+        // A phase in which no shard stalled.
+        let quiet = stalls_grown(&before, &before).unwrap();
+        assert!(quiet.is_empty());
+        assert_eq!(stall_column(Some(&quiet)), " stalls 0");
+
+        // An endpoint's servers, read by pid, answer no stalls.
+        let pids: [Counted; 2] = std::array::from_fn(|_| Counted::default());
+        assert_eq!(stalls_grown(&pids, &pids), None);
+        assert_eq!(stalls_grown(&before, &pids), None);
+        assert_eq!(stall_column(None), " stalls -");
     }
 
     /// A listing's keys are its set's, each after the one before it as S3 orders keys, byte by

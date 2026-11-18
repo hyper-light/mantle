@@ -68,6 +68,8 @@ pub struct Chunks {
 /// and the entries it proposed and their commands, since it began, and its log's commit waits
 /// since it was last asked, their count and three quantiles in nanoseconds, none where none ended;
 /// then the table of what held its shard (`mantle_node::process::slow_poll_counts`), none where
+/// the answer carries none; then the stalls hyper-rt's watchdog counted on each of its shards, its
+/// own first (`mantle_node::process::stall_counts`), a shard's `None` where it was gone, none where
 /// the answer carries none.
 #[derive(Clone, Debug, Default)]
 pub struct Counted {
@@ -90,6 +92,7 @@ pub struct Counted {
     pub wait_p99_ns: Option<u64>,
     pub wait_max_ns: Option<u64>,
     pub slow: Option<Vec<Slow>>,
+    pub stalls: Option<Vec<Option<u64>>>,
 }
 
 /// An entry of the table of what held a node's shard, as its `counts` answer says it: the spawn
@@ -111,16 +114,38 @@ pub struct Slow {
 impl Counted {
     /// A `counts` line's fields past its first two words, each a name and a value or `-`. The
     /// table's entries are as many as its `slow_entries` says, each begun by its `slow_site`, and
-    /// at most the table's own entries ([`hyper_rt::slow::ENTRIES`] and its unkeyed one): an
-    /// answer saying more, or an entry's field outside an entry or not a count, is not read.
+    /// at most the table's own entries ([`hyper_rt::slow::ENTRIES`] and its unkeyed one); the
+    /// stalls are as many shards' as its `stall_shards` says, at most the shards a process
+    /// registers ([`hyper_rt::registry::MAX_SHARDS`]), each a count or `-`: an answer saying more,
+    /// or an entry's or a shard's field before its count or not a count, is not read.
     fn parse(fields: &[&str]) -> Option<Self> {
         let mut counted = Self::default();
         let most = hyper_rt::slow::ENTRIES.checked_add(1)?;
         let mut entries = None;
+        let mut shards = None;
         for pair in fields.chunks(2) {
             let [name, value] = pair else { return None };
             let unsigned = || value.parse::<u64>().ok();
             let signed = || value.parse::<i64>().ok();
+            if let Some(field) = name.strip_prefix("stall_") {
+                let stalls = counted.stalls.get_or_insert_with(Vec::new);
+                match field {
+                    "shards" => {
+                        let n = value
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|n| *n <= hyper_rt::registry::MAX_SHARDS)?;
+                        shards = Some(n);
+                        stalls.reserve_exact(n);
+                    }
+                    "episodes" if stalls.len() < shards? => stalls.push(match *value {
+                        "-" => None,
+                        count => Some(count.parse().ok()?),
+                    }),
+                    _ => return None,
+                }
+                continue;
+            }
             if let Some(field) = name.strip_prefix("slow_") {
                 let slow = counted.slow.get_or_insert_with(Vec::new);
                 match field {
@@ -165,7 +190,9 @@ impl Counted {
                 _ => {}
             }
         }
-        if counted.slow.as_ref().map(Vec::len) != entries {
+        if counted.slow.as_ref().map(Vec::len) != entries
+            || counted.stalls.as_ref().map(Vec::len) != shards
+        {
             return None;
         }
         Some(counted)
@@ -704,6 +731,44 @@ mod tests {
             (None, None, None)
         );
         assert_eq!(c.slow, None, "an answer with no table");
+        assert_eq!(c.stalls, None, "an answer with no stalls");
+    }
+
+    /// The stalls on each of a node's shards, as the node says them in its `counts` answer
+    /// (`mantle_node::process::stall_counts`), are read back shard by shard, a shard gone none;
+    /// an answer whose shards are not as many as it says, more than a process registers, a
+    /// shard's count before how many or one not a count, is not read.
+    #[test]
+    fn a_counts_answers_stalls_are_read_back() {
+        let mut line = "counts uncounted frames 1".to_owned();
+        mantle_node::process::slow_poll_counts(&mut line, &[]).unwrap();
+        mantle_node::process::stall_counts(&mut line, &[Some(0), Some(3), None]).unwrap();
+        let Some(Said::Counts(c)) = said(&line) else {
+            panic!("a counts answer not read: {line}");
+        };
+        assert_eq!(c.frames, Some(1));
+        assert_eq!(c.slow, Some(Vec::new()));
+        assert_eq!(c.stalls, Some(vec![Some(0), Some(3), None]));
+
+        let most = hyper_rt::registry::MAX_SHARDS;
+        for bad in [
+            "counts uncounted stall_shards 2 stall_episodes 1".to_owned(),
+            "counts uncounted stall_shards 1 stall_episodes 1 stall_episodes 1".to_owned(),
+            format!("counts uncounted stall_shards {}", most + 1),
+            "counts uncounted stall_episodes 1 stall_shards 1".to_owned(),
+            "counts uncounted stall_shards 1 stall_episodes x".to_owned(),
+            "counts uncounted stall_shards 1 stall_held 1".to_owned(),
+        ] {
+            assert!(!matches!(said(&bad), Some(Said::Counts(_))), "read: {bad}");
+        }
+        let full = format!(
+            "counts uncounted stall_shards {most} {}",
+            vec!["stall_episodes 0"; most].join(" ")
+        );
+        let Some(Said::Counts(c)) = said(&full) else {
+            panic!("every shard's stalls not read");
+        };
+        assert_eq!(c.stalls.map(|s| s.len()), Some(most));
     }
 
     /// The table of what held a node's shard, as the node says it in its `counts` answer

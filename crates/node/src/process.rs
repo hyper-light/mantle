@@ -2480,6 +2480,15 @@ async fn serve(
                             .map(hyper_rt::slow::slow_polls)
                             .unwrap_or_default();
                         slow_poll_counts(&mut line, &slow).map_err(wrote)?;
+                        let episodes: Vec<Option<u64>> = holders
+                            .iter()
+                            .map(|holder| {
+                                holder
+                                    .and_then(hyper_rt::watch::stalls)
+                                    .map(|stalls| stalls.episodes)
+                            })
+                            .collect();
+                        stall_counts(&mut line, &episodes).map_err(wrote)?;
                         line.push('\n');
                         stats = Some(log);
                         say(&mut output, &line).await?;
@@ -3289,6 +3298,21 @@ fn stall_line(
     Ok(())
 }
 
+/// The stalls hyper-rt's watchdog counted on each of the node's shards (`watch::stalls`), its own
+/// first, as the `counts` answer says them, names and values: `stall_shards`, then each shard's
+/// `stall_episodes`, the polls seen held past its limit since the shard began, `-` for a shard
+/// gone. Bounded by the runtime's shards.
+pub fn stall_counts(said: &mut String, episodes: &[Option<u64>]) -> std::fmt::Result {
+    write!(said, " stall_shards {}", episodes.len())?;
+    for shard in episodes {
+        match shard {
+            Some(episodes) => write!(said, " stall_episodes {episodes}")?,
+            None => said.push_str(" stall_episodes -"),
+        }
+    }
+    Ok(())
+}
+
 /// The cell's repair as this node runs it (docs/design/repair.md §5): `repair LEADING SETTLED
 /// ROOT_APPLIED BLOCK_APPLIED REBUILT TIMING COMMANDS UNPLACED UNREADABLE CORRUPT WAITING SHORT LOST
 /// TAKERS RUNNING`, each flag 0 or 1, said each time it changes.
@@ -3643,6 +3667,18 @@ mod tests {
             .sum();
         assert_eq!(said_lines + missed, said.number);
         assert!(number - said.number <= gap_ns / turn_ns);
+    }
+
+    /// The `counts` answer's stalls are each shard's, its count or `-` for a shard gone, after
+    /// how many shards it says.
+    #[test]
+    fn the_stall_counts_are_said_a_shard_each() {
+        let mut said = "counts uncounted".to_owned();
+        stall_counts(&mut said, &[Some(0), Some(7), None]).unwrap();
+        assert_eq!(
+            said,
+            "counts uncounted stall_shards 3 stall_episodes 0 stall_episodes 7 stall_episodes -"
+        );
     }
 
     /// The table of what held the shard is said entry by entry, each field a name and one word,

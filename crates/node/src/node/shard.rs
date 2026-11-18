@@ -25,7 +25,7 @@ use hyper_raft::Timing;
 use hyper_raft::proto::Message;
 use hyper_rt::SlotHolder;
 use hyper_rt::combine::{Either, race2};
-use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender, SyncError, channel, oneshot};
 use hyper_timing::{Ballot, ExchangeRtt, Trust};
 use hyper_transport::Classes;
 use mantle_meta::engine::Engine;
@@ -70,6 +70,12 @@ pub(crate) enum In<E: Engine, S: LogStore> {
     Compact,
     /// Whether a snapshot a range sent member `to` arrived (`Replica::report_snapshot`).
     Reported { group: u128, to: u64, arrived: bool },
+    /// The stop's hand-over of a range's lead ([`transfer`]), past the voter `failed` whose
+    /// transfer its core gave up: the voter it goes to told back ([`Out::Handing`]).
+    Transfer { group: u128, failed: Option<u64> },
+    /// Each range's engine as it stands, handed back through the sender, and the task ends: the
+    /// node closes (`Node::close`).
+    Release(OneshotSender<Vec<(u128, E)>>),
 }
 
 /// What a shard's ranges gave, for the node's shard.
@@ -92,6 +98,9 @@ pub(crate) enum Out {
     Served(u128, u64, Served),
     /// A round of compaction ([`In::Compact`]) that started at least one.
     Compacted,
+    /// The voter a range's hand-over ([`In::Transfer`]) goes to; `None` where it began none: the
+    /// range leads not here, or its core refused.
+    Handing(u128, Option<u64>),
     /// Why the shard stopped: its task ends after it.
     Stopped(NodeError),
 }
@@ -235,6 +244,8 @@ pub(crate) struct Seen {
     /// Whether the member and the members its detectors trust are a quorum, or it campaigns not
     /// (`Raft::campaign_state`).
     pub(crate) trusted_quorum: bool,
+    /// The voter the member hands its lead to, while it does (`Raft::lead_transferee`).
+    pub(crate) transferee: Option<u64>,
 }
 
 impl Seen {
@@ -258,6 +269,7 @@ impl Seen {
             trusted_quorum: raft
                 .campaign_state()
                 .is_none_or(|state| state.trusted_quorum),
+            transferee: raft.lead_transferee(),
         }
     }
 }
@@ -354,6 +366,56 @@ pub(crate) fn ask_read<E: Engine + 'static, S: LogStore>(
     }
 }
 
+/// Asks `far`'s shard to hand its lead over ([`In::Transfer`]), past the voter `failed`: whether it
+/// was asked. One whose lane has no room is not, as one its core refuses: the range elects once
+/// this node is gone (`node::stop`). A shard with no lanes, or whose task ended, stops the node.
+pub(crate) fn ask_transfer<E: Engine + 'static, S: LogStore>(
+    shards: &[Lanes<E, S>],
+    far: &Far,
+    failed: Option<u64>,
+) -> Result<bool, NodeError> {
+    let lanes = shards
+        .iter()
+        .find(|lanes| lanes.shard() == far.shard)
+        .ok_or(NodeError::ShardEnded(far.shard))?;
+    match lanes.send(In::Transfer {
+        group: far.group,
+        failed,
+    }) {
+        Ok(()) => Ok(true),
+        Err(NodeError::LaneFull(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Begins handing the lead of `replica`'s range, which it leads, to a voter whose log holds
+/// everything committed, or, with none such, the voter whose log holds the most, which the core
+/// brings up to its own before it hands over (Raft §3.10); once a transfer to `failed` was given
+/// up, to another voter where there is one. The voter it goes to, or `None` where the core refuses,
+/// after which the range elects as after a crash (`node::stop`).
+pub(crate) fn transfer<E: Engine + 'static, S: LogStore>(
+    replica: &mut Replica<E, S>,
+    failed: Option<u64>,
+) -> Option<u64> {
+    let id = replica.id();
+    let tracker = replica.core().raft.tracker();
+    let to = replica
+        .configuration()
+        .voters
+        .iter()
+        .copied()
+        .filter(|voter| *voter != id)
+        .max_by_key(|voter| {
+            (
+                Some(*voter) != failed,
+                replica.caught_up(*voter),
+                tracker.get(*voter).map_or(0, |p| p.matched),
+            )
+        })?;
+    replica.transfer(to).ok()?;
+    Some(to)
+}
+
 /// The node's shard's ends of a range's shard's two lanes.
 pub(crate) struct Lanes<E: Engine, S: LogStore> {
     shard: usize,
@@ -393,6 +455,26 @@ where
 }
 
 impl<E: Engine + 'static, S: LogStore> Lanes<E, S> {
+    /// Each of the shard's ranges' engines as they stand, its task ended (`Node::close`): asked
+    /// once its lane has room, which its task makes at its next turn. A shard that gives them not
+    /// within `patience_ns` is refused, typed, its task ending as its lanes go.
+    pub(crate) async fn release(&mut self, patience_ns: u64) -> Result<Vec<(u128, E)>, NodeError> {
+        let shard = self.shard;
+        let (reply, engines) = oneshot()?;
+        let asked = pin!(async {
+            self.into
+                .send(In::Release(reply))
+                .await
+                .map_err(|_| NodeError::ShardEnded(shard))?;
+            engines.await.map_err(|_| NodeError::ShardEnded(shard))
+        });
+        match race2(asked, pin!(hyper_rt::futures::sleep(patience_ns))).await {
+            Either::First(engines) => engines,
+            Either::Second(Ok(())) => Err(NodeError::ShardSilent(shard)),
+            Either::Second(Err(error)) => Err(error.into()),
+        }
+    }
+
     /// The shard the lanes reach.
     pub(crate) fn shard(&self) -> usize {
         self.shard
@@ -486,6 +568,8 @@ struct Shard<E: Engine, S: LogStore> {
     /// round of compaction ([`In::Compact`]) the shard has yet to make.
     waker: Waker,
     compact: bool,
+    /// Where the node's shard asked its ranges' engines back ([`In::Release`]).
+    release: Option<OneshotSender<Vec<(u128, E)>>>,
 }
 
 impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
@@ -610,8 +694,32 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     self.owner.schedule(handle);
                 }
             }
+            In::Transfer { group, failed } => {
+                let handle = self.at(group);
+                let to = handle
+                    .and_then(|handle| self.owner.get_mut(handle))
+                    .filter(|replica| replica.is_leader())
+                    .and_then(|replica| transfer(replica, failed));
+                if let (Some(handle), Some(_)) = (handle, to) {
+                    self.owner.schedule(handle);
+                }
+                self.gave.push(Out::Handing(group, to));
+            }
+            In::Release(reply) => self.release = Some(reply),
         }
         Ok(())
+    }
+
+    /// Each range's engine as it stands, its replica gone from the owner, with whatever it had
+    /// not made durable, as `Node::close` takes the node's own.
+    fn engines(&mut self) -> Vec<(u128, E)> {
+        let mut engines = Vec::with_capacity(self.ranges.len());
+        for kept in self.ranges.drain(..) {
+            if let Some(replica) = self.owner.remove(kept.handle) {
+                engines.push((kept.group, replica.into_machine().into_engine()));
+            }
+        }
+        engines
     }
 
     /// The round of compaction the node's shard asked, after a turn ([`compact`]): its ranges
@@ -850,6 +958,7 @@ async fn run<E: Engine + 'static, S: LogStore>(
         served: Vec::new(),
         waker,
         compact: false,
+        release: None,
     };
     let mut arrived = None;
     loop {
@@ -863,6 +972,11 @@ async fn run<E: Engine + 'static, S: LogStore>(
                 Ok(None) => break,
                 Err(_) => return,
             }
+        }
+        // Asked its ranges' engines back, it gives them and ends: the node closes.
+        if let Some(reply) = shard.release.take() {
+            let _ = reply.send(shard.engines());
+            return;
         }
         let now = hyper_rt::futures::now_ns();
         if stopped.is_none() {
@@ -1552,6 +1666,196 @@ mod tests {
             ask_read(&shards, &far, 2, &query),
             Err(NodeError::ShardEnded(2))
         ));
+    }
+
+    /// The stop's hand-over asked of a far range's shard whose lane holds all it takes is not
+    /// asked, which the stop takes as one the range's core refused: the range elects once this
+    /// node is gone; one of a shard the node has no lanes to stops the node, typed.
+    #[test]
+    fn a_full_lane_refuses_a_hand_over_as_its_core_would() {
+        let (lanes, _ends) = unstarted(1);
+        lanes.send(measured()).unwrap();
+        let shards = vec![lanes];
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let mut far = far(Seen::of(&campaigning(&log, &range)));
+        assert!(!ask_transfer(&shards, &far, None).unwrap());
+        far.shard = 2;
+        assert!(matches!(
+            ask_transfer(&shards, &far, None),
+            Err(NodeError::ShardEnded(2))
+        ));
+    }
+
+    /// A range of voters 1 and 2, each member's replica moved to a shard of its own before its
+    /// first drive: the stop's hand-over of its lead, asked of the leader's shard once it leads,
+    /// goes to voter 2, as that shard tells, and voter 2 then leads, as the leader's shard shows.
+    /// One of a range the shard holds not begins none.
+    #[test]
+    fn a_far_ranges_lead_is_handed_over_by_its_shard() {
+        let rt = started(2, 2);
+        let (dir, voting_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut range = one_member();
+        range.boot.voters = vec![1, 2];
+        let (log, voting_log) = (
+            log_in(dir.path(), &range),
+            log_in(voting_dir.path(), &range),
+        );
+        let voting = {
+            let mut engine = Model::default();
+            engine.install(0, name::first(1).unwrap()).unwrap();
+            engine.persist().unwrap();
+            let store = Answers::new(mantle_range::claim(&voting_log, GROUP, &range).unwrap());
+            mantle_range::open_shell(2, store, engine, &range, 2, Elections::Suspicion).unwrap()
+        };
+        let mut leader = Lanes::start(rt.holder_of(rt.shard_ids()[1]).unwrap(), 1, 1, 8).unwrap();
+        let mut voter = Lanes::start(rt.holder_of(rt.shard_ids()[0]).unwrap(), 0, 1, 8).unwrap();
+        leader
+            .send(In::Adopt(GROUP, Box::new(campaigning(&log, &range))))
+            .unwrap();
+        voter.send(In::Adopt(GROUP, Box::new(voting))).unwrap();
+        // Each member's messages stepped by the other, the test's thread their network, which
+        // drops one a full lane refuses, as a network may.
+        let (mut asked, mut handing, mut handed) = (false, None, false);
+        let until = deadline();
+        while !handed {
+            assert!(
+                std::time::Instant::now() < until,
+                "waited for voter 1 to lead ({asked}), its hand-over told ({handing:?}) and voter \
+                 2 shown leading ({handed})"
+            );
+            if let Some(out) = leader.take().unwrap() {
+                match out {
+                    Out::Message(_, message) => {
+                        let _ = voter.send(In::Step {
+                            group: GROUP,
+                            sender: 1,
+                            message,
+                        });
+                    }
+                    Out::Seen(_, seen) if seen.leading && !asked => {
+                        leader
+                            .send(In::Transfer {
+                                group: GROUP,
+                                failed: None,
+                            })
+                            .unwrap();
+                        asked = true;
+                    }
+                    Out::Seen(_, seen) if handing.is_some() && seen.leader == 2 => handed = true,
+                    Out::Handing(group, to) => {
+                        assert_eq!((group, to), (GROUP, Some(2)));
+                        handing = to;
+                    }
+                    Out::Stopped(error) => panic!("the leader's shard stopped: {error}"),
+                    _ => {}
+                }
+            }
+            if let Some(out) = voter.take().unwrap() {
+                match out {
+                    Out::Message(_, message) => {
+                        let _ = leader.send(In::Step {
+                            group: GROUP,
+                            sender: 2,
+                            message,
+                        });
+                    }
+                    Out::Stopped(error) => panic!("the voter's shard stopped: {error}"),
+                    _ => {}
+                }
+            }
+            std::thread::yield_now();
+        }
+        leader
+            .send(In::Transfer {
+                group: GROUP + 1,
+                failed: None,
+            })
+            .unwrap();
+        let Out::Handing(group, to) = next(
+            &mut leader,
+            "a hand-over of a range not held",
+            deadline(),
+            |out| !matches!(out, Out::Handing(..)),
+        ) else {
+            panic!("`next` gives only what it does not skip")
+        };
+        assert_eq!((group, to), (GROUP + 1, None));
+        drop((leader, voter));
+        rt.shutdown().unwrap();
+        drop((log, voting_log));
+    }
+
+    /// What a shard's close gave back: its ranges' engines, or why not.
+    type Engines = Result<Vec<(u128, Model)>, NodeError>;
+
+    /// What `lanes.release` gives, run as a task on shard 0, as the node's close runs it, and
+    /// the lanes after it.
+    fn released(
+        rt: &Runtime,
+        mut lanes: Lanes<Model, Stored>,
+        patience_ns: u64,
+    ) -> (Engines, Lanes<Model, Stored>) {
+        let (given, taken) = std::sync::mpsc::sync_channel(1);
+        hyper_rt::runtime::submit_to_holder(rt.holder_of(rt.shard_ids()[0]).unwrap(), async move {
+            let engines = lanes.release(patience_ns).await;
+            let _ = given.send((engines, lanes));
+        })
+        .unwrap();
+        taken.recv_timeout(PATIENCE).unwrap()
+    }
+
+    /// The node's close takes a far range's engine back from its shard, whose task then ends; a
+    /// shard whose task ended is refused as ended, and one that gives nothing back within the
+    /// patience as silent, typed.
+    #[test]
+    fn a_far_ranges_engine_is_given_back_at_close_and_its_task_ends() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (lanes, _, _) = leading(&rt, &log, &range);
+        let patience_ns = u64::try_from(PATIENCE.as_nanos()).unwrap();
+        let (engines, mut lanes) = released(&rt, lanes, patience_ns);
+        assert_eq!(
+            engines
+                .unwrap()
+                .iter()
+                .map(|(group, _)| *group)
+                .collect::<Vec<_>>(),
+            vec![GROUP]
+        );
+        // The shard's task ended: once what it gave is taken, its lane says so.
+        let until = deadline();
+        loop {
+            match lanes.take() {
+                Err(NodeError::ShardEnded(1)) => break,
+                Err(error) => panic!("the lane ended otherwise: {error}"),
+                Ok(_) => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "waited for the shard's task to end"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        let (lanes, ends) = unstarted(1);
+        assert!(matches!(
+            released(&rt, lanes, 1_000_000).0,
+            Err(NodeError::ShardSilent(1))
+        ));
+        drop(ends);
+        let (lanes, (taken, _given)) = unstarted(1);
+        drop(taken);
+        assert!(matches!(
+            released(&rt, lanes, patience_ns).0,
+            Err(NodeError::ShardEnded(1))
+        ));
+        rt.shutdown().unwrap();
+        drop(log);
     }
 
     /// A replica with a write out is refused a move, typed: the write's answer would wake the

@@ -527,8 +527,12 @@ async fn run_node(
         match ended {
             Either::First(Ok(())) => {}
             Either::First(Err(error)) => {
-                let (log, engines) = node.close();
-                let _ = reports.send(Report::Stopped(id, error.to_string(), log, engines));
+                let _ = match node.close().await {
+                    Ok((log, engines)) => {
+                        reports.send(Report::Stopped(id, error.to_string(), log, engines))
+                    }
+                    Err(closed) => reports.send(Report::Failed(id, format!("{error}; {closed}"))),
+                };
                 return;
             }
             Either::Second(Ok(Order::Learn(peer, quic, plane))) => {
@@ -538,8 +542,10 @@ async fn run_node(
                 }
             }
             Either::Second(Ok(Order::Crash)) => {
-                let (log, engines) = node.close();
-                let _ = reports.send(Report::Crashed(id, log, engines));
+                let _ = match node.close().await {
+                    Ok((log, engines)) => reports.send(Report::Crashed(id, log, engines)),
+                    Err(closed) => reports.send(Report::Failed(id, closed.to_string())),
+                };
                 return;
             }
             // The test is done.

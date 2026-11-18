@@ -280,6 +280,8 @@ pub enum NodeError {
     ShardEnded(usize),
     #[error("range {0:x} has writes out, whose answers would wake the shard it left")]
     WritesOut(u128),
+    #[error("shard {0} gave its ranges back not within the transport's idle timeout")]
+    ShardSilent(usize),
 }
 
 impl From<Refusal> for NodeError {
@@ -1614,6 +1616,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             shard::Out::Pairs(group, peers) => self.pair_far(group, peers)?,
             shard::Out::Elected(group, election) => self.elect_far(group, election),
+            shard::Out::Handing(group, to) => self.handing_far(group, to),
             shard::Out::Stopped(error) => return Err(error),
         }
         Ok(())
@@ -1895,16 +1898,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Stops the node as a power cut stops it, giving back what it held of its own: its log, and
-    /// each range's group and engine as they stood, with whatever they had not made durable. Its
-    /// connections and sockets go with it, unclosed, as a cut leaves them to its peers' timeouts.
-    pub fn close(mut self) -> (L, Vec<(u128, E)>) {
+    /// each range's group and engine as they stood, with whatever they had not made durable, the
+    /// far ranges' given back by their shards, whose tasks end (node.md §2.9). Its connections and
+    /// sockets go with it, unclosed, as a cut leaves them to its peers' timeouts. A shard that
+    /// gives its ranges back not within the transport's idle timeout, by which a silent peer is
+    /// taken as gone (RFC 9000 §10.1), is refused, typed ([`NodeError::ShardSilent`]).
+    pub async fn close(mut self) -> Result<(L, Vec<(u128, E)>), NodeError> {
         let mut engines = Vec::with_capacity(self.ranges.len());
         for kept in std::mem::take(&mut self.ranges) {
             if let Some(replica) = self.owner.remove(kept.handle) {
                 engines.push((kept.group, replica.into_machine().into_engine()));
             }
         }
-        (self.log, engines)
+        let patience_ns = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap_or(u64::MAX);
+        for mut lanes in std::mem::take(&mut self.shards) {
+            engines.extend(lanes.release(patience_ns).await?);
+        }
+        Ok((self.log, engines))
     }
 
     /// What the node's log measured from its opening (hyper-log `Log::stats`), asked of the log's

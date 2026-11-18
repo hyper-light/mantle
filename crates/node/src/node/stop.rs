@@ -11,7 +11,9 @@
 //! and keeps each in its closing state until it drains (RFC 9000 §10.2: the node keeps the socket
 //! its peers know, and answers their late packets). Each turn steps it ([`Node::step_stop`]); once
 //! it is done ([`Node::stopped`]) nothing the node holds is owed to the cell, and its process closes
-//! its log and volumes and ends.
+//! its log and volumes and ends. A range another shard drives is handed over by that shard
+//! (`shard::In::Transfer`), which tells the voter it goes to (`shard::Out::Handing`), and the stop
+//! follows it as that shard last showed it (node.md §2.9).
 
 use std::net::SocketAddr;
 
@@ -19,14 +21,14 @@ use hyper_durable::Handle;
 use hyper_transport::PeerId;
 use mantle_meta::engine::Engine;
 
-use super::{Node, NodeError, NodeLog};
+use super::{Node, NodeError, NodeLog, shard};
 
 /// Where an orderly stop stands.
 pub(super) enum Stopping {
     /// Object operations running end; none begins.
     Objects,
     /// Each led range's lead handed over: the ranges whose transfer is out, each by its group and
-    /// the voter it goes to.
+    /// the voter it goes to, 0 while a far range's shard has yet to tell it.
     Handing(Vec<(u128, u64)>),
     /// No connection taken, each held closed and kept in its closing state until it drains.
     Closing,
@@ -89,9 +91,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let next = match stopping {
-            Stopping::Objects if self.jobs.is_empty() => Stopping::Handing(self.hand_over()),
+            Stopping::Objects if self.jobs.is_empty() => Stopping::Handing(self.hand_over()?),
             Stopping::Handing(out) => {
-                let out = self.handing(out);
+                let out = self.handing(out)?;
                 if out.is_empty() {
                     // Every range handed over: the stop's last act on the plane tells each peer
                     // this run ends in order, so its next run is no failure in their MTBF's
@@ -120,14 +122,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Hands each range this node leads to a voter ([`Node::transfer_lead`]): the ranges whose
-    /// transfer is out, each by its group and the voter it goes to.
-    fn hand_over(&mut self) -> Vec<(u128, u64)> {
+    /// Hands each range this node leads to a voter ([`Node::transfer_lead`]; a far range's, as its
+    /// shard last showed it, by that shard, [`shard::ask_transfer`]): the ranges whose transfer is
+    /// out, each by its group and the voter it goes to, 0 for a far range's until its shard tells.
+    fn hand_over(&mut self) -> Result<Vec<(u128, u64)>, NodeError> {
         let mut out = Vec::with_capacity(self.ranges.len());
         for at in 0..self.ranges.len() {
             let Some((group, handle)) = self.ranges.get(at).map(|k| (k.group, k.handle)) else {
                 continue;
             };
+            if let Some(far) = self.far.iter().find(|far| far.group == group) {
+                if far.seen.leading && shard::ask_transfer(&self.shards, far, None)? {
+                    out.push((group, 0));
+                }
+                continue;
+            }
             if !self.owner.get(handle).is_some_and(|r| r.is_leader()) {
                 continue;
             }
@@ -136,7 +145,35 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 out.push((group, to));
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// The voter a far range's hand-over goes to, as its shard told it ([`shard::Out::Handing`]):
+    /// the stop's transfer of it out to that voter, or, where its shard began none, done, the
+    /// range electing once this node is gone.
+    pub(super) fn handing_far(&mut self, group: u128, to: Option<u64>) {
+        let Some(Stopping::Handing(out)) = self.stopping.as_mut() else {
+            return;
+        };
+        let Some(at) = out.iter().position(|&(g, voter)| g == group && voter == 0) else {
+            return;
+        };
+        match to {
+            Some(to) => {
+                if let Some(entry) = out.get_mut(at) {
+                    entry.1 = to;
+                }
+                // Its core hands to `to` from now on, which the range's next shown status, a drive
+                // later, says too: until then the stop follows the shard's word.
+                if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+                    far.seen.transferee = Some(to);
+                }
+                self.handing.push((group, to));
+            }
+            None => {
+                out.swap_remove(at);
+            }
+        }
     }
 
     /// Begins handing the lead of the range at `handle`, which this node leads, to a voter whose
@@ -145,22 +182,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// `failed` was given up, to another voter where there is one. The voter it goes to, or `None`
     /// where the core refuses, after which the range elects as after a crash.
     fn transfer_lead(&mut self, handle: Handle, failed: Option<u64>) -> Option<u64> {
-        let replica = self.owner.get(handle)?;
-        let tracker = replica.core().raft.tracker();
-        let to = replica
-            .configuration()
-            .voters
-            .iter()
-            .copied()
-            .filter(|voter| *voter != self.id)
-            .max_by_key(|voter| {
-                (
-                    Some(*voter) != failed,
-                    replica.caught_up(*voter),
-                    tracker.get(*voter).map_or(0, |p| p.matched),
-                )
-            })?;
-        self.owner.get_mut(handle)?.transfer(to).ok()?;
+        let to = shard::transfer(self.owner.get_mut(handle)?, failed)?;
         self.owner.schedule(handle);
         Some(to)
     }
@@ -168,10 +190,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// The transfers still out of `out`. A range whose lead another member now holds, as this
     /// node's member learned from it, is handed over (to the voter it went to, or to one the range
     /// elected instead); one whose member steps down to an election waits for its winner; one whose
-    /// core gave the transfer up, this node still leading, is handed again.
-    fn handing(&mut self, out: Vec<(u128, u64)>) -> Vec<(u128, u64)> {
+    /// core gave the transfer up, this node still leading, is handed again. A far range's is
+    /// followed as its shard last showed it, and one whose shard has yet to tell its voter waits.
+    fn handing(&mut self, out: Vec<(u128, u64)>) -> Result<Vec<(u128, u64)>, NodeError> {
         let mut still = Vec::with_capacity(out.len());
         for (group, to) in out {
+            if let Some(far) = self.far.iter().find(|far| far.group == group) {
+                let (leader, transferee) = (far.seen.leader, far.seen.transferee);
+                if to == 0 {
+                    still.push((group, to));
+                } else if leader != 0 && leader != self.id {
+                    self.handed.push((group, leader));
+                } else if leader == 0 || transferee == Some(to) {
+                    still.push((group, to));
+                } else if shard::ask_transfer(&self.shards, far, Some(to))? {
+                    still.push((group, 0));
+                }
+                continue;
+            }
             let Some(handle) = self.kept(group).map(|k| k.handle) else {
                 continue;
             };
@@ -188,7 +224,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 still.push((group, again));
             }
         }
-        still
+        Ok(still)
     }
 
     /// Takes no connection from now on, dials no peer, and closes each connection held.

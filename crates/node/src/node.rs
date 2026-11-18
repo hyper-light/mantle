@@ -4671,6 +4671,24 @@ mod tests {
         }
     }
 
+    /// A range's replica over its group of the log, and the arena that holds a shard's replicas,
+    /// may be moved to the shard that drives them, and the log is shared by every shard by
+    /// reference (node.md §2.9, step 2): over the process's file and engine, each moves (`Send`)
+    /// and the log is `Sync`. None of the three is `Sync` (a `Cell`, a `RefCell` and the reply
+    /// port's `Receiver` keep each to one thread at a time), which a range driven by its shard's
+    /// task alone never needs.
+    #[test]
+    fn a_range_may_move_to_the_shard_that_drives_it() {
+        type Store = Answers<GroupStore<DeviceFile>>;
+        type Machine = RangeMachine<mantle_range::Stored<DeviceFile>>;
+        fn moves<T: Send>() {}
+        fn shared<T: Sync>() {}
+        moves::<hyper_log::GroupLog<DeviceFile>>();
+        moves::<hyper_durable::Replica<Store, Machine, Unbounded>>();
+        moves::<Owner<Store, Machine, Unbounded>>();
+        shared::<Log<DeviceFile>>();
+    }
+
     #[test]
     fn a_chunk_is_waited_on_at_most_the_stock_patience() {
         let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();

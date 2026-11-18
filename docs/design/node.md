@@ -1553,6 +1553,22 @@ shards to 32; every shard past the first stays within one range of every other, 
 nine and one range to forty; the table says each range's shard and each shard's ranges in its
 order; and a count past a `usize`'s is refused with nothing placed.
 
+*As built (2026-11-18), step 2's check: a range may move to the shard that drives it.* A range's
+replica (hyper-durable's `Replica` over the node's `Answers` of hyper-log's `GroupStore`, with its
+`RangeMachine`), its group's handle (`GroupLog`) and the arena of a shard's replicas (`Owner`) are
+each `Send`, and the log (`Log`) is `Sync`, over the process's file (`DeviceFile`) and engine
+(`Stored`); `node::tests::a_range_may_move_to_the_shard_that_drives_it` holds this at compile time.
+None of the first three is `Sync`: a `Cell`, a `RefCell` and a reply port's `Receiver` keep each to
+one thread at a time, which a range moved to its shard once and driven by that shard's task alone
+never needs. Nothing in them is tied to the thread that made them (research/95 §7): hyper-log's
+owner and I/O threads are its own, which `Log::open` spawns; a group's handle reaches the owner
+over its bounded channel and hears each answer through the waker its caller gave; and hyper-durable
+spawns no thread, each owner thread (a shard) holding one `Owner` driven with the wakers its
+embedder gives it. hyper-log keeps each thread's free reply ports in a pool of that thread's,
+taking one where a call is made and keeping it where its wait ends; a range's calls are made and
+end on its shard, so a shard's pool holds its own ranges' calls. So step 2 needs no change in
+hyper-raft.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

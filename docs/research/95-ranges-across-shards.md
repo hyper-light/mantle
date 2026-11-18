@@ -118,6 +118,26 @@ cannot read the shard out of the ID: the shard is written under a key, never in 
   which any number of threads may share by reference"; callers reach the owner by message and hear
   back through tickets; "A log runs those two threads, whatever its number of groups or callers."
   Its refusal `LogError::Busy` is its queue holding all it takes (`node::refused_for_room`).
+- Where hyper-log's threads run, read in its source at the vendored tree of lean-doors `aa9dee43`:
+  `Log::open` calls `Log::spawn`, which starts the threads named `hyper-log` (the owner) and
+  `hyper-log-io` (`lib.rs`); a group's handle (`GroupLog`, `group.rs`) holds the owner's inbox, a
+  `sync_channel` of a stated capacity, and a write's answer wakes the waker its caller gave
+  (`GroupLog::submit_waking`). Each thread keeps its free reply ports in a `thread_local!` pool,
+  "This thread's ports, free for its next call": a call takes one from its thread's pool, and an
+  answered wait's drop keeps it in the pool of the thread that drops it (`ticket.rs`, `port`,
+  `keep`, `Waiting`'s `Drop`).
+- hyper-durable (`vendor/hyper-durable/src/owner.rs`, module documentation): "The node runs a fixed
+  set of owner threads (mantle's shards, focal's session owners); this crate spawns none
+  (`CLAUDE.md` §1, sans-io), and each owner thread holds one [`Owner`]. The owner's embedder gives
+  it one waker for each slot of its arena, made once".
+- The compiler, 2026-11-18, on lean-doors `aa9dee43` (rustc of `rust-toolchain.toml`): over
+  `DeviceFile` and the `Stored` engine, `GroupLog`, `GroupStore`, the node's `Answers` of it,
+  `RangeMachine`, hyper-durable's `Replica` and `Owner`, and `Log` are `Send`, and `Log` is `Sync`;
+  `GroupLog` is not `Sync` for its `Cell<u64>` and, through its writes out (`Out`, `Waiting`), a
+  `Cell<bool>` and a reply port's `Receiver`, and `Replica` is not, among others for `Held`'s
+  `RefCell<Entry>`, `GroupStore`'s `Cell` and `RefCell<CatchUp>` and the engine's boxed `Send`
+  closures (error E0277 on each, `cargo clippy -p mantle-node --all-targets` with a `Sync` bound
+  asked of each).
 - Run r20 (the coordinator's, a three-node cell on one Mac Studio, M3 Ultra, 32 cores; a release
   build of lean-doors `aef9efae`; a closed ladder of 1-byte PUTs through the native door): 1,290
   PUTs a second at 512 clients, 0.69 ms of server CPU and 7.0 M instructions a PUT, the three

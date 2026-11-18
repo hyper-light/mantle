@@ -137,6 +137,7 @@ fn watching<T>(
     match watched {
         Ok(found) => found,
         Err(quiet) => {
+            let threads = threads_of(child);
             child.kill().unwrap();
             child.wait().unwrap();
             let why = quiet
@@ -144,8 +145,55 @@ fn watching<T>(
                 .map(String::as_str)
                 .or_else(|| quiet.downcast_ref::<&str>().copied())
                 .unwrap_or("the cell's watch ended");
-            panic!("{why}\n{what}: killed at the watch's end; {}", said())
+            panic!(
+                "{why}\n{what}: killed at the watch's end, its threads then {threads}; {}",
+                said()
+            )
         }
+    }
+}
+
+/// What the OS said of `child`'s threads as the watch ended, on Linux (proc(5)): each thread's
+/// name, its state, its CPU time in clock ticks, the system call it is in and the kernel function
+/// it sleeps in, so a failure tells a command spinning in a poll from one parked on a wake that
+/// never came. Elsewhere, that the OS was not asked.
+fn threads_of(child: &Child) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", child.id())) else {
+            return "gone".to_owned();
+        };
+        let threads: Vec<String> = tasks
+            .filter_map(Result::ok)
+            .map(|task| {
+                let path = task.path();
+                let read =
+                    |name: &str| std::fs::read_to_string(path.join(name)).unwrap_or_default();
+                let stat = read("stat");
+                // proc(5)'s `stat`: `pid (comm) state ...`, field 14 `utime` and 15 `stime`, the
+                // fields after the name counted from its third.
+                let (name, rest) = stat
+                    .rsplit_once(") ")
+                    .map(|(head, rest)| (head.split_once(" (").map_or("", |(_, n)| n), rest))
+                    .unwrap_or(("", ""));
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                let field = |n: usize| fields.get(n - 3).copied().unwrap_or("");
+                format!(
+                    "{name} state {} utime {} stime {} syscall {} wchan {}",
+                    field(3),
+                    field(14),
+                    field(15),
+                    read("syscall").split_whitespace().next().unwrap_or(""),
+                    read("wchan")
+                )
+            })
+            .collect();
+        threads.join("; ")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child;
+        "not asked of this OS".to_owned()
     }
 }
 

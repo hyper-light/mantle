@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-14. A component is complete when its tests pass on the supported CI targets
+Updated 2026-11-17. A component is complete when its tests pass on the supported CI targets
 (Linux and Windows on x86_64 and arm64, macOS on arm64) and the evidence listed for it has been
 recorded.
 
@@ -57,8 +57,15 @@ still by its host past the QUIC idle timeout (3.072 s) is timed out by its clien
 `Lost(Closed)` (reproduced exactly, held 4 s; 2 s passes), and the harness's quiet watch fails when
 the test process itself is held still. The trace found hyper-rt-transport's driver firing timers
 before it reads the sockets that became ready in a hold; whether links should outlast longer holds
-is open ([holds](measurements/2026-11-06-node-test-holds.md)). A founder of the KIND cell whose
-log was full of live records when its host stopped started 22 times into "the log is full of
+is open ([holds](measurements/2026-11-06-node-test-holds.md)). membership.rs's read-back met the
+same end on CI (run 44205173347, linux-x86_64, five nodes with one killed and started again: "o289
+natively: Lost(Closed)"), not yet traced. Since 2026-11-17 a node says its longest poll as it grows
+(`longest-poll`) and each shard's stalls as hyper-rt's watchdog reports them (`stall SHARD SITE
+LABEL HELD_NS CPU_NS WHOSE MISSED`, at most one line a shard each half serve period), and the
+harness shows both with when each was heard in the quiet watch's and the read-back's failures, the
+read-back's naming the node and index it asked (78d29fe2, 0068f230), so the next such failure says
+whether a shard was held in one poll. A founder of the KIND cell whose log was full of live records
+when its host stopped started 22 times into "the log is full of
 live records": a liveness write the log refused for room stopped the node. Such a write is now
 owed until the ranges compact ([full log](measurements/2026-11-07-full-log-restart.md)). A log
 answering `Full` for good once its groups had compacted, which held its node's ranges still with
@@ -159,8 +166,12 @@ and absent voters made learners where that lets a range survive more failures; a
 once its presence has been away past the durability model's mean repair time, or stated gone
 (`gone ID`), every volume of it gone with it and its identity refused from then; and a volume of
 what its file system spares (`volume = DIR spare KEEP`). Repair and membership were merged on
-lean-doors on 2026-11-15, each fact one record. Open: a range's voters a subset of the cell,
-certificates' rotation, and the owner's decisions in membership.md §10.
+lean-doors on 2026-11-15, each fact one record. Membership's suite alone takes 2 h 45 min to
+4 h 06 min on one CPU, and CI's one-CPU leg was cut at GitHub's six hours in mantle-engine's unit
+tests (run 44032796943); the leg now runs as three jobs, each on one CPU of its own: membership,
+mantle's other suites, and every other crate's (32a1e5a3). On `c3b16c42`'s tree the membership job
+ended in 1 h 55 min and the other crates' in 1 h 11 min (run 44205173347). Open: a range's voters a
+subset of the cell, certificates' rotation, and the owner's decisions in membership.md §10.
 
 **Chunk store** ([design](design/chunk-store.md)). Implemented: the volume layout with
 two superblocks, self-describing data records with a CRC-32C per checksum block, the
@@ -304,7 +315,10 @@ suspended and never enabled, conditional writes judged at commit, delete markers
 version, multipart uploads whose parts are checked at completion, listings that stop
 within a budget and resume, and Object Lock: each version's retention and legal hold, the
 removals and changes they refuse at the step that would make them, and a bucket's default
-retention, with versioning held enabled while Object Lock is on. Every file a removal stops
+retention, with versioning held enabled while Object Lock is on. A write carrying its client's
+operation commits with a row of what it made, and every later attempt the row holds is answered from
+it with nothing applied, the rows forgotten past their horizon and carried by splits and merges
+(item 9; metadata.md §2, "Operations"). Every file a removal stops
 referencing, and every file a refused write carried, is released in the same transaction
 into a queue the collector takes oldest first; a property test over random histories checks
 that each file handed to a range is held in exactly one place after every step. A reclaimer
@@ -357,8 +371,17 @@ and refuses past the cell's stated bounds; read a page at a time, as many volume
 carries. A cell of three `mantle node` processes hosts it beside a range of each layer. A node
 asks commands of ranges itself, as a gateway does, within a session of its own, in-process where
 it leads and over QUIC where another node does, each applied once through a leader's stop
-([node design §6.6](design/node.md)); the leader stamps every entry it proposes with its wall
-clock. Each node with volumes enlists itself and them as it starts, a node in another domain
+([node design §6.6](design/node.md)). Since 2026-11-17 it keeps up to two entries of its own out to
+a range at once (`ask::ENTRIES_OUT`), as many as the range's log has frames in flight, each asked,
+answered, refused and given up on its own, so a command asked while one entry is out goes into the
+next rather than wait out the first's flush, quorum and answer; what needs an order waits for the
+answer before it, a PUT's block, file and name commands and the node's statements one out at a time
+(aef9efae, 053cb77d). The exactly-once simulation of lost replies, late copies and refusals runs
+with one entry out and with two, and a cluster test has a cut-off leader's two puts out side by
+side, each answered its own version by the new leader; no end-to-end suite or doors run has run on
+it, and its effect on the write path is unmeasured. The leader stamps every entry it proposes with
+its wall clock. Each node with volumes enlists itself and them as it starts, a node in another
+domain
 than the table holds refused; placement offers a block's volumes by a capacity-weighted highest
 random weight, one to a failure domain first ([research 63](research/63-placement-order.md)).
 Remaining: the table published to nodes that host no root range (architecture §4's constant-work
@@ -407,7 +430,9 @@ through the three nodes in turn, every key once and in order; a multipart upload
 through different nodes, one node killed and started again between them, completes through
 another into an object whose bytes, multipart ETag and full-object checksum are S3's, the same
 when completed again, each block's chunks on distinct nodes (`crates/mantle/tests/serve.rs`).
-The operation identity every mutation carries is not yet recorded by the Name range (item 9).
+The Name range keeps an operation's first answer for a write that carries the operation (item 9,
+2026-11-17), but the node hands no write over as one yet, so the identity every mutation carries is
+not yet recorded end to end.
 Stock S3 clients reach the same operations through each node's HTTP/1.1 listener, mantle's own
 codec on hyper-rt's TCP, plain on loopback and TLS 1.3 and 1.2 with the endpoint's P-256 chain
 elsewhere, each request routed, its SigV4 signature checked against the cell's access keys, and
@@ -417,7 +442,18 @@ trailing checksum checked before commit, and a burst past the host's operations 
 door, its bodies unread, rather than refused (node design §4.1–§4.5; research/72); a client resumes its TLS
 session from a store the listener reserves whole, two single-use tickets a TLS 1.3 handshake and
 a session ID a TLS 1.2 one, for 24 hours from the full handshake, with no early data
-(research/94; `listener::sessions::tests`). Through each listener of a cell of three: buckets,
+(research/94; `listener::sessions::tests`), each TLS connection held to 382,052 bytes with its way
+into the store counted, and `listener_memory` checking every count of connections against as many
+times that bound (4df9387a). Since 2026-11-17 a node runs a shard of hyper-rt's runtime for each CPU
+the process runs at once (`Facts::cpus_at_once`: its cores, capped by its CPU budget, affinity and
+cgroup quota included), where it ran every task on one shard, a count picked by hand: the ranges,
+the log, the transport and the QUIC door stay on the first, where the listener accepts, and each
+connection it admits goes to the other shard with the fewest of its connections open among those the
+runtime's watchdog neither sees stalled nor counts gone, the first serving it where none takes it
+(node.md §4.1; `listener/shards.rs`); a connection's socket reads and TLS records charge its turn,
+so a client whose bytes are always there yields its shard at the quantum (hyper-rt's turns by time).
+Built and unit-tested; the end-to-end suites, the doors and the transfer harness have not yet run on
+it, and no rate has been measured with it. Through each listener of a cell of three: buckets,
 puts read back whole and by range and head through the others, ListObjectsV2, conditional writes,
 deletes and a multipart upload spread over the listeners, each read byte-identical; objects put
 through one listener alone held by the other two nodes exactly as received over QUIC, and on every
@@ -482,7 +518,16 @@ objects alone, never a range's command (node design §3.6; research/73). A put s
 and a get into a sink a piece at a time within the client's stated memory (a put and a get of 1,024
 windows peaked at 408,996 bytes of the 3,821,063 stated, `crates/client/tests/heap.rs`); every
 mutation carries its identity, a request is asked again only where no node can have taken it, at
-most three attempts, and a put states its CRC-64/NVME in a trailer the node checks before commit,
+most three attempts, and one answered `SlowDown` is asked again as botocore's standard mode asks a
+throttling error, within those attempts and its retry quota, of the next node after a full-jitter
+backoff. Since 2026-11-17 that holds for a put or a part with a body too: it is sent again from its
+source's first byte where the source gives it again (a file, bytes held whole), the same encoded
+request and identity, and one from a source read once, standard input streamed to a part, answers
+`SlowDown` to its caller (`crates/client/tests/slowed.rs`, against the in-process stub node; release
+run 43905794145 had a native part slowed on a fresh cell abort its upload). Until the node records
+operations (item 9) a retry whose first attempt applied after all applies again: a part replaces
+itself with the same bytes, a put makes a second version where versioning is on, as a stock client's
+retry does (gateway.md §6). A put states its CRC-64/NVME in a trailer the node checks before commit,
 a whole get held to the full-object checksum kept. Through the library and the command line,
 against a cell of three `mantle init` made whose nodes pin each other alone: buckets made, headed,
 listed, versioned and removed; objects put from memory, files and standard input (in 8 MiB parts
@@ -616,8 +661,15 @@ progress (D1) and waiting out each request's patience (D2), a client asked with 
 its exchange at most the stock S3 clients' 60 s as its period: a node that works for it says so
 each beat, and one that says nothing is given up at the end of the first period that moved nothing,
 never sooner than the node would give up the work (a put held three periods by a test's node is cut
-`Stalled` after two). CI's busy job fails the native
-suite on the same cause with the client unchanged, on both arms of an A/B of the chunk store's
+`Stalled` after two). Since 2026-11-17 the node's client measures each kind of work apart, a range's
+commands and reads, a node's object jobs and a volume's chunks, each node its own cuts of each, so a
+client that asked only objects or chunks has a patience of its own and a chunk transfer is not given
+a request's pace; an object's or a chunk's exchange is given at least the node's serve period, in
+which the node's notes of its work come three times, and at most the stock patience, the most a node
+waits on such work asked with no deadline, before any reply is measured
+(`crates/node/tests/client_patience.rs`, both cases failing before the change). CI's busy job fails
+the native suite on the same cause with the client unchanged, on both arms of an A/B of the chunk
+store's
 latest changes: a node's own asks are judged by the period its client gives it, so a node whose
 ask of a peer takes most of a period loses to its client (7 of 36 read-backs cut), and a run cut
 while its node wrote is sent again, its first chunks left behind until the suite's small volumes
@@ -815,8 +867,8 @@ Remaining before it is done:
 - The windows a gateway admits, from its memory and measured latency; the rates of the paths
   measured on an idle machine.
 - The native upload's checkpoint interval from its measured terms, two runs in flight, the
-  operation identity's record (item 9), and the journal in the library with its power-cut tests
-  (gateway design §2.1, §6); the rest of planned items 12 and 13.
+  operation identity's record at the node (item 9's host half), and the journal in the library with
+  its power-cut tests (gateway design §2.1, §6); the rest of planned items 12 and 13.
 - The HTTP/1.1 listener's remaining parts: the operations beyond the node's own set (tags, ACLs,
   CORS, lifecycle, policies, object lock, encryption settings, object tags beyond the empty set
   and ListObjects v1 answer `501` there), a copy that outlasts a client's read timeout answered as S3's early `200` with its
@@ -923,8 +975,9 @@ Remaining before it is done:
   docs/research/22 §10).
 - The production engine: a node keeps its ranges' rows in mantle's engine
   (`mantle_range::Stored`, `ShardDb` checkpointed at the applied index, the Raft log its only
-  log) on the shard that runs the node, whose owner permits it to wait on the device. Moving the
-  replicas to metadata shards apart from the network's (node.md §1.2) is left.
+  log) on the node's first shard, beside its log, transport and QUIC door, whose owner permits it to
+  wait on the device; since 2026-11-17 the S3 connections run on the node's other shards (above).
+  Moving the replicas to metadata shards apart from the network's (node.md §1.2) is left.
 - The replica side of splits and merges: the child's group made on the parent's replicas
   from the parent's engine files as they stood at the split's entry, which carries the split
   alone; a merge's replica sets aligned first, its decision proposed once every replica of
@@ -960,6 +1013,11 @@ Remaining before it is done:
   failing a write, on one of three path profiles, with 2% loss on some seeds. Each key's history
   must be linearizable, and each seed must replay to the same histories (node.md §9.1). A leader
   whose plane goes deaf, before or after it judged its links, steps down and the others elect.
+  Since 2026-11-17 a node's store can hold its ranges' writes as a device whose flush has not
+  ended holds them (`Sim::hold_writes`): an entry of four puts is answered in `took` with nothing
+  held, unanswered for `took` past that with so many followers' flushes held that a quorum is one
+  short or with the leader's own held, and answered whole once its flushes end, seeds 1 to 4 on
+  cells of three and five; a store that answers while held fails it at the first seed.
 - Done when a linearizability checker accepts histories recorded under network partitions,
   process crashes and disk faults, both in deterministic simulation and with real
   processes.
@@ -1001,12 +1059,26 @@ passed each time but the leaving node's once, on macOS, stopped before any repai
 wait for the cell's links to be judged (`Cell::judging`, quiet for the reconnect time while the
 leader still measured), a wait the other suites share.
 
+CI then failed two of them. On linux-aarch64-1cpu (run 43992405910) the spread onto a joiner took a
+settled pass begun before the root range held the joiner's volume active, which swept nothing toward
+it: the `repair` line now states `TAKERS`, the domains the last pass found taking chunks (repair.md
+§5), and the test waits for a settled pass past its mark that saw three (9a12a06a). On macos-aarch64
+the stated-gone test sat until GitHub's cut with nothing said (job 133868481366): every wait of the
+cell's harness is now under its watch and names itself at the test's line when it fails, the
+writer's puts, the chunk reads and the S3 requests among them, and a wait's own probe no longer
+moves the watch (cf6d7bbc, 1702d02a); every suite's S3 requests, the AWS CLI's and boto3's runs (a
+run given up on killed) and the node crate's listener exchanges are bounded likewise (fdf6d7b4,
+014ef527, a6ac6be0, dc632ec4, 536d7682). These changes ran as unit tests and lints; the end-to-end
+suites have not yet run on them.
+
 Remaining before it is done: deleting chunks no block names, which needs a fence against a rebuild
-naming one; moves for disk space; admission of a node no founder's directory pins (node.md §11,
-built apart); sizing a machine's volumes from the disk it can spare; trimming kept places; re-coding
-a block wider than the volumes a shrunk cell keeps; keeping the measured rebuild time across a
+naming one; moves for disk space; trimming kept places; re-coding a block wider than the volumes a
+shrunk cell keeps; keeping the measured rebuild time across a
 change of leader; repair's priority against client work beyond the shared slots; a stated value for
-the default repair time, an open row; and the end-to-end scenarios on Linux and Windows.
+the default repair time, an open row; and the end-to-end scenarios recorded passing on Windows and
+on CI's other legs, which run them on every target (Windows suspending threads where SIGSTOP stops a
+process). Admitting a node no founder's directory pins (grants, above in Membership) and sizing a
+machine's volumes from the disk it can spare (`volume = DIR spare KEEP`) are built.
 
 **Derived settings** ([design](design/node.md) §1.4). `mantle serve CONFIG` runs a node from its
 operator's statements alone: its identity and directory, where it listens, its peers, the cell's
@@ -1044,8 +1116,20 @@ did not issue (the node's own and each pinned peer's: RFC 5280 §6.1.3 (a)'s iss
 validity); and refuses no configuration, and a volume another process holds, at their steps, and a
 plane or QUIC port another socket holds at its network step (hyper-rt-transport's listener binds its
 port before it shares it). A node whose peers have never answered heartbeats each every 3 s at most,
-not at its stream's floor with a flush each (hyper-liveness `f647365`). A cell
-of three made by `mantle init` rolls one node at a time, each handing its ranges over, announcing its
+not at its stream's floor with a flush each (hyper-liveness `f647365`). Since 2026-11-17 that floor
+takes the larger of the log writes' mean flush and the stream's own proof, from the poll that asks a
+liveness write to the poll that takes its durability (hyper-raft `65cdd84`, vendored with every
+hyper-raft crate at `17371e2`): below it, a stream whose flushes return at once (tmpfs, a device
+with power-loss protection) asked a flush at every poll, and on adacachy2's tmpfs sent 3 heartbeats
+to 10,683 slots skipped. `tests/turn_allocs.rs`'s counts moved with it and are re-derived on macOS
+arm64, a cell at rest 95,102 allocations where it was 96,375 and one serving 34,389 where it was
+34,337, the floor's one line moving both; Linux's serving count stays 34,388 until CI on lean-doors
+reports it (5e63283a). Open: 053cb77d records the test failing with the same counts on lean-doors
+before it as after, the host and the counts unstated, not yet traced. The node runs on hyper-rt's
+`Runtime`, its task launched on the first shard and the runtime shut down at its end, and
+`derive::threads` counts six threads of the node's own, the runtime's watchdog among them, and one a
+shard (adf6125b, a93c172a). A cell of three made by `mantle init` rolls one node at a time, each
+handing its ranges over, announcing its
 end to its peers' liveness streams and started again from its directories, with no other member
 saying a range has no leader, and every object read back through every node after the roll, on two
 CPUs beside two or four busy loops and on one CPU: on CI's busy runners 0 of 48 rounds failed of the
@@ -1088,8 +1172,8 @@ peer, counted each closed connection's redial due, which ended every wait at onc
 3.7 s on macOS). The shard holds three, a closing node counts no redial due, and every orderly stop
 says its loop's timer waits, which the serve harness holds to none (with two timers the stop test
 fails); the serve suite's stops turn 4 to 61 times, where they turned 420 to 85,171.
-Remaining: `mantle init client`;
-Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler now holds
+Remaining: Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler
+now holds
 for the owner's stop; a replicated range refusing puts at its engine's metadata share where its
 leader admits a command, since a refusal at apply would let members diverge; and hyper-raft's
 `cc5a65b` (a stop suspected as its announcement arrives, and answered, so a stop may announce before
@@ -1162,7 +1246,7 @@ measurements. Their `ready` phase means ready to execute, not that their steps p
 | Serve roles, 4 steps | met | Implemented; Windows rolling-stop stress passed. |
 | Three-node serve cell, 5 steps | met | Implemented; Scale adds larger transfer and restart coverage. |
 | Data storage/transfer, 13 steps | pending | Steps 1–9 built; Scale active; image, Helm and localkind pending. Main landing alone does not close the parent. |
-| Lean doors, 11 steps | pending | Steps 1 and 2 met: `mantle bench doors` drives and counts both doors per operation, and its `--smoke` passes through both doors with all six controls caught. Step 3's baseline runs on the box (2026-11-16): the baseline's product with lean-doors' harness (doors-baseline-graft-2), every condition, including the native door's relay (`--relay`: 500 ± 100 ms one way, reordered, lost as a measured Switzerland–Japan path, 0.36% in runs of 1.49; research/70). The Mac and its VM lane are still to run it. Steps 4 to 11 remain, their timed matrices at step 10. Transfer throughput is not that proof. |
+| Lean doors, 11 steps | pending | Steps 1 and 2 met: `mantle bench doors` drives and counts both doors per operation, and its `--smoke` passes through both doors with all six controls caught. Step 3's baseline runs on the box (2026-11-16): the baseline's product with lean-doors' harness (doors-baseline-graft-2), every condition, including the native door's relay (`--relay`: 500 ± 100 ms one way, reordered, lost as a measured Switzerland–Japan path, 0.36% in runs of 1.49; research/70). The Mac and its VM lane are still to run it. Since 2026-11-17 `mantle serve`'s `counts` answer carries, in every build, the write path's counts (the log's frames, updates and flushes, the entries the node proposed and their commands, its log's commit waits since the last answer), the slow-poll table of the shard `serve` runs on (each long poll by spawn site and label, every operation through either door labelling what holds its shard) and each shard's stalls; every doors phase line says `commands/entry`, `updates/frame`, `log_frames/op`, `log_flushes/op`, the commit waits' p50, p99 and longest, `slow_polls/op`, `slowest_label` and `stalls`, each shard's grown entries on lines of their own (e8469ad9, 2ac5645d, 5fe38197, 6a41fdaf; measurement.md §12). Unit-tested; no doors run has used them yet. Steps 4 to 11 remain, their timed matrices at step 10. Transfer throughput is not that proof. |
 
 Their research records contain 203 graded findings (123 A, 69 B, 8 C, 3 D), as graded by kiln,
 not regraded here. A verified quotation about old code remains historical. In particular Lean
@@ -1177,10 +1261,14 @@ wrong controls ([research/76](research/76-transfer-harness.md)). Its three proce
 do not demonstrate independent physical-device or rack failures. Carried remaining time and the
 native caller's own finite deadline are built; distinguishing held from moved in notes for a
 no-deadline caller remains open ([research/77](research/77-progress-and-patience.md)). The served
-S3 subset still lacks copies and stored user headers, which kiln must account for when adapting
-its storage integration. The vendored hyper-* crates are at `0a182ae` on
-`progress-notes-reachable` ([provenance](../vendor/UPSTREAM.md)); upstream main landing and kiln's
-single-revision integration are separate work. Approval to land Mantle does not authorize landing
+S3 subset then lacked copies and stored user headers, which kiln must account for when adapting its
+storage integration; both are served since 2026-11-14 (In progress, Gateway object path). The
+vendored hyper-* crates were then at `0a182ae` on `progress-notes-reachable`; since 2026-11-17 every
+one is at `6a6b4d2` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s `17371e2` and
+four commits to hyper-rt alone, its slow-poll table, its record of what it took from Kiln's
+`slow.rs`, its watchdog, and turns by time) with no local delta
+([provenance](../vendor/UPSTREAM.md)); upstream main landing and kiln's single-revision integration
+are separate work. Approval to land Mantle does not authorize landing
 hyper-raft.
 
 The data-layer and Lean doors plans now carry these dated execution corrections. Scale's plan
@@ -1207,19 +1295,23 @@ targets. Each item is done when its test passes on every supported target.
    §1.3; raft-log.md §3). Done when an instrumented test with `W` waiters and `K` completions
    counts at most `K` plus the waiters admitted, a fence wakes each exactly once, and `bench log`
    at thousands of logical replicas runs on macOS without a kernel spinlock timeout.
-   *Done on macOS (2026-09-30)*: the log's `Room` (now hyper-log's, held by its owner thread)
+   *Done (2026-09-30)*: the log's `Room` (now hyper-log's, held by its owner thread)
    hands freed room to waiters in arrival order, each woken by its own `unpark`, its list bounded at `max_groups` times a group's two;
    `room::tests::each_answer_wakes_only_the_waiter_it_admits_and_a_fence_wakes_each_once`
    counts 16 wakes for 16 answers among 48 waiters and 48 in all after the fence;
    `workers.rs` is gone. A submission can carry a `Waker`, woken exactly once
    (`a_waker_is_woken_once_for_each_answer`). `bench log` ran 16,384 logical replicas on 20
    threads on the development Mac. No production `notify_all` or `Barrier` remains; the tests'
-   simulated files keep theirs, waited on by a few test threads.
-2. **Depth without a thread per transfer.** Calibration's depth kept by io_uring on Linux, an
-   overlapped completion port on Windows, and a reusable pool of exactly `depth` workers with
-   per-worker slots on macOS and where io_uring is unusable, inside a process thread budget read
-   from `kern.wq_max_threads` on macOS, refused before any thread starts; achieved depth sampled
-   and reported (measurement.md §8). Done when a measurement at a device's full reported depth
+   simulated files keep theirs, waited on by a few test threads. The counting tests are
+   hyper-log's (`room.rs`, `tests/log.rs`), whose suite is a gate CI runs on every target
+   (`cargo test --manifest-path vendor/Cargo.toml`), not on macOS alone.
+2. **Depth without a thread per transfer.** Calibration's depth kept by the kernel's native AIO
+   on Linux (the owner's decision of 2026-10-01: not io_uring, node.md §1.2), an overlapped
+   completion port on Windows, and a reusable pool of exactly `depth` workers with per-worker
+   slots on macOS and where the kernel cannot hold a file's transfers, inside a process thread
+   budget read from `kern.wq_max_threads` on macOS, refused before any thread starts; achieved
+   depth sampled and reported (measurement.md §8). Done when a measurement at a device's full
+   reported depth
    never exceeds the pool bound in the OS's own thread count, a request past the budget starts
    no thread, and the achieved depth reaches the depth asked or reports its shortfall.
    *The portable pool is done on macOS (2026-09-30)*: the process thread budget (now
@@ -1230,10 +1322,13 @@ targets. Each item is done when its test passes on every supported target.
    `measure::Pool` draws from it before any thread starts and refuses with
    `DiskError::Threads`. `tests/depth.rs` measured at the NVMe controller's 253: 2 threads
    before, a peak of 256 (the pool and the test's sampler), a mean of 228.7 in flight and
-   253 at most; a depth past the budget started none. *Remaining*: io_uring on Linux and the
-   completion port on Windows, which the pool stands in for on every OS until they land; the
-   Linux and Windows thread counters have been type-checked for their targets but not yet run
-   there; macOS reads its queue from `IOCommandPoolSize`, Windows reports none yet.
+   253 at most; a depth past the budget started none. *Linux done (2026-11-14, b543fb0c)*:
+   calibration's jobs over a direct file hold their depth in the kernel through native AIO on the
+   calling thread (`measure::in_kernel`, `hyper_block::aio::AioFile`), so a ladder that reaches a CI
+   runner's queue of 316 starts no thread for it. The Linux and Windows thread counters run in CI
+   (`crates/node/tests/threads.rs` on Linux; Windows x86_64's thread-count test, above).
+   *Remaining*: the completion port on Windows, which the pool stands in for there until it lands;
+   macOS reads its queue from `IOCommandPoolSize`, Windows reports none yet.
 3. **Logical clients as records.** `bench log`, `bench` and `bench gateway` multiplex clients on
    at most the granted cores' driver threads through `submit` and a `Waker`; the replica ladder
    ends at the stated replica bound; generators report their CPU and lateness (measurement.md
@@ -1273,9 +1368,11 @@ targets. Each item is done when its test passes on every supported target.
    *Remaining*: each volume's writer, cleaner and scrubber are still threads of their own, not
    state machines on the issuer's thread, so the count is `2V` or `3V` plus `D + Σ p_i`, not yet
    `3C + D + Σ p_i`; the Raft log's writer does not go through the issuer; startup rollback is
-   still each volume's own; io_uring on Linux and the completion port on Windows are not built,
-   the pool runs there (node.md §1.2); the 100-volume test is not written; reads go through the
-   issuer with item 5.
+   still each volume's own; the completion port on Windows is not built and the pool runs there, as
+   on macOS (node.md §1.2), where since 2026-11-14 a Linux device's issuer holds its whole depth in
+   the kernel through one native AIO context on its own thread, reads, writes and flushes, one
+   thread a device (`Issuer::start_device`, b543fb0c); the 100-volume test is not written; reads go
+   through the issuer with item 5.
 5. **The device dispatcher**: start-tag order across tenants and principals, in-flight budget
    `D_b`, `D_n` and dispatch unit `u` from calibration, background shares, the log, engines and
    chunks of a laptop's one device under one authority (node.md §2.7; chunk-store.md §4, §7).
@@ -1298,15 +1395,21 @@ targets. Each item is done when its test passes on every supported target.
 8. **Fair-share windows**: a PUT's window from the entitled rate, a GET's from the latency at the
    hedge quantile (node.md §2.6; gateway.md §2–§3). Done when a lone upload's goodput reaches
    `min(client rate, device plateau)` and its window shrinks and regrows across a spike.
-   *Open*: a replica's chunk put waits one idle timeout (3.07 s) for its answer once the peer
-   has the request, whatever the peer's device takes; a durable write slower than that ends the
-   put as stalled, and a cell with no spare volume fails the object (on windows-11-arm a
-   volume's first write took up to 8.0 s before calibration saw NTFS's zeros;
-   measurements/2026-10-24-first-writes-past-unwritten-space.md). The answer's period belongs
-   with the peer's measured write time, as a command ask's comes from its slowest answer. A
-   native client learns from its own cuts (gateway.md §6's as-built note): a run it cut waiting
-   for the node's answer sets its next period to at least twice that wait; its first run still
-   waits the idle timeout until the node states its write time.
+   *Built (2026-11-13, 6d95f931)*: a PUT's window learned from the node's own puts by Little's law,
+   a block's time from going down to recorded times the body's pace over a block's bytes, each
+   smoothed with RFC 6298's gain, one block until both are measured (`crates/node/src/window.rs`;
+   node.md §2.8). A replica's chunk put no longer ends at the idle timeout (3.07 s) while the peer's
+   device makes it durable, a write slower than that once ending the put as stalled (on
+   windows-11-arm a volume's first write took up to 8.0 s before calibration saw NTFS's zeros;
+   measurements/2026-10-24-first-writes-past-unwritten-space.md): the peer states
+   its progress and vouches for a chunk it holds as long as its asker's client would wait
+   (research/77 D1 and D2, on main at `17eb8032`, above), and since 2026-11-17 the node's client
+   gives an object's or a chunk's exchange at least the node's serve period and at most the stock
+   patience before it has measured a reply (above). *Open*: the entitled rate `min(body rate,
+   principal's fair share)`, which needs item 6; a GET's window, still one block, the floor
+   (`gateway:window` in `scripts/arbitrary-open.txt`); the hedge quantile, with hedging (gateway.md
+   §3); telling held from moved in a note for an asker with no deadline (research/77); and the done
+   test.
 9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,
    operation rows in the Name range with the first answer, the horizon capped by the operation
    table's budget, removal by the collector, carried by splits (gateway.md §2.1; metadata.md §2).
@@ -1336,7 +1439,9 @@ targets. Each item is done when its test passes on every supported target.
     raft-log.md §2; measurement.md §9). Done when tests on reported and simulated geometries
     take the right `B` and plan, and C1–C3 run on each OS's devices.
 11. **The derived scrub period** from the workload, bandwidth and durability bounds, per device,
-    with `mantle status` naming the binding bound (chunk-store.md §9.1; durability.md §5). Done
+    with the binding bound said beside the period (chunk-store.md §9.1; durability.md §5; derived
+    values are said by `mantle serve`'s `basis` lines, `mantle status` being the supervisor's
+    readiness check, and node.md §8's command for the node's operating envelope is not built). Done
     when a simulated 24 TB disk at 550 TB/yr scrubs no more often than its workload bound and the
     durability model counts latent errors detected at the chosen period.
 
@@ -1346,7 +1451,8 @@ targets. Each item is done when its test passes on every supported target.
     streamed within the client's memory, and the client admitted by its certificate are built
     (above); the rest: credits,
     typed refusals and the admission level, the server's upload plan, per-block GET streams with
-    CRC-64/NVME, migration on interface change, TLS session resumption without early data, the
+    CRC-64/NVME, migration on interface change, TLS session resumption without early data on the
+    native door's QUIC connections (the HTTP/1.1 listener's is built, 2026-11-17, above), the
     TLS-over-TCP route, and the journal with its flush rules (node.md §3.9, §4.1; gateway.md §3,
     §6). Done when the client killed and its storage cut at every journal write and protocol step
     ends every operation answered, resumed or provably restarted, and a Wi-Fi to cellular switch
@@ -1362,7 +1468,13 @@ targets. Each item is done when its test passes on every supported target.
     the ETag equals S3's for objects at and above 5 GiB.
 14. **The HTTP/1.1 listener's resilience**: exact `ListParts`, `AbortIncompleteMultipartUpload`,
     open-upload bytes reported, completion answered directly unless near clients' read
-    timeouts, pinned resumed downloads (gateway.md §2.1). Done when the AWS CLI's and boto3's
+    timeouts, pinned resumed downloads (gateway.md §2.1), of which `ListParts` and
+    `ListMultipartUploads` paged as S3 pages them, and a GET naming its version with its
+    preconditions and range judged against the version it reads, are built (above); no listener test
+    yet pins a ranged strong `If-Match` GET across an overwrite. The rest: the lifecycle worker and
+    stored lifecycle configurations (PUT and GET lifecycle answer `501`), open-upload bytes,
+    completion's early `200`, the connection budget past its floor of ten, reclaiming the slowest
+    connection, and the cut-connection and s3-tests harnesses. Done when the AWS CLI's and boto3's
     multipart uploads with the connection cut at every part and at completion finish or resume,
     and s3-tests' multipart suite passes.
 15. **The gateway's caches**: sealed-block, File and Block row caches; Name rows and absences
@@ -1404,12 +1516,15 @@ mantle, and ceph's s3-tests pass for every supported feature.
 
 ### Fourth: prove heterogeneous regional operation
 
-20. **The QUIC layer on a vendored quinn-proto**: the pacing quantum and operating packet size,
+20. **The QUIC layer on hyper-quic** (hyper-raft's, vendored with hyper-transport; the work is
+    hyper-raft's): the pacing quantum and operating packet size,
     adaptive reordering, the PMTU raise rule, Copa with focal's half stride, idle timeout from
     the probe timeout, keep-alive from the measured NAT lifetime, stream windows under the
     2,048-frame ceiling, the connection credit reserve, key update before AES-GCM's limit (node.md
-    §3.3, §3.8–§3.9). Done when control-message p99 beside saturating bulk at 8, 16, 64 and 256
-    kbit/s beats stock quinn with goodput reported, a fuzzed alternate-frame loss at the window
+    §3.3, §3.8–§3.9), of which Copa with slates' and focal's changes, a round trip moving the window
+    by half of itself at most, is in hyper-quic (`vendor/hyper-quic/src/congestion/copa.rs`). Done
+    when control-message p99 beside saturating bulk at 8, 16, 64 and 256 kbit/s beats stock quinn
+    with goodput reported, a fuzzed alternate-frame loss at the window
     ceiling never closes a connection, and the congestion qualification over the audit §13.6
     matrix is recorded with its selection rule and rows.
 21. **Brownouts and reconnects**: the four clocks, equal-jitter backoff from the probe timeout,
@@ -1445,14 +1560,21 @@ mantle, and ceph's s3-tests pass for every supported feature.
     §5.6). Done when an injected divergent member is found and rebuilt, an injected faulty core
     is quarantined, a week without faults measures the false-positive rate that sets the
     thresholds, and repair with one corrupt source and one lost chunk rebuilds from a verified
-    subset or refuses, never writing a chunk that fails the block's CRC.
+    subset or refuses, never writing a chunk that fails the block's CRC. *Built (2026-11-15)*: the
+    repair half, every source checked against the block's CRC-32C and the rebuilt chunk cut or coded
+    from the checked block, refusing `Corrupt` where no verified subset rebuilds it (repair.md §4;
+    `crates/gateway/src/repair.rs`, `crates/gateway/tests/repair_sim.rs`; In progress, Repair).
+    *Open*: replica digests (none in `crates/range` or `crates/meta`), core quarantine and node
+    fencing, which need item 16's attribution, and correctable-memory counters (nothing reads EDAC).
 
 Multi-machine operation keeps its frame: placement across racks and zones, repair ordered by
 remaining redundancy, rebalancing, and retiring disks that start to fail; done when tests that
 fail disks, machines and racks during writes show every acknowledged write can still be read
 back. Repair by margin, reintegration of an away machine's copies, draining a machine that
 leaves and spreading onto one that joins are built (In progress: Repair, rebalancing and failures
-of several machines); moves for disk space and retiring failing disks remain.
+of several machines); moves for disk space and retiring failing disks remain, and the scrubber's
+findings reach no caller outside `crates/chunk` yet (`Volume::damaged`, `at_risk`, `failing`,
+`repaired`).
 
 ### Fifth: make fleet growth and geography safe
 

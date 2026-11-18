@@ -2721,8 +2721,9 @@ fn stream_peaks(scheme: Scheme, blocks: u64, seed: u8) -> (i64, i64) {
 /// block it wrote, which its file's write names (gateway.md §2.2; `put.rs`'s `recorded`), and the
 /// GET holds not a byte more. Each holds the window of blocks its driver states at the largest
 /// blocks (`put::bytes_for`, `get::most_bytes`; the node's bound, `derive::native`): the GET
-/// within it, the PUT past it by its records alone, which no layout states, 3,971 bytes at two
-/// blocks and 6,019 at 16 on this Mac (about 146 bytes a block).
+/// within it, the PUT past it by its records and its own state, 3,971 bytes at two blocks and
+/// 6,019 at 16 on this Mac (about 146 bytes a block). Each block more holds no more than the
+/// records state a block (`put::records_for`), which the node charges a put with its window.
 #[test]
 fn a_put_and_a_get_many_windows_long_hold_their_windows_bytes() {
     const MANY: u64 = 16;
@@ -2742,6 +2743,13 @@ fn a_put_and_a_get_many_windows_long_hold_their_windows_bytes() {
     );
     assert!(put_many >= put_two, "{put_many} {put_two}");
     assert!(put_many - put_two < segment, "{put_many} {put_two}");
+    let records = |blocks| signed(put::records_for(&layout, len(blocks)).unwrap());
+    let stated = records(MANY) - records(2);
+    eprintln!("the records of {} blocks more: {stated}", MANY - 2);
+    assert!(
+        put_many - put_two <= stated,
+        "{put_many} {put_two} past {stated}"
+    );
     assert!(
         put_two - window_put(2) < segment,
         "{put_two} {}",

@@ -226,8 +226,9 @@ pub fn most_charged(charges: &Charges) -> u64 {
 /// its client's connection and exchange at QUIC's windows, a range's read, its task; and the
 /// host's records of it, its job and its boxed put or get (`node::record_bytes`). A put admitted
 /// at a window it learned holds that window's blocks instead ([`Charges::write`]), at most the
-/// operations' bytes. Not in it: a put's record of each block it wrote until its file names them
-/// (`mantle_gateway::put`'s `recorded`), which grows with the body by design and no layout states.
+/// operations' bytes. A put's charge holds its record of each block it wrote until its file names
+/// them, which grows with the body by design, at the largest body a PUT carries
+/// (`put::most_records`), or its own (`put::records_for`).
 pub fn native(charges: &Charges, beside: u64) -> Option<u64> {
     let records = u64::try_from(crate::node::record_bytes()?).ok()?;
     charges.most().checked_add(beside)?.checked_add(records)
@@ -310,7 +311,8 @@ pub fn charges(
 /// The bytes an object operation holds while it runs, at its own size, under each scheme a block
 /// may take ([`charges`]), each the driver's own (`put::bytes_for`, `put::most_bytes`,
 /// `get::most_bytes`) and the host's: a put's chunks copied to send, every chunk of every block
-/// going down, and a piece of its body carried; a get's block taken and written out. A write is
+/// going down, a piece of its body carried, and its records of the blocks it wrote until its file
+/// names them (`put::records_for`); a get's block taken and written out. A write is
 /// charged at its body's length, known from its head; every other operation at the most any
 /// holds, as a get's object's size is known only once its row is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +339,7 @@ impl Charges {
             let put = put::most_bytes(window, &layout)
                 .and_then(|bytes| bytes.checked_add(copies(&layout, block, window_n)?))
                 .and_then(|bytes| bytes.checked_add(piece))
+                .and_then(|bytes| bytes.checked_add(put::most_records(&layout)?))
                 .ok_or_else(overflow)?;
             let get = get::most_bytes(window, &layout)
                 .and_then(|bytes| bytes.checked_add(block))
@@ -375,13 +378,15 @@ impl Charges {
             let bytes = layout.block_len(length, 0).ok().and_then(|block| {
                 put::bytes_for(window, layout, length)?
                     .checked_add(copies(layout, block, blocks)?)?
-                    .checked_add(self.piece)
+                    .checked_add(self.piece)?
+                    .checked_add(put::records_for(layout, length)?)
             });
             let most = || {
                 layout.largest_block().and_then(|block| {
                     put::most_bytes(window, layout)?
                         .checked_add(copies(layout, block, blocks)?)?
-                        .checked_add(self.piece)
+                        .checked_add(self.piece)?
+                        .checked_add(put::most_records(layout)?)
                 })
             };
             held = held.max(bytes.or_else(most).unwrap_or(u64::MAX));
@@ -3109,7 +3114,8 @@ fn say_native(said: &mut Said, native: u64) {
         Kind::Derived,
         "the most one native PUT or GET holds above the node's idle at gateway.window: the most \
          an operation is charged, its window of blocks at the largest block, a put's chunks copied \
-         to send and a piece of its body (derive::Charges); what one more operation adds beside \
+         to send, a piece of its body and its records of the blocks of the largest body a PUT \
+         carries (derive::Charges); what one more operation adds beside \
          it to the transport, the ranges, the listener and the runtime; and the host's records of \
          it (derive::native)",
     );
@@ -3886,25 +3892,35 @@ mod tests {
         let sealed = mantle_gateway::layout::SEALED;
         let piece = u64::try_from(hyper_transport::RECEIVE_CHUNK).unwrap();
         let block = Layout::new(copies).unwrap().largest_block().unwrap();
-        assert_eq!(
-            Charges::new(1, &[copies]).unwrap().most(),
-            5 * block + sealed
-        );
+        let records = |scheme, length| put::records_for(&Layout::new(scheme).unwrap(), length);
+        // Under one copy a get holds the most; a put of the largest body, its records with it,
+        // holds no more.
+        let one = Layout::new(copies).unwrap();
+        let largest = put::most_bytes(1, &one).unwrap() + block + piece;
+        let most = Charges::new(1, &[copies]).unwrap().most();
+        assert_eq!(most, 5 * block + sealed);
+        assert!(largest + put::most_records(&one).unwrap() <= most);
         assert_eq!(charges.of(None), charges.most());
         assert_eq!(charges.of(Some(u64::MAX)), charges.most());
         let tag = sealed - u64::try_from(mantle_s3::seal::SEGMENT).unwrap();
         // Under three copies: the segment it seals in, the block filling and the block going
-        // down, and the three chunks copied to send, each the body and its tag; and a piece of
-        // body.
+        // down, and the three chunks copied to send, each the body and its tag; a piece of body;
+        // and its record of its one block.
         for length in [0u64, 1, 4096] {
             assert_eq!(
                 charges.of(Some(length)),
-                piece + 6 * (length + tag),
+                piece + 6 * (length + tag) + records(three, length).unwrap(),
                 "{length}"
             );
         }
-        assert_eq!(charges.least(), piece + 6 * tag);
-        assert_eq!(charges.of(Some(1 << 30)), charges.most());
+        assert_eq!(
+            charges.least(),
+            piece + 6 * tag + records(three, 0).unwrap()
+        );
+        // A write of the largest body is charged the most, its records of its blocks with it.
+        let largest = mantle_s3::body::MAX_UPLOAD;
+        assert_eq!(charges.of(Some(largest)), charges.most());
+        assert!(charges.of(Some(1 << 30)) < charges.most());
         // A write holding more blocks going down holds more, a block's copies each; the window
         // of one is what `of` charges.
         assert_eq!(charges.write(1, 4096), charges.of(Some(4096)));
@@ -4620,6 +4636,11 @@ mod tests {
             native(&three, 300_000),
             Some(three.most() + 300_000 + records)
         );
+        // The charge holds a put of the largest body, its window of blocks and its record of each
+        // block it wrote until its file names them.
+        let layout = Layout::new(durability::Scheme::Copies(3)).unwrap();
+        let put = put::most_bytes(1, &layout).unwrap() + put::most_records(&layout).unwrap();
+        assert!(three.most() >= put, "{} {put}", three.most());
         let hosting = stated(1);
         let charges = charges(1, hosting.enlist.as_ref(), &rates(), target(None)).unwrap();
         let derived = derive(hosting, &facts(1), &mut fresh).unwrap();

@@ -337,6 +337,64 @@ pub fn most_commands(layout: &Layout) -> u64 {
     layout.blocks(MAX_UPLOAD).saturating_add(1)
 }
 
+/// std's B-tree, which holds a put's records of the blocks it recorded (`recorded`, `due`), as
+/// rust-lang/rust's `library/alloc/src/collections/btree/node.rs` makes it (read in 1.94.1's and
+/// nightly 2026-09-05's sources, either side of the pinned 1.98.1): a node holds at most
+/// `CAPACITY` entries, 2B - 1 at B 6; every node but the root at least `MIN_LEN_AFTER_SPLIT`,
+/// B - 1, which a split leaves and a removal restores (`fix.rs`); and an internal node `2 * B`
+/// edges beside.
+const NODE_ENTRIES: usize = 11;
+const NODE_LEAST: u64 = 5;
+const NODE_EDGES: usize = 12;
+
+/// The most bytes a node of std's B-tree of `K` keys and `V` values takes, an internal one: its
+/// parent's address, its place there and its length (`LeafNode`'s), its keys and its values each
+/// past at most its alignment's padding, and its edges, all at the node's alignment.
+fn node_bytes<K, V>() -> Option<u64> {
+    let align = align_of::<K>()
+        .max(align_of::<V>())
+        .max(align_of::<usize>());
+    let keys = size_of::<K>().checked_mul(NODE_ENTRIES)?;
+    let values = size_of::<V>().checked_mul(NODE_ENTRIES)?;
+    let node = size_of::<(usize, [u16; 2])>()
+        .checked_add(keys.checked_add(align_of::<K>())?)?
+        .checked_add(values.checked_add(align_of::<V>())?)?
+        .checked_add(size_of::<usize>().checked_mul(NODE_EDGES)?)?
+        .checked_next_multiple_of(align)?;
+    u64::try_from(node).ok()
+}
+
+/// The most bytes a put holds of its records of `blocks` blocks, each kept from the Block range's
+/// answer until its file names it (docs/design/gateway.md §2.2): the block's entry in its map of
+/// blocks recorded and in its index of renewals due, each at a node's bytes over the least entries
+/// every node but a root holds, and each tree's root. A record grows with the body by design; the
+/// body is at most `MAX_UPLOAD`, so the records are too ([`most_records`]).
+pub fn records_bytes(blocks: u64) -> Option<u64> {
+    let trees = [
+        node_bytes::<u64, Recorded>()?,
+        node_bytes::<(u64, u64), ()>()?,
+    ];
+    trees.into_iter().try_fold(0u64, |held, node| {
+        let each = node.checked_div(NODE_LEAST)?.checked_add(1)?;
+        blocks
+            .checked_mul(each)?
+            .checked_add(node)?
+            .checked_add(held)
+    })
+}
+
+/// The most bytes a put of a body of `length` bytes under `layout` holds of its records
+/// ([`records_bytes`]), one a block of the body.
+pub fn records_for(layout: &Layout, length: u64) -> Option<u64> {
+    records_bytes(layout.blocks(length))
+}
+
+/// The most bytes a put under `layout` holds of its records ([`records_bytes`]), its body the
+/// largest a PUT or a part carries (`MAX_UPLOAD`).
+pub fn most_records(layout: &Layout) -> Option<u64> {
+    records_for(layout, MAX_UPLOAD)
+}
+
 /// The most bytes a put holds with `window` blocks going down under `layout`, its blocks the
 /// largest: the segment it seals in; the block filling, or a full one waiting once the window is
 /// full; and each block going down, which a copy shares, and beside which a code keeps its

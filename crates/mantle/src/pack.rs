@@ -20,7 +20,7 @@ use std::fmt;
 use std::io::{Read as _, Write};
 use std::path::{Path, PathBuf};
 
-use crate::files;
+use mantle_node::files;
 
 /// The pack's first bytes.
 const MAGIC: [u8; 8] = *b"MNTLPACK";

@@ -53,7 +53,7 @@ use mantle_meta::root::MAX_DOMAIN;
 use mantle_node::derive::VolumeBytes;
 use mantle_protocol::node_name;
 
-use crate::files;
+use mantle_node::files;
 
 /// RFC 5280 §4.1.2.5: "To indicate that a certificate has no well-defined expiration date, the
 /// notAfter SHOULD be assigned the GeneralizedTime value of 99991231235959Z", in Unix seconds.

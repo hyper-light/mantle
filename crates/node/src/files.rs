@@ -1,11 +1,11 @@
-//! Files `mantle init` keeps, each written whole and durable under a temporary name, then renamed over
-//! its place and its directory flushed (CLAUDE.md §6). Keys (encryption.md §2: the root key "32
-//! bytes created at initialization with owner-only permissions"; the node's and the authority's
-//! private keys) are never readable by another principal, not even for a moment: each is created as
-//! `mantle serve` reads it (`mantle_node::secret`), with mode 0600 on Unix, and on Windows with a
-//! protected DACL that grants its owner and LocalSystem alone and inherits nothing from its
-//! directory, the two principals hyper-seal's check of a key file admits (vendor/hyper-seal
-//! `file_windows.rs`).
+//! Files `mantle init` keeps, and the node's own, each written whole and durable under a temporary
+//! name, then renamed over its place and its directory flushed (CLAUDE.md §6).
+//! Keys (encryption.md §2: the root key "32 bytes created at initialization with owner-only
+//! permissions"; the node's and the authority's private keys) are never readable by another
+//! principal, not even for a moment: each is created as `mantle serve` reads it (`crate::secret`),
+//! with mode 0600 on Unix, and on Windows with a protected DACL that grants its owner and
+//! LocalSystem alone and inherits nothing from its directory, the two principals hyper-seal's check
+//! of a key file admits (vendor/hyper-seal `file_windows.rs`).
 
 use std::fs::File;
 use std::io::Write as _;
@@ -79,7 +79,7 @@ fn keep(path: &Path, bytes: &[u8], secret: bool) -> Result<(), DiskError> {
     }
     {
         let mut file = if secret {
-            mantle_node::secret::create(&temporary).map_err(io("create", &temporary))?
+            crate::secret::create(&temporary).map_err(io("create", &temporary))?
         } else {
             File::create_new(&temporary).map_err(io("create", &temporary))?
         };
@@ -91,10 +91,10 @@ fn keep(path: &Path, bytes: &[u8], secret: bool) -> Result<(), DiskError> {
 }
 
 /// Whether the file at `path` is readable by its owner alone, by the rule `mantle serve` reads a
-/// key by (`mantle_node::secret`).
+/// key by (`crate::secret`).
 pub fn owner_only(path: &Path) -> Result<bool, DiskError> {
     let file = File::open(path).map_err(io("open", path))?;
-    mantle_node::secret::owner_only(&file).map_err(io("read the permissions of", path))
+    crate::secret::owner_only(&file).map_err(io("read the permissions of", path))
 }
 
 #[cfg(test)]

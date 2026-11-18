@@ -32,7 +32,6 @@ mod display;
 mod door;
 mod drive;
 mod durability;
-mod files;
 mod init;
 mod journal;
 mod pack;

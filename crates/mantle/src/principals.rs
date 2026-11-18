@@ -10,7 +10,7 @@
 //!
 //! **A key's secret** leaves the cell once, in the reply that made the key, and is written here
 //! only to the file the operator names, as AWS's shared credentials file under the profile
-//! `mantle init` names, owner-only, written whole and durable (`crate::files`): never to standard
+//! `mantle init` names, owner-only, written whole and durable (`mantle_node::files`): never to standard
 //! output or a log. A key is made only into a file that does not exist yet, and a rotation writes
 //! its new key over the file of the key it replaces, which stays valid until it is revoked, so
 //! clients move to the new key with no request refused (research/91 §4).
@@ -221,7 +221,7 @@ async fn key(
         crate::init::PROFILE,
         secret.as_str()
     ));
-    crate::files::write_secret(file, credentials.as_bytes()).map_err(|e| {
+    mantle_node::files::write_secret(file, credentials.as_bytes()).map_err(|e| {
         Error::Usage(format!(
             "key {id} made, its secret not written to {}: {e}; revoke it with `mantle key revoke {id}`",
             file.display()

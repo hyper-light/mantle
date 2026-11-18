@@ -41,6 +41,7 @@ pub mod command;
 pub mod derive;
 pub mod directory;
 pub mod door;
+pub mod files;
 pub mod frame;
 pub mod history;
 mod labels;

@@ -649,8 +649,12 @@ impl ShardContext {
         if now >= self.due_ns.get() {
             return true;
         }
-        // Told no: the task may go on, and the loop judges its hold from here (`checked_ns`).
+        // Told no: the task may go on, and the loop and the watchdog judge its hold from here (`checked_ns`,
+        // `crate::watch`).
         self.checked_ns.set(now);
+        if let Some(entry) = self.entry {
+            entry.watch.went_on();
+        }
         false
     }
 

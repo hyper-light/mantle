@@ -95,6 +95,93 @@ pub(crate) fn read(handle: u64) -> Option<CpuReading> {
     const NS_PER_MICRO: u64 = 1_000;
     /// Format: microseconds per second.
     const MICROS_PER_SECOND: u64 = 1_000_000;
+    let info = basic_info(handle)?;
+    let micros = |time: libc::time_value_t| {
+        u64::try_from(time.seconds)
+            .ok()?
+            .checked_mul(MICROS_PER_SECOND)?
+            .checked_add(u64::try_from(time.microseconds).ok()?)
+    };
+    micros(info.user_time)?
+        .checked_add(micros(info.system_time)?)?
+        .checked_mul(NS_PER_MICRO)
+        .map(CpuReading::of_time)
+}
+
+/// Whether the thread is runnable (`true`: running, or waiting for a CPU) or waits inside a call (`false`), by its
+/// state in `/proc/self/task/<tid>/stat` (proc(5): `R` running or runnable, `S` sleeping in an interruptible wait,
+/// `D` waiting in an uninterruptible one); `None` for any other state and where the file cannot be read. Read into
+/// this frame's buffers, so it allocates nothing.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn runnable(_handle: u64, os_thread: u64) -> Option<bool> {
+    use std::io::{Read, Write};
+    /// Format: the decimal digits of the largest `u64` (18446744073709551615).
+    const U64_DIGITS: usize = 20;
+    /// Format: the directory of the process's own threads.
+    const TASKS: &str = "/proc/self/task/";
+    /// Format: a thread's status file, after its id.
+    const STAT: &str = "/stat";
+    /// Cited: the bytes of a task's command name, its terminating zero among them (`TASK_COMM_LEN`, Linux
+    /// include/linux/sched.h).
+    const TASK_COMM_LEN: usize = 16;
+    /// Derived: the stat line through its state: the id, " (", the command name, ") " and the state's byte.
+    const STAT_PREFIX: usize = U64_DIGITS + 2 + TASK_COMM_LEN + 2 + 1;
+    if os_thread == 0 {
+        return None;
+    }
+    let mut path = [0u8; TASKS.len() + U64_DIGITS + STAT.len()];
+    let mut cursor = std::io::Cursor::new(&mut path[..]);
+    write!(cursor, "{TASKS}{os_thread}{STAT}").ok()?;
+    let written = usize::try_from(cursor.position()).ok()?;
+    let path = std::str::from_utf8(path.get(..written)?).ok()?;
+    let mut stat = [0u8; STAT_PREFIX];
+    let read = std::fs::File::open(path).ok()?.read(&mut stat).ok()?;
+    let stat = stat.get(..read)?;
+    // The state follows the command name's closing parenthesis and a space; the name may hold either.
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    match stat.get(close.checked_add(2)?)? {
+        b'R' => Some(true),
+        b'S' | b'D' => Some(false),
+        _ => None,
+    }
+}
+
+/// The calling thread's id as `/proc/self/task` names it (gettid(2)); zero where it cannot be taken.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn os_thread() -> u64 {
+    // SAFETY: `gettid` takes no argument, touches no memory of the caller's and always succeeds (gettid(2)).
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    u64::try_from(tid).unwrap_or(0)
+}
+
+/// Whether the thread is runnable (`true`: Mach's `TH_STATE_RUNNING`, running or on a run queue) or waits inside a
+/// call (`false`: `TH_STATE_WAITING` or `TH_STATE_UNINTERRUPTIBLE`), by its run state (`thread_basic_info`);
+/// `None` for any other state and a thread gone.
+#[cfg(all(target_os = "macos", not(miri)))]
+pub(crate) fn runnable(handle: u64, _os_thread: u64) -> Option<bool> {
+    match basic_info(handle)?.run_state {
+        libc::TH_STATE_RUNNING => Some(true),
+        libc::TH_STATE_WAITING | libc::TH_STATE_UNINTERRUPTIBLE => Some(false),
+        _ => None,
+    }
+}
+
+/// The thread's id is not needed where its state is read by its clock's handle, or not read at all.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+pub(crate) fn os_thread() -> u64 {
+    0
+}
+
+/// Windows and the rest do not tell a thread waiting inside a call from a runnable one by a read of another
+/// thread's state here.
+#[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(miri))))]
+pub(crate) fn runnable(_handle: u64, _os_thread: u64) -> Option<bool> {
+    None
+}
+
+/// The basic information (`THREAD_BASIC_INFO`) of the thread `handle` names; `None` for a thread gone.
+#[cfg(all(target_os = "macos", not(miri)))]
+fn basic_info(handle: u64) -> Option<libc::thread_basic_info> {
     if handle & TAG == 0 {
         return None;
     }
@@ -112,19 +199,7 @@ pub(crate) fn read(handle: u64) -> Option<CpuReading> {
             &mut count,
         )
     };
-    if status != libc::KERN_SUCCESS {
-        return None;
-    }
-    let micros = |time: libc::time_value_t| {
-        u64::try_from(time.seconds)
-            .ok()?
-            .checked_mul(MICROS_PER_SECOND)?
-            .checked_add(u64::try_from(time.microseconds).ok()?)
-    };
-    micros(info.user_time)?
-        .checked_add(micros(info.system_time)?)?
-        .checked_mul(NS_PER_MICRO)
-        .map(CpuReading::of_time)
+    (status == libc::KERN_SUCCESS).then_some(info)
 }
 
 /// The calling thread's CPU-clock handle: its thread id, tagged.

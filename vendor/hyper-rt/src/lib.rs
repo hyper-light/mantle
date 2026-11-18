@@ -92,6 +92,7 @@ pub mod udp;
 mod unwind;
 pub mod waker;
 pub mod wakes;
+pub mod watch;
 
 #[cfg(target_os = "windows")]
 mod afd;

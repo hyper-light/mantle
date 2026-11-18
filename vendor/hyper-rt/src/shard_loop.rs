@@ -1881,9 +1881,11 @@ impl Shard {
         self.desk.current.set(word.word());
         self.desk.now_ns.set(start);
         let entered = registry::enter_in(current, &self.desk);
+        self.watch_begin(slot, word.word());
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.poll(&mut cx));
+        self.watch_end();
         drop(entered);
         let ended = self.carried_from(carried).max(start);
         self.desk.current.set(crate::shard::NO_TASK);
@@ -1920,6 +1922,27 @@ impl Shard {
             current,
         );
         ended
+    }
+
+    /// Tells the runtime's watchdog the task `word` in `slot` is being polled, with its spawn site and label
+    /// (`crate::watch`).
+    #[inline(always)]
+    fn watch_begin(&self, slot: u32, word: u64) {
+        if let Some(entry) = self.desk.entry {
+            let (site, label) = self
+                .desk
+                .task(slot)
+                .map_or((None, None), |cell| (cell.site.get(), cell.label.get()));
+            entry.watch.begin(word, site, label);
+        }
+    }
+
+    /// Tells the runtime's watchdog the poll ended.
+    #[inline(always)]
+    fn watch_end(&self) {
+        if let Some(entry) = self.desk.entry {
+            entry.watch.end();
+        }
     }
 
     /// The future of the task in `slot`, taken out of its slot for a poll, with whether the task is a service and

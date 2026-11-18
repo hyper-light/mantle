@@ -351,6 +351,9 @@ fn spawn_retirement<F: FnOnce() + Send + 'static>(body: F) -> std::io::Result<Jo
 /// their slots, and dropping the value detached every worker.
 pub struct Runtime {
     workers: Vec<Worker>,
+    /// The thread that reports a shard held in one poll past its limit ([`crate::watch`]): started once every
+    /// shard is built, stopped once every worker is joined, so it watches a shutdown a held shard delays.
+    watchdog: Option<crate::watch::Watchdog>,
     ids: Vec<ShardId>,
     notes: Vec<String>,
     retirement: Vec<retirement::Owner>,
@@ -373,6 +376,7 @@ impl Drop for Runtime {
         if !self.workers.is_empty() && stop(std::mem::take(&mut self.workers)).is_err() {
             registry::note_unreported_failure();
         }
+        drop(self.watchdog.take());
         // Reapers remain alive through every service-worker join, including driver failure.
         for owner in &mut self.retirement {
             if owner.join().is_err() {
@@ -560,8 +564,18 @@ impl Runtime {
             roll_back(workers, &error);
             return Err(error);
         }
+        let holders: Vec<registry::SlotHolder> =
+            workers.iter().map(|worker| worker.holder).collect();
+        let watchdog = match crate::watch::Watchdog::start(&holders, config) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                roll_back(workers, &error);
+                return Err(error);
+            }
+        };
         Ok(Runtime {
             workers,
+            watchdog: Some(watchdog),
             ids,
             notes,
             retirement: Vec::new(),
@@ -708,6 +722,7 @@ impl Runtime {
     /// slot still given back).
     pub fn shutdown(mut self) -> Result<Vec<Counters>, RtError> {
         let mut result = stop(std::mem::take(&mut self.workers));
+        drop(self.watchdog.take());
         for owner in &mut self.retirement {
             if let Err(error) = owner.join()
                 && result.is_ok()

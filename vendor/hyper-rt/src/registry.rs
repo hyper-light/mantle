@@ -20,7 +20,7 @@
 
 use std::cell::Cell;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::thread::Thread;
 
 use crate::mem::Encoded;
@@ -96,6 +96,13 @@ pub struct Entry {
     /// The shard's long polls by spawn site and label, which only the shard writes and any thread reads
     /// ([`crate::slow`]).
     pub(crate) slow: crate::slow::SlowTable,
+    /// What the shard writes as each poll begins and ends, which its runtime's watchdog reads ([`crate::watch`]).
+    pub(crate) watch: crate::watch::Watch,
+    /// What the watchdog found of the shard, which only it writes and any thread reads ([`crate::watch`]).
+    pub(crate) board: crate::watch::Board,
+    /// The shard thread's id where a reader of its state needs one (Linux's tid, recorded as it starts; zero
+    /// elsewhere): what the watchdog reads to tell a thread waiting inside a call from a runnable one.
+    pub(crate) os_thread: AtomicU64,
     /// Set by the shard at its loop's exit ([`note_exited`]): its rings will never be drained again, so
     /// a sender that finds one full stops spinning and counts the wake stale instead of waiting for a
     /// consumer that is gone (the livelock the registry stress test found on 2026-09-14).
@@ -493,6 +500,9 @@ pub(crate) fn register_runtime_slot(
             parking: Parking::new(),
             pulse: Pulse::default(),
             slow: crate::slow::SlowTable::default(),
+            watch: crate::watch::Watch::default(),
+            board: crate::watch::Board::default(),
+            os_thread: AtomicU64::new(0),
             exited: AtomicBool::new(false),
             abandoned: (0..waits).map(|_| AtomicU64::new(0)).collect(),
             abandoned_summary: (0..waits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
@@ -625,12 +635,59 @@ pub fn with_entry<R>(shard: u16, f: impl FnOnce(&Entry) -> R) -> Option<R> {
     slot.entry.read(f, |entry| slot.free(entry))
 }
 
-/// Records the calling thread's CPU clock on shard `shard`'s entry (the shard's own thread, as it starts).
+/// Records the calling thread's CPU clock, and its id where the watchdog reads its state by one, on shard
+/// `shard`'s entry (the shard's own thread, as it starts).
 pub fn record_cpu_clock(shard: u16) {
-    if let Some(handle) = crate::thread_clock::current() {
-        let _ = with_entry(shard, |entry| {
-            entry.cpu_clock.store(handle, Ordering::Release)
+    let os_thread = crate::thread_clock::os_thread();
+    let handle = crate::thread_clock::current();
+    let _ = with_entry(shard, |entry| {
+        entry.os_thread.store(os_thread, Ordering::Release);
+        if let Some(handle) = handle {
+            entry.cpu_clock.store(handle, Ordering::Release);
+        }
+    });
+}
+
+/// Whether the thread of the shard `holder` names is runnable (`true`: running, or waiting for a CPU) or waits
+/// inside a call (`false`), as the platform tells it now; `None` for a shard gone and where it does not tell.
+pub(crate) fn shard_runnable(holder: SlotHolder) -> Option<bool> {
+    let (clock, os_thread) = with_holder(holder, |entry| {
+        (
+            entry.cpu_clock.load(Ordering::Acquire),
+            entry.os_thread.load(Ordering::Acquire),
+        )
+    })?;
+    crate::thread_clock::runnable(clock, os_thread)
+}
+
+/// A `'static` reference any thread may swap and read without a lock (the watchdog's spawn sites and labels,
+/// [`crate::watch`]): it is only ever stored from a `&'static T`, so every pointer it holds names a value that
+/// lives as long as the program.
+#[derive(Debug)]
+pub(crate) struct StaticCell<T: 'static>(AtomicPtr<T>);
+
+impl<T: 'static> Default for StaticCell<T> {
+    fn default() -> Self {
+        Self(AtomicPtr::new(std::ptr::null_mut()))
+    }
+}
+
+impl<T: Sync + 'static> StaticCell<T> {
+    /// Holds `value` from here.
+    pub(crate) fn store(&self, value: Option<&'static T>, order: Ordering) {
+        let pointer = value.map_or(std::ptr::null_mut(), |value| {
+            std::ptr::from_ref(value).cast_mut()
         });
+        self.0.store(pointer, order);
+    }
+
+    /// What it holds.
+    pub(crate) fn load(&self, order: Ordering) -> Option<&'static T> {
+        let pointer = self.0.load(order).cast_const();
+        // SAFETY: every pointer stored here came from a `&'static T` (`store` takes nothing else, and the field is
+        // this module's alone), so a non-null one names a value that lives as long as the program; `T: Sync`, so a
+        // shared reference to it may be held on any thread, and nothing is written through it.
+        unsafe { pointer.as_ref() }
     }
 }
 

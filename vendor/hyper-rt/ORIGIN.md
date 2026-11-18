@@ -114,3 +114,25 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   its slot until it sets another, where Kiln clears it as each poll begins; Kiln's table of 128
   entries is here the entries one 4 KiB page holds; Kiln's readings of the CPU clock (its step 3)
   are not taken. Tests: `tests/slow_polls.rs`, three unit tests in `slow.rs`.
+
+## Made here: the watchdog, a shard held in one poll seen while it runs (2026-11-18)
+
+- One thread per OS runtime reports a shard held in one poll past `batch` × twice its quantum, once, with
+  the task, its spawn site and label, the hold and whose time it was, into a board on the shard's registry
+  entry that any thread reads with no lock (`src/watch.rs`, docs/runtime.md §3.13; `Entry::watch`,
+  `board`, `os_thread`; `registry::StaticCell`, `shard_runnable`; `thread_clock::runnable`, `os_thread`;
+  `Shard::watch_begin` and `watch_end` around each poll; `ShardContext::wanted`'s go-on and
+  `futures::label` written to the watch; `Runtime`'s `watchdog`, started after every shard is built and
+  joined after every worker). Taken from Kiln's runtime copy (`kiln-rt`'s `watch.rs`, its goal 6 step 2,
+  plan `01a1a59c2abe`; the file as Kiln's `a24bb683f` left it, read at Kiln's `28b6c8ca8c4`): the watch's
+  odd count read whole, the board's report under a sequence count, the verdict from the thread's CPU clock
+  and state, and the thread that allocates nothing once started, as Kiln wrote them. Changed in the port: Kiln's limit is `batch` × the quantum, a task charged by
+  its leaves holding a wanted shard about a quantum (Kiln's own coop budget, not taken); here a task keeps
+  §3.11's contract up to twice the quantum, so the limit is `batch` × that threshold, and a go-on at `wanted`
+  starts a new hold as §3.11's does; the watch carries the spawn site and the label (Kiln's report names
+  the site from a per-slot table and no label); Linux's run state is read from `/proc` into the frame's own
+  buffers; a report read whole retries once, where Kiln's retries without a count; Kiln's cap of five
+  reports a minute a shard (Seastar's default, another system's tuning) is not taken: the store keeps one
+  report, so a reader bounds its own log by how often it reads; Kiln's movable spawns, handed off a held
+  shard, are not taken (mantle's placement, its S3b, asks `watch::stalled` instead). Tests:
+  `tests/watchdog.rs`, `tests/watchdog_ends.rs`, four unit tests in `watch.rs`.

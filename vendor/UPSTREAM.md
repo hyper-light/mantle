@@ -87,9 +87,19 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `41ce087` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
-`17371e2` and two commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
-branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its commits
+**Every crate at `c472c2e` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
+`17371e2` and three commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its third
+commit, `c472c2e`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.13, hyper-rt ORIGIN.md,
+"the watchdog"): each OS runtime runs one watchdog thread that sees a shard held in one poll past
+`batch` × twice its quantum (no step of tasks keeping the long-poll contract holds it longer) while
+the poll still runs, and reports it once, with the task, its spawn site and label, the hold and whose
+time it was (the shard thread's CPU clock over the hold, then its run state on Linux and macOS), on
+a board of fixed size on the shard's registry entry that any thread reads with no lock
+(`watch::stalled`, `stalls`, `report`: one report kept, numbered on); the thread starts once every
+shard is built and is joined at the runtime's shutdown or drop. Every other crate is as at
+`17371e2`. Before it, every crate was at `41ce087` (the same branch: `17371e2` and two commits),
+with no local delta, taken by `scripts/snapshot-hyper-raft.py`. Those commits
 change hyper-rt alone (`1783231`, and `41ce087`, which corrects hyper-rt ORIGIN.md's record of what
 was taken from Kiln's `slow.rs` as written; hyper-raft docs/runtime.md §3.12, hyper-rt ORIGIN.md,
 "what held a shard"): each shard counts its long polls, those held past twice its step quantum since it last let

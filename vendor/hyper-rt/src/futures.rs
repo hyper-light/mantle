@@ -172,6 +172,10 @@ pub fn label(label: Option<&'static crate::slow::Label>) -> Result<(), RtError> 
         let slot = ctx.current_slot().ok_or(RtError::NotOnShardThread)?;
         let cell = ctx.task(slot).ok_or(RtError::NotOnShardThread)?;
         cell.label.set(label);
+        // The runtime's watchdog names the label of a poll it finds held (`crate::watch`).
+        if let Some(entry) = ctx.entry {
+            entry.watch.labelled(label);
+        }
         Ok(())
     })
     .ok_or(RtError::NotOnShardThread)?

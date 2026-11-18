@@ -444,7 +444,7 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `durability.*` | cited, stated | the worst device class's annual failure rate an hour, since a block's chunks land on any device of the cell (`mantle_ec::durability`'s disk rate), with durability.md §5's yearly power-on restart taking a hundredth of the nodes; repair in research 15's day until repair is built and measured; the target S3's 10⁻¹¹ unless stated (`derive::rates`, `derive::target`) |
 | `range.max_entry_bytes` | derived | `mantle_meta::wire::largest_entry_bytes` (replica.md §7) |
 | `range.election_tick`, `range.heartbeat_tick` | cited | focal's 10 and 2 (§2.4), checked though ranges elect by suspicion, which takes no ticks |
-| `range.max_size_per_msg`, `range.max_uncommitted_size`, `range.max_committed_size_per_ready`, `range.max_inflight_msgs` | derived | an entry of the range's largest each append, apply and `Ready`; as many appends out to a follower and entries uncommitted as a range can hold, one an identity of the cell, each asking through one entry out (`ask::Asking`), and one of the leader's own, its term's first entry or a change of configuration (`derive::in_flight`; Ongaro 2014 §3.6.2, §4): no asked entry waits unsent for a follower's round trip and flush, where two out had held each frame to a confirmation of its own and one made every frame wait (raft-log.md §6; research/71, step 9) |
+| `range.max_size_per_msg`, `range.max_uncommitted_size`, `range.max_committed_size_per_ready`, `range.max_inflight_msgs` | derived | an entry of the range's largest each append, apply and `Ready`; as many appends out to a follower and entries uncommitted as a range can hold, `ask::ENTRIES_OUT` an identity of the cell, each asking through as many entries out at once (`ask::Asking`), and one of the leader's own, its term's first entry or a change of configuration (`derive::in_flight`; Ongaro 2014 §3.6.2, §4): no asked entry waits unsent for a follower's round trip and flush, where two out had held each frame to a confirmation of its own and one made every frame wait (raft-log.md §6; research/71, step 9) |
 | `rules.*` | derived | the same on every member, from the cell's identities and the metadata layer's bounds alone (`derive::cell`): a session of each identity for good, as above; an entry carrying every command waiting that fits its bytes, so every command the node's operations wait on shares the next entry's flush (§2.8; replica.md §1; research/71, step 9: one command an entry committed one a Raft round, the cell's writes capped at 20 to 47 a second); their answers kept until the gateway acknowledges them, as many as a session's row holds within the largest row S3 admits, so no page grows, and one at the largest a node's command gets where it keeps no other (`wire::largest_answer_bytes`: a range's lineage at the longest route keys; a sweep sizes its checks to it), a command past them refused before it takes effect and asked again (research/87); a row's key and value at most the longest key S3's names give a row (`key::largest_bytes`) and the largest value a request S3 admits, or a session at its bounds, gives one (`wire::largest_row_bytes`: a version keeping S3's 8 KB of headers at their longest encoding), which every member's engine holds (replica.md §2); the node refuses to start on an engine that does not (`mantle_range::holds_rows`) |
 | `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry with the shell's bytes, its groups (the ranges and the liveness stream's), a checkpoint's cadence and what a group holds uncommitted past it of one `Ready` each (`mantle_range::ready_held`: as many entries as its bytes make of the least entry a range proposes, 13 bytes, and the term's empty first one, and its bytes with each entry's 5-byte shell), a cache of one largest entry a group, and a file holding every group's retention at once beside the least file the log runs in: a `Ready` goes in greedy parts of a frame's room, any two in a row more than a room, each a segment at most (`derive::log`). Before, entries were counted at the shell's 5 bytes, 2.6 times too many, and the file was the least, which one group's retention filled: a write past it is refused `Full`. Its memory: each group's slots, a deque doubled past its retained entries at hyper-log's 56 bytes a slot, its handle's unapplied entries and its cache, one group's slots again while they grow, and ten segments of the log's own buffers (`derive::log_bytes`; `tests/log_memory.rs`: every group at its retention, 112.6 MB at the peak of a 225.9 MB bound) |
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
@@ -2948,15 +2948,25 @@ node's own connection.
 paged read (`crate::read`), with the layer check on reads; a cell of three `mantle node`
 processes hosting the root range and a range of each other layer reads its volume table through
 a client (`crates/mantle/tests/node.rs`). A node's own commands (`Node::command`,
-`crate::ask`): a session registered at first use, an entry out a range at a time carrying the
-commands waiting in order (at most a session's unacknowledged answers, within the range's entry
-bytes), proposed in-process where the node leads, else sent to the leader the node's member or
-the last reply names, or to each node in turn, pausing by RFC 6298's doubling backoff once every
-node was asked; asked again with the same serials when its exchange is lost, and a command whose
-session expired asked again under a new one, in its place. Tested node to node over real
-sockets (`crates/node/tests/cluster.rs`): the gate asked in-process by the leader, puts asked by a
-follower over QUIC, and puts out when the leader is stopped, each answered once with the version
-the client then reads as its key's current. Every entry a node proposes is stamped with its wall
+`crate::ask`): a session registered at first use, up to `ask::ENTRIES_OUT` (two) entries out a
+range at once, as many as the range's log has frames in flight (research/71 step 9; research/87
+§1), each carrying the commands waiting in order (at most a session's unacknowledged answers,
+within the range's entry bytes), so a command asked while one entry is out goes in the next
+rather than waiting out the first's flush, quorum and answer. Each entry out is asked on its
+own: proposed in-process where the node leads, its proposal waiting under its own place
+(`Out::id`), else sent to the leader the node's member or the last reply names, or to each node
+in turn, pausing by RFC 6298's doubling backoff once every node was asked; its reply found by
+its exchange, its answers given to its own commands, asked again with the same serials when its
+exchange is lost, given up at its commands' deadlines or its own clock without a leader, and a
+command whose session expired asked again under a new one, in its place. Entries out together
+keep no order between them, as the range may apply either first: what needs an order waits for
+the answer before it (a PUT's block, file and name commands; the node's statements, one out at
+a time). A range holds uncommitted `ENTRIES_OUT` entries an identity and one of its leader's
+(`derive::in_flight`). Tested node to node over real sockets (`crates/node/tests/cluster.rs`):
+the gate asked in-process by the leader, puts asked by a follower over QUIC, and puts out when
+the leader is stopped, each answered once with the version the client then reads as its key's
+current; and two puts the leader proposes beside each other while cut off, both out at once,
+each answered its own version once the others' new leader is asked. Every entry a node proposes is stamped with its wall
 clock (`Wall`) as the entry's time, the leader's time every command in it takes
 (`mantle_meta::wire::Entry::at_ns`), where before a client's entry kept whatever time its client
 wrote. A node with volumes states its failure domain and the cell's bounds on the table, hosts

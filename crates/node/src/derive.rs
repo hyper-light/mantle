@@ -30,6 +30,7 @@ use mantle_meta::session::Rules;
 use mantle_meta::{key, wire};
 use mantle_range::{ConfState, Range, Settings};
 
+use crate::ask::ENTRIES_OUT;
 use crate::node::Hosted;
 use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig, S3Stated};
 use crate::storage::VolumeSettings;
@@ -780,18 +781,21 @@ pub fn cell(identities: u64) -> Result<(Settings, Rules), DeriveError> {
 }
 
 /// The entries a range of a cell of `identities` holds uncommitted at most, and so the appends its
-/// leader may keep out to each follower: one an identity, as each asks a range through one entry
-/// out at a time (`ask::Asking::next_entry`, a node's and a gateway's alike), and one the leader
-/// appends of its own, its term's first entry or a change of its configuration (Ongaro 2014, §3.6.2
-/// and §4). More would never be sent; fewer leaves an asked entry unsent while a follower's round
-/// trip and flush answer the last, where two had held every frame to a confirmation of its own
-/// (research/71, step 9). Bytes stay bounded at as many of the range's largest entries
-/// (`max_uncommitted_size`). A proposal past them, a copy asked again while its first is
-/// uncommitted, is refused by the core and asked again.
+/// leader may keep out to each follower: [`ENTRIES_OUT`] an identity, as each asks a range through
+/// at most as many entries out at once (`ask::Asking::another_entry`), and one the leader appends
+/// of its own, its term's first entry or a change of its configuration (Ongaro 2014, §3.6.2 and
+/// §4). More would never be sent; fewer leaves an asked entry unsent, refused for the uncommitted
+/// bound, while a follower's round trip and flush answer the last, where two had held every frame
+/// to a confirmation of its own (research/71, step 9). Bytes stay bounded at as many of the range's
+/// largest entries (`max_uncommitted_size`). A proposal past them, a copy asked again while its
+/// first is uncommitted, is refused by the core and asked again.
 pub fn in_flight(identities: u64) -> Result<u64, DeriveError> {
+    let overflow = || DeriveError::Overflow("the appends out");
+    let out = u64::try_from(ENTRIES_OUT).map_err(|_| overflow())?;
     identities
-        .checked_add(1)
-        .ok_or(DeriveError::Overflow("the appends out"))
+        .checked_mul(out)
+        .and_then(|entries| entries.checked_add(1))
+        .ok_or_else(overflow)
 }
 
 /// The message bounds every node of a cell states, which a client of its ranges states the same:
@@ -2618,9 +2622,9 @@ fn say_cell(said: &mut Said, settings: &Settings, rules: &Rules) {
         "range.max_inflight_msgs",
         settings.max_inflight_msgs,
         Kind::Derived,
-        "an append out to a follower for each entry a range can hold uncommitted: one an identity \
-         of the cell, each asking through one entry out, and one of the leader's own \
-         (derive::in_flight)",
+        "an append out to a follower for each entry a range can hold uncommitted: ask::ENTRIES_OUT \
+         an identity of the cell, each asking through as many entries out, and one of the \
+         leader's own (derive::in_flight)",
     );
     said.add(
         "range.max_uncommitted_size",
@@ -3147,9 +3151,9 @@ mod tests {
         let entry = u64::try_from(wire::largest_entry_bytes().unwrap()).unwrap();
         assert_eq!(settings.max_entry_bytes, entry);
         assert_eq!(settings.max_size_per_msg, entry);
-        // An entry out for each of the seven identities, and one of the leader's own.
-        assert_eq!(settings.max_inflight_msgs, 8);
-        assert_eq!(settings.max_uncommitted_size, entry * 8);
+        // Two entries out for each of the seven identities, and one of the leader's own.
+        assert_eq!(settings.max_inflight_msgs, 15);
+        assert_eq!(settings.max_uncommitted_size, entry * 15);
         // A session's row is a row the range already admits, so no page grows, and holds one
         // answer at the largest a node's command gets.
         assert_eq!(rules.max_value_bytes, wire::largest_row_bytes().unwrap());

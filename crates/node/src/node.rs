@@ -55,7 +55,8 @@ use mantle_range::membership::{Next, Replacement};
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
 use crate::ask::{
-    Asking, CommandAsk, CommandOutcome, ReadAsk, ReadOut, ReadOutcome, Via, Wait, Wanted,
+    Asking, CommandAsk, CommandOutcome, ENTRIES_OUT, ReadAsk, ReadOut, ReadOutcome, Via, Wait,
+    Wanted,
 };
 use crate::chunk;
 use crate::command;
@@ -695,11 +696,18 @@ enum ReadOrigin {
     Own(ReadAsk),
 }
 
+/// Whom an entry this node's member proposed is answered to: a peer's exchange, or this node's
+/// own entry out to the range, by its place among the entries out (`ask::Out::id`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandOrigin {
+    Exchange(ExchangeId),
+    Own(u64),
+}
+
 /// A command this node's member of `group` proposed as leader, waiting for its entry to apply:
 /// each command's session and serial, in the entry's order, with its answer once applied.
 struct Commanded {
-    /// The exchange its asker waits on, or none for one this node asked itself.
-    exchange: Option<ExchangeId>,
+    origin: CommandOrigin,
     group: u128,
     commands: Vec<(u64, u64, Option<Answer>)>,
 }
@@ -1506,10 +1514,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .asking
                 .iter()
                 .filter(|a| a.group == group)
-                .filter_map(|a| {
-                    let out = a.out.as_ref()?;
-                    let since = out.leaderless_since.filter(|_| a.holds_request());
-                    Some((out.via, since, a.backoff, a.stated_patience_ns))
+                .flat_map(|a| {
+                    a.outs.iter().map(|out| {
+                        let since = out.leaderless_since.filter(|_| a.holds_request());
+                        (out.via, since, a.backoff, a.stated_patience_ns)
+                    })
                 })
                 .chain(self.reads_out.iter().filter(|r| r.group == group).map(|r| {
                     let since = r.leaderless_since.filter(|_| r.wait == Wait::Request);
@@ -2296,7 +2305,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.give_back(exchange);
                 self.receiving.retain(|r| r.exchange != exchange);
                 self.writing.retain(|w| w.exchange != exchange);
-                self.commanded.retain(|c| c.exchange != Some(exchange));
+                self.commanded
+                    .retain(|c| c.origin != CommandOrigin::Exchange(exchange));
                 self.reading
                     .retain(|r| r.origin != ReadOrigin::Exchange(exchange));
                 self.ask_lost(exchange);
@@ -3140,7 +3150,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match self.propose(group, &mut entry) {
             Ok(()) => {
                 self.commanded.push(Commanded {
-                    exchange: Some(exchange),
+                    origin: CommandOrigin::Exchange(exchange),
                     group,
                     commands: entry
                         .commands
@@ -3649,7 +3659,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 // node's next registration there ends: the ranges kept are no more than the
                 // commands held.
                 if self.asking.len() >= self.command_asks {
-                    self.asking.retain(|a| a.held() > 0 || a.out.is_some());
+                    self.asking.retain(|a| a.held() > 0 || !a.outs.is_empty());
                 }
                 self.asking.push(Asking::new(group, bounds::initial_pto()));
                 self.asking.len().saturating_sub(1)
@@ -3691,88 +3701,107 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The commands this node asks itself, at a turn: those past their deadline answered so, each
-    /// range's next entry made, and each entry not out asked.
+    /// range's next entries made, as many as may be out at once ([`ENTRIES_OUT`]), and each entry
+    /// not out asked, every entry out judged on its own.
     fn step_asks(&mut self, now: u64) -> Result<(), NodeError> {
         let limits = self.entry_bytes();
         for at in 0..self.asking.len() {
             let Some(asking) = self.asking.get_mut(at) else {
                 continue;
             };
-            let via = asking.out.as_ref().map(|o| o.via);
-            if asking.expire(now, &mut self.commands_done) {
-                match via {
-                    Some(Via::Exchange { exchange, .. }) => self.driver.endpoint().end(exchange),
-                    Some(Via::Local) => {
-                        let group = asking.group;
-                        self.commanded
-                            .retain(|c| c.exchange.is_some() || c.group != group);
-                    }
-                    Some(Via::Unasked | Via::Paused { .. }) | None => {}
-                }
-            }
-            let nth = self.next_nonce;
-            let nonce = self.id.rotate_left(32) ^ nth;
-            let Some(asking) = self.asking.get_mut(at) else {
-                continue;
-            };
-            if asking.out.is_none() && !asking.waiting.is_empty() {
+            let group = asking.group;
+            let given_up = asking.expire(now, &mut self.commands_done);
+            self.end_asked(group, &given_up);
+            for _ in 0..ENTRIES_OUT {
+                let nth = self.next_nonce;
+                let Some(asking) = self.asking.get_mut(at).filter(|a| a.room()) else {
+                    break;
+                };
                 // Each new entry draws the next, which places a registration among the run's.
                 self.next_nonce = nth.checked_add(1).ok_or(NodeError::Registrations(nth))?;
+                let nonce = self.id.rotate_left(32) ^ nth;
+                let owner = (self.id, self.run, nth);
+                asking.another_entry(limits, owner, nonce, &mut self.commands_done);
             }
-            let owner = (self.id, self.run, nth);
-            asking.next_entry(limits, owner, nonce, &mut self.commands_done);
-            // Waited the range's budget without a leader that can serve it (node.md §5.4): every
-            // command a request waits on answered as past its deadline, each of which may still
-            // apply, once (`Asking::unled`).
-            let unled = self.asking.get(at).and_then(|a| {
-                let out = a.out.as_ref()?;
-                Some(self.unled(
-                    a.group,
-                    out.via,
-                    out.leaderless_since,
-                    a.stated_patience_ns,
-                    now,
-                ))
-            });
+            // Waited the range's budget without a leader that can serve an entry (node.md §5.4):
+            // every command a request waits on answered as past its deadline, each of which may
+            // still apply, once (`Asking::unled`). Each entry's clock is its own.
+            let judged: Vec<(u64, Option<u64>, bool)> = self
+                .asking
+                .get(at)
+                .into_iter()
+                .flat_map(|a| {
+                    a.outs.iter().map(|out| {
+                        let stated = a.stated_patience_ns;
+                        let (since, spent) =
+                            self.unled(group, out.via, out.leaderless_since, stated, now);
+                        (out.id, since, spent)
+                    })
+                })
+                .collect();
             let Some(asking) = self.asking.get_mut(at) else {
                 continue;
             };
-            let group = asking.group;
-            if let Some((since, spent)) = unled {
-                let local = asking.out.as_ref().is_some_and(|o| o.via == Via::Local);
-                if let Some(out) = asking.out.as_mut() {
+            let mut spent = Vec::new();
+            for (id, since, spent_now) in judged {
+                if let Some(out) = asking.out_mut(id) {
                     out.leaderless_since = since;
                 }
-                if spent && asking.unled(&mut self.commands_done) && local {
-                    self.commanded
-                        .retain(|c| c.exchange.is_some() || c.group != group);
+                if spent_now {
+                    spent.push(id);
                 }
             }
-            let due = match asking.out.as_ref().map(|o| o.via) {
-                Some(Via::Unasked) => true,
-                // A pause for want of a leader ends once this node's own member names one.
-                Some(Via::Paused { at_ns, leaderless }) => {
-                    at_ns <= now || (leaderless && self.leader_of(group) != 0)
-                }
-                Some(Via::Local | Via::Exchange { .. }) | None => false,
-            };
-            if due {
-                self.ask_entry(at, now)?;
+            if !spent.is_empty() {
+                let given_up = asking.unled(&spent, &mut self.commands_done);
+                self.end_asked(group, &given_up);
+            }
+            let due: Vec<u64> = self
+                .asking
+                .get(at)
+                .into_iter()
+                .flat_map(|a| &a.outs)
+                .filter(|o| match o.via {
+                    Via::Unasked => true,
+                    // A pause for want of a leader ends once this node's own member names one.
+                    Via::Paused { at_ns, leaderless } => {
+                        at_ns <= now || (leaderless && self.leader_of(group) != 0)
+                    }
+                    Via::Local | Via::Exchange { .. } => false,
+                })
+                .map(|o| o.id)
+                .collect();
+            for id in due {
+                self.ask_entry(at, id, now)?;
             }
         }
         Ok(())
     }
 
-    /// Asks range `at`'s entry out: proposed to this node's own member when it leads the range,
-    /// else sent to the node the member, or the last reply, names as leader, or to the next node in
-    /// turn; once every node was asked this round and none answered, asked again after a pause.
-    fn ask_entry(&mut self, at: usize, now: u64) -> Result<(), NodeError> {
+    /// Ends the asking of `group`'s entries out given up: the exchange one is out on ended, the
+    /// proposal of this node's own member no longer waited for.
+    fn end_asked(&mut self, group: u128, given_up: &[(u64, Via)]) {
+        for &(id, via) in given_up {
+            match via {
+                Via::Exchange { exchange, .. } => self.driver.endpoint().end(exchange),
+                Via::Local => self
+                    .commanded
+                    .retain(|c| c.group != group || c.origin != CommandOrigin::Own(id)),
+                Via::Unasked | Via::Paused { .. } => {}
+            }
+        }
+    }
+
+    /// Asks range `at`'s entry out `id`: proposed to this node's own member when it leads the
+    /// range, else sent to the node the member, or the last reply, names as leader, or to the next
+    /// node in turn; once every node was asked this round and none answered, asked again after a
+    /// pause.
+    fn ask_entry(&mut self, at: usize, id: u64, now: u64) -> Result<(), NodeError> {
         let Some(group) = self.asking.get(at).map(|a| a.group) else {
             return Ok(());
         };
         let known = self.leader_of(group);
         if known == self.id {
-            return self.propose_own(at, now);
+            return self.propose_own(at, id, now);
         }
         let nodes = self.remotes.len().max(1);
         let Some(asking) = self.asking.get_mut(at) else {
@@ -3780,7 +3809,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         if asking.tried >= nodes {
             asking.tried = 0;
-            pause(self.id, asking, now, true);
+            pause(self.id, asking, id, now, true);
             return Ok(());
         }
         let next = self
@@ -3797,11 +3826,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // one would hold the entry out until its idle timeout; the pause ends as soon as this
             // node's own member names a leader.
             asking.tried = 0;
-            pause(self.id, asking, now, true);
+            pause(self.id, asking, id, now, true);
             return Ok(());
         }
         asking.tried = asking.tried.saturating_add(1);
-        let Some(out) = asking.out.as_mut() else {
+        let Some(out) = asking.out_mut(id) else {
             return Ok(());
         };
         let body = out
@@ -3840,14 +3869,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Proposes range `at`'s entry out to this node's own member, which leads the range, and keeps
-    /// it until its entry applies (`reply_commands`); one the member does not take now (its log or
-    /// its uncommitted bound full, or no longer leading) is asked again after a pause.
-    fn propose_own(&mut self, at: usize, now: u64) -> Result<(), NodeError> {
-        let Some(mut out) = self.asking.get_mut(at).and_then(|a| a.out.take()) else {
-            return Ok(());
-        };
-        let Some(group) = self.asking.get(at).map(|a| a.group) else {
+    /// Proposes range `at`'s entry out `id` to this node's own member, which leads the range, and
+    /// keeps it, in its place among the entries out, until its entry applies (`reply_commands`);
+    /// one the member does not take now (its log or its uncommitted bound full, or no longer
+    /// leading) is asked again after a pause.
+    fn propose_own(&mut self, at: usize, id: u64, now: u64) -> Result<(), NodeError> {
+        let Some((group, place, mut out)) = self.asking.get_mut(at).and_then(|a| {
+            let place = a.outs.iter().position(|o| o.id == id)?;
+            Some((a.group, place, a.outs.remove(place)?))
+        }) else {
             return Ok(());
         };
         let proposed = self.propose(group, &mut out.entry);
@@ -3865,31 +3895,34 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 out.via = Via::Local;
                 // Its wait for a quorum's commit, counted where nothing here judges (`unled`).
                 out.leaderless_since.get_or_insert(now);
-                asking.out = Some(out);
+                asking.outs.insert(place, out);
                 self.commanded.push(Commanded {
-                    exchange: None,
+                    origin: CommandOrigin::Own(id),
                     group,
                     commands,
                 });
             }
             Err(NodeError::Range(mantle_range::ReplicaError::EntryTooLarge { .. })) => {
-                asking.out = Some(out);
-                asking.refused(command::Status::Malformed, &mut self.commands_done);
+                asking.outs.insert(place, out);
+                asking.refused_entry(id, command::Status::Malformed, &mut self.commands_done);
             }
             Err(_) => {
                 // The member takes no entry now: the time without a leader that serves it counted.
                 out.leaderless_since.get_or_insert(now);
-                asking.out = Some(out);
-                pause(self.id, asking, now, false);
+                asking.outs.insert(place, out);
+                pause(self.id, asking, id, now, false);
             }
         }
         Ok(())
     }
 
-    /// The range whose entry out is on `exchange`.
-    fn asking_on(&self, exchange: ExchangeId) -> Option<usize> {
-        self.asking.iter().position(|a| {
-            matches!(a.out.as_ref().map(|o| o.via), Some(Via::Exchange { exchange: e, .. }) if e == exchange)
+    /// The range, and its entry out, on `exchange`.
+    fn asking_on(&self, exchange: ExchangeId) -> Option<(usize, u64)> {
+        self.asking.iter().enumerate().find_map(|(at, a)| {
+            a.outs
+                .iter()
+                .find(|o| matches!(o.via, Via::Exchange { exchange: e, .. } if e == exchange))
+                .map(|o| (at, o.id))
         })
     }
 
@@ -3903,7 +3936,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         body: u64,
         now: u64,
     ) -> Result<(), NodeError> {
-        let Some(at) = self.asking_on(exchange) else {
+        let Some((at, id)) = self.asking_on(exchange) else {
             return Ok(());
         };
         let endpoint = self.driver.endpoint();
@@ -3911,7 +3944,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(asking) = self.asking.get_mut(at) else {
             return Ok(());
         };
-        let Some(Via::Exchange { peer, .. }) = asking.out.as_ref().map(|o| o.via) else {
+        let Some(Via::Exchange { peer, .. }) = asking.out_mut(id).map(|o| o.via) else {
             return Ok(());
         };
         let status = head
@@ -3930,7 +3963,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         endpoint.end(exchange);
         let unasked = |asking: &mut Asking| {
-            if let Some(out) = asking.out.as_mut() {
+            if let Some(out) = asking.out_mut(id) {
                 out.via = Via::Unasked;
             }
         };
@@ -3945,23 +3978,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 asking.leader = None;
                 unasked(asking);
             }
-            command::Status::Refused => pause(self.id, asking, now, false),
-            status => asking.refused(status, &mut self.commands_done),
+            command::Status::Refused => pause(self.id, asking, id, now, false),
+            status => asking.refused_entry(id, status, &mut self.commands_done),
         }
         Ok(())
     }
 
-    /// The answers to the entry this node asked on `exchange`, read whole.
+    /// The answers to the entry this node asked on `exchange`, read whole: its own commands'.
     fn answers_came(&mut self, exchange: ExchangeId, bytes: &[u8]) {
-        let Some(at) = self.asking_on(exchange) else {
+        let Some((at, id)) = self.asking_on(exchange) else {
             return;
         };
         let Some(asking) = self.asking.get_mut(at) else {
             return;
         };
         match command::decode_answers(bytes) {
-            Ok(answers) => asking.answered(answers, &mut self.commands_done),
-            Err(_) => asking.refused(command::Status::Malformed, &mut self.commands_done),
+            Ok(answers) => asking.answered_entry(id, answers, &mut self.commands_done),
+            Err(_) => {
+                asking.refused_entry(id, command::Status::Malformed, &mut self.commands_done);
+            }
         }
     }
 
@@ -3981,16 +4016,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             out.via = Via::Unasked;
             return;
         }
-        let Some(at) = self.asking_on(exchange) else {
+        let Some((at, id)) = self.asking_on(exchange) else {
             return;
         };
         if let Some(asking) = self.asking.get_mut(at) {
-            if let Some(Via::Exchange { peer, .. }) = asking.out.as_ref().map(|o| o.via)
+            if let Some(Via::Exchange { peer, .. }) = asking.out_mut(id).map(|o| o.via)
                 && asking.leader == Some(peer)
             {
                 asking.leader = None;
             }
-            if let Some(out) = asking.out.as_mut() {
+            if let Some(out) = asking.out_mut(id) {
                 out.via = Via::Unasked;
             }
         }
@@ -4317,27 +4352,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .min()
     }
 
-    /// When the commands this node asks itself next need a turn: an entry to ask now or after its
-    /// pause, or a deadline.
+    /// When the commands this node asks itself next need a turn: an entry to make, or one to ask
+    /// now or after its pause, or a deadline.
     fn asks_due(&self, now: u64) -> Option<u64> {
         self.asking
             .iter()
             .filter_map(|a| {
-                let asked = match a.out.as_ref().map(|o| o.via) {
-                    Some(Via::Unasked) => Some(now),
-                    Some(Via::Paused { at_ns, .. }) => Some(at_ns),
-                    Some(Via::Local | Via::Exchange { .. }) => None,
-                    None if a.waiting.is_empty() => None,
-                    None => Some(now),
-                };
-                // Or the range's budget spent without a leader that can serve its entry, which ends
-                // what requests wait on and starts the clock of the node's own again.
-                let unled = a.out.as_ref().and_then(|o| {
-                    self.unled_end(a.group, o.via, o.leaderless_since, a.stated_patience_ns)
+                let made = if a.room() { Some(now) } else { None };
+                let outs = a.outs.iter().filter_map(|o| {
+                    let asked = match o.via {
+                        Via::Unasked => Some(now),
+                        Via::Paused { at_ns, .. } => Some(at_ns),
+                        Via::Local | Via::Exchange { .. } => None,
+                    };
+                    // Or the range's budget spent without a leader that can serve the entry, which
+                    // ends what requests wait on and starts the clock of the node's own again.
+                    let unled =
+                        self.unled_end(a.group, o.via, o.leaderless_since, a.stated_patience_ns);
+                    asked.into_iter().chain(unled).min()
                 });
-                [asked, unled, a.next_deadline()]
+                [made, a.next_deadline()]
                     .into_iter()
                     .flatten()
+                    .chain(outs)
                     .min()
             })
             .min()
@@ -4394,20 +4431,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             }
             let c = self.commanded.swap_remove(at);
-            let Some(exchange) = c.exchange else {
-                // One this node asked itself: answered, or asked again of the leader there is now,
-                // its serials the same.
-                if let Some(asking) = self.asking.iter_mut().find(|a| a.group == c.group) {
-                    if answered {
-                        let answers = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
-                        asking.answered(answers, &mut self.commands_done);
-                    } else if let Some(out) = asking.out.as_mut()
-                        && out.via == Via::Local
-                    {
-                        out.via = Via::Unasked;
+            let exchange = match c.origin {
+                CommandOrigin::Exchange(exchange) => exchange,
+                // One this node asked itself: its own entry answered, or asked again of the leader
+                // there is now, its serials the same.
+                CommandOrigin::Own(id) => {
+                    if let Some(asking) = self.asking.iter_mut().find(|a| a.group == c.group) {
+                        if answered {
+                            let answers =
+                                c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
+                            asking.answered_entry(id, answers, &mut self.commands_done);
+                        } else if let Some(out) = asking.out_mut(id)
+                            && out.via == Via::Local
+                        {
+                            out.via = Via::Unasked;
+                        }
                     }
+                    continue;
                 }
-                continue;
             };
             if !answered {
                 self.redirect(exchange, c.group)?;
@@ -4517,13 +4558,14 @@ fn waits_until(now: u64, remaining_ns: u64) -> u64 {
     now.saturating_add(wait)
 }
 
-/// Pauses `asking`'s entry out: no node named a leader this round (`leaderless`), or the leader
-/// refused it for room. RFC 6298 §5.5's doubling backoff, at most the idle timeout
+/// Pauses `asking`'s entry out `id`: no node named a leader this round (`leaderless`), or the
+/// leader refused it for room. RFC 6298 §5.5's doubling backoff, at most the idle timeout
 /// (`bounds::backed_off`), each pause drawn between its half and its whole (`bounds::pause`) so
-/// nodes do not ask again in step.
-fn pause(local: u64, asking: &mut Asking, now: u64, leaderless: bool) {
+/// nodes do not ask again in step. The range's backoff is its entries' alike: a pause says what
+/// the range did, whichever entry found it.
+fn pause(local: u64, asking: &mut Asking, id: u64, now: u64, leaderless: bool) {
     let at_ns = paused_until(local, (&mut asking.backoff, &mut asking.pauses), now);
-    if let Some(out) = asking.out.as_mut() {
+    if let Some(out) = asking.out_mut(id) {
         out.via = Via::Paused { at_ns, leaderless };
         if leaderless {
             out.leaderless_since.get_or_insert(now);

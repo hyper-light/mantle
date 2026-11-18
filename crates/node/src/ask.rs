@@ -1,10 +1,10 @@
 //! The commands a node asks of the cell's ranges itself (docs/design/node.md §6.6): its enlistment
 //! in the root range, and the gateway host's requests after it (§5.1). A range's commands are asked
-//! within a session the node registers with the range at first use, an entry out at a time or as
-//! many as the range's log has frames in flight ([`ENTRIES_OUT`]), the commands waiting taken into
-//! the next entry in the order they were asked, each a serial of the session (replica.md §1). An
-//! entry asked again after its exchange was lost carries the same serials, which the range answers
-//! from what the session keeps without applying them twice.
+//! within a session the node registers with the range at first use, as many entries out at once as
+//! the range's log has frames in flight ([`ENTRIES_OUT`]), each asked on its own, the commands
+//! waiting taken into the next entry in the order they were asked, each a serial of the session
+//! (replica.md §1). An entry asked again after its exchange was lost carries the same serials,
+//! which the range answers from what the session keeps without applying them twice.
 //!
 //! What is here decides what an entry carries and what its answers mean; the node asks it, of its
 //! own member when that leads the range, or of a peer over the request class
@@ -159,11 +159,8 @@ pub(crate) struct Asking {
     pub session: u64,
     pub next_serial: u64,
     pub waiting: VecDeque<Wanted>,
-    /// The oldest entry out.
-    pub out: Option<Out>,
-    /// The entries out after `out`, oldest first: with it at most [`ENTRIES_OUT`], and none while
-    /// it is none.
-    pub later: VecDeque<Out>,
+    /// The entries out, oldest first: at most [`ENTRIES_OUT`], each asked on its own.
+    pub outs: VecDeque<Out>,
     /// The place the next entry out takes ([`Out::id`]).
     next_out: u64,
     pub leader: Option<PeerId>,
@@ -182,8 +179,7 @@ impl Asking {
             session: 0,
             next_serial: 1,
             waiting: VecDeque::new(),
-            out: None,
-            later: VecDeque::new(),
+            outs: VecDeque::with_capacity(ENTRIES_OUT),
             next_out: 0,
             leader: None,
             tried: 0,
@@ -193,14 +189,10 @@ impl Asking {
         }
     }
 
-    /// The entries out, oldest first.
-    fn outs(&self) -> impl Iterator<Item = &Out> {
-        self.out.iter().chain(&self.later)
-    }
-
     /// The commands this range holds for the node: waiting and out.
     pub fn held(&self) -> usize {
-        self.outs()
+        self.outs
+            .iter()
             .map(|o| match &o.carried {
                 Carried::Commands(commands) => commands.len(),
                 Carried::Registration { .. } => 0,
@@ -211,7 +203,8 @@ impl Asking {
     /// Whether a request waits on what the range holds: an entry out's commands, or one waiting.
     pub fn holds_request(&self) -> bool {
         let out = self
-            .outs()
+            .outs
+            .iter()
             .any(|o| matches!(o.carried, Carried::Commands(_)) && o.wait == Wait::Request);
         out || self.waiting.iter().any(|w| w.wait == Wait::Request)
     }
@@ -229,7 +222,8 @@ impl Asking {
     /// ahead of it acknowledges none of that one's answers, which the range keeps for its copies.
     fn unanswered(&self) -> u64 {
         let out = self
-            .outs()
+            .outs
+            .iter()
             .flat_map(|o| &o.entry.commands)
             .filter(|c| c.session == self.session)
             .map(|c| c.serial);
@@ -240,21 +234,22 @@ impl Asking {
             .fold(self.next_serial, u64::min)
     }
 
-    /// The next entry, when none is out and a command waits ([`Self::another_entry`]).
-    pub fn next_entry(
-        &mut self,
-        max_entry_bytes: usize,
-        owner: (u64, u64, u64),
-        nonce: u64,
-        refused: &mut Vec<(CommandAsk, CommandOutcome)>,
-    ) {
-        if self.out.is_none() {
-            self.another_entry(max_entry_bytes, owner, nonce, refused);
-        }
+    /// Whether another entry goes out now ([`Self::another_entry`]): fewer than [`ENTRIES_OUT`]
+    /// are, a command waits, and no registration is out while the range holds no session for the
+    /// node, since the session its answer opens is every entry's after: one registration out at a
+    /// time.
+    pub fn room(&self) -> bool {
+        self.outs.len() < ENTRIES_OUT
+            && !self.waiting.is_empty()
+            && (self.session != 0
+                || !self
+                    .outs
+                    .iter()
+                    .any(|o| matches!(o.carried, Carried::Registration { .. })))
     }
 
-    /// The next entry, beside those out, while fewer than [`ENTRIES_OUT`] are and a command
-    /// waits: the session's registration first, unless one is out, as `owner` (the node, as it
+    /// The next entry, beside those out, while there is room for it ([`Self::room`]): the
+    /// session's registration first, as `owner` (the node, as it
     /// authenticates) in its `run`, placed at `nth` among the run's registrations, under `nonce`;
     /// then the leading run of waiting commands that wait for the same, as many as fit
     /// `max_entry_bytes` once encoded, each under the serial it was given or the next, no count
@@ -268,17 +263,10 @@ impl Asking {
         nonce: u64,
         refused: &mut Vec<(CommandAsk, CommandOutcome)>,
     ) {
-        if self.outs().count() >= ENTRIES_OUT || self.waiting.is_empty() {
+        if !self.room() {
             return;
         }
         if self.session == 0 {
-            // One registration out at a time: the session its answer opens is every entry's after.
-            if self
-                .outs()
-                .any(|o| matches!(o.carried, Carried::Registration { .. }))
-            {
-                return;
-            }
             let entry = Entry {
                 at_ns: 0,
                 commands: vec![Sessioned {
@@ -365,29 +353,18 @@ impl Asking {
             wait,
         };
         self.next_out = self.next_out.wrapping_add(1);
-        if self.out.is_none() {
-            self.out = Some(out);
-        } else {
-            self.later.push_back(out);
-        }
+        self.outs.push_back(out);
     }
 
-    /// Takes entry out `id`; the one after it is the oldest if it was.
-    fn take_out(&mut self, id: u64) -> Option<Out> {
-        if self.out.as_ref().is_some_and(|o| o.id == id) {
-            let out = self.out.take();
-            self.out = self.later.pop_front();
-            return out;
-        }
-        let at = self.later.iter().position(|o| o.id == id)?;
-        self.later.remove(at)
+    /// Entry out `id`.
+    pub fn out_mut(&mut self, id: u64) -> Option<&mut Out> {
+        self.outs.iter_mut().find(|o| o.id == id)
     }
 
-    /// The oldest entry out was answered ([`Self::answered_entry`]).
-    pub fn answered(&mut self, answers: Vec<Answer>, done: &mut Vec<(CommandAsk, CommandOutcome)>) {
-        if let Some(id) = self.out.as_ref().map(|o| o.id) {
-            self.answered_entry(id, answers, done);
-        }
+    /// Takes entry out `id`, those after it keeping their order.
+    pub fn take_out(&mut self, id: u64) -> Option<Out> {
+        let at = self.outs.iter().position(|o| o.id == id)?;
+        self.outs.remove(at)
     }
 
     /// Entry out `id` was answered with `answers`, one for each of its commands, in its order:
@@ -476,17 +453,6 @@ impl Asking {
         }
     }
 
-    /// The oldest entry out was refused ([`Self::refused_entry`]).
-    pub fn refused(
-        &mut self,
-        status: command::Status,
-        done: &mut Vec<(CommandAsk, CommandOutcome)>,
-    ) {
-        if let Some(id) = self.out.as_ref().map(|o| o.id) {
-            self.refused_entry(id, status, done);
-        }
-    }
-
     /// Entry out `id` was refused for what it is, and none of it applied: each of its commands
     /// answered so, a registration asked again.
     pub fn refused_entry(
@@ -508,9 +474,13 @@ impl Asking {
 
     /// The commands past their deadline at `now_ns`: those waiting are answered so and leave;
     /// each entry out whose every command is past it is given up, since one that may still apply
-    /// is told to its caller as such, and a registration nothing waits for any more. Whether an
-    /// entry out was given up, whose asking then ends.
-    pub fn expire(&mut self, now_ns: u64, done: &mut Vec<(CommandAsk, CommandOutcome)>) -> bool {
+    /// is told to its caller as such, and a registration nothing waits for any more. The entries
+    /// given up, each its place and how it was being asked, whose asking then ends.
+    pub fn expire(
+        &mut self,
+        now_ns: u64,
+        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+    ) -> Vec<(u64, Via)> {
         let mut kept = VecDeque::with_capacity(self.waiting.len());
         for wanted in self.waiting.drain(..) {
             if wanted.deadline_ns <= now_ns {
@@ -529,12 +499,17 @@ impl Asking {
         })
     }
 
-    /// Its range's budget without a leader that can serve it spent (node.md §5.4): each command a
-    /// request waits on answered as past its deadline, which may still apply, once, and each entry
-    /// out given up that carries them, or is a registration no command waits for now. Whether an
-    /// entry out was given up. An entry the node states of its own is asked on, its clock
-    /// started again: the range's laws decide when it is answered.
-    pub fn unled(&mut self, done: &mut Vec<(CommandAsk, CommandOutcome)>) -> bool {
+    /// Its range's budget without a leader that can serve it spent on the entries out `spent`
+    /// names (node.md §5.4): each command a request waits on answered as past its deadline, which
+    /// may still apply, once, and each of those entries given up that carries them, or is a
+    /// registration no command waits for now. The entries given up, as [`Self::expire`]'s. One of
+    /// them the node states of its own is asked on, its clock started again: the range's laws
+    /// decide when it is answered. An entry out whose budget is not spent is judged on its own.
+    pub fn unled(
+        &mut self,
+        spent: &[u64],
+        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+    ) -> Vec<(u64, Via)> {
         let mut kept = VecDeque::with_capacity(self.waiting.len());
         for wanted in self.waiting.drain(..) {
             match wanted.wait {
@@ -544,39 +519,38 @@ impl Asking {
         }
         self.waiting = kept;
         let nothing_waits = self.waiting.is_empty();
-        let given_up = self.give_up(done, |out| match out.carried {
-            Carried::Registration { .. } => nothing_waits,
-            Carried::Commands(_) => out.wait == Wait::Request,
+        let given_up = self.give_up(done, |out| {
+            spent.contains(&out.id)
+                && match out.carried {
+                    Carried::Registration { .. } => nothing_waits,
+                    Carried::Commands(_) => out.wait == Wait::Request,
+                }
         });
-        for out in self.out.iter_mut().chain(self.later.iter_mut()) {
+        for out in self.outs.iter_mut().filter(|o| spent.contains(&o.id)) {
             out.leaderless_since = None;
         }
         given_up
     }
 
     /// Gives up each entry out `past` names, oldest first, its commands answered as past their
-    /// deadline, which may still apply, once; those kept keep their order. Whether one was.
+    /// deadline, which may still apply, once; those kept keep their order. The entries given up,
+    /// each its place and how it was being asked: at most [`ENTRIES_OUT`].
     fn give_up(
         &mut self,
         done: &mut Vec<(CommandAsk, CommandOutcome)>,
         past: impl Fn(&Out) -> bool,
-    ) -> bool {
-        let mut given_up = false;
-        if self.out.as_ref().is_some_and(&past) {
-            given_up_with(self.out.take(), done);
-            given_up = true;
-        }
+    ) -> Vec<(u64, Via)> {
+        let mut given_up = Vec::new();
         let mut at = 0;
-        while let Some(out) = self.later.get(at) {
-            if past(out) {
-                given_up_with(self.later.remove(at), done);
-                given_up = true;
-            } else {
+        while let Some(out) = self.outs.get(at) {
+            if !past(out) {
                 at = at.saturating_add(1);
+                continue;
             }
-        }
-        if self.out.is_none() {
-            self.out = self.later.pop_front();
+            if let Some(out) = self.outs.remove(at) {
+                given_up.push((out.id, out.via));
+                given_up_with(out, done);
+            }
         }
         given_up
     }
@@ -584,7 +558,8 @@ impl Asking {
     /// The earliest deadline of a command this range holds.
     pub fn next_deadline(&self) -> Option<u64> {
         let out = self
-            .outs()
+            .outs
+            .iter()
             .flat_map(|o| match &o.carried {
                 Carried::Commands(commands) => commands.as_slice(),
                 Carried::Registration { .. } => &[],
@@ -601,12 +576,8 @@ impl Asking {
 }
 
 /// An entry out given up: each of its commands answered as past its deadline.
-fn given_up_with(out: Option<Out>, done: &mut Vec<(CommandAsk, CommandOutcome)>) {
-    if let Some(Out {
-        carried: Carried::Commands(commands),
-        ..
-    }) = out
-    {
+fn given_up_with(out: Out, done: &mut Vec<(CommandAsk, CommandOutcome)>) {
+    if let Carried::Commands(commands) = out.carried {
         for (ask, _, _) in commands {
             done.push((ask, CommandOutcome::Deadline));
         }
@@ -642,6 +613,36 @@ mod tests {
         ENTRY_HEAD_BYTES + n * one.encoded_len().unwrap()
     }
 
+    /// The next entry when none is out, as a node that keeps one out at a time makes it.
+    fn next_entry(
+        a: &mut Asking,
+        max_entry_bytes: usize,
+        owner: (u64, u64, u64),
+        nonce: u64,
+        refused: &mut Vec<(CommandAsk, CommandOutcome)>,
+    ) {
+        if a.outs.is_empty() {
+            a.another_entry(max_entry_bytes, owner, nonce, refused);
+        }
+    }
+
+    /// The oldest entry out answered.
+    fn answered(
+        a: &mut Asking,
+        answers: Vec<Answer>,
+        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+    ) {
+        if let Some(id) = a.outs.front().map(|o| o.id) {
+            a.answered_entry(id, answers, done);
+        }
+    }
+
+    /// The range's budget spent on every entry out: whether one was given up.
+    fn unled(a: &mut Asking, done: &mut Vec<(CommandAsk, CommandOutcome)>) -> bool {
+        let spent: Vec<u64> = a.outs.iter().map(|o| o.id).collect();
+        !a.unled(&spent, done).is_empty()
+    }
+
     fn asking(waiting: &[Wanted]) -> Asking {
         let mut a = Asking::new(7, Duration::from_millis(1));
         a.waiting.extend(waiting.iter().cloned());
@@ -652,15 +653,15 @@ mod tests {
     fn a_session_is_registered_first_then_commands_go_in_order_as_serials() {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
         let mut done = Vec::new();
-        a.next_entry(1 << 20, (1, 1, 42), 42, &mut done);
-        let out = a.out.clone().unwrap();
+        next_entry(&mut a, 1 << 20, (1, 1, 42), 42, &mut done);
+        let out = a.outs.front().cloned().unwrap();
         assert_eq!(out.carried, Carried::Registration { nonce: 42 });
         assert_eq!(out.entry.commands[0].serial, 42);
-        a.answered(vec![Answer::Registered { session: 9 }], &mut done);
+        answered(&mut a, vec![Answer::Registered { session: 9 }], &mut done);
         assert_eq!((a.session, a.next_serial), (9, 1));
         // Two to an entry's bytes: serials 1 and 2, the oldest unanswered the first.
-        a.next_entry(holding(2), (1, 1, 43), 43, &mut done);
-        let out = a.out.clone().unwrap();
+        next_entry(&mut a, holding(2), (1, 1, 43), 43, &mut done);
+        let out = a.outs.front().cloned().unwrap();
         assert_eq!(
             out.carried,
             Carried::Commands(vec![(1, 1, 100), (2, 2, 100)])
@@ -671,10 +672,14 @@ mod tests {
                 .iter()
                 .all(|c| c.session == 9 && c.unanswered == 1)
         );
-        a.answered(vec![Answer::Repeated, Answer::WrongLayer], &mut done);
-        a.next_entry(holding(2), (1, 1, 44), 44, &mut done);
+        answered(
+            &mut a,
+            vec![Answer::Repeated, Answer::WrongLayer],
+            &mut done,
+        );
+        next_entry(&mut a, holding(2), (1, 1, 44), 44, &mut done);
         assert_eq!(
-            a.out.as_ref().unwrap().carried,
+            a.outs.front().unwrap().carried,
             Carried::Commands(vec![(3, 3, 100)])
         );
         assert_eq!(
@@ -708,13 +713,13 @@ mod tests {
             (vec![(3, 3, u64::MAX)], Wait::Answered),
             (vec![(4, 4, 100)], Wait::Request),
         ] {
-            a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
-            let out = a.out.clone().unwrap();
+            next_entry(&mut a, 1 << 20, (1, 1, 0), 0, &mut done);
+            let out = a.outs.front().cloned().unwrap();
             assert_eq!((out.carried, out.wait), (Carried::Commands(carried), wait));
             let answers = vec![Answer::Repeated; out.entry.commands.len()];
-            a.answered(answers, &mut done);
+            answered(&mut a, answers, &mut done);
         }
-        assert!(a.waiting.is_empty() && a.out.is_none());
+        assert!(a.waiting.is_empty() && a.outs.is_empty());
     }
 
     #[test]
@@ -723,8 +728,8 @@ mod tests {
         // An entry requests wait on: given up, and the request waiting behind it ended.
         let mut a = asking(&[wanted(1, 100), answered_by(2), wanted(3, 100)]);
         a.session = 5;
-        a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
-        assert!(a.unled(&mut done));
+        next_entry(&mut a, 1 << 20, (1, 1, 0), 0, &mut done);
+        assert!(unled(&mut a, &mut done));
         assert_eq!(
             done,
             vec![(3, CommandOutcome::Deadline), (1, CommandOutcome::Deadline)]
@@ -733,13 +738,13 @@ mod tests {
         // The node's own statement: asked on, its clock started again, the request behind it ended.
         done.clear();
         a.waiting.push_back(wanted(4, 100));
-        a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
-        if let Some(out) = a.out.as_mut() {
+        next_entry(&mut a, 1 << 20, (1, 1, 0), 0, &mut done);
+        if let Some(out) = a.outs.front_mut() {
             out.leaderless_since = Some(7);
         }
-        assert!(!a.unled(&mut done));
+        assert!(!unled(&mut a, &mut done));
         assert_eq!(done, vec![(4, CommandOutcome::Deadline)]);
-        let out = a.out.clone().unwrap();
+        let out = a.outs.front().cloned().unwrap();
         assert_eq!(
             (out.carried, out.leaderless_since),
             (Carried::Commands(vec![(2, 2, u64::MAX)]), None)
@@ -747,11 +752,11 @@ mod tests {
         // A registration: given up once no command waits for it.
         done.clear();
         let mut b = asking(&[answered_by(5)]);
-        b.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
-        assert!(!b.unled(&mut done) && b.out.is_some());
+        next_entry(&mut b, 1 << 20, (1, 1, 0), 0, &mut done);
+        assert!(!unled(&mut b, &mut done) && !b.outs.is_empty());
         let mut c = asking(&[wanted(6, 100)]);
-        c.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
-        assert!(c.unled(&mut done) && c.out.is_none());
+        next_entry(&mut c, 1 << 20, (1, 1, 0), 0, &mut done);
+        assert!(unled(&mut c, &mut done) && c.outs.is_empty());
         assert_eq!(done, vec![(6, CommandOutcome::Deadline)]);
     }
 
@@ -760,10 +765,10 @@ mod tests {
         // The owner registered in a later run: this process's commands go to no session.
         let mut a = asking(&[wanted(1, 100), wanted(2, 100)]);
         let mut done = Vec::new();
-        a.next_entry(1 << 20, (1, 1, 5), 5, &mut done);
-        a.answered(vec![Answer::Superseded], &mut done);
+        next_entry(&mut a, 1 << 20, (1, 1, 5), 5, &mut done);
+        answered(&mut a, vec![Answer::Superseded], &mut done);
         assert_eq!(a.session, 0);
-        assert!(a.waiting.is_empty() && a.out.is_none());
+        assert!(a.waiting.is_empty() && a.outs.is_empty());
         assert_eq!(
             done,
             vec![
@@ -795,16 +800,16 @@ mod tests {
         .len();
         let mut done = Vec::new();
         // Room for one command an entry: the first goes alone.
-        a.next_entry(one, (1, 1, 0), 0, &mut done);
+        next_entry(&mut a, one, (1, 1, 0), 0, &mut done);
         assert_eq!(
-            a.out.as_ref().unwrap().carried,
+            a.outs.front().unwrap().carried,
             Carried::Commands(vec![(1, 1, 100)])
         );
         // Room for none: each is refused, nothing goes.
         let mut b = asking(&[wanted(1, 100), wanted(2, 100)]);
         b.session = 5;
-        b.next_entry(one - 1, (1, 1, 0), 0, &mut done);
-        assert!(b.out.is_none() && b.waiting.is_empty());
+        next_entry(&mut b, one - 1, (1, 1, 0), 0, &mut done);
+        assert!(b.outs.is_empty() && b.waiting.is_empty());
         assert_eq!(
             done,
             vec![
@@ -819,8 +824,9 @@ mod tests {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
         a.session = 5;
         let mut done = Vec::new();
-        a.next_entry(holding(2), (1, 1, 0), 0, &mut done);
-        a.answered(
+        next_entry(&mut a, holding(2), (1, 1, 0), 0, &mut done);
+        answered(
+            &mut a,
             vec![Answer::SessionExpired, Answer::SessionExpired],
             &mut done,
         );
@@ -829,9 +835,9 @@ mod tests {
         let order: Vec<_> = a.waiting.iter().map(|w| w.ask).collect();
         assert_eq!(order, vec![1, 2, 3]);
         // The new session first.
-        a.next_entry(holding(2), (1, 1, 8), 8, &mut done);
+        next_entry(&mut a, holding(2), (1, 1, 8), 8, &mut done);
         assert_eq!(
-            a.out.as_ref().unwrap().carried,
+            a.outs.front().unwrap().carried,
             Carried::Registration { nonce: 8 }
         );
     }
@@ -846,11 +852,12 @@ mod tests {
         let mut a = asking(&[wanted(1, 100), wanted(2, 100), wanted(3, 100)]);
         a.session = 5;
         let mut done = Vec::new();
-        a.next_entry(holding(3), (1, 1, 0), 0, &mut done);
+        next_entry(&mut a, holding(3), (1, 1, 0), 0, &mut done);
         let applied = Answer::Name(mantle_meta::name::Outcome::Put {
             version: "v".into(),
         });
-        a.answered(
+        answered(
+            &mut a,
             vec![applied.clone(), Answer::AnswersFull, Answer::AnswersFull],
             &mut done,
         );
@@ -858,8 +865,8 @@ mod tests {
         let serials: Vec<_> = a.waiting.iter().map(|w| (w.ask, w.serial)).collect();
         assert_eq!(serials, vec![(2, Some(2)), (3, Some(3))]);
         a.waiting.push_back(wanted(4, 100));
-        a.next_entry(1 << 20, (1, 1, 0), 0, &mut done);
-        let out = a.out.clone().unwrap();
+        next_entry(&mut a, 1 << 20, (1, 1, 0), 0, &mut done);
+        let out = a.outs.front().cloned().unwrap();
         assert_eq!(
             out.carried,
             Carried::Commands(vec![(2, 2, 100), (3, 3, 100), (4, 4, 100)])
@@ -867,7 +874,8 @@ mod tests {
         assert!(out.entry.commands.iter().all(|c| c.unanswered == 2));
         assert_eq!(a.next_serial, 5);
         // The range no longer holds the session: every command waits for the new one's serials.
-        a.answered(
+        answered(
+            &mut a,
             vec![
                 Answer::SessionExpired,
                 Answer::AnswersFull,
@@ -885,14 +893,14 @@ mod tests {
         let mut a = asking(&[wanted(1, 50), wanted(2, 200), wanted(3, 60)]);
         a.session = 5;
         let mut done = Vec::new();
-        a.next_entry(holding(2), (1, 1, 0), 0, &mut done);
+        next_entry(&mut a, holding(2), (1, 1, 0), 0, &mut done);
         assert_eq!(a.next_deadline(), Some(50));
         // Command 3, waiting, passes; the entry out holds 2, not yet past.
-        assert!(!a.expire(100, &mut done));
+        assert!(a.expire(100, &mut done).is_empty());
         assert_eq!(done, vec![(3, CommandOutcome::Deadline)]);
         // Both of the entry's past: it is given up.
-        assert!(a.expire(200, &mut done));
-        assert!(a.out.is_none());
+        assert!(!a.expire(200, &mut done).is_empty());
+        assert!(a.outs.is_empty());
         assert_eq!(
             done,
             vec![
@@ -912,8 +920,8 @@ mod tests {
         a.another_entry(holding(2), (1, 1, 0), 0, &mut done);
         a.another_entry(holding(2), (1, 1, 0), 0, &mut done);
         assert!(done.is_empty());
-        let first = a.out.as_ref().unwrap().id;
-        let second = a.later[0].id;
+        let first = a.outs.front().unwrap().id;
+        let second = a.outs[1].id;
         (a, first, second)
     }
 
@@ -931,7 +939,8 @@ mod tests {
         let mut done = Vec::new();
         a.another_entry(holding(2), (1, 1, 0), 0, &mut done);
         let outs: Vec<_> = a
-            .outs()
+            .outs
+            .iter()
             .map(|o| (o.carried.clone(), unanswered(o)))
             .collect();
         assert_eq!(
@@ -951,14 +960,14 @@ mod tests {
         // The second answered first: the third still names the first's serials unanswered.
         a.answered_entry(second, vec![Answer::Repeated; 2], &mut done);
         a.another_entry(holding(2), (1, 1, 0), 0, &mut done);
-        assert_eq!(a.later[0].carried, Carried::Commands(vec![(5, 5, 100)]));
-        assert_eq!(unanswered(&a.later[0]), vec![1]);
+        assert_eq!(a.outs[1].carried, Carried::Commands(vec![(5, 5, 100)]));
+        assert_eq!(unanswered(&a.outs[1]), vec![1]);
         // The first answered, the third the oldest out: the next names the third's serial.
         a.answered_entry(first, vec![Answer::Repeated; 2], &mut done);
         a.waiting.push_back(wanted(6, 100));
         a.another_entry(holding(2), (1, 1, 0), 0, &mut done);
-        assert_eq!(a.later[0].carried, Carried::Commands(vec![(6, 6, 100)]));
-        assert_eq!(unanswered(&a.later[0]), vec![5]);
+        assert_eq!(a.outs[1].carried, Carried::Commands(vec![(6, 6, 100)]));
+        assert_eq!(unanswered(&a.outs[1]), vec![5]);
         assert_eq!(done.len(), 4);
     }
 
@@ -973,8 +982,8 @@ mod tests {
         let mut done = Vec::new();
         a.answered_entry(second, vec![put("v3"), put("v4")], &mut done);
         // The first is still out, the oldest.
-        assert_eq!(a.out.as_ref().map(|o| o.id), Some(first));
-        assert!(a.later.is_empty());
+        assert_eq!(a.outs.front().map(|o| o.id), Some(first));
+        assert_eq!(a.outs.len(), 1);
         a.answered_entry(first, vec![put("v1"), put("v2")], &mut done);
         // An answer for an entry no longer out is no command's.
         a.answered_entry(second, vec![put("x"), put("y")], &mut done);
@@ -987,7 +996,7 @@ mod tests {
                 (2, CommandOutcome::Answered(put("v2"))),
             ]
         );
-        assert!(a.out.is_none() && a.held() == 0);
+        assert!(a.outs.is_empty() && a.held() == 0);
     }
 
     /// A command refused for room while another entry is out waits again under its serial,
@@ -1007,19 +1016,19 @@ mod tests {
         assert_eq!(serials, vec![(2, Some(2)), (5, None)]);
         a.another_entry(1 << 20, (1, 1, 0), 0, &mut done);
         assert_eq!(
-            a.later[0].carried,
+            a.outs[1].carried,
             Carried::Commands(vec![(2, 2, 100), (5, 5, 100)])
         );
-        assert_eq!(unanswered(&a.later[0]), vec![2, 2]);
+        assert_eq!(unanswered(&a.outs[1]), vec![2, 2]);
         a.answered_entry(second, vec![Answer::AnswersFull; 2], &mut done);
         let serials: Vec<_> = a.waiting.iter().map(|w| (w.ask, w.serial)).collect();
         assert_eq!(serials, vec![(3, Some(3)), (4, Some(4))]);
         a.another_entry(1 << 20, (1, 1, 0), 0, &mut done);
         assert_eq!(
-            a.later[0].carried,
+            a.outs[1].carried,
             Carried::Commands(vec![(3, 3, 100), (4, 4, 100)])
         );
-        assert_eq!(unanswered(&a.later[0]), vec![2, 2]);
+        assert_eq!(unanswered(&a.outs[1]), vec![2, 2]);
         assert_eq!(a.next_serial, 6);
         assert_eq!(done, vec![(1, CommandOutcome::Answered(applied))]);
     }
@@ -1037,9 +1046,9 @@ mod tests {
         assert_eq!(a.session, 0);
         a.another_entry(holding(2), (1, 1, 8), 8, &mut done);
         a.another_entry(holding(2), (1, 1, 9), 9, &mut done);
-        assert_eq!(a.later.len(), 1);
-        assert_eq!(a.later[0].carried, Carried::Registration { nonce: 8 });
-        let registration = a.later[0].id;
+        assert_eq!(a.outs.len(), 2);
+        assert_eq!(a.outs[1].carried, Carried::Registration { nonce: 8 });
+        let registration = a.outs[1].id;
         a.answered_entry(
             registration,
             vec![Answer::Registered { session: 9 }],
@@ -1048,11 +1057,11 @@ mod tests {
         assert_eq!((a.session, a.next_serial), (9, 1));
         a.another_entry(holding(2), (1, 1, 0), 0, &mut done);
         assert_eq!(
-            a.later[0].carried,
+            a.outs[1].carried,
             Carried::Commands(vec![(1, 1, 100), (2, 2, 100)])
         );
         assert!(
-            a.later[0]
+            a.outs[1]
                 .entry
                 .commands
                 .iter()
@@ -1068,7 +1077,7 @@ mod tests {
         assert_eq!(serials, vec![(3, None), (4, None)]);
         a.another_entry(holding(2), (1, 1, 0), 0, &mut done);
         assert_eq!(
-            a.later[0].carried,
+            a.outs[1].carried,
             Carried::Commands(vec![(3, 3, 100), (4, 4, 100)])
         );
         assert!(done.is_empty());
@@ -1083,21 +1092,21 @@ mod tests {
         let early = [wanted(1, 50), wanted(2, 60), wanted(3, 200), wanted(4, 300)];
         let (mut a, _, second) = two_out(&early);
         assert_eq!(a.next_deadline(), Some(50));
-        assert!(a.expire(100, &mut done));
-        assert_eq!(a.out.as_ref().map(|o| o.id), Some(second));
-        assert!(a.later.is_empty());
+        assert!(!a.expire(100, &mut done).is_empty());
+        assert_eq!(a.outs.front().map(|o| o.id), Some(second));
+        assert_eq!(a.outs.len(), 1);
         assert_eq!(a.next_deadline(), Some(200));
-        assert!(!a.expire(150, &mut done));
+        assert!(a.expire(150, &mut done).is_empty());
         // The later past: given up, the oldest kept.
         let late = [wanted(5, 300), wanted(6, 300), wanted(7, 50), wanted(8, 60)];
         let (mut b, first, _) = two_out(&late);
-        assert!(b.expire(100, &mut done));
-        assert_eq!(b.out.as_ref().map(|o| o.id), Some(first));
-        assert!(b.later.is_empty());
+        assert!(!b.expire(100, &mut done).is_empty());
+        assert_eq!(b.outs.front().map(|o| o.id), Some(first));
+        assert_eq!(b.outs.len(), 1);
         // A refusal: the oldest refused, the later kept.
         let (mut c, first, second) = two_out(&late);
         c.refused_entry(first, command::Status::Forbidden, &mut done);
-        assert_eq!(c.out.as_ref().map(|o| o.id), Some(second));
+        assert_eq!(c.outs.front().map(|o| o.id), Some(second));
         assert_eq!(
             done,
             vec![
@@ -1115,17 +1124,33 @@ mod tests {
         d.session = 5;
         d.another_entry(1 << 20, (1, 1, 0), 0, &mut done);
         d.another_entry(1 << 20, (1, 1, 0), 0, &mut done);
-        for out in d.out.iter_mut().chain(d.later.iter_mut()) {
+        for out in &mut d.outs {
             out.leaderless_since = Some(7);
         }
-        assert!(d.unled(&mut done));
+        let spent: Vec<u64> = d.outs.iter().map(|o| o.id).collect();
+        assert_eq!(d.unled(&spent, &mut done).len(), 1);
         assert_eq!(done, vec![(10, CommandOutcome::Deadline)]);
-        let out = d.out.clone().unwrap();
+        let out = d.outs.front().cloned().unwrap();
         assert_eq!(
             (out.carried, out.leaderless_since),
             (Carried::Commands(vec![(9, 1, u64::MAX)]), None)
         );
-        assert!(d.later.is_empty());
+        assert_eq!(d.outs.len(), 1);
+        // A budget spent on one entry alone: that entry given up, the other, judged on its own
+        // clock, kept with it.
+        done.clear();
+        let (mut e, first, second) = two_out(&early);
+        for out in &mut e.outs {
+            out.leaderless_since = Some(7);
+        }
+        assert_eq!(e.unled(&[second], &mut done), vec![(second, Via::Unasked)]);
+        assert_eq!(
+            done,
+            vec![(3, CommandOutcome::Deadline), (4, CommandOutcome::Deadline)]
+        );
+        let kept = e.outs.front().unwrap();
+        assert_eq!((kept.id, kept.leaderless_since), (first, Some(7)));
+        assert_eq!(e.outs.len(), 1);
     }
 
     /// A session's commands take effect once, under deterministic simulation with injected faults
@@ -1249,18 +1274,19 @@ mod tests {
                     }
                     let mut done = Vec::new();
                     a.expire(now, &mut done);
-                    let before = a.outs().count();
+                    let before = a.outs.len();
                     if before < entries_out {
                         let registering = a
-                            .outs()
+                            .outs
+                            .iter()
                             .any(|o| matches!(o.carried, Carried::Registration { .. }));
                         if a.session == 0 && !registering {
                             registrations += 1;
                         }
                         a.another_entry(1 << 20, (1, 1, registrations), registrations, &mut done);
                     }
-                    if a.outs().count() > before {
-                        let out = a.outs().last().unwrap();
+                    if a.outs.len() > before {
+                        let out = a.outs.back().unwrap();
                         flight.push((
                             now + next(30),
                             out.entry.clone(),
@@ -1270,7 +1296,7 @@ mod tests {
                     } else if next(6) == 0 && before > 0 {
                         // Asked again, as after a reply lost or a leader changed.
                         let at = usize::try_from(next(before as u64)).unwrap();
-                        let out = a.outs().nth(at).unwrap();
+                        let out = a.outs.get(at).unwrap();
                         flight.push((
                             now + next(30),
                             out.entry.clone(),
@@ -1302,7 +1328,7 @@ mod tests {
                             lost += 1;
                             continue;
                         }
-                        let id = a.outs().find(|o| o.entry == entry).map(|o| o.id);
+                        let id = a.outs.iter().find(|o| o.entry == entry).map(|o| o.id);
                         if let Some(id) = id {
                             a.answered_entry(id, answers, &mut done);
                         }

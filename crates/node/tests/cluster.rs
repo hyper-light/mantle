@@ -582,8 +582,8 @@ enum Order {
     Replace(u64, u64),
     /// A chunk's put or get for the node to ask, under the test's tag.
     Chunk(u64, Chunked),
-    /// A command for the node to ask the range itself, under the test's tag.
-    Command(u64, Command),
+    /// A command for the node to ask the range itself, under the test's tag, waiting as it says.
+    Command(u64, Command, Wait),
     /// A read for the node to ask the range itself, under the test's tag.
     Read(u64, Query),
     Stop,
@@ -706,8 +706,8 @@ async fn run<E: Engine + 'static>(
                     }
                 }
             }
-            Either::Second(Ok(Order::Command(tag, command))) => {
-                match node.command(GROUP, command, u64::MAX, Wait::Request) {
+            Either::Second(Ok(Order::Command(tag, command, wait))) => {
+                match node.command(GROUP, command, u64::MAX, wait) {
                     Ok(asked) => {
                         command_tags.insert(asked, tag);
                     }
@@ -842,6 +842,8 @@ struct Watch {
     /// The nodes open and not stopped.
     live: BTreeSet<u64>,
     status: BTreeMap<u64, Status>,
+    /// Each node's most proposals of its member's waiting at once to apply, as its statuses said.
+    most_commanded: BTreeMap<u64, usize>,
     /// The live nodes whose last word was that they wait on their own device.
     held: BTreeSet<u64>,
     /// Each node's registrations applied, by serial: the index and the answer.
@@ -923,6 +925,8 @@ impl Watch {
                         || was.measuring != now.measuring
                         || was.asking != now.asking
                 });
+                let most = self.most_commanded.entry(id).or_default();
+                *most = (*most).max(now.commanded);
                 self.status.insert(id, *now);
                 // A status whose change moved nothing (its patience, say) moves nothing.
                 if moved {
@@ -1551,11 +1555,18 @@ impl Cell {
         self.asks = Some(asks);
     }
 
-    /// Node `from` asks `command` of the range itself (`Node::command`), under the tag returned.
+    /// Node `from` asks `command` of the range itself (`Node::command`), under the tag returned,
+    /// as a request does: past the range's budget without a leader that can serve it, it ends.
     fn ask_command(&mut self, from: u64, command: Command) -> u64 {
+        self.ask_waiting(from, command, Wait::Request)
+    }
+
+    /// Node `from` asks `command` of the range itself, waiting as `wait` says, under the tag
+    /// returned.
+    fn ask_waiting(&mut self, from: u64, command: Command, wait: Wait) -> u64 {
         let tag = self.next_tag;
         self.next_tag += 1;
-        self.order(from, Order::Command(tag, command));
+        self.order(from, Order::Command(tag, command, wait));
         tag
     }
 
@@ -1887,6 +1898,77 @@ fn client_redirected(engines: Engines) {
         assert_eq!(answers, vec![applied]);
         cell.close();
     }
+}
+
+/// A node keeps two entries of its own out to a range at once (`ask::ENTRIES_OUT`), each answered
+/// to its own commands: the leader, cut off from its followers so that nothing it proposes
+/// commits, proposes a put of its own and a second beside it, where one entry out at a time held
+/// the second back until the first was answered. Both asked until the range answers them, as the
+/// node's own statements are (`Wait::Answered`), they wait out the leader's loss of the lead,
+/// each entry asked again on its own, of the leader the others elected once the node is joined
+/// again; each put is answered the version it made, which a read of its key finds current, so
+/// neither entry's answers went to the other's command and neither applied twice.
+fn two_entries_out(engines: Engines) {
+    let mut cell = Cell::start_on(engines, Network::Relayed, 3);
+    let leader = cell.leader();
+    let gate = cell.ask_command(leader, open_gate());
+    assert_eq!(
+        cell.commanded(gate),
+        CommandOutcome::Answered(Answer::Name(name::Outcome::GateMoved))
+    );
+    cell.isolate(leader, true);
+    let asked: Vec<(&str, u64)> = [("k1", 1), ("k2", 2)]
+        .into_iter()
+        .map(|(key, n)| {
+            (
+                key,
+                cell.ask_waiting(leader, put(key, "e", n), Wait::Answered),
+            )
+        })
+        .collect();
+    // The others elect one of themselves, in a later term than the one cut off leads, whose log
+    // holds neither entry.
+    let led = cell.watch.status[&leader].term;
+    let others: Vec<u64> = (1..=cell.nodes).filter(|id| *id != leader).collect();
+    cell.watch.until(&cell.reports, |w| {
+        let named: Vec<&Status> = others.iter().filter_map(|id| w.status.get(id)).collect();
+        let first = named.first()?;
+        let agreed = named.len() == others.len()
+            && others.contains(&first.leader)
+            && first.term > led
+            && named
+                .iter()
+                .all(|s| (s.leader, s.term) == (first.leader, first.term));
+        if agreed { Some(()) } else { None }
+    });
+    // Both were proposed by the leader's own member, which committed neither while cut off.
+    assert_eq!(cell.watch.most_commanded.get(&leader), Some(&2));
+    cell.isolate(leader, false);
+    for (key, tag) in asked {
+        let outcome = cell.commanded(tag);
+        let CommandOutcome::Answered(Answer::Name(name::Outcome::Put { version })) = outcome else {
+            panic!("the put of {key} answered {outcome:?}");
+        };
+        let reader = cell.leader();
+        let query = Query::Current {
+            bucket: "b".into(),
+            key: key.into(),
+        };
+        let read = cell.ask_read(reader, query);
+        let ReadOutcome::Read(read) = cell.read_of(read) else {
+            panic!("node {reader}'s read of {key} was not answered");
+        };
+        let Read::Current(Some((order, _))) = *read else {
+            panic!("node {reader} read no version of {key}: {read:?}");
+        };
+        assert_eq!(mantle_meta::key::version_id(order), version, "{key}");
+    }
+    cell.close();
+}
+
+#[test]
+fn a_nodes_two_entries_out_are_each_answered_to_their_own_commands_through_a_lost_lead() {
+    two_entries_out(Engines::Model);
 }
 
 #[test]

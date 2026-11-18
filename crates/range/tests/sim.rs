@@ -534,17 +534,7 @@ fn live_frames(image: &[u8], id: u128) -> Vec<(u64, usize, usize)> {
 /// frame lost restores its groups from its record and marks those entries, which the engine
 /// does not hold (hyper-log `recover::restores`).
 fn writes_past(image: &[u8], id: u128, sequence: u64, applied: u64) -> bool {
-    // A frame's record lies in one of the two slots at the file's start, each sized for the
-    // most groups the log holds and aligned to its block (hyper-log `recover::persist_slot`).
-    let slot = Alignment::new(4096)
-        .unwrap()
-        .up(hyper_log::format::persist_len(log_config().max_groups).unwrap())
-        .unwrap();
-    let records: Vec<hyper_log::format::Persist> = [0, slot]
-        .into_iter()
-        .filter_map(|at| image.get(at..).and_then(hyper_log::format::Persist::decode))
-        .filter(|p| p.log == id)
-        .collect();
+    let records = persist_records(image, id);
     records.iter().any(|p| p.confirms >= sequence)
         && records
             .iter()
@@ -556,6 +546,36 @@ fn writes_past(image: &[u8], id: u128, sequence: u64, applied: u64) -> bool {
                     && !g.damaged
                     && g.entries.is_some_and(|w| w.count > 0 && w.first > applied)
             })
+}
+
+/// The records that read whole in the two persist slots of log `id`'s image. The simulated device
+/// states its atomic write unit, its sector, so the log lays its records in pieces of it (mantle
+/// docs/design/durability.md §7.7, step 2b): the mark of pieces at the area's start, and two slots
+/// past the two whole ones, each at an offset the larger of the unit and the block divides and
+/// sized for the most groups the log holds in pieces (hyper-log `recover::Area::in_pieces`). A
+/// torn record is none, as the open reads it.
+fn persist_records(image: &[u8], id: u128) -> Vec<hyper_log::format::Persist> {
+    let mark = hyper_log::format::pieces_marked(image, id, false).expect("the mark of pieces");
+    assert!(
+        !mark.at_end,
+        "log {id:x}'s slots lie where its creation laid them"
+    );
+    let block = mark.block.unwrap();
+    let groups = log_config().max_groups;
+    let pieces = hyper_log::format::Pieces::new(mark.unit, false).unwrap();
+    let laid = mark.unit.max(block);
+    let len = laid.up(pieces.len(groups).unwrap()).unwrap();
+    let whole = block
+        .up(hyper_log::format::persist_len(groups).unwrap())
+        .unwrap();
+    let first = laid.up(2 * whole).unwrap();
+    [first, first + len]
+        .into_iter()
+        .filter_map(|at| match pieces.decode(&image[at..at + len]).unwrap() {
+            hyper_log::format::Pieced::Whole(p) if p.log == id => Some(p),
+            _ => None,
+        })
+        .collect()
 }
 
 /// What a gateway is doing.

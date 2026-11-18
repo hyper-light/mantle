@@ -1527,7 +1527,8 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
 
 **The order of building.** Each step is an hour's work, unit-tested and merged before the next:
 
-1. The rule, and the node's table of ranges by shard, every range still on the first shard.
+1. The rule, and the node's table of ranges by shard, every range still on the first shard (as
+   built, below).
 2. A shard's ranges driven by a task on that shard, with their own owner (`Owner`) and the log's
    group handles; first, whether hyper-log's group handle and hyper-durable's shell may cross
    threads, which, if not, is a hyper-raft change before this step.
@@ -1538,6 +1539,19 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
 6. Native requests driven past the first shard.
 7. In hyper-raft: hyper-log's frames in flight past one, sized to the device's measured knee.
 8. In hyper-raft: connection IDs that name their shard, and datagrams routed by them.
+
+*As built (2026-11-18), the rule* (`crates/node/src/node/spread.rs`). `Spread` holds each range's
+shard, by its place in the node's table, and each shard's count of ranges, and places each range by
+the rule above as the node opens it (`Node::open_on`), over the one shard the node's task runs
+every range on (`NonZeroUsize::MIN`), so each range's shard is the first, where it runs. A count
+past a `usize`'s refuses the range, `NodeError::Full`, placing nothing. `Node::shard_of` says a
+range's shard and `Node::ranges_on` a shard's ranges in the order the node opened them, which
+step 3's routing reads. Tested (`node::spread`): the rule places each range on the shard past the
+first with the fewest, the first of those tied, never on the first while another shard exists, and
+every range on the first where it is the only one; a cell's five ranges take a shard each from six
+shards to 32; every shard past the first stays within one range of every other, from one shard to
+nine and one range to forty; the table says each range's shard and each shard's ranges in its
+order; and a count past a `usize`'s is refused with nothing placed.
 
 ## 3. Transport
 

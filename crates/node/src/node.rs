@@ -25,6 +25,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::future::poll_fn;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::task::{Poll, Waker};
@@ -73,6 +74,7 @@ mod answers;
 mod host;
 mod members;
 mod repair;
+mod spread;
 mod stop;
 use answers::Answers;
 pub use host::GatewaySettings;
@@ -804,6 +806,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     log: L,
     owner: Owner<Answers<L::Store>, RangeMachine<E>, Unbounded>,
     ranges: Vec<Kept>,
+    /// The shard that runs each range, by its place in `ranges` (node.md §2.9).
+    spread: spread::Spread,
     deadlines: BTreeSet<(u64, usize)>,
     liveness: Liveness,
     asked: Asked,
@@ -1139,6 +1143,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let hosting = std::mem::take(&mut settings.ranges);
         let mut owner = Owner::new(vec![waker.clone(); hosting.len()]);
         let mut ranges = Vec::with_capacity(hosting.len());
+        // The node runs every range in its one task, on the shard that task runs on (node.md §1.2,
+        // as built 2026-11-17): one shard, the least a spread holds, so the rule places each range
+        // there, where it runs (§2.9).
+        let mut spread = spread::Spread::over(NonZeroUsize::MIN, hosting.len());
         for hosted in hosting {
             if hosted.group == 0 || hosted.group == LIVENESS_GROUP {
                 return Err(at(Step::Configuration)(NodeError::Reserved(hosted.group)));
@@ -1160,6 +1168,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .insert(shell)
                 .map_err(|_| at(Step::Budgets)(NodeError::Full))?;
             owner.schedule(handle);
+            spread
+                .place()
+                .ok_or_else(|| at(Step::Budgets)(NodeError::Full))?;
             ranges.push(Kept {
                 group: hosted.group,
                 layer: hosted.range.layer,
@@ -1259,6 +1270,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             log,
             owner,
             ranges,
+            spread,
             deadlines: BTreeSet::new(),
             liveness,
             asked: Asked::default(),
@@ -1417,6 +1429,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     fn kept(&self, group: u128) -> Option<&Kept> {
         self.ranges.iter().find(|k| k.group == group)
+    }
+
+    /// The shard that runs `group`'s range, numbered from the node's first (node.md §2.9); `None`
+    /// for a range the node does not host.
+    pub fn shard_of(&self, group: u128) -> Option<usize> {
+        let place = self.ranges.iter().position(|k| k.group == group)?;
+        self.spread.shard(place)
+    }
+
+    /// The groups of the ranges `shard` runs, in the order the node opened them (node.md §2.9).
+    pub fn ranges_on(&self, shard: usize) -> impl Iterator<Item = u128> + '_ {
+        self.spread
+            .on(shard)
+            .filter_map(|place| self.ranges.get(place).map(|k| k.group))
     }
 
     /// Whether this node's member leads `group`.

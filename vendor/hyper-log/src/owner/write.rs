@@ -1179,6 +1179,9 @@ impl<F: BlockFile + 'static> Owner<F> {
         b.persist.groups.extend(updates.map(writer::persisted));
         b.record_bytes.clear();
         b.persist.sealed = self.seal.is_some();
+        // No frame is answered at its flush yet: each waits for its confirmation (mantle
+        // durability.md §7.7, step 4).
+        b.persist.at_flush = false;
         // In pieces where the log's area is laid so (format 5, 6 sealed), each a unit the device
         // writes whole; whole otherwise, a sealed log's MAC after it (mantle durability.md §7.7).
         let encoded = match self.p.area.pieces() {

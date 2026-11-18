@@ -608,6 +608,7 @@ fn update_of(write: &Write<'_>) -> Result<Update, Fault> {
         proposals,
         released: write.released,
         remove: false,
+        at_flush: write.at_flush,
     })
 }
 

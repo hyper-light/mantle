@@ -106,6 +106,12 @@ pub struct Write<'a> {
     /// ([`LogStore::released`]). Nothing else ends a proposal: not the log reaching its index,
     /// not a start that moves past it.
     pub released: Option<u64>,
+    /// The member's configuration lets the write be answered at its frame's own flush: in each
+    /// half, the voters but any one are a quorum, three voters or more, so a copy of the write
+    /// a crash leaves marked is resolved by the rest (mantle docs/design/durability.md §7.5).
+    /// False keeps the frame holding it answered once confirmed. Not something to make durable:
+    /// a write of it alone is empty.
+    pub at_flush: bool,
 }
 
 impl Write<'_> {

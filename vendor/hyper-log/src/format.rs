@@ -100,7 +100,8 @@ pub const PERSIST_HEADER_LEN: usize = 44;
 /// start, entries and uncertainty.
 pub const PERSIST_GROUP_LEN: usize = 97;
 /// Bytes of a piece of a persist record before its rows: magic 4, format 1, the base-2 logarithm
-/// of the atomic write unit it was laid in 1, padding 2, the log's ID 16, the frame's sequence and
+/// of the atomic write unit it was laid in 1, how the frame was answered 1 ([`AT_FLUSH`]), padding
+/// 1, the log's ID 16, the frame's sequence and
 /// the last sequence known flushed 8 each, the CRC-32C of every row of the record 4, the piece's
 /// index, the count of pieces and the rows it holds 4 each.
 pub const PIECE_HEADER_LEN: usize = 56;
@@ -997,6 +998,22 @@ pub struct Persist {
     pub groups: Vec<Persisted>,
     /// Whether the record is a sealed log's: format 4, its MAC after it.
     pub sealed: bool,
+    /// Whether the frame was answered at its own flush rather than once confirmed (mantle
+    /// docs/design/durability.md §7.1, §7.5): its record and its flush then prove it answered, and
+    /// an open that finds it past the last frame that reads restores it as one confirmed (§7.2).
+    /// Only a record in pieces says so ([`AT_FLUSH`]); a whole one cannot, since a torn whole
+    /// record and a damaged one read alike, and decodes as false.
+    pub at_flush: bool,
+}
+
+/// The byte after a piece's unit that says its frame was answered at its own flush
+/// ([`Persist::at_flush`]): the first of the two the piece's header left as padding before it, so
+/// a piece that does not say so reads as it did then.
+pub const AT_FLUSH: u8 = 1;
+
+/// The byte of a piece that says how its frame was answered ([`AT_FLUSH`]).
+fn answered(at_flush: bool) -> u8 {
+    if at_flush { AT_FLUSH } else { 0 }
 }
 
 /// A persist row's flag: it carries a hard state.
@@ -1136,8 +1153,12 @@ impl Persist {
         Some(w.into_vec())
     }
 
-    /// Appends the record's bytes to `w`, as [`Persist::encode`] gives them.
+    /// Appends the record's bytes to `w`, as [`Persist::encode`] gives them; `None` for a record
+    /// that says its frame was answered at its flush, which a whole record cannot say.
     pub fn encode_into(&self, w: &mut Writer) -> Option<()> {
+        if self.at_flush {
+            return None;
+        }
         let from = w.len();
         w.bytes(&PERSIST_MAGIC);
         w.u8(if self.sealed { FORMAT_SEALED } else { FORMAT });
@@ -1174,6 +1195,7 @@ impl Persist {
             confirms,
             groups,
             sealed,
+            at_flush: false,
         })
     }
 
@@ -1321,6 +1343,7 @@ pub enum Pieced {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Piece {
     sealed: bool,
+    at_flush: bool,
     log: u128,
     sequence: u64,
     confirms: u64,
@@ -1336,6 +1359,7 @@ impl Piece {
     fn same_record(&self, other: &Self) -> bool {
         (
             self.sealed,
+            self.at_flush,
             self.log,
             self.sequence,
             self.confirms,
@@ -1343,6 +1367,7 @@ impl Piece {
             self.count,
         ) == (
             other.sealed,
+            other.at_flush,
             other.log,
             other.sequence,
             other.confirms,
@@ -1436,7 +1461,8 @@ impl Pieces {
                 FORMAT_PIECES
             });
             w.u8(unit);
-            w.zeros(2);
+            w.u8(answered(record.at_flush));
+            w.zeros(1);
             w.u128(record.log);
             w.u64(record.sequence);
             w.u64(record.confirms);
@@ -1547,6 +1573,7 @@ impl Pieces {
             confirms: newest.confirms,
             groups,
             sealed: newest.sealed,
+            at_flush: newest.at_flush,
         };
         if !whole {
             return Ok(Pieced::Torn(record));
@@ -1601,9 +1628,15 @@ impl Pieces {
         if u32::from(r.u8()?) != self.unit.get().trailing_zeros() {
             return None;
         }
-        r.take(2)?;
+        let at_flush = match r.u8()? {
+            0 => false,
+            AT_FLUSH => true,
+            _ => return None,
+        };
+        r.take(1)?;
         Some(Piece {
             sealed,
+            at_flush,
             log: r.u128()?,
             sequence: r.u64()?,
             confirms: r.u64()?,
@@ -1929,6 +1962,40 @@ mod tests {
         assert_eq!(decoded.mac_at(), Some(FRAME_HEADER_LEN + 7));
     }
 
+    /// A record in pieces says whether its frame was answered at its own flush, and reads back
+    /// so; pieces of the same record that differ in it are two writes, never one record; a byte
+    /// there that no write leaves is damage; and a whole record cannot say it (mantle
+    /// durability.md §7.7, step 3).
+    #[test]
+    fn only_pieces_say_a_frame_was_answered_at_its_flush() {
+        let pieces = Pieces::new(Alignment::new(512).unwrap(), false).unwrap();
+        let record = Persist {
+            at_flush: true,
+            ..persist(9, 8, 6, 3, false)
+        };
+        let bytes = pieces.encode(&record).unwrap();
+        assert_eq!(
+            pieces.decode(&bytes).unwrap(),
+            Pieced::Whole(record.clone())
+        );
+        let unanswered = Persist {
+            at_flush: false,
+            ..record.clone()
+        };
+        let mut mixed = pieces.encode(&unanswered).unwrap();
+        mixed[..512].copy_from_slice(&bytes[..512]);
+        assert!(matches!(pieces.decode(&mixed), Ok(Pieced::Torn(_))));
+        // The byte past the unit's: 2 is no write's, its CRC made to hold.
+        let mut odd = bytes.clone();
+        odd[6] = 2;
+        let len = PIECE_HEADER_LEN + pieces.rows() * PERSIST_GROUP_LEN;
+        let crc = crate::codec::crc32c(&odd[..len]);
+        odd[len..len + 4].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(pieces.decode(&odd), Err(LogError::Damaged(_))));
+        assert_eq!(record.encode(), None);
+        assert!(unanswered.encode().is_some());
+    }
+
     /// A persist record reads back as written, and any flipped bit makes it unreadable.
     #[test]
     fn persist_records_round_trip_and_refuse_damage() {
@@ -1966,6 +2033,7 @@ mod tests {
                 },
             ],
             sealed: false,
+            at_flush: false,
         };
         let bytes = record.encode().unwrap();
         assert_eq!(bytes.len(), persist_len(2).unwrap());
@@ -2011,6 +2079,7 @@ mod tests {
                 })
                 .collect(),
             sealed,
+            at_flush: false,
         }
     }
 

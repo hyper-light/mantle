@@ -1590,14 +1590,20 @@ impl Opened {
 /// torn by a crash as well as one damaged since its flush; what tells the two apart is a
 /// confirmation that the frame was flushed: the next frame's record, which is written only
 /// after that flush, or the one the writer writes when no frame follows at once. A frame's
-/// updates are answered only once it is confirmed.
+/// updates are answered once it is confirmed, or at its own flush where its record says so
+/// (mantle docs/design/durability.md §7.1).
 ///
-/// A confirmed frame was acknowledged, and damaged since (AGL+18 §3.3.3). Each of its groups
+/// A confirmed frame was acknowledged, and damaged since (AGL+18 §3.3.3). So may an unconfirmed
+/// one whose record says it was answered at its flush have been: torn by a crash or damaged since,
+/// which nothing on the device tells apart, it is restored as a confirmed one is, and its group
+/// decides from the mark (§7.2, §7.3). The record of either kind says so: the frame's own, and the
+/// copy an open restoring the frame made, so that a restore torn after its record landed is
+/// restored again the same way. Each of its groups
 /// gets back the start and hard state the frame left, its entries cut back to where the
 /// frame's began, and, where the frame wrote entries, the mark that the log may lack them; a
 /// group whose frame held proposals, which a persist record does not carry, is damaged and
-/// recovers from its peers. An unconfirmed frame was never acknowledged, and is the torn tail,
-/// but for its term and vote, which are kept, since raising a term or keeping a vote is always
+/// recovers from its peers. An unconfirmed frame answered once confirmed was never acknowledged,
+/// and is the torn tail, but for its term and vote, which are kept, since raising a term or keeping a vote is always
 /// safe. Its commit is not kept, since it may name an entry only the frame held. A fence the
 /// frame put on a damaged group is kept, confirmed or not.
 ///
@@ -1628,6 +1634,12 @@ fn restores<F: BlockFile>(
         }
     }
     let confirmed = records.iter().any(|(_, p)| p.confirms >= sequence);
+    // Only the frame's own records say how it was answered: the other slot's record of the frame
+    // before says nothing of this one, so a crash between two frames never marks the earlier
+    // (durability.md §7.6).
+    let at_flush = records
+        .iter()
+        .any(|(_, p)| p.sequence == sequence && p.at_flush);
     let own = area.at(sequence);
     let other = area.other(own);
     let chosen = [own, other].into_iter().find_map(|from| {
@@ -1642,8 +1654,10 @@ fn restores<F: BlockFile>(
     let tail = if confirmed {
         Tail::Lost { sequence }
     } else {
-        Tail::Undetermined { sequence }
+        Tail::Undetermined { sequence, at_flush }
     };
+    // Answered, by its confirmation or at its flush: restored and marked, not cut.
+    let answered = confirmed || at_flush;
     let copy = (from == own).then(|| {
         (
             other,
@@ -1659,14 +1673,14 @@ fn restores<F: BlockFile>(
         if damaged.contains(&p.group) || (fenced.contains_key(&p.group) && !p.removed) {
             continue;
         }
-        // A fence the frame wrote is kept whether or not the frame was confirmed: marking a
+        // A fence the frame wrote is kept whether or not the frame was answered: marking a
         // group damaged is always safe, and the frame it fenced may be gone.
-        if p.damaged || (confirmed && p.proposals) {
+        if p.damaged || (answered && p.proposals) {
             damaged.push(p.group);
             continue;
         }
         let g = groups.get(&p.group).unwrap_or(&empty);
-        let restore = if confirmed {
+        let restore = if answered {
             restore_confirmed(&p, g)?
         } else {
             restore_torn(&p, g)
@@ -1698,7 +1712,8 @@ fn restore_torn(p: &format::Persisted, g: &state::Group) -> Option<Restore> {
     })
 }
 
-/// A confirmed frame's group, the frame damaged since it was acknowledged: its removal, or the
+/// An answered frame's group, confirmed or answered at its flush, the frame damaged or torn since
+/// it was acknowledged: its removal, or the
 /// start and hard state the frame left, its entries cut back to where the frame's began, and,
 /// where the frame wrote entries, the mark that the log may lack them. `None` where that
 /// changes nothing.
@@ -1980,6 +1995,7 @@ mod tests {
                 })
                 .collect(),
             sealed: false,
+            at_flush: false,
         }
     }
 

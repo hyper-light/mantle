@@ -427,6 +427,7 @@ fn write_of(first: u64, entries: &[hyper_raft::proto::Entry]) -> hyper_durable::
         hard_state: None,
         proposals: &[],
         released: None,
+        at_flush: false,
     }
 }
 

@@ -1569,7 +1569,13 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     // Its record landed and no confirmation did: the device alone cannot say whether the frame
     // tore or was damaged since, and it was never answered.
-    assert_eq!(recovery.tail, Tail::Undetermined { sequence: 2 });
+    assert_eq!(
+        recovery.tail,
+        Tail::Undetermined {
+            sequence: 2,
+            at_flush: false
+        }
+    );
     assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
     let view = log.view(1).unwrap().unwrap();
     assert_eq!(view.last, 1);
@@ -1651,7 +1657,10 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
         let tail = if confirmed {
             Tail::Lost { sequence: 2 }
         } else {
-            Tail::Undetermined { sequence: 2 }
+            Tail::Undetermined {
+                sequence: 2,
+                at_flush: false,
+            }
         };
         assert_eq!(recovery.tail, tail, "confirmed {confirmed}");
         assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
@@ -4483,4 +4492,319 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
     assert_eq!(recovery.tail, Tail::Torn);
     assert_eq!(log.view(1).unwrap().unwrap().last, 1);
     assert!(log.view(2).unwrap().is_some());
+}
+
+/// Sets, in `file`, the bit of the record of the frame of `sequence` that says the frame was
+/// answered at its own flush, as no writer sets it yet (mantle durability.md §7.7, step 4): the
+/// record in pieces of whichever slot holds it whole, written again with the bit.
+fn answered_at_flush(file: &SimFile, sequence: u64) {
+    let image = file.durable_image().unwrap();
+    let pieces = hyper_log::format::Pieces::new(Alignment::new(512).unwrap(), false).unwrap();
+    let (at, record) = PIECES_SLOTS
+        .into_iter()
+        .find_map(|at| match pieced(&image, at) {
+            hyper_log::format::Pieced::Whole(record) if record.sequence == sequence => {
+                Some((at, record))
+            }
+            _ => None,
+        })
+        .expect("the frame's record reads whole");
+    assert!(
+        !record.at_flush,
+        "the writer says no frame was answered at its flush"
+    );
+    let record = hyper_log::format::Persist {
+        at_flush: true,
+        ..record
+    };
+    write_flushed(file, &pieces.encode(&record).unwrap(), at);
+}
+
+/// The frame of `an_unconfirmed_torn_frame_keeps_only_its_term_and_vote`, its record landed and
+/// itself torn by the crash: frame 2, which wrote entry 2 of term 4 and the vote for 3 in term 4,
+/// over frame 1's entry 1 and vote for 1 in term 1. Its record says it was answered at its flush
+/// where `at_flush`. The file, its frame torn.
+fn torn_after_its_record(seed: u64, update: Update, at_flush: bool) -> SimFile {
+    let file = sim(seed);
+    let cfg = config_now(16, 8);
+    let log = Log::create(file, cfg, ID).unwrap();
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(1, &[1])),
+            hard_state: Some(hard_vote(1, 1, 1)),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    // The next frame's writes, frame and persist record, reach the device; its flush fails,
+    // and every written sector survives the crash.
+    log.with_file(|f| f.inject(Fault::PowerCut { ops: 2 }).unwrap())
+        .unwrap();
+    assert!(matches!(log.write(1, update), Err(LogError::Fenced)));
+    let file = closed(log);
+    file.crash(Crash::KeepAll).unwrap();
+    file.clear_faults().unwrap();
+    if at_flush {
+        answered_at_flush(&file, 2);
+    }
+    let torn = valid_frames(&file.durable_image().unwrap())
+        .into_iter()
+        .max_by_key(|f| f.2)
+        .unwrap();
+    assert_eq!(torn.2, 2, "the unflushed frame's writes survived");
+    file.inject(Fault::BitFlip {
+        offset: torn.0 + 70,
+        bit: 0,
+        stored: true,
+    })
+    .unwrap();
+    file
+}
+
+fn hard_vote(term: u64, vote: u64, commit: u64) -> HardState {
+    HardState {
+        term,
+        vote,
+        commit,
+        held: None,
+    }
+}
+
+/// Frame 2's update in `torn_after_its_record`: entry 2 of term 4, and the vote for 3 in term 4.
+fn voted_in_four(at_flush: bool) -> Update {
+    Update {
+        entries: Some(entries(2, &[4])),
+        hard_state: Some(hard_vote(4, 3, 2)),
+        at_flush,
+        ..Update::default()
+    }
+}
+
+/// The twin of `an_unconfirmed_torn_frame_keeps_only_its_term_and_vote` for a frame answered at
+/// its own flush (mantle durability.md §7.2, §7.6): the same tear, its record whole and no
+/// confirmation, cannot be told from damage after the answer, so the frame is restored as a
+/// lost one is, its entries cut and marked, its term and vote kept, and a second open finds the
+/// same marks.
+#[test]
+fn a_torn_frame_answered_at_its_flush_is_restored_and_marked() {
+    let cfg = config_now(16, 8);
+    let file = torn_after_its_record(47, voted_in_four(true), true);
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(
+        recovery.tail,
+        Tail::Undetermined {
+            sequence: 2,
+            at_flush: true
+        }
+    );
+    assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
+    let mark = Some(Start { index: 2, term: 4 });
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.uncertain), (1, mark));
+    assert_eq!(view.hard_state, Some(hard_vote(4, 3, 1)));
+    let (log, recovery) = Log::open(closed(log), cfg, ID).unwrap();
+    assert_eq!(recovery.tail, Tail::Torn);
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.uncertain), (1, mark));
+    assert_eq!(view.hard_state, Some(hard_vote(4, 3, 1)));
+}
+
+/// The twin of `an_update_is_answered_only_once_its_frame_is_confirmed`'s unconfirmed frame for
+/// one answered at its own flush: its write, its record's and its flush succeed and the
+/// confirmation's does not, and the frame is damaged at rest. Its record says it was answered,
+/// so it is restored and its entry marked, as a confirmed frame's is; a frame answered once
+/// confirmed stays the torn tail.
+#[test]
+fn an_unconfirmed_frame_answered_at_its_flush_is_restored_as_a_lost_one() {
+    for at_flush in [false, true] {
+        let file = sim(48);
+        let cfg = config_now(16, 8);
+        let log = Log::create(file, cfg, ID).unwrap();
+        log.write(
+            1,
+            Update {
+                entries: Some(entries(1, &[1])),
+                hard_state: Some(hard_vote(1, 1, 1)),
+                ..Update::default()
+            },
+        )
+        .unwrap();
+        log.with_file(|f| f.inject(Fault::PowerCut { ops: 3 }).unwrap())
+            .unwrap();
+        let second = Update {
+            entries: Some(entries(2, &[2])),
+            hard_state: Some(hard_vote(2, 2, 1)),
+            at_flush: true,
+            ..Update::default()
+        };
+        assert!(matches!(log.write(1, second), Err(LogError::Fenced)));
+        log.with_file(|f| f.crash(Crash::KeepAll).unwrap()).unwrap();
+        let file = closed(log);
+        file.clear_faults().unwrap();
+        if at_flush {
+            answered_at_flush(&file, 2);
+        }
+        let last = valid_frames(&file.durable_image().unwrap())
+            .into_iter()
+            .max_by_key(|f| f.2)
+            .unwrap();
+        assert_eq!(last.2, 2, "the second frame was flushed");
+        file.inject(Fault::BitFlip {
+            offset: last.0 + 70,
+            bit: 0,
+            stored: true,
+        })
+        .unwrap();
+        let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+        assert_eq!(
+            recovery.tail,
+            Tail::Undetermined {
+                sequence: 2,
+                at_flush
+            }
+        );
+        assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
+        let view = log.view(1).unwrap().unwrap();
+        assert_eq!(view.last, 1, "at its flush {at_flush}");
+        assert_eq!(view.hard_state.map(|h| (h.term, h.vote)), Some((2, 2)));
+        let mark = at_flush.then_some(Start { index: 2, term: 2 });
+        assert_eq!(view.uncertain, mark, "at its flush {at_flush}");
+    }
+}
+
+/// A record torn across its pieces is no record, whatever its landed pieces say of how the frame
+/// was answered: its flush never ended, so nothing in it was answered, and the frame is the torn
+/// tail (mantle durability.md §7.2). Frame 2's record here takes two pieces, of which only the
+/// first landed.
+#[test]
+fn a_record_torn_across_its_pieces_is_the_torn_tail() {
+    let cfg = config_now(16, 8);
+    let file = torn_after_its_record(49, voted_in_four(true), false);
+    let image = file.durable_image().unwrap();
+    let hyper_log::format::Pieced::Whole(record) = pieced(&image, PIECES_SLOTS[0]) else {
+        panic!("frame 2's record reads whole in the first slot");
+    };
+    assert_eq!(record.sequence, 2);
+    let pieces = hyper_log::format::Pieces::new(Alignment::new(512).unwrap(), false).unwrap();
+    let mut groups = record.groups.clone();
+    groups.extend(
+        (2..=u128::try_from(pieces.rows()).unwrap() + 1).map(|group| {
+            hyper_log::format::Persisted {
+                group,
+                hard_state: Some(hard_vote(4, 3, 2)),
+                ..hyper_log::format::Persisted::default()
+            }
+        }),
+    );
+    let record = hyper_log::format::Persist {
+        groups,
+        at_flush: true,
+        ..record
+    };
+    assert_eq!(pieces.count(record.groups.len()), Some(2));
+    let bytes = pieces.encode(&record).unwrap();
+    write_flushed(&file, &bytes[..512], PIECES_SLOTS[0]);
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(recovery.tail, Tail::Torn);
+    assert_eq!((recovery.restored, recovery.damaged), (vec![], vec![]));
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.uncertain), (1, None));
+}
+
+/// A piece of the record of a frame answered at its flush that fails its own checksum, its frame
+/// failing too, is damage at rest, since no crash tears a piece: the log opens nothing and its
+/// replicas recover from their peers (mantle durability.md §7.2).
+#[test]
+fn a_damaged_piece_with_its_frame_is_damage() {
+    let cfg = config_now(16, 8);
+    let file = torn_after_its_record(50, voted_in_four(true), true);
+    damage(&file, PIECES_SLOTS[0] + 70);
+    assert!(matches!(
+        Log::open(file, cfg, ID),
+        Err(LogError::Damaged(_))
+    ));
+}
+
+/// A crash between two frames never marks the earlier (mantle durability.md §7.6): frame 2,
+/// answered at its flush, reads whole, and the next frame either left no record or left one of
+/// its own, which alone says how it was answered: as the writer writes it, once confirmed, so it
+/// is the torn tail. Frame 2's record in the other slot says nothing of frame 3.
+#[test]
+fn a_crash_between_two_frames_never_marks_the_earlier() {
+    let file = sim(51);
+    let cfg = config_now(16, 8);
+    let log = Log::create(file, cfg, ID).unwrap();
+    for index in 1..=2 {
+        let update = Update {
+            entries: Some(entries(index, &[1])),
+            hard_state: Some(hard_vote(1, 1, index)),
+            at_flush: true,
+            ..Update::default()
+        };
+        log.write(1, update).unwrap();
+    }
+    let file = closed(log);
+    answered_at_flush(&file, 2);
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(recovery.tail, Tail::Torn);
+    assert_eq!(recovery.restored, Vec::<u128>::new());
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.uncertain), (2, None));
+    // Frame 3's frame and record land, its flush does not, and it tears.
+    log.with_file(|f| f.inject(Fault::PowerCut { ops: 2 }).unwrap())
+        .unwrap();
+    let third = Update {
+        entries: Some(entries(3, &[2])),
+        hard_state: Some(hard_vote(2, 2, 2)),
+        at_flush: true,
+        ..Update::default()
+    };
+    assert!(matches!(log.write(1, third), Err(LogError::Fenced)));
+    let file = closed(log);
+    file.crash(Crash::KeepAll).unwrap();
+    file.clear_faults().unwrap();
+    let torn = valid_frames(&file.durable_image().unwrap())
+        .into_iter()
+        .max_by_key(|f| f.2)
+        .unwrap();
+    assert_eq!(torn.2, 3, "the unflushed frame's writes survived");
+    damage(&file, torn.0 + 70);
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(
+        recovery.tail,
+        Tail::Undetermined {
+            sequence: 3,
+            at_flush: false
+        }
+    );
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.uncertain), (2, None));
+    assert_eq!(view.hard_state.map(|h| (h.term, h.vote)), Some((2, 2)));
+}
+
+/// A one-voter group's frame is never marked (mantle durability.md §7.5): the others are no
+/// quorum without its only member, so its frames stay answered once confirmed, and the update
+/// says so. Torn after its record landed, the frame is the torn tail: its entries cut, unmarked,
+/// its term and vote kept.
+#[test]
+fn a_one_voter_groups_frame_is_never_marked() {
+    let cfg = config_now(16, 8);
+    let file = torn_after_its_record(52, voted_in_four(false), false);
+    let image = file.durable_image().unwrap();
+    let hyper_log::format::Pieced::Whole(record) = pieced(&image, PIECES_SLOTS[0]) else {
+        panic!("frame 2's record reads whole in the first slot");
+    };
+    assert_eq!((record.sequence, record.at_flush), (2, false));
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(
+        recovery.tail,
+        Tail::Undetermined {
+            sequence: 2,
+            at_flush: false
+        }
+    );
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!((view.last, view.uncertain), (1, None));
+    assert_eq!(view.hard_state, Some(hard_vote(4, 3, 1)));
 }

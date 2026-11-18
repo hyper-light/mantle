@@ -87,9 +87,19 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `b4c7230` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and ten commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
-in the hyper-raft repository's own objects and not yet pushed to its origin. Its tenth commit,
+**Every crate at `e8c4bed` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and eleven commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
+in the hyper-raft repository's own objects and not yet pushed to its origin. Its eleventh commit,
+`e8c4bed`, changes hyper-log and hyper-durable (mantle docs/design/durability.md §7.7, step 3a): a
+persist record in pieces says whether its frame was answered at its own flush, in the first byte its
+pieces' header left as padding (`format::AT_FLUSH`), and pieces that differ in it are two writes; a
+whole record cannot say it. The open reads it from the frame's own records only, so a crash between
+two frames never marks the earlier, and restores an `Undetermined` frame so answered as a `Lost` one
+is (`Tail::Undetermined::at_flush`). `Update::at_flush`, from hyper-durable's `Write::at_flush`,
+which the replica sets where each half of its configuration has voters enough that the others are a
+quorum, three or more. Every writer still writes the bit false, so a log's bytes are as before and
+the equivalence test's hashes stand. New constant `AT_FLUSH`, and the header's padding read as one
+byte, with their rows in docs/design/constants.md. Its tenth commit,
 `b4c7230`, changes hyper-log alone (mantle docs/design/durability.md §7.7, step 2b-iii): a sealed
 log's persist records are laid in pieces too (format 6), each piece's MAC under the log's
 authentication key over the piece through its CRC, so a forged or altered piece, or an unsealed

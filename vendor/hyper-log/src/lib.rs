@@ -166,6 +166,13 @@ pub struct Update {
     /// The replica left this device: every record of the group is dead. Nothing else may
     /// come with it.
     pub remove: bool,
+    /// The group may be answered at its frame's own flush: the replica's configuration has three
+    /// voters or more in each half, so the others are a quorum without it, and a copy of its
+    /// entry left marked by a crash is resolved by the rest of the group (mantle
+    /// docs/design/durability.md §7.5). False keeps the frame holding it answered once
+    /// confirmed, as a one- or two-voter group's must stay; and every frame is so answered until
+    /// the writer answers at the flush (§7.7, step 4).
+    pub at_flush: bool,
 }
 
 /// How urgently a submission is wanted durable, as Tectonic's TrafficClasses order a node's
@@ -255,11 +262,15 @@ pub enum Tail {
     Torn,
     /// Its record reads and no confirmation of its flush does: torn by a crash after its
     /// record landed, or damaged since its flush, which nothing on the device tells apart
-    /// (AGL+18 §3.3.3). A frame is answered only once confirmed, so nothing in it was
-    /// answered: it is the torn tail, its terms and votes kept.
+    /// (AGL+18 §3.3.3). A frame answered once confirmed was never answered: it is the torn
+    /// tail, its terms and votes kept. One whose record says it was answered at its flush is
+    /// restored as a lost one is, its groups marked, and each group decides (mantle
+    /// docs/design/durability.md §7.2, §7.3).
     Undetermined {
         /// The frame's sequence.
         sequence: u64,
+        /// Its record says it was answered at its own flush.
+        at_flush: bool,
     },
     /// Its record reads and a confirmation of its flush does: it was answered and is damaged
     /// since. Its groups are restored and their entries marked.

@@ -477,6 +477,19 @@ fn answers(message: &Message) -> bool {
     )
 }
 
+/// Whether a write under a configuration of these halves may be answered at its frame's own flush
+/// (`Write::at_flush`): in each half, the voters but any one are a quorum, `n - 1 > n / 2`, which
+/// three voters or more meet and one or two do not (mantle docs/design/durability.md §7.5). The
+/// outgoing half counts only in a joint configuration, where it is not empty.
+fn others_a_quorum(voters: &[u64], outgoing: &[u64]) -> bool {
+    let enough = |half: &[u64]| {
+        half.len()
+            .checked_sub(1)
+            .is_some_and(|others| others > half.len() / 2)
+    };
+    enough(voters) && (outgoing.is_empty() || enough(outgoing))
+}
+
 /// Every member a configuration names.
 fn names(configuration: &ConfState, member: u64) -> bool {
     [
@@ -631,6 +644,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// The commit the member's durable writes stated.
     pub fn logged_commit(&self) -> u64 {
         self.logged_commit
+    }
+
+    /// Whether this member's writes may be answered at their frame's own flush (`Write::at_flush`):
+    /// under both the configuration it counts by, the newest its log states, and the one applied,
+    /// so that a change in the log and not applied answers no write the other would not.
+    fn at_flush(&self) -> bool {
+        [
+            self.node.raft.configuration(),
+            self.node.raft.applied_configuration(),
+        ]
+        .into_iter()
+        .all(|c| others_a_quorum(c.voters(), c.outgoing()))
     }
 
     /// The configuration as of the last entry applied.
@@ -1931,6 +1956,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             hard_state: Some(hard),
             proposals: &proposals,
             released,
+            at_flush: self.at_flush(),
         };
         let submitted = self.node.store_mut().log.submit(&write, waker);
         let state = self.submitted_state(submitted)?;
@@ -2230,6 +2256,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         hard: Option<HardState>,
         waker: &Waker,
     ) -> Result<State, ReplicaError> {
+        let at_flush = self.at_flush();
         let Self { node, machine, .. } = self;
         let persist = node.to_persist();
         let start = match persist.snapshot {
@@ -2249,6 +2276,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             hard_state: hard,
             proposals: ready.proposals(),
             released: ready.released(),
+            at_flush,
         };
         if write.is_empty() {
             return Ok(State::Empty);
@@ -2294,6 +2322,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         };
         let write = Write {
             hard_state: Some(hard),
+            at_flush: self.at_flush(),
             ..Write::default()
         };
         let submitted = self.node.store_mut().log.submit(&write, waker);
@@ -2636,6 +2665,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             let write = Write {
                 start: Some(Point { index, term }),
                 hard_state: hard,
+                at_flush: r.at_flush(),
                 ..Write::default()
             };
             let submitted = r.node.store_mut().log.submit(&write, waker);
@@ -2853,6 +2883,9 @@ fn repair_at_open<L: LogStore>(log: &mut L, durable: Point) -> Result<crate::Sto
             }),
             proposals: &[],
             released: None,
+            // Written as the member opens, before its configuration is read: answered once
+            // confirmed.
+            at_flush: false,
         }
     } else if durable.index > hard.commit {
         Write {
@@ -2867,4 +2900,24 @@ fn repair_at_open<L: LogStore>(log: &mut L, durable: Point) -> Result<crate::Sto
     };
     log.write_now(&write).map_err(OpenError::Log)?;
     log.view().map_err(OpenError::Log)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::others_a_quorum;
+
+    /// A write is answered at its frame's flush only where, in each half of the configuration,
+    /// the voters but any one are a quorum: three voters or more, never one or two, and in a
+    /// joint configuration both halves (mantle durability.md §7.5).
+    #[test]
+    fn only_three_voters_or_more_in_each_half_answer_at_the_flush() {
+        assert!(!others_a_quorum(&[], &[]));
+        assert!(!others_a_quorum(&[1], &[]));
+        assert!(!others_a_quorum(&[1, 2], &[]));
+        assert!(others_a_quorum(&[1, 2, 3], &[]));
+        assert!(others_a_quorum(&[1, 2, 3, 4], &[]));
+        assert!(!others_a_quorum(&[1, 2, 3], &[1, 2]));
+        assert!(!others_a_quorum(&[1, 2], &[1, 2, 3]));
+        assert!(others_a_quorum(&[1, 2, 3], &[2, 3, 4, 5]));
+    }
 }

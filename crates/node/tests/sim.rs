@@ -1,5 +1,6 @@
 //! Deterministic simulation of a cell of nodes (docs/design/node.md §9.1, `support/cell.rs`):
-//! three nodes or five (odd seeds three, even seeds five) and three clients.
+//! three nodes or five (odd seeds three, even seeds five), or one for a tear on a one-voter group,
+//! and three clients.
 //!
 //! A run is its seed. The cell's paths are one of the named profiles of focal's path model (one
 //! switch, one continent, across the planet: hyper-sim's `Path::LAN`, `REGIONAL`, `GEOGRAPHIC`).
@@ -25,7 +26,7 @@
 )]
 
 use hyper_block::sim::Fault as DeviceFault;
-use hyper_log::Start;
+use hyper_log::{Start, Tail};
 use hyper_rt::sim::SimPath;
 use hyper_sim::rng::{Seeded, stream_seed};
 use mantle_meta::name;
@@ -659,6 +660,8 @@ enum Tear {
     /// On a quorum of members, drawn from the seed; once the last of them stops, every other
     /// node's power is cut at once, as a cell whose nodes share one feed loses them.
     Quorum,
+    /// On every member of a one-voter group: the node of a cell of one, as a laptop's is.
+    OneVoter,
 }
 
 /// What one torn cut left of the range: whether a member's copy of the entry was marked, and
@@ -672,9 +675,14 @@ struct Left {
 
 /// One run of `seed` under `tear`, its laws checked: an answered entry is applied on every node;
 /// every mark ends once a quorum of members is up and one copy reads whole or a quorum lacks the
-/// entry; a group left waiting reports `Uncertain` on each marked member and serves nothing.
+/// entry; a group left waiting reports `Uncertain` on each marked member and serves nothing; a
+/// one-voter group's torn frame says it was not answered at its flush, and the group never marks.
 fn torn(seed: u64, tear: Tear) -> Left {
-    let mut cell = Sim::new(seed);
+    let mut cell = if tear == Tear::OneVoter {
+        Sim::lone(seed)
+    } else {
+        Sim::new(seed)
+    };
     cell.leader();
     cell.open_bucket();
     let order: Vec<u64> = (1..=cell.nodes).collect();
@@ -692,6 +700,7 @@ fn torn(seed: u64, tear: Tear) -> Left {
     let struck: Vec<u64> = (0..match tear {
         Tear::One => 1,
         Tear::Quorum => quorum,
+        Tear::OneVoter => cell.nodes,
     })
         .map(|_| {
             let at = draws.below(u64::try_from(members.len()).unwrap());
@@ -729,6 +738,25 @@ fn torn(seed: u64, tear: Tear) -> Left {
             r.tail, r.view
         );
     }
+    if tear == Tear::OneVoter {
+        // A one-voter group's frames are answered once confirmed (durability.md §7.5): the torn
+        // frame's record says it was not answered at its flush, as `Write::at_flush` holds only
+        // for three voters or more, and the open keeps the frame as the torn tail, unmarked.
+        for (id, r) in &reopened {
+            assert!(
+                matches!(
+                    r.tail,
+                    Tail::Undetermined {
+                        at_flush: false,
+                        ..
+                    }
+                ) && r.view.as_ref().is_some_and(|v| v.uncertain.is_none()),
+                "seed {seed}: node {id}, a one-voter group's member, reopened {:?}, its range {:?}",
+                r.tail,
+                r.view
+            );
+        }
+    }
     let marks: Vec<(u64, Start)> = reopened
         .iter()
         .filter_map(|(id, r)| r.view.as_ref()?.uncertain.map(|m| (*id, m)))
@@ -738,6 +766,12 @@ fn torn(seed: u64, tear: Tear) -> Left {
         assert!(
             cell.converged() >= answered,
             "seed {seed}: an answered entry was lost"
+        );
+        assert!(
+            cell.members
+                .values()
+                .all(|m| m.status.as_ref().is_some_and(|s| !s.uncertain)),
+            "seed {seed}: {tear:?}: a member opened unmarked reports a mark"
         );
         return Left::default();
     };
@@ -818,18 +852,20 @@ fn torn(seed: u64, tear: Tear) -> Left {
 }
 
 /// A power cut that tears a frame of the range's entry after its persist record landed, the
-/// frame's write lost and its record's kept (durability.md §7.6), on one member and on a quorum of
-/// members, over the power-cut tests' seeds. Every frame is still answered once confirmed, and
-/// the record of a range of three voters or more says its frame was answered at its flush, so the
-/// open restores each torn member's frame as a lost one and marks it. The laws: an answered entry
-/// is applied on every node; every mark ends once a quorum is up and one copy reads whole or a
-/// quorum lacks the entry; a group left waiting reports `Uncertain` and serves nothing. The groups
-/// marked and left waiting are counted, the evidence §7.5 decides step 4 from.
+/// frame's write lost and its record's kept (durability.md §7.6), on one member, on a quorum of
+/// members and on every member of a one-voter group, over the power-cut tests' seeds. Every frame
+/// is still answered once confirmed, and the record of a range of three voters or more says its
+/// frame was answered at its flush, so the open restores each torn member's frame as a lost one
+/// and marks it; a one-voter group's record says it was not, and the group is never marked. The
+/// laws: an answered entry is applied on every node; every mark ends once a quorum is up and one
+/// copy reads whole or a quorum lacks the entry; a group left waiting reports `Uncertain` and
+/// serves nothing. The groups marked and left waiting are counted, the evidence §7.5 decides step
+/// 4 from.
 #[test]
 fn a_frame_torn_after_its_record_lands_is_marked_and_each_group_resolves_or_waits_reported() {
     let seeds = seeds(&(1..=CUT_SEEDS).collect::<Vec<_>>());
     let mut table = Vec::new();
-    for tear in [Tear::One, Tear::Quorum] {
+    for tear in [Tear::One, Tear::Quorum, Tear::OneVoter] {
         let left: Vec<Left> = seeds.iter().map(|&seed| torn(seed, tear)).collect();
         let marked = left.iter().filter(|l| l.marked).count();
         let waiting = left.iter().filter(|l| l.waiting).count();

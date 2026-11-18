@@ -1,13 +1,14 @@
 //! The simulated cell the node's simulation tests run (docs/design/node.md §9.1): three nodes or
-//! five and their clients, each on a shard of its own of one hyper-rt simulation runtime, which
-//! runs every shard on one thread on a virtual clock. The nodes' QUIC endpoints, their sealed
-//! datagram planes and the clients' endpoints are sockets on the runtime's fabric; each node's log
-//! is hyper-log on hyper-block's simulated device, every write's answer taken as it is asked (as
-//! the range simulation's members are, `crates/range/tests/sim.rs`), and its range's rows are in
-//! the model engine. The nodes are the production owner (`Node`), elected by suspicion over their
-//! liveness stream, replicating on QUIC lanes with consensus control on the plane; the clients are
-//! the production client, redirected and retrying as they are. A run is its seed: every key,
-//! certificate serial and endpoint's draws derive from it.
+//! five, or one as a laptop's cell is, and their clients, each on a shard of its own of one
+//! hyper-rt simulation runtime, which runs every shard on one thread on a virtual clock. The
+//! nodes' QUIC endpoints, their sealed datagram planes and the clients' endpoints are sockets on
+//! the runtime's fabric; each node's log is hyper-log on hyper-block's simulated device, every
+//! write's answer taken as it is asked (as the range simulation's members are,
+//! `crates/range/tests/sim.rs`), and its range's rows are in the model engine. The nodes are the
+//! production owner (`Node`), elected by suspicion over their liveness stream, replicating on QUIC
+//! lanes with consensus control on the plane; the clients are the production client, redirected
+//! and retrying as they are. A run is its seed: every key, certificate serial and endpoint's draws
+//! derive from it.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -44,6 +45,7 @@ use mantle_node::node::{
     Hosted, Node, NodeLog, NodeSettings, Status, Wall, Written, message_bounds,
 };
 use mantle_node::storage::Storage;
+use mantle_protocol::bounds;
 use mantle_protocol::classes::Role;
 use mantle_protocol::node_name;
 use mantle_range::{ConfState, Entry as RaftEntry, Range, ReplicaError, Settings};
@@ -626,6 +628,17 @@ impl Sim {
     /// The cell of `seed`, its range under `settings` and its nodes' logs under `log`.
     pub fn with(seed: u64, settings: Settings, log: LogConfig) -> Self {
         let nodes = if seed % 2 == 1 { NODES } else { MOST_NODES };
+        Self::of(seed, nodes, settings, log)
+    }
+
+    /// The cell of `seed` of one node, as a laptop's is: its range one voter, so every frame
+    /// holding it is answered once confirmed (durability.md §7.5).
+    pub fn lone(seed: u64) -> Self {
+        Self::of(seed, 1, SETTINGS, log_config())
+    }
+
+    /// The cell of `seed` of `nodes`, its range under `settings` and its nodes' logs under `log`.
+    fn of(seed: u64, nodes: u64, settings: Settings, log: LogConfig) -> Self {
         let shards = usize::try_from(nodes + CLIENTS + 1).unwrap();
         let mut rt = SimRuntime::new(
             &RuntimeConfig {
@@ -1038,8 +1051,15 @@ impl Sim {
 
     /// The quiet period: the longest any node states it may go without moving, or a link to a
     /// peer it dials may should that peer fall silent, or any client gives an exchange; never
-    /// less than a round trip of the longest path, nor than one step.
+    /// less than a node's serve period, nor than a round trip of the longest path, nor than one
+    /// step. The serve period (`bounds::idle_timeout`, the endpoint's `serve_period`) is how long
+    /// an exchange a node carries may make no progress before its transport judges it stalled: a
+    /// client's exchange may go that quiet and be no fault. It is what a lone node's cell waits
+    /// on, as such a node states none of the rest: it waits on no peer, its range one voter that
+    /// elects itself and commits at its own flush, and its patience is the wait for peers'
+    /// evidence and a measured election (`Status::patience`), which it lacks.
     pub fn quiet(&self) -> u64 {
+        let serve = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap_or(u64::MAX);
         self.members
             .values()
             .filter_map(|m| m.status.as_ref())
@@ -1048,7 +1068,9 @@ impl Sim {
             .chain(self.patience.values().copied())
             .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
             .fold(
-                self.step_ns.max(1).max(self.longest_ns.saturating_mul(2)),
+                serve
+                    .max(self.step_ns.max(1))
+                    .max(self.longest_ns.saturating_mul(2)),
                 u64::max,
             )
     }

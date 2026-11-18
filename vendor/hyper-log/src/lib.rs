@@ -213,6 +213,32 @@ pub struct Recovery {
     pub damaged: Vec<u128>,
     /// Groups restored from the persist record of a last frame that no longer reads.
     pub restored: Vec<u128>,
+    /// What the open found of the frame after the last that reads.
+    pub tail: Tail,
+}
+
+/// The frame after the last that reads, as its persist records leave it (mantle
+/// docs/design/raft-log.md §6, durability.md §7.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tail {
+    /// No record of it reads: none was written, or one tore before its flush ended, so
+    /// nothing in it was answered. The log is cut there.
+    #[default]
+    Torn,
+    /// Its record reads and no confirmation of its flush does: torn by a crash after its
+    /// record landed, or damaged since its flush, which nothing on the device tells apart
+    /// (AGL+18 §3.3.3). A frame is answered only once confirmed, so nothing in it was
+    /// answered: it is the torn tail, its terms and votes kept.
+    Undetermined {
+        /// The frame's sequence.
+        sequence: u64,
+    },
+    /// Its record reads and a confirmation of its flush does: it was answered and is damaged
+    /// since. Its groups are restored and their entries marked.
+    Lost {
+        /// The frame's sequence.
+        sequence: u64,
+    },
 }
 
 /// Entries fetched: the caller's reservation, which the log fills with each entry's term and

@@ -87,10 +87,16 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `85bd35f` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
-`17371e2` and six commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
-branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its sixth
-commit, `85bd35f`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.15, hyper-rt ORIGIN.md,
+**Every crate at `2dd3bde` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and one commit), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is in
+the hyper-raft repository's own objects and not yet pushed to its origin. Its commit, `2dd3bde`,
+changes hyper-log alone (hyper-raft docs/durable.md; mantle docs/design/durability.md §7.7, step 1):
+the open reports what the persist records left of the frame after the last that reads
+(`Recovery::tail`), `Torn` where no record of it reads, `Undetermined` where its record reads and
+no confirmation does, `Lost` where its confirmation reads; recovery is unchanged. No new constant.
+Every other crate is as at `85bd35f`. Before it, every crate was at `85bd35f` (hyper-raft branch
+`mantle-shard-port`: `land/mantle-general-4`'s `17371e2` and six commits), with no local delta. Its
+sixth commit, `85bd35f`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.15, hyper-rt ORIGIN.md,
 "task classes"): tasks carry a class, Critical, Normal (the default) or Background, each with its
 own lists in the run queue, made as a task of the shard first takes it; each class with work has an
 equal share of the shard's time, and the most urgent goes first while it has run no more than the

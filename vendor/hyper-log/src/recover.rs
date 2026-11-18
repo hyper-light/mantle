@@ -11,7 +11,7 @@ use crate::format::{self, FRAME_HEADER_BYTES, FrameHeader, MAC_LEN, Owned, Segme
 use crate::seal::Sealer;
 use crate::state::{self, Live, Place, Replayed, Slot};
 use crate::state::{Head, Segments, State};
-use crate::{Config, LogError, Recovery};
+use crate::{Config, LogError, Recovery, Tail};
 
 /// What a frame's position holds.
 pub(crate) enum Found<'a> {
@@ -1041,7 +1041,7 @@ pub(crate) fn open<F: BlockFile>(
     let (groups, mut damaged, fenced) = finish(replay.groups);
     // 4b. A frame after the last valid one may have been flushed and damaged since: its
     // persist record, written in the same flush, says what it held (AGL+18 §3.3.3).
-    let (mut restores, copy) = restores(
+    let (mut restores, copy, tail) = restores(
         file,
         config,
         id,
@@ -1072,7 +1072,7 @@ pub(crate) fn open<F: BlockFile>(
         head_offset,
         frames: replay.frames,
     };
-    let (state, recovery) = opened.into_state(heads, &last, shape.slots, &restores)?;
+    let (state, recovery) = opened.into_state(heads, &last, shape.slots, &restores, tail)?;
     Ok((state, recovery, restores))
 }
 
@@ -1094,6 +1094,7 @@ impl Opened {
         last: &Last,
         slots: u32,
         restores: &[Restore],
+        tail: Tail,
     ) -> Result<(State, Recovery), LogError> {
         let highest = heads.highest;
         let head_slot = heads.slot(highest)?;
@@ -1159,6 +1160,7 @@ impl Opened {
             frames: self.frames,
             damaged: all,
             restored,
+            tail,
         };
         Ok((state, recovery))
     }
@@ -1186,7 +1188,8 @@ impl Opened {
 /// landed, that record is the one read: it holds the restore, and restoring from it leaves
 /// each group as restoring from the lost frame's record does. Also returns the copy to make
 /// before a restore is written, when the record read is in its own slot: where the copy goes,
-/// and the record saying whether the frame was confirmed.
+/// and the record saying whether the frame was confirmed; and what the records left of the
+/// frame, the open's report of it.
 fn restores<F: BlockFile>(
     file: &F,
     config: &Config,
@@ -1195,9 +1198,9 @@ fn restores<F: BlockFile>(
     (groups, fenced): (&HashMap<u128, state::Group>, &HashMap<u128, Place>),
     damaged: &mut Vec<u128>,
     sealer: Option<&Sealer>,
-) -> Result<(Vec<Restore>, Option<RecordCopy>), LogError> {
+) -> Result<(Vec<Restore>, Option<RecordCopy>, Tail), LogError> {
     let Some(sequence) = last.checked_add(1) else {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, Tail::Torn));
     };
     let align = file.layout_block();
     let slot = persist_slot(config, align, sealer.is_some())?;
@@ -1222,7 +1225,12 @@ fn restores<F: BlockFile>(
             .map(|(_, p)| (from, p.clone()))
     });
     let Some((from, record)) = chosen else {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, Tail::Torn));
+    };
+    let tail = if confirmed {
+        Tail::Lost { sequence }
+    } else {
+        Tail::Undetermined { sequence }
     };
     let copy = (from == own).then(|| {
         (
@@ -1253,7 +1261,7 @@ fn restores<F: BlockFile>(
         };
         out.extend(restore);
     }
-    Ok((out, copy))
+    Ok((out, copy, tail))
 }
 
 /// An unconfirmed frame's group: the torn tail, keeping only a later term or a vote given, at

@@ -18,7 +18,7 @@ use hyper_block::buf::{AlignedBuf, Alignment};
 use hyper_block::sim::{Crash, Fault, SimFile};
 use hyper_log::{
     Class, Config, Entries, Entry, HardState, Log, LogError, LogStats, Proposal, Refused, Start,
-    Update, View, Waits,
+    Tail, Update, View, Waits,
 };
 use proptest::prelude::*;
 
@@ -1567,6 +1567,9 @@ fn an_unconfirmed_torn_frame_keeps_only_its_term_and_vote() {
     })
     .unwrap();
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    // Its record landed and no confirmation did: the device alone cannot say whether the frame
+    // tore or was damaged since, and it was never answered.
+    assert_eq!(recovery.tail, Tail::Undetermined { sequence: 2 });
     assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
     let view = log.view(1).unwrap().unwrap();
     assert_eq!(view.last, 1);
@@ -1645,6 +1648,12 @@ fn an_update_is_answered_only_once_its_frame_is_confirmed() {
         })
         .unwrap();
         let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+        let tail = if confirmed {
+            Tail::Lost { sequence: 2 }
+        } else {
+            Tail::Undetermined { sequence: 2 }
+        };
+        assert_eq!(recovery.tail, tail, "confirmed {confirmed}");
         assert_eq!((recovery.restored, recovery.damaged), (vec![1], vec![]));
         let view = log.view(1).unwrap().unwrap();
         assert_eq!(view.last, 1, "confirmed {confirmed}");
@@ -1702,6 +1711,7 @@ fn a_torn_frame_without_its_persist_record_is_the_torn_tail() {
     );
     damage(&file, torn.0 + 70);
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(recovery.tail, Tail::Torn);
     assert_eq!(recovery.restored, Vec::<u128>::new());
     let view = log.view(1).unwrap().unwrap();
     assert_eq!((view.last, view.uncertain), (1, None));

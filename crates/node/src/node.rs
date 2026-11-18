@@ -576,7 +576,7 @@ struct Remote {
     /// When this node dials it again, for a peer it dials that has no connection.
     redial_at: Option<u64>,
     /// The redial's backoff ([`bounds::backed_off`]): from the probe timeout the last connection
-    /// measured, or the initial one before any.
+    /// measured, or the initial one before any, at most the idle timeout ([`redial_backoff`]).
     backoff: Duration,
     /// Redials paused for so far: the draw each pause's jitter takes ([`bounds::pause`]).
     redials: u32,
@@ -3028,13 +3028,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(max) = max_datagram {
             self.plane.set_path(peer, max).map_err(NodeError::Plane)?;
         }
-        // The connection's handshake measured its path: a later redial backs off from its probe
-        // timeout (RFC 6298 §5.5), not the one before any sample.
-        let backoff = self
-            .driver
-            .endpoint()
-            .path(peer)
-            .map_or_else(bounds::initial_pto, |path| bounds::measured_pto(&path));
+        let backoff = redial_backoff(
+            self.driver
+                .endpoint()
+                .path(peer)
+                .map(|path| bounds::measured_pto(&path)),
+        );
         if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
             remote.keyed = true;
             remote.redial_at = None;
@@ -3063,13 +3062,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// A peer's connection went: what this node kept for it goes ([`Self::unkey`]), and a peer
-    /// this node dials is dialed again after a pause of its backoff ([`Self::redial_later`]).
+    /// this node dials is dialed again after a pause of its backoff ([`redial_later`]).
     fn lost(&mut self, peer: PeerId, now: u64) {
         self.unkey(peer);
         if self.dials(peer)
             && let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer)
         {
-            Self::redial_later(self.id, remote, now);
+            redial_later(self.id, remote, now);
         }
     }
 
@@ -3130,20 +3129,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     remote.ended = remote.ended.saturating_add(1);
                     remote.refusal = Some(refusal);
                     remote.was_up = false;
-                    Self::redial_later(self.id, remote, now);
+                    redial_later(self.id, remote, now);
                 }
             }
         }
-    }
-
-    /// Dials `remote` again after a pause of its backoff, and backs off further (node.md §5:
-    /// doubled from the measured probe timeout, at most the idle timeout, with equal jitter).
-    fn redial_later(local: u64, remote: &mut Remote, now: u64) {
-        let pause = bounds::pause(remote.backoff, local, remote.redials);
-        remote.redials = remote.redials.wrapping_add(1);
-        let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
-        remote.redial_at = Some(now.saturating_add(wait));
-        remote.backoff = bounds::backed_off(remote.backoff);
     }
 
     /// Queues the replicas whose deadline has come, and those with a write out, which a log's
@@ -5312,6 +5301,25 @@ fn answer_command(commanded: &mut [Commanded], group: u128, applied: &Applied) {
     }
 }
 
+/// The backoff a redial of a peer starts from once its connection is up: the probe timeout its
+/// handshake measured (RFC 6298 §5.5), the one before any sample where none was, at most the
+/// idle timeout as every backoff is (`bounds::backoff_from`), so the reconnect the node states,
+/// the idle timeout and the backoff (`Status::reconnect`), bounds every pause a redial takes: a
+/// handshake whose answers its shard read late, held, measured the hold as its round trip.
+fn redial_backoff(measured: Option<Duration>) -> Duration {
+    measured.map_or_else(bounds::initial_pto, bounds::backoff_from)
+}
+
+/// Dials `remote` again after a pause of its backoff, and backs off further (node.md §5:
+/// doubled from the measured probe timeout, at most the idle timeout, with equal jitter).
+fn redial_later(local: u64, remote: &mut Remote, now: u64) {
+    let pause = bounds::pause(remote.backoff, local, remote.redials);
+    remote.redials = remote.redials.wrapping_add(1);
+    let wait = u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX);
+    remote.redial_at = Some(now.saturating_add(wait));
+    remote.backoff = bounds::backed_off(remote.backoff);
+}
+
 /// The node's log, on a file in its directory: created empty for a new node, which sizes it as
 /// it writes.
 fn open_log(dir: &Path, node: u64, config: LogConfig) -> Result<Log<DeviceFile>, NodeError> {
@@ -5338,6 +5346,34 @@ mod tests {
     use mantle_meta::root;
 
     use super::*;
+
+    /// A peer whose handshake measured its path across a hold of this node's shard is dialed
+    /// again, once its connection ends, within the reconnect the node states for it, the idle
+    /// timeout and its backoff, at every redial; one with no path measured starts from the probe
+    /// timeout before any sample, and one measured on a quick path from what it measured.
+    #[test]
+    fn a_link_measured_across_a_hold_is_dialed_again_within_its_stated_reconnect() {
+        let idle = bounds::idle_timeout();
+        assert_eq!(redial_backoff(None), bounds::initial_pto());
+        let quick = Duration::from_millis(3);
+        assert_eq!(redial_backoff(Some(quick)), quick);
+        // A first round trip sampled across the 218 s hold: its probe timeout three times it.
+        let held = Duration::from_secs(218).saturating_mul(3);
+        let mut remote = Remote::new(2, false);
+        remote.backoff = redial_backoff(Some(held));
+        let mut now = 1_000u64;
+        for _ in 0..8 {
+            let stated = idle.saturating_add(remote.backoff);
+            redial_later(1, &mut remote, now);
+            let at = remote.redial_at.unwrap();
+            let pause = Duration::from_nanos(at - now);
+            assert!(
+                pause <= idle && pause <= stated,
+                "{pause:?} past {stated:?}"
+            );
+            now = at;
+        }
+    }
 
     /// A chunk is waited on as long as its asker carried, never past the stock S3 clients'
     /// patience: none said is that patience, a shorter time is kept, and a longer one, which no

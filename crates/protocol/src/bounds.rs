@@ -94,6 +94,19 @@ pub fn measured_pto(path: &hyper_transport::PathFacts) -> Duration {
     path.probe_timeout.saturating_add(MAX_ACK_DELAY)
 }
 
+/// A backoff's first delay from a measured probe timeout `pto` (node.md §5, retries and
+/// reconnects): `pto`, at most the idle timeout, as every delay [`backed_off`] gives after it is.
+/// A round trip sampled across a hold of its endpoint (its shard held in one poll, its process
+/// stopped or swapped out) measures the hold, and a path's first sample makes its probe timeout
+/// three times it (RFC 9002 §5.3: `smoothed_rtt` the sample, `rttvar` half of it; §6.2.1). Taken
+/// whole, a redial's pause drawn from it outlasted the reconnect its node stated, the idle timeout
+/// and the backoff the doubling had capped: on CI run 44369369345 (linux-aarch64-1cpu) a node
+/// restarted into a shard held 218 s stated a reconnect of 6.144 s, and its links stayed unkeyed
+/// after one dial each to the end of a 600 s wait, its loop turning all the while.
+pub fn backoff_from(pto: Duration) -> Duration {
+    pto.min(idle_timeout())
+}
+
 /// RFC 9002 §6.2.1's probe timeout before any sample: `smoothed_rtt + max(4·rttvar, kGranularity)
 /// + max_ack_delay`, with `rttvar` half the initial round trip (§6.2.2).
 pub fn initial_pto() -> Duration {
@@ -636,6 +649,21 @@ mod tests {
         }
         // Two peers' pauses of one delay differ: they do not ask again in step.
         assert_ne!(pause(delays[4], 1, 0), pause(delays[4], 2, 0));
+    }
+
+    /// A backoff begun from a measured probe timeout is that timeout, at most the idle timeout:
+    /// one measured across a hold of minutes gives pauses no longer than the idle timeout, where
+    /// pauses drawn from it whole ran for minutes.
+    #[test]
+    fn a_backoff_from_a_measured_probe_timeout_is_at_most_the_idle_timeout() {
+        let measured = Duration::from_millis(40);
+        assert_eq!(backoff_from(measured), measured);
+        // A first round trip sampled across a 218 s hold: its probe timeout three times it.
+        let held = Duration::from_secs(218).saturating_mul(3);
+        assert_eq!(backoff_from(held), idle_timeout());
+        for attempt in 0..16 {
+            assert!(pause(backoff_from(held), 7, attempt) <= idle_timeout());
+        }
     }
 
     #[test]

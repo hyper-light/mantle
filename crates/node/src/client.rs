@@ -455,8 +455,9 @@ impl Client {
     ) -> Result<Vec<u8>, ClientError> {
         let mut target = self.leaders.get(&group).copied();
         // RFC 6298 §5.5: the wait doubles from the current retransmission timeout, the client's
-        // measured probe timeout once a path is measured.
-        let mut backoff = self.measured_pto();
+        // measured probe timeout once a path is measured, at most the idle timeout as every
+        // backoff (`bounds::backoff_from`).
+        let mut backoff = bounds::backoff_from(self.measured_pto());
         // Nodes asked since the last wait: once every node was tried and none answered or named a
         // leader, the client waits before it asks again: its backoff, and no longer than the
         // longest patience a node that named no leader stated, by when its range has elected.
@@ -881,7 +882,7 @@ impl Client {
         deadline_ns: u64,
     ) -> Result<ObjectOutcome, ClientError> {
         // RFC 6298 §5.5, as `request` waits.
-        let mut backoff = self.measured_pto();
+        let mut backoff = bounds::backoff_from(self.measured_pto());
         loop {
             match self.object_once(node, op, data, deadline_ns).await? {
                 ObjectOutcome::Lost(refusal) if untaken(refusal) => {

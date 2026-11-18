@@ -14,13 +14,17 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::task::Waker;
 use std::time::Duration;
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::{Crash, Fault as DeviceFault, SimFile};
-use hyper_log::{Class as LogClass, Config as LogConfig, Log, LogError, LogStats, Update, Waits};
+use hyper_durable::{EntryRef, Fault, LogStore, Point, StoreView, Write};
+use hyper_log::{
+    Class as LogClass, Config as LogConfig, Log, LogError, LogStats, Tail, Update, View, Waits,
+};
+use hyper_raft::StorageError;
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{RuntimeConfig, interests_for};
@@ -42,7 +46,7 @@ use mantle_node::node::{
 use mantle_node::storage::Storage;
 use mantle_protocol::classes::Role;
 use mantle_protocol::node_name;
-use mantle_range::{ConfState, Range, ReplicaError, Settings};
+use mantle_range::{ConfState, Entry as RaftEntry, Range, ReplicaError, Settings};
 
 use crate::history::{Clock, Part, Plan, Steer, Told, open_bucket, work};
 use crate::store::Synchronous;
@@ -147,10 +151,13 @@ fn log_id(node: u64) -> u128 {
 /// log's threads answered and a seed runs the same every time; and the faults the test arms on the device, each armed at the log's next call,
 /// between its own writes (hyper-log's `Log::with_file`), at the same point in every run.
 struct SimLog {
-    log: Log<SimFile>,
+    log: Arc<Log<SimFile>>,
     /// While set, the node's ranges are given no answer to their writes, as from a device whose
     /// flush has not ended ([`Sim::hold_writes`]).
     hold: &'static AtomicBool,
+    /// While set, the next write of a range's entries is torn after its record lands
+    /// ([`Sim::tear_next_entry`]).
+    tear: &'static AtomicBool,
     faults: mpsc::Receiver<DeviceFault>,
     /// The stream's next writes the test wants refused for room, whatever the log holds.
     refusals: mpsc::Receiver<u64>,
@@ -191,16 +198,121 @@ impl Written for Answered {
     }
 }
 
+/// A node's range store in the simulation: [`Synchronous`], whose next write of entries the test
+/// may tear after its persist record lands ([`Sim::tear_next_entry`]).
+pub struct Tearing {
+    inner: Synchronous<SimFile>,
+    log: Arc<Log<SimFile>>,
+    tear: &'static AtomicBool,
+}
+
+impl LogStore for Tearing {
+    type Hold = <Synchronous<SimFile> as LogStore>::Hold;
+
+    fn held(&self) -> Option<&Self::Hold> {
+        self.inner.held()
+    }
+
+    fn release(&mut self, met: &Self::Hold) {
+        self.inner.release(met);
+    }
+
+    fn depth(&self) -> usize {
+        self.inner.depth()
+    }
+
+    fn view(&self) -> Result<StoreView, Fault> {
+        self.inner.view()
+    }
+
+    fn bounds(&self) -> Result<(Point, u64), StorageError> {
+        self.inner.bounds()
+    }
+
+    fn term(&self, index: u64) -> Result<u64, StorageError> {
+        self.inner.term(index)
+    }
+
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: &mut Vec<RaftEntry>,
+    ) -> Result<(), StorageError> {
+        self.inner.entries(low, high, max_bytes, into)
+    }
+
+    fn visit(
+        &self,
+        low: u64,
+        high: u64,
+        page: u64,
+        visit: &mut dyn FnMut(EntryRef<'_>) -> bool,
+    ) -> Result<(), StorageError> {
+        self.inner.visit(low, high, page, visit)
+    }
+
+    fn proposals(&self, into: &mut Vec<RaftEntry>) -> Result<(), StorageError> {
+        self.inner.proposals(into)
+    }
+
+    fn released(&self) -> Result<u64, StorageError> {
+        self.inner.released()
+    }
+
+    fn room(&self) -> bool {
+        self.inner.room()
+    }
+
+    /// A write of entries the test tears: its frame's write is lost, every sector of it (the
+    /// device's lost write), its persist record's lands, and the power is cut at the flush after
+    /// them, so the log is fenced and the node stops (durability.md §7.6). The device is idle
+    /// here: the store's writes, and the stream's, are each answered before the next is asked.
+    fn submit(&mut self, write: &Write<'_>, waker: &Waker) -> Result<(), Fault> {
+        if write.entries.is_some() && self.tear.swap(false, Ordering::SeqCst) {
+            self.log
+                .with_file(|file| {
+                    file.inject(DeviceFault::LostWrite)?;
+                    file.inject(DeviceFault::PowerCut { ops: 2 })
+                })
+                .unwrap()
+                .unwrap();
+        }
+        self.inner.submit(write, waker)
+    }
+
+    fn poll(&mut self) -> Option<Result<(), Fault>> {
+        self.inner.poll()
+    }
+
+    fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
+        self.inner.write_now(write)
+    }
+
+    fn keep_after(&mut self, index: u64) {
+        self.inner.keep_after(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.inner.kept_bytes()
+    }
+}
+
 impl NodeLog for SimLog {
-    type Store = Synchronous<SimFile>;
+    type Store = Tearing;
     type Written = Answered;
 
-    fn claim(&self, group: u128, range: &Range) -> Result<Synchronous<SimFile>, ReplicaError> {
+    fn claim(&self, group: u128, range: &Range) -> Result<Tearing, ReplicaError> {
         self.arm();
-        Ok(Synchronous::new(
-            mantle_range::claim(&self.log, group, range)?,
-            Some(self.hold),
-        ))
+        Ok(Tearing {
+            inner: Synchronous::new(
+                mantle_range::claim(&*self.log, group, range)?,
+                Some(self.hold),
+            ),
+            log: Arc::clone(&self.log),
+            tear: self.tear,
+        })
     }
 
     /// Waited for here, under a waker no task holds: the node takes the answer at its next poll,
@@ -461,6 +573,17 @@ pub struct Member {
     /// While set, its ranges are given no answer to their writes ([`Sim::hold_writes`]): leaked
     /// once a member, for each store its log claims to read, through its starts.
     hold: &'static AtomicBool,
+    /// While set, its next write of a range's entries is torn ([`Sim::tear_next_entry`]), leaked
+    /// as `hold` is.
+    tear: &'static AtomicBool,
+}
+
+/// What a node's log held when it was opened again: what the open found past its last frame that
+/// reads, and the range's view.
+#[derive(Debug, Clone)]
+pub struct Reopened {
+    pub tail: Tail,
+    pub view: Option<View>,
 }
 
 /// The cell, its runtime and what the test has heard.
@@ -546,6 +669,7 @@ impl Sim {
                     refusals: None,
                     armed: false,
                     hold: Box::leak(Box::new(AtomicBool::new(false))),
+                    tear: Box::leak(Box::new(AtomicBool::new(false))),
                 },
             );
         }
@@ -602,8 +726,9 @@ impl Sim {
         let (faults, armed) = mpsc::channel();
         let (refusals, refused) = mpsc::channel();
         let log = SimLog {
-            log,
+            log: Arc::new(log),
             hold: self.members[&id].hold,
+            tear: self.members[&id].tear,
             faults: armed,
             refusals: refused,
             refusing: Cell::new(0),
@@ -814,16 +939,45 @@ impl Sim {
         self.longest_ns = self.longest_ns.max(path.one_way_ns() + path.jitter_ns());
     }
 
-    /// Starts node `id` again on what its device and engines kept.
-    pub fn restart(&mut self, id: u64) {
+    /// Starts node `id` again on what its device and engines kept, and says what its log held.
+    pub fn restart(&mut self, id: u64) -> Reopened {
         let (file, engines) = self.members.get_mut(&id).unwrap().down.take().unwrap();
         file.clear_faults().unwrap();
-        let (log, _) = Log::open(file, self.log, log_id(id)).unwrap();
+        let (log, recovery) = Log::open(file, self.log, log_id(id)).unwrap();
+        let reopened = Reopened {
+            tail: recovery.tail,
+            view: log.view(GROUP).unwrap(),
+        };
         self.spawn(id, log, engines);
         self.until("the node listens again", |c| {
             c.members[&id].bound.map(|_| ())
         });
         self.introduce();
+        reopened
+    }
+
+    /// Tears node `id`'s next write of the range's entries after its persist record lands
+    /// ([`Tearing`]'s submit): the node stops on its fenced log, as a fault armed on its device.
+    pub fn tear_next_entry(&mut self, id: u64) {
+        let member = self.members.get_mut(&id).unwrap();
+        member.armed = true;
+        member.tear.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether node `id` is down: its power cut, or stopped on its device.
+    pub fn is_down(&self, id: u64) -> bool {
+        self.members[&id].down.is_some()
+    }
+
+    /// Cuts the power of node `id`, stopped on its torn write: its device keeps every sector
+    /// written since its last flush, the torn frame's lost write never, and its engine what it
+    /// persisted.
+    pub fn cut_stopped(&mut self, id: u64) {
+        let (file, engines) = self.members.get_mut(&id).unwrap().down.as_mut().unwrap();
+        for (_, engine) in engines.iter_mut() {
+            engine.crash();
+        }
+        file.crash(Crash::KeepAll).unwrap();
     }
 
     /// Takes what the tasks reported.
@@ -849,7 +1003,7 @@ impl Sim {
                     self.members.get_mut(&id).unwrap().status = Some(status);
                 }
                 Report::Crashed(id, log, engines) => {
-                    let file = log.log.close().unwrap();
+                    let file = only(log.log).close().unwrap();
                     self.members.get_mut(&id).unwrap().down = Some((file, engines));
                 }
                 // A node stops on its device's failure only when the test armed one there.
@@ -861,7 +1015,7 @@ impl Sim {
                     member.refusals = None;
                     member.bound = None;
                     member.status = None;
-                    member.down = Some((log.log.close().unwrap(), engines));
+                    member.down = Some((only(log.log).close().unwrap(), engines));
                 }
                 Report::Failed(id, why) => panic!("seed {}: {id} failed: {why}", self.seed),
                 Report::Opened(answers) => self.opened = Some(answers),
@@ -885,7 +1039,7 @@ impl Sim {
     /// The quiet period: the longest any node states it may go without moving, or a link to a
     /// peer it dials may should that peer fall silent, or any client gives an exchange; never
     /// less than a round trip of the longest path, nor than one step.
-    fn quiet(&self) -> u64 {
+    pub fn quiet(&self) -> u64 {
         self.members
             .values()
             .filter_map(|m| m.status.as_ref())
@@ -1115,4 +1269,11 @@ impl Sim {
             if done { Some(()) } else { None }
         });
     }
+}
+
+/// A node's log once the node gave it back: its stores, which shared it, are gone with the node.
+fn only(log: Arc<Log<SimFile>>) -> Log<SimFile> {
+    Arc::try_unwrap(log)
+        .ok()
+        .expect("a closed node's stores hold its log no more")
 }

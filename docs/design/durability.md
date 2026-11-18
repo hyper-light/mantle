@@ -356,6 +356,29 @@ answered. Two cases reach it:
   power cuts count the groups left waiting (§7.6), and the owner decides from that count whether
   frames there are answered at their flush or once confirmed. Until then they are confirmed.
 
+The count, 2026-11-18 (`crates/node/tests/sim.rs`,
+`a_frame_torn_after_its_record_lands_is_marked_and_each_group_resolves_or_waits_reported`), over
+the power-cut tests' seeds 1-8: each cell size, three nodes on odd seeds and five on even, on each
+of the three profiles of paths, then seeds 1 and 2 again. Each run tears the frame of the range's
+next entry on the members its seed draws: the frame's write lost, every sector of it (hyper-block's
+simulated lost write, the tear that leaves least), its persist record's kept, the flush after them
+cut. The open finds the record and not the frame, `Tail::Undetermined { at_flush: true }`, and
+marks the range through the entry. A tear on a quorum cuts every other node's power once the last
+torn member stops, each of their unflushed sectors kept or lost (`Crash::Random`).
+
+| fault | seeds | groups marked | groups resolved | groups left waiting |
+|---|---|---|---|---|
+| (a) one member | 1-8 | 8 | 8 | 0 |
+| (b) a quorum of members, the others' power cut with them | 1-8 | 8 | 7 | 1 |
+| (c) every member of a one-voter group | not yet run | | | |
+
+The group left waiting is seed 5's, three nodes across the planet: nodes 2 and 3 torn and marked
+through entry 5, and node 1, its power cut with them, holding entries through 4: no copy whole, and
+one member lacking the entry, short of the quorum of two. Each marked member reported `Uncertain`,
+and for the cell's quiet period nothing past the answered entries was applied or answered. Every
+other group resolved: in (a) the others are a quorum without the torn member; in (b) a member
+outside the torn quorum held the entry whole, and the marks ended by it.
+
 ### 7.6 What changes in the node's power-cut and torn-write tests
 
 - hyper-log: `an_unconfirmed_torn_frame_keeps_only_its_term_and_vote` and
@@ -371,7 +394,10 @@ answered. Two cases reach it:
   counted and reported with `Uncertain`, never served. The held-flush test answers an entry when
   its frames' flushes end, one write sooner. A new fault tears a frame after its record lands on
   one member, then on a quorum, then on every member of a one-voter group whose frames are
-  answered once confirmed, which must never mark.
+  answered once confirmed, which must never mark. Built for one member and a quorum (step 3c):
+  the range's store tears the next write of entries on a member the test arms, the frame's write
+  lost and its record's landed, the flush cut, so the node stops on its fenced log; the node's
+  status says whether its range is marked (`Status::uncertain`).
 - Real processes: `kill -9` never tears a completed write, so the end-to-end tests keep their
   laws; they count flushes a PUT, 4 on the critical path where 7 were (research/71's
   instruments).
@@ -466,7 +492,10 @@ answered. Two cases reach it:
      quorum, `n - 1 > n / 2`, three or more. A frame holding a group that may not stays answered
      once confirmed (§7.5).
 
-   3c, built (hyper-raft `mantle-frame-flush`): the writer sets the bit.
+   3c, built (hyper-raft `mantle-frame-flush`; mantle's node simulation): the writer sets the bit,
+   and the simulation's tears of §7.6 on one member and on a quorum run against it, their laws
+   held on seeds 1-8 and the groups left waiting counted (§7.5). The tear on a one-voter group
+   needs a cell of one node, which the simulation does not yet build.
    - A frame's record, and its confirmation, say it was answered at its flush where the record is
      in pieces (format 5, 6 sealed), the only records that can say it, and every update in the
      frame allows it (`Update::at_flush`). A frame of no updates, one holding a group whose update

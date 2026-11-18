@@ -428,6 +428,10 @@ pub struct Status {
     pub writes: hyper_durable::Writes,
     /// Whether the member is fenced.
     pub fenced: bool,
+    /// Whether the member is marked: its log may lack entries it acknowledged, so it votes for no
+    /// candidate behind them and applies none of them until a peer's copy or a leader elected by
+    /// a quorum ends the mark (docs/design/replica.md §4, durability.md §7.3).
+    pub uncertain: bool,
     /// What the node's Raft sends did, and what it did with the frames that came to it.
     pub sends: Sends,
     pub received: Received,
@@ -1713,6 +1717,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             in_flight: replica.in_flight(),
             writes: replica.writes(),
             fenced: replica.fenced().is_some(),
+            uncertain: replica.mark().is_some(),
             sends: self.sends,
             received: self.received,
             reconnect: self

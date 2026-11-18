@@ -25,6 +25,7 @@
 )]
 
 use hyper_block::sim::Fault as DeviceFault;
+use hyper_log::Start;
 use hyper_rt::sim::SimPath;
 use hyper_sim::rng::{Seeded, stream_seed};
 use mantle_meta::name;
@@ -47,6 +48,11 @@ use hyper_log::Config as LogConfig;
 /// The seeds run when `MANTLE_NODE_SIM_SEEDS` is not set: one cell of three and one of five, each
 /// run twice.
 const SEEDS: u64 = 2;
+
+/// The seeds the power-cut tests run, a cut at any moment and a cut that tears a frame after its
+/// record lands: each cell size on every profile of paths (`cell::PROFILES`, seeds 1 to 6, odd
+/// seeds three nodes, even five), and the first two again.
+const CUT_SEEDS: u64 = 8;
 
 /// What befalls a node half way through the clients' operations.
 #[derive(Clone, Copy, Debug)]
@@ -408,7 +414,7 @@ const BATCH: u64 = 4;
 /// leader before a quorum's, a cut at the answer would leave the cell short of it.
 #[test]
 fn a_batched_entry_is_answered_only_once_durable_and_a_power_cut_at_any_moment_keeps_it_whole() {
-    for seed in 1..=8u64 {
+    for seed in 1..=CUT_SEEDS {
         let mut cell = Sim::new(seed);
         cell.leader();
         cell.open_bucket();
@@ -642,4 +648,202 @@ fn a_batched_entry_is_answered_only_after_the_flushes_it_needs_and_never_while_t
             "seed {seed}: {leader_answered:?}"
         );
     }
+}
+
+/// Where a power cut tears a frame of the range's entry after its persist record landed
+/// (durability.md §7.6), the frame's write lost and its record's kept, its flush cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tear {
+    /// On one member, drawn from the seed; the others go on.
+    One,
+    /// On a quorum of members, drawn from the seed; once the last of them stops, every other
+    /// node's power is cut at once, as a cell whose nodes share one feed loses them.
+    Quorum,
+}
+
+/// What one torn cut left of the range: whether a member's copy of the entry was marked, and
+/// whether the group was left waiting, every marked copy with none whole to repair from and no
+/// quorum lacking it (durability.md §7.3).
+#[derive(Clone, Copy, Debug, Default)]
+struct Left {
+    marked: bool,
+    waiting: bool,
+}
+
+/// One run of `seed` under `tear`, its laws checked: an answered entry is applied on every node;
+/// every mark ends once a quorum of members is up and one copy reads whole or a quorum lacks the
+/// entry; a group left waiting reports `Uncertain` on each marked member and serves nothing.
+fn torn(seed: u64, tear: Tear) -> Left {
+    let mut cell = Sim::new(seed);
+    cell.leader();
+    cell.open_bucket();
+    let order: Vec<u64> = (1..=cell.nodes).collect();
+    let asking = cell.asking(CLIENT, &order);
+    let (registered, _) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 1));
+    let session = match registered.as_deref() {
+        Ok([Answer::Registered { session }]) => *session,
+        other => panic!("seed {seed}: the registration answered {other:?}"),
+    };
+    // Every entry answered so far, applied on every node.
+    let answered = cell.converged();
+    let quorum = cell.nodes / 2 + 1;
+    let mut draws = Seeded::new(stream_seed(seed, "tear", &[]));
+    let mut members: Vec<u64> = (1..=cell.nodes).collect();
+    let struck: Vec<u64> = (0..match tear {
+        Tear::One => 1,
+        Tear::Quorum => quorum,
+    })
+        .map(|_| {
+            let at = draws.below(u64::try_from(members.len()).unwrap());
+            members.remove(usize::try_from(at).unwrap())
+        })
+        .collect();
+    for &id in &struck {
+        cell.tear_next_entry(id);
+    }
+    asking
+        .try_send((GROUP, batch(session, 1, "t")))
+        .map_err(|_| "the client's asks are full")
+        .unwrap();
+    cell.until("every torn member stops", |c| {
+        if struck.iter().all(|id| c.is_down(*id)) {
+            Some(())
+        } else {
+            None
+        }
+    });
+    if tear == Tear::Quorum {
+        for &id in &members {
+            cell.crash(id);
+        }
+    }
+    for &id in &struck {
+        cell.cut_stopped(id);
+    }
+    let down: Vec<u64> = (1..=cell.nodes).filter(|id| cell.is_down(*id)).collect();
+    let reopened: Vec<(u64, cell::Reopened)> =
+        down.iter().map(|&id| (id, cell.restart(id))).collect();
+    for (id, r) in &reopened {
+        eprintln!(
+            "seed {seed}: {tear:?}: node {id} reopened {:?}, its range {:?}",
+            r.tail, r.view
+        );
+    }
+    let marks: Vec<(u64, Start)> = reopened
+        .iter()
+        .filter_map(|(id, r)| r.view.as_ref()?.uncertain.map(|m| (*id, m)))
+        .collect();
+    let Some(index) = marks.iter().map(|(_, m)| m.index).min() else {
+        cell.leader();
+        assert!(
+            cell.converged() >= answered,
+            "seed {seed}: an answered entry was lost"
+        );
+        return Left::default();
+    };
+    for (id, _) in &marks {
+        assert!(
+            struck.contains(id),
+            "seed {seed}: node {id}, whose writes were not torn, was marked"
+        );
+    }
+    // The unmarked members opened again, by what each holds of the marked entry: whole, or
+    // lacking it. A member still running holds it whole or lacks it, and either way the group
+    // resolves through it with the others like it: it is counted with those lacking it, the
+    // lesser claim, since a quorum of them lacks it or one holds it.
+    let unmarked = |id: &u64| marks.iter().all(|(m, _)| m != id);
+    let running = (1..=cell.nodes)
+        .filter(|id| unmarked(id) && reopened.iter().all(|(r, _)| r != id))
+        .count();
+    let whole = reopened
+        .iter()
+        .filter(|(id, r)| unmarked(id) && r.view.as_ref().is_some_and(|v| v.last >= index))
+        .count();
+    let lacking = reopened.iter().filter(|(id, _)| unmarked(id)).count() - whole + running;
+    let waiting = whole == 0 && u64::try_from(lacking).unwrap() < quorum;
+    eprintln!(
+        "seed {seed}: {tear:?}: marked {:?}, whole copies {whole}, lacking {lacking}, quorum \
+         {quorum}: waiting {waiting}",
+        marks.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+    if waiting {
+        cell.until("each marked member reports Uncertain", |c| {
+            let reported = marks
+                .iter()
+                .all(|(id, _)| c.members[id].status.as_ref().is_some_and(|s| s.uncertain));
+            if reported { Some(()) } else { None }
+        });
+        // For the cell's quiet period, the longest any node states it may go without moving:
+        // every mark stays, and nothing past what was answered is applied or answered.
+        let quiet = cell.quiet();
+        cell.run_for(quiet);
+        for (id, member) in &cell.members {
+            let status = member.status.as_ref();
+            assert!(
+                status.is_none_or(|s| s.applied <= answered),
+                "seed {seed}: node {id} of a waiting group applied {status:?}"
+            );
+        }
+        for (id, _) in &marks {
+            assert!(
+                cell.members[id]
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.uncertain),
+                "seed {seed}: node {id}'s mark ended in a waiting group"
+            );
+        }
+        assert!(
+            cell.asked.take().is_none(),
+            "seed {seed}: a waiting group answered"
+        );
+    } else {
+        cell.until("every mark ends", |c| {
+            let ended = c
+                .members
+                .values()
+                .all(|m| m.status.as_ref().is_some_and(|s| !s.uncertain));
+            if ended { Some(()) } else { None }
+        });
+        cell.leader();
+        assert!(
+            cell.converged() >= answered,
+            "seed {seed}: an answered entry was lost"
+        );
+    }
+    Left {
+        marked: true,
+        waiting,
+    }
+}
+
+/// A power cut that tears a frame of the range's entry after its persist record landed, the
+/// frame's write lost and its record's kept (durability.md §7.6), on one member and on a quorum of
+/// members, over the power-cut tests' seeds. Every frame is still answered once confirmed, and
+/// the record of a range of three voters or more says its frame was answered at its flush, so the
+/// open restores each torn member's frame as a lost one and marks it. The laws: an answered entry
+/// is applied on every node; every mark ends once a quorum is up and one copy reads whole or a
+/// quorum lacks the entry; a group left waiting reports `Uncertain` and serves nothing. The groups
+/// marked and left waiting are counted, the evidence §7.5 decides step 4 from.
+#[test]
+fn a_frame_torn_after_its_record_lands_is_marked_and_each_group_resolves_or_waits_reported() {
+    let seeds = seeds(&(1..=CUT_SEEDS).collect::<Vec<_>>());
+    let mut table = Vec::new();
+    for tear in [Tear::One, Tear::Quorum] {
+        let left: Vec<Left> = seeds.iter().map(|&seed| torn(seed, tear)).collect();
+        let marked = left.iter().filter(|l| l.marked).count();
+        let waiting = left.iter().filter(|l| l.waiting).count();
+        table.push((tear, marked, marked - waiting, waiting));
+    }
+    eprintln!("| fault | seeds | groups marked | groups resolved | groups left waiting |");
+    eprintln!("|---|---|---|---|---|");
+    for (tear, marked, resolved, waiting) in &table {
+        eprintln!(
+            "| {tear:?} | {}-{} | {marked} | {resolved} | {waiting} |",
+            seeds.first().unwrap(),
+            seeds.last().unwrap()
+        );
+    }
+    let one = table.iter().find(|row| row.0 == Tear::One).unwrap();
+    assert_eq!(one.3, 0, "a tear on one member left a group waiting");
 }

@@ -68,6 +68,8 @@ pub(crate) enum In<E: Engine, S: LogStore> {
     /// A range waits for room in the node's log, or the node owes the stream a write the log
     /// refused for room: every range compacts ([`compact`]).
     Compact,
+    /// Whether a snapshot a range sent member `to` arrived (`Replica::report_snapshot`).
+    Reported { group: u128, to: u64, arrived: bool },
 }
 
 /// What a shard's ranges gave, for the node's shard.
@@ -198,13 +200,16 @@ impl Belief {
 }
 
 /// A range another shard drives, as the node's shard keeps it: its shard, the peers the stream
-/// keeps pairs with for it, its latest expected election, and what it showed last.
+/// keeps pairs with for it, its latest expected election, what it showed last, and the ends of
+/// the snapshots it sent that its lane has yet to take ([`In::Reported`]): at most one a member, a
+/// later end superseding an earlier, as a member's progress waits on one snapshot at a time.
 pub(crate) struct Far {
     pub(crate) group: u128,
     pub(crate) shard: usize,
     pub(crate) peers: Vec<PeerId>,
     pub(crate) election: Option<Duration>,
     pub(crate) seen: Seen,
+    pub(crate) reports: Vec<(u64, bool)>,
 }
 
 /// What a range's member shows of itself: what the node's status, its leadership and its applied
@@ -565,6 +570,16 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                 }
             }
             In::Compact => self.compact = true,
+            In::Reported { group, to, arrived } => {
+                let Some(handle) = self.at(group) else {
+                    return Ok(());
+                };
+                if let Some(replica) = self.owner.get_mut(handle) {
+                    // A replica that refuses it is fenced, which its next drive reports.
+                    let _ = replica.report_snapshot(to, arrived);
+                    self.owner.schedule(handle);
+                }
+            }
         }
         Ok(())
     }
@@ -1047,19 +1062,26 @@ mod tests {
     }
 
     /// A one-member range moved to the second shard of two before its first drive: its lanes,
-    /// once its shard showed it leading, and what it showed when it moved.
-    fn leading(rt: &Runtime, log: &Log<DeviceFile>, range: &Range) -> (Lanes<Model, Stored>, Seen) {
+    /// once its shard showed it leading, what it showed when it moved, and the messages it gave
+    /// meanwhile.
+    fn leading(
+        rt: &Runtime,
+        log: &Log<DeviceFile>,
+        range: &Range,
+    ) -> (Lanes<Model, Stored>, Seen, Vec<Message>) {
         let replica = campaigning(log, range);
         let moved = Seen::of(&replica);
         let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
         let mut lanes = Lanes::start(holder, 1, 1, 8).unwrap();
         lanes.send(In::Adopt(GROUP, Box::new(replica))).unwrap();
+        let mut messages = Vec::new();
         loop {
             match lanes.from.blocking_recv().unwrap() {
                 Out::Seen(group, seen) if seen.leading => {
                     assert_eq!(group, GROUP);
-                    return (lanes, moved);
+                    return (lanes, moved, messages);
                 }
+                Out::Message(_, message) => messages.push(message),
                 Out::Stopped(error) => panic!("the shard stopped: {error}"),
                 _ => {}
             }
@@ -1085,7 +1107,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let range = one_member();
         let log = log_in(dir.path(), &range);
-        let (mut lanes, moved) = leading(&rt, &log, &range);
+        let (mut lanes, moved, _) = leading(&rt, &log, &range);
         assert!(!moved.leading);
         lanes
             .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
@@ -1117,7 +1139,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let range = one_member();
         let log = log_in(dir.path(), &range);
-        let (mut lanes, _) = leading(&rt, &log, &range);
+        let (mut lanes, _, _) = leading(&rt, &log, &range);
         let query = Query::Current {
             bucket: "b".into(),
             key: "k".into(),
@@ -1164,7 +1186,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let range = one_member();
         let log = log_in(dir.path(), &range);
-        let (mut lanes, _) = leading(&rt, &log, &range);
+        let (mut lanes, _, _) = leading(&rt, &log, &range);
         let mut commanded = vec![super::super::Commanded {
             origin: super::super::CommandOrigin::Own(0),
             group: GROUP,
@@ -1193,7 +1215,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let range = one_member();
         let log = log_in(dir.path(), &range);
-        let (mut lanes, _) = leading(&rt, &log, &range);
+        let (mut lanes, _, _) = leading(&rt, &log, &range);
         lanes
             .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
             .unwrap();
@@ -1223,6 +1245,147 @@ mod tests {
         drop(lanes);
         rt.shutdown().unwrap();
         drop(log);
+    }
+
+    /// How long the test's thread waits on a fact the shards' lanes show before it fails: each step
+    /// it waits through is a write made durable and a lane's hop, so ten seconds is far past it on
+    /// a loaded host and fails only a wait that would never end (as `listener::shards`'s tests
+    /// bound theirs).
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// A range of voter 1 and learner 2, with each member's replica moved to a shard of its own
+    /// before its first drive: the leader's log compacted past the learner's next entry, so the
+    /// learner is sent a snapshot, out of the leader's lane, which it installs from its own, the
+    /// snapshot's end reported into the leader's; then the learner is sent entries again.
+    #[test]
+    fn a_far_ranges_snapshot_is_sent_and_installed_through_the_lanes() {
+        use hyper_raft::proto::MessageType;
+
+        let rt = started(2, 2);
+        let (dir, learning_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut range = one_member();
+        range.boot.learners = vec![2];
+        let (log, learning_log) = (
+            log_in(dir.path(), &range),
+            log_in(learning_dir.path(), &range),
+        );
+        // The leader's messages to the learner, held until its log is compacted past them.
+        let (mut leader, _, mut held) = leading(&rt, &log, &range);
+        let mut take_held = |out: &Out| {
+            if let Out::Message(_, message) = out {
+                held.push(message.clone());
+            }
+            !matches!(out, Out::Applied(..))
+        };
+        leader
+            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
+            .unwrap();
+        let Out::Applied(_, answer) = next(&mut leader, &mut take_held) else {
+            panic!("`next` gives only what it does not skip")
+        };
+        loop {
+            match next(&mut leader, |_| false) {
+                Out::Compacted => break,
+                Out::Message(_, message) => held.push(message),
+                Out::Seen(_, seen) if seen.applied >= answer.index && seen.in_flight == 0 => {
+                    leader.send(In::Compact).unwrap();
+                }
+                _ => {}
+            }
+        }
+        // A compaction started is not one made: the log starts past what it compacted only once
+        // the compaction's write is durable (hyper-durable's `Replica::durable`), and until then
+        // the leader holds the learner's next entry and sends it in an append, which needs no
+        // snapshot. The learner starts once the leader shows the write made and none out.
+        let until = std::time::Instant::now() + PATIENCE;
+        loop {
+            assert!(
+                std::time::Instant::now() < until,
+                "waited for the leader's compaction made"
+            );
+            match leader.take().unwrap() {
+                Some(Out::Message(_, message)) => held.push(message),
+                Some(Out::Seen(_, seen)) if seen.writes.starts > 0 && seen.in_flight == 0 => break,
+                Some(Out::Stopped(error)) => panic!("the leader's shard stopped: {error}"),
+                Some(_) => {}
+                None => std::thread::yield_now(),
+            }
+        }
+        let learning = {
+            let mut engine = Model::default();
+            engine.install(0, name::first(1).unwrap()).unwrap();
+            engine.persist().unwrap();
+            let store = Answers::new(mantle_range::claim(&learning_log, GROUP, &range).unwrap());
+            mantle_range::open_shell(2, store, engine, &range, 2, Elections::Suspicion).unwrap()
+        };
+        let holder = rt.holder_of(rt.shard_ids()[0]).unwrap();
+        let mut learner = Lanes::start(holder, 0, 1, 8).unwrap();
+        learner.send(In::Adopt(GROUP, Box::new(learning))).unwrap();
+        for message in held.drain(..).filter(|message| message.to == 2) {
+            learner
+                .send(In::Step {
+                    group: GROUP,
+                    sender: 1,
+                    message,
+                })
+                .unwrap();
+        }
+        // Each member's messages stepped by the other, the test's thread their network.
+        let (mut sent, mut installed, mut appended) = (false, false, false);
+        let until = std::time::Instant::now() + PATIENCE;
+        while !(sent && installed && appended) {
+            assert!(
+                std::time::Instant::now() < until,
+                "waited for the snapshot sent ({sent}), the learner past it ({installed}) and an \
+                 append after it ({appended})"
+            );
+            if let Some(out) = leader.take().unwrap() {
+                match out {
+                    Out::Message(_, message) if message.to == 2 => {
+                        if message.msg_type == MessageType::MsgSnapshot {
+                            sent = true;
+                            leader
+                                .send(In::Reported {
+                                    group: GROUP,
+                                    to: 2,
+                                    arrived: true,
+                                })
+                                .unwrap();
+                        } else if sent && message.msg_type == MessageType::MsgAppend {
+                            appended = true;
+                        }
+                        learner
+                            .send(In::Step {
+                                group: GROUP,
+                                sender: 1,
+                                message,
+                            })
+                            .unwrap();
+                    }
+                    Out::Stopped(error) => panic!("the leader's shard stopped: {error}"),
+                    _ => {}
+                }
+            }
+            if let Some(out) = learner.take().unwrap() {
+                match out {
+                    Out::Message(_, message) if message.to == 1 => leader
+                        .send(In::Step {
+                            group: GROUP,
+                            sender: 2,
+                            message,
+                        })
+                        .unwrap(),
+                    Out::Seen(_, seen) if seen.applied >= answer.index => installed = true,
+                    Out::Stopped(error) => panic!("the learner's shard stopped: {error}"),
+                    _ => {}
+                }
+            }
+            std::thread::yield_now();
+        }
+        assert!(sent && installed);
+        drop((leader, learner));
+        rt.shutdown().unwrap();
+        drop((log, learning_log));
     }
 
     /// A replica with a write out is refused a move, typed: the write's answer would wake the

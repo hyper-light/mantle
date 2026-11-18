@@ -1526,6 +1526,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 peers,
                 election: None,
                 seen,
+                reports: Vec::new(),
             });
         }
         self.shards.push(lanes);
@@ -1535,6 +1536,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// What the shards' ranges gave since the last turn, at most a lane's capacity from each; a
     /// shard whose task ended stops the node, typed (node.md §2.9).
     fn take_shards(&mut self, now: u64) -> Result<(), NodeError> {
+        self.report_far()?;
         for at in 0..self.shards.len() {
             let budget = self.shards.get(at).map_or(0, shard::Lanes::capacity);
             for _ in 0..budget {
@@ -1550,6 +1552,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     break;
                 };
                 self.took(out, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The ends of the snapshots far ranges sent, each handed to its range's shard while its lane
+    /// has room, and held for the next turn while it has none: a range that missed one would wait
+    /// in its snapshot state for that member for good (hyper-raft's `handle_snapshot_status`).
+    fn report_far(&mut self) -> Result<(), NodeError> {
+        for far in &mut self.far {
+            let Some(lanes) = self.shards.iter().find(|lanes| lanes.shard() == far.shard) else {
+                continue;
+            };
+            while let Some(&(to, arrived)) = far.reports.first() {
+                match lanes.send(shard::In::Reported {
+                    group: far.group,
+                    to,
+                    arrived,
+                }) {
+                    Ok(()) => {
+                        far.reports.remove(0);
+                    }
+                    Err(NodeError::LaneFull(_)) => break,
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(())
@@ -3147,7 +3174,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.report_snapshot(group, to, arrived);
     }
 
+    /// Tells `group`'s member whether its snapshot to `to` arrived; a far range's, at the turn's
+    /// take of its shard's lanes (`Node::report_far`).
     fn report_snapshot(&mut self, group: u128, to: u64, arrived: bool) {
+        if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+            far.reports.retain(|(member, _)| *member != to);
+            far.reports.push((to, arrived));
+            return;
+        }
         if let Some(handle) = self.kept(group).map(|k| k.handle)
             && let Some(shell) = self.owner.get_mut(handle)
         {

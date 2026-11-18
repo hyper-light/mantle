@@ -128,6 +128,11 @@ pub fn reason(status: u16) -> &'static str {
     }
 }
 
+/// The answer of an S3 request slowed for `cause`: `503 SlowDown`, its message naming the cause.
+pub fn slowed(cause: crate::door::Slowed) -> Refused {
+    Refused::new("SlowDown", 503, cause.message())
+}
+
 /// S3's code, status and message for a host's refusal (node.md §4.4; 05 §11.2).
 pub fn refusal(status: Status) -> Refused {
     let (code, http, message) = match status {
@@ -1090,5 +1095,58 @@ mod tests {
         assert_eq!(put.status, 400);
         let document = String::from_utf8(put.document).unwrap();
         assert!(document.contains("proposed upload exceeds"), "{document}");
+    }
+
+    /// Each path that answers an S3 request `503 SlowDown` says which it is: the code S3's API
+    /// reference states for 503, the message S3's own words and then its cause, each cause's apart,
+    /// so a client's failure names the path that answered it.
+    #[test]
+    fn each_slowdown_names_its_cause_under_s3s_code() {
+        use crate::door::Slowed;
+        let causes = [
+            Slowed::Connections,
+            Slowed::Door,
+            Slowed::Lookups,
+            Slowed::Stopping,
+            Slowed::KeyLeaderless,
+            Slowed::Leaderless,
+            Slowed::Unreadable,
+            Slowed::Unplaced,
+            Slowed::Patience,
+        ];
+        let mut messages = std::collections::BTreeSet::new();
+        for cause in causes {
+            let refused = slowed(cause);
+            assert_eq!(
+                (refused.code, refused.status),
+                ("SlowDown", 503),
+                "{cause:?}"
+            );
+            assert!(
+                refused
+                    .message
+                    .starts_with("Please reduce your request rate. "),
+                "{cause:?}: {}",
+                refused.message
+            );
+            assert!(
+                messages.insert(refused.message.clone()),
+                "{cause:?} says another's"
+            );
+            let ids = Ids {
+                request: *b"0123456789ABCDEF",
+                host: "host",
+            };
+            let response = error(
+                &refused,
+                Resource::Text("/b/o"),
+                &ids,
+                false,
+                Fields::new(Vec::new()),
+            );
+            let document = String::from_utf8(response.document).unwrap();
+            assert!(document.contains("<Code>SlowDown</Code>"), "{document}");
+            assert!(document.contains(&refused.message), "{document}");
+        }
     }
 }

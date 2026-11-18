@@ -2612,7 +2612,12 @@ commands and reads, and a typed reply the native protocol encodes.
 
 *As built (2026-10-25), the S3 listener* (`crates/node/src/listener`, `crates/node/src/door.rs`).
 1. A connection past the budget, ten (research/72), is answered `503 SlowDown` with `Connection:
-close` from a reserve of ten more, and one past both closed as it comes (§4.5, 2026-11-02). 2. `mantle_s3::route` names the bucket by the path at the endpoint's stated names, its
+close` from a reserve of ten more, and one past both closed as it comes (§4.5, 2026-11-02). Every
+`503 SlowDown` the S3 door answers keeps S3's `<Code>` and says its path in its `<Message>`, S3's
+words and then its cause (`door::Slowed`): past the connections served at once, the door full or
+the node gone, the key lookups full, a stopping node, the access key's root-range read or an
+operation's range read or command without a leader that serves it within its budget, a block's
+chunks unreadable or unplaced, or work held past a client's patience. 2. `mantle_s3::route` names the bucket by the path at the endpoint's stated names, its
 addresses and `localhost`, and by the host under one of its names; any other host is
 `InvalidURI`. 3. `mantle_s3::sigv4` checks the signature, its header's or a presigned URL's,
 against the cell's access keys; who asks is the account the key acts for, and a mutation's identity

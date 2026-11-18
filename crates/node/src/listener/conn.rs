@@ -296,7 +296,7 @@ impl Connection {
             Parts::of(head, octets).map_or_else(|_| "/".to_owned(), |p| p.path.to_owned());
         let fields = self.fields();
         let response = respond::error(
-            &respond::refusal(Status::SlowDown),
+            &respond::slowed(door::Slowed::Connections),
             Resource::Text(&resource),
             &ids,
             is_head,
@@ -435,6 +435,7 @@ impl Connection {
             door::Signed::Principal(signer) => signer,
             door::Signed::Unknown => return Err(unknown()),
             door::Signed::Refused(status) => return Err(respond::refusal(status)),
+            door::Signed::Slowed(cause) => return Err(respond::slowed(cause)),
         };
         let key = request::Key::Principal {
             signer: &signer,
@@ -447,7 +448,7 @@ impl Connection {
     /// a channel of its own, which holds the one answer. A door at its bound, or a node gone, is
     /// `SlowDown`, a cause that passes.
     async fn look_up(&self, id: String) -> door::Signed {
-        let slow = door::Signed::Refused(Status::SlowDown);
+        let slow = door::Signed::Slowed(door::Slowed::Door);
         let Ok((reply, mut answer)) = channel::<door::Signed>(1) else {
             return slow;
         };
@@ -529,7 +530,7 @@ impl Connection {
         (version, head): (Version, bool),
     ) -> Result<bool, ()> {
         let mut unread = has_body(framing) && body.is_some();
-        let slow = || respond::refusal(Status::SlowDown);
+        let slow = || respond::slowed(door::Slowed::Door);
         let (Ok((pieces, taken)), Ok((answers, mut replies))) = (
             channel::<Piece>(BODY_PIECES),
             channel::<Answer>(REPLY_PIECES),
@@ -599,6 +600,14 @@ impl Connection {
                         self.respond(response, version, unread).await?;
                     }
                     return Ok(!unread);
+                }
+                // The host slowed it in place of a head: its cause, unless the listener refused
+                // the body first.
+                Ok(Answer::Slowed(cause)) => {
+                    let why = refused.unwrap_or_else(|| respond::slowed(cause));
+                    return self
+                        .refuse(&why, resource, ids, (version, head), unread)
+                        .await;
                 }
                 // A reply's end, or bytes, with no head before them: the host's word is not
                 // whole, and nothing of it can be answered as done.

@@ -140,6 +140,9 @@ pub(crate) struct Job {
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
+    /// Why it was answered `SlowDown`, where it was: the S3 door names it in its reply
+    /// (`door::Slowed`).
+    slowed: Option<door::Slowed>,
 }
 
 impl Job {
@@ -1121,6 +1124,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label: None,
+            slowed: None,
         });
     }
 
@@ -1178,6 +1182,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label,
+            // Taken past the limit, the door holds no request while the host has no room: a
+            // stopping node's (`take_door`).
+            slowed: if room {
+                None
+            } else {
+                Some(door::Slowed::Stopping)
+            },
         });
     }
 
@@ -1187,15 +1198,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub(super) fn take_lookup(&mut self, ask: door::KeyAsk) {
         let door::KeyAsk { id, reply } = ask;
         let refused = if self.gateway.is_none() {
-            Some(Status::Failed)
-        } else if self.stopping() || self.lookups.len() >= self.door_capacity {
-            Some(Status::SlowDown)
+            Some(door::Signed::Refused(Status::Failed))
+        } else if self.stopping() {
+            Some(door::Signed::Slowed(door::Slowed::Stopping))
+        } else if self.lookups.len() >= self.door_capacity {
+            Some(door::Signed::Slowed(door::Slowed::Lookups))
         } else {
             None
         };
-        if let Some(status) = refused {
+        if let Some(refused) = refused {
             // A connection gone takes no answer.
-            let _ = reply.try_send(door::Signed::Refused(status));
+            let _ = reply.try_send(refused);
             return;
         }
         self.lookups.push(Lookup {
@@ -1250,7 +1263,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let failed = door::Signed::Refused(Status::Failed);
         let read = match outcome {
             ReadOutcome::Read(read) => *read,
-            ReadOutcome::Deadline => return door::Signed::Refused(Status::SlowDown),
+            ReadOutcome::Deadline => return door::Signed::Slowed(door::Slowed::KeyLeaderless),
             ReadOutcome::Refused(_) => return failed,
         };
         let signer = match read {
@@ -1686,7 +1699,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 continue;
             }
             match job.bounded(now) {
-                Bounded::SlowDown => self.fail_job(at, Status::SlowDown)?,
+                Bounded::SlowDown => self.slow_job(at, door::Slowed::Patience)?,
                 Bounded::Held => {
                     if let Door::Exchange(exchange) = job.door {
                         self.driver.endpoint().working(exchange);
@@ -1766,7 +1779,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Outcome::Read(ReadOutcome::Deadline) | Outcome::Command(CommandOutcome::Deadline)
         );
         if leaderless && self.jobs.get(at).is_some_and(Job::working) {
-            return self.fail_job(at, Status::SlowDown);
+            return self.slow_job(at, door::Slowed::Leaderless);
         }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
@@ -2379,10 +2392,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 putting.put = Some(put);
                 Ok(())
             }
-            Err(error) => {
-                let status = put_status(&error);
-                self.fail_job(at, status)
-            }
+            Err(error) => match put_status(&error) {
+                Status::SlowDown => self.slow_job(at, door::Slowed::Unplaced),
+                status => self.fail_job(at, status),
+            },
         }
     }
 
@@ -2897,7 +2910,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(Err(e)) = get.outcome() {
             let status = get_status(e);
             getting.held = None;
-            self.fail_job(at, status)?;
+            match status {
+                Status::SlowDown => self.slow_job(at, door::Slowed::Unreadable)?,
+                _ => self.fail_job(at, status)?,
+            }
             return Ok(Some(false));
         }
         if !get.ready() && get.outcome().is_none() {
@@ -4245,10 +4261,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 copying.stage = CopyStage::Run;
                 Ok(())
             }
-            (_, Err(error)) => {
-                let status = put_status(&error);
-                self.fail_job(at, status)
-            }
+            (_, Err(error)) => match put_status(&error) {
+                Status::SlowDown => self.slow_job(at, door::Slowed::Unplaced),
+                status => self.fail_job(at, status),
+            },
             (Err(_), _) => self.fail_job(at, Status::Failed),
         }
     }
@@ -4437,6 +4453,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.reply_job(at, Reply::status(status))
     }
 
+    /// Ends job `at` `SlowDown` for `cause`, which the S3 door names in its reply.
+    fn slow_job(&mut self, at: usize, cause: door::Slowed) -> Result<(), NodeError> {
+        if let Some(job) = self.jobs.get_mut(at) {
+            job.slowed = Some(cause);
+        }
+        self.fail_job(at, Status::SlowDown)
+    }
+
     /// The outcomes of asks whose job ended before they came, dropped as they come: an outcome no
     /// job takes would hold one of the node's asks for good.
     fn drop_abandoned(&mut self) {
@@ -4476,10 +4500,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 else {
                     return Ok(false);
                 };
-                job.work = Work::Answering(VecDeque::from([
-                    door::Answer::Head(reply),
-                    door::Answer::End,
-                ]));
+                // A reply slowed for a cause says it (`door::Slowed`); any other, its head.
+                let head = match job.slowed {
+                    Some(cause) if reply.status == Status::SlowDown => door::Answer::Slowed(cause),
+                    _ => door::Answer::Head(reply),
+                };
+                job.work = Work::Answering(VecDeque::from([head, door::Answer::End]));
                 return self.answer_local(at);
             }
         };
@@ -5572,6 +5598,7 @@ mod tests {
             charge: 0,
             window: 1,
             label: None,
+            slowed: None,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);

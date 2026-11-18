@@ -43,9 +43,71 @@ pub enum Signed {
     /// The cell holds no such key, or held it once and it was revoked: S3's
     /// `InvalidAccessKeyId`.
     Unknown,
-    /// The lookup was not answered: a stopping node or a root range without a leader that can
-    /// serve it (`SlowDown`), or the root range's rows failing (`Failed`).
+    /// The lookup was not answered: the root range's rows failing (`Failed`).
     Refused(Status),
+    /// The lookup was not answered, for a cause that passes (`503 SlowDown`): which.
+    Slowed(Slowed),
+}
+
+/// Why an S3 request was answered `503 SlowDown`, each a cause that passes, which stock clients ask
+/// again (node.md §4.5). Its `<Code>` is `SlowDown`, as the S3 API reference states for 503; its
+/// `<Message>` says which path answered, so a refusal names its cause ([`Slowed::message`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slowed {
+    /// Past the connections the listener serves at once (`listener::Settings::connections`).
+    Connections,
+    /// The node's door held as many requests as it keeps, the node was gone, or its channels for
+    /// the request could not be made.
+    Door,
+    /// The node held as many key lookups as its door holds requests.
+    Lookups,
+    /// The node was stopping, or had no room for an operation its door handed it.
+    Stopping,
+    /// The access key's read of the root range waited its range's budget without a leader that
+    /// could serve it (node.md §5.4).
+    KeyLeaderless,
+    /// A read or command of the operation waited its range's budget without a leader that could
+    /// serve it (node.md §5.4).
+    Leaderless,
+    /// Fewer of a block's chunks could be read than rebuild it.
+    Unreadable,
+    /// No volume the placement offered took one of a block's chunks.
+    Unplaced,
+    /// The operation's work was held past a stock client's patience (research/77 D2).
+    Patience,
+}
+
+impl Slowed {
+    /// What the refusal's `<Message>` says past S3's own words: which path answered.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Connections => {
+                "Please reduce your request rate. Past the connections the node serves at once."
+            }
+            Self::Door => {
+                "Please reduce your request rate. The node's door was full, or the node gone."
+            }
+            Self::Lookups => {
+                "Please reduce your request rate. The node held as many key lookups as it keeps."
+            }
+            Self::Stopping => "Please reduce your request rate. The node was stopping.",
+            Self::KeyLeaderless => {
+                "Please reduce your request rate. The access key's read of the root range found no leader that serves it within its budget."
+            }
+            Self::Leaderless => {
+                "Please reduce your request rate. A range's read or command found no leader that serves it within its budget."
+            }
+            Self::Unreadable => {
+                "Please reduce your request rate. Fewer of a block's chunks could be read than rebuild it."
+            }
+            Self::Unplaced => {
+                "Please reduce your request rate. No volume offered took a block's chunk."
+            }
+            Self::Patience => {
+                "Please reduce your request rate. The operation's work was held past a client's patience."
+            }
+        }
+    }
 }
 
 /// A principal's key as the root range holds it, its secret unwrapped: the secret, wiped when
@@ -100,6 +162,8 @@ pub enum Answer {
     /// The operation failed past its head: the connection ends with the response unfinished, as
     /// the native door refuses its exchange, so no client takes a short body for the object's.
     Failed,
+    /// The reply in place of a head: `503 SlowDown`, for its cause.
+    Slowed(Slowed),
 }
 
 /// The node's end of its door: the requests the listener submits, and the waker that turns the

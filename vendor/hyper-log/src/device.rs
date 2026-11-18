@@ -625,7 +625,9 @@ impl<F: BlockFile> Device<F> {
     ) -> Completion {
         let (result, timing) =
             self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
-        let confirming = result.is_ok() && !f.at_flush && !(f.more || self.follows(f.sequence));
+        // The owner's words are read for a frame answered at its flush too, which needs none, so
+        // that a word about it never fills the room a later frame's word needs.
+        let confirming = result.is_ok() && !(f.more || self.follows(f.sequence)) && !f.at_flush;
         if result.is_ok() {
             // This frame's record confirms the frame before.
             answers.append(&mut f.before);

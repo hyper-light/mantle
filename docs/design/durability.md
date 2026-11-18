@@ -572,8 +572,9 @@ either decision a frame holding a one- or two-voter group stays confirmed (`Upda
      its record landed, as the torn tail. Such a mark always records its block. This binary reads
      it, and every re-lay and every mark written again keeps it. Nothing sets it yet.
 
-   4b, built (hyper-raft `mantle-frame-flush` `0f5dce2`, `f9248d5`): the mechanism, behind the
-   owner's decisions (§7.5's table), which answer at the flush nowhere until the owner takes one.
+   4b, built (hyper-raft `mantle-frame-flush` `0f5dce2`, `f9248d5`, `2b50efd`): the mechanism,
+   behind the owner's decisions (§7.5's table), which answer at the flush nowhere until the owner
+   takes one.
    - The policy: hyper-log `AtFlush`, decision (A) `WriteBackFrames` and decision (B)
      `StatedCache`, with `AtFlush::DECIDED` today's; a log is made or opened with it
      (`With::at_flush`, `DECIDED` by default, as every `create` and `open` takes it). `Answers`

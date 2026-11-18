@@ -87,10 +87,13 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `f9248d5` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and nineteen commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch
-is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last two commits
-are step 4b of mantle docs/design/durability.md §7.7. `f9248d5` changes hyper-log alone: the owner's
+**Every crate at `2b50efd` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twenty commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch
+is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last three
+commits are step 4b of mantle docs/design/durability.md §7.7. `2b50efd` changes hyper-log alone: the
+device reads the owner's words that another frame follows for a frame answered at its flush too, so
+a word left unread never fills the room a later confirmed frame's word needs, which would cost that
+frame a confirmation of its own. `f9248d5` changes hyper-log alone: the owner's
 two decisions of §7.5 are one typed policy, `AtFlush` (decision (A) `WriteBackFrames`, decision (B)
 `StatedCache`), whose `AtFlush::DECIDED` takes neither, so no device answers a frame at its flush; a
 log is made or opened with it (`With::at_flush`, `DECIDED` by default); `Answers` gains `Kept`,
@@ -100,7 +103,7 @@ says so and the log answers so, writing no confirmation of it, under condition (
 file holds written. `0f5dce2` changes hyper-sim and hyper-block: a simulated device that keeps every
 completed write (`Device::keep_completed`, `SimFile::keeping`, its cache write-through from a new
 `Source::Simulated`), and `BlockFile::writes_reach_device`, false for every real file. No new
-constants. The two before them are step 4a. `abfca69` changes hyper-log alone: the open
+constants. The two before those are step 4a. `abfca69` changes hyper-log alone: the open
 and the create read the device's write cache where they read its atomic write unit, and `Laid`
 carries it with `Answers`, how the log answers a frame's updates and why (`Whole`, `WriteBack`,
 `Unmeasured`), every frame still answered once confirmed; and the mark of pieces says, in its

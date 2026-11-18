@@ -1787,6 +1787,26 @@ its `doors run` line says it. Tested (`process::tests`): the key reads `first` a
 unstated where the file names it not, and refuses another word; `derive::tests` reads it back from
 the bases as the node runs with it.
 
+*As built (2026-11-18), step 4's smallest form: a far range's refusal answered at once*
+(`crates/node/src/node/shard.rs`, `Node::refused_far`). Each proposal the node makes is given an
+ask (`Node::propose_asked`), kept with the command waiting on it (`Commanded::ask`) and carried
+over the lane with the entry (`In::Propose`). A proposal the far range's replica refuses (it leads
+not, its lead is being handed over, its uncommitted entries are at their bound, or the shard holds
+it not) is answered by its ask in the turn that took it (`Out::Refused`, `shard::Refusal`), no
+longer dropped to its asker's patience: the node takes the command waiting on that ask and answers
+it as `propose_command` and `propose_own` answer the node's own replica's refusal, a peer's command
+`Malformed` for an entry past the range's bytes, else `Refused` while the range shows this node
+leading and redirected while it does not, and the node's own entry refused for what it is, or
+paused and asked again. A refusal no command waits on any longer, its range having stopped leading
+meanwhile (`Node::reply_commands` answered it), answers nothing. A read was already answered so
+(step 2b: `Out::Served` refused, as `ask_read` refuses one), and a full lane refuses either at
+once on the node's shard. The answer rides the shard's out lane, which waits for room rather than
+dropping, so it cannot be refused; a turn gives at most one refusal for each proposal it took, a
+lane's capacity and the one that woke it, so what a shard gives stays bounded. Tested
+(`node::shard`): a proposal to a far member that leads not is refused by its ask at once, and one
+past the range's bytes refused for what it is, the command waiting on each taken by its ask alone;
+and a read asked of a far member that leads not comes back refused at once.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

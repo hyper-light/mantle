@@ -750,10 +750,12 @@ enum CommandOrigin {
 }
 
 /// A command this node's member of `group` proposed as leader, waiting for its entry to apply:
+/// the ask its proposal was given, which a far range's refusal names (`shard::Out::Refused`), and
 /// each command's session and serial, in the entry's order, with its answer once applied.
 struct Commanded {
     origin: CommandOrigin,
     group: u128,
+    ask: u64,
     commands: Vec<(u64, u64, Option<Answer>)>,
 }
 
@@ -913,6 +915,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     reading: Vec<Reading>,
     /// The id the next read's context carries.
     next_read: u64,
+    /// The ask the next proposal is given, which a far range's refusal of it names.
+    next_ask: u64,
     /// The plane's messages the turn's wait took (`Node::wait`): sender, the kernel's arrival stamp
     /// and where in `inbox_bytes` the message lies. They are taken after the wait ends, in the order
     /// they came, before the drain's, which are taken where they are opened (`Node::drain_plane`):
@@ -1367,6 +1371,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             commanded: Vec::new(),
             reading: Vec::new(),
             next_read: 0,
+            next_ask: 0,
             inbox: Vec::new(),
             inbox_bytes: Vec::new(),
             events: Vec::new(),
@@ -1693,6 +1698,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
             shard::Out::Served(group, id, served) => self.served_far(group, id, served, now)?,
+            shard::Out::Refused(group, ask, refusal) => {
+                self.refused_far(group, ask, refusal, now)?;
+            }
             shard::Out::Compacted => self.compactions = self.compactions.saturating_add(1),
             shard::Out::Flushed(started, durable) => {
                 self.liveness
@@ -1862,18 +1870,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Proposes an entry of commands to `group`, stamped with this node's wall clock as the
     /// entry's time; only its leader takes it.
     pub fn propose(&mut self, group: u128, entry: &mut Entry) -> Result<(), NodeError> {
+        self.propose_asked(group, entry).map(|_| ())
+    }
+
+    /// Proposes an entry as [`Node::propose`] does, under the ask it gives it: a far range that
+    /// refuses the entry names the ask (`shard::Out::Refused`), and its command's asker is
+    /// answered by it (`Node::refused_far`).
+    fn propose_asked(&mut self, group: u128, entry: &mut Entry) -> Result<u64, NodeError> {
         let Some(kept) = self.ranges.iter().find(|k| k.group == group) else {
             return Err(NodeError::Bounds(format!("no range {group:x} here")));
         };
         let (handle, max) = (kept.handle, kept.max_entry_bytes);
         entry.at_ns = self.wall.now_ns();
+        let ask = self.next_ask;
+        self.next_ask = ask.wrapping_add(1);
         if let Some(far) = self.far.iter().find(|far| far.group == group) {
-            shard::propose(&self.shards, far, entry, max)?;
+            shard::propose(&self.shards, far, entry, max, ask)?;
             self.proposed_entries = self.proposed_entries.saturating_add(1);
             self.proposed_commands = self
                 .proposed_commands
                 .saturating_add(u64::try_from(entry.commands.len()).unwrap_or(u64::MAX));
-            return Ok(());
+            return Ok(ask);
         }
         let shell = self
             .owner
@@ -1885,7 +1902,61 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.proposed_commands = self
             .proposed_commands
             .saturating_add(u64::try_from(entry.commands.len()).unwrap_or(u64::MAX));
-        Ok(())
+        Ok(ask)
+    }
+
+    /// A proposal a far range refused (`shard::Out::Refused`), answered to the command waiting on
+    /// it at once, as `propose_command` and `propose_own` answer one the node's own replica
+    /// refuses: a peer's command `Malformed` for an entry past the range's bytes, else `Refused`
+    /// while the range shows this node leading and redirected while it does not; the node's own
+    /// entry refused for what it is, or paused and asked again (node.md §2.9, step 4). One no
+    /// command waits on any longer, its range having stopped leading meanwhile
+    /// (`Node::reply_commands`), answers nothing.
+    fn refused_far(
+        &mut self,
+        group: u128,
+        ask: u64,
+        refusal: shard::Refusal,
+        now: u64,
+    ) -> Result<(), NodeError> {
+        let Some(commanded) = refused_command(&mut self.commanded, group, ask) else {
+            return Ok(());
+        };
+        match (commanded.origin, refusal) {
+            (CommandOrigin::Exchange(exchange), shard::Refusal::TooLarge) => {
+                self.answer_status(exchange, command::Status::Malformed, 0)
+            }
+            (CommandOrigin::Exchange(exchange), shard::Refusal::NotTaken) => {
+                let leader = self.leader_of(group);
+                if leader == self.id {
+                    self.answer_status(exchange, command::Status::Refused, leader)
+                } else {
+                    self.redirect(exchange, group)
+                }
+            }
+            (CommandOrigin::Own(id), refusal) => {
+                let local = self.id;
+                let Some(asking) = self.asking.iter_mut().find(|a| a.group == group) else {
+                    return Ok(());
+                };
+                match refusal {
+                    shard::Refusal::TooLarge => asking.refused_entry(
+                        id,
+                        command::Status::Malformed,
+                        &mut self.commands_done,
+                    ),
+                    shard::Refusal::NotTaken => {
+                        // The member takes no entry now: the time without a leader that serves
+                        // it counted, as `propose_own` counts its own replica's refusal.
+                        if let Some(out) = asking.out_mut(id) {
+                            out.leaderless_since.get_or_insert(now);
+                        }
+                        pause(local, asking, id, now, false);
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// What the node shows of `group` and of its stream.
@@ -3652,11 +3723,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             return self.answer_status(exchange, command::Status::Forbidden, self.id);
         }
-        match self.propose(group, &mut entry) {
-            Ok(()) => {
+        match self.propose_asked(group, &mut entry) {
+            Ok(ask) => {
                 self.commanded.push(Commanded {
                     origin: CommandOrigin::Exchange(exchange),
                     group,
+                    ask,
                     commands: entry
                         .commands
                         .iter()
@@ -4378,7 +4450,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }) else {
             return Ok(());
         };
-        let proposed = self.propose(group, &mut out.entry);
+        let proposed = self.propose_asked(group, &mut out.entry);
         let commands = out
             .entry
             .commands
@@ -4389,7 +4461,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         match proposed {
-            Ok(()) => {
+            Ok(ask) => {
                 out.via = Via::Local;
                 // Its wait for a quorum's commit, counted where nothing here judges (`unled`).
                 out.leaderless_since.get_or_insert(now);
@@ -4397,6 +4469,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.commanded.push(Commanded {
                     origin: CommandOrigin::Own(id),
                     group,
+                    ask,
                     commands,
                 });
             }
@@ -5098,6 +5171,15 @@ fn requested(seen: Option<shard::Seen>, group: u128, led: fn(u128) -> Arriving) 
         Some(seen) if !seen.leading => Arriving::Redirect(group),
         Some(_) => led(group),
     }
+}
+
+/// The command waiting on `group`'s entry proposed as `ask`, taken out to be answered: its range
+/// refused the entry (`shard::Out::Refused`). None where none waits on it any longer.
+fn refused_command(commanded: &mut Vec<Commanded>, group: u128, ask: u64) -> Option<Commanded> {
+    let at = commanded
+        .iter()
+        .position(|c| c.group == group && c.ask == ask)?;
+    Some(commanded.swap_remove(at))
 }
 
 /// An answer a range applied, given to the command waiting for it, if one is: the first whose

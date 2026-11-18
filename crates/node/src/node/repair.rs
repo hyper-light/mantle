@@ -29,11 +29,12 @@ use mantle_gateway::repair::{
 use mantle_meta::apply::Layer;
 use mantle_meta::block;
 use mantle_meta::engine::Engine;
-use mantle_meta::record::{BlockHeader, ChunkPlace, VolumeStanding};
+use mantle_meta::record::VolumeStanding;
 use mantle_meta::root::{self, Fact, Seen};
 use mantle_meta::wire::{Answer as RangeAnswer, Command};
 
 use super::host::Pending;
+use super::shard::{self, BlockRead, BlockRows};
 use super::{ChunkOutcome, Node, NodeError, NodeLog, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, Wait};
 use crate::chunk;
@@ -149,6 +150,9 @@ pub(crate) struct Repair {
     /// A block the walk reached whose plan waits for room, with the operation slots its repair
     /// takes (none for a change of rows): it goes first once there is room, the walk held there.
     deferred: Option<(u128, usize)>,
+    /// Whether the last settled pass's retiring of empty volumes stopped short, waiting on a read
+    /// of the Block range's rows asked of its shard: the service is not idle until it is done.
+    unretired: bool,
     status: RepairStatus,
 }
 
@@ -166,6 +170,7 @@ impl Repair {
             counts: std::collections::BTreeMap::new(),
             concurrency: 1,
             deferred: None,
+            unretired: false,
             status: RepairStatus {
                 leading: true,
                 ..RepairStatus::default()
@@ -305,12 +310,37 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// The handle of this node's member of the range of `layer`.
-    fn handle_of(&self, layer: Layer) -> Option<hyper_durable::Handle> {
-        self.ranges
+    /// Repair's `read` of the Block range's rows as this node's member applied them: read now
+    /// where the node's own task drives the range; where another shard does, what that shard
+    /// answered ([`shard::read_block`]), none until it comes or while its lane has no room to ask
+    /// it, the walk waiting meanwhile. None where the node holds no Block range.
+    fn read_block(&mut self, read: BlockRead) -> Result<Option<BlockRows>, NodeError> {
+        let Some((handle, group)) = self
+            .ranges
             .iter()
-            .find(|k| k.layer == layer)
-            .map(|k| k.handle)
+            .find(|k| k.layer == Layer::Block)
+            .map(|k| (k.handle, k.group))
+        else {
+            return Ok(None);
+        };
+        if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+            return match shard::read_block(&self.shards, far, read) {
+                Err(NodeError::LaneFull(_)) => Ok(None),
+                read => read,
+            };
+        }
+        let Some(shell) = self.owner.get_mut(handle) else {
+            return Ok(None);
+        };
+        read.read(shell.machine_mut().engine_mut()).map(Some)
+    }
+
+    /// Whether a read of the Block range's rows is asked of its shard and unanswered: the walk
+    /// waits on it, and its answer wakes the node.
+    fn block_reading(&self) -> bool {
+        self.far
+            .iter()
+            .any(|far| far.block.as_ref().is_some_and(|(_, rows)| rows.is_none()))
     }
 
     /// The facts the root range keeps, as this node's member applied them: each volume, its
@@ -427,12 +457,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .iter()
                 .chain(&repair.retiring)
                 .any(|(ask, _)| self.commands_done.iter().any(|(a, _)| a == ask));
-        // A pass whose walk is over waits for its answers, which `waiting` says.
-        let resumes = match repair.deferred {
-            Some((_, 0)) => self.command_room(),
-            Some((_, slots)) => self.starts(repair, slots),
-            None => repair.pass.as_ref().is_some_and(|p| !p.walked) && self.starts(repair, 1),
-        };
+        // A pass whose walk is over waits for its answers, which `waiting` says; one waiting on
+        // the Block range's shard for a read resumes once its answer wakes the node.
+        let resumes = !self.block_reading()
+            && match repair.deferred {
+                Some((_, 0)) => self.command_room(),
+                Some((_, slots)) => self.starts(repair, slots),
+                None => repair.pass.as_ref().is_some_and(|p| !p.walked) && self.starts(repair, 1),
+            };
         if waiting || resumes {
             return Some(shard);
         }
@@ -475,15 +507,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .group_of(Layer::Block)
                 .is_some_and(|block| self.is_leader(block))
             && self.group_of(Layer::Root).is_some();
-        if !leads {
+        let stepped = if leads {
+            let mut repair = self.repair.take().unwrap_or_else(Repair::new);
+            let stepped = self.step_service(&mut repair);
+            self.repair = Some(repair);
+            stepped
+        } else {
             if let Some(repair) = self.repair.take() {
                 self.abandon(repair);
             }
-            return Ok(());
+            Ok(())
+        };
+        // A Block range's rows its shard answered that the walk took not at this turn are let go:
+        // none is read a turn past the one it came at, and the walk asks again.
+        for far in &mut self.far {
+            if far.block.as_ref().is_some_and(|(_, rows)| rows.is_some()) {
+                far.block = None;
+            }
         }
-        let mut repair = self.repair.take().unwrap_or_else(Repair::new);
-        let stepped = self.step_service(&mut repair);
-        self.repair = Some(repair);
         stepped
     }
 
@@ -518,6 +559,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             && repair.commanding.is_empty()
             && repair.retiring.is_empty()
             && repair.status.settled
+            && !repair.unretired
             && repair.status.block_applied == block_applied;
         let ended = repair.status.ended_ns;
         let fallen = {
@@ -600,19 +642,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .map(|slots| (block, slots));
         }
         if repair.pass.is_none() && repair.status.settled {
-            self.retire_empty(repair, &facts)?;
+            repair.unretired = !self.retire_empty(repair, &facts)?;
         }
         Ok(())
     }
 
     /// Each leaving volume no block names any more is gone, and each gone one the table forgets
     /// (docs/design/repair.md §4): asked of the root range once a pass settled, one ask a volume.
-    fn retire_empty(&mut self, repair: &mut Repair, facts: &[Fact]) -> Result<(), NodeError> {
+    /// Whether it went through every volume: not while it waits on the Block range's shard.
+    fn retire_empty(&mut self, repair: &mut Repair, facts: &[Fact]) -> Result<bool, NodeError> {
         let Some(root_group) = self.group_of(Layer::Root) else {
-            return Ok(());
-        };
-        let Some(handle) = self.handle_of(Layer::Block) else {
-            return Ok(());
+            return Ok(true);
         };
         for fact in facts {
             let volume = fact.placed.volume;
@@ -628,18 +668,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if repair.retiring.iter().any(|(_, v)| *v == volume) || !self.command_room() {
                 continue;
             }
-            let Some(shell) = self.owner.get_mut(handle) else {
-                return Ok(());
+            // None: no Block range here, or its shard is asked, whose answer a later turn reads.
+            let Some(named) = self.read_block(BlockRead::OnVolume {
+                volume,
+                after: None,
+            })?
+            else {
+                return Ok(false);
             };
-            let named = block::on_volume(shell.machine_mut().engine_mut(), volume, None, 1)
-                .map_err(|e| NodeError::Bounds(e.to_string()))?;
-            if !named.is_empty() {
+            if named != BlockRows::OnVolume(None) {
                 continue;
             }
             let ask = self.command(root_group, Command::Root(word), u64::MAX, Wait::Request)?;
             repair.retiring.push((ask, volume));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// The next block the pass walks, or none: a walk that found a higher margin to act on walks
@@ -652,34 +695,28 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         repair: &mut Repair,
         now: (u64, u64),
     ) -> Result<Option<u128>, NodeError> {
-        let Some(handle) = self.handle_of(Layer::Block) else {
-            return Ok(None);
-        };
-        let Some(shell) = self.owner.get_mut(handle) else {
-            return Ok(None);
-        };
-        let engine = shell.machine_mut().engine_mut();
-        let meta = |e: mantle_meta::error::MetaError| NodeError::Bounds(e.to_string());
         let Some(pass) = repair.pass.as_mut() else {
             return Ok(None);
         };
+        // Each read none where no Block range is here, or while its shard is asked: the walk
+        // waits there for the turn its answer comes.
         loop {
             if let Some(after) = pass.sweep {
-                match block::blocks(engine, after, 1).map_err(meta)?.first() {
-                    Some(&block) => {
+                match self.read_block(BlockRead::Next { after })? {
+                    None => return Ok(None),
+                    Some(BlockRows::Next(Some(block))) => {
                         pass.sweep = Some(Some(block));
                         return Ok(Some(block));
                     }
-                    None => pass.sweep = None,
+                    Some(_) => pass.sweep = None,
                 }
                 continue;
             }
             if let Some(&volume) = pass.volumes.get(pass.at) {
-                match block::on_volume(engine, volume, pass.after, 1)
-                    .map_err(meta)?
-                    .first()
-                {
-                    Some(&(block, _)) => {
+                let after = pass.after;
+                match self.read_block(BlockRead::OnVolume { volume, after })? {
+                    None => return Ok(None),
+                    Some(BlockRows::OnVolume(Some((block, _)))) => {
                         pass.after = Some(block);
                         if pass.level == 0 {
                             let count = pass.counting.entry(volume).or_insert(0);
@@ -687,7 +724,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         }
                         return Ok(Some(block));
                     }
-                    None => {
+                    Some(_) => {
                         pass.at = pass.at.saturating_add(1);
                         pass.after = None;
                     }
@@ -761,8 +798,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             return Ok(None);
         }
-        let Some((header, places)) = self.block_places(block)? else {
-            return Ok(None);
+        let far = self.far.iter().any(|far| far.group == block_group);
+        let (header, places) = match self.read_block(BlockRead::Places { block })? {
+            Some(BlockRows::Places(Some(places))) => places,
+            // Asked of the Block range's shard, or to be once its lane has room: the walk holds at
+            // the block until its answer.
+            None if far => return Ok(Some(0)),
+            _ => return Ok(None),
         };
         // A block the walk reached already at its level, by the sweep or through a volume walked
         // before, was planned and counted then: once a walk.
@@ -867,22 +909,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         Ok(None)
-    }
-
-    /// `block`'s header and every place of its chunks, as this node's member of the Block range
-    /// applied them.
-    fn block_places(
-        &mut self,
-        block: u128,
-    ) -> Result<Option<(BlockHeader, Vec<ChunkPlace>)>, NodeError> {
-        let Some(handle) = self.handle_of(Layer::Block) else {
-            return Ok(None);
-        };
-        let Some(shell) = self.owner.get_mut(handle) else {
-            return Ok(None);
-        };
-        block::places(shell.machine_mut().engine_mut(), block)
-            .map_err(|e| NodeError::Bounds(e.to_string()))
     }
 
     /// The row changes the service asked, as their answers come: each lets its block be planned

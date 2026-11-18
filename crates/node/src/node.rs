@@ -1514,6 +1514,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 shard::movable(kept.group, replica)?;
             }
         }
+        // The volume table read while the root range is here, so the node holds one to read while
+        // it asks its shard for the next (`Node::table`).
+        if places.iter().any(|place| {
+            self.ranges
+                .get(*place)
+                .is_some_and(|k| k.layer == Layer::Root)
+        }) {
+            self.table()?;
+        }
         let lanes = shard::Lanes::start(holder, shard, places.len(), self.parked_most)?;
         for place in places {
             let Some(kept) = self.ranges.get_mut(place) else {
@@ -1543,6 +1552,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 // A replacement the node was told before the range moved goes with it.
                 replacing: kept.replacing.take().map(|replacement| (replacement, true)),
                 rows: None,
+                table_out: false,
+                table: None,
+                block: None,
             });
         }
         self.shards.push(lanes);
@@ -1644,6 +1656,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             shard::Out::Rows(group, rows) => {
                 if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
                     far.rows = Some(rows);
+                }
+            }
+            shard::Out::Table(group, facts) => {
+                if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+                    far.answered_table(facts);
+                }
+            }
+            shard::Out::Block(group, read, rows) => {
+                if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+                    far.answered_block(read, rows);
                 }
             }
             shard::Out::Replaced(group, replacement) => {

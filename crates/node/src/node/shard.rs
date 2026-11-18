@@ -5,11 +5,12 @@
 //! there in an owner of its own (`hyper_durable::Owner`), made with that task's waker, so a range's
 //! log answers wake the shard that drives it, and keeps that shard's deadlines. The two talk over
 //! two bounded lanes of hyper-rt's channel: into the shard, each replica moved there before its
-//! first drive, Raft messages, proposals, reads, the stream's changes and measurements, and the
-//! membership's targets and replacements ([`In`]); out of it, Raft messages, applied answers,
+//! first drive, Raft messages, proposals, reads, the stream's changes and measurements, the
+//! membership's targets and replacements, and the asks for the root range's volume table and for
+//! the Block range's rows repair walks by ([`In`]); out of it, Raft messages, applied answers,
 //! flushes, each range's peers, its expected election, what it shows after a drive that changed it
-//! ([`Seen`], [`Configured`]), the root range's rows, its reads served and its replacements done
-//! ([`Out`]). The node's shard sends without waiting, a full lane refused, typed
+//! ([`Seen`], [`Configured`]), the root range's rows, its reads served, its replacements done, and
+//! the volume table and Block rows asked ([`Out`]). The node's shard sends without waiting, a full lane refused, typed
 //! (`NodeError::LaneFull`); the shard waits for room on its way out, its replicas' next turn held
 //! until the node's shard takes what they gave. A shard whose task ended took its ranges with it,
 //! which nothing else holds, so the node stops (`NodeError::ShardEnded`) and its next start
@@ -30,7 +31,10 @@ use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender, SyncError, channel, oneshot};
 use hyper_timing::{Ballot, ExchangeRtt, Trust};
 use hyper_transport::Classes;
+use mantle_meta::block;
 use mantle_meta::engine::Engine;
+use mantle_meta::record::{BlockHeader, ChunkPlace};
+use mantle_meta::root::{self, Fact};
 use mantle_meta::wire::Entry;
 use mantle_protocol::bounds;
 use mantle_protocol::classes::{self, NodeClasses};
@@ -87,6 +91,14 @@ pub(crate) enum In<E: Engine, S: LogStore> {
     /// at each of its turns while the range leads here ([`step_replacement`]), until it is done
     /// ([`Out::Replaced`]). A later one supersedes it.
     Replace(u128, Replacement),
+    /// The root range's volume table, read from its engine as it applied it when the shard takes
+    /// this ([`Out::Table`]): asked by the node once the range applied past the table it holds,
+    /// one at a time ([`ask_table`]).
+    Table(u128),
+    /// A read of the Block range's rows that repair walks by, answered from its engine when the
+    /// shard takes it ([`Out::Block`]): one at a time, as repair walks one block at a time
+    /// ([`read_block`]).
+    Block(u128, BlockRead),
     /// Each range's engine as it stands, handed back through the sender, and the task ends: the
     /// node closes (`Node::close`).
     Release(OneshotSender<Vec<(u128, E)>>),
@@ -122,6 +134,10 @@ pub(crate) enum Out {
     /// The root range's rows the membership reads, after a drive in which it applied an entry, and
     /// at its first.
     Rows(u128, Box<Rows>),
+    /// The root range's volume table an [`In::Table`] asked, or why its engine failed to read it.
+    Table(u128, Result<Box<Facts>, NodeError>),
+    /// What an [`In::Block`] read of the Block range's rows found, or why its engine failed it.
+    Block(u128, BlockRead, Result<BlockRows, NodeError>),
     /// Why the shard stopped: its task ends after it.
     Stopped(NodeError),
 }
@@ -248,6 +264,90 @@ pub(crate) struct Far {
     /// The root range's rows its shard last handed over ([`Out::Rows`]) that the node has yet to
     /// read: the latest, superseding those before.
     pub(crate) rows: Option<Box<Rows>>,
+    /// Whether the root range's volume table is asked of its shard ([`In::Table`]), and the one it
+    /// answered ([`Out::Table`]) that the node has yet to read.
+    pub(crate) table_out: bool,
+    pub(crate) table: Option<Result<Box<Facts>, NodeError>>,
+    /// The read of the Block range's rows repair asked of its shard ([`In::Block`]), and its
+    /// answer once given ([`Out::Block`]), until repair takes it or its turn ends.
+    pub(crate) block: Option<(BlockRead, Option<Result<BlockRows, NodeError>>)>,
+}
+
+impl Far {
+    /// The volume table its shard answered ([`Out::Table`]), for the node's next read: its ask is
+    /// out no more.
+    pub(crate) fn answered_table(&mut self, facts: Result<Box<Facts>, NodeError>) {
+        self.table_out = false;
+        self.table = Some(facts);
+    }
+
+    /// What its shard found for repair's `read` ([`Out::Block`]), kept while it is the read out.
+    pub(crate) fn answered_block(&mut self, read: BlockRead, rows: Result<BlockRows, NodeError>) {
+        if self.block.as_ref().is_some_and(|(asked, _)| *asked == read) {
+            self.block = Some((read, Some(rows)));
+        }
+    }
+}
+
+/// The root range's volume table as its member applied it: each volume, its standing and its
+/// node's presence (`root::facts`), at most the table's census of them, and the entry it had
+/// applied when read.
+pub(crate) struct Facts {
+    pub(crate) applied: u64,
+    pub(crate) facts: Vec<Fact>,
+}
+
+/// Every fact of the volume table in `engine`, the root range's: at most its census of volumes.
+pub(crate) fn read_facts<E: Engine>(engine: &mut E) -> Result<Vec<Fact>, NodeError> {
+    let meta = |e: mantle_meta::error::MetaError| NodeError::Bounds(e.to_string());
+    let census = root::census(engine).map_err(meta)?;
+    let most = usize::try_from(census.volumes).unwrap_or(usize::MAX);
+    root::facts(engine, None, most).map_err(meta)
+}
+
+/// A read of the Block range's rows that repair walks by (`node::repair`), each of one block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockRead {
+    /// The first block past `after` (`block::blocks`).
+    Next { after: Option<u128> },
+    /// The first block past `after` with a place on `volume`, and its chunk's index
+    /// (`block::on_volume`).
+    OnVolume { volume: u128, after: Option<u128> },
+    /// A block's header and every place of its chunks (`block::places`).
+    Places { block: u128 },
+}
+
+/// What a [`BlockRead`] found: at most one block, or one block's places.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BlockRows {
+    Next(Option<u128>),
+    OnVolume(Option<(u128, u16)>),
+    Places(Option<(BlockHeader, Vec<ChunkPlace>)>),
+}
+
+impl BlockRead {
+    /// What it finds in `engine`, the Block range's, as its member applied it: read alike on the
+    /// node's shard and on the range's.
+    pub(crate) fn read<E: Engine>(self, engine: &mut E) -> Result<BlockRows, NodeError> {
+        let meta = |e: mantle_meta::error::MetaError| NodeError::Bounds(e.to_string());
+        Ok(match self {
+            Self::Next { after } => BlockRows::Next(
+                block::blocks(engine, after, 1)
+                    .map_err(meta)?
+                    .first()
+                    .copied(),
+            ),
+            Self::OnVolume { volume, after } => BlockRows::OnVolume(
+                block::on_volume(engine, volume, after, 1)
+                    .map_err(meta)?
+                    .first()
+                    .copied(),
+            ),
+            Self::Places { block } => {
+                BlockRows::Places(block::places(engine, block).map_err(meta)?)
+            }
+        })
+    }
 }
 
 /// What a range's member applied of its configuration, whether a change of it is pending, and,
@@ -621,6 +721,56 @@ pub(crate) fn ask_transfer<E: Engine + 'static, S: LogStore>(
         Err(NodeError::LaneFull(_)) => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// Asks `far`'s shard for the root range's volume table ([`In::Table`]) where it applied past
+/// `held`, the entry the node's table was read at, and none is asked: one at a time, as the
+/// table, every volume of the cell, may be large, so the shard sends it only when asked and the
+/// node reads the table it holds meanwhile. One whose lane has no room is refused `LaneFull`, not
+/// asked, and asked again at the node's next read; a shard with no lanes, or whose task ended, is
+/// refused `ShardEnded`.
+pub(crate) fn ask_table<E: Engine + 'static, S: LogStore>(
+    shards: &[Lanes<E, S>],
+    far: &mut Far,
+    held: Option<u64>,
+) -> Result<(), NodeError> {
+    if far.table_out || far.table.is_some() || held == Some(far.seen.applied) {
+        return Ok(());
+    }
+    shards
+        .iter()
+        .find(|lanes| lanes.shard() == far.shard)
+        .ok_or(NodeError::ShardEnded(far.shard))?
+        .send(In::Table(far.group))?;
+    far.table_out = true;
+    Ok(())
+}
+
+/// Repair's `read` of `far`'s rows, the Block range's: what its shard answered, taken once; none
+/// until then, the read asked ([`In::Block`]) one at a time, so a read past one out waits for it
+/// and an answer to another read is let go. One whose lane has no room is refused `LaneFull`, not
+/// asked, and asked again at repair's next turn; a shard with no lanes, or whose task ended, is
+/// refused `ShardEnded`.
+pub(crate) fn read_block<E: Engine + 'static, S: LogStore>(
+    shards: &[Lanes<E, S>],
+    far: &mut Far,
+    read: BlockRead,
+) -> Result<Option<BlockRows>, NodeError> {
+    match far.block.take() {
+        Some((asked, Some(answer))) if asked == read => return answer.map(Some),
+        Some((asked, None)) => {
+            far.block = Some((asked, None));
+            return Ok(None);
+        }
+        Some(_) | None => {}
+    }
+    shards
+        .iter()
+        .find(|lanes| lanes.shard() == far.shard)
+        .ok_or(NodeError::ShardEnded(far.shard))?
+        .send(In::Block(far.group, read))?;
+    far.block = Some((read, None));
+    Ok(None)
 }
 
 /// Begins handing the lead of `replica`'s range, which it leads, to a voter whose log holds
@@ -1016,6 +1166,26 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     kept.replacing = Some(replacement);
                     self.owner.schedule(kept.handle);
                 }
+            }
+            In::Table(group) => {
+                let replica = self.at(group).and_then(|handle| self.owner.get_mut(handle));
+                let facts = match replica {
+                    Some(replica) => {
+                        let applied = replica.applied().index;
+                        read_facts(replica.machine_mut().engine_mut())
+                            .map(|facts| Box::new(Facts { applied, facts }))
+                    }
+                    None => Err(NodeError::Bounds("no root range here".into())),
+                };
+                self.gave.push(Out::Table(group, facts));
+            }
+            In::Block(group, read) => {
+                let replica = self.at(group).and_then(|handle| self.owner.get_mut(handle));
+                let rows = match replica {
+                    Some(replica) => read.read(replica.machine_mut().engine_mut()),
+                    None => Err(NodeError::Bounds("no Block range here".into())),
+                };
+                self.gave.push(Out::Block(group, read, rows));
             }
             In::Release(reply) => self.release = Some(reply),
         }
@@ -1961,6 +2131,9 @@ mod tests {
             },
             replacing: None,
             rows: None,
+            table_out: false,
+            table: None,
+            block: None,
         }
     }
 
@@ -2705,5 +2878,324 @@ mod tests {
         drop(lanes);
         rt.shutdown().unwrap();
         drop((log, name_log));
+    }
+
+    /// Node 1's replica of a one-member `range` on `log`, over `engine`, campaigning, moved to the
+    /// second shard of `rt` before its first drive: its lanes once its shard shows it leading with
+    /// its leader's first entry applied, after which it applies nothing unless proposed to, and
+    /// what it shows then.
+    fn far_leading(
+        rt: &Runtime,
+        log: &Log<DeviceFile>,
+        range: &Range,
+        mut engine: Model,
+    ) -> (Lanes<Model, Stored>, Seen) {
+        engine.persist().unwrap();
+        let store = Answers::new(mantle_range::claim(log, GROUP, range).unwrap());
+        let mut replica =
+            mantle_range::open_shell(1, store, engine, range, 1, Elections::Suspicion).unwrap();
+        replica.campaign().unwrap();
+        let mut lanes = Lanes::start(rt.holder_of(rt.shard_ids()[1]).unwrap(), 1, 1, 8).unwrap();
+        lanes.send(In::Adopt(GROUP, Box::new(replica))).unwrap();
+        let until = deadline();
+        loop {
+            if let Out::Seen(_, seen) = next(&mut lanes, "the range leading", until, |_| false)
+                && seen.leading
+                && seen.applied > 0
+            {
+                return (lanes, seen);
+            }
+        }
+    }
+
+    /// An engine of the Name range's first rows, as `campaigning` makes one, and the rows `apply`
+    /// writes through entries past it, all installed as of entry 0, where a replica opens.
+    fn installed(apply: impl FnOnce(&mut Model)) -> Model {
+        let mut written = Model::default();
+        written.install(0, name::first(1).unwrap()).unwrap();
+        apply(&mut written);
+        let mut engine = Model::default();
+        engine.install(0, written.image().unwrap()).unwrap();
+        engine
+    }
+
+    /// The root range's word enlisting `node` in domain "d" with `volumes`.
+    fn enlist(node: u64, volumes: Vec<(u128, u64)>) -> root::Command {
+        root::Command::Enlist(root::Enlist {
+            node,
+            domain: "d".into(),
+            volumes,
+            max_nodes: 3,
+            max_volumes: 3,
+            at_ns: 0,
+        })
+    }
+
+    /// What the shard answered of the table asked of it, the far range told as the node's shard
+    /// tells it (`Node::took`), what it shows kept as the node keeps it.
+    fn table_answered(lanes: &mut Lanes<Model, Stored>, far: &mut Far) -> Box<Facts> {
+        let until = deadline();
+        loop {
+            match next(lanes, "the table answered", until, |_| false) {
+                Out::Seen(_, seen) => far.seen = seen,
+                Out::Table(group, facts) => {
+                    assert_eq!(group, GROUP);
+                    far.answered_table(facts);
+                    assert!(!far.table_out, "its ask is out no more");
+                    // The node reads it once (`Node::table`).
+                    return far.table.take().unwrap().unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The host's volume table of a far root range is asked of the range's shard and answered
+    /// as of the entry the range applied ([`In::Table`], [`Out::Table`]): every volume its engine
+    /// holds. While the range shows it applied nothing past the table held, nothing is asked and
+    /// the node reads the one it holds; once it applies an entry, which enlists a volume, the
+    /// table is asked again, one ask at a time, and answered with that volume.
+    #[test]
+    fn a_far_root_ranges_volume_table_is_asked_once_it_applies_past_the_one_held() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let mut range = one_member();
+        range.layer = Layer::Root;
+        let log = log_in(dir.path(), &range);
+        // Node 9 enlisted with volume 1, and a session registered for the entry proposed later.
+        let mut session = 0;
+        let engine = installed(|engine| {
+            root::apply(engine, 1, &enlist(9, vec![(1, 1 << 30)])).unwrap();
+            let register = Entry {
+                at_ns: 0,
+                commands: vec![Sessioned {
+                    session: 0,
+                    serial: 0,
+                    unanswered: 0,
+                    command: Command::Register {
+                        owner: 1,
+                        run: 1,
+                        nth: 1,
+                    },
+                }],
+            };
+            let answers =
+                mantle_meta::apply::apply_entry(engine, 2, &register, Layer::Root, &range.rules)
+                    .unwrap();
+            let [
+                mantle_meta::wire::Answer::Registered {
+                    session: registered,
+                },
+            ] = answers[..]
+            else {
+                panic!("{answers:?}")
+            };
+            session = registered;
+        });
+        let (mut lanes, seen) = far_leading(&rt, &log, &range, engine);
+        let mut far = far(seen);
+        ask_table(std::slice::from_ref(&lanes), &mut far, None).unwrap();
+        assert!(far.table_out);
+        // One at a time: asked again while out, nothing more is sent.
+        ask_table(std::slice::from_ref(&lanes), &mut far, None).unwrap();
+        let facts = table_answered(&mut lanes, &mut far);
+        assert_eq!(
+            facts.applied, far.seen.applied,
+            "as of the entry it applied"
+        );
+        let volumes: Vec<(u128, u64)> = facts
+            .facts
+            .iter()
+            .map(|f| (f.placed.volume, f.placed.node))
+            .collect();
+        assert_eq!(volumes, [(1, 9)]);
+
+        // The range applied nothing since: the table held is read, nothing asked.
+        let held = Some(facts.applied);
+        ask_table(std::slice::from_ref(&lanes), &mut far, held).unwrap();
+        assert!(!far.table_out, "the table held is the range's");
+
+        let entry = Entry {
+            at_ns: 0,
+            commands: vec![Sessioned {
+                session,
+                serial: 1,
+                unanswered: 0,
+                command: Command::Root(enlist(10, vec![(2, 1 << 30)])),
+            }],
+        };
+        lanes
+            .send(In::Propose(GROUP, entry, range.settings.max_entry_bytes))
+            .unwrap();
+        let until = deadline();
+        while far.seen.applied <= facts.applied {
+            match next(&mut lanes, "the enlistment applied", until, |_| false) {
+                Out::Seen(_, seen) => far.seen = seen,
+                Out::Applied(_, applied) => {
+                    assert_eq!(
+                        applied.answer,
+                        mantle_meta::wire::Answer::Root(root::Outcome::Enlisted)
+                    );
+                }
+                _ => {}
+            }
+        }
+        ask_table(std::slice::from_ref(&lanes), &mut far, held).unwrap();
+        assert!(far.table_out, "asked again once the range applied past it");
+        let again = table_answered(&mut lanes, &mut far);
+        assert_eq!(again.applied, far.seen.applied);
+        let volumes: Vec<(u128, u64)> = again
+            .facts
+            .iter()
+            .map(|f| (f.placed.volume, f.placed.node))
+            .collect();
+        assert_eq!(volumes, [(1, 9), (2, 10)]);
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// Repair's three reads of a far Block range's rows, the next block, the next block on a
+    /// volume, and a block's places, asked of its shard ([`In::Block`]) one at a time, answer as
+    /// the range's engine answers them where the node's own task drives it: each taken once.
+    #[test]
+    fn repairs_reads_of_a_far_block_range_answer_as_its_engine_on_the_nodes_shard() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let mut range = one_member();
+        range.layer = Layer::Block;
+        let log = log_in(dir.path(), &range);
+        let engine = installed(|engine| {
+            for block in 1..=3u128 {
+                let chunks = [7, 100 + block]
+                    .into_iter()
+                    .zip(0u16..)
+                    .map(|(volume, index)| ChunkPlace {
+                        volume,
+                        key: mantle_chunk::ChunkKey {
+                            block,
+                            epoch: 1,
+                            index,
+                        },
+                    })
+                    .collect();
+                let write = block::Command::Write {
+                    block,
+                    header: BlockHeader {
+                        length: 3 << 20,
+                        data: 1,
+                        parity: 1,
+                        chunk_len: 3 << 20,
+                        crc32c: 1,
+                    },
+                    chunks,
+                    file: 1,
+                    handover_ns: u64::MAX / 2,
+                    at_ns: 0,
+                };
+                let index = u64::try_from(block).unwrap();
+                block::apply(engine, index, &write).unwrap();
+            }
+        });
+        let mut here = engine.clone();
+        let (mut lanes, seen) = far_leading(&rt, &log, &range, engine);
+        let mut far = far(seen);
+        let reads = [
+            BlockRead::Next { after: None },
+            BlockRead::Next { after: Some(2) },
+            BlockRead::Next { after: Some(3) },
+            BlockRead::OnVolume {
+                volume: 7,
+                after: None,
+            },
+            BlockRead::OnVolume {
+                volume: 7,
+                after: Some(1),
+            },
+            BlockRead::OnVolume {
+                volume: 102,
+                after: Some(2),
+            },
+            BlockRead::Places { block: 2 },
+            BlockRead::Places { block: 4 },
+        ];
+        let mut found = 0;
+        for read in reads {
+            let shards = std::slice::from_ref(&lanes);
+            assert_eq!(read_block(shards, &mut far, read).unwrap(), None, "asked");
+            // One at a time: another read waits for it, unasked.
+            let other = BlockRead::Places { block: 1 };
+            assert_eq!(read_block(shards, &mut far, other).unwrap(), None);
+            let until = deadline();
+            loop {
+                if let Out::Block(group, answered, rows) =
+                    next(&mut lanes, "the read answered", until, |_| false)
+                {
+                    assert_eq!((group, answered), (GROUP, read), "the read out, alone");
+                    far.answered_block(answered, rows);
+                    break;
+                }
+            }
+            let shards = std::slice::from_ref(&lanes);
+            let rows = read_block(shards, &mut far, read).unwrap().unwrap();
+            assert_eq!(rows, read.read(&mut here).unwrap(), "{read:?}");
+            assert!(far.block.is_none(), "taken once");
+            if !matches!(
+                rows,
+                BlockRows::Next(None) | BlockRows::OnVolume(None) | BlockRows::Places(None)
+            ) {
+                found += 1;
+            }
+        }
+        assert_eq!(found, 5, "the reads that find a block find it");
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
+    /// The volume table and each of repair's reads asked of a far range's shard whose lane holds
+    /// all it takes are refused `LaneFull`, unasked: the node reads the table it holds and asks
+    /// at its next read, and repair's walk waits and asks at its next turn. Of a shard the node
+    /// has no lanes to, each is refused `ShardEnded`, which stops the node.
+    #[test]
+    fn a_full_lane_refuses_the_table_and_each_block_read_typed() {
+        let (lanes, _ends) = unstarted(1);
+        lanes.send(measured()).unwrap();
+        let shards = vec![lanes];
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let mut far = far(Seen::of(&campaigning(&log, &range)));
+        assert!(matches!(
+            ask_table(&shards, &mut far, None),
+            Err(NodeError::LaneFull(1))
+        ));
+        assert!(!far.table_out, "unasked");
+        let reads = [
+            BlockRead::Next { after: None },
+            BlockRead::OnVolume {
+                volume: 7,
+                after: None,
+            },
+            BlockRead::Places { block: 1 },
+        ];
+        for read in reads {
+            assert!(matches!(
+                read_block(&shards, &mut far, read),
+                Err(NodeError::LaneFull(1))
+            ));
+            assert!(far.block.is_none(), "unasked");
+        }
+        far.shard = 2;
+        assert!(matches!(
+            ask_table(&shards, &mut far, None),
+            Err(NodeError::ShardEnded(2))
+        ));
+        for read in reads {
+            assert!(matches!(
+                read_block(&shards, &mut far, read),
+                Err(NodeError::ShardEnded(2))
+            ));
+        }
     }
 }

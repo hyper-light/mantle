@@ -46,7 +46,7 @@ use mantle_s3::copy::Directive;
 use mantle_s3::range::{self, CopyRangeError, Span};
 use mantle_s3::seal::{DataKey, WrappingKey};
 
-use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, take_done};
+use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, shard, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome, Wait};
 use crate::chunk;
 use crate::door::{self, Piece};
@@ -655,6 +655,30 @@ pub(crate) struct Table {
 }
 
 impl Table {
+    /// The table of `facts`, read as of entry `applied`, after `was`: its scheme chosen over the
+    /// volumes that take chunks now, or kept where their domains are as they were.
+    fn of(
+        was: Option<&Table>,
+        gateway: Option<&GatewaySettings>,
+        applied: u64,
+        facts: Vec<root::Fact>,
+    ) -> Self {
+        let placed: Vec<Placed> = facts.iter().map(|f| f.placed.clone()).collect();
+        let standing: Vec<Placed> = facts
+            .iter()
+            .filter(|f| f.takes())
+            .map(|f| f.placed.clone())
+            .collect();
+        let scheme = scheme_over(was, &standing, gateway);
+        Self {
+            applied,
+            placed,
+            facts,
+            standing,
+            scheme,
+        }
+    }
+
     /// The node that holds `volume`, if the table holds it.
     pub(super) fn node_of(&self, volume: u128) -> Option<PeerId> {
         let at = self
@@ -1517,40 +1541,39 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The volume table as this node's member of the root range holds it now: read from the
-    /// range's rows again only once the member applied an entry since the last read.
+    /// range's rows again only once the member applied an entry since the last read. Where another
+    /// shard drives the root range, the table its shard last answered, asked again once the range
+    /// shows it applied past it ([`shard::ask_table`]), the one held read meanwhile: the node read
+    /// one before the range moved (`Node::spread_to`).
     pub(super) fn table(&mut self) -> Result<&Table, NodeError> {
-        let handle = self
+        let (handle, group) = self
             .ranges
             .iter()
             .find(|k| k.layer == Layer::Root)
-            .map(|k| k.handle)
+            .map(|k| (k.handle, k.group))
             .ok_or(NodeError::Bounds("no root range here".into()))?;
-        let shell = self
-            .owner
-            .get_mut(handle)
-            .ok_or(NodeError::Bounds("no root range here".into()))?;
-        let applied = shell.applied().index;
-        if self.table.as_ref().is_none_or(|t| t.applied != applied) {
-            let engine = shell.machine_mut().engine_mut();
-            let census = root::census(engine).map_err(|e| NodeError::Bounds(e.to_string()))?;
-            let most = usize::try_from(census.volumes).unwrap_or(usize::MAX);
-            let facts =
-                root::facts(engine, None, most).map_err(|e| NodeError::Bounds(e.to_string()))?;
-            let placed: Vec<Placed> = facts.iter().map(|f| f.placed.clone()).collect();
-            // The scheme is chosen over the volumes that take chunks now.
-            let standing: Vec<Placed> = facts
-                .iter()
-                .filter(|f| f.takes())
-                .map(|f| f.placed.clone())
-                .collect();
-            let scheme = scheme_over(self.table.as_ref(), &standing, self.gateway.as_ref());
-            self.table = Some(Table {
-                applied,
-                placed,
-                facts,
-                standing,
-                scheme,
-            });
+        if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
+            if let Some(answered) = far.table.take() {
+                let shard::Facts { applied, facts } = *answered?;
+                let held = self.table.as_ref();
+                self.table = Some(Table::of(held, self.gateway.as_ref(), applied, facts));
+            }
+            let held = self.table.as_ref().map(|t| t.applied);
+            match shard::ask_table(&self.shards, far, held) {
+                Ok(()) | Err(NodeError::LaneFull(_)) => {}
+                Err(e) => return Err(e),
+            }
+        } else {
+            let shell = self
+                .owner
+                .get_mut(handle)
+                .ok_or(NodeError::Bounds("no root range here".into()))?;
+            let applied = shell.applied().index;
+            if self.table.as_ref().is_none_or(|t| t.applied != applied) {
+                let facts = shard::read_facts(shell.machine_mut().engine_mut())?;
+                let held = self.table.as_ref();
+                self.table = Some(Table::of(held, self.gateway.as_ref(), applied, facts));
+            }
         }
         self.table
             .as_ref()

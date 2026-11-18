@@ -136,3 +136,25 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   report, so a reader bounds its own log by how often it reads; Kiln's movable spawns, handed off a held
   shard, are not taken (mantle's placement, its S3b, asks `watch::stalled` instead). Tests:
   `tests/watchdog.rs`, `tests/watchdog_ends.rs`, four unit tests in `watch.rs`.
+
+## Made here: turns by time, sockets and timers (2026-11-17)
+
+- A task's operations charge its turn, and past its share (the step quantum) on a shard something else
+  wants, the next charge's await yields, with no yield written in (`src/coop.rs`, docs/runtime.md §3.14;
+  `ShardContext::charge`, `wanted_untimed`, `coop_spent`, `coop_charged`, `interest_armed`; `Shard`
+  clears `coop_spent` and `coop_charged` as each poll begins; `Counters::coop_charges`, `coop_yields`).
+  Charged: `TcpStream`'s `read`, `read_vectored`, `write`, `write_vectored` (so `write_all` and
+  `LocalStream`'s), `TcpListener::accept` and `LocalListener::accept`, as each tries; `readiness::Ready`
+  as its wait goes on, fired; `Sleep` as it ends. Taken from Kiln's runtime copy (`kiln-rt`'s `coop.rs`
+  and its charge in `shard.rs`, its goal 6 step 1, plan `01a1a59c2abe`; read at Kiln's `7205b10c5b4`):
+  `poll_proceed`, `consume_budget`, `spent` and the charge as Kiln wrote them, with its two fixes of the
+  livelocks its tests found: each poll's first charge under the task's own waker goes on (a poll whose own
+  work before its first leaf outlasted the share was refused there at every poll, redoing that work), and a
+  leaf is charged only as it goes on, never as it registers or waits (a wait charged as it looked spent the
+  poll's first charge on no operation, so the leaf after it was refused at every poll). Changed in the
+  port: a charge that lets a task go on past its share with nothing else wanting the shard starts a new
+  hold for the watchdog too (§3.13's go-on, which Kiln's `wanted` does not write); Kiln's task classes
+  (`Class`, `set_class`, `give_way`) are its goal 6 step 3, not taken; channels, joins, datagrams and
+  signals do not charge yet. Tests: `tests/coop_budget.rs` and `tests/coop_waits.rs`, Kiln's cases for
+  these leaves (its `readiness_waits.rs` charge case among them) with socket reads and writes added beside
+  its timer.

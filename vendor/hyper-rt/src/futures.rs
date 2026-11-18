@@ -324,6 +324,8 @@ impl Future for Sleep {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
         if registry::with_current(|ctx| ctx.driver_lost()) == Some(true) {
+            // It goes on, its driver lost: charged first (`crate::coop`), its timer kept on a refusal.
+            std::task::ready!(crate::coop::poll_proceed(cx));
             if let Some(id) = self.timer.take() {
                 let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
             }
@@ -343,6 +345,9 @@ impl Future for Sleep {
         };
         let deadline = *self.deadline.get_or_insert(first_deadline);
         if now >= deadline {
+            // It goes on, its deadline passed: charged first (`crate::coop`), its timer kept on a refusal. A
+            // sleep that waits is no charge.
+            std::task::ready!(crate::coop::poll_proceed(cx));
             if let Some(id) = self.timer.take() {
                 let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
             }

@@ -213,6 +213,8 @@ impl TcpListener {
     /// taken (refused or aborted ones included) before the task yields to the driver, which reports the
     /// listener ready at once if more wait.
     pub async fn accept(&self) -> Result<TcpStream, RtError> {
+        // An accept is a charge of its task's turn (`crate::coop`).
+        crate::coop::consume_budget().await;
         loop {
             for _ in 0..self.backlog {
                 let accepted = match tcpsys::accept(&self.stream)? {
@@ -395,6 +397,9 @@ impl TcpStream {
     /// Reads into `buf`, awaiting readability when nothing is ready: the byte count, or zero at end of
     /// stream (the peer closed its write half).
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize, RtError> {
+        // A read is a charge of its task's turn (`crate::coop`): a stream that always has bytes ready yields
+        // past its share, as one that waits does at its wait. The try is charged; a wait it arms is not.
+        crate::coop::consume_budget().await;
         loop {
             if let Some(n) = self.try_read(buf)? {
                 return Ok(n);
@@ -405,6 +410,7 @@ impl TcpStream {
 
     /// Reads into `bufs` in order, in one call, awaiting readability when nothing is ready.
     pub async fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> Result<usize, RtError> {
+        crate::coop::consume_budget().await;
         loop {
             match tcpsys::read_vectored(&self.stream, bufs)? {
                 Io::Ready(n) => return Ok(n),
@@ -425,6 +431,8 @@ impl TcpStream {
 
     /// Writes from `buf`, awaiting writability while the send buffer is full: the bytes the kernel took.
     pub async fn write(&self, buf: &[u8]) -> Result<usize, RtError> {
+        // A write is a charge of its task's turn (`crate::coop`).
+        crate::coop::consume_budget().await;
         loop {
             if let Some(n) = self.try_write(buf)? {
                 return Ok(n);
@@ -435,6 +443,7 @@ impl TcpStream {
 
     /// Writes from `bufs` in order, in one call, awaiting writability while the send buffer is full.
     pub async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> Result<usize, RtError> {
+        crate::coop::consume_budget().await;
         loop {
             match tcpsys::write_vectored(&self.stream, bufs)? {
                 Io::Ready(n) => return Ok(n),

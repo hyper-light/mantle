@@ -372,6 +372,14 @@ pub struct ShardContext {
     pub(crate) is_sim: bool,
     /// Admission is paused while owned futures are cancelled, and closed at shutdown.
     pub(crate) accepting: Cell<bool>,
+    /// Whether the task being polled has used its share while something else wants the shard
+    /// ([`crate::coop`]): every leaf it polls answers `Pending` until its poll ends. The loop clears it as each
+    /// poll begins.
+    pub(crate) coop_spent: Cell<bool>,
+    /// Whether the task being polled has made a charge under its own waker this poll ([`crate::coop`]): its
+    /// first goes on whatever its time, so each poll makes at least one operation. The loop clears it as each
+    /// poll begins.
+    pub(crate) coop_charged: Cell<bool>,
     // The second: the run queue, and the counters a poll counts (`LiveCounters` leads with them).
     /// The local run queue.
     pub(crate) local: LocalQueue,
@@ -514,6 +522,8 @@ impl ShardContext {
             asked: Cell::new(false),
             current: Cell::new(NO_TASK),
             accepting: Cell::new(true),
+            coop_spent: Cell::new(false),
+            coop_charged: Cell::new(false),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
             activity_noted: Cell::new(false),
@@ -636,26 +646,78 @@ impl ShardContext {
     /// step a yield. An answer of no is the shard letting the task go on: the loop judges the poll's hold
     /// from the last one (`checked_ns`).
     pub fn wanted(&self) -> bool {
-        if self.is_sim
-            || !self.local.is_empty()
-            || self.asked.get()
-            || self
-                .entry
-                .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
-        {
+        if self.is_sim || self.wanted_untimed() {
             return true;
         }
         let now = self.now_ns();
         if now >= self.due_ns.get() {
             return true;
         }
-        // Told no: the task may go on, and the loop and the watchdog judge its hold from here (`checked_ns`,
-        // `crate::watch`).
+        self.let_go_on(now);
+        false
+    }
+
+    /// What of [`ShardContext::wanted`] needs no time: a task listed or yielded, an intent unapplied, a wake
+    /// or control message from another thread.
+    fn wanted_untimed(&self) -> bool {
+        !self.local.is_empty()
+            || self.asked.get()
+            || self
+                .entry
+                .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
+    }
+
+    /// The shard lets the polling task go on at `now`: the loop and the watchdog judge its hold from here
+    /// (`checked_ns`, `crate::watch`).
+    fn let_go_on(&self, now: u64) {
         self.checked_ns.set(now);
         if let Some(entry) = self.entry {
             entry.watch.went_on();
         }
-        false
+    }
+
+    /// One charge of the task being polled ([`crate::coop`]): whether it goes on with its operation. No once
+    /// it has held the shard past its share (the quantum) since its poll began or the shard last let it go
+    /// on, while anything else wants the shard: it then yields at this await, and every later charge of its
+    /// poll answers no. Past its share with nothing wanting the shard, it is let go on, as `wanted`'s no lets
+    /// it, and its hold counts from here. Yes between polls, off a task, and on a simulated shard. `own`: the
+    /// leaf is polled under the task's own waker; under another the charge counts, but is never refused. Nor
+    /// is a poll's first charge under its own waker: each poll makes at least one operation.
+    pub(crate) fn charge(&self, own: bool) -> bool {
+        if self.current.get() == NO_TASK || self.is_sim {
+            return true;
+        }
+        let live = &self.live.coop_charges;
+        live.set(live.get().saturating_add(1));
+        // A poll's first operation goes on whatever the time: a poll whose own work before it outlasted the
+        // share would otherwise redo that work at every poll and get no further (as futures' `read_to_end`,
+        // which zeroes its buffer's spare room again each poll, did in Kiln's tests, spinning its shard).
+        if own && !self.coop_charged.replace(true) {
+            return true;
+        }
+        if self.coop_spent.get() {
+            return !own;
+        }
+        let untimed = self.wanted_untimed();
+        let due = self.due_ns.get();
+        // Nothing could want the shard: no time is needed to say go on.
+        if !untimed && due == u64::MAX {
+            return true;
+        }
+        let now = self.now_ns();
+        // The poll's start (published as it began) or the shard's last let-go, whichever is later.
+        let from = self.now_ns.get().max(self.checked_ns.get());
+        if now.saturating_sub(from) < self.quantum_ns.get() {
+            return true;
+        }
+        if untimed || now >= due {
+            self.coop_spent.set(true);
+            let yields = &self.live.coop_yields;
+            yields.set(yields.get().saturating_add(1));
+            return !own;
+        }
+        self.let_go_on(now);
+        true
     }
 
     /// The online wake estimate, nanoseconds (the quantum).
@@ -1164,6 +1226,15 @@ impl ShardContext {
             });
         }
         Ok(ticket)
+    }
+
+    /// Whether the wait `ticket` names is armed and its driver lives: it waits still, and its future looks
+    /// no further (`crate::readiness`'s charge is made only as a wait goes on).
+    pub(crate) fn interest_armed(&self, ticket: Ticket) -> bool {
+        !self.driver_lost()
+            && self
+                .wait_of(ticket)
+                .is_some_and(|cell| cell.phase.get() == WaitPhase::Armed)
     }
 
     /// What became of the wait `ticket` names: `None` while it waits; `Some(Ok)` once it fired, or

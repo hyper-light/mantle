@@ -87,10 +87,21 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `c472c2e` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
-`17371e2` and three commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
-branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its third
-commit, `c472c2e`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.13, hyper-rt ORIGIN.md,
+**Every crate at `6a6b4d2` (hyper-raft branch `mantle-shard-port`: `land/mantle-general-4`'s
+`17371e2` and four commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
+branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its fourth
+commit, `6a6b4d2`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.14, hyper-rt ORIGIN.md,
+"turns by time"): a task's operations on sockets and timers charge its turn (`TcpStream`'s reads and
+writes, and `LocalStream`'s through it; `TcpListener`'s and `LocalListener`'s accepts; a readiness
+wait once it fired; a sleep once due), and once it has held a shard something else wants past its
+share, the shard's own quantum (the one `wanted`, the long-poll rule and the watchdog use, so nothing
+is picked), the leaf answers `Pending` with its task woken and nothing taken, so the task yields at
+that await (`coop::consume_budget` is the charge alone; `Counters::coop_charges`, `coop_yields`).
+Each poll's first charge goes on, and a leaf is charged only as it goes on, never as it waits: the
+two livelocks Kiln's runtime copy, whose design this takes, found and fixed. Channels, joins,
+datagrams and signals do not charge yet. Every other crate is as at `17371e2`. Before it, every
+crate was at `c472c2e` (the same branch: `17371e2` and three commits), with no local delta, taken by
+`scripts/snapshot-hyper-raft.py`. Its third commit, `c472c2e`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.13, hyper-rt ORIGIN.md,
 "the watchdog"): each OS runtime runs one watchdog thread that sees a shard held in one poll past
 `batch` × twice its quantum (no step of tasks keeping the long-poll contract holds it longer) while
 the poll still runs, and reports it once, with the task, its spawn site and label, the hold and whose

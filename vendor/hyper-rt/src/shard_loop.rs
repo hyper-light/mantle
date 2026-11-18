@@ -181,6 +181,12 @@ counters! {
     /// Marks of waits dropped away from this shard that its sweeps visited: one per marked slot, never a
     /// pass over every slot.
     abandons_swept,
+    /// Operations of leaf futures charged to the tasks that polled them ([`crate::coop`]): each a reading of
+    /// the shard's clock, unless nothing could want the shard.
+    coop_charges,
+    /// Polls a charge ended: the task had held the shard past its share while something else wanted it, and
+    /// yielded at its next await ([`crate::coop`]).
+    coop_yields,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
@@ -1880,6 +1886,9 @@ impl Shard {
         let mut cx = Context::from_waker(&waker);
         self.desk.current.set(word.word());
         self.desk.now_ns.set(start);
+        // Each poll starts within its share (`crate::coop`).
+        self.desk.coop_spent.set(false);
+        self.desk.coop_charged.set(false);
         let entered = registry::enter_in(current, &self.desk);
         self.watch_begin(slot, word.word());
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that

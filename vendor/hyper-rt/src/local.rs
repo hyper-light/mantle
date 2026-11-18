@@ -46,6 +46,8 @@ impl LocalListener {
     /// Accepts the next connection, awaiting readability when none is pending; at most the backlog's worth
     /// of attempts before it yields to the driver.
     pub async fn accept(&self) -> Result<LocalStream, RtError> {
+        // An accept is a charge of its task's turn (`crate::coop`).
+        crate::coop::consume_budget().await;
         loop {
             for _ in 0..self.backlog {
                 match tcpsys::accept(&self.stream)? {

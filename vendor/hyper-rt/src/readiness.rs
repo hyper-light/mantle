@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 use crate::error::RtError;
 use crate::mem::Encoded;
 use crate::registry;
-use crate::shard::Ticket;
+use crate::shard::{ShardContext, Ticket};
 use crate::waker::polling_task;
 
 /// Which readiness edge a caller awaits.
@@ -78,9 +78,10 @@ impl Future for Ready {
         };
         if let Some((ticket, armed_for)) = self.armed {
             if armed_for == word {
-                let outcome = registry::with_current(|ctx| ctx.interest_outcome(ticket)).flatten();
+                let outcome = registry::with_current(|ctx| fired(ctx, ticket, cx)).flatten();
                 return match outcome {
-                    // Not fired: whatever woke the task, this wait goes on.
+                    // Not fired (whatever woke the task, this wait goes on), or fired with its task's turn
+                    // spent: it yields here, its wait kept.
                     None => Poll::Pending,
                     Some(outcome) => {
                         self.armed = None;
@@ -111,6 +112,21 @@ impl Future for Ready {
             None => Poll::Ready(Err(RtError::NotOnShardThread)),
         }
     }
+}
+
+/// What became of the armed wait `ticket` names, once it fired and its task's turn lets it go on: `None`
+/// while it waits, or when the task yields here instead (its wait kept).
+///
+/// A wait is a charge of its task's turn (`crate::coop`) only as it goes on, never as it registers or waits.
+/// Refused while it waited, it would wake its task at once instead of at the fire, and spend the poll's
+/// first charge, which always goes on, on no operation: the leaf polled after it, refused at every poll
+/// once the poll's own work outlasted the share, would never go on (Kiln's front door spun a shard so;
+/// `tests/coop_waits.rs`).
+fn fired(ctx: &ShardContext, ticket: Ticket, cx: &mut Context<'_>) -> Option<Result<(), RtError>> {
+    if ctx.interest_armed(ticket) || crate::coop::proceed_in(ctx, cx).is_pending() {
+        return None;
+    }
+    ctx.interest_outcome(ticket)
 }
 
 /// Waits dropped away from their shard whose end could not be marked on it while it lived: a slot held

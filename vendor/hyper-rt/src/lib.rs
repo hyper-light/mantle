@@ -54,6 +54,7 @@ pub mod blocking;
 mod cells;
 pub mod combine;
 pub mod control;
+pub mod coop;
 pub mod dns;
 pub mod driver;
 pub mod error;

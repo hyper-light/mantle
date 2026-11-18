@@ -2306,20 +2306,24 @@ fn bench_doors_smoke_checks_both_doors_and_catches_each_control() {
             "MPU-COMPLETE",
             "MPU-ABORT",
         ] {
+            // Each of the operation's phases failed no check: its `failed` column, read by name
+            // wherever the bench writes it among the columns.
             let phase = format!("doors {door} {op} ");
-            assert!(
-                said.lines()
-                    .any(|l| l.starts_with(&phase) && l.ends_with(" failed 0")),
-                "{phase}: {said}"
-            );
+            let lines: Vec<&str> = said
+                .lines()
+                .filter(|l| l.starts_with(&phase) && is_phase(l))
+                .collect();
+            assert!(!lines.is_empty(), "{phase}: {said}");
+            for line in lines {
+                assert_eq!(measure(line, "failed"), Some("0"), "{line}");
+            }
         }
         // Every phase that asked anything moved bytes on its door's wire, and only the native
         // door's are datagrams: its clients' sockets' counts, the HTTP door's octets on TCP.
-        // A phase's line is the one whose sixth word is `clients` (scripts/doors-tables.py).
-        for line in said.lines().filter(|l| {
-            l.starts_with(&format!("doors {door} "))
-                && l.split_whitespace().nth(5) == Some("clients")
-        }) {
+        for line in said
+            .lines()
+            .filter(|l| l.starts_with(&format!("doors {door} ")) && is_phase(l))
+        {
             if measure(line, "ops") == Some("0") {
                 continue;
             }
@@ -2333,12 +2337,13 @@ fn bench_doors_smoke_checks_both_doors_and_catches_each_control() {
             }
         }
     }
-    assert!(
-        said.lines().any(|l| l.starts_with("doors verified ")
-            && l.contains(" differed 0 ")
-            && l.contains(" failed 0 controls caught 6 of 6")),
-        "{said}"
-    );
+    let verified = said
+        .lines()
+        .find(|l| l.starts_with("doors verified "))
+        .unwrap_or_else(|| panic!("no verified line: {said}"));
+    assert_eq!(measure(verified, "differed"), Some("0"), "{verified}");
+    assert_eq!(measure(verified, "failed"), Some("0"), "{verified}");
+    assert!(verified.contains(" controls caught 6 of 6"), "{verified}");
 }
 
 /// The value that follows `name` in a line of `mantle bench doors`.
@@ -2350,4 +2355,73 @@ fn measure<'l>(line: &'l str, name: &str) -> Option<&'l str> {
         }
     }
     None
+}
+
+/// Whether `line` of `mantle bench doors` is a phase's: its sixth word is `clients`, the door,
+/// operation, size and condition before it and its columns' names and values after
+/// (scripts/doors-tables.py). The lines after a phase's that begin as it does, its step, slow
+/// server, stall server, ladder and failure lines, are not.
+fn is_phase(line: &str) -> bool {
+    line.split_whitespace().nth(5) == Some("clients")
+}
+
+/// A phase line's columns are read by their names, wherever the bench writes them: `failed`
+/// reads the same with the write path's, slow polls' and stalls' columns after it (a
+/// linux-aarch64 smoke's line, CI run 44239790476), and a phase that failed reads as failed. None
+/// of the lines that follow a phase's and begin as it does is taken for a phase's, nor are the
+/// run's and a door's lines that name `clients`. The ladder's and an unanswered operation's lines
+/// are the bench's formats (src/bench_doors.rs), an open loop's smoke writing none.
+#[test]
+fn a_bench_doors_phase_line_is_read_by_name_and_no_other_line_is_a_phase() {
+    let phase = "doors native PUT 0B quiet clients 2 elapsed_ms 77 ops 4 allocs/op - reallocs/op - \
+                 moved/op - bytes/op - peak_live/request - peak_live/connection - client_allocs/op \
+                 - client_bytes/op - minor_faults/op 4.0 major_faults/op 0.0 user_ns/op 40000000.0 \
+                 system_ns/op 2500000.0 instructions/op - cycles/op - switches/op 344.0 \
+                 wire_bytes/op 8483.5 datagrams/op 10.8 server_footprint_bytes 265056256 \
+                 harness_allocs/op - harness_peak_live_bytes - out_most 2 threads 5 latency_us p50 \
+                 - p50_95 - - p99 - p99.9 - p99.99 - max 45975.8 generator_cpu_ns/op 2162244.0 \
+                 lateness_us p99 - refused 0 unanswered 0 skipped 0 differed 0 again 0 failed 0 \
+                 commands/entry 1.00 updates/frame 1.10 log_frames/op 5.00 log_flushes/op 7.25 \
+                 log_wait_p50_us 13631.5 log_wait_p99_us - log_wait_max_us 18874.4 slow_polls/op \
+                 29.00 slowest_label Put stalls 11";
+    assert!(is_phase(phase), "{phase}");
+    for (name, value) in [
+        ("ops", "4"),
+        ("wire_bytes/op", "8483.5"),
+        ("datagrams/op", "10.8"),
+        ("failed", "0"),
+        ("commands/entry", "1.00"),
+        ("updates/frame", "1.10"),
+        ("log_frames/op", "5.00"),
+        ("log_flushes/op", "7.25"),
+        ("log_wait_p50_us", "13631.5"),
+        ("log_wait_p99_us", "-"),
+        ("log_wait_max_us", "18874.4"),
+        ("slow_polls/op", "29.00"),
+        ("slowest_label", "Put"),
+        ("stalls", "11"),
+    ] {
+        assert_eq!(measure(phase, name), Some(value), "{name}");
+    }
+    let failing = phase.replace(
+        "unanswered 0 skipped 0 differed 0 again 0 failed 0",
+        "unanswered 1 skipped 0 differed 0 again 3 failed 1",
+    );
+    assert!(is_phase(&failing), "{failing}");
+    assert_eq!(measure(&failing, "failed"), Some("1"), "{failing}");
+    for line in [
+        "doors native PUT 0B quiet step clients 2 paused_ms 0 longest_pause_ms 0",
+        "doors native PUT 0B quiet slow server 0 site crates/node/src/process.rs:1681:25 label Put \
+         polls 28 held_us 51644.3 longest_us 3223.0 task 26 host 0",
+        "doors native PUT 0B quiet stall server 0 shard 0 stalls 5",
+        "doors native GET 64KiB quiet ladder ended clients 8 unanswered 1",
+        "doors native GET 64KiB quiet ladder best clients 4 ops/s median 812.4 low 790.1 high \
+         830.6",
+        "doors native GET 64KiB quiet unanswered: SlowDown, asked 4 times",
+        "doors native clients at most 47088: each node admits gateway.clients identities at once",
+        "doors run seed 1 condition quiet load open:100 clients 2 ops 4 counting no (a \
+         count-allocs build counts allocations)",
+    ] {
+        assert!(!is_phase(line), "{line}");
+    }
 }

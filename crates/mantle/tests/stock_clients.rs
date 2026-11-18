@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use cell::*;
+use mantle_protocol::bounds::STOCK_PATIENCE;
 
 /// The CLI's multipart threshold, `8MB`, a megabyte being 1024² octets to it (the AWS CLI's S3
 /// configuration reference; `awscli/customizations/s3/utils.py`): a file past it goes up in parts.
@@ -80,8 +81,21 @@ fn started(root: &Path) -> (Cell, Vec<(String, String)>) {
 }
 
 /// `program` with `args`, its environment `env`, `input` on its standard input: its output, which
-/// must say it exited 0. A program the runner lacks fails here.
-fn run(program: &str, args: &[&str], env: &[(String, String)], input: Option<&[u8]>) -> Output {
+/// must say it exited 0. A program the runner lacks fails here. Its input is written and its output
+/// read each on a thread of its own, and its exit and their ends are waited on under `cell`'s
+/// watch, its quiet period longer by a stock client's patience (`bounds::STOCK_PATIENCE`): what
+/// the client does between its exchanges, its start and the bytes it builds, is its own work and
+/// the OS's, which no law of the cell's bounds, and a stock client waits that long on the cell
+/// between bytes before it gives up itself. A failure names the command at the test's own line, and
+/// the process is killed rather than outliving the test.
+#[track_caller]
+fn run(
+    cell: &mut Cell,
+    program: &str,
+    args: &[&str],
+    env: &[(String, String)],
+    input: Option<&[u8]>,
+) -> Output {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -93,25 +107,68 @@ fn run(program: &str, args: &[&str], env: &[(String, String)], input: Option<&[u
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|e| panic!("{program}: {e}: the runner must have it"));
-    if let Some(input) = input {
-        child.stdin.take().unwrap().write_all(input).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
+    let mut child = Killed(
+        command
+            .spawn()
+            .unwrap_or_else(|e| panic!("{program}: {e}: the runner must have it")),
+    );
+    let writing = input.map(|input| {
+        let (mut stdin, input) = (child.0.stdin.take().unwrap(), input.to_vec());
+        std::thread::spawn(move || stdin.write_all(&input))
+    });
+    let stdout = drained(child.0.stdout.take().unwrap());
+    let stderr = drained(child.0.stderr.take().unwrap());
+    let what = format!("{program} {args:?}");
+    let status = cell.waiting_on(&what, STOCK_PATIENCE, |_| {
+        let ended = stdout.is_finished()
+            && stderr.is_finished()
+            && writing.as_ref().is_none_or(JoinHandle::is_finished);
+        if ended {
+            child.0.try_wait().unwrap()
+        } else {
+            None
+        }
+    });
+    let output = Output {
+        status,
+        stdout: stdout.join().unwrap().unwrap(),
+        stderr: stderr.join().unwrap().unwrap(),
+    };
     assert!(
         output.status.success(),
-        "{program} {args:?}: {}\n{}{}",
+        "{what}: {}\n{}{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if let Some(writing) = writing {
+        (writing.join().unwrap()).unwrap_or_else(|e| panic!("{what}'s input: {e}"));
+    }
     output
 }
 
-fn aws(args: &[&str], env: &[(String, String)]) -> Output {
-    run("aws", args, env, None)
+/// What `pipe` gives until its end, read on a thread of its own.
+fn drained(mut pipe: impl std::io::Read + Send + 'static) -> JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut read = Vec::new();
+        pipe.read_to_end(&mut read).map(|_| read)
+    })
+}
+
+/// A stock client's process, killed and reaped once dropped, so one whose wait failed does not
+/// outlive the test; one that exited is only reaped.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[track_caller]
+fn aws(cell: &mut Cell, args: &[&str], env: &[(String, String)]) -> Output {
+    run(cell, "aws", args, env, None)
 }
 
 fn text(output: &Output) -> String {
@@ -130,10 +187,11 @@ fn write(dir: &Path, name: &str, data: &[u8]) -> PathBuf {
 }
 
 /// The value of `query` (JMESPath, the CLI's `--query`) in what `args` answer, as text.
-fn query(args: &[&str], query: &str, env: &[(String, String)]) -> String {
+#[track_caller]
+fn query(cell: &mut Cell, args: &[&str], query: &str, env: &[(String, String)]) -> String {
     let mut all = args.to_vec();
     all.extend(["--query", query, "--output", "text"]);
-    text(&aws(&all, env))
+    text(&aws(cell, &all, env))
 }
 
 /// The CLI's version as `aws --version` says it: `aws-cli/2.38.4 Python/...`.
@@ -152,7 +210,7 @@ fn cli_version(said: &str) -> (u32, u32, u32) {
 
 /// A small object and a large one up and down by the CLI's CRT transfer client, each read back
 /// byte-identical, then removed.
-fn crt_transfers(dir: &Path, env: &[(String, String)]) {
+fn crt_transfers(cell: &mut Cell, dir: &Path, env: &[(String, String)]) {
     let mut crt = env.to_vec();
     crt.retain(|(k, _)| k != "AWS_CONFIG_FILE");
     crt.push((
@@ -165,14 +223,14 @@ fn crt_transfers(dir: &Path, env: &[(String, String)]) {
     ] {
         let file = write(dir, &format!("{client}.bin"), &data);
         let key = format!("s3://stock/{client}.bin");
-        aws(&["s3", "cp", file.to_str().unwrap(), &key], &crt);
+        aws(cell, &["s3", "cp", file.to_str().unwrap(), &key], &crt);
         let back = dir.join(format!("back-{client}.bin"));
-        aws(&["s3", "cp", &key, back.to_str().unwrap()], &crt);
+        aws(cell, &["s3", "cp", &key, back.to_str().unwrap()], &crt);
         assert!(
             std::fs::read(&back).unwrap() == data,
             "{client} by the CRT client"
         );
-        aws(&["s3", "rm", &key], &crt);
+        aws(cell, &["s3", "rm", &key], &crt);
     }
 }
 
@@ -180,8 +238,8 @@ fn crt_transfers(dir: &Path, env: &[(String, String)]) {
 fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path();
-    let (_cell, env) = started(dir);
-    let version = text(&aws(&["--version"], &env));
+    let (mut cell, env) = started(dir);
+    let version = text(&aws(&mut cell, &["--version"], &env));
     println!("{version}");
 
     // aws s3 by each of the CLI's transfer clients, botocore's and the CRT's, named rather than left
@@ -190,9 +248,9 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     // host, from the CLI's 2.38.0 ("Disable TLS in CRT client when resolved endpoint scheme is
     // http"; "Enable the CRT S3 transfer client by default on all hosts", the CLI's changelog); an
     // older CLI's default is botocore's, which the commands below run.
-    aws(&["s3", "mb", "s3://stock"], &env);
+    aws(&mut cell, &["s3", "mb", "s3://stock"], &env);
     if cli_version(&version) >= (2, 38, 0) {
-        crt_transfers(dir, &env);
+        crt_transfers(&mut cell, dir, &env);
     }
 
     // aws s3: a bucket, a small object and a large one up, listed, down, compared, and removed.
@@ -201,6 +259,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     let small_file = write(dir, "small.bin", &small);
     let large_file = write(dir, "large.bin", &large);
     aws(
+        &mut cell,
         &[
             "s3",
             "cp",
@@ -210,6 +269,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         &env,
     );
     aws(
+        &mut cell,
         &[
             "s3",
             "cp",
@@ -218,7 +278,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         ],
         &env,
     );
-    let listed = text(&aws(&["s3", "ls", "s3://stock/"], &env));
+    let listed = text(&aws(&mut cell, &["s3", "ls", "s3://stock/"], &env));
     assert!(
         listed.contains("small.bin") && listed.contains("large.bin"),
         "{listed}"
@@ -226,6 +286,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     for (key, data) in [("small.bin", &small), ("large.bin", &large)] {
         let back = dir.join(format!("back-{key}"));
         aws(
+            &mut cell,
             &[
                 "s3",
                 "cp",
@@ -245,20 +306,21 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         "--key",
         "large.bin",
     ];
-    let etag = query(&head, "ETag", &env);
+    let etag = query(&mut cell, &head, "ETag", &env);
     assert!(etag.trim_matches('"').ends_with("-3"), "{etag}");
     // From standard input and to standard output, past the threshold.
     let piped = bytes(3, THRESHOLD + 777);
     run(
+        &mut cell,
         "aws",
         &["s3", "cp", "-", "s3://stock/piped.bin"],
         &env,
         Some(&piped),
     );
-    let out = aws(&["s3", "cp", "s3://stock/piped.bin", "-"], &env);
+    let out = aws(&mut cell, &["s3", "cp", "s3://stock/piped.bin", "-"], &env);
     assert!(out.stdout == piped, "piped.bin read to standard output");
-    aws(&["s3", "rm", "s3://stock/small.bin"], &env);
-    let listed = text(&aws(&["s3", "ls", "s3://stock/"], &env));
+    aws(&mut cell, &["s3", "rm", "s3://stock/small.bin"], &env);
+    let listed = text(&aws(&mut cell, &["s3", "ls", "s3://stock/"], &env));
     assert!(!listed.contains("small.bin"), "{listed}");
 
     // aws s3api: the object and listing commands.
@@ -274,10 +336,11 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         "--body",
         one_file.to_str().unwrap(),
     ];
-    let etag = query(&put, "ETag", &env);
+    let etag = query(&mut cell, &put, "ETag", &env);
     assert!(!etag.trim_matches('"').is_empty(), "{etag}");
     let got = dir.join("got.bin");
     aws(
+        &mut cell,
         &[
             "s3api",
             "get-object",
@@ -292,6 +355,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     assert!(std::fs::read(&got).unwrap() == one, "one.bin by get-object");
     let ranged = dir.join("ranged.bin");
     aws(
+        &mut cell,
         &[
             "s3api",
             "get-object",
@@ -317,14 +381,18 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         "--key",
         "one.bin",
     ];
-    assert_eq!(query(&head, "ContentLength", &env), one.len().to_string());
+    assert_eq!(
+        query(&mut cell, &head, "ContentLength", &env),
+        one.len().to_string()
+    );
     let list = ["s3api", "list-objects-v2", "--bucket", "stock"];
-    let keys = query(&list, "Contents[].Key", &env);
+    let keys = query(&mut cell, &list, "Contents[].Key", &env);
     assert!(
         keys.contains("one.bin") && keys.contains("piped.bin"),
         "{keys}"
     );
     aws(
+        &mut cell,
         &[
             "s3api",
             "delete-object",
@@ -345,7 +413,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         "--key",
         "parts.bin",
     ];
-    let upload = query(&create, "UploadId", &env);
+    let upload = query(&mut cell, &create, "UploadId", &env);
     let parts = [bytes(5, 5 << 20), bytes(6, 3_333)];
     let mut tags = Vec::new();
     for (number, data) in parts.iter().enumerate() {
@@ -365,7 +433,11 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
             "--body",
             file.to_str().unwrap(),
         ];
-        tags.push(query(&part, "ETag", &env).trim_matches('"').to_owned());
+        tags.push(
+            query(&mut cell, &part, "ETag", &env)
+                .trim_matches('"')
+                .to_owned(),
+        );
     }
     let list = [
         "s3api",
@@ -377,7 +449,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         "--upload-id",
         &upload,
     ];
-    let numbers = query(&list, "Parts[].PartNumber", &env);
+    let numbers = query(&mut cell, &list, "Parts[].PartNumber", &env);
     assert_eq!(
         numbers.split_whitespace().collect::<Vec<_>>(),
         ["1", "2"],
@@ -389,6 +461,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     );
     let document_file = write(dir, "parts.json", document.as_bytes());
     aws(
+        &mut cell,
         &[
             "s3api",
             "complete-multipart-upload",
@@ -405,6 +478,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     );
     let got = dir.join("parts-back.bin");
     aws(
+        &mut cell,
         &[
             "s3api",
             "get-object",
@@ -428,8 +502,9 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         "--key",
         "dropped.bin",
     ];
-    let dropped = query(&create, "UploadId", &env);
+    let dropped = query(&mut cell, &create, "UploadId", &env);
     aws(
+        &mut cell,
         &[
             "s3api",
             "abort-multipart-upload",
@@ -443,6 +518,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
         &env,
     );
     let uploads = text(&aws(
+        &mut cell,
         &["s3api", "list-multipart-uploads", "--bucket", "stock"],
         &env,
     ));
@@ -451,6 +527,7 @@ fn the_aws_cli_and_boto3_pass_against_a_cell_of_three() {
     // boto3: object calls, a listing, and the managed transfers, with the SDK's default checksums.
     let script = write(dir, "boto.py", BOTO.as_bytes());
     let said = run(
+        &mut cell,
         PYTHON,
         &["-I", script.to_str().unwrap(), dir.to_str().unwrap()],
         &env,
@@ -504,14 +581,15 @@ print("boto3 passed")
 fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path();
-    let (_cell, env) = started(dir);
-    aws(&["s3", "mb", "s3://kept"], &env);
-    aws(&["s3", "mb", "s3://copies"], &env);
+    let (mut cell, env) = started(dir);
+    aws(&mut cell, &["s3", "mb", "s3://kept"], &env);
+    aws(&mut cell, &["s3", "mb", "s3://copies"], &env);
 
     // aws s3 cp with content headers and metadata, kept and returned.
     let small = bytes(40, 123_457);
     let small_file = write(dir, "small.blob", &small);
     aws(
+        &mut cell,
         &[
             "s3",
             "cp",
@@ -539,20 +617,27 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         "blobs/small",
     ];
     assert_eq!(
-        query(&head, "ContentType", &env),
+        query(&mut cell, &head, "ContentType", &env),
         "application/vnd.oci.image.layer.v1.tar"
     );
-    assert_eq!(query(&head, "CacheControl", &env), "max-age=60");
-    assert_eq!(query(&head, "ContentDisposition", &env), "attachment");
-    assert_eq!(query(&head, "ContentLanguage", &env), "en");
-    assert_eq!(query(&head, "Metadata.digest", &env), "sha256:abc");
-    assert_eq!(query(&head, "Metadata.kind", &env), "layer");
+    assert_eq!(query(&mut cell, &head, "CacheControl", &env), "max-age=60");
+    assert_eq!(
+        query(&mut cell, &head, "ContentDisposition", &env),
+        "attachment"
+    );
+    assert_eq!(query(&mut cell, &head, "ContentLanguage", &env), "en");
+    assert_eq!(
+        query(&mut cell, &head, "Metadata.digest", &env),
+        "sha256:abc"
+    );
+    assert_eq!(query(&mut cell, &head, "Metadata.kind", &env), "layer");
 
     // A server-side copy across buckets below the CLI's multipart threshold (one CopyObject) and
     // one past it (UploadPartCopy), each read back whole with the source's metadata.
     let large = bytes(41, THRESHOLD * 2 + 4_321);
     let large_file = write(dir, "large.blob", &large);
     aws(
+        &mut cell,
         &[
             "s3",
             "cp",
@@ -567,6 +652,7 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
     );
     for (key, data) in [("small", &small), ("large", &large)] {
         aws(
+            &mut cell,
             &[
                 "s3",
                 "cp",
@@ -577,6 +663,7 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         );
         let back = dir.join(format!("back-{key}"));
         aws(
+            &mut cell,
             &[
                 "s3",
                 "cp",
@@ -591,12 +678,13 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         );
         let head = ["s3api", "head-object", "--bucket", "copies", "--key", key];
         assert!(
-            query(&head, "Metadata.digest", &env).starts_with("sha256:"),
+            query(&mut cell, &head, "Metadata.digest", &env).starts_with("sha256:"),
             "copies/{key} kept the source's metadata"
         );
     }
     // s3api copy-object under REPLACE.
     aws(
+        &mut cell,
         &[
             "s3api",
             "copy-object",
@@ -623,12 +711,13 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         "--key",
         "replaced",
     ];
-    assert_eq!(query(&head, "ContentType", &env), "text/plain");
-    assert_eq!(query(&head, "Metadata.fresh", &env), "yes");
-    assert_eq!(query(&head, "Metadata.digest", &env), "None");
+    assert_eq!(query(&mut cell, &head, "ContentType", &env), "text/plain");
+    assert_eq!(query(&mut cell, &head, "Metadata.fresh", &env), "yes");
+    assert_eq!(query(&mut cell, &head, "Metadata.digest", &env), "None");
 
     // Versions by s3api: put twice, each read by its ID, one removed by its ID, all listed.
     aws(
+        &mut cell,
         &[
             "s3api",
             "put-bucket-versioning",
@@ -654,10 +743,11 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
             "--body",
             file.to_str().unwrap(),
         ];
-        ids.push(query(&put, "VersionId", &env));
+        ids.push(query(&mut cell, &put, "VersionId", &env));
     }
     let got = dir.join("got-first");
     aws(
+        &mut cell,
         &[
             "s3api",
             "get-object",
@@ -676,6 +766,7 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         "the first version by its ID"
     );
     let listed = query(
+        &mut cell,
         &[
             "s3api",
             "list-object-versions",
@@ -693,6 +784,7 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         "{listed}"
     );
     aws(
+        &mut cell,
         &[
             "s3api",
             "delete-object",
@@ -707,6 +799,7 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
     );
     let back = dir.join("got-current");
     aws(
+        &mut cell,
         &["s3", "cp", "s3://kept/versioned", back.to_str().unwrap()],
         &env,
     );
@@ -719,6 +812,7 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
     // which deletes in batches.
     for key in ["batch/1", "batch/2"] {
         aws(
+            &mut cell,
             &[
                 "s3",
                 "cp",
@@ -734,6 +828,7 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         br#"{"Objects":[{"Key":"batch/1"},{"Key":"batch/2"},{"Key":"batch/missing"}]}"#,
     );
     let deleted = query(
+        &mut cell,
         &[
             "s3api",
             "delete-objects",
@@ -750,13 +845,18 @@ fn the_aws_cli_and_boto3_keep_metadata_versions_copies_and_batch_deletes() {
         ["batch/1", "batch/2", "batch/missing"],
         "{deleted}"
     );
-    aws(&["s3", "rm", "--recursive", "s3://copies/"], &env);
-    let left = text(&aws(&["s3", "ls", "s3://copies/"], &env));
+    aws(
+        &mut cell,
+        &["s3", "rm", "--recursive", "s3://copies/"],
+        &env,
+    );
+    let left = text(&aws(&mut cell, &["s3", "ls", "s3://copies/"], &env));
     assert!(left.is_empty(), "{left}");
 
     // boto3's half.
     let script = write(dir, "boto89.py", BOTO_89.as_bytes());
     let said = run(
+        &mut cell,
         PYTHON,
         &["-I", script.to_str().unwrap(), dir.to_str().unwrap()],
         &env,

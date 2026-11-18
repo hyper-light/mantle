@@ -1992,13 +1992,36 @@ plain HTTP; elsewhere TLS 1.3 and 1.2 with the endpoint's P-256 certificate, hyp
 suites, of which a P-256 key takes the ECDHE-ECDSA AES-GCM ones for TLS 1.2 (research/84). A
 hyper-tls connection holds no configuration (vendor/hyper-tls/VENDORED.md §2), so each connection
 builds its own around the one certified key the listener loads at its start: it answers HTTP/1.1
-when a client offers ALPN, keeps no sessions and sends no tickets, its configuration ending with
-the connection, and compresses no certificate (RFC 8879), the chain being one leaf. A connection's
+when a client offers ALPN, resumes sessions from the listener's one store (below), and compresses
+no certificate (RFC 8879), the chain being one leaf. A connection's
 requests are taken one at a time, each at the octet its last one's body ended. Tested in
 `crates/node/tests/listener.rs`: a listener on a real socket reached by hyper-tls's client over
 TLS 1.3 and over TLS 1.2 alone, its certificate verified under the endpoint authority for the name
 dialed, HTTP/1.1 chosen over an offered HTTP/2, an ECDHE-ECDSA AES-GCM suite on TLS 1.2, and a
 request answered over each.
+
+*As built (2026-11-17), resumption without early data* (`crates/node/src/listener/sessions.rs`;
+research/94). A client resumes its TLS session with the endpoint, which skips the certificate and
+its signature (RFC 8446 §2.2), and sends no early data. The sessions stay on the node, in one store
+the listener reserves whole when it binds: `listener::SESSION_BYTES` for each connection it serves,
+two sessions' slots and their share of the store's index, counted into what an operation costs the
+node. A TLS 1.3 handshake, full or resumed, gives its client two tickets (RFC 8446 Appendix C.4),
+each the 32-octet key of a session kept there and used once (§8.1); a TLS 1.2 handshake gives a
+session ID, resumed as often as the store keeps it (RFC 5246 §7.4.1.3). No ticket carries a session
+sealed under a key of the node's, so there is no ticket key to rotate or lose, and no TLS 1.2
+client is offered an RFC 5077 ticket. A session is resumed for 24 hours from the full handshake
+that authenticated the endpoint (RFC 5246 Appendix F.1.4, and the lifetime hyper-tls states on the
+ticket), a resumed handshake's tickets keeping the time of the session it resumed (RFC 8446
+§4.6.1). The store holds the last sessions made, a newer one taking the slot of the one made
+longest ago; a session taken, found past its lifetime or displaced is zeroed. The configuration
+allows no early data, so no ticket offers it, and early data a client sends anyway is skipped
+unread (RFC 8446 §4.2.10). Tested in `sessions::tests`: a stock client's TLS (hyper-tls's)
+reconnecting to the listener's own configuration, its second and third connections resumed over
+TLS 1.3 by tickets and over TLS 1.2 by its session ID, each side saying so, the client asking for
+early data and having none to send and the server reading none, and the store keeping two tickets a
+TLS 1.3 handshake less the one a resumption spent; the lifetime, single use, eviction and refusals;
+and the store's bytes counted by the allocator, at most 1,142 a connection against the 1,143
+stated, nothing allocated as it churns.
 
 *As built (2026-10-26), the native protocol's messages* (`crates/protocol`, `mantle-protocol`): the
 kinds of message and their classes, the transport's bounds and an object's request and reply, which

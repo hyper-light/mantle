@@ -772,4 +772,5 @@ put once; and a part slowed at every attempt is put three times and answers `Slo
 
 Not yet built: the journal in the library and its power-cut tests, the checkpoint interval's
 measured terms and two runs in flight (§2.1), credits and the admission level, path adaptation and
-migration, per-block GET streams, the validated caches, and the TLS-over-TCP route.
+migration, per-block GET streams, the validated caches, the TLS-over-TCP route, and TLS session
+resumption on the native protocol (the S3 listener's is built: node.md §4.1, research/94).

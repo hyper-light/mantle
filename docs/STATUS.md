@@ -414,7 +414,10 @@ elsewhere, each request routed, its SigV4 signature checked against the cell's a
 its operation handed to the node's object host in-process through a bounded door, with a put's
 body read only as its driver wants it, `aws-chunked` decoded with each chunk's signature and its
 trailing checksum checked before commit, and a burst past the host's operations waiting at the
-door, its bodies unread, rather than refused (node design §4.1–§4.5; research/72). Through each listener of a cell of three: buckets,
+door, its bodies unread, rather than refused (node design §4.1–§4.5; research/72); a client resumes its TLS
+session from a store the listener reserves whole, two single-use tickets a TLS 1.3 handshake and
+a session ID a TLS 1.2 one, for 24 hours from the full handshake, with no early data
+(research/94; `listener::sessions::tests`). Through each listener of a cell of three: buckets,
 puts read back whole and by range and head through the others, ListObjectsV2, conditional writes,
 deletes and a multipart upload spread over the listeners, each read byte-identical; objects put
 through one listener alone held by the other two nodes exactly as received over QUIC, and on every
@@ -820,7 +823,7 @@ Remaining before it is done:
   result at the end (research/89 §6), bucket policies judged on each request, the connection budget growing past its floor of ten with the node's memory (the
   AWS CLI's CRT transfers open at least ten and twenty-five at their 10 Gb/s target, research/72)
   and reading the descriptor limit, the reclaim of the slowest connection when the node needs the
-  room, TLS session resumption, and the endpoint certificate's issue again before 825 days
+  room, and the endpoint certificate's issue again before 825 days
   (node design §1.5, §4.1–§4.5); deadlines and
   hedging on the node's asks (node design §5.4); routing by descriptors once ranges split; and
   each request's memory admitted against the gateway's.

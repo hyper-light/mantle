@@ -650,7 +650,8 @@ struct Held {
     beside: u64,
     ranges_bytes: u64,
     /// The S3 listener's connections, one an operation, each at what it holds
-    /// (`listener::CONNECTION_BYTES`); none for a node with no S3 endpoint.
+    /// (`listener::CONNECTION_BYTES`) and the slots of the TLS sessions it leaves
+    /// (`listener::SESSION_BYTES`); none for a node with no S3 endpoint.
     listener: u64,
 }
 
@@ -1885,7 +1886,8 @@ pub fn derive(
         let listener = if hosts && stated.s3.is_some() {
             u64::try_from(objects)
                 .ok()
-                .and_then(|n| n.checked_mul(crate::listener::CONNECTION_BYTES))
+                .zip(crate::listener::CONNECTION_BYTES.checked_add(crate::listener::SESSION_BYTES))
+                .and_then(|(n, each)| n.checked_mul(each))
                 .ok_or(overflow("the listener's connections"))?
         } else {
             0
@@ -2858,8 +2860,8 @@ fn say_floor(
                 Class::Transport => {
                     "the transport's budget and what it holds beside it, its plane and its \
                      liveness stream (derive::transport_bytes_beside), and the S3 listener's \
-                     connections, as many as the operations, each at its measured bytes \
-                     (listener::CONNECTION_BYTES)"
+                     connections, as many as the operations, each at its measured bytes and \
+                     its sessions' slots (listener::CONNECTION_BYTES, listener::SESSION_BYTES)"
                 }
                 Class::Threads => {
                     "the threads the node starts, each a 2 MiB stack reserved whole \

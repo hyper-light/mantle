@@ -14,21 +14,25 @@
 //! Plain HTTP on a loopback address, TLS elsewhere with the endpoint's P-256 certificate (node.md
 //! §1.5; research/84), TLS 1.2 beside 1.3. A connection's TLS configuration is its own, as
 //! hyper-tls's connections hold none (vendor/hyper-tls/VENDORED.md §2): it is built at the
-//! connection's start around the one certified key every connection signs with.
+//! connection's start around the one certified key every connection signs with and the endpoint's
+//! one store of sessions ([`sessions`]), which a client resumes from without early data
+//! (research/94).
 
 mod conn;
 mod io;
 mod request;
 mod respond;
+mod sessions;
 
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 use hyper_rt::RtError;
 use hyper_rt::sync::Notify;
 use hyper_rt::tcp::{ConnectionBudget, TcpListener, TcpStream};
 use hyper_tls::crypto::CryptoProvider;
 use hyper_tls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use hyper_tls::server::{ClientHello, NoServerSessionStorage, ResolvesServerCert};
+use hyper_tls::server::{ClientHello, ResolvesServerCert};
 use hyper_tls::sign::CertifiedKey;
 use hyper_tls::{ServerConfig, version};
 
@@ -36,6 +40,7 @@ use crate::door::Submitter;
 use crate::process::AccessKey;
 
 pub use conn::PIECE;
+use sessions::Sessions;
 
 /// The connections one stock client opens to an endpoint at once by default, the AWS CLI's
 /// `max_concurrent_requests` and botocore's `max_pool_connections`, ten each (the AWS CLI's S3
@@ -59,6 +64,18 @@ pub(crate) const STOCK_PART: u64 = 8 << 20;
 /// however far each connection had read: 300,208 over TLS, and on one CPU 101 KB less at one
 /// connection (CI run 43762797164).
 pub const CONNECTION_BYTES: u64 = 382_028;
+
+/// What the listener holds for each connection it serves beside the connection's own bytes, all
+/// reserved when it binds: the slots of the sessions one handshake leaves its client
+/// (`sessions::TICKETS`, a TLS 1.3 ticket each or a TLS 1.2 session), 384 octets each, 768, and
+/// the connection's share of the store's index, hashbrown's table for twice the slots' ids. Its
+/// buckets are the power of two at or past 8/7 of the ids it is made for, so fewer than 2 × 8/7 of
+/// them, 64/7 a connection, each its 40-octet id and slot and one control octet: under 375
+/// octets a connection, the table's own group of control octets included at every count. 1,143
+/// in all, counted by the allocator as the store is made for every count of connections to 64 and
+/// either side of each doubling of its table to 2^17 buckets
+/// (`sessions::tests::the_store_is_reserved_whole_within_its_stated_bytes_and_never_grows`).
+pub const SESSION_BYTES: u64 = 1_143;
 
 /// The connections past those it serves ([`Settings::connections`]) the listener answers `503
 /// SlowDown`, `Connection: close`, rather than closes: as many as one more stock client opens at
@@ -110,10 +127,13 @@ pub enum ListenError {
     Socket(RtError),
     #[error("the endpoint's key: {0}")]
     Key(hyper_tls::Error),
+    #[error("the sessions of {0} connections, past what this machine addresses")]
+    Sessions(u64),
 }
 
-/// What every connection reads and none changes: the region, the keys, the endpoint's certified
-/// key, and the signal a connection's end gives an accept that waits for a descriptor.
+/// What every connection reads: the region, the keys, the endpoint's certified key, the sessions
+/// its clients resume, and the signal a connection's end gives an accept that waits for a
+/// descriptor. Only the sessions change, each within one call of a handshake.
 pub(crate) struct Endpoint {
     pub(crate) region: String,
     pub(crate) access: Vec<AccessKey>,
@@ -122,6 +142,9 @@ pub(crate) struct Endpoint {
     /// the host under one of its names; any other host names nothing.
     pub(crate) addressing: mantle_s3::route::Endpoint,
     pub(crate) certified: Option<&'static CertifiedKey>,
+    /// The TLS sessions every connection's handshake keeps and resumes, [`sessions::TICKETS`] for
+    /// each connection served; none over plain HTTP.
+    sessions: Mutex<Sessions>,
     /// This node's id, as `x-amz-id-2` names it.
     pub(crate) host: String,
     /// A connection ended: its descriptor is free.
@@ -159,19 +182,29 @@ fn provider() -> &'static CryptoProvider {
 }
 
 /// A connection's TLS configuration around `certified`: TLS 1.3 and 1.2, no client certificate,
-/// HTTP/1.1 by ALPN. It keeps no sessions and sends no tickets, since a connection's configuration
-/// ends with it, and compresses no certificate (RFC 8879): the chain is one leaf, and a
+/// HTTP/1.1 by ALPN, and no compressed certificate (RFC 8879): the chain is one leaf, and a
 /// compressor's window is megabytes a connection would hold for it.
+///
+/// Its sessions are the endpoint's (`sessions`): a TLS 1.3 handshake gives [`sessions::TICKETS`]
+/// tickets, each the key of a session kept there, and a TLS 1.2 handshake a session ID. hyper-tls's
+/// ticketer stays its default, which makes no ticket: a TLS 1.3 ticket is then a key into the store
+/// (`server/tls13.rs`, `emit_ticket`), and a TLS 1.2 client is offered no RFC 5077 ticket. No early
+/// data: a client "MUST NOT send unsafe methods (or methods whose safety is not known) in early
+/// data" (RFC 8470 §4), and RFC 9001 calls disabling 0-RTT "the most effective defense against
+/// replay attack" (research/25 §5); a ticket then says the client may send none (RFC 8446 §4.6.1),
+/// and early data a client sends anyway is skipped unread (§4.2.10).
 pub(crate) fn tls_config(
     certified: &'static CertifiedKey,
+    sessions: &'static Mutex<Sessions>,
 ) -> Result<ServerConfig, hyper_tls::Error> {
     let mut config = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&version::TLS13, &version::TLS12])?
         .with_no_client_auth()
         .with_cert_resolver(Box::new(Certified(certified)));
     config.alpn_protocols = vec![ALPN.to_vec()];
-    config.session_storage = Box::new(NoServerSessionStorage {});
-    config.send_tls13_tickets = 0;
+    config.session_storage = Box::new(sessions::Kept::new(sessions));
+    config.send_tls13_tickets = sessions::TICKETS;
+    config.max_early_data_size = 0;
     config.cert_compressors = Vec::new();
     Ok(config)
 }
@@ -189,8 +222,9 @@ pub struct Listener {
 
 impl Listener {
     /// Binds `settings.listen` under the connection budget, the endpoint's key loaded once for
-    /// every connection's handshake. The endpoint lives as long as the process: every connection
-    /// task reads it, so it is made once and never freed.
+    /// every connection's handshake and the slots of its sessions reserved, `sessions::TICKETS`
+    /// for each connection it serves ([`SESSION_BYTES`]). The endpoint lives as long as the
+    /// process: every connection task reads it, so it is made once and never freed.
     pub fn bind(settings: Settings, door: Submitter) -> Result<Self, ListenError> {
         let certified = match settings.tls {
             Some((certificate, key)) => {
@@ -202,6 +236,13 @@ impl Listener {
                 Some(&*Box::leak(Box::new(certified)))
             }
             None => None,
+        };
+        let slots = match certified {
+            Some(_) => usize::try_from(settings.connections)
+                .ok()
+                .and_then(|n| n.checked_mul(sessions::TICKETS))
+                .ok_or(ListenError::Sessions(settings.connections))?,
+            None => 0,
         };
         let budget = ConnectionBudget::new(settings.connections).map_err(ListenError::Socket)?;
         let refusing = ConnectionBudget::new(REFUSING).map_err(ListenError::Socket)?;
@@ -217,6 +258,7 @@ impl Listener {
                 cname: false,
             },
             certified,
+            sessions: Mutex::new(Sessions::new(slots)),
             host: format!("{:016x}", settings.node),
             closed: Notify::new().map_err(ListenError::Socket)?,
         }));
@@ -264,7 +306,7 @@ impl Listener {
         };
         let io = match self.endpoint.certified {
             None => io::Io::Plain(stream),
-            Some(certified) => match tls_config(certified)
+            Some(certified) => match tls_config(certified, &self.endpoint.sessions)
                 .map_err(io::IoError::Tls)
                 .and_then(|config| io::Tls::new(stream, config))
             {

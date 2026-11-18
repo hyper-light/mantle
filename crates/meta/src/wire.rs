@@ -189,9 +189,11 @@ pub fn stamp(bytes: &mut [u8], at_ns: u64) -> Result<(), RecordError> {
     if *format != FORMAT {
         return Err(corrupt());
     }
-    rest.get_mut(..8)
-        .ok_or_else(corrupt)?
-        .copy_from_slice(&at_ns.to_le_bytes());
+    let time: &mut [u8; 8] = rest
+        .get_mut(..8)
+        .and_then(|time| time.try_into().ok())
+        .ok_or_else(corrupt)?;
+    *time = at_ns.to_le_bytes();
     Ok(())
 }
 

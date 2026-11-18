@@ -17,21 +17,24 @@ use std::time::{Duration, Instant};
 
 use hyper_measure::alloc;
 use hyper_transport::{Event, ExchangeId, Progress};
+use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_node::derive;
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Kind};
+use mantle_protocol::node_name;
 
 #[path = "support/net.rs"]
+#[allow(dead_code)]
 mod net;
-use net::{Net, certificates, stated};
+use net::{Issued, Net, certificates, stated};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
-/// Runs two nodes of `stated` through a handshake and chunk puts that take every byte of credit,
-/// and says what each step left.
+/// Runs two nodes of `stated`, under the longest certificates a node carries issued now, through a
+/// handshake and chunk puts that take every byte of credit, and says what each step left.
 fn run(stated: &Stated) -> Vec<(String, i64, i64)> {
-    let certificates = certificates();
+    let certificates = longest(net::VALIDITY);
     let start = Instant::now();
     let mut steps = Vec::new();
     let mut step = |what: &str| {
@@ -41,9 +44,9 @@ fn run(stated: &Stated) -> Vec<(String, i64, i64)> {
     let wire = VecDeque::with_capacity(1 << 16);
     let out = Vec::with_capacity(1 << 16);
     alloc::begin();
-    let mut net = Net::new(&certificates, stated, start, (wire, out));
+    let mut net = longest_net(&certificates, stated, start, (wire, out));
     step("opened");
-    net.connect();
+    assert!(net.dial(IDS[1]), "the handshake did not end");
     step("connected");
     let body = vec![7u8; 1 << 16];
     let mut exchanges: Vec<(ExchangeId, u64)> = Vec::new();
@@ -51,8 +54,15 @@ fn run(stated: &Stated) -> Vec<(String, i64, i64)> {
     let head = [0u8; mantle_node::chunk::PUT_HEAD_BYTES];
     for _ in 0..stated.transfers {
         let chunk = mantle_gateway::layout::CHUNK;
-        if let Ok(id) = net.nodes[0].open(net.now, 2, Kind::ChunkPut, &head, Some(chunk), deadline)
-        {
+        let opened = net.nodes[0].open(
+            net.now,
+            IDS[1],
+            Kind::ChunkPut,
+            &head,
+            Some(chunk),
+            deadline,
+        );
+        if let Ok(id) = opened {
             exchanges.push((id, 0));
         }
     }
@@ -166,31 +176,121 @@ fn the_plane_and_a_link_hold_what_derive_states() {
     assert_eq!(u64::try_from(c.peak).unwrap(), ring);
 }
 
+/// The longest certificate a node carries, each field at its longest as `mantle init` issues one
+/// (`init.rs`): granted, under the cell's authority's name, `mantle cell` and the cell's id in
+/// sixteen hex digits, 28 characters whatever the id; its name's id and its grant at twenty digits,
+/// `u64::MAX`'s; valid from the time it is issued to `NO_EXPIRY`. Its serial is 16 octets, and its
+/// key and its authority's signature Ed25519's 32 and 64, whatever is drawn (`mantle_cert`). X.509
+/// writes `NO_EXPIRY` as a GeneralizedTime, and the time it is issued as a UTCTime to 2049 and a
+/// GeneralizedTime from 2050, two octets longer (RFC 5280 §4.1.2.5): 403 bytes issued now, 405
+/// from 2050.
+const LONGEST_CERTIFICATE: usize = 405;
+
+/// A certificate issued from 2050-01-01T00:00:00Z, the first time RFC 5280 §4.1.2.5 writes as a
+/// GeneralizedTime, to the last X.509 holds.
+const FROM_2050: Validity = Validity {
+    not_before: 2_524_608_000,
+    not_after: net::VALIDITY.not_after,
+};
+
+/// The nodes whose names are a node's longest, twenty digits: the one dialing and the one served.
+const IDS: [u64; 2] = [u64::MAX - 1, u64::MAX];
+
+/// Nodes [`IDS`]' certificates as `mantle init` issues them at their longest
+/// ([`LONGEST_CERTIFICATE`]), valid over `validity`, under one authority, each with its key.
+fn longest(validity: Validity) -> (Vec<u8>, [Issued; 2]) {
+    let key = KeyPair::generate().unwrap();
+    let name = format!("mantle cell {:016x}", u64::MAX);
+    let authority = mantle_cert::authority(&key, &name, validity, Serial::draw().unwrap()).unwrap();
+    let issue = |id: u64| {
+        let own = KeyPair::generate().unwrap();
+        let (node, issued) = (node_name(id), (validity, Serial::draw().unwrap()));
+        let names = (node.as_str(), u64::MAX);
+        let certificate =
+            mantle_cert::granted_node(&key, &name, own.public_key(), names, issued).unwrap();
+        (certificate, own.pkcs8().to_vec())
+    };
+    (authority, IDS.map(issue))
+}
+
+/// Nodes [`IDS`] of `stated` at `now` under `certificates`, each knowing the other as its one
+/// peer; the wire and the transmit buffer are made by the caller, as `Net::new`'s are.
+fn longest_net(
+    (authority, certs): &(Vec<u8>, [Issued; 2]),
+    stated: &Stated,
+    now: Instant,
+    (wire, out): (VecDeque<(usize, Vec<u8>)>, Vec<u8>),
+) -> Net {
+    let nodes = [
+        net::endpoint(
+            authority,
+            &certs[0],
+            (IDS[1], &certs[1].0),
+            stated,
+            now,
+            [1; 32],
+        ),
+        net::endpoint(
+            authority,
+            &certs[1],
+            (IDS[0], &certs[0].0),
+            stated,
+            now,
+            [2; 32],
+        ),
+    ];
+    Net::of(nodes, now, (wire, out))
+}
+
+/// What a node's TLS compresses of a certificate (RFC 8879 §4): its Certificate message (RFC 8446
+/// §4.4.2), no request context and one entry, the certificate with no extensions.
+fn certificate_message(certificate: &[u8]) -> Vec<u8> {
+    let u24 = |len: usize| u32::try_from(len).unwrap().to_be_bytes()[1..].to_vec();
+    [
+        &[0][..],
+        &u24(certificate.len() + 5),
+        &u24(certificate.len()),
+        certificate,
+        &[0, 0],
+    ]
+    .concat()
+}
+
 /// A server compresses its certificate (RFC 8879) at its first handshake and keeps the compression
 /// for the handshakes after it. So the server's peak through its first handshake, above its peak
 /// through its second, is the compression alone: no more than brotli's own state compressing the
-/// certificate at the window its length takes, which `bounds::CERTIFICATE_COMPRESSION_BYTES`
-/// states. Node 1 dials node 2 twice, a new endpoint each time; only node 2's own work is counted,
-/// node 1's and the network's paused.
+/// certificate's message at the window its length takes. Within one window that state grows with
+/// the message and not with what it says, so `bounds::CERTIFICATE_COMPRESSION_BYTES` states it at
+/// the longest certificate a node carries, issued from 2050: each of many, their keys, serials and
+/// signatures drawn anew, takes the same, the longest issued now and the transport tests' 326-byte
+/// one less. Node [`IDS`]`[0]` dials node `IDS[1]` twice, both under the longest certificates
+/// issued now, a new endpoint each time; only the server's own work is counted, the dialer's and
+/// the network's paused.
 #[test]
 fn a_servers_first_handshake_takes_brotlis_state_at_its_certificates_window_and_no_more() {
     use hyper_tls::compress::{BROTLI_COMPRESSOR, CompressionLevel};
-    let certificates = certificates();
-    let stated = stated(bounds::least_transport(&stated(0)).unwrap());
-    let brotli_of = |certificate: Vec<u8>| {
+    let brotli_of = |certificate: &[u8]| {
+        let message = certificate_message(certificate);
         alloc::begin();
-        let compressed = BROTLI_COMPRESSOR.compress(certificate, CompressionLevel::Amortized);
+        let compressed = BROTLI_COMPRESSOR.compress(message, CompressionLevel::Amortized);
         let peak = alloc::end().peak;
         assert!(compressed.is_ok());
-        peak
+        u64::try_from(peak).unwrap()
     };
+    let shorter = brotli_of(&certificates().1[1].0);
+    let (mut least, mut most) = (u64::MAX, 0);
+    for _ in 0..64 {
+        let (_, [_, (latest, _)]) = longest(FROM_2050);
+        assert_eq!(latest.len(), LONGEST_CERTIFICATE);
+        let state = brotli_of(&latest);
+        (least, most) = (least.min(state), most.max(state));
+    }
+    let certificates = longest(net::VALIDITY);
     let length = certificates.1[1].0.len();
-    let brotli = brotli_of(certificates.1[1].0.clone());
-    // The longest certificate a node carries: its name's id at its most digits.
-    let key = || mantle_cert::KeyPair::generate().unwrap();
-    let longest = net::issued(&key(), &key(), u64::MAX);
-    let (longest_length, longest_brotli) = (longest.len(), brotli_of(longest));
-    let mut net = Net::new(
+    assert_eq!(length, LONGEST_CERTIFICATE - 2);
+    let brotli = brotli_of(&certificates.1[1].0);
+    let stated = stated(bounds::least_transport(&stated(0)).unwrap());
+    let mut net = longest_net(
         &certificates,
         &stated,
         Instant::now(),
@@ -204,7 +304,7 @@ fn a_servers_first_handshake_takes_brotlis_state_at_its_certificates_window_and_
     net.nodes[0] = net::endpoint(
         authority,
         &certs[0],
-        (2, &certs[1].0),
+        (IDS[1], &certs[1].0),
         &stated,
         net.now,
         [3; 32],
@@ -212,24 +312,29 @@ fn a_servers_first_handshake_takes_brotlis_state_at_its_certificates_window_and_
     net.wire.clear();
     let second = server_handshake(&mut net);
     eprintln!(
-        "certificate {length} bytes: brotli {brotli}; the server's peaks {first} then {second}, {} apart; \
-         the longest, {longest_length} bytes: brotli {longest_brotli}",
+        "the 326-byte certificate: brotli {shorter}; the longest issued now, {length} bytes: brotli \
+         {brotli}, the server's peaks {first} then {second}, {} apart; the longest, \
+         {LONGEST_CERTIFICATE} bytes: brotli {least} to {most}",
         first - second
     );
-    assert!(first - second <= brotli, "{first} - {second} past {brotli}");
-    for state in [brotli, longest_brotli] {
-        assert!(u64::try_from(state).unwrap() <= bounds::CERTIFICATE_COMPRESSION_BYTES);
-    }
+    assert!(
+        first - second <= i64::try_from(brotli).unwrap(),
+        "{first} - {second} past {brotli}"
+    );
+    assert_eq!(least, most, "a certificate's state with what it says");
+    assert!(shorter < brotli && brotli < most);
+    assert!(most <= bounds::CERTIFICATE_COMPRESSION_BYTES, "{most}");
 }
 
-/// Node 1 dials node 2 and the handshake runs until both are told they are connected, as
-/// `Net::connect` runs it: the peak of node 2's own live bytes over it, everything else uncounted.
+/// The node at index 0 dials node [`IDS`]`[1]` at index 1 and the handshake runs until both are
+/// told they are connected, as `Net::dial` runs it: the peak of the server's own live bytes over
+/// it, everything else uncounted.
 fn server_handshake(net: &mut Net) -> i64 {
     let [client, server] = [0usize, 1];
     alloc::begin();
     alloc::pause();
     net.nodes[client]
-        .connect(net.now, 2, net.addresses[server])
+        .connect(net.now, IDS[1], net.addresses[server])
         .unwrap();
     let mut up = [false; 2];
     for _ in 0..1_000 {

@@ -382,10 +382,13 @@ fn held(stated: &Stated, shape: &Shape) -> Result<(u64, u64), Unfit> {
 }
 
 /// A transport endpoint as it opens, its TLS configurations with the node's certificate, key and
-/// authority included, beside the tables its limits size: measured, 59,325 bytes, and 713 for
-/// each peer its directory names, at one, two and four peers (mantle-node's
-/// `tests/transport_memory.rs`).
-const ENDPOINT_BYTES: u64 = 59_325;
+/// authority included, beside the tables its limits size: measured, 59,325 bytes under the
+/// transport tests' 326-byte certificates, and 713 for each peer its directory names, at one, two
+/// and four peers (mantle-node's `tests/transport_memory.rs`); and 550 more at the longest
+/// certificate a node carries ([`CERTIFICATE_COMPRESSION_BYTES`]): two endpoints opened 534 more
+/// under the longest issued now, 403 bytes (macOS arm64), and from 2050 its two octets more take
+/// 16 at the most an octet of certificate took, 8, from 346 bytes to 403.
+const ENDPOINT_BYTES: u64 = 59_875;
 const ENDPOINT_PEER_BYTES: u64 = 713;
 
 /// A slot of an endpoint's table of receive chunks, beside the chunk its budget charges:
@@ -393,8 +396,13 @@ const ENDPOINT_PEER_BYTES: u64 = 713;
 const CHUNK_SLOT_BYTES: u64 = 72;
 
 /// A QUIC connection and its TLS session once established, a side's: measured, 122,012 bytes at
-/// the most any window took, and 95 for each stream it may hold.
-const CONNECTION_BYTES: u64 = 122_012;
+/// the most any window took under the transport tests' 326-byte certificates, and 95 for each
+/// stream it may hold; and 1,322 more at the longest certificate a node carries
+/// ([`CERTIFICATE_COMPRESSION_BYTES`]): a connection's two sides together took 1,270 more under
+/// the longest issued now, 403 bytes (mantle-node's `tests/transport_memory.rs`, macOS arm64), and
+/// from 2050 its two octets more take 52 at the most an octet of certificate took, 26, from 346
+/// bytes to 403.
+const CONNECTION_BYTES: u64 = 123_334;
 const STREAM_BYTES: u64 = 95;
 
 /// An exchange in use, a side's, beside what its budget charges: its stream's state and the
@@ -402,10 +410,16 @@ const STREAM_BYTES: u64 = 95;
 const EXCHANGE_BYTES: u64 = 2_151;
 
 /// What a server's handshake takes, once a certificate, to compress the certificate (RFC 8879):
-/// hyper-tls's brotli at quality 11 with a window the certificate's length (1 KiB), measured,
-/// 721,474 bytes for the longest certificate a node carries (365 bytes, the name of id
-/// `u64::MAX`), given back as the handshake goes on (mantle-node's `tests/transport_memory.rs`).
-pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 721_474;
+/// hyper-tls's brotli at quality 11 with a window the length of the certificate's Certificate
+/// message (1 KiB, WBITS 10, for every message up to 1,008 bytes), given back as the handshake goes
+/// on. Within the window the state grows with the message and not with what it says, so it is
+/// measured at the longest certificate a node carries: each field at its longest as `mantle init`
+/// issues it, the cell's authority's 28-character name, a name's id and a grant at twenty digits,
+/// Ed25519's 32-byte key and 64-byte signature and a 16-octet serial, valid from a GeneralizedTime,
+/// as every time from 2050 is (RFC 5280 §4.1.2.5), to `NO_EXPIRY`: 405 bytes, a 414-byte message.
+/// 722,238 bytes, the same for each of 64 drawn anew (mantle-node's `tests/transport_memory.rs`,
+/// macOS arm64); 722,215 at the longest issued before 2050, 403 bytes, and 721,001 at 326.
+pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 722_238;
 
 /// The most bytes a transport of `stated` holds beside its budget (`transport_bytes`): what the
 /// budget does not charge.

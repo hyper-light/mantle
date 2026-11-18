@@ -80,7 +80,8 @@ uncompressed.
 mantle-node's `tests/transport_memory.rs`; an Ed25519 certificate of this profile is a few hundred
 bytes (`crates/cert`). Since 2026-11-12 the constant states 721,474 bytes: hyper-tls takes a window
 of the certificate's length (hyper-raft e4bca91), measured for the longest node certificate, 365
-bytes.
+bytes. Since 2026-11-18 it states 722,238 bytes, measured at the longest certificate a node carries
+as `mantle init` issues it, 405 bytes, each of its fields at its longest.
 
 [10] AWS CLI Command Reference, "AWS CLI S3 Configuration",
 https://docs.aws.amazon.com/cli/latest/topic/s3-config.html: `multipart_threshold`, "Default -

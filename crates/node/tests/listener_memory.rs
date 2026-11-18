@@ -23,7 +23,10 @@ mod s3;
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::task::Waker;
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 use hyper_measure::alloc;
 use hyper_rt::combine::{Either, race2};
@@ -35,6 +38,7 @@ use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door::{self, Piece};
 use mantle_node::listener::{Listener, PIECE, Settings, tasks};
 use mantle_node::process::AccessKey;
+use mantle_protocol::bounds::STOCK_PATIENCE;
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -178,10 +182,22 @@ fn client(at: SocketAddr, authority: Option<Vec<u8>>) {
 
 /// The bytes the listener's thread holds with `connections` connections each at its most, past
 /// what it held bound with none, over TLS where `tls`.
+///
+/// Each wait is bounded by a stock client's patience (`bounds::STOCK_PATIENCE`, research/77 D2),
+/// as `listener.rs` bounds its exchanges: the requests' coming to the door, each body's coming
+/// whole and the clients' end once the runtime closed their connections, each owed well within
+/// it. A wait past its bound fails the test naming it at the test's line rather than holding it,
+/// and a client that failed fails the test with its own failure.
+#[track_caller]
 fn held(connections: usize, tls: bool) -> i64 {
+    let line = std::panic::Location::caller();
     let chain = tls.then(chain);
+    let patience = u64::try_from(STOCK_PATIENCE.as_nanos()).unwrap();
+    // Each client holds a sender until it returns or unwinds: every sender gone, every client
+    // ended.
+    let (ending, ends) = sync_channel::<()>(0);
     let mut runtime = runtime();
-    let (live, clients) = runtime
+    let (count, clients) = runtime
         .block_on(async move {
             let (mut doorway, submitter) =
                 door::doorway(connections, Waker::noop().clone()).unwrap();
@@ -205,10 +221,17 @@ fn held(connections: usize, tls: bool) -> i64 {
             alloc::pause();
             let clients: Vec<_> = (0..connections)
                 .map(|_| {
-                    let authority = authority.clone();
-                    std::thread::spawn(move || client(at, authority))
+                    let (authority, ending) = (authority.clone(), ending.clone());
+                    std::thread::spawn(move || {
+                        client(at, authority);
+                        drop(ending);
+                    })
                 })
                 .collect();
+            drop(ending);
+            // Each client sends its request as it starts: every one is owed at the door within a
+            // stock client's patience of now.
+            let started = Instant::now();
             alloc::resume();
             // The host's side: each request taken from the door as it comes and its whole body
             // taken as the connection sends it, held as the host holds pieces while it writes;
@@ -216,7 +239,9 @@ fn held(connections: usize, tls: bool) -> i64 {
             // connection's buffer into pieces the host holds, whatever order the connections and
             // their clients ran in. Taking only what a connection reads ahead, the count read
             // whatever it had read by then: on one CPU a lone connection had not read its last
-            // pieces off the socket, and held 101 KB less (CI run 43762797164).
+            // pieces off the socket, and held 101 KB less (CI run 43762797164). A wait past its
+            // bound is returned, not panicked: an unwind here ends the root `RootUnwound`, which
+            // names no wait, and a client's own failure is known only once it is joined.
             let hold = async {
                 while requests.len() < connections {
                     match doorway.waiting() {
@@ -225,46 +250,91 @@ fn held(connections: usize, tls: bool) -> i64 {
                             Some(door::Asked::Op(request)) => requests.push(request),
                             _ => panic!("a root key's connection asked the node for a key"),
                         },
+                        // A client ends only once the listener has: one that ended first failed,
+                        // or its connection did.
+                        None if clients.iter().any(JoinHandle::is_finished) => {
+                            let came = requests.len();
+                            let why = format!("a client ended with {came} there");
+                            return Err(("every request at the door", why));
+                        }
+                        None if started.elapsed() > STOCK_PATIENCE => {
+                            let came = requests.len();
+                            let why = format!("{came} came within {STOCK_PATIENCE:?}");
+                            return Err(("every request at the door", why));
+                        }
                         None => hyper_rt::futures::sleep(1_000_000).await.unwrap(),
                     }
                 }
-                for request in &mut requests {
+                for (taken, request) in requests.iter_mut().enumerate() {
                     // A put's driver wants its body: the connection reads it from here on.
                     request.reply.try_send(door::Answer::Ready).unwrap();
-                    loop {
-                        match request.body.recv().await.unwrap() {
-                            Piece::Bytes(bytes) => {
-                                // The piece is the connection's copy; the list the test keeps
-                                // it in is the test's, uncounted.
-                                alloc::pause();
-                                pieces.push(bytes);
-                                alloc::resume();
+                    let whole = async {
+                        loop {
+                            match request.body.recv().await.unwrap() {
+                                Piece::Bytes(bytes) => {
+                                    // The piece is the connection's copy; the list the test
+                                    // keeps it in is the test's, uncounted.
+                                    alloc::pause();
+                                    pieces.push(bytes);
+                                    alloc::resume();
+                                }
+                                Piece::End(_) => break,
+                                other => panic!("{other:?}"),
                             }
-                            Piece::End(_) => break,
-                            other => panic!("{other:?}"),
                         }
+                    };
+                    // Whole within a stock client's patience: its client wrote it at once, and the
+                    // connection waits on a client that long between octets before it lets it go
+                    // (`listener::conn`).
+                    if hyper_rt::futures::within(patience, whole)
+                        .await
+                        .unwrap()
+                        .is_none()
+                    {
+                        let why =
+                            format!("{taken} came whole, the next not within {STOCK_PATIENCE:?}");
+                        return Err(("each body whole", why));
                     }
                 }
                 let live = alloc::read().live;
-                (live, requests, pieces)
+                Ok((live, requests, pieces))
             };
-            let live = match race2(listener.serve(), hold).await {
-                Either::Second((live, requests, pieces)) => {
+            let count = match race2(listener.serve(), hold).await {
+                Either::Second(held) => held.map(|(live, requests, pieces)| {
                     drop((requests, pieces));
-                    live
-                }
+                    live - bound
+                }),
                 Either::First(e) => panic!("the listener ended: {e}"),
             };
             alloc::end();
-            (live - bound, clients)
+            (count, clients)
         })
         .unwrap();
-    // The connections end with the runtime that holds them, and their clients with them.
+    // The connections end with the runtime that holds them, and their clients with them: each
+    // client's end is owed at once, and waited on for a stock client's patience.
     drop(runtime);
+    let ended = matches!(
+        ends.recv_timeout(STOCK_PATIENCE),
+        Err(RecvTimeoutError::Disconnected)
+    );
     for client in clients {
-        let _ = client.join();
+        // A client that failed fails the test with its own failure, ahead of any wait's.
+        if (ended || client.is_finished())
+            && let Err(failure) = client.join()
+        {
+            std::panic::resume_unwind(failure);
+        }
     }
-    live
+    let (what, why) = match (count, ended) {
+        (Ok(live), true) => return live,
+        (Ok(_), false) => {
+            let why = format!("not within {STOCK_PATIENCE:?} of their connections' close");
+            ("every client's end", why)
+        }
+        (Err(stopped), _) => stopped,
+    };
+    let over = if tls { "TLS" } else { "plain HTTP" };
+    panic!("{what} of {connections} over {over} at {line}: {why}")
 }
 
 /// A connection with a request in flight holds the same bytes whichever its place, over plain

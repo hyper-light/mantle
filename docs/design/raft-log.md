@@ -449,7 +449,7 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    (docs/measurements/2026-09-29-log-confirmation.md).
 
    durability.md §7 answers a frame at its own flush again, and has the group decide what the
-   device cannot (research/95): there an unconfirmed frame whose record reads is undetermined,
+   device cannot (research/97): there an unconfirmed frame whose record reads is undetermined,
    restored and marked as a confirmed one is, and resolved as CTRL resolves a faulty entry
    (AGL+18 §3.4), with the confirmation kept where the others could not resolve it without the
    member. The open reports which of the three it found (`Recovery::tail`: `Torn`,

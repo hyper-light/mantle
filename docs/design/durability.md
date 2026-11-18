@@ -207,7 +207,7 @@ margin left after one zone's loss.
 ## 7. A metadata write's answer: its log frame's own flush
 
 Status: design, 2026-11-17, the owner's decision 2 of research/71 ("Step 9, after"), approved
-that day. Source: research/95 (AGL+18, cited by section and page). Built: the open's account of
+that day. Source: research/97 (AGL+18, cited by section and page). Built: the open's account of
 the frame past the last that reads (§7.7, step 1). Until steps 2 to 4 land, a frame is answered
 only once confirmed, as raft-log.md §6 describes.
 

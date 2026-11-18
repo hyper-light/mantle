@@ -2188,6 +2188,14 @@ range, its descriptor generation and the operation's identity in each frame deci
 message may act (audit §11.8), and a range refuses a frame from a term or generation it has
 left (architecture §5).
 
+*Pinned nodes (2026-11-18).* A node pinned by certificate, as `mantle init` pins each founder in
+the others' configurations, is judged by its member's row once the root range holds rows, as a
+node known by its name under the authority is (membership.md §2 rule 1): a row `Gone`, or
+`Removed` with the root range keeping it as a learner no more, or none with its grant spent,
+refuses it at its handshakes from the entry that says so, and the node closes its open connections
+`Identity` as it applies that entry (`crates/node/src/directory.rs` `Peers::set_members`,
+`node/members.rs`). A pin admits only a node the rows have not written off.
+
 **Decided (2026-10-26): a client is known by its name under the authority, pinned by no node**
 (research/73, closing §11's open item for clients). A client's certificate is the authority's
 leaf for a connection's client end alone (`extKeyUsage` clientAuth): RFC 5280 §4.2.1.12 lets a

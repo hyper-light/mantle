@@ -17,9 +17,11 @@
 //! chain verified at the handshake, names `node-ID`, and the node admits it when the cell's root
 //! range, as this node's member of it last applied it, holds `ID` serving or leaving under that
 //! certificate's fingerprint, or holds no member of `ID` and the certificate's grant is new by
-//! the grant window ([`Peers::set_members`]). A pinned node whose grant is spent and that the
-//! root range holds no member of was removed, and is refused too. The pinned table still names
-//! the gateways, and the founders of a cell made before grants.
+//! the grant window ([`Peers::set_members`]). A pinned node is judged by the same rows once the
+//! root range holds any: refused once its member is gone, or removed and kept as a learner no
+//! more, or its grant is spent and the root range holds no member of its id. The pinned table
+//! still names the gateways and the founders `mantle init` pinned, in a cell made before grants
+//! or by them.
 
 use std::net::SocketAddr;
 
@@ -46,12 +48,24 @@ pub struct Admitted {
     pub admitted: bool,
 }
 
+/// A pinned peer as the directory holds it.
+#[derive(Debug)]
+struct Pinned {
+    /// The peer, its certificate the one its handshakes must present byte for byte.
+    peer: Peer,
+    /// The name a dial checks its certificate against.
+    name: String,
+    /// The grant its certificate names, if it is a node's that names one.
+    grant: Option<u64>,
+    /// Its certificate's SHA-256, what its member's row is compared to.
+    fingerprint: [u8; FINGERPRINT],
+}
+
 /// The node's peers.
 #[derive(Debug, Default)]
 pub struct Peers {
-    /// Each pinned peer, the name a dial checks its certificate against, and the grant its
-    /// certificate names, if it is a node's that names one.
-    peers: Vec<(Peer, String, Option<u64>)>,
+    /// Each pinned peer.
+    peers: Vec<Pinned>,
     /// The clients admitted, each its id and the account it acts for, sorted by id.
     clients: Vec<(PeerId, String)>,
     /// The most clients held at once: the identities and handshakes the transport admits, or none
@@ -88,7 +102,13 @@ impl Peers {
                         Role::Node => mantle_cert::node_grant(&peer.certificate).ok().flatten(),
                         Role::Gateway | Role::Client => None,
                     };
-                    (peer, name, grant)
+                    let fingerprint = mantle_cert::fingerprint(&peer.certificate);
+                    Pinned {
+                        peer,
+                        name,
+                        grant,
+                        fingerprint,
+                    }
                 })
                 .collect(),
             clients: Vec::new(),
@@ -110,10 +130,13 @@ impl Peers {
         }
     }
 
-    /// Whether `peer` is a node this directory admits: pinned as one, a member serving or
-    /// leaving, or granted and joining.
+    /// Whether `peer` is a node this directory admits: pinned as one and not refused, a member
+    /// serving or leaving, or granted and joining.
     pub fn is_node(&self, peer: PeerId) -> bool {
-        self.get(peer).is_some_and(|p| p.role == Role::Node)
+        self.peers
+            .iter()
+            .find(|p| p.peer.id == peer)
+            .is_some_and(|p| p.peer.role == Role::Node && !self.pinned_refused(p))
             || self
                 .members
                 .binary_search_by_key(&peer, |m| m.id)
@@ -126,11 +149,11 @@ impl Peers {
 
     /// The pinned peer named `id`.
     pub fn get(&self, id: PeerId) -> Option<&Peer> {
-        self.peers.iter().map(|(p, ..)| p).find(|p| p.id == id)
+        self.iter().find(|p| p.id == id)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Peer> {
-        self.peers.iter().map(|(p, ..)| p)
+        self.peers.iter().map(|p| &p.peer)
     }
 
     /// The cell's members and grant window as this node's root range holds them now, `width` the
@@ -146,22 +169,20 @@ impl Peers {
         width: u32,
     ) -> Vec<PeerId> {
         members.sort_unstable_by_key(|m| m.id);
-        let pinned_removed = |peers: &Self| -> Vec<PeerId> {
+        let pinned_refused = |peers: &Self| -> Vec<PeerId> {
             peers
                 .peers
                 .iter()
-                .filter(|(peer, _, grant)| {
-                    peer.role == Role::Node && peers.removed(peer.id, *grant)
-                })
-                .map(|(peer, ..)| peer.id)
+                .filter(|p| peers.pinned_refused(p))
+                .map(|p| p.peer.id)
                 .collect()
         };
-        let removed_before = pinned_removed(self);
+        let refused_before = pinned_refused(self);
         let was = std::mem::take(&mut self.members);
         self.members = members;
         self.window = Some((window, width));
         // Every identity admitted before is judged again under the new rows: a member gone or
-        // removed, or a pinned node removed since, is withdrawn.
+        // removed, or a pinned node refused since, is withdrawn.
         let mut withdrawn: Vec<PeerId> = was
             .iter()
             .filter(|m| m.admitted)
@@ -169,9 +190,9 @@ impl Peers {
             .map(|m| m.id)
             .collect();
         withdrawn.extend(
-            pinned_removed(self)
+            pinned_refused(self)
                 .into_iter()
-                .filter(|id| !removed_before.contains(id)),
+                .filter(|id| !refused_before.contains(id)),
         );
         withdrawn.sort_unstable();
         withdrawn.dedup();
@@ -220,6 +241,20 @@ impl Peers {
             }
             _ => false,
         }
+    }
+
+    /// Whether `pinned` is a node the root range's rows refuse (membership.md §2 rule 1), as
+    /// they refuse a node pinned nowhere: a member of its id that they hold neither serving nor
+    /// leaving under its certificate, nor removed and kept as a learner (gone, or removed and
+    /// dropped), or none and its grant spent (delisted). A gateway is judged by no row.
+    fn pinned_refused(&self, pinned: &Pinned) -> bool {
+        if pinned.peer.role != Role::Node {
+            return false;
+        }
+        if self.is_member(pinned.peer.id) {
+            return !self.member_admitted(pinned.peer.id, &pinned.fingerprint);
+        }
+        self.removed(pinned.peer.id, pinned.grant)
     }
 
     /// Whether a node certificate of `id` under `grant`, with `fingerprint`, is admitted by the
@@ -281,23 +316,24 @@ impl Directory for Peers {
     type Role = Role;
 
     /// A pinned peer whose certificate the handshake verified, byte for byte, and for a dial only
-    /// the peer dialed; else, for a connection a peer opened, the client the authority's
-    /// certificate names, unless its id is a pinned peer's or names another account, or the
-    /// clients held are at their bound.
+    /// the peer dialed, unless it is a node the root range's rows refuse; else, for a connection
+    /// a peer opened, the client the authority's certificate names, unless its id is a pinned
+    /// peer's or names another account, or the clients held are at their bound.
     fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Role)> {
         let certificate = authenticated.certificate?;
-        if let Some((peer, _, grant)) = self
+        if let Some(pinned) = self
             .peers
             .iter()
-            .find(|(p, ..)| p.certificate.as_slice() == certificate)
+            .find(|p| p.peer.certificate.as_slice() == certificate)
         {
-            if authenticated.dialed.is_some_and(|dialed| dialed != peer.id) {
+            if authenticated
+                .dialed
+                .is_some_and(|dialed| dialed != pinned.peer.id)
+                || self.pinned_refused(pinned)
+            {
                 return None;
             }
-            if peer.role == Role::Node && self.removed(peer.id, *grant) {
-                return None;
-            }
-            return Some((peer.id, peer.role));
+            return Some((pinned.peer.id, pinned.peer.role));
         }
         // A node's certificate, known by its name under the authority (membership.md §2).
         if let Ok(names) = mantle_cert::node_names(certificate) {
@@ -349,8 +385,8 @@ impl Directory for Peers {
     fn server_name(&self, peer: PeerId) -> Option<&str> {
         self.peers
             .iter()
-            .find(|(p, ..)| p.id == peer)
-            .map(|(_, name, _)| name.as_str())
+            .find(|p| p.peer.id == peer)
+            .map(|p| p.name.as_str())
             .or_else(|| {
                 self.named
                     .binary_search_by_key(&peer, |(n, _)| *n)

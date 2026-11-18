@@ -79,18 +79,29 @@ for every slot of the cell at once has each still joinable, in any order. State:
 *The directory.* A node admits a connection whose certificate the authority issued (the TLS
 handshake verifies the chain, node.md §3.6) as the node it names when (`crate::directory`):
 
-1. it is a pinned peer (a gateway, or a founder of a cell made before grants), byte for byte, as
-   before, unless its grant is spent and the root range holds no member of its id: removed;
+1. it is a pinned peer (a gateway, or a founder, which `mantle init` pins in every other
+   founder's configuration), byte for byte, as before, unless the root range's rows refuse it as
+   they refuse a node pinned nowhere: its member `Gone`, or `Removed` and kept as a learner no
+   more, or no member of its id held and its grant spent (delisted);
 2. its id is a member the root range holds `Serving` or `Leaving`, or `Removed` while the root
    range's configuration, as this node applied it, keeps it as a learner (§4 step 5), and its
    certificate's SHA-256 is the member's fingerprint; or
 3. it names no member and its grant is new by the window: a node granted and not yet joined.
 
 A `Gone` member, a removed one the root range keeps as a learner no more, a delisted one (its grant
-spent, its rows gone) and a certificate that is neither are refused at the handshake, charged to no identity (hyper-transport `Directory::identify`). A
-node applies its root range's entries to its directory at each turn that applied any, and closes
-the connections of an identity it refuses from then (`Endpoint::refuse` with `Refusal::Identity`),
-so a removal reaches connections already open (node.md §3.6).
+spent, its rows gone) and a certificate that is neither are refused at the handshake, pinned or
+not, charged to no identity (hyper-transport `Directory::identify`). A node applies its root
+range's entries to its directory at each turn that applied any, and closes the connections of an
+identity it refuses from then (`Endpoint::refuse` with `Refusal::Identity`), so a removal reaches
+connections already open (node.md §3.6).
+
+*Decided (2026-11-18, the owner): a pinned founder is refused from the entry that writes it off.*
+A founder pinned in its peers' configurations was refused only once its rows went at its
+delisting, so while its row said `Gone` or `Removed` its peers admitted it again whenever it
+dialed. Rule 1 now judges it by its row as rules 2 and 3 judge a node pinned nowhere
+(`Peers::set_members`, `crate::directory`), so no written-off identity has a window in which it
+still talks to the cell, and a leaving founder learns of its drop as a granted node does (§4 step
+5).
 
 *The protocol.* Granting is the authority holder's alone, offline: `mantle init grant DIR --cell
 OUT --node ...` (§7) draws the id, numbers the grant, issues the node's certificate and its S3 endpoint's,
@@ -199,12 +210,12 @@ standard input (one running), the steps a supervisor runs without a person:
    meanwhile, whose tracker starts empty, hears it again. The leader then drops it from the root
    range's configuration (a learner dropped sooner would never hear of its own removal), and, once
    no range names it, asks `Delist { node }`: its rows go. Each member refuses its identity once it
-   applies the drop, and the leaving node, at the first refusal since its removal by a member its
-   replica holds serving or leaving, stops in order and exits 0 (`Departure::settle` in
-   `crate::process`). A link its own handshake refused, to a member gone, removed or delisted,
-   says nothing of its own standing and does not stop it. Refused at the removal itself, as the
-   members first did, it could not answer: it either never heard its removal or was never heard,
-   and the leader kept it as a learner for good.
+   applies the drop, pinned or not (§2 rule 1), and the leaving node, at the first refusal since
+   its removal by a member its replica holds serving or leaving, stops in order and exits 0
+   (`Departure::settle` in `crate::process`). A link its own handshake refused, to a member gone,
+   removed or delisted, says nothing of its own standing and does not stop it. Refused at the
+   removal itself, as the members first did, it could not answer: it either never heard its
+   removal or was never heard, and the leader kept it as a learner for good.
 
 A leave never completes while its volumes hold a chunk the cell needs: until repair has retired
 them, the node waits in step 4, which keeps every acknowledged object as whole as it was.

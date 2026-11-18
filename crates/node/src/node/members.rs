@@ -3,8 +3,8 @@
 //!
 //! - **The directory and the peers.** Each member serving or leaving is admitted by its
 //!   certificate's fingerprint, and the grant window admits a node granted and not yet joined
-//!   (`crate::directory`, membership.md §2); a member gone or removed is refused, its connections
-//!   closed. Each member is a peer this node keeps, dialed where it says it is reached, its reach a
+//!   (`crate::directory`, membership.md §2); a member gone or removed is refused, pinned in the
+//!   configuration or not, at its handshakes and, as its row changes, its open connections. Each member is a peer this node keeps, dialed where it says it is reached, its reach a
 //!   host the process looks up where it names one ([`Node::take_reached`]).
 //! - **Each range this node leads** steps its configuration toward the members (membership.md §6;
 //!   `mantle_range::membership::Toward`): one change at a time, only while none is pending.
@@ -669,5 +669,88 @@ mod tests {
         assert!(!gone_by(&presence(true, 100), u64::MAX, repair));
         assert!(!gone_by(&presence(false, 100), u64::MAX, None));
         assert!(!gone_by(&presence(false, 2_000), 1_500, repair));
+    }
+
+    /// membership.md §2: a founder pinned in the configuration is judged by its member's row as a
+    /// node pinned nowhere is, so a row that writes it off refuses it at its handshakes at once,
+    /// and gives it back for `read_members` to close its open connections `Identity`. Admitted
+    /// serving, leaving, and removed while the root range keeps it as a learner (§4 step 5);
+    /// refused gone, learner or not, and removed once dropped.
+    #[test]
+    fn a_pinned_founder_is_refused_at_once_by_a_row_that_writes_it_off() {
+        use crate::directory::{Peer, Peers};
+        use hyper_transport::{Authenticated, Directory};
+        use mantle_protocol::classes::Role;
+        let founder = |id: u64| Peer {
+            id,
+            role: Role::Node,
+            certificate: format!("founder {id}").into_bytes(),
+        };
+        let (two, three) = (founder(2), founder(3));
+        let hello = |peer: &Peer, dialed: Option<PeerId>| {
+            let certificate = peer.certificate.clone();
+            move |peers: &mut Peers| {
+                peers.identify(&Authenticated {
+                    certificate: Some(&certificate),
+                    protocol: b"mantle/1",
+                    dialed,
+                })
+            }
+        };
+        let (accepted, dialed) = (hello(&two, None), hello(&two, Some(2)));
+        let row = |peer: &Peer, state: MemberState, learner: bool| Admitted {
+            id: peer.id,
+            fingerprint: mantle_cert::fingerprint(&peer.certificate),
+            admitted: admitted(state, learner),
+        };
+        // The founders' rows, two's as given and three's serving: the identities withdrawn.
+        let judge = |peers: &mut Peers, state: MemberState, learner: bool| {
+            let rows = vec![
+                row(&two, state, learner),
+                row(&three, MemberState::Serving, false),
+            ];
+            peers.set_members(rows, Grants::default(), 3)
+        };
+        let mut peers = Peers::new(vec![two.clone(), three.clone()], 0);
+        // Before any row, admitted by its pin.
+        assert_eq!(accepted(&mut peers), Some((2, Role::Node)));
+        for (state, learner) in [
+            (MemberState::Serving, false),
+            (MemberState::Leaving, true),
+            (MemberState::Removed, true),
+        ] {
+            assert!(judge(&mut peers, state, learner).is_empty());
+            assert_eq!(accepted(&mut peers), Some((2, Role::Node)));
+            assert_eq!(dialed(&mut peers), Some((2, Role::Node)));
+            assert!(peers.is_node(2));
+        }
+        // Removed and dropped from the root range: refused at once, its connections to close, once.
+        assert_eq!(judge(&mut peers, MemberState::Removed, false), vec![2]);
+        assert_eq!(accepted(&mut peers), None);
+        assert_eq!(dialed(&mut peers), None);
+        assert!(!peers.is_node(2));
+        assert!(judge(&mut peers, MemberState::Removed, false).is_empty());
+        assert_eq!(accepted(&mut peers), None);
+        // The founder beside it, serving, stays admitted.
+        assert_eq!(hello(&three, None)(&mut peers), Some((3, Role::Node)));
+        // Gone, learner or not: refused at once. A node whose first rows say so closes the
+        // connections its pin admitted before.
+        for learner in [false, true] {
+            let mut peers = Peers::new(vec![two.clone(), three.clone()], 0);
+            assert_eq!(accepted(&mut peers), Some((2, Role::Node)));
+            assert_eq!(judge(&mut peers, MemberState::Gone, learner), vec![2]);
+            assert_eq!(accepted(&mut peers), None);
+            assert_eq!(dialed(&mut peers), None);
+        }
+        let mut peers = Peers::new(vec![two.clone(), three.clone()], 0);
+        assert!(judge(&mut peers, MemberState::Serving, false).is_empty());
+        assert_eq!(judge(&mut peers, MemberState::Gone, false), vec![2]);
+        assert_eq!(accepted(&mut peers), None);
+        // A row of its id under another certificate admits not the pinned one.
+        let mut other = row(&founder(4), MemberState::Serving, false);
+        other.id = 2;
+        let rows = vec![other, row(&three, MemberState::Serving, false)];
+        assert!(peers.set_members(rows, Grants::default(), 3).is_empty());
+        assert_eq!(accepted(&mut peers), None);
     }
 }

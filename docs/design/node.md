@@ -355,6 +355,38 @@ measures the second, and derives the rest by these rules:
   `tests/range_memory.rs` over stores that hold nothing of their own, `tests/range_log_memory.rs`
   over the node's logs, `tests/transport_memory.rs` two endpoints at one, two and four peers and
   at the floor's budget and eight times it).
+  *As built (2026-11-18).* What binds the three largest classes, read at the code that enforces
+  each (CI run 44349745026: a founder of the membership suite, nine identities, refused at
+  7,718,104,000 bytes on a three-core 7 GiB runner). **The ranges:** a member's entries are
+  counted at the least an entry takes on the wire, as hyper-raft's limits count them
+  (`Limits::derive`: `entries_per_message`, `unstable_entries`), for nothing bounds their count
+  but their bytes. `range.max_inflight_msgs` (`derive::in_flight`, 19 at nine identities) counts
+  the appends out to a follower, not their entries; each append carries up to
+  `entries_per_message` of them (hyper-raft's outbox, `max_entries`); a leader's uncommitted bound
+  counts bytes, and admits an entry of none whatever it holds (`Raft::admit_uncommitted`);
+  `ask::ENTRIES_OUT` is what an asker keeps out of its own, which a leader does not count
+  (`Node::propose_command` proposes what a peer's exchange carries, an entry of no commands among
+  it); and a follower catching up is sent committed entries packed by their bytes, however they
+  were proposed. **The log:** a group's retention is three `Ready`s of entries at the least a
+  range proposes (`mantle_range::ready_held`), for the same reason. **The transport:** a lane's
+  window of appends (`max_inflight_msgs` a range, the lane's `lane_window`, past which
+  `send_frame` refuses) each at the largest message, the count and the bytes both binding. Its
+  frames were charged to every peer; a range's messages go to the cell's other nodes alone
+  (`Node::send` sends to a remote, a node of the cell), so a lane's window out is charged to
+  those (`bounds::Stated::replicas`), and a gateway its connections and a frame a lane read in: the
+  founder's transport from 1,095,918,972 bytes to 653,428,641 at 256 deep, its floor within its
+  allowance with the issuer's 257 stacks (`derive.rs`'s
+  `a_membership_founder_on_cis_macos_runner_starts_at_its_issuers_stacks`). Its ranges, 3.58 GB,
+  and log, 2.18 GB, are unchanged: three founders on one 7 GiB runner each start, but their floors
+  together pass it. What would bound a range's count, and so charge its entries at the lesser of
+  that count by the largest entry and its bytes: a count hyper-raft enforces on a leader's
+  uncommitted entries beside their bytes and states for what an append carries, in place of their
+  bytes over the least entry; and a leader that refuses an entry of no commands, and a peer's
+  entries past `ENTRIES_OUT` out. **The threads:** each stack is charged whole at Rust's 2 MiB,
+  reserved, where a thread holds what it touches; a high-water mark measured for each kind of
+  thread, or a stack size derived for each thread mantle spawns, would charge that. The issuer's
+  workers, a read of the depth each where a pool carries the transfers, are most of them: 257 of
+  269 at a depth of 256.
   *Open:* a range's member is stated at the bounds hyper-raft puts on each queue, which mantle
   states as one `Ready` of the range's settings (`mantle_range::limits`): 52.9 MB a member at the
   floor, where three members held 11.0 MB at most through the shapes that fill each hold, and
@@ -1764,7 +1796,9 @@ task's wait and each connection's). A lane holds the exchanges the transport adm
 shard past the first that runs ranges with its two lanes (`node::shard_lanes_bytes`: a ring place
 and a room place for each value, at the types a process runs). `lanes_per_peer` is a lane for each
 shard that runs ranges, at most one a range (`node::lanes`), and the transport's messages' bytes
-count each peer's frames for each lane it may open; the node's task still sends every range's
+count, for each lane it may open, a window of frames out to each node its ranges replicate to
+(`bounds::Stated::replicas`; a gateway is sent none) and one frame in from each peer; the node's
+task still sends every range's
 messages, its own and those its shards hand back, on its one lane, so the lanes a peer may open
 bound what a peer sends, not what this node does. A word of the stream (a change, or its belief of
 a peer a range came to share its group with) a shard's lane has no room for is held, in order, and
@@ -2101,8 +2135,8 @@ messages share: a connection's receive window and the receive chunks datagrams a
 both charged to it, as are every message's head, every lane frame, and the piece a body is read
 into. Reading what QUIC buffered is what frees it, so the buffering is sized within the budget
 less what the messages hold at once at most (`bounds::limits`): every exchange's head both ways,
-one body piece, and for a node that keeps appends out each peer lane's frames, its window out and
-one in; a peer's two connections' windows (each with the class reserve its first window carries)
+one body piece, and for a node that keeps appends out a lane's window of frames out to each node
+its ranges replicate to and one frame in from each peer; a peer's two connections' windows (each with the class reserve its first window carries)
 and its full window of unread data packed into whole chunks share the rest, and a budget that
 leaves no window is refused at start. Before, the windows and the chunks were each sized from the
 whole budget: on macos-aarch64 a gateway's three connections grew their windows to the budget's

@@ -942,6 +942,7 @@ impl Pki {
         };
         let least = mantle_protocol::bounds::least_transport(&mantle_protocol::bounds::Stated {
             peers: self.nodes.len(),
+            replicas: 0,
             clients: 0,
             pool: 0,
             ranges: 1,

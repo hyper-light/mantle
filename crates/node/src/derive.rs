@@ -2107,6 +2107,8 @@ pub fn derive(
                 .saturating_sub(1)
                 .checked_add(gateway_lines)
                 .ok_or(overflow("the transport's peers"))?,
+            // A range's messages go to the cell's other nodes alone (`Node::send`).
+            replicas: cell_nodes.saturating_sub(1),
             clients,
             pool: if hosts { objects } else { 0 },
             ranges,
@@ -3831,6 +3833,7 @@ mod tests {
         let (settings, _) = cell(3).unwrap();
         let stated = |peers: usize, transport_bytes: u64| mantle_protocol::bounds::Stated {
             peers,
+            replicas: peers,
             clients: 0,
             pool: 0,
             ranges: 5,
@@ -4686,16 +4689,19 @@ mod tests {
     /// A founder of the membership suite's cell (`three_of_five` made by `Cell::made`: five nodes
     /// at most and the four test clients pinned as gateways, nine identities; its five founding
     /// ranges; a volume of 256 MiB; S3 served) on CI's macOS arm64 runner, three cores and 7 GiB,
-    /// its device's queue 256 and measured 256 deep. Its ranges, log and transport, sized by the
-    /// nine identities' appends out, hold more than 6 GiB of its floor at any depth. Where a pool's
-    /// worker carries each transfer (macOS, Windows), the issuer's 257 threads' stacks take it past
-    /// the machine at its threads, as CI's founder refused to start, its floor 7,718,104,000 bytes
-    /// (run 44349745026); the rest fits. Measured 4 deep, it starts. Its need, its floor at the
-    /// deepest its queue lets calibration measure with every want whole, passes the machine at
-    /// either depth: no memory it states starts it there, nor the suite's two other founders, which
-    /// are alike.
+    /// its device's queue 256 and measured 256 deep, starts on every platform. CI's founder refused
+    /// to start at its threads, its floor 7,718,104,000 bytes (run 44349745026), its transport
+    /// charged a lane's frames to each of the four gateways, which no range's message goes to
+    /// (`Node::send`); charged to the four other nodes alone, the floor holds the issuer's 257
+    /// threads' stacks where a pool's worker carries each transfer (macOS, Windows). Its ranges
+    /// and log, a range's entries counted at the least an entry takes since nothing bounds their
+    /// count but their bytes (node.md §1.4), hold more than 5 GiB at any depth, the ranges alone
+    /// more than a third of the machine: the suite's three founders, which are alike, each start,
+    /// but their floors together pass the machine. Its need, its floor at the deepest its queue lets
+    /// calibration measure with every want whole, passes the machine: no memory it states starts
+    /// it there.
     #[test]
-    fn a_membership_founder_on_cis_macos_runner_passes_its_memory_at_its_issuers_stacks() {
+    fn a_membership_founder_on_cis_macos_runner_starts_at_its_issuers_stacks() {
         let founder = || {
             let mut s = Stated {
                 s3: Some(crate::process::S3Stated {
@@ -4736,26 +4742,36 @@ mod tests {
             allowance(Some(need), &machine(memory, None)),
             Err(DeriveError::Ceiling { .. })
         ));
-        let large: u64 = ["ranges", "log", "transport"]
-            .iter()
-            .map(|class| said_bytes(&shallow, &format!("memory.floor.{class}")))
-            .sum();
-        assert!(large > 6 << 30, "{large}");
-        let stacks = threads(3, &[256], &[true]).unwrap() * STACK;
-        match derive(founder(), &runner(256), &mut fresh) {
-            Ok(deep) if cfg!(target_os = "linux") => {
-                assert_eq!(said_bytes(&deep, "memory.need"), need);
-            }
-            Err(DeriveError::Memory {
-                class: Class::Threads,
-                floor,
-                allowance,
-            }) if !cfg!(target_os = "linux") => {
-                assert_eq!(allowance, memory);
-                assert_eq!(stacks, 269 * STACK);
-                assert!(floor - stacks <= allowance, "{floor} {stacks}");
-            }
-            other => panic!("{:?}", other.map(|_| ())),
+        let floor = |derived: &Derived, classes: &[&str]| -> u64 {
+            classes
+                .iter()
+                .map(|class| said_bytes(derived, &format!("memory.floor.{class}")))
+                .sum()
+        };
+        let large = floor(&shallow, &["ranges", "log"]);
+        assert!(large > 5 << 30, "{large}");
+        assert!(floor(&shallow, &["ranges"]) > memory / 3);
+        let deep = derive(founder(), &runner(256), &mut fresh).unwrap();
+        assert_eq!(said_bytes(&deep, "memory.need"), need);
+        assert_eq!(said_bytes(&deep, "memory.allowance"), memory);
+        let all = floor(
+            &deep,
+            &[
+                "objects",
+                "volumes",
+                "engines",
+                "ranges",
+                "log",
+                "transport",
+                "runtime",
+                "threads",
+            ],
+        );
+        assert!(all <= memory, "{all}");
+        if !cfg!(target_os = "linux") {
+            let stacks = threads(3, &[256], &[true]).unwrap() * STACK;
+            assert_eq!(stacks, 269 * STACK);
+            assert_eq!(said_bytes(&deep, "memory.floor.threads"), stacks);
         }
     }
 

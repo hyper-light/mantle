@@ -124,6 +124,7 @@ pub fn stated(transport_bytes: u64) -> Stated {
         + mantle_node::frame::HEADER_BYTES as u64;
     Stated {
         peers: 1,
+        replicas: 1,
         clients: 0,
         pool: 0,
         ranges: 5,

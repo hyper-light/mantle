@@ -168,6 +168,7 @@ fn client_settings(pki: &Pki) -> ClientSettings {
     let messages = node_stated().messages;
     let transport_bytes = bounds::least_transport(&Stated {
         peers: 1,
+        replicas: 0,
         clients: 0,
         pool: 0,
         ranges: 1,

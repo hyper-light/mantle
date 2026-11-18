@@ -317,6 +317,7 @@ impl Client {
         let peers = settings.nodes.len();
         let stated = Stated {
             peers,
+            replicas: 0,
             clients: 0,
             pool: 0,
             // A client keeps one command out, to one range at a time, and a gateway one chunk.

@@ -1233,6 +1233,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             peers: node_peers
                 .checked_add(others)
                 .ok_or_else(|| at(Step::Budgets)(NodeError::Bounds("the peers".into())))?,
+            // A range's messages go to the cell's other nodes alone (`Node::send`).
+            replicas: node_peers,
             clients,
             pool: settings.gateway.as_ref().map_or(0, |g| g.objects),
             ranges: settings.ranges.len(),

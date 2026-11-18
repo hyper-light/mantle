@@ -108,6 +108,7 @@ fn two_nodes_transports_hold_their_budget_and_what_it_does_not_charge() {
     for (peers, transfers) in [(1usize, 38usize), (2, 38), (4, 38), (1, 76)] {
         let at = |bytes| Stated {
             peers,
+            replicas: peers,
             transfers,
             ..stated(bytes)
         };

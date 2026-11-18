@@ -47,6 +47,11 @@ pub struct Stated {
     /// The peers it keeps connections to that replicate, place chunks or ask ranges: a node's
     /// other nodes and gateways, a client's nodes.
     pub peers: usize,
+    /// The peers its ranges' messages go to over its lanes: a node's other nodes, the cell's,
+    /// which its ranges' members are on (mantle-node's `Node::send` sends a range's message to a
+    /// node of the cell alone); none for a client, which nothing replicates to. A gateway among
+    /// [`Self::peers`] is sent no frame of a lane.
+    pub replicas: usize,
     /// The clients of the native protocol it admits at once (a node's `gateway.clients`), each a
     /// pooled role: its connection holds [`CLIENT_EXCHANGES`] of its own and draws the rest from
     /// the pool (hyper-transport's `StreamCredit::Pooled`, Breakwater's credit). None for a client.
@@ -289,8 +294,8 @@ fn lanes(stated: &Stated) -> Result<u32, Unfit> {
 /// The bytes the transport and its owner hold of messages at once, at most: every exchange's head
 /// both ways (an outgoing message's prefix and head, an incoming head), the one body piece the
 /// owner reads at a time (a receive chunk: the node's and the client's `PIECE`), and, for a node
-/// that keeps appends out (`Stated::inflight`), each peer lane's frames, its window queued out and
-/// one read in, for each lane it may open.
+/// that keeps appends out (`Stated::inflight`), for each lane it may open, its window queued out
+/// to each node its ranges replicate to (`Stated::replicas`) and one frame read in from each peer.
 fn messages(
     stated: &Stated,
     exchanges: usize,
@@ -311,13 +316,16 @@ fn messages(
     } else {
         let frame = frame_grant(stated.messages.replication);
         let lanes = u64::from(lanes(stated)?);
-        u64::try_from(stated.peers.max(1))
+        // Queued out, a lane's window to each node the ranges replicate to; read in, a frame a
+        // lane from any peer, which may open its lanes whatever its role.
+        u64::try_from(stated.replicas)
             .ok()
-            .zip(u64::try_from(lane_window.checked_add(1).ok_or_else(unfit)?).ok())
-            .and_then(|(peers, window)| {
-                peers
+            .zip(u64::try_from(lane_window).ok())
+            .and_then(|(replicas, window)| replicas.checked_mul(window))
+            .zip(u64::try_from(stated.peers.max(1)).ok())
+            .and_then(|(out, peers)| {
+                out.checked_add(peers)?
                     .checked_mul(lanes)?
-                    .checked_mul(window)?
                     .checked_mul(frame)
             })
             .ok_or_else(unfit)?
@@ -496,6 +504,7 @@ mod tests {
     fn stated() -> Stated {
         Stated {
             peers: 2,
+            replicas: 2,
             clients: 0,
             pool: 0,
             ranges: 3,
@@ -546,6 +555,40 @@ mod tests {
                 assert!(limits(&s).unwrap().exchanges >= 4 * ranges);
             }
         }
+    }
+
+    /// A node queues lane frames out to the nodes its ranges replicate to alone, a range's
+    /// messages going to a node of the cell alone (mantle-node's `Node::send`): a gateway among
+    /// its peers is charged its connections and a frame a lane read in, none queued out.
+    #[test]
+    fn a_gateway_among_the_peers_is_held_no_lane_frames() {
+        let frames = |s: &Stated| {
+            let at = |s: &Stated| {
+                let shape = shape(s).unwrap();
+                messages(s, shape.exchanges, shape.max_head, shape.lane_window).unwrap()
+            };
+            at(s) - at(&Stated { inflight: 0, ..*s })
+        };
+        let nodes = stated();
+        let read = frame_grant(nodes.messages.replication) * u64::from(lanes(&nodes).unwrap());
+        let gateways = Stated {
+            peers: nodes.peers + 2,
+            ..nodes
+        };
+        assert!(frames(&nodes) > 2 * read);
+        assert_eq!(frames(&gateways), frames(&nodes) + 2 * read);
+        let replicas = Stated {
+            replicas: gateways.peers,
+            ..gateways
+        };
+        assert_eq!(frames(&replicas), 2 * frames(&nodes));
+        assert_eq!(
+            frames(&Stated {
+                replicas: 0,
+                ..nodes
+            }),
+            2 * read
+        );
     }
 
     #[test]
@@ -625,6 +668,7 @@ mod tests {
     fn quics_buffering_leaves_the_messages_their_bytes() {
         let client = Stated {
             peers: 3,
+            replicas: 0,
             ranges: 1,
             inflight: 0,
             lanes: 1,
@@ -637,6 +681,7 @@ mod tests {
         // queue's transfers.
         let node = Stated {
             peers: 7,
+            replicas: 7,
             clients: 0,
             pool: 0,
             ranges: 5,

@@ -210,10 +210,11 @@ Status: design, 2026-11-17, the owner's decision 2 of research/71 ("Step 9, afte
 that day. Source: research/97 (AGL+18, cited by section and page). Built: the open's account of
 the frame past the last that reads (§7.7, step 1), the record in pieces (step 2), and the record's
 word on how its frame was answered, with the open's restore of a frame answered at its flush
-(step 3a) and the writer's setting of it (step 3c), the device's write cache (step 5), and step 4's
-first part: each log says how it answers and why, and its mark can refuse the binaries before
-answers at the flush. Until the rest of step 4 lands, a frame is answered only once confirmed, as
-raft-log.md §6 describes.
+(step 3a) and the writer's setting of it (step 3c), the device's write cache (step 5), and step 4:
+each log says how it answers and why, its mark refuses the binaries before answers at the flush,
+and the writer answers a frame at its flush where the owner's two decisions allow (§7.5,
+hyper-log `AtFlush`). Neither decision is taken, so on every device a frame is still answered
+only once confirmed, as raft-log.md §6 describes.
 
 A PUT's critical path holds seven flushes: the slowest replica's chunk, then the Block, File and
 Name commands, each a frame flushed and then confirmed by a second durable write (research/71,
@@ -399,6 +400,27 @@ voters or more), so on every seed the open found `Tail::Undetermined { at_flush:
 the frame as the torn tail, as a frame answered once confirmed and never confirmed was never
 answered; the node elected itself again and applied through every entry it answered.
 
+The owner's two decisions are stated where the writer reads them, each a typed enum of hyper-log's
+`AtFlush`, and `AtFlush::DECIDED` is the one place either changes (§7.7, step 4b):
+
+| decision | what it decides | variants, and how a log then answers | today |
+|---|---|---|---|
+| (A) `write_back: WriteBackFrames` | whether a device with a volatile write cache, or one that states none, answers a frame at its flush, accepting fault (b): a group left waiting after a power cut across a quorum, reported `Uncertain`, never an answered write lost (§7.4) | `Confirmed` (`Answers::WriteBack`); `AtFlush` (`Answers::Accepted`) | `Confirmed` |
+| (B) `stated: StatedCache` | whether a cache the OS states keeps a completed write, write-through or power-protected, is trusted, which no timing of a write and a flush checks | `Unmeasured` (`Answers::Unmeasured`); `Trusted` (`Answers::Kept` under condition (a), `Answers::Buffered` where the file's completed writes are not the device's) | `Unmeasured` |
+
+So no device answers a frame at its flush today. Under (B) a frame is answered at its flush only
+under condition (a): a write the file completes is the device's own completion
+(`BlockFile::writes_reach_device`: false for every real file until its direct path is built and
+cited, true for the simulated device that keeps every completed write, hyper-block
+`SimFile::keeping`), and the frame overwrites a slot the file holds written, so its write completes
+before its record's is issued and a record that landed proves its frame did. A frame that grows the
+file stays confirmed: the file system's journal commits that write's metadata only at the next
+flush (fallocate(2)). Condition (b), a frame and its record in one atomic write, is not reachable
+in this log's layout: the record lies in the persist area and the frame in a segment, two ranges of
+the file, where an atomic write (`RWF_ATOMIC`, research/02 §2.10) is one pwritev2(2) call, which
+writes one contiguous range from its offset. Under
+either decision a frame holding a one- or two-voter group stays confirmed (`Update::at_flush`).
+
 ### 7.6 What changes in the node's power-cut and torn-write tests
 
 - hyper-log: `an_unconfirmed_torn_frame_keeps_only_its_term_and_vote` and
@@ -550,16 +572,45 @@ answered; the node elected itself again and applied through every entry it answe
      its record landed, as the torn tail. Such a mark always records its block. This binary reads
      it, and every re-lay and every mark written again keeps it. Nothing sets it yet.
 
-   4b, not built: the writer answers a frame at its flush where its record says so (`AT_FLUSH`), its
-   log is in pieces, and either (a) the cache keeps a completed write, the claim measured, and the
-   record is written only once the frame's write completed, on a file whose completed write is the
-   device's (direct I/O, its slot already written so the file system logs nothing for it), or (b)
-   the device's atomic write unit holds the frame and its record written as one atomic write. Its
-   open sets the mark's bit, and flushes it, before the first such frame. Its tests: a simulated
-   device that keeps every completed write, beside hyper-block's `SimFile`, whose crash loses
-   unflushed writes; a frame answered at its flush there survives every crash point by §7.6's laws;
-   a write-back device, and a one- or two-voter group, never answer so. The measurement (a) needs is
-   open (§7.5): a write and flush timed against a write cannot check Linux's attribute.
+   4b, built (hyper-raft `mantle-frame-flush` `0f5dce2`, `f9248d5`): the mechanism, behind the
+   owner's decisions (§7.5's table), which answer at the flush nowhere until the owner takes one.
+   - The policy: hyper-log `AtFlush`, decision (A) `WriteBackFrames` and decision (B)
+     `StatedCache`, with `AtFlush::DECIDED` today's; a log is made or opened with it
+     (`With::at_flush`, `DECIDED` by default, as every `create` and `open` takes it). `Answers`
+     gains `Kept` (condition (a)), `Accepted` (decision (A)) and `Buffered` (decision (B) taken
+     on a file whose completed writes are not the device's), and `Answers::at_flush`.
+   - The create and the open of a log that answers at the flush set the mark's bit and flush it
+     before its first frame, the restore included, so a binary of `f3dae3b` or before refuses the
+     log. A mark that has the bit keeps it, whatever the log answers later.
+   - The writer answers a frame at its flush where its record says so (`AT_FLUSH`: records in
+     pieces, every update in the frame allowing it) and the log answers so; under condition (a)
+     only for a frame in a slot the file holds written whole (`BlockFile::fills_new_space`). The
+     frame's write and then its record's, one flush, then the device answers the frame before and
+     this one, and writes no confirmation; the owner gives the frame's room back then. Everywhere
+     else, answers come once confirmed, as before.
+   - The simulated device that keeps every completed write: hyper-sim's block device told to
+     (`Device::keep_completed`), each write's sectors durable as it returns, a lost write still
+     never on the medium; hyper-block's `SimFile::keeping`, its cache write-through from
+     `Source::Simulated` and its writes the device's (`writes_reach_device`). Tests take decision
+     (B) for it alone.
+   - Tests (hyper-log `tests/at_flush.rs`, `recover::tests`), all passing: a frame of three-voter
+     groups answered at its flush costs one durable operation, its flush, where a confirmed one
+     costs two, the flush and the confirmation's durable write, counted on the device and in the
+     log's `flushes` and `durable_writes`, with no `flushed_confirmations`; the power cut at each of
+     the frame's three operations (its write, its record's write, its flush) and after them, each
+     with `Crash::LoseAll`, `Random` and `KeepAll`, twelve runs: an entry is answered only when
+     the cut comes after its flush, every answered entry is held after the open, at most the cut
+     frame's entry more, and no group is marked (no `Undetermined` or `Lost` tail), since a record
+     written after its frame's write completed proves the frame landed; a write-back device
+     answers at the flush only under decision (A); a one- or two-voter group's frame never, under
+     either; a binary from before refuses the mark the writer itself set, at a create and at an
+     open of a log made before the decision.
+   - Not built: condition (b), unreachable in this layout (§7.5); a real file's
+     `writes_reach_device`, which needs each platform's direct path cited (Linux `O_DIRECT`, macOS
+     `F_NOCACHE`, Windows `FILE_FLAG_NO_BUFFERING`), so decision (B) answers no real device at the
+     flush until it is; the measurement (a) needs (§7.5); and the node's count of log flushes per
+     PUT on the simulated device, which needs the node to open its log with a decision and the
+     simulation's store on `SimFile::keeping`.
 5. The device's write cache is read from the OS beside its atomic write unit, for step 4. Built
    (hyper-raft `mantle-frame-flush`): hyper-block `write_cache::write_cache` answers a
    `DeviceCache`, a `WriteCache` (`WriteThrough`, `PowerProtected`, `WriteBack`) with its `Source`

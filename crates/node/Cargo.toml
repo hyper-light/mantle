@@ -71,6 +71,11 @@ hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
 hyper-measure = { path = "../../vendor/hyper-measure" }
 # The simulation's draws: hyper-sim's generator and named streams (tests/sim.rs).
 hyper-sim = { path = "../../vendor/hyper-sim" }
+# Google's reference Brotli decoder, google/brotli's C 1.2.1 as brotlic-sys 0.2.5 builds it:
+# written apart from the `brotli` crate that compresses a node's certificate, it decodes what a
+# handshake sends (tests/certificate_compression.rs; RFC 8879, RFC 7932). A dev-dependency only,
+# which Ada allowed on 2026-11-18 (research/88 [9]).
+brotlic = "0.8.4"
 tempfile.workspace = true
 
 [lints]

@@ -24,13 +24,18 @@ pub type Node = Endpoint<NodeClasses, Fixed, Peers>;
 pub type Issued = (Vec<u8>, Vec<u8>);
 
 /// The certificates' validity: from the epoch to the last second X.509's GeneralizedTime holds.
-const VALIDITY: Validity = Validity {
+pub const VALIDITY: Validity = Validity {
     not_before: 0,
     not_after: 253_402_300_799,
 };
 
 /// Two nodes' certificates under one authority, each with its key.
 pub fn certificates() -> (Vec<u8>, [Issued; 2]) {
+    certificates_of([1, 2])
+}
+
+/// The certificates of nodes `ids` under one authority, each with its key.
+pub fn certificates_of(ids: [u64; 2]) -> (Vec<u8>, [Issued; 2]) {
     let key = KeyPair::generate().unwrap();
     let authority =
         mantle_cert::authority(&key, AUTHORITY, VALIDITY, Serial::draw().unwrap()).unwrap();
@@ -38,7 +43,7 @@ pub fn certificates() -> (Vec<u8>, [Issued; 2]) {
         let own = KeyPair::generate().unwrap();
         (issued(&key, &own, id), own.pkcs8().to_vec())
     };
-    (authority, [issue(1), issue(2)])
+    (authority, ids.map(issue))
 }
 
 /// Node `id`'s certificate, `own` its key, issued by `authority`.
@@ -64,13 +69,31 @@ pub fn endpoint(
     now: Instant,
     seed: [u8; 32],
 ) -> Node {
+    endpoint_under(tls(authority, own), other, stated, now, seed)
+}
+
+/// The TLS a node runs under with its certificate `own`, its peers' verified against `authority`:
+/// `Tls::mutual`, as a node's start makes it.
+pub fn tls(authority: &[u8], own: &Issued) -> Tls {
     let credentials = Credentials {
         chain: vec![CertificateDer::from(own.0.clone())],
         key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.1.clone())),
         roots: vec![CertificateDer::from(authority.to_vec())],
     };
+    Tls::mutual(&credentials, true).unwrap()
+}
+
+/// A node's endpoint under `tls`, which knows `other` as its one peer, its QUIC layer drawing from
+/// `seed`.
+pub fn endpoint_under(
+    tls: Tls,
+    other: (u64, &[u8]),
+    stated: &Stated,
+    now: Instant,
+    seed: [u8; 32],
+) -> Node {
     let config = Config {
-        tls: Tls::mutual(&credentials, true).unwrap(),
+        tls,
         role: Role::Node,
         limits: bounds::limits(stated).unwrap(),
         congestion: Default::default(),
@@ -145,6 +168,15 @@ impl Net {
             endpoint(authority, &certs[0], (2, &certs[1].0), stated, now, [1; 32]),
             endpoint(authority, &certs[1], (1, &certs[0].0), stated, now, [2; 32]),
         ];
+        Self::of(nodes, now, (wire, out))
+    }
+
+    /// The network between `nodes` at `now`, each at the address of its index.
+    pub fn of(
+        nodes: [Node; 2],
+        now: Instant,
+        (wire, out): (VecDeque<(usize, Vec<u8>)>, Vec<u8>),
+    ) -> Self {
         Self {
             now,
             nodes,
@@ -214,12 +246,20 @@ impl Net {
     /// Node 1 dials node 2, and the handshake runs until both owners are told they are connected;
     /// the events of the handshake are cleared.
     pub fn connect(&mut self) {
+        self.dial(2);
+    }
+
+    /// The node at index 0 dials the one at index 1, node `id`, and the handshake runs until both
+    /// owners are told they are connected, or for 1,000 rounds: whether both were told. The events
+    /// of the handshake are cleared.
+    pub fn dial(&mut self, id: u64) -> bool {
         self.nodes[0]
-            .connect(self.now, 2, self.addresses[1])
+            .connect(self.now, id, self.addresses[1])
             .unwrap();
+        let mut up = false;
         for _ in 0..1_000 {
             self.pump();
-            let up = self
+            up = self
                 .events
                 .iter()
                 .all(|e| e.iter().any(|e| matches!(e, Event::Connected { .. })));
@@ -230,5 +270,6 @@ impl Net {
         }
         self.events[0].clear();
         self.events[1].clear();
+        up
     }
 }

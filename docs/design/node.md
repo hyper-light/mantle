@@ -2225,9 +2225,12 @@ RUSTSEC-2026-0348 (no large window, so five bytes no longer allocate 1 GiB; the 
 buffer filled exactly), and refuses any allocation past what a stream decoding to the
 certificate's length needs: a four-byte header declaring a 16 MiB metablock took 16,780,366 bytes
 before the bound and 2,584 after, a whole 1 KiB certificate 38,835. Every stream a stock encoder
-makes still decodes (window 2^22 and the certificate's own, 1 to 65,535 bytes). *Open:* an
-independent decoder decoding a node's certificate at its window, which needs a tool the owner has
-not yet allowed (every Google decoder on the box is the affected 1.2.0).
+makes still decodes (window 2^22 and the certificate's own, 1 to 65,535 bytes). A decoder
+written apart from the encoder decodes what a node's handshakes send, at the certificate's window:
+Google's C decoder 1.2.1 through `brotlic`, a dev-dependency the owner allowed on 2026-11-18,
+takes every node certificate `mantle init` issues, from the shortest to the longest, and the
+gateway's, as a real handshake compresses them (mantle-node `tests/certificate_compression.rs`,
+research/88 [9]).
 
 ### 3.7 Defenses
 

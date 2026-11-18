@@ -166,6 +166,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "brotlic"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2191d58e061de06588bbed469453b84b6f732c1040a4ea76ae0551ea1c203958"
+dependencies = [
+ "brotlic-sys",
+]
+
+[[package]]
+name = "brotlic-sys"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44564126338ef14526ee5eddb56795cde7fc432ced4f3cfc39f1ec4fe74929c8"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -901,6 +919,7 @@ dependencies = [
 name = "mantle-node"
 version = "0.1.0"
 dependencies = [
+ "brotlic",
  "bytes",
  "getrandom 0.4.3",
  "hyper-block",

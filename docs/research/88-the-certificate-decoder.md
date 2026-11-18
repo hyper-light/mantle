@@ -1,9 +1,10 @@
 # 88. The certificate decoder: CVE-2026-111497, RUSTSEC-2026-0348 and a header's allocation
 
 Status: research note, 2026-11-12. For the owner's decision on certificate compression's decoder
-(node.md §3.6, "certificate compression's decoder"; Lean doors step 8). Sources [1] to [8]; [1] to
+(node.md §3.6, "certificate compression's decoder"; Lean doors step 8). Sources [1] to [9]; [1] to
 [3] are web pages read through a search's summaries, [4] to [8] were read on the box (crate
-sources from the registry, the advisory database cargo deny fetched), each quoted where read.
+sources from the registry, the advisory database cargo deny fetched), each quoted where read, and
+[9] on the Mac, 2026-11-18.
 Measurements are hyper-raft branch doors-step8-2's tests, run on the box.
 
 ## The question
@@ -67,6 +68,16 @@ for `ResultSuccess if available_out == 0 && available_in == 0`; zlib's takes `In
 declared before its data; §7.3, a literal context map of 64 contexts for each of NBLTYPESL block
 types, at most 256. The large window is not RFC 7932. RFC 8879 §3 names RFC 7932's Brotli.
 
+[9] `brotlic` 0.8.4 and `brotlic-sys` 0.2.5, read from the registry on 2026-11-18 (crates.io's
+index: published 2026-11-14T21:18:28Z and 21:18:15Z; both `.cargo_vcs_info.json` name
+github.com/stefan-zander/brotlic at `0bd9f997`). `brotlic-sys`'s `build.rs` compiles the
+google/brotli C it bundles (`brotli/c/common`, `dec`, `enc`) with `cc`, and fails on any older
+than 1.2.1 (`MIN_BROTLI_VERSION`); its `brotli/c/common/version.h` is 1.2.1. Licenses: the
+binding MIT OR Apache-2.0, google/brotli's `LICENSE` MIT. `BrotliDecoder::new` is
+`BrotliDecoderCreateInstance(None, None, null)`, and `BrotliDecoderStateInit` sets
+`large_window = 0` until `BROTLI_DECODER_PARAM_LARGE_WINDOW` is set (`c/dec/state.c`,
+`c/dec/decode.c`).
+
 ## What follows
 
 - The C decoder's bug [1] is not in the code mantle links. The Rust port is safe Rust [5], so a
@@ -94,6 +105,16 @@ types, at most 256. The large window is not RFC 7932. RFC 8879 §3 names RFC 793
   test that fails before it. hyper-raft's lock moves past -0382 (rustls-webpki 0.103.17, and
   hyper-tls requires 0.103.16), -0381 (webpki-roots 1.0.12), -0386 (tokio 1.54.1) and -0486 (rustix
   1.1.6). Its oracle, upstream rustls pinned at 0.23.45, a test dependency, keeps its four.
-- An independent decoder, one not from the encoder's crate, has not decoded mantle's
-  certificate at its window: every Google decoder on the box is 1.2.0 [3], and another is a new
-  tool, the owner's to allow.
+- An independent decoder, one not from the encoder's crate, decodes every certificate a node's
+  handshakes compress, at its window. The owner allowed one as a dev-dependency (2026-11-18):
+  Google's reference C decoder, which shares no code with the Rust port, at 1.2.1, the release
+  with [1]'s fix [2], built from source by `brotlic-sys` and bound by `brotlic` [9], with RFC
+  7932's window only. mantle-node `tests/certificate_compression.rs` keeps what hyper-tls's own
+  Brotli compressor is given and returns in a real handshake between two nodes' transports and
+  decodes it: every stream states WBITS 10 and decodes whole to its Certificate message, the
+  certificate's bytes within it. Covered: the shortest and the longest node certificates `mantle
+  init` issues (granted, under its 28-character authority name; 346 and 403 bytes, ids and grants
+  of one digit and of twenty), each as a server's and the shortest as a dialer's; the gateway's
+  at its longest (378 bytes, `gateway-` and twenty digits), which its range client presents; and
+  the transport tests' 326- and 365-byte certificates. The S3 door and the native client send
+  no compressed certificate.

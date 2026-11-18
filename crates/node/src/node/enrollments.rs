@@ -54,6 +54,9 @@ enum Stands {
         grant: u64,
         certificate: Vec<u8>,
     },
+    /// Refused `NotRemoved` by the root range: waiting, until `until_ns` ([`removal_waited`]), for
+    /// the rows to hold the old member removed or no longer hold it, then proposed again.
+    Removing { until_ns: u64 },
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
@@ -132,24 +135,46 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// A turn's step of the requests held: those past their patience answered `Unanswered`, each
-    /// proposal's outcome answered, and each waiting one proposed as the leader, one re-grant out
-    /// at a time, or forwarded to the leader.
+    /// proposal's outcome answered, one refused `NotRemoved` waiting for the old member's removal
+    /// (membership.md §5.1 step 3) and proposed again once the rows hold it, or answered so once
+    /// its wait's bound passes ([`removal_waited`]), and each waiting one proposed as the leader,
+    /// one re-grant out at a time, or forwarded to the leader.
     pub(super) fn step_enrollments(&mut self, now: u64) -> Result<(), NodeError> {
         let mut at = 0;
         while at < self.enrollments.len() {
             let Some(held) = self.enrollments.get(at) else {
                 break;
             };
-            let (exchange, until_ns) = (held.exchange, held.until_ns);
+            let (exchange, until_ns, old) = (held.exchange, held.until_ns, held.enrolling.old);
+            let removing = match held.stands {
+                Stands::Removing { until_ns } => Some(until_ns),
+                _ => None,
+            };
             let outcome = match &held.stands {
                 Stands::Proposed { ask, .. } => self.take_command(*ask),
                 _ => None,
             };
             let taken = outcome.is_some();
-            let answer = match outcome {
-                Some(outcome) => Some(self.regrant_answer(at, outcome)),
-                None if until_ns <= now => Some(wire::Answer::Refused(wire::Refusal::Unanswered)),
-                None => None,
+            let waits = removal_waited(until_ns, bounds::idle_timeout());
+            let answer = match (outcome, removing) {
+                (Some(outcome), _) => match self.regrant_answer(at, outcome) {
+                    wire::Answer::Refused(wire::Refusal::NotRemoved) if now < waits => {
+                        self.stand(at, Stands::Removing { until_ns: waits });
+                        None
+                    }
+                    answer => Some(answer),
+                },
+                (None, Some(_)) if self.removed(old) => {
+                    self.stand(at, Stands::Waiting);
+                    None
+                }
+                (None, Some(waits)) if waits <= now => {
+                    Some(wire::Answer::Refused(wire::Refusal::NotRemoved))
+                }
+                (None, _) if until_ns <= now => {
+                    Some(wire::Answer::Refused(wire::Refusal::Unanswered))
+                }
+                (None, _) => None,
             };
             match answer {
                 Some(answer) => {
@@ -197,6 +222,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.forward_enrollment(at, group, now)?;
         }
         Ok(())
+    }
+
+    /// Request `at` stands at `stands` from here.
+    fn stand(&mut self, at: usize, stands: Stands) {
+        if let Some(held) = self.enrollments.get_mut(at) {
+            held.stands = stands;
+        }
+    }
+
+    /// Whether the root range's rows, as this node last read them, hold node `old` removed or no
+    /// longer hold it: the fact a request refused `NotRemoved` waits for, after which no volume of
+    /// it is left in the table and nothing on its disks is needed (membership.md §5.1).
+    fn removed(&self, old: u64) -> bool {
+        self.cell.as_ref().is_some_and(|c| {
+            c.members()
+                .iter()
+                .find(|(id, _)| *id == old)
+                .is_none_or(|(_, row)| row.state == MemberState::Removed)
+        })
     }
 
     /// As the root range's leader, re-grants request `at`: a new id drawn from the operating
@@ -367,7 +411,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.receiving.retain(|r| r.exchange != out);
             }
             Stands::Proposed { ask, .. } => self.duties.push((ask, held.enrolling.old)),
-            Stands::Waiting => {}
+            Stands::Waiting | Stands::Removing { .. } => {}
         }
     }
 
@@ -523,6 +567,21 @@ fn next_grant(top: u64, spent: u64) -> Option<u64> {
     top.max(spent).checked_add(1)
 }
 
+/// When a request the root range refused `NotRemoved` stops waiting for the old member's removal
+/// and is answered so: its patience's end, `until_ns` (the stock patience from its read), less
+/// [`ANSWER_LEGS`] idle timeouts (`idle`, RFC 9000 §10.1). The written-off node gives each member
+/// the stock patience from its dial (`rejoin::ask`), and the dial connects within one idle timeout
+/// before its request is read here; the answer reaches it within another, or its connection
+/// ends; so the answer arrives while it still listens.
+fn removal_waited(until_ns: u64, idle: std::time::Duration) -> u64 {
+    let idle = u64::try_from(idle.as_nanos()).unwrap_or(u64::MAX);
+    until_ns.saturating_sub(idle.saturating_mul(ANSWER_LEGS))
+}
+
+/// The legs a request's wait leaves room for within its asker's patience, an idle timeout each:
+/// the asker's dial before the request is read, and the answer's way back.
+const ANSWER_LEGS: u64 = 2;
+
 /// Nanoseconds a second: a unit conversion.
 const NANOS_A_SECOND: u64 = 1_000_000_000;
 
@@ -537,6 +596,27 @@ fn refusal_of(refused: enroll::Refused) -> wire::Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// membership.md §5.1 step 3: a request refused `NotRemoved` waits for the old member's
+    /// removal no longer than leaves its answer time to reach the written-off node within the
+    /// patience it gave this member from its dial, which connected within an idle timeout before
+    /// the request was read; a patience shorter than the legs waits none.
+    #[test]
+    fn a_wait_for_removal_ends_while_its_asker_still_listens() {
+        let idle = bounds::idle_timeout();
+        let idle_ns = u64::try_from(idle.as_nanos()).unwrap();
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let dialed = 1_000_000_000_000u64;
+        // Read as late as the dial's connection allows.
+        let read = dialed + idle_ns;
+        let waits = removal_waited(read + patience, idle);
+        assert_eq!(waits, read + patience - 2 * idle_ns);
+        assert!(waits > read, "the stock patience leaves the wait no time");
+        // The answer, sent at the wait's end, arrives within an idle timeout: before the asker's
+        // patience, from its dial, passes.
+        assert!(waits + idle_ns <= dialed + patience);
+        assert_eq!(removal_waited(idle_ns, idle), 0);
+    }
 
     fn proved() -> Enrolling {
         Enrolling {

@@ -448,7 +448,8 @@ impl Pki {
 }
 
 /// What a run's seed gives an endpoint: its key, its certificate's serial, its QUIC endpoint's
-/// draws (`Endpoint::new_seeded`). Each its own, as a host's are.
+/// draws (`Endpoint::new_seeded`) and a client's TLS draws (`ClientSettings::seed`). Each its own,
+/// as a host's are.
 #[derive(Clone, Copy)]
 enum Derived {
     Key = 1,

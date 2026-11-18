@@ -48,14 +48,19 @@
 //! with no deadline at the most (node.md §5.4, research/77 D2): one asked with no deadline of a
 //! node that says nothing is given up, not waited on without end, before any reply is measured.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use hyper_rt::combine::{Either, race2};
+use hyper_rt::machine::stats::Xorshift;
 use hyper_rt_transport::Driver;
-use hyper_transport::tls::{Credentials, Tls};
+use hyper_tls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
+use hyper_tls::{ClientConfig, RootCertStore};
+use hyper_transport::tls::{ALPN, Credentials, Tls};
 use hyper_transport::{
     Config, Endpoint, Epoch, Event, ExchangeId, Fixed, PeerId, Progress, Refusal,
 };
@@ -86,8 +91,9 @@ pub struct ClientSettings {
     pub messages: Bounds,
     /// The bytes its transport may hold at once.
     pub transport_bytes: u64,
-    /// The seed of its QUIC endpoint's draws (`Endpoint::new_seeded`), so a simulation's run is its
-    /// seed (node.md §9.1); `None` elsewhere, the endpoint drawing its own.
+    /// The seed of its QUIC endpoint's draws (`Endpoint::new_seeded`) and of its TLS's
+    /// ([`Seeded`]), so a simulation's run is its seed (node.md §9.1); `None` elsewhere, the
+    /// endpoint and TLS drawing their own.
     pub seed: Option<[u8; 32]>,
 }
 
@@ -229,6 +235,78 @@ pub struct Client {
     /// The transport's keep-alive interval, nanoseconds: how long a driven connection stays silent
     /// at most ([`Client::forget_quiet`]).
     keep_alive_ns: u64,
+    /// Its TLS's draws, for a client given a seed: lent to [`Seeded`] for each dial.
+    draws: Option<Xorshift>,
+}
+
+thread_local! {
+    /// The draws of the client dialing on this thread, there for the length of its dial's call
+    /// only ([`Client::reach`]).
+    static DIALING: Cell<Option<Xorshift>> = const { Cell::new(None) };
+}
+
+/// TLS's source of randomness for a client given a seed: the draws its dial lent.
+///
+/// hyper-tls draws from its provider's source as a dial builds the connection's ClientHello: the
+/// hello's random and the seed of the order its extensions are encoded in
+/// (`ClientHelloInput::new`, `ClientExtensions::order_insensitive_extensions_in_random_order`),
+/// and nothing after it on a TLS 1.3 connection that offers no ECH. Drawn from the system, each
+/// run encoded its hellos' extensions in other orders, so the encoding's buffer grew in other steps
+/// (the hybrid key share, 1,216 octets, appended at another length) and a simulation's
+/// allocations were not its seed's. Drawn here, a seed's run encodes the same hellos. A draw with
+/// no dial lending is refused: nothing else draws.
+#[derive(Debug)]
+struct Seeded;
+
+impl SecureRandom for Seeded {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
+        let mut draws = DIALING.take().ok_or(GetRandomFailed)?;
+        for chunk in buf.chunks_mut(size_of::<u64>()) {
+            for (octet, drawn) in chunk.iter_mut().zip(draws.next_u64().to_le_bytes()) {
+                *octet = drawn;
+            }
+        }
+        DIALING.set(Some(draws));
+        Ok(())
+    }
+}
+
+static SEEDED: Seeded = Seeded;
+
+/// The transport's provider with [`Seeded`] for its randomness, made once from the first.
+static SEEDED_PROVIDER: OnceLock<CryptoProvider> = OnceLock::new();
+
+/// The client half of [`Tls::mutual`] for a client given a seed: the same provider, versions,
+/// roots, certificate and protocol, drawing from [`Seeded`].
+fn seeded_tls(credentials: &Credentials) -> Result<Tls, ClientError> {
+    let provider = match SEEDED_PROVIDER.get() {
+        Some(provider) => provider,
+        None => {
+            let mutual = Tls::mutual(credentials, false)?;
+            SEEDED_PROVIDER.get_or_init(|| {
+                let mut provider = mutual.client.crypto_provider().clone();
+                provider.secure_random = &SEEDED;
+                provider
+            })
+        }
+    };
+    let mut roots = RootCertStore::empty();
+    for root in &credentials.roots {
+        roots
+            .add(root.clone())
+            .map_err(|_| Refusal::Configuration)?;
+    }
+    let mut client = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&hyper_tls::version::TLS13])
+        .map_err(|_| Refusal::Configuration)?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(credentials.chain.clone(), credentials.key.clone_key())
+        .map_err(|_| Refusal::Configuration)?;
+    client.alpn_protocols = vec![ALPN.to_vec()];
+    Ok(Tls {
+        server: None,
+        client,
+    })
 }
 
 impl Client {
@@ -256,7 +334,20 @@ impl Client {
             u64::try_from(limits.keep_alive.unwrap_or(limits.idle_timeout).as_nanos())
                 .map_err(|_| ClientError::Bounds("the keep-alive interval".into()))?;
         let io = bounds::io(&stated);
-        let tls = Tls::mutual(&settings.credentials, false)?;
+        let (tls, draws) = match settings.seed {
+            Some(seed) => {
+                let folded = seed
+                    .as_chunks::<{ size_of::<u64>() }>()
+                    .0
+                    .iter()
+                    .fold(0, |folded, word| folded ^ u64::from_le_bytes(*word));
+                (
+                    seeded_tls(&settings.credentials)?,
+                    Some(Xorshift::new(folded)),
+                )
+            }
+            None => (Tls::mutual(&settings.credentials, false)?, None),
+        };
         let config = Config {
             tls,
             role: settings.role,
@@ -298,6 +389,7 @@ impl Client {
             body: Vec::new(),
             driven_ns: hyper_rt::futures::now_ns(),
             keep_alive_ns,
+            draws,
         })
     }
 
@@ -478,7 +570,10 @@ impl Client {
         // `learn` closed, not the dial's.
         let before = known.epoch;
         let clock = self.driver.clock()?;
-        if self.driver.endpoint().connect(clock, node, quic).is_err() {
+        DIALING.set(self.draws.take());
+        let dialed = self.driver.endpoint().connect(clock, node, quic);
+        self.draws = DIALING.take();
+        if dialed.is_err() {
             return Ok(false);
         }
         let now_ns = hyper_rt::futures::now_ns();

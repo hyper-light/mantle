@@ -121,7 +121,13 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// the stream's own proof (the cell at rest's count): the clients' run asks 10 more liveness
 /// writes and sends 6 fewer heartbeats, its plane carries 144 fewer Raft frames, and it ends
 /// 61.8 ms sooner on the virtual clock. On Linux, 34,388 then and 34,440 since: CI run
-/// 44239790476's linux-aarch64 crates leg counted 34,440 at 0ae45327.
+/// 44239790476's linux-aarch64 crates leg counted 34,440 at 0ae45327. The clients' TLS drew from
+/// the system as each dial built its hello, the seed of the order its extensions are encoded in
+/// among it (hyper-tls `ClientHelloInput::new`), so the hybrid key share's 1,216 octets were
+/// appended at another length each run and the hello's buffer grew in other steps: 2,311 to 2,318
+/// reallocations in 45 runs on this Mac, every allocation the same. A client given a seed draws its
+/// TLS's from it (`mantle_node::client`'s `Seeded`), so its hellos are the seed's and the run's
+/// reallocations the same every run: 2,316 here.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {

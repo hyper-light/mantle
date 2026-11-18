@@ -3479,9 +3479,11 @@ clients on one hyper-rt simulation runtime (`SimRuntime`): every shard on one th
 virtual clock, every socket on its fabric. The nodes are the production owner (`Node::open_on`),
 elected by suspicion and replicating over QUIC and the sealed plane. Each node's log is
 hyper-log on hyper-block's simulated device (`NodeLog`), and its range runs on the model engine.
-The clients are the production client. A run is its seed: keys, certificate serials and every
-endpoint's draws derive from it (`KeyPair::from_seed`, `Serial::from_octets`,
-`Endpoint::new_seeded`), so the handshakes carry the same bytes and a seed run twice gives the
+The clients are the production client. A run is its seed: keys, certificate serials, every
+endpoint's draws and a client's TLS draws derive from it (`KeyPair::from_seed`,
+`Serial::from_octets`, `Endpoint::new_seeded`, the client's `Seeded`: its hellos' randoms and
+the order their extensions are encoded in), so the handshakes carry the same bytes in the same
+order and a seed run twice gives the
 same histories, operation by operation. The paths are focal's profiles: one switch, one
 continent, or across the planet. Half way through the clients' operations, the leader or a
 follower is cut off, loses power (its device keeping what it flushed, as the seed draws), or has

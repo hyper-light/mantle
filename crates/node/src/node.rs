@@ -499,7 +499,12 @@ pub struct Status {
 /// handshake either side began: the peer's by this node's directory or its verifier, or this
 /// node's by the peer's directory, which the transport tells this node whichever side dialed (its
 /// `access_denied` close, membership.md §5.1); on a connection the peer dialed, a TLS alert other
-/// than that one is not `Identity`.
+/// than that one is not `Identity`. `was_up` says whether the last ending was a connection's, up
+/// until it closed, rather than a dial's that ended before one was: the transport ends a dial
+/// whose peer this node's directory or verifier refused before it is up, and closes one whose
+/// identity the peer refused after (hyper-transport `Event::Closed`), so `Identity` on a
+/// connection that was up is the peer's word on this node's certificate, never this node's on
+/// the peer's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
     pub peer: PeerId,
@@ -509,6 +514,7 @@ pub struct Link {
     pub suspected: u64,
     pub suspect: bool,
     pub refusal: Option<Refusal>,
+    pub was_up: bool,
 }
 
 /// What the node's sends of Raft messages did, all told.
@@ -575,11 +581,13 @@ struct Remote {
     /// Redials paused for so far: the draw each pause's jitter takes ([`bounds::pause`]).
     redials: u32,
     /// Dials made to it, connections and dials to it that ended, the times this node's detectors
-    /// came to suspect it, and the last refusal one ended with ([`Link`]).
+    /// came to suspect it, the last refusal one ended with, and whether that one was a connection
+    /// up until it closed ([`Link`]).
     dials: u64,
     ended: u64,
     suspected: u64,
     refusal: Option<Refusal>,
+    was_up: bool,
     /// Whether the detectors suspect it now: suspected, or its stop announced, until a heartbeat
     /// trusts it or its next run's comes (hyper-liveness's changes), or a connection to it is made.
     suspect: bool,
@@ -2241,6 +2249,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             suspected: r.suspected,
             suspect: r.suspect,
             refusal: r.refusal,
+            was_up: r.was_up,
         })
     }
 
@@ -2961,12 +2970,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.write_exchange(exchange);
                 Ok(())
             }
-            Event::Closed { peer, refusal, .. } | Event::Unreachable { peer, refusal } => {
-                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
-                    remote.ended = remote.ended.saturating_add(1);
-                    remote.refusal = refusal;
-                }
-                self.lost(peer, now);
+            Event::Closed { peer, refusal, .. } => {
+                self.link_ended(peer, refusal, true, now);
+                Ok(())
+            }
+            Event::Unreachable { peer, refusal } => {
+                self.link_ended(peer, refusal, false, now);
                 Ok(())
             }
             // A path's degrading and its progress again: the connection stays open either way, and
@@ -3040,6 +3049,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
+    /// A connection to `peer` that was up (`was_up`), or a dial of it, ended for `refusal`: counted
+    /// on its link ([`Link`]), and the peer lost ([`Self::lost`]).
+    fn link_ended(&mut self, peer: PeerId, refusal: Option<Refusal>, was_up: bool, now: u64) {
+        if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) {
+            remote.ended = remote.ended.saturating_add(1);
+            remote.refusal = refusal;
+            remote.was_up = was_up;
+        }
+        self.lost(peer, now);
+    }
+
     /// A peer's connection went: what this node kept for it goes ([`Self::unkey`]), and a peer
     /// this node dials is dialed again after a pause of its backoff ([`Self::redial_later`]).
     fn lost(&mut self, peer: PeerId, now: u64) {
@@ -3107,6 +3127,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if let Err(refusal) = dialed {
                     remote.ended = remote.ended.saturating_add(1);
                     remote.refusal = Some(refusal);
+                    remote.was_up = false;
                     Self::redial_later(self.id, remote, now);
                 }
             }

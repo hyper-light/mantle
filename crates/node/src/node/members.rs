@@ -633,6 +633,7 @@ impl Remote {
             ended: 0,
             suspected: 0,
             refusal: None,
+            was_up: false,
             suspect: false,
             learned,
             row: None,

@@ -380,37 +380,41 @@ rather than preceding the request: only the root range knows that no block names
 node's volumes, and a node refused (a ban, the setting) keeps its disks for whoever decides.
 
 1. **It learns it is retired.** A member its replica holds serving or leaving refuses its identity
-   at a handshake either side began, from an entry the member applied (§2). But a member's
-   directory refuses with the same `access_denied` a node no row names once the grant window is
-   full, and a certificate not the one its dial named; and on a link this node dialed,
-   `Identity` is also this node's own refusal of the peer's certificate (slice 1). So one refusal
-   is not the cell's word. **Decided (2026-11-18): retired only on refusals none of those
-   explains.** Its own replica holding it gone is the write-off itself, applied here: retired at
-   once. Else the count begins at the first turn of its run at which its own replica holds it
-   serving or leaving, a member, which no grant window judges, so no refusal of its join counts,
-   each link's endings taken as they stand then (as a leave's end is judged, §4). Once its
-   patience has passed since, two idle timeouts (a dial made as the count begins connects or ends
-   within one, RFC 9000 §10.1, and a redial waits at most one more, `bounds::backed_off`), it is
-   retired when a member its replica holds serving or leaving refused its identity since, that
-   link's last ending `Identity`, and no such member admits it, none connected to it. A member
+   at a handshake either side began, from an entry the member applied (§2). But a member's directory
+   refuses with the same `access_denied` a node no row names once the grant window is full, and a
+   certificate not the one its dial named; and on a link this node dialed, `Identity` is also this
+   node's own refusal of the peer's certificate (slice 1). So one refusal is not the cell's word.
+   **Decided (2026-11-18): retired only on refusals none of those explains.** Its own replica
+   holding it gone is the write-off itself, applied here: retired at once. Else the count begins at
+   the first turn of its run at which its own replica holds it serving or leaving, a member, which
+   no grant window judges, so no refusal of its join counts, each link's endings taken as they stand
+   then (as a leave's end is judged, §4). Once its patience has passed since, two idle timeouts (a
+   dial made as the count begins connects or ends within one, RFC 9000 §10.1, and a redial waits at
+   most one more, `bounds::backed_off`), it is retired when a member its replica holds serving or
+   leaving refused its identity since, that link's last ending a connection that was up closed
+   `Identity`, and no such member admits it, none connected to it. A connection up and then closed
+   `Identity` is the peer's word on this node's certificate: the transport ends a dial whose server
+   this node's own directory or verifier refused before it is up (`Unreachable`), and closes one
+   whose certificate the peer refused after (`Closed`, slice 1; `Link::was_up`), so a member's old
+   port answered by another member, or by another cell's node, says nothing of this node. A member
    connected is the cell's word that it is not written off, so a certificate refused at one stale
-   address does not retire a node another member admits; a link that ended another way, a timeout
-   or a bound of the peer's admission, says nothing either way, so a member down does not hold a
-   written-off node serving nothing for good; a refusal from a node its replica holds gone,
-   removed or not at all says nothing of it. Not taken: a majority of the members it holds. A
-   member dials only the members of higher ids (`Node::dials`), and members drop a node they
-   write off from their peers (`Node::keep_peers`), so a written-off node hears only from the
-   members above it and those that pin it, and a majority would leave about half of them refused
-   and waiting for good. What is left: a node no member admits over its patience, refused only
-   where a member's address answered as another member's, or by a verifier that could not take
-   its certificate (one that expired as it ran, a skewed clock), is retired wrongly, and its data
-   is the cell's to rebuild once its absence passes the repair time (§5), as for any node that
-   stops; and a written-off node above every member it holds, and pinned by none, hears no
+   address does not retire a node another member admits; a link that ended another way, a timeout or
+   a bound of the peer's admission, says nothing either way, so a member down does not hold a
+   written-off node serving nothing for good; a refusal from a node its replica holds gone, removed
+   or not at all says nothing of it. Not taken: a majority of the members it holds. A member dials
+   only the members of higher ids (`Node::dials`), and members drop a node they write off from their
+   peers (`Node::keep_peers`), so a written-off node hears only from the members above it and those
+   that pin it, and a majority would leave about half of them refused and waiting for good. What is
+   left: a node no member admits over its patience, refused only by a member that dialed another
+   member at this node's address (its port since taken by this node), or by a member's verifier that
+   could not take its certificate (one that expired as it ran, a skewed clock), is retired wrongly,
+   and its data is the cell's to rebuild once its absence passes the repair time (§5), as for any
+   node that stops; and a written-off node above every member it holds, and pinned by none, hears no
    refusal at all, which the rejoin closes (slice 6: a member that reached no member over its
    patience dials each one its replica holds, each once). The node writes a marker, `rejoin`,
    holding its old certificate's fingerprint, whole and durable (hyper-block's record: a temporary
-   name, the platform's full flush, a rename, its directory flushed, and a CRC-32C checked on
-   read, as the node keeps its run, node.md §1.6), and says `retired`.
+   name, the platform's full flush, a rename, its directory flushed, and a CRC-32C checked on read,
+   as the node keeps its run, node.md §1.6), and says `retired`.
 2. **It stops serving.** Its doors, ranges and chunk service stop; it dials no member under its old
    identity and writes no liveness record. A node that starts with the marker present starts here.
    Until the rejoin is built (slices 3 to 6), the process ends here: the marker kept, it says

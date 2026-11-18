@@ -3192,11 +3192,12 @@ impl Retirement {
     /// refuses; from the turn that first held so, so a refusal of its join does not count; and
     /// only once `patience_ns` has passed since, so each member it dials or is dialed by has
     /// answered. Then retired when a member its replica holds serving or leaving refused its
-    /// identity since, that link's latest ending `Identity`, and no such member admits it, none
-    /// connected now: a member connected is the cell's word that it is not written off. A link
-    /// that ended another way since, a timeout or a bound of the peer's admission, says nothing
-    /// either way, and a refusal by a node its replica does not hold serving or leaving says
-    /// nothing of it.
+    /// identity since, that link's latest ending a connection that was up closed `Identity`, the
+    /// peer's word on this node's certificate (a dial this node's own directory or verifier ended,
+    /// a certificate not the one it dialed, is not), and no such member admits it, none connected
+    /// now: a member connected is the cell's word that it is not written off. A link that ended
+    /// another way since, a timeout or a bound of the peer's admission, says nothing either way,
+    /// and a refusal by a node its replica does not hold serving or leaving says nothing of it.
     fn judge(
         &mut self,
         standing: impl Fn(u64) -> Option<MemberState>,
@@ -3232,7 +3233,7 @@ impl Retirement {
                 .ok()
                 .and_then(|at| ended.get(at))
                 .map_or(0, |(_, then)| *then);
-            refused |= link.ended > then && link.refusal == Some(Refusal::Identity);
+            refused |= link.ended > then && link.was_up && link.refusal == Some(Refusal::Identity);
         }
         refused
     }
@@ -3787,6 +3788,7 @@ mod tests {
             suspected: 2,
             suspect: false,
             refusal: Some(hyper_transport::Refusal::Closed),
+            was_up: true,
         };
         let quiet = Link {
             keyed: false,
@@ -4475,6 +4477,7 @@ mod tests {
             suspected: 0,
             suspect: false,
             refusal,
+            was_up: true,
         };
         let identity = Some(Refusal::Identity);
         // Node 1 leaves; 2 and 3 serve, 4 is gone, 5 removed, 6 delisted.
@@ -4522,7 +4525,8 @@ mod tests {
         assert_eq!(leave.settle(removed, 1, links.into_iter()), None);
     }
 
-    /// A link as the node keeps it, for the retirement's tests.
+    /// A link as the node keeps it, for the retirement's tests: its last ending a connection's
+    /// close, up until then, where it ended at all.
     fn link(peer: u64, keyed: bool, ended: u64, refusal: Option<Refusal>) -> Link {
         Link {
             peer,
@@ -4532,6 +4536,7 @@ mod tests {
             suspected: 0,
             suspect: false,
             refusal,
+            was_up: true,
         }
     }
 
@@ -4616,6 +4621,20 @@ mod tests {
             link(4, false, 2, Some(Refusal::Closed)),
         ];
         assert!(!retirement.judge(serving, 1, mismatch.into_iter(), (2_000, PATIENCE)));
+        // This node's own dials refused, every member's: a certificate not the one it dialed, or
+        // one its verifier could not take (another cell's node at a member's old port), ends a
+        // dial before it is up, and says nothing of this node.
+        let own = [
+            Link {
+                was_up: false,
+                ..link(2, false, 3, identity)
+            },
+            Link {
+                was_up: false,
+                ..link(3, false, 3, identity)
+            },
+        ];
+        assert!(!retirement.judge(serving, 1, own.into_iter(), (2_000, PATIENCE)));
         // A connection up the moment before its refusal closes it: admitted while it is up.
         let brief = [link(2, true, 1, None), link(3, false, 2, identity)];
         assert!(!retirement.judge(serving, 1, brief.into_iter(), (2_000, PATIENCE)));

@@ -4,6 +4,7 @@
 //!
 //! - [`bounds`]: every bound of a transport, derived from what its owner states.
 //! - [`classes`]: the kinds of message QUIC carries, their classes and who may send each.
+//! - [`enroll`]: a written-off node's request for a new identity and its answer.
 //! - [`object`]: an object's request and reply, S3's operations on the native protocol.
 
 #![cfg_attr(
@@ -26,6 +27,7 @@ static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Countin
 
 pub mod bounds;
 pub mod classes;
+pub mod enroll;
 pub mod object;
 
 /// The name a node's certificate carries and a dial checks it against (RFC 6125).

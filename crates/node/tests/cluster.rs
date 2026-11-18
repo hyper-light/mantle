@@ -534,6 +534,7 @@ impl Pki {
             history: mantle_meta::record::History::default(),
             max_nodes: 0,
             seeds: Vec::new(),
+            issuer: None,
         }
     }
 }

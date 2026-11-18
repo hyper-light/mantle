@@ -10,6 +10,7 @@
 //! | `ChunkPut`, `ChunkGet` | transfer, an exchange | nodes and gateways | a chunk's bytes to the volume that keeps them, a range of them back (mantle-node's `chunk`) |
 //! | `Object` | transfer, an exchange | anyone | a bucket made, an object's bytes put, a range of them got ([`crate::object`]) |
 //! | `Snapshot` | bulk, an exchange | nodes | a range's snapshot to a member that lags past the log's start |
+//! | `Enroll` | request, an exchange | enrolling nodes, and nodes forwarding for them | a written-off node's request for a new identity, and its answer ([`crate::enroll`]) |
 //!
 //! The frame bound of each class is the largest message of that kind the node's ranges can make,
 //! stated once a process ([`Bounds`]), so a receiver refuses a larger frame before it reserves
@@ -36,6 +37,7 @@ pub enum Kind {
     ChunkPut,
     ChunkGet,
     Object,
+    Enroll,
 }
 
 /// The classes a node's QUIC connections share credit by, most urgent first (node.md §3.1, §3.3):
@@ -109,7 +111,7 @@ pub fn state_bounds(bounds: Bounds) -> Result<(), BoundsTaken> {
 /// The classes of a node's connections ([`Kind`], [`Class`], [`Role`]).
 pub struct NodeClasses;
 
-const KINDS: [Kind; 7] = [
+const KINDS: [Kind; 8] = [
     Kind::Raft,
     Kind::Command,
     Kind::Snapshot,
@@ -117,6 +119,7 @@ const KINDS: [Kind; 7] = [
     Kind::ChunkPut,
     Kind::ChunkGet,
     Kind::Object,
+    Kind::Enroll,
 ];
 
 impl Classes for NodeClasses {
@@ -147,9 +150,13 @@ impl Classes for NodeClasses {
             (Kind::ChunkPut | Kind::ChunkGet, Role::Node | Role::Gateway) => Some(Class::Transfer),
             // An object's body is a large request's: the transfer level (node.md §3.1).
             (Kind::Object, Role::Node | Role::Gateway | Role::Client) => Some(Class::Transfer),
-            (Kind::Raft | Kind::Snapshot, Role::Gateway | Role::Client)
+            // A written-off node's request for a new identity, and a member's forward of it to the
+            // root range's leader, which a member answers by a command of the root range
+            // (membership.md §5.1 step 3).
+            (Kind::Enroll, Role::Enrolling | Role::Node) => Some(Class::Request),
+            (Kind::Raft | Kind::Snapshot | Kind::Enroll, Role::Gateway | Role::Client)
             | (Kind::Command | Kind::Read | Kind::ChunkPut | Kind::ChunkGet, Role::Client) => None,
-            // An enrolling node sends none of these (membership.md §5.1).
+            // An enrolling node sends none of a member's messages (membership.md §5.1).
             (_, Role::Enrolling) => None,
         }
     }
@@ -173,6 +180,7 @@ impl Classes for NodeClasses {
             Kind::ChunkPut => 5,
             Kind::ChunkGet => 6,
             Kind::Object => 7,
+            Kind::Enroll => 8,
         }
     }
 
@@ -207,7 +215,7 @@ mod tests {
             );
         }
         assert_eq!(NodeClasses::kind_of(0), None);
-        assert_eq!(NodeClasses::kind_of(8), None);
+        assert_eq!(NodeClasses::kind_of(9), None);
     }
 
     #[test]
@@ -260,15 +268,24 @@ mod tests {
     }
 
     /// A node enrolling under its old certificate sends none of a node's, a gateway's or a
-    /// client's messages (membership.md §5.1).
+    /// client's messages, only its request, which a node forwards and no gateway or client sends
+    /// (membership.md §5.1).
     #[test]
-    fn an_enrolling_node_sends_no_member_message() {
+    fn an_enrolling_node_sends_its_request_alone() {
         for kind in KINDS {
-            assert_eq!(
-                NodeClasses::class_of(kind, Role::Enrolling),
-                None,
-                "{kind:?}"
-            );
+            let class = NodeClasses::class_of(kind, Role::Enrolling);
+            if kind == Kind::Enroll {
+                assert_eq!(class, Some(Class::Request));
+            } else {
+                assert_eq!(class, None, "{kind:?}");
+            }
+        }
+        assert_eq!(
+            NodeClasses::class_of(Kind::Enroll, Role::Node),
+            Some(Class::Request)
+        );
+        for role in [Role::Gateway, Role::Client] {
+            assert_eq!(NodeClasses::class_of(Kind::Enroll, role), None);
         }
     }
 

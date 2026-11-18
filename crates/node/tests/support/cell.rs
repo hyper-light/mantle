@@ -803,6 +803,7 @@ impl Sim {
             history: mantle_meta::record::History::default(),
             max_nodes: 0,
             seeds: Vec::new(),
+            issuer: None,
         };
         self.starts += 1;
         let shard = member.shard;

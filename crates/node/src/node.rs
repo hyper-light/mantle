@@ -71,6 +71,7 @@ use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object;
 
 mod answers;
+mod enrollments;
 mod host;
 mod members;
 mod repair;
@@ -181,6 +182,9 @@ pub struct NodeSettings<E> {
     /// The nodes this node dials first, whatever their ids, until it is a member: a granted
     /// node's seeds (membership.md §3 step 2), each one known by its name under the authority.
     pub seeds: Vec<PeerId>,
+    /// The cell's issuer, its certificate and key, where the cell has one (membership.md §5.1):
+    /// what the root range's leader signs a written-off node's new certificate with.
+    pub issuer: Option<crate::enroll::Issuer>,
 }
 
 /// The wall clock a node stamps each entry it proposes with, nanoseconds since the Unix epoch: the
@@ -647,6 +651,8 @@ enum Then {
     Asked,
     /// An entry of commands this node asked: its peer's reply.
     Commanded,
+    /// A written-off node's request forwarded to the root range's leader: its reply.
+    Forwarded,
 }
 
 /// A body arriving on an exchange: from whom, its length, how much of it was read and what of it
@@ -701,6 +707,10 @@ enum Arriving {
     Answers,
     /// The answer to a read this node asked.
     ReadAnswer,
+    /// A written-off node's request for a new identity, or a member's forward of one.
+    Enroll,
+    /// The root range's leader's answer to a written-off node's request this node forwarded.
+    Enrolled,
 }
 
 impl Arriving {
@@ -713,7 +723,9 @@ impl Arriving {
             | Self::Redirect(_)
             | Self::Status(_)
             | Self::Answers
-            | Self::ReadAnswer => classes::Class::Request,
+            | Self::ReadAnswer
+            | Self::Enroll
+            | Self::Enrolled => classes::Class::Request,
             Self::ChunkPut { .. }
             | Self::ChunkGet { .. }
             | Self::ChunkStatus(_)
@@ -730,7 +742,9 @@ impl Arriving {
             | Self::ChunkPut { .. }
             | Self::ChunkBytes(_)
             | Self::Answers
-            | Self::ReadAnswer => true,
+            | Self::ReadAnswer
+            | Self::Enroll
+            | Self::Enrolled => true,
             Self::Redirect(_) | Self::Status(_) | Self::ChunkGet { .. } | Self::ChunkStatus(_) => {
                 false
             }
@@ -1094,6 +1108,13 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The root range's commands this node asks as its leader, one out at most a member: each its
     /// ask and the member it names (membership.md §4, §5).
     duties: Vec<(CommandAsk, u64)>,
+    /// The cell's issuer, where the cell has one (membership.md §5.1).
+    issuer: Option<crate::enroll::Issuer>,
+    /// The written-off nodes' requests this node holds, at most `command_asks`
+    /// (`enrollments`), and the highest issuer's grant its own re-grants spent, which the root
+    /// range's rows may not yet hold.
+    enrollments: Vec<enrollments::Enrollment>,
+    issuer_spent: u64,
     /// The members whose reach names a host the process looks up, not yet taken
     /// ([`Node::take_reached`]): at most the cell's members.
     reached: Vec<(u64, String, String)>,
@@ -1493,6 +1514,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             cell: None,
             max_nodes: settings.max_nodes,
             duties: Vec::new(),
+            issuer: settings.issuer,
+            enrollments: Vec::new(),
+            issuer_spent: 0,
             reached: Vec::new(),
         };
         for kept in &node.ranges {
@@ -2368,6 +2392,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.step_reads(now)?;
         self.step_replacements();
         self.step_members()?;
+        self.step_enrollments(now)?;
         self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;
@@ -2916,6 +2941,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     self.take_object(exchange, peer, body);
                     return Ok(());
                 }
+                if kind == Kind::Enroll {
+                    return self.take_enrollment(exchange, peer, body);
+                }
                 let what = match kind {
                     Kind::Snapshot => Arriving::Snapshot,
                     Kind::Command => self.take_request(exchange, Arriving::Command),
@@ -2933,8 +2961,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         }
                     },
                     // A Raft message travels on a lane, never on an exchange; an object's is the
-                    // host's, taken above.
-                    Kind::Raft | Kind::Object => {
+                    // host's and an enrollment's the member's, taken above.
+                    Kind::Raft | Kind::Object | Kind::Enroll => {
                         self.driver
                             .endpoint()
                             .refuse_exchange(exchange, Refusal::Kind);
@@ -2966,6 +2994,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if self.read_on(exchange).is_some() {
                     return self.read_replied(exchange, body.unwrap_or(0), now);
                 }
+                if self.forwarded_on(exchange) {
+                    return self.forward_replied(exchange, body);
+                }
                 self.snapshot_done(exchange, true);
                 self.driver.endpoint().end(exchange);
                 Ok(())
@@ -2994,6 +3025,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     .retain(|r| r.origin != ReadOrigin::Exchange(exchange));
                 self.ask_lost(exchange);
                 self.job_lost(exchange);
+                self.enrollment_lost(exchange);
                 self.keep_pool();
                 Ok(())
             }
@@ -3501,6 +3533,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(Then::Commanded) if whole => {
                 self.writing.swap_remove(at);
             }
+            // A forward whose bytes could not all go is forwarded again; one sent whole waits.
+            Some(Then::Forwarded) if failed.is_some() => {
+                self.writing.swap_remove(at);
+                self.driver.endpoint().end(exchange);
+                self.enrollment_lost(exchange);
+            }
+            Some(Then::Forwarded) if whole => {
+                self.writing.swap_remove(at);
+            }
             _ => {}
         }
     }
@@ -3676,6 +3717,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.read_came(exchange, &received.bytes);
                 Ok(())
             }
+            Arriving::Enroll => self.enrollment_read(exchange, received.peer, &received.bytes),
+            Arriving::Enrolled => self.forward_answered(exchange, &received.bytes),
         }
     }
 

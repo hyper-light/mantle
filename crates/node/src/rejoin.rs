@@ -1,6 +1,7 @@
-//! A node the cell wrote off coming back as a new member (docs/design/membership.md §5.1): the wipe
-//! (step 4) and the identity's switch (step 5), each an act done whole and durable before the next,
-//! and the resume table a start reads its place in them from, its files alone.
+//! A node the cell wrote off coming back as a new member (docs/design/membership.md §5.1): its
+//! request for a new identity ([`ask`], step 3), the wipe (step 4) and the identity's switch (step
+//! 5), each an act done whole and durable before the next, and the resume table a start reads its
+//! place in them from, its files alone.
 //!
 //! The node's identity is kept in one of two places in the `identity` directory beside its
 //! configuration, `node.der` and `node.key` or `next.der` and `next.key`: the configuration names
@@ -11,11 +12,22 @@
 //! there by the switch: nothing here removes a path a configuration's value names, only one built
 //! from the node's layout and these names.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::time::Duration;
 
+use hyper_rt::combine::{Either, race2};
+use hyper_rt_transport::Driver;
+use hyper_transport::tls::Tls;
+use hyper_transport::{Config, Endpoint, Event, ExchangeId, Fixed, PeerId, Progress, Refusal};
 use mantle_cert::KeyPair;
 use mantle_meta::record::FINGERPRINT;
+use mantle_protocol::bounds::{self, Stated};
+use mantle_protocol::classes::{self, Kind, NodeClasses, Role};
+use mantle_protocol::enroll as wire;
 
+use crate::directory::Peers;
 use crate::files;
 use crate::layout::{LIVE, LOG, Layout, LayoutError, RUN, STOPPED};
 use crate::secret::{self, SecretError};
@@ -414,6 +426,248 @@ pub fn keep_certificate(configured: &Configured, certificate: &[u8]) -> Result<(
     files::write(&at, certificate)?;
     Ok(())
 }
+
+/// What [`ask`] is given: the old identity's credentials (its certificate, its key and the
+/// authority's certificate its members chain to), the members to dial, each its id and where its
+/// QUIC endpoint listens, at most the cell's bound on nodes, the key asked for, where its endpoint
+/// binds, and the transport's bounds as the cell's nodes state them.
+pub struct Asking {
+    pub credentials: hyper_transport::tls::Credentials,
+    pub members: Vec<(PeerId, SocketAddr)>,
+    pub key: [u8; wire::KEY],
+    pub bind: SocketAddr,
+    pub messages: classes::Bounds,
+    pub transport_bytes: u64,
+}
+
+/// Why [`ask`] came back with no new identity.
+#[derive(Debug, thiserror::Error)]
+pub enum AskError {
+    /// A member answered the cell's refusal (membership.md §5.1 step 3): it stands until a person
+    /// or a supervisor acts.
+    #[error("rejoin refused {0:?}: {0}")]
+    Refused(wire::Refusal),
+    /// No member answered within the stock patience.
+    #[error("rejoin unreachable: no member answered")]
+    Unreachable,
+    /// A member's answer does not decode.
+    #[error("a member's answer: {0}")]
+    Answer(#[from] wire::EnrollError),
+    #[error("the transport: {0:?}")]
+    Transport(Refusal),
+    #[error("the runtime: {0}")]
+    Runtime(String),
+    #[error("the transport's bounds: {0}")]
+    Bounds(String),
+}
+
+impl From<Refusal> for AskError {
+    fn from(r: Refusal) -> Self {
+        Self::Transport(r)
+    }
+}
+
+impl From<hyper_rt::RtError> for AskError {
+    fn from(e: hyper_rt::RtError) -> Self {
+        Self::Runtime(format!("{e:?}"))
+    }
+}
+
+/// The endpoint a written-off node asks from: a client's, under its old certificate, offering the
+/// enrollment protocol alone.
+type Asker = Driver<NodeClasses, Fixed, Peers>;
+
+/// Asks the cell for a new identity (membership.md §5.1 step 3): dials each of `asking`'s members
+/// in turn, once each, under the enrollment protocol alone and the old certificate, sends
+/// `Regrant { key }` and reads the answer, each member given the stock patience
+/// (`bounds::STOCK_PATIENCE`) from its dial to its answer. The first member's certificate, or the
+/// first refusal of the cell's, is the round's; a member that is not reached, loses the
+/// exchange, or answers that the root range did not answer in time passes the round to the next.
+/// Each connection is closed once its one request is answered.
+pub async fn ask(asking: Asking) -> Result<wire::Granted, AskError> {
+    classes::state_bounds(asking.messages).map_err(|e| AskError::Bounds(e.to_string()))?;
+    let peers = asking.members.len();
+    let stated = Stated {
+        peers,
+        replicas: 0,
+        clients: 0,
+        pool: 0,
+        // One request out, to one member at a time.
+        ranges: 1,
+        inflight: 0,
+        // Nothing replicates to it: one lane, the least a peer may open.
+        lanes: 1,
+        transfers: 0,
+        asked: 0,
+        transport_bytes: asking.transport_bytes,
+        messages: asking.messages,
+        max_head: crate::node::MAX_HEAD,
+    };
+    let limits = bounds::limits(&stated).map_err(|e| AskError::Bounds(e.to_string()))?;
+    let io = bounds::io(&stated);
+    let mut tls = Tls::mutual(&asking.credentials, false)?;
+    tls.client.alpn_protocols = vec![classes::ENROLL.to_vec()];
+    let config = Config {
+        tls,
+        role: Role::Enrolling,
+        limits,
+        congestion: Default::default(),
+    };
+    let budget = Fixed::new(asking.transport_bytes, peers.max(1));
+    // Each member is dialed by its name under the authority, as a granted node's seeds are.
+    let mut directory = Peers::new(Vec::new(), 0);
+    for (id, _) in &asking.members {
+        directory.seed(*id);
+    }
+    let endpoint = Endpoint::new(
+        config,
+        budget,
+        directory,
+        hyper_rt_transport::shard_instant(),
+    )?;
+    let mut driver = Driver::bind(endpoint, asking.bind, io)?;
+    let request = wire::Request::Regrant { key: asking.key }.encode();
+    let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
+    for (id, at) in &asking.members {
+        let until_ns = hyper_rt::futures::now_ns().saturating_add(patience);
+        let answered = ask_one(&mut driver, (*id, *at), &request, until_ns).await?;
+        let clock = driver.clock()?;
+        driver.endpoint().disconnect(clock, *id);
+        match answered
+            .map(|bytes| wire::Answer::decode(&bytes))
+            .transpose()?
+        {
+            Some(wire::Answer::Granted(granted)) => return Ok(granted),
+            Some(wire::Answer::Refused(wire::Refusal::Unanswered | wire::Refusal::Unled))
+            | None => {}
+            Some(wire::Answer::Refused(refusal)) => return Err(AskError::Refused(refusal)),
+        }
+    }
+    Err(AskError::Unreachable)
+}
+
+/// Asks member `id`, listening at `at`, once, by `until_ns` on the shard's clock: the answer's
+/// bytes, or none where it was not reached or the exchange ended without one.
+async fn ask_one(
+    driver: &mut Asker,
+    (id, at): (PeerId, SocketAddr),
+    request: &[u8],
+    until_ns: u64,
+) -> Result<Option<Vec<u8>>, AskError> {
+    let clock = driver.clock()?;
+    if driver.endpoint().connect(clock, id, at).is_err() {
+        return Ok(None);
+    }
+    loop {
+        match next_event(driver, until_ns).await? {
+            Some(Event::Connected { peer, .. }) if peer == id => break,
+            Some(Event::Unreachable { peer, .. } | Event::Closed { peer, .. }) if peer == id => {
+                return Ok(None);
+            }
+            Some(_) => {}
+            None => return Ok(None),
+        }
+    }
+    let clock = driver.clock()?;
+    let left = until_ns.saturating_sub(hyper_rt::futures::now_ns()).max(1);
+    let period = Progress::new(Duration::from_nanos(left))?;
+    let len = u64::try_from(request.len()).unwrap_or(u64::MAX);
+    let Ok(exchange) = driver
+        .endpoint()
+        .open(clock, id, Kind::Enroll, &[], Some(len), period)
+    else {
+        return Ok(None);
+    };
+    let mut written = 0usize;
+    let mut bytes = Vec::new();
+    let mut replied = false;
+    loop {
+        while let Some(rest) = request.get(written..)
+            && !rest.is_empty()
+        {
+            match driver.endpoint().write_body(exchange, rest) {
+                Ok(0) => break,
+                Ok(took) => written = written.saturating_add(took),
+                Err(_) => return Ok(None),
+            }
+        }
+        match next_event(driver, until_ns).await? {
+            Some(Event::Reply { exchange: e, .. }) if e == exchange => {
+                replied = true;
+                if read_answer(driver, exchange, &mut bytes)? {
+                    return Ok(Some(bytes));
+                }
+            }
+            Some(Event::BodyReady { exchange: e }) if e == exchange && replied => {
+                if read_answer(driver, exchange, &mut bytes)? {
+                    return Ok(Some(bytes));
+                }
+            }
+            Some(Event::Refused { exchange: e, .. }) if e == exchange => return Ok(None),
+            Some(Event::Unreachable { peer, .. } | Event::Closed { peer, .. }) if peer == id => {
+                return Ok(None);
+            }
+            Some(_) => {}
+            None => {
+                driver.endpoint().end(exchange);
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Reads what has arrived of the answer on `exchange` into `into`: whether it is whole, its
+/// checksum verified.
+fn read_answer(
+    driver: &mut Asker,
+    exchange: ExchangeId,
+    into: &mut Vec<u8>,
+) -> Result<bool, AskError> {
+    let endpoint = driver.endpoint();
+    loop {
+        let mut piece = endpoint.reserve(classes::Class::Request, PIECE)?;
+        let got = endpoint.read_body(exchange, &mut piece);
+        into.extend_from_slice(piece.bytes());
+        endpoint.release(piece);
+        if got? == 0 {
+            break;
+        }
+    }
+    if !endpoint.body_complete(exchange) {
+        return Ok(false);
+    }
+    endpoint.end(exchange);
+    Ok(true)
+}
+
+/// The asker's next event, or none once `until_ns` passes on the shard's clock.
+async fn next_event(
+    driver: &mut Asker,
+    until_ns: u64,
+) -> Result<Option<Event<NodeClasses>>, AskError> {
+    if let Some(event) = driver.endpoint().poll_event() {
+        return Ok(Some(event));
+    }
+    let left = until_ns.saturating_sub(hyper_rt::futures::now_ns());
+    if left == 0 {
+        return Ok(None);
+    }
+    let ended = {
+        let event = pin!(driver.event());
+        let sleep = pin!(hyper_rt::futures::sleep(left));
+        race2(event, sleep).await
+    };
+    match ended {
+        Either::First(event) => Ok(Some(event?)),
+        Either::Second(slept) => {
+            slept?;
+            Ok(None)
+        }
+    }
+}
+
+/// The piece an answer is read in: the transport's own receive chunk.
+const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
 #[cfg(test)]
 pub(crate) mod tests {

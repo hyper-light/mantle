@@ -582,6 +582,43 @@ grant with one re-grant out at a time, the start keeping the issuer's key for th
 it and drops it still), one request a connection and its close after the answer, and the node's
 client call `rejoin::ask`.
 
+*As built (slice 5c, 2026-11-18;* `mantle_protocol::enroll`*, `crate::node::enrollments`,
+`crate::rejoin::ask`*).* The request is a message of its own kind, `Enroll` (the request class),
+sent by an enrolling node and by a member forwarding one's, never by a gateway or a client. A
+request is the exchange's body, its head empty, so no head of the node's grows (`node::MAX_HEAD`):
+`Regrant { key }` from the written-off node, `Forward { old, fingerprint, old_key, key }` from a
+member to the root range's leader; the answer is the reply's body, `Granted` (the certificate, the
+issuer's and each member serving or leaving, its id and its QUIC and plane places, as a `seed`
+line names them) or `Refused` with its code, each written at its length into one buffer and each
+with golden vectors. Beside the refusals of step 3 the answer carries three the request's path
+makes: `Conflict` (the id the leader drew is taken), `Unanswered` (the member's patience passed
+with no outcome) and `Unled` (a forward reached a node that no longer leads, which the member
+forwards again to the leader it knows then; never answered to the written-off node). A member
+takes an `Enroll` request only from a node its directory admits as enrolling, as the identity its
+handshake proved (`Peers::enrolling`), or a `Forward` from a member not enrolling; holds at most
+`command_asks` requests, a second of one node while its first is held refused `Budget` as one past
+the bound is; judges it (`enroll::judge`) before the root range is asked; and answers each once,
+by the stock patience (`bounds::STOCK_PATIENCE`) at most, `Unanswered` past it. The root range's
+leader, one re-grant out at a time, draws the new id from the OS (`getrandom`, as `mantle init`
+draws ids), takes the grant after the higher of the issuer window's top as its rows last held it
+and its own last re-grant's, signs and proposes the `Regrant`, and answers `Granted` with the
+certificate it signed, or the ledger's where the same key was re-granted before, or the root
+range's refusal. A start keeps the issuer it verified (`enroll::Issuer`) and hands it to the node.
+`rejoin::ask` dials each member it is given in turn, once, under the old certificate with the
+enrollment protocol alone, its directory admitting on that protocol only the member it dialed,
+by its name as a seed's (`Peers::seed`), sends `Regrant { key }` and reads the answer, each member given the
+stock patience from its dial; the first certificate or refusal of the cell's ends the round, and
+`Unanswered` or a member not reached passes it to the next; it closes each connection once its
+request is answered, the close after one request being the asker's: a member closing first could
+discard its answer in flight (RFC 9000 §10.2). Tested: the wire's golden vectors and lengths
+(`mantle_protocol::enroll`), the asker taken as its handshake proved it and the root range's
+refusals as the wire's (`node::enrollments`), and `rejoin::ask` against a stub member on the
+enrollment protocol, answered once with a certificate `mantle_cert::node_issued` takes as the
+issuer's, or `SameKey` for the old key (`crates/node/tests/enroll.rs`). Left to slice 6: the
+start's call of `rejoin::ask` with its kept next key and the members it knows, the wait at a
+member for a `NotRemoved` member's removal, and the real-process tests through a member's own
+handler and the root range's leader.
+
 **What stays forbidden.** The old identity is never admitted again: its grant stays spent in its
 issuer's window and its member written off. A re-grant draws a new id and refuses the old key. The
 issuer signs node certificates alone, never a CA, a gateway's or a client's, and the directory

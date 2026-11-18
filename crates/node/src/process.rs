@@ -287,6 +287,8 @@ struct Identity {
     grant: Option<u64>,
     issued: bool,
     fingerprint: [u8; mantle_meta::record::FINGERPRINT],
+    /// The cell's issuer, kept for the node where the cell has one (membership.md §5.1).
+    issuer: Option<crate::enroll::Issuer>,
 }
 
 /// What a node's join states of its certificate: the grant it names where it was granted, whether
@@ -300,8 +302,13 @@ pub const ISSUER: (&str, &str) = ("issuer.der", "issuer.key");
 
 /// The cell's issuer beside the authority's certificate at `at`, `authority` its bytes, where the
 /// cell has one: its certificate, of the issuer's profile and issued by the authority, valid `now`
-/// (`mantle_cert::issuer_issued`), and its key, owner-only, the one that certificate certifies.
-fn issuer(at: &Path, authority: &[u8], now: u64) -> Result<Option<Vec<u8>>, ProcessError> {
+/// (`mantle_cert::issuer_issued`), and its key, owner-only, the one that certificate certifies,
+/// kept for the node, whose root range's leader signs with it (membership.md §5.1).
+fn issuer(
+    at: &Path,
+    authority: &[u8],
+    now: u64,
+) -> Result<Option<crate::enroll::Issuer>, ProcessError> {
     let (certificate, key) = (at.with_file_name(ISSUER.0), at.with_file_name(ISSUER.1));
     if !certificate
         .try_exists()
@@ -314,15 +321,14 @@ fn issuer(at: &Path, authority: &[u8], now: u64) -> Result<Option<Vec<u8>>, Proc
         .map_err(|e| ProcessError::Certificate(certificate.clone(), e))?;
     let pair = mantle_cert::KeyPair::from_pkcs8(&read_secret(&key)?)
         .map_err(|e| ProcessError::Certificate(key.clone(), e))?;
-    let certified = mantle_cert::public_key(&der)
-        .map_err(|e| ProcessError::Certificate(certificate.clone(), e))?;
-    if certified != pair.public_key() {
-        return Err(ProcessError::Read(
+    match crate::enroll::Issuer::new(der, pair) {
+        Ok(issuer) => Ok(Some(issuer)),
+        Err(mantle_cert::CertError::Key) => Err(ProcessError::Read(
             key,
             "not the key the issuer's certificate beside it certifies".into(),
-        ));
+        )),
+        Err(e) => Err(ProcessError::Certificate(certificate, e)),
     }
-    Ok(Some(der))
 }
 
 /// Reads the identity the configuration names: the node's `certificate` and `key`, the cell's
@@ -351,16 +357,21 @@ fn identity(
     };
     let issuer = issuer(authority_at, &authority, now)?;
     let own = read_file(certificate)?;
-    let signed = mantle_cert::node_issued(&own, issuer.as_deref(), &authority, now)
-        .map_err(|e| ProcessError::Certificate(certificate.to_path_buf(), e))?;
+    let signed = mantle_cert::node_issued(
+        &own,
+        issuer.as_ref().map(crate::enroll::Issuer::certificate),
+        &authority,
+        now,
+    )
+    .map_err(|e| ProcessError::Certificate(certificate.to_path_buf(), e))?;
     let grant = mantle_cert::node_names(&own)
         .map_err(|e| ProcessError::Certificate(certificate.to_path_buf(), e))?
         .grant;
     let fingerprint = mantle_cert::fingerprint(&own);
     let mut chain = vec![CertificateDer::from(own)];
     let issued_by_issuer = signed == mantle_cert::IssuedBy::Issuer;
-    if issued_by_issuer && let Some(issuer) = issuer {
-        chain.push(CertificateDer::from(issuer));
+    if issued_by_issuer && let Some(issuer) = &issuer {
+        chain.push(CertificateDer::from(issuer.certificate().to_vec()));
     }
     let mut known = Vec::with_capacity(peers.len());
     for peer in peers {
@@ -385,6 +396,7 @@ fn identity(
         grant,
         issued: issued_by_issuer,
         fingerprint,
+        issuer,
     })
 }
 
@@ -1806,6 +1818,7 @@ fn run_node(
         grant,
         issued,
         fingerprint,
+        issuer,
     } = identity;
     let gateway = config
         .gateway
@@ -1866,7 +1879,7 @@ fn run_node(
             config,
             storage,
             gateway,
-            (credentials, peers, (grant, issued, fingerprint)),
+            (credentials, peers, (grant, issued, fingerprint), issuer),
             (resolved, s3, others),
             (asked, at_once),
         )
@@ -2370,7 +2383,12 @@ async fn serve(
     config: ProcessConfig,
     storage: Storage,
     gateway: Option<GatewaySettings>,
-    (credentials, peers, (grant, issued, fingerprint)): (Credentials, Vec<Peer>, Joins),
+    (credentials, peers, (grant, issued, fingerprint), issuer): (
+        Credentials,
+        Vec<Peer>,
+        Joins,
+        Option<crate::enroll::Issuer>,
+    ),
     (resolved, s3, others): (Resolved, Option<S3Keys>, Vec<SlotHolder>),
     (asked, at_once): (Asked, SyncSender<Ended>),
 ) -> Result<(), ProcessError> {
@@ -2476,6 +2494,7 @@ async fn serve(
         history,
         max_nodes,
         seeds: config.seeds.iter().map(|s| s.id).collect(),
+        issuer,
     };
     let mut node = Node::open(settings).await.map_err(opened)?;
     // Each range placed past the first shard moves to its shard before the node's first turn

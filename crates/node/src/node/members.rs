@@ -57,6 +57,8 @@ pub struct Cell {
     ledger: Vec<(u64, Ledgered)>,
     /// The cell's setting for a written-off node coming back.
     rejoin: Rejoin,
+    /// The highest grant the cell's issuer's window has spent (membership.md §5.1).
+    issuer_top: u64,
 }
 
 impl Cell {
@@ -96,6 +98,11 @@ impl Cell {
     pub fn rejoin(&self) -> Rejoin {
         self.rejoin
     }
+
+    /// The highest grant the cell's issuer's window has spent: a re-grant takes the one after.
+    pub fn issuer_top(&self) -> u64 {
+        self.issuer_top
+    }
 }
 
 /// The root range's rows the membership reads, as its member held them after an entry it applied:
@@ -114,6 +121,8 @@ pub(crate) struct Rows {
     /// The ledger's entries, at most those it counts, and the cell's `rejoin` setting.
     ledger: Vec<(u64, Ledgered)>,
     rejoin: Rejoin,
+    /// The highest grant the issuer's window has spent.
+    issuer_top: u64,
 }
 
 impl Rows {
@@ -145,6 +154,7 @@ impl Rows {
         let ledger =
             root::ledger(engine, usize::try_from(held).unwrap_or(usize::MAX)).map_err(meta)?;
         let rejoin = root::rejoin(engine).map_err(meta)?;
+        let issuer_top = root::issuer_grants(engine).map_err(meta)?.top;
         Ok(Self {
             applied,
             members,
@@ -153,6 +163,7 @@ impl Rows {
             holding,
             ledger,
             rejoin,
+            issuer_top,
         })
     }
 }
@@ -229,7 +240,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The root range's member: its slot's handle and its group.
-    fn root_range(&self) -> Option<(hyper_durable::Handle, u128)> {
+    pub(super) fn root_range(&self) -> Option<(hyper_durable::Handle, u128)> {
         self.ranges
             .iter()
             .find(|k| k.layer == Layer::Root)
@@ -267,6 +278,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             holding,
             ledger,
             rejoin,
+            issuer_top,
         } = rows;
         if members.is_empty() && grants.top == 0 && self.cell.is_none() {
             // No member has joined: a cell made before grants, or one whose founders have yet to.
@@ -312,6 +324,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             removed,
             ledger,
             rejoin,
+            issuer_top,
         });
         self.keep_peers()
     }

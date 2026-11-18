@@ -691,6 +691,10 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/node/src/chunk.rs` `REPLY_HEAD_BYTES` | format | `1` | A chunk reply's head: its status, one byte. |
 | `crates/node/src/client.rs` `PERSISTENT_CONGESTION_THRESHOLD` | external | `3` | `kPersistentCongestionThreshold`, three probe timeouts with no acknowledgement (RFC 9002 §7.6.1): the least an exchange is given once the client has measured its exchanges. |
 | `crates/node/src/client.rs` `PIECE` | derived | `hyper_transport::RECEIVE_CHUNK as u64` | hyper-transport's `RECEIVE_CHUNK`: a reply's body is read a receive chunk at a time. |
+| `crates/node/src/rejoin.rs` `PIECE` | derived | `hyper_transport::RECEIVE_CHUNK as u64` | hyper-transport's `RECEIVE_CHUNK`: an enrollment's answer is read a receive chunk at a time, as a client reads a reply. |
+| `crates/node/src/rejoin.rs` `ask:ranges` | derived | `1` | A written-off node's request: one exchange out, to one member at a time (docs/design/membership.md §5.1 step 3; a structural limit, not a number). |
+| `crates/node/src/rejoin.rs` `ask:lanes` | derived | `1` | The Raft lanes a member may open to a written-off node asking (`bounds::Stated::lanes`): nothing replicates to it, and one lane is the least the transport takes (`Limits::validate` refuses none). |
+| `crates/node/src/node/enrollments.rs` `NANOS_A_SECOND` | derived | `1_000_000_000` | Unit conversion: nanoseconds a second, the wall clock's nanoseconds to a certificate's validity in seconds (RFC 5280 §4.1.2.5). |
 | `crates/node/src/command.rs` `HEAD_BYTES` | format | `16` | A command's head: the range's group, a u128 as the log names it. |
 | `crates/node/src/command.rs` `LENGTH_BYTES` | format | `4` | An answer's length before it in a reply's body, a u32. |
 | `crates/node/src/command.rs` `REPLY_HEAD_BYTES` | format | `1 + 8 + 8` | A reply's head: its status, one byte; the leader the node knows, a u64; and, for a redirect, how long until the node acts on its leader's silence, a u64 of nanoseconds. |
@@ -809,6 +813,15 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/protocol/src/bounds.rs` `STREAM_BYTES` | counted | `95` | 95 bytes a connection keeps for each stream it may hold (`tests/transport_memory.rs`: 3,602 more at 86 streams than at 48). |
 | `crates/protocol/src/classes.rs` `RAFT_CHECKSUM` | format | `Embedded { covered_from: 4, at: 0, }` | Where a Raft frame's own checksum lies, and what it covers: its CRC-32C first, of every byte after it (mantle-node's `frame`), which the transport checks on a lane. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/protocol/src/classes.rs` `RANKS` | format | `4` | Four classes on a node's QUIC connections: replication, request, transfer (the request class's lower level, chunk bodies) and bulk (docs/design/node.md §3.1); consensus control that fits a datagram takes the plane. |
+| `crates/protocol/src/enroll.rs` `KEY` | external | `32` | A node's public key: an Ed25519 key's 32 bytes (RFC 8032 §5.1.5), as `mantle_meta::record::PUBLIC_KEY`. |
+| `crates/protocol/src/enroll.rs` `FINGERPRINT` | external | `32` | A certificate's fingerprint: a SHA-256, 32 bytes (FIPS 180-4), as `mantle_meta::record::FINGERPRINT`. |
+| `crates/protocol/src/enroll.rs` `MAX_REACH` | derived | `255 + 8` | A member's place, `HOST:PORT`: a host of at most 255 octets (RFC 1035 §2.3.4), brackets for an IPv6 address (RFC 3986 §3.2.2), a colon and a port of at most five digits, as `mantle_meta::root::MAX_REACH`. |
+| `crates/protocol/src/enroll.rs` `MAX_REQUEST` | format | `1 + 8 + FINGERPRINT + KEY + KEY` | The longest enrollment request, a forward: its tag, the old id (u64), the old certificate's fingerprint and key, and the key asked for. |
+| `crates/protocol/src/enroll.rs` `REGRANT` | format | `0` | An enrollment request's tag: a written-off node's own request. |
+| `crates/protocol/src/enroll.rs` `FORWARD` | format | `1` | An enrollment request's tag: a member's forward to the root range's leader. |
+| `crates/protocol/src/enroll.rs` `GRANTED` | format | `0` | An enrollment answer's tag: the new identity. |
+| `crates/protocol/src/enroll.rs` `REFUSED` | format | `1` | An enrollment answer's tag: a refusal. |
+| `crates/protocol/src/enroll.rs` `MEMBER_BYTES` | format | `8 + 4 + 4` | A member in an enrollment answer beside its places: its id (u64) and each place's u32 length, the least bytes a member takes, which bounds a count before anything is reserved for it. |
 | `crates/protocol/src/object.rs` `ABORT` | format | `14` | An object request's kind: AbortMultipartUpload. |
 | `crates/protocol/src/object.rs` `APPEND` | format | `18` | An object request's kind: a native upload's run, its bytes and trailer after its fields. |
 | `crates/protocol/src/object.rs` `COMPLETE` | format | `13` | An object request's kind: CompleteMultipartUpload, its parts listed in its fields. |

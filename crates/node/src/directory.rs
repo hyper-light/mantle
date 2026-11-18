@@ -383,6 +383,18 @@ impl Peers {
         Some((old, Role::Enrolling))
     }
 
+    /// The member a written-off node dialed to ask for a new identity (`crate::rejoin::ask`): the
+    /// node it names a seed, `dialed`, by its name under the authority, and no other.
+    fn dialed_to_enroll(&self, certificate: &[u8], dialed: PeerId) -> Option<(PeerId, Role)> {
+        let names = mantle_cert::node_names(certificate).ok()?;
+        let id = mantle_protocol::node_id(names.name)?;
+        if id == dialed && self.seeds.binary_search(&id).is_ok() {
+            Some((id, Role::Node))
+        } else {
+            None
+        }
+    }
+
     /// Whether the root range holds a member of `id`, in any state.
     fn is_member(&self, id: PeerId) -> bool {
         self.members.binary_search_by_key(&id, |m| m.id).is_ok()
@@ -480,9 +492,13 @@ impl Directory for Peers {
     fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Role)> {
         let certificate = authenticated.certificate?;
         // The enrollment protocol admits a written-off identity's certificate alone, and nothing
-        // else is admitted on it.
+        // else is admitted on it; on the written-off node's own dial (`crate::rejoin::ask`), the
+        // member it dialed, by its name.
         if authenticated.protocol == ENROLL {
-            return self.enroll(certificate, authenticated.dialed);
+            return match authenticated.dialed {
+                Some(dialed) => self.dialed_to_enroll(certificate, dialed),
+                None => self.enroll(certificate, None),
+            };
         }
         if let Some(pinned) = self
             .peers

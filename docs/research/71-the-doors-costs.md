@@ -495,7 +495,8 @@ unchanged.
 | site | test | before | after |
 |---|---|---:|---:|
 | a head parsed (codec), every head shape of the rule tests cut at every length, the 8 KiB head and one octet more, 256 mutated | `crates/http/tests/allocations.rs` `every_head_shape_is_parsed_with_no_allocation`, `a_mutated_head_is_parsed_with_no_allocation` | 1 allocation a head with a field | 0 |
-| SigV4, AWS's GetObject example verified | `crates/s3/tests/allocations.rs` `a_signature_is_checked_in_three_buffers` | 33 allocs, 20 reallocs | 3, 0 (signing key, string to sign, access key) |
+| SigV4, AWS's GetObject example verified | `crates/s3/tests/allocations.rs` `a_signature_is_checked_with_one_buffer_its_access_keys` | 33 allocs, 20 reallocs | 3, 0 (signing key, string to sign, access key); 1, 0 since 2026-11-18, the signing key's `AWS4` and secret and the string to sign on the stack (the access key, `Verified::access_key`) |
+| a warmed request through the listener, its host a stub on the listener's thread, plain HTTP: HEAD and GET of four segments, PUT of 1 B, DELETE (2026-11-18) | `crates/node/tests/listener_memory.rs` `a_warmed_request_allocates_only_what_crosses_to_the_host` | 20, 20, 22, 19 allocs | 13, 13, 14, 12: the request's box and two channels (7), its bucket, key and account (3), a put's piece (1), `Verified::access_key` (1), the stub host's reply and etag (2, 1 for a DELETE); over TLS, one more for each record read and each written |
 | aws-chunked, AWS's 66,560-byte, three-chunk example decoded and its signatures checked | same, `an_aws_chunked_body_is_decoded_in_place_with_no_allocation` | 11, 32 | 0, 0 |
 | a ListObjectsV2 document | same, `a_listings_document_allocates_nothing_a_key` | 7, 8 at 1 key | 2, 0 at 1, 10 and 1,000 keys |
 

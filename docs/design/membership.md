@@ -380,13 +380,44 @@ rather than preceding the request: only the root range knows that no block names
 node's volumes, and a node refused (a ban, the setting) keeps its disks for whoever decides.
 
 1. **It learns it is retired.** A member its replica holds serving or leaving refuses its identity
-   at a handshake either side began. A member refuses an identity only from an entry it applied
-   (§2), so one refusal is the cell's committed word. The node writes a marker, `rejoin`, holding
-   its old certificate's fingerprint, whole and durable (written under a temporary name, flushed,
-   renamed, its directory flushed, as `mantle init` writes keys, node.md §1.5), and says
-   `retired`.
+   at a handshake either side began, from an entry the member applied (§2). But a member's
+   directory refuses with the same `access_denied` a node no row names once the grant window is
+   full, and a certificate not the one its dial named; and on a link this node dialed,
+   `Identity` is also this node's own refusal of the peer's certificate (slice 1). So one refusal
+   is not the cell's word. **Decided (2026-11-18): retired only on refusals none of those
+   explains.** Its own replica holding it gone is the write-off itself, applied here: retired at
+   once. Else the count begins at the first turn of its run at which its own replica holds it
+   serving or leaving, a member, which no grant window judges, so no refusal of its join counts,
+   each link's endings taken as they stand then (as a leave's end is judged, §4). Once its
+   patience has passed since, two idle timeouts (a dial made as the count begins connects or ends
+   within one, RFC 9000 §10.1, and a redial waits at most one more, `bounds::backed_off`), it is
+   retired when a member its replica holds serving or leaving refused its identity since, that
+   link's last ending `Identity`, and no such member admits it, none connected to it. A member
+   connected is the cell's word that it is not written off, so a certificate refused at one stale
+   address does not retire a node another member admits; a link that ended another way, a timeout
+   or a bound of the peer's admission, says nothing either way, so a member down does not hold a
+   written-off node serving nothing for good; a refusal from a node its replica holds gone,
+   removed or not at all says nothing of it. Not taken: a majority of the members it holds. A
+   member dials only the members of higher ids (`Node::dials`), and members drop a node they
+   write off from their peers (`Node::keep_peers`), so a written-off node hears only from the
+   members above it and those that pin it, and a majority would leave about half of them refused
+   and waiting for good. What is left: a node no member admits over its patience, refused only
+   where a member's address answered as another member's, or by a verifier that could not take
+   its certificate (one that expired as it ran, a skewed clock), is retired wrongly, and its data
+   is the cell's to rebuild once its absence passes the repair time (§5), as for any node that
+   stops; and a written-off node above every member it holds, and pinned by none, hears no
+   refusal at all, which the rejoin closes (slice 6: a member that reached no member over its
+   patience dials each one its replica holds, each once). The node writes a marker, `rejoin`,
+   holding its old certificate's fingerprint, whole and durable (hyper-block's record: a temporary
+   name, the platform's full flush, a rename, its directory flushed, and a CRC-32C checked on
+   read, as the node keeps its run, node.md §1.6), and says `retired`.
 2. **It stops serving.** Its doors, ranges and chunk service stop; it dials no member under its old
    identity and writes no liveness record. A node that starts with the marker present starts here.
+   Until the rejoin is built (slices 3 to 6), the process ends here: the marker kept, it says
+   `retired` and ends with a typed reason (`retired: the cell wrote this node off`, the old
+   certificate's fingerprint) and a nonzero status, its log and volumes closing as the node is
+   dropped; a start that finds the marker says `retired` and ends the same way before anything
+   opens, measures, dials or writes.
 3. **It asks.** It makes a key pair and writes it (`identity/next.key`) whole and durable before
    sending anything, and keeps it through every retry, since the cell may commit a certificate for
    it before the answer arrives. It dials each member it knows, its seeds and the members its
@@ -472,7 +503,7 @@ comes back by the authority holder's grant, as before (§2). `ban ID` withdraws 
 | # | Slice | Files |
 |---|---|---|
 | 1 | The transport tells the side a peer's handshake refused that it was refused: the refusing end closes with a code its peer's endpoint maps to `Refusal::Identity` of its own identity | `vendor/hyper-transport/src/endpoint.rs` (the refusal at `refuse_connection` after `Directory::identify`), its tests |
-| 2 | The node learns it is retired (step 1) and stops serving (step 2): the marker, `retired`, no more redials or liveness records | `crates/node/src/process.rs` (beside `Departure`), `crates/node/src/node/members.rs`, `crates/mantle/src/files.rs` |
+| 2 | The node learns it is retired (step 1) and stops serving (step 2): the marker, `retired`, no more redials or liveness records | `crates/node/src/process.rs` (`Retirement`, beside `Departure`; the start's refusal), `crates/node/src/layout.rs` (the marker, a record of the node's directory, which the node's process writes and so its crate keeps) |
 | 3 | The wipe (step 4) and the identity's switch (step 5), as functions over a node directory with each crash point's files, not yet triggered | `crates/mantle/src/files.rs`, `crates/mantle/src/disk.rs`, `crates/node/src/process.rs` |
 | 4 | The root range's records: the ledger, the issuer's window, the setting; `Regrant`, `ban`, `rejoin` and each refusal | `crates/meta/src/root.rs`, `crates/node/src/command.rs`, `crates/node/src/process.rs` (the lines) |
 | 5 | The online issuer: the issuer's certificate, `mantle init`'s and `mantle init issuer`'s, the leader's signing, rule 4 and the enrollment protocol's admission | `crates/cert/src/lib.rs`, `crates/mantle/src/init.rs`, `crates/node/src/directory.rs`, `crates/node/src/node/members.rs` |

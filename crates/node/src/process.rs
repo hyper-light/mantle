@@ -207,6 +207,11 @@ pub enum ProcessError {
     History(String),
     #[error("the S3 listener: {0}")]
     Listener(String),
+    /// The cell wrote the node off (docs/design/membership.md §5.1): its directory's rejoin marker
+    /// holds the fingerprint, in hex, of the certificate the cell refuses, and the node serves
+    /// nothing under it.
+    #[error("retired: the cell wrote this node off, its certificate's fingerprint {0}")]
+    Retired(String),
 }
 
 /// The signals that stop the node in order (node.md §1.7): SIGTERM, which a service manager or a
@@ -1337,6 +1342,7 @@ pub fn run(config: &Path) -> Result<(), ProcessError> {
     // budget following the machine reads as room (docs/research/65 §6).
     mantle_engine::port::mmap::return_freed_blocks();
     let config = ProcessConfig::read(config).map_err(step(Step::Configuration))?;
+    refuse_retired(&config.dir)?;
     let keys = config
         .gateway
         .as_ref()
@@ -1511,6 +1517,7 @@ fn since(now: &Histogram, then: &Histogram, q_ppm: u32) -> Option<u64> {
 pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
     mantle_engine::port::mmap::return_freed_blocks();
     let stated = read_stated(config).map_err(step(Step::Configuration))?;
+    refuse_retired(&stated.dir)?;
     let identity = identity(
         (&stated.certificate, &stated.key, &stated.authority),
         &stated.peers,
@@ -1544,6 +1551,33 @@ pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
             leave,
         },
     )
+}
+
+/// Refuses the start of a node the cell wrote off (docs/design/membership.md §5.1 step 2): its
+/// directory `dir` holds the rejoin marker, so before anything opens, measures, dials or writes, it
+/// says `retired` and the process ends with the marker's fingerprint. Taking a new identity is the
+/// rejoin's (§5.1 steps 3 to 6); until then the marker stands.
+fn refuse_retired(dir: &Path) -> Result<(), ProcessError> {
+    let Some(fingerprint) = Layout::new(dir)
+        .retired()
+        .map_err(|e| ProcessError::History(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "retired").map_err(|e| ProcessError::Say(e.to_string()))?;
+    out.flush().map_err(|e| ProcessError::Say(e.to_string()))?;
+    Err(ProcessError::Retired(hex(&fingerprint)))
+}
+
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    let mut said = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        // Writing to a String does not fail.
+        let _ = write!(said, "{byte:02x}");
+    }
+    said
 }
 
 /// What the process is asked of the node as it starts: whether it ends when its standard input
@@ -2443,6 +2477,16 @@ async fn serve(
     // and done once the root range removed it; and an operator's statements that another node is
     // gone, each out until answered.
     let mut departure = Departure::Staying;
+    // Whether the cell wrote the node off (membership.md §5.1 step 1), judged once its patience
+    // has passed: a dial made as the count begins connects or ends within one idle timeout (RFC
+    // 9000 §10.1), and a redial waits at most one more (`bounds::backed_off`).
+    let mut retirement = Retirement::default();
+    let patience_ns = u64::try_from(
+        mantle_protocol::bounds::idle_timeout()
+            .saturating_mul(2)
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX);
     // A member stated gone is asked of the root range once the node's commands have room; each
     // id is held once, and at most as many as the cell holds nodes.
     let mut stated_gone: Vec<(Option<CommandAsk>, u64)> = Vec::new();
@@ -2714,6 +2758,26 @@ async fn serve(
         }
         if let Some(said) = departure.step(&mut node)? {
             say(&mut output, said).await?;
+        }
+        // Written off: the marker is kept before anything is said, and the process ends, its log
+        // and volumes closing as the node is dropped, so it answers no request, dials no member
+        // and writes no liveness record from here; a start that finds the marker starts nothing.
+        let retired = {
+            let cell = node.cell();
+            let standing = |id| cell.and_then(|c| c.member(id)).map(|row| row.state);
+            retirement.judge(
+                standing,
+                node.id(),
+                node.links(),
+                (hyper_rt::futures::now_ns(), patience_ns),
+            )
+        };
+        if retired {
+            layout
+                .retire(&fingerprint)
+                .map_err(|e| ProcessError::History(e.to_string()))?;
+            say(&mut output, "retired\n").await?;
+            return Err(ProcessError::Retired(hex(&fingerprint)));
         }
         for at in (0..stated_gone.len()).rev() {
             let Some(&(ask, id)) = stated_gone.get(at) else {
@@ -3104,6 +3168,73 @@ impl Departure {
             | Self::Left
             | Self::Draining => None,
         }
+    }
+}
+
+/// Whether the cell wrote this node off (docs/design/membership.md §5.1 step 1), judged at each turn
+/// from what its own replica of the root range holds and its links.
+#[derive(Default)]
+struct Retirement {
+    /// When the count began, the first turn of this run at which the node's own replica held it
+    /// serving or leaving, and each peer's link endings as counted then, in the order of the
+    /// peers' ids: none before. At most the node's peers.
+    since: Option<(u64, Vec<(u64, u64)>)>,
+}
+
+impl Retirement {
+    /// Whether the node `own` is retired at `now_ns`, `standing` each member's state as its own
+    /// replica of the root range holds it.
+    ///
+    /// Retired at once where its own replica holds it gone: the cell's write-off, applied here.
+    /// Else only on refusals that a join, a full grant window or a certificate not the one dialed
+    /// cannot explain (§5.1, decided): counted only while its own replica holds it serving or
+    /// leaving, a member, which the grant window, judging only a node that holds no row, never
+    /// refuses; from the turn that first held so, so a refusal of its join does not count; and
+    /// only once `patience_ns` has passed since, so each member it dials or is dialed by has
+    /// answered. Then retired when a member its replica holds serving or leaving refused its
+    /// identity since, that link's latest ending `Identity`, and no such member admits it, none
+    /// connected now: a member connected is the cell's word that it is not written off. A link
+    /// that ended another way since, a timeout or a bound of the peer's admission, says nothing
+    /// either way, and a refusal by a node its replica does not hold serving or leaving says
+    /// nothing of it.
+    fn judge(
+        &mut self,
+        standing: impl Fn(u64) -> Option<MemberState>,
+        own: u64,
+        links: impl Iterator<Item = Link>,
+        (now_ns, patience_ns): (u64, u64),
+    ) -> bool {
+        let serving = |state| matches!(state, Some(MemberState::Serving | MemberState::Leaving));
+        match standing(own) {
+            Some(MemberState::Gone) => return true,
+            state if !serving(state) => return false,
+            _ => {}
+        }
+        let Some((began_ns, ended)) = &self.since else {
+            let mut ended: Vec<(u64, u64)> = links.map(|l| (l.peer, l.ended)).collect();
+            ended.sort_unstable_by_key(|(peer, _)| *peer);
+            self.since = Some((now_ns, ended));
+            return false;
+        };
+        if now_ns.saturating_sub(*began_ns) < patience_ns {
+            return false;
+        }
+        let mut refused = false;
+        for link in links {
+            if link.peer == own || !serving(standing(link.peer)) {
+                continue;
+            }
+            if link.keyed {
+                return false;
+            }
+            let then = ended
+                .binary_search_by_key(&link.peer, |(peer, _)| *peer)
+                .ok()
+                .and_then(|at| ended.get(at))
+                .map_or(0, |(_, then)| *then);
+            refused |= link.ended > then && link.refusal == Some(Refusal::Identity);
+        }
+        refused
     }
 }
 
@@ -4389,5 +4520,143 @@ mod tests {
         );
         assert!(matches!(leave, Departure::Left));
         assert_eq!(leave.settle(removed, 1, links.into_iter()), None);
+    }
+
+    /// A link as the node keeps it, for the retirement's tests.
+    fn link(peer: u64, keyed: bool, ended: u64, refusal: Option<Refusal>) -> Link {
+        Link {
+            peer,
+            keyed,
+            dials: 0,
+            ended,
+            suspected: 0,
+            suspect: false,
+            refusal,
+        }
+    }
+
+    /// Node 1, its own row `own`; 2, 3 and 4 serve, 5 leaves, 6 is gone, 7 removed, 8 delisted.
+    fn cell(own: Option<MemberState>) -> impl Fn(u64) -> Option<MemberState> + Copy {
+        move |id: u64| match id {
+            1 => own,
+            2..=4 => Some(MemberState::Serving),
+            5 => Some(MemberState::Leaving),
+            6 => Some(MemberState::Gone),
+            7 => Some(MemberState::Removed),
+            _ => None,
+        }
+    }
+
+    /// The rule of membership.md §5.1 step 1: a node is retired once, its patience passed, a member
+    /// its own replica holds serving or leaving refused its identity since its count began and none
+    /// is connected to it; or at once where its own replica holds it gone.
+    #[test]
+    fn a_node_is_retired_once_a_member_refuses_it_and_none_admits_it() {
+        const PATIENCE: u64 = 10;
+        let identity = Some(Refusal::Identity);
+        let serving = cell(Some(MemberState::Serving));
+        let mut retirement = Retirement::default();
+        // The count begins with the links as they are: 2's refusal from before does not count.
+        let before = [link(2, false, 1, identity), link(3, false, 0, None)];
+        assert!(!retirement.judge(serving, 1, before.into_iter(), (100, PATIENCE)));
+        // Refused since by 2, 3 and the leaving 5, but its patience not yet passed.
+        let refused = [
+            link(2, false, 2, identity),
+            link(3, false, 1, identity),
+            link(4, false, 1, None),
+            link(5, false, 1, identity),
+        ];
+        assert!(!retirement.judge(serving, 1, refused.into_iter(), (109, PATIENCE)));
+        // Past its patience: refused, and 4, its dial timed out, says nothing either way.
+        assert!(retirement.judge(serving, 1, refused.into_iter(), (110, PATIENCE)));
+        // Only 2 refused since, the rest unreachable or bounded: the same.
+        let one = [
+            link(2, false, 2, identity),
+            link(3, false, 2, Some(Refusal::Pending)),
+        ];
+        assert!(retirement.judge(serving, 1, one.into_iter(), (110, PATIENCE)));
+        // Leaving itself, the same.
+        let leaving = cell(Some(MemberState::Leaving));
+        assert!(retirement.judge(leaving, 1, refused.into_iter(), (110, PATIENCE)));
+        // Its own replica holds it gone: retired at once, whatever its links say.
+        let gone = cell(Some(MemberState::Gone));
+        let mut fresh = Retirement::default();
+        assert!(fresh.judge(gone, 1, std::iter::empty(), (0, PATIENCE)));
+    }
+
+    /// What a join, a full grant window, a certificate not the one dialed and a non-member's
+    /// refusal look like on a node's links, none of which retires it (membership.md §5.1).
+    #[test]
+    fn a_node_is_not_retired_by_a_join_a_full_window_a_mismatch_or_a_non_member() {
+        const PATIENCE: u64 = 10;
+        let identity = Some(Refusal::Identity);
+        let refused = [
+            link(2, false, 1, identity),
+            link(3, false, 1, identity),
+            link(4, false, 1, identity),
+        ];
+        // Joining, or refused by full windows: its replica holds no row of its own, so no count
+        // begins, however long every member refuses it.
+        let joining = cell(None);
+        let mut retirement = Retirement::default();
+        for now in [0, 100, 1_000] {
+            assert!(!retirement.judge(joining, 1, refused.into_iter(), (now, PATIENCE)));
+        }
+        assert!(retirement.since.is_none());
+        // Its join applied: the count begins with the window's refusals counted, so they do not
+        // retire it, and a member that admitted it since stays reached.
+        let serving = cell(Some(MemberState::Serving));
+        assert!(!retirement.judge(serving, 1, refused.into_iter(), (1_000, PATIENCE)));
+        assert!(!retirement.judge(serving, 1, refused.into_iter(), (2_000, PATIENCE)));
+        // A certificate not the one dialed at one member's address, and another member connected
+        // to it now: not retired.
+        let mismatch = [
+            link(2, false, 2, identity),
+            link(3, true, 1, None),
+            link(4, false, 2, Some(Refusal::Closed)),
+        ];
+        assert!(!retirement.judge(serving, 1, mismatch.into_iter(), (2_000, PATIENCE)));
+        // A connection up the moment before its refusal closes it: admitted while it is up.
+        let brief = [link(2, true, 1, None), link(3, false, 2, identity)];
+        assert!(!retirement.judge(serving, 1, brief.into_iter(), (2_000, PATIENCE)));
+        // Refusals only from nodes its replica does not hold serving or leaving (gone, removed,
+        // delisted, unknown), and its own id: nothing.
+        let others = [
+            link(1, false, 3, identity),
+            link(6, false, 3, identity),
+            link(7, false, 3, identity),
+            link(8, false, 3, identity),
+            link(9, false, 3, identity),
+        ];
+        assert!(!retirement.judge(serving, 1, others.into_iter(), (2_000, PATIENCE)));
+        // Removed by its own leave: the leave's to settle (`Departure`), not a write-off.
+        let removed = cell(Some(MemberState::Removed));
+        let all = [link(2, false, 5, identity)];
+        assert!(!retirement.judge(removed, 1, all.into_iter(), (2_000, PATIENCE)));
+    }
+
+    /// A directory holding the rejoin marker is refused its start before anything is written in
+    /// it: no run raised, so the node opens no log, dials no member and writes no liveness record
+    /// (membership.md §5.1 step 2); one without the marker starts.
+    #[test]
+    fn a_retired_node_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        refuse_retired(dir.path()).unwrap();
+        let fingerprint = [0xa5u8; mantle_meta::record::FINGERPRINT];
+        Layout::new(dir.path()).retire(&fingerprint).unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        match refuse_retired(dir.path()) {
+            Err(ProcessError::Retired(said)) => assert_eq!(said, "a5".repeat(32)),
+            other => panic!("not refused as retired: {other:?}"),
+        }
+        let after: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(Layout::new(dir.path()).run().unwrap(), None);
     }
 }

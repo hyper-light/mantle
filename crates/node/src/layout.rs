@@ -12,6 +12,8 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
+use mantle_meta::record::FINGERPRINT;
+
 /// The run record's file in the node's directory.
 const RUN: &str = "run";
 /// The run record's bytes: one count.
@@ -25,6 +27,10 @@ const STOPPED: &str = "stopped";
 /// The stop record's bytes: the run that stopped, the node's time run then in nanoseconds, and its
 /// orderly stops.
 const STOPPED_BYTES: usize = 24;
+/// The marker of a node the cell wrote off (docs/design/membership.md §5.1 step 1): the fingerprint
+/// of the certificate it was refused under, kept as the other records are. A start that finds it
+/// serves nothing (step 2).
+const REJOIN: &str = "rejoin";
 
 /// The node's last orderly stop: the run that stopped, the node's time run over all its runs when it
 /// did, and how many of its runs had then stopped in order.
@@ -48,6 +54,8 @@ pub enum LayoutError {
     Exhausted(u64),
     #[error("the node's readiness lock: {0}")]
     Live(std::io::Error),
+    #[error("the node's rejoin marker holds {0} bytes, not one certificate's fingerprint")]
+    MalformedRejoin(usize),
 }
 
 /// The node's readiness lock, held: the cell's root range enlisted the node in this run, and the
@@ -174,6 +182,28 @@ impl Layout {
         hyper_block::record::write(&self.dir.join(STOPPED), &bytes)
             .map_err(|e| LayoutError::Record(e.to_string()))
     }
+
+    /// Keeps the marker that the cell wrote the node off under the certificate whose fingerprint is
+    /// `fingerprint`: whole and durable when this returns (membership.md §5.1 step 1).
+    pub fn retire(&self, fingerprint: &[u8; FINGERPRINT]) -> Result<(), LayoutError> {
+        hyper_block::record::write(&self.dir.join(REJOIN), fingerprint)
+            .map_err(|e| LayoutError::Record(e.to_string()))
+    }
+
+    /// The fingerprint the rejoin marker holds, none where the cell has not written the node off.
+    pub fn retired(&self) -> Result<Option<[u8; FINGERPRINT]>, LayoutError> {
+        let path = self.dir.join(REJOIN);
+        let Some(bytes) = hyper_block::record::read(&path, FINGERPRINT)
+            .map_err(|e| LayoutError::Record(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let fingerprint: [u8; FINGERPRINT] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| LayoutError::MalformedRejoin(bytes.len()))?;
+        Ok(Some(fingerprint))
+    }
 }
 
 #[cfg(test)]
@@ -274,5 +304,31 @@ mod tests {
         bytes[0] ^= 0xff;
         std::fs::write(&path, bytes).unwrap();
         assert!(layout.stopped().is_err());
+    }
+
+    /// The rejoin marker is written whole, survives into the next start's reading, and a damaged one
+    /// is refused as corrupt rather than read as no marker (membership.md §5.1 step 1).
+    #[test]
+    fn the_rejoin_marker_is_kept_whole_and_read_back_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        assert_eq!(layout.retired().unwrap(), None);
+        let fingerprint = [7u8; FINGERPRINT];
+        layout.retire(&fingerprint).unwrap();
+        // The temporary name is gone: the marker is in place under its own.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(REJOIN)]);
+        assert_eq!(
+            Layout::new(dir.path()).retired().unwrap(),
+            Some(fingerprint)
+        );
+        let path = dir.path().join(REJOIN);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(layout.retired().is_err());
     }
 }

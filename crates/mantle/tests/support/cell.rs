@@ -1126,6 +1126,9 @@ pub(crate) struct Cell {
     /// Where the running workload's clients are told of a node started again.
     pub(crate) learns: Vec<Sender<(u64, SocketAddr)>>,
     pub(crate) moved_at: Instant,
+    /// When a node's line or a process's end last moved the cell: what a client's progress, a
+    /// wait's own probe among them, does not move.
+    pub(crate) stirred_at: Instant,
     /// Since the last movement, how long the cell held still for its devices, each stretch at
     /// most `DEVICE_PATIENCE`, and when the stretch under way began, if one is.
     pub(crate) held_for: Duration,
@@ -1501,6 +1504,7 @@ impl Cell {
                 .then(|| Relay::start(&founders.iter().map(|(id, _)| *id).collect::<Vec<_>>())),
             learns: Vec::new(),
             moved_at: Instant::now(),
+            stirred_at: Instant::now(),
             held_for: Duration::ZERO,
             held_since: None,
             host_held: Duration::ZERO,
@@ -1637,6 +1641,7 @@ impl Cell {
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
             learns: Vec::new(),
             moved_at: Instant::now(),
+            stirred_at: Instant::now(),
             held_for: Duration::ZERO,
             held_since: None,
             host_held: Duration::ZERO,
@@ -1678,12 +1683,14 @@ impl Cell {
 
     /// Starts node `id`'s process on its directory, a thread forwarding its lines, and waits until
     /// it listens.
+    #[track_caller]
     pub(crate) fn start(&mut self, id: u64) {
         self.spawn_process(id, Stdio::inherit());
     }
 
     /// Starts node `id`'s process on its directory, its standard error to `stderr`, a thread
     /// forwarding its lines, and waits until it listens.
+    #[track_caller]
     pub(crate) fn spawn_process(&mut self, id: u64, stderr: Stdio) {
         // What its last process said its detectors started from is that process's, not this one's.
         self.histories.remove(&id);
@@ -1734,16 +1741,16 @@ impl Cell {
 
     /// Waits until node `id`'s process listens, or fails once it ends first. A process's start
     /// (its runtime's calibration, its log's and store's files, its keys) is the operating
-    /// system's and the device's work, with no law of the node's to bound it, so nothing but the
-    /// process's own word ends the wait: its `bound` line, or its output's end.
+    /// system's and the device's work, with no law of the node's to bound it: the watch gives it,
+    /// past the quiet period, as long as the cell may hold still for a device (`DEVICE_PATIENCE`),
+    /// the longest the product itself waits on one.
+    #[track_caller]
     pub(crate) fn listening(&mut self, id: u64) {
-        while self.running[&id].bound.is_none() {
-            match self.heard.recv() {
-                Ok(heard) => self.take(heard),
-                Err(_) => panic!("node {id}'s output is gone"),
-            }
-        }
-        self.moved();
+        let what = format!("node {id}'s start");
+        self.waiting_on(&what, DEVICE_PATIENCE, |c| match c.running.get(&id) {
+            Some(running) => running.bound.map(|_| ()),
+            None => panic!("node {id} ended before it listened: {:?}", c.status),
+        });
     }
 
     /// Starts node `id`'s process on a directory whose store is damaged, and waits for its end:
@@ -1798,13 +1805,14 @@ impl Cell {
     /// Starts node `id`'s process, which must listen and then end on a failure of its own: what
     /// it said on standard error. The cell learns where it listens, and the watch waits for its end
     /// as for any fact the cell reports.
+    #[track_caller]
     pub(crate) fn start_refused(&mut self, id: u64) -> String {
         self.refusing = Some(id);
         self.spawn_process(id, Stdio::piped());
         self.introduce();
         let mut running = self.until(|c| c.refused.take());
         self.refusing = None;
-        let status = running.child.wait().unwrap();
+        let status = self.exited(id, &mut running);
         let mut said = String::new();
         if let Some(mut stderr) = running.child.stderr.take() {
             std::io::Read::read_to_string(&mut stderr, &mut said).unwrap();
@@ -1818,6 +1826,7 @@ impl Cell {
     /// console's Ctrl-Break reaches only a process group sharing the sender's console (Microsoft's
     /// `GenerateConsoleCtrlEvent`), which a test's process may not have. The cell's watch goes on
     /// meanwhile, so a stop that holds still past the quiet period fails the test.
+    #[track_caller]
     pub(crate) fn stop(&mut self, id: u64) -> std::process::ExitStatus {
         self.refusing = Some(id);
         if cfg!(unix) {
@@ -1852,10 +1861,19 @@ impl Cell {
     }
 
     /// Waits for the process the test expects to end (`refusing`) to end: how it exited.
+    #[track_caller]
     pub(crate) fn ended(&mut self) -> std::process::ExitStatus {
         let mut running = self.until(|c| c.refused.take());
-        self.refusing = None;
-        running.child.wait().unwrap()
+        let id = self.refusing.take().unwrap();
+        self.exited(id, &mut running)
+    }
+
+    /// How node `id`'s process `running` exited, its output ended: waited on under the watch, as
+    /// its output's end was.
+    #[track_caller]
+    fn exited(&mut self, id: u64, running: &mut Running) -> std::process::ExitStatus {
+        let what = format!("node {id}'s exit");
+        self.waiting_on(&what, Duration::ZERO, |_| running.child.try_wait().unwrap())
     }
 
     /// Overwrites the first two pages of node `id`'s engine store, where both its superblocks
@@ -2038,11 +2056,16 @@ impl Cell {
 
     /// Something moved: the watch begins again.
     pub(crate) fn moved(&mut self) {
-        self.moved_at = Instant::now();
+        self.moved_since(Instant::now());
+    }
+
+    /// The watch begins again from `at`, when something moved.
+    fn moved_since(&mut self, at: Instant) {
+        self.moved_at = at;
         self.held_for = Duration::ZERO;
         self.host_held = Duration::ZERO;
         self.held_since = if self.held_by_devices() {
-            Some(self.moved_at)
+            Some(at)
         } else {
             None
         };
@@ -2074,14 +2097,49 @@ impl Cell {
 
     /// Takes what it hears until `done` holds; fails once a quiet period passes with nothing, past
     /// the time the host held the watch: each wait at most `HOLD_TICK`, and a wait that ends late
-    /// moves the watch's end by its lateness, so each spends exactly the span it scheduled.
-    pub(crate) fn until<T>(&mut self, mut done: impl FnMut(&mut Self) -> Option<T>) -> T {
+    /// moves the watch's end by its lateness, so each spends exactly the span it scheduled. A
+    /// failure names the wait by its caller and says what the cell said last.
+    #[track_caller]
+    pub(crate) fn until<T>(&mut self, done: impl FnMut(&mut Self) -> Option<T>) -> T {
+        self.waiting_on("the wait", Duration::ZERO, done)
+    }
+
+    /// [`Cell::until`] for `what`, as its failure names it, its quiet period longer by
+    /// `allowance`.
+    #[track_caller]
+    pub(crate) fn waiting_on<T>(
+        &mut self,
+        what: &str,
+        allowance: Duration,
+        mut done: impl FnMut(&mut Self) -> Option<T>,
+    ) -> T {
+        let at = std::panic::Location::caller();
         self.moved();
         loop {
+            let watch = (
+                self.moved_at,
+                self.held_for,
+                self.held_since,
+                self.host_held,
+            );
             if let Some(found) = done(self) {
                 return found;
             }
-            let quiet = self.quiet();
+            // What `done` waited on itself, a read it asked under a watch of its own, is not the
+            // cell moving toward the fact waited on: this watch goes on from where it was, moved
+            // only where a node moved the cell meanwhile.
+            if self.stirred_at > watch.0 {
+                self.moved_since(self.stirred_at);
+            } else {
+                (
+                    self.moved_at,
+                    self.held_for,
+                    self.held_since,
+                    self.host_held,
+                ) = watch;
+                self.hold();
+            }
+            let quiet = self.quiet() + allowance;
             let now = Instant::now();
             let left = (self.deadline(quiet).max(self.flush_deadline()) + self.host_held)
                 .saturating_duration_since(now);
@@ -2093,9 +2151,9 @@ impl Cell {
                     self.host_held += Instant::now().saturating_duration_since(woke_by);
                 }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
-                    "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
-                     devices and {:?} the host held the watch: {:?}, progress {:?}, links {:?}, \
-                     log {:?}, room {:?}, longest polls {:?}",
+                    "{what} at {at}: quiet for {quiet:?} with nothing moved, besides {:?} held still \
+                     for the devices and {:?} the host held the watch: {:?}, progress {:?}, links \
+                     {:?}, log {:?}, room {:?}, longest polls {:?}, repairs {:?}",
                     self.held_for,
                     self.host_held,
                     self.status,
@@ -2103,7 +2161,8 @@ impl Cell {
                     self.links,
                     self.log,
                     self.room,
-                    self.polls
+                    self.polls,
+                    self.repairs
                 ),
             }
         }
@@ -2263,15 +2322,19 @@ impl Cell {
                     self.transfers.remove(&id);
                 }
             }
+            // A client's progress moves the watch waiting on it, not the cell.
             Heard::Told(Told::Progress(client, done, patience)) => {
                 self.progress.insert(client, done);
                 if let Some(patience) = patience {
                     self.clients.insert(client, patience);
                 }
+                self.moved();
+                return;
             }
             Heard::Told(Told::Failed(client, why)) => panic!("client {client} failed: {why}"),
         }
         self.moved();
+        self.stirred_at = self.moved_at;
     }
 
     /// Tells each running node, each listening (`Cell::start`), where the others do: where they
@@ -2456,7 +2519,7 @@ impl Cell {
     /// initial probe timeout is 1.024 s) or its node waits on a device others share: under two
     /// serve suites at once, 1% of first operations took more than 2.0 s
     /// (measurements/2026-10-25-first-operations-on-a-loaded-host.md).
-    fn client_begins(&mut self, id: u64) {
+    pub(crate) fn client_begins(&mut self, id: u64) {
         self.progress.remove(&id);
         self.clients
             .insert(id, mantle_protocol::bounds::idle_timeout());
@@ -2469,6 +2532,22 @@ impl Cell {
         let (settings, bound) = (self.pki.gateway_settings(), self.bound_quic());
         let tell = self.tell.clone();
         std::thread::spawn(move || gateway(settings, bound, ops, tell))
+    }
+
+    /// What `thread` came to, the work of client `id`, `done` operations each told as its progress:
+    /// waited on under the watch until it told the last, then joined. Its client began
+    /// (`Cell::client_begins`) before it started.
+    #[track_caller]
+    pub(crate) fn joined<T>(&mut self, id: u64, done: u64, thread: JoinHandle<T>) -> T {
+        let what = format!("client {id}'s {done} operations");
+        self.waiting_on(&what, Duration::ZERO, |c| {
+            if c.progress.get(&id).copied().unwrap_or(0) >= done {
+                Some(())
+            } else {
+                None
+            }
+        });
+        thread.join().unwrap()
     }
 
     /// Waits until the gateway has done `done` of its operations.
@@ -2492,11 +2571,13 @@ impl Cell {
 
     /// What `ops` came to, each an object's request asked of a node with its data, which the
     /// writer client asks in turn, knowing every node and told where the running ones listen.
+    #[track_caller]
     pub(crate) fn objects(&mut self, ops: Vec<(u64, Op, Vec<u8>)>) -> Vec<ObjectOutcome> {
         self.objects_as(CLIENT, ops)
     }
 
     /// What `ops` came to, asked as [`Cell::objects`] asks them, by client `client`.
+    #[track_caller]
     pub(crate) fn objects_as(
         &mut self,
         client: u64,
@@ -2508,14 +2589,7 @@ impl Cell {
         let (settings, bound) = (self.pki.object_settings(id), self.bound_quic());
         let tell = self.tell.clone();
         let thread = std::thread::spawn(move || objects(settings, bound, ops, tell));
-        self.until(|c| {
-            if c.progress.get(&id).is_some_and(|d| *d >= done) {
-                Some(())
-            } else {
-                None
-            }
-        });
-        thread.join().unwrap()
+        self.joined(id, done, thread)
     }
 
     /// The root range's volume table, read a page at a time through the writer client.
@@ -2542,6 +2616,7 @@ impl Cell {
         self.until(|c| c.histories.get(&id).copied())
     }
 
+    #[track_caller]
     pub(crate) fn enlisted(&mut self, id: u64) {
         self.until(|c| {
             if c.enlisted.contains(&id) {
@@ -2557,6 +2632,7 @@ impl Cell {
     /// detectors judge, which a request's steps wait out (node.md §5.4). A node started again
     /// measures its links anew and suspects no peer meanwhile, so a leader killed before it judges
     /// them is not replaced while they are young.
+    #[track_caller]
     pub(crate) fn judging(&mut self) {
         self.until(|c| {
             let groups: BTreeSet<u128> = c.status.keys().map(|&(_, group)| group).collect();
@@ -2575,38 +2651,26 @@ impl Cell {
 
     /// What `reads` read, each a query of a range's group, which the writer client asks in turn,
     /// knowing every node and told where the running ones listen.
+    #[track_caller]
     pub(crate) fn read(&mut self, reads: Vec<(u128, Query)>) -> Vec<Result<Read, ClientError>> {
         self.client_begins(CLIENT);
         let done = reads.len() as u64;
         let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
         let tell = self.tell.clone();
         let thread = std::thread::spawn(move || reader(settings, bound, reads, tell));
-        self.until(|c| {
-            if c.progress.get(&CLIENT).is_some_and(|d| *d >= done) {
-                Some(())
-            } else {
-                None
-            }
-        });
-        thread.join().unwrap()
+        self.joined(CLIENT, done, thread)
     }
 
     /// The answers to `asks`, each an entry to a range's group, which the writer client asks in
     /// turn, knowing every node and told where the running ones listen.
+    #[track_caller]
     pub(crate) fn asked(&mut self, asks: Vec<(u128, Entry)>) -> Vec<Vec<Answer>> {
         self.client_begins(CLIENT);
         let done = asks.len() as u64;
         let (settings, bound) = (self.pki.client_settings(CLIENT), self.bound_quic());
         let tell = self.tell.clone();
         let thread = std::thread::spawn(move || asker(settings, bound, asks, tell));
-        self.until(|c| {
-            if c.progress.get(&CLIENT).is_some_and(|d| *d >= done) {
-                Some(())
-            } else {
-                None
-            }
-        });
-        thread.join().unwrap()
+        self.joined(CLIENT, done, thread)
     }
 }
 

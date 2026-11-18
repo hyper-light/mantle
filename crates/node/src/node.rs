@@ -495,7 +495,11 @@ pub struct Status {
 /// dials made to it, the connections and dials to it that ended, the times this node's detectors
 /// came to suspect it and whether they suspect it now, a peer whose chunk reads are lost at once
 /// (`Node::end_chunk_gets`), and the last refusal one ended with, as its peer or this side stated
-/// it (`None` when none was stated: a timeout, the path).
+/// it (`None` when none was stated: a timeout, the path). `Identity` is a certificate refused at a
+/// handshake either side began: the peer's by this node's directory or its verifier, or this
+/// node's by the peer's directory, which the transport tells this node whichever side dialed (its
+/// `access_denied` close, membership.md §5.1); on a connection the peer dialed, a TLS alert other
+/// than that one is not `Identity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
     pub peer: PeerId,

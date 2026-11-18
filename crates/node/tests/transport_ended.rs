@@ -253,3 +253,81 @@ fn a_write_told_before_its_put_was_refused_finds_it_unknown_and_the_refusal_foll
         "{told:?}"
     );
 }
+
+/// A node whose identity its dialer refuses, the dialer's directory pinning another certificate
+/// for it as a member's does for a node the cell wrote off (membership.md §5.1), is told who
+/// refused it and why, though it did not dial: the dialer sends its own flight before its refusal,
+/// so the refused node authenticates it (hyper-transport docs/transport.md). `Node::on_event`
+/// keeps a close's refusal as its link's, so the refused node's `link` line to the dialer ends
+/// `Identity`, as the dialer's to it does.
+#[test]
+fn a_node_whose_dialer_refuses_its_identity_is_told_who_refused_it() {
+    let least = bounds::least_transport(&stated(0)).unwrap();
+    let stated = stated(least);
+    let (authority, certs) = certificates();
+    let (_, [_, written_off]) = certificates();
+    let now = Instant::now();
+    let nodes = [
+        net::endpoint(
+            &authority,
+            &certs[0],
+            (2, &written_off.0),
+            &stated,
+            now,
+            [1; 32],
+        ),
+        net::endpoint(
+            &authority,
+            &certs[1],
+            (1, &certs[0].0),
+            &stated,
+            now,
+            [2; 32],
+        ),
+    ];
+    let mut net = Net::of(nodes, now, (VecDeque::new(), Vec::new()));
+    net.nodes[0].connect(net.now, 2, net.addresses[1]).unwrap();
+    let ended = |events: &VecDeque<Event<classes::NodeClasses>>, peer: u64| {
+        events.iter().any(|event| {
+            matches!(event, Event::Closed { peer: p, .. } | Event::Unreachable { peer: p, .. } if *p == peer)
+        })
+    };
+    for _ in 0..1_000 {
+        net.pump();
+        if ended(&net.events[0], 2) && ended(&net.events[1], 1) {
+            break;
+        }
+        net.tick();
+    }
+    let told =
+        |at: usize| -> Vec<String> { net.events[at].iter().map(|e| format!("{e:?}")).collect() };
+    // The dialer refused node 2's identity at its handshake.
+    assert!(
+        matches!(
+            net.events[0].iter().collect::<Vec<_>>().as_slice(),
+            [Event::Unreachable {
+                peer: 2,
+                refusal: Some(Refusal::Identity)
+            }]
+        ),
+        "{:?}",
+        told(0)
+    );
+    // Node 2's connection from node 1 was up, then closed for its own identity.
+    let closed: Vec<_> = net.events[1]
+        .iter()
+        .filter(|event| !matches!(event, Event::Connected { peer: 1, .. }))
+        .collect();
+    assert!(
+        matches!(
+            closed.as_slice(),
+            [Event::Closed {
+                peer: 1,
+                refusal: Some(Refusal::Identity),
+                ..
+            }]
+        ),
+        "{:?}",
+        told(1)
+    );
+}

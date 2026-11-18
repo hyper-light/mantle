@@ -87,9 +87,15 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `e8c4bed` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and eleven commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
-in the hyper-raft repository's own objects and not yet pushed to its origin. Its eleventh commit,
+**Every crate at `537311c` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and twelve commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
+in the hyper-raft repository's own objects and not yet pushed to its origin. Its twelfth commit,
+`537311c`, changes hyper-log alone (mantle docs/design/durability.md §7.7, step 3c): the writer's
+persist record, and its confirmation, say the frame was answered at its flush (`format::AT_FLUSH`)
+where the record is in pieces and every update in the frame allows it (`Update::at_flush`); frames
+are still answered only once confirmed, so the bit only adds marks, an `Undetermined` frame so
+recorded restored as a lost one. The equivalence test's updates allow no answer at the flush, so its
+hashes stand. Its eleventh commit,
 `e8c4bed`, changes hyper-log and hyper-durable (mantle docs/design/durability.md §7.7, step 3a): a
 persist record in pieces says whether its frame was answered at its own flush, in the first byte its
 pieces' header left as padding (`format::AT_FLUSH`), and pieces that differ in it are two writes; a

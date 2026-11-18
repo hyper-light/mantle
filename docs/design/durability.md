@@ -210,8 +210,8 @@ Status: design, 2026-11-17, the owner's decision 2 of research/71 ("Step 9, afte
 that day. Source: research/97 (AGL+18, cited by section and page). Built: the open's account of
 the frame past the last that reads (§7.7, step 1), the record in pieces (step 2), and the record's
 word on how its frame was answered, with the open's restore of a frame answered at its flush
-(step 3a). Until step 4 lands, a frame is answered only once confirmed, as raft-log.md §6
-describes.
+(step 3a) and the writer's setting of it (step 3c). Until step 4 lands, a frame is answered only
+once confirmed, as raft-log.md §6 describes.
 
 A PUT's critical path holds seven flushes: the slowest replica's chunk, then the Block, File and
 Name commands, each a frame flushed and then confirmed by a second durable write (research/71,
@@ -454,9 +454,7 @@ answered. Two cases reach it:
      (hyper-log `format::AT_FLUSH`), under each piece's CRC; pieces that differ in it are two
      writes, never one record. A whole record cannot say it, since a torn whole record and a
      damaged one read alike: a log of whole records never marks a frame answered at its flush.
-     No format change: every writer writes the bit as not answered at its flush until step 4, so
-     a log's bytes are 2b-iii's. Before a binary writes it set, binaries of 2b, which read the byte
-     as padding, must refuse the log, as the mark made binaries before them refuse it.
+     No format change: a log's bytes are 2b-iii's but for that byte.
    - The open reads the bit from the frame's own records, its slot's and the copy a restore made,
      never the other slot's record of the frame before, so a crash between two frames never marks
      the earlier. An `Undetermined` frame so answered (`Tail::Undetermined { at_flush }`) is
@@ -467,7 +465,20 @@ answered. Two cases reach it:
      configuration it counts by and of the one applied has voters enough that the others are a
      quorum, `n - 1 > n / 2`, three or more. A frame holding a group that may not stays answered
      once confirmed (§7.5).
+
+   3c, built (hyper-raft `mantle-frame-flush`): the writer sets the bit.
+   - A frame's record, and its confirmation, say it was answered at its flush where the record is
+     in pieces (format 5, 6 sealed), the only records that can say it, and every update in the
+     frame allows it (`Update::at_flush`). A frame of no updates, one holding a group whose update
+     does not allow it, and every frame of a log of whole records say not.
+   - Frames are still answered only once confirmed, so the bit only adds marks: an `Undetermined`
+     frame so recorded is restored as a lost one and its groups marked, where it was the torn
+     tail. A binary of 2b reads the byte as padding and keeps such a frame the torn tail, which is
+     what a frame answered once confirmed is.
 4. The writer answers a frame at its flush where §7.5 allows, and the flushes a PUT are counted.
+   Before any frame is answered at its flush, binaries of 2b, which read the bit's byte as padding
+   and would cut such a frame as the torn tail, must refuse the log, as the mark made binaries
+   before them refuse it (step 2b-ii).
 
 ## 8. Open
 

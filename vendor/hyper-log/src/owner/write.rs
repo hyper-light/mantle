@@ -1176,12 +1176,19 @@ impl<F: BlockFile + 'static> Owner<F> {
         b.persist.sequence = sequence;
         b.persist.confirms = confirms;
         b.persist.groups.clear();
-        b.persist.groups.extend(updates.map(writer::persisted));
+        let mut allows = None;
+        b.persist.groups.extend(updates.map(|s| {
+            allows = Some(allows.unwrap_or(true) && s.update.at_flush);
+            writer::persisted(s)
+        }));
         b.record_bytes.clear();
         b.persist.sealed = self.seal.is_some();
-        // No frame is answered at its flush yet: each waits for its confirmation (mantle
-        // durability.md §7.7, step 4).
-        b.persist.at_flush = false;
+        // The record says its frame was answered at its flush where every update in the frame
+        // allows it (`Update::at_flush`) and the record is in pieces, the only records that can
+        // say it (`format::AT_FLUSH`); a frame of no updates answers nothing. The frame is still
+        // answered only once confirmed, so the bit only adds marks (mantle durability.md §7.7,
+        // steps 3c and 4).
+        b.persist.at_flush = self.p.area.pieces().is_some() && allows == Some(true);
         // In pieces where the log's area is laid so (format 5, 6 sealed), each a unit the device
         // writes whole; whole otherwise, a sealed log's MAC after it (mantle durability.md §7.7).
         let encoded = match self.p.area.pieces() {

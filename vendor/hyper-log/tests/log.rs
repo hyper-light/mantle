@@ -4494,37 +4494,23 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
     assert!(log.view(2).unwrap().is_some());
 }
 
-/// Sets, in `file`, the bit of the record of the frame of `sequence` that says the frame was
-/// answered at its own flush, as no writer sets it yet (mantle durability.md §7.7, step 4): the
-/// record in pieces of whichever slot holds it whole, written again with the bit.
-fn answered_at_flush(file: &SimFile, sequence: u64) {
+/// The record in pieces of the frame of `sequence` in `file`, from whichever slot holds it whole.
+fn record_of_frame(file: &SimFile, sequence: u64) -> hyper_log::format::Persist {
     let image = file.durable_image().unwrap();
-    let pieces = hyper_log::format::Pieces::new(Alignment::new(512).unwrap(), false).unwrap();
-    let (at, record) = PIECES_SLOTS
+    PIECES_SLOTS
         .into_iter()
         .find_map(|at| match pieced(&image, at) {
-            hyper_log::format::Pieced::Whole(record) if record.sequence == sequence => {
-                Some((at, record))
-            }
+            hyper_log::format::Pieced::Whole(record) if record.sequence == sequence => Some(record),
             _ => None,
         })
-        .expect("the frame's record reads whole");
-    assert!(
-        !record.at_flush,
-        "the writer says no frame was answered at its flush"
-    );
-    let record = hyper_log::format::Persist {
-        at_flush: true,
-        ..record
-    };
-    write_flushed(file, &pieces.encode(&record).unwrap(), at);
+        .expect("the frame's record reads whole")
 }
 
 /// The frame of `an_unconfirmed_torn_frame_keeps_only_its_term_and_vote`, its record landed and
 /// itself torn by the crash: frame 2, which wrote entry 2 of term 4 and the vote for 3 in term 4,
 /// over frame 1's entry 1 and vote for 1 in term 1. Its record says it was answered at its flush
-/// where `at_flush`. The file, its frame torn.
-fn torn_after_its_record(seed: u64, update: Update, at_flush: bool) -> SimFile {
+/// where `update` allows it, as the writer writes it. The file, its frame torn.
+fn torn_after_its_record(seed: u64, update: Update) -> SimFile {
     let file = sim(seed);
     let cfg = config_now(16, 8);
     let log = Log::create(file, cfg, ID).unwrap();
@@ -4541,13 +4527,16 @@ fn torn_after_its_record(seed: u64, update: Update, at_flush: bool) -> SimFile {
     // and every written sector survives the crash.
     log.with_file(|f| f.inject(Fault::PowerCut { ops: 2 }).unwrap())
         .unwrap();
+    let at_flush = update.at_flush;
     assert!(matches!(log.write(1, update), Err(LogError::Fenced)));
     let file = closed(log);
     file.crash(Crash::KeepAll).unwrap();
     file.clear_faults().unwrap();
-    if at_flush {
-        answered_at_flush(&file, 2);
-    }
+    assert_eq!(
+        record_of_frame(&file, 2).at_flush,
+        at_flush,
+        "the record says what its one update allows"
+    );
     let torn = valid_frames(&file.durable_image().unwrap())
         .into_iter()
         .max_by_key(|f| f.2)
@@ -4589,7 +4578,7 @@ fn voted_in_four(at_flush: bool) -> Update {
 #[test]
 fn a_torn_frame_answered_at_its_flush_is_restored_and_marked() {
     let cfg = config_now(16, 8);
-    let file = torn_after_its_record(47, voted_in_four(true), true);
+    let file = torn_after_its_record(47, voted_in_four(true));
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(
         recovery.tail,
@@ -4635,16 +4624,14 @@ fn an_unconfirmed_frame_answered_at_its_flush_is_restored_as_a_lost_one() {
         let second = Update {
             entries: Some(entries(2, &[2])),
             hard_state: Some(hard_vote(2, 2, 1)),
-            at_flush: true,
+            at_flush,
             ..Update::default()
         };
         assert!(matches!(log.write(1, second), Err(LogError::Fenced)));
         log.with_file(|f| f.crash(Crash::KeepAll).unwrap()).unwrap();
         let file = closed(log);
         file.clear_faults().unwrap();
-        if at_flush {
-            answered_at_flush(&file, 2);
-        }
+        assert_eq!(record_of_frame(&file, 2).at_flush, at_flush);
         let last = valid_frames(&file.durable_image().unwrap())
             .into_iter()
             .max_by_key(|f| f.2)
@@ -4680,7 +4667,7 @@ fn an_unconfirmed_frame_answered_at_its_flush_is_restored_as_a_lost_one() {
 #[test]
 fn a_record_torn_across_its_pieces_is_the_torn_tail() {
     let cfg = config_now(16, 8);
-    let file = torn_after_its_record(49, voted_in_four(true), false);
+    let file = torn_after_its_record(49, voted_in_four(true));
     let image = file.durable_image().unwrap();
     let hyper_log::format::Pieced::Whole(record) = pieced(&image, PIECES_SLOTS[0]) else {
         panic!("frame 2's record reads whole in the first slot");
@@ -4718,7 +4705,7 @@ fn a_record_torn_across_its_pieces_is_the_torn_tail() {
 #[test]
 fn a_damaged_piece_with_its_frame_is_damage() {
     let cfg = config_now(16, 8);
-    let file = torn_after_its_record(50, voted_in_four(true), true);
+    let file = torn_after_its_record(50, voted_in_four(true));
     damage(&file, PIECES_SLOTS[0] + 70);
     assert!(matches!(
         Log::open(file, cfg, ID),
@@ -4728,8 +4715,9 @@ fn a_damaged_piece_with_its_frame_is_damage() {
 
 /// A crash between two frames never marks the earlier (mantle durability.md §7.6): frame 2,
 /// answered at its flush, reads whole, and the next frame either left no record or left one of
-/// its own, which alone says how it was answered: as the writer writes it, once confirmed, so it
-/// is the torn tail. Frame 2's record in the other slot says nothing of frame 3.
+/// its own, which alone says how it was answered: here once confirmed, its update allowing no
+/// answer at the flush, so it is the torn tail. Frame 2's record in the other slot says nothing
+/// of frame 3.
 #[test]
 fn a_crash_between_two_frames_never_marks_the_earlier() {
     let file = sim(51);
@@ -4745,7 +4733,7 @@ fn a_crash_between_two_frames_never_marks_the_earlier() {
         log.write(1, update).unwrap();
     }
     let file = closed(log);
-    answered_at_flush(&file, 2);
+    assert!(record_of_frame(&file, 2).at_flush);
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
     assert_eq!(recovery.tail, Tail::Torn);
     assert_eq!(recovery.restored, Vec::<u128>::new());
@@ -4757,7 +4745,6 @@ fn a_crash_between_two_frames_never_marks_the_earlier() {
     let third = Update {
         entries: Some(entries(3, &[2])),
         hard_state: Some(hard_vote(2, 2, 2)),
-        at_flush: true,
         ..Update::default()
     };
     assert!(matches!(log.write(1, third), Err(LogError::Fenced)));
@@ -4790,7 +4777,7 @@ fn a_crash_between_two_frames_never_marks_the_earlier() {
 #[test]
 fn a_one_voter_groups_frame_is_never_marked() {
     let cfg = config_now(16, 8);
-    let file = torn_after_its_record(52, voted_in_four(false), false);
+    let file = torn_after_its_record(52, voted_in_four(false));
     let image = file.durable_image().unwrap();
     let hyper_log::format::Pieced::Whole(record) = pieced(&image, PIECES_SLOTS[0]) else {
         panic!("frame 2's record reads whole in the first slot");
@@ -4807,4 +4794,62 @@ fn a_one_voter_groups_frame_is_never_marked() {
     let view = log.view(1).unwrap().unwrap();
     assert_eq!((view.last, view.uncertain), (1, None));
     assert_eq!(view.hard_state, Some(hard_vote(4, 3, 1)));
+}
+
+/// The writer's record says its frame was answered at its flush only where every update in the
+/// frame allows it and the record is in pieces (mantle durability.md §7.7, step 3c): a frame
+/// holding one group whose update does not allow it says not, and a log of whole records, which
+/// cannot say it, never does.
+#[test]
+fn the_record_says_answered_at_its_flush_only_where_every_update_allows_it() {
+    let allowing = |index: u64, at_flush: bool| Update {
+        entries: Some(entries(index, &[1])),
+        at_flush,
+        ..Update::default()
+    };
+    for (seed, mixed) in [(53, false), (54, true)] {
+        let cfg = config_now(16, 8);
+        let (device, gated) = held(sim(seed));
+        let log = Log::create(device, cfg, ID).unwrap();
+        for group in [1, 2] {
+            log.write(group, allowing(1, true)).unwrap();
+        }
+        // Both groups' next updates go in one frame: the writer is held in a flush meanwhile.
+        gated.hold();
+        let shut = gated.released();
+        let plug = log.submit(3, allowing(1, true)).unwrap();
+        gated.held();
+        let first = log.submit(1, allowing(2, true)).unwrap();
+        let second = log.submit(2, allowing(2, !mixed)).unwrap();
+        drop(shut);
+        for pending in [plug, first, second] {
+            pending.wait().unwrap();
+        }
+        let file = closed(log).into_inner();
+        let image = file.durable_image().unwrap();
+        let newest = valid_frames(&image).into_iter().map(|f| f.2).max().unwrap();
+        let record = record_of_frame(&file, newest);
+        assert_eq!(record.groups.len(), 2, "one frame holds both groups");
+        assert_eq!(record.at_flush, !mixed, "mixed {mixed}");
+    }
+    // An area too small for its slots in pieces keeps whole records, which never say it.
+    let whole = Config {
+        max_groups: 80,
+        ..config_now(4, 8)
+    };
+    let log = Log::create(sim(55), whole, ID).unwrap();
+    assert_eq!(log.laid().pieces, None);
+    log.write(1, allowing(1, true)).unwrap();
+    let image = closed(log).durable_image().unwrap();
+    let records: Vec<_> = (0..whole.segment_bytes as usize)
+        .step_by(BLOCK)
+        .filter_map(|at| hyper_log::format::Persist::decode(&image[at..]))
+        .filter(|r| r.log == ID)
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|r| r.sequence == 1 && !r.groups.is_empty())
+    );
+    assert!(records.iter().all(|r| !r.at_flush));
 }

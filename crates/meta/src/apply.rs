@@ -36,6 +36,10 @@ pub fn apply_entry<R: Rows>(
         let mut answers = reserved(entry.commands.len())?;
         for (position, c) in entry.commands.iter().enumerate() {
             let answer = match &c.command {
+                // A command whose body did not match its CRC asked nothing anyone knows: every
+                // member finds the same mismatch in the same entry, answers it so and writes
+                // nothing, its session untouched (replica.md §2).
+                Command::Corrupt => Answer::Corrupt,
                 // Registering may expire the session least recently used, which it finds by
                 // the order of last use: the sessions used so far are written first, and read
                 // anew after.
@@ -277,6 +281,59 @@ mod tests {
         assert_eq!(answers[1], Answer::SessionExpired);
         assert!(matches!(answers[2], Answer::Name(Outcome::Put { .. })));
         assert_eq!(answers[3], Answer::Repeated);
+    }
+
+    /// A command whose bytes do not match the CRC it was built with is answered `Corrupt` on every
+    /// member alike and writes nothing, its session untouched: the commands beside it apply, and
+    /// its gateway's copy sent again under its serial applies once (replica.md §2).
+    #[test]
+    fn a_corrupt_command_is_refused_alike_on_every_member_and_applies_once_sent_again() {
+        let mut members = [name_range(), name_range(), name_range()];
+        let run = |m: &mut Model, index, e: &Entry| {
+            apply_entry(m, index, e, Layer::Name, &RULES).unwrap()
+        };
+        let mut session = 0;
+        for m in &mut members {
+            let answers = run(m, 1, &entry(10, vec![registration()]));
+            let [Answer::Registered { session: s }] = answers[..] else {
+                panic!("{answers:?}")
+            };
+            session = s;
+        }
+        let sent = entry(
+            20,
+            vec![
+                from(session, 1, open_gate()),
+                from(session, 2, put("k", "a", true)),
+                from(session, 3, put("j", "b", true)),
+            ],
+        );
+        let mut bytes = sent.encode().unwrap();
+        // A bit of the second command's own bytes, past its frame's length and session fields.
+        let first = sent.commands[0].encoded_len().unwrap();
+        bytes[crate::wire::ENTRY_HEAD_BYTES + first + 4 + 24 + 3] ^= 0x10;
+        let flipped = Entry::decode(&bytes).unwrap();
+        assert_eq!(flipped.commands[1].command, Command::Corrupt);
+        let answers: Vec<_> = members.iter_mut().map(|m| run(m, 2, &flipped)).collect();
+        assert!(answers.iter().all(|a| *a == answers[0]));
+        assert_eq!(answers[0][1], Answer::Corrupt);
+        assert!(matches!(answers[0][2], Answer::Name(Outcome::Put { .. })));
+        for m in &mut members {
+            assert!(crate::name::current(m, "b", "k").unwrap().is_none());
+        }
+        // Sent again under its serial, it applies once, on every member.
+        let again = entry(30, vec![from(session, 2, put("k", "a", true))]);
+        for m in &mut members {
+            let answers = run(m, 3, &again);
+            assert!(
+                matches!(answers[..], [Answer::Name(Outcome::Put { .. })]),
+                "{answers:?}"
+            );
+            let current = crate::name::current(m, "b", "k").unwrap().unwrap();
+            assert_eq!(current.1.etag, "a");
+        }
+        let images: Vec<_> = members.iter_mut().map(|m| m.image().unwrap()).collect();
+        assert!(images.iter().all(|i| *i == images[0]));
     }
 
     /// A command whose writes hold a row past the range's bounds is refused whole, as every

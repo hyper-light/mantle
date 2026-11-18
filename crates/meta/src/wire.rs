@@ -3,6 +3,14 @@
 //! follow it, so a malformed entry decodes to an error and never to a panic or an allocation
 //! it cannot fill. Time is the entry's: every command in it takes the leader's time from
 //! when the entry was proposed.
+//!
+//! Each command carries its own checksum (replica.md §2): in an entry it is its body's length, its
+//! body (its session, serial, lowest serial unanswered and command), and the CRC-32C of the body,
+//! computed where the entry is first encoded, at the gateway, over the bytes it wrote. The leader
+//! proposes that encoding as it came, setting only the entry's time ([`stamp`]), so the CRC is
+//! carried to every member and never computed again over bytes that may already be wrong
+//! (node.md §5.6). A body that does not match its CRC decodes as [`Command::Corrupt`], which
+//! every member answers [`Answer::Corrupt`] alike and which writes nothing.
 
 use mantle_codec::{Reader, Writer};
 
@@ -12,7 +20,7 @@ use crate::record::{
 };
 use crate::{block, bucket, file, name, principal, root};
 
-const FORMAT: u8 = 6;
+const FORMAT: u8 = 7;
 
 /// Commands one entry carries at most: a session is named by the index of the entry that
 /// registered it and the registration's place in that entry.
@@ -53,6 +61,10 @@ pub enum Command {
     File(file::Command),
     Block(block::Command),
     Root(root::Command),
+    /// A command whose body does not match the CRC-32C it was built with (replica.md §2): what it
+    /// asked is unknown, and its session fields are as its bytes read them. Only decoding makes
+    /// one, and none is encoded.
+    Corrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +96,10 @@ pub enum Answer {
     AnswersFull,
     /// The command is for another layer than the range's.
     WrongLayer,
+    /// The command's body did not match the CRC-32C it was built with ([`Command::Corrupt`]):
+    /// nothing of it was written, on any member, and its session is as it was. Its gateway sends
+    /// it again under its serial (replica.md §2).
+    Corrupt,
     Bucket(bucket::Outcome),
     Name(name::Outcome),
     File(file::Outcome),
@@ -102,18 +118,81 @@ fn corrupt() -> RecordError {
 /// Bytes an entry's encoding takes before its commands: its format, its time and its count.
 pub const ENTRY_HEAD_BYTES: usize = 13;
 
+/// Bytes a command takes in an entry's encoding at least: its body's length and CRC-32C, u32 each,
+/// and a body of its three session fields, u64 each, and its command's tag.
+const LEAST_COMMAND_BYTES: usize = 4 + 8 * 3 + 1 + 4;
+
 impl Sessioned {
     /// Bytes this command takes in an entry's encoding, so an entry of commands takes
     /// [`ENTRY_HEAD_BYTES`] and theirs: a gateway fills an entry to its bound in one pass.
     pub fn encoded_len(&self) -> Result<usize, RecordError> {
         // Counted, not written: nothing is allocated.
         let mut w = Writer::counting();
+        self.put(&mut w)?;
+        Ok(w.len())
+    }
+
+    /// Writes the command as an entry carries it: its body's length, its body, and the CRC-32C of
+    /// the body as this writer holds it, computed here, where the command is encoded
+    /// (replica.md §2). A counting writer counts the same bytes.
+    fn put(&self, w: &mut Writer) -> Result<(), RecordError> {
+        let mut count = Writer::counting();
+        self.put_body(&mut count)?;
+        record::put_len(w, count.len())?;
+        let start = w.len();
+        self.put_body(w)?;
+        w.u32(mantle_crc::crc32c(
+            w.as_slice().get(start..).unwrap_or_default(),
+        ));
+        Ok(())
+    }
+
+    fn put_body(&self, w: &mut Writer) -> Result<(), RecordError> {
         w.u64(self.session);
         w.u64(self.serial);
         w.u64(self.unanswered);
-        put_command(&mut w, &self.command)?;
-        Ok(w.len())
+        put_command(w, &self.command)
     }
+
+    /// A command's `body` as an entry carries it, checked against the CRC-32C `crc` it was built
+    /// with: one that does not match is [`Command::Corrupt`], its session fields as its bytes read
+    /// them, so every member answers it alike and none writes it (replica.md §2). None where a
+    /// body that matches does not decode.
+    fn take(body: &[u8], crc: u32, at_ns: u64) -> Option<Self> {
+        let mut r = Reader::new(body);
+        if mantle_crc::crc32c(body) != crc {
+            return Some(Self {
+                session: r.u64().unwrap_or_default(),
+                serial: r.u64().unwrap_or_default(),
+                unanswered: r.u64().unwrap_or_default(),
+                command: Command::Corrupt,
+            });
+        }
+        let sessioned = Self {
+            session: r.u64()?,
+            serial: r.u64()?,
+            unanswered: r.u64()?,
+            command: take_command(&mut r, at_ns)?,
+        };
+        if r.remaining() != 0 {
+            return None;
+        }
+        Some(sessioned)
+    }
+}
+
+/// Sets the leader's time in an entry's encoding `bytes`, as it proposes the entry, leaving its
+/// commands' bytes and the CRC each carries from where it was built as they came (replica.md
+/// §2): a leader never encodes a gateway's commands again.
+pub fn stamp(bytes: &mut [u8], at_ns: u64) -> Result<(), RecordError> {
+    let (format, rest) = bytes.split_first_mut().ok_or_else(corrupt)?;
+    if *format != FORMAT {
+        return Err(corrupt());
+    }
+    rest.get_mut(..8)
+        .ok_or_else(corrupt)?
+        .copy_from_slice(&at_ns.to_le_bytes());
+    Ok(())
 }
 
 impl Entry {
@@ -126,10 +205,7 @@ impl Entry {
             w.u64(self.at_ns);
             record::put_len(w, self.commands.len())?;
             for c in &self.commands {
-                w.u64(c.session);
-                w.u64(c.serial);
-                w.u64(c.unanswered);
-                put_command(w, &c.command)?;
+                c.put(w)?;
             }
             Ok(())
         })?;
@@ -144,18 +220,14 @@ impl Entry {
             }
             let at_ns = r.u64()?;
             let count = usize::try_from(r.u32()?).ok()?;
-            // A command takes 25 bytes at least.
-            if count > MAX_COMMANDS || count > r.remaining() / 25 {
+            if count > MAX_COMMANDS || count > r.remaining() / LEAST_COMMAND_BYTES {
                 return None;
             }
             let mut commands = crate::record::reserved(count)?;
             for _ in 0..count {
-                commands.push(Sessioned {
-                    session: r.u64()?,
-                    serial: r.u64()?,
-                    unanswered: r.u64()?,
-                    command: take_command(&mut r, at_ns)?,
-                });
+                let len = usize::try_from(r.u32()?).ok()?;
+                let body = r.take(len)?;
+                commands.push(Sessioned::take(body, r.u32()?, at_ns)?);
             }
             Some(Self { at_ns, commands })
         })();
@@ -186,6 +258,7 @@ impl Answer {
             Answer::Superseded => w.u8(10),
             Answer::RowTooLarge => w.u8(11),
             Answer::AnswersFull => w.u8(12),
+            Answer::Corrupt => w.u8(13),
             Answer::Bucket(o) => {
                 w.u8(3);
                 put_bucket_outcome(w, o);
@@ -272,6 +345,7 @@ impl Answer {
                 10 => Answer::Superseded,
                 11 => Answer::RowTooLarge,
                 12 => Answer::AnswersFull,
+                13 => Answer::Corrupt,
                 3 => Answer::Bucket(take_bucket_outcome(&mut r)?),
                 4 => Answer::Name(take_name_outcome(&mut r)?),
                 5 => Answer::File(match r.u8()? {
@@ -552,6 +626,8 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             w.u8(14);
             w.u64(*node);
         }
+        // What a corrupt command asked is unknown: there is nothing to encode.
+        Command::Corrupt => return Err(RecordError::Corrupt("a corrupt command")),
     }
     Ok(())
 }
@@ -2955,6 +3031,86 @@ mod tests {
         commands
     }
 
+    /// A bit flipped anywhere in a command's body or its CRC, of every kind of command, is found
+    /// at decode: the command is `Corrupt`, its session fields as the bytes read them, and the
+    /// entry around it decodes; applied, it is answered `Corrupt` and writes nothing, on every
+    /// member alike (replica.md §2).
+    #[test]
+    fn a_flipped_bit_in_any_commands_bytes_is_refused_corrupt_and_writes_nothing() {
+        use crate::apply::{Layer, apply_entry};
+        use crate::engine::{Engine, Model};
+        let at_ns = 1_700_000_000_000_000_000;
+        let rules = crate::session::Rules {
+            lifetime_ns: 1_000,
+            max_sessions: 8,
+            expiries_per_entry: 8,
+            max_key_bytes: usize::MAX,
+            max_value_bytes: usize::MAX,
+        };
+        for (i, command) in commands(at_ns).into_iter().enumerate() {
+            let sessioned = Sessioned {
+                session: 7,
+                serial: i as u64 + 1,
+                unanswered: 1,
+                command,
+            };
+            let entry = Entry {
+                at_ns,
+                commands: vec![sessioned.clone()],
+            };
+            let bytes = entry.encode().unwrap();
+            let body = ENTRY_HEAD_BYTES + 4;
+            for at in body..bytes.len() {
+                let mut flipped = bytes.clone();
+                flipped[at] ^= 1 << (at % 8);
+                let decoded = Entry::decode(&flipped).unwrap();
+                assert_eq!(decoded.commands.len(), 1);
+                assert_eq!(decoded.commands[0].command, Command::Corrupt, "{i} at {at}");
+                // Past the session fields, the answer goes to the command it was.
+                if at >= body + 24 {
+                    assert_eq!(decoded.commands[0].session, 7);
+                    assert_eq!(decoded.commands[0].serial, i as u64 + 1);
+                }
+            }
+            // Every member applies the same flipped bytes alike, and none writes a row.
+            let mut flipped = bytes.clone();
+            flipped[body + 24] ^= 1;
+            let decoded = Entry::decode(&flipped).unwrap();
+            for layer in [
+                Layer::Bucket,
+                Layer::Name,
+                Layer::File,
+                Layer::Block,
+                Layer::Root,
+            ] {
+                let mut member = Model::default();
+                let answers = apply_entry(&mut member, 1, &decoded, layer, &rules).unwrap();
+                assert_eq!(answers, [Answer::Corrupt]);
+                assert!(member.image().unwrap().is_empty());
+            }
+            // The leader's time set in place leaves the command and its CRC as they came.
+            let mut stamped = bytes.clone();
+            stamp(&mut stamped, at_ns + 1).unwrap();
+            let decoded = Entry::decode(&stamped).unwrap();
+            assert_eq!(decoded.commands[0].session, 7);
+            assert_ne!(decoded.commands[0].command, Command::Corrupt);
+            assert_eq!(stamped[ENTRY_HEAD_BYTES..], bytes[ENTRY_HEAD_BYTES..]);
+        }
+        assert!(stamp(&mut [FORMAT, 0, 0], 1).is_err());
+        assert!(stamp(&mut [FORMAT - 1; 13], 1).is_err());
+        // A corrupt command is never encoded again.
+        let corrupt = Entry {
+            at_ns,
+            commands: vec![Sessioned {
+                session: 7,
+                serial: 1,
+                unanswered: 1,
+                command: Command::Corrupt,
+            }],
+        };
+        assert!(corrupt.encode().is_err());
+    }
+
     #[test]
     fn every_command_round_trips_and_takes_the_entry_time() {
         let at_ns = 1_700_000_000_000_000_000;
@@ -3225,6 +3381,8 @@ mod tests {
             .map(Answer::Root),
         );
         answers.push(Answer::File(file::Outcome::Released));
+        // Last, so every answer before keeps the line its golden vector was written on.
+        answers.push(Answer::Corrupt);
         answers
     }
 
@@ -3287,10 +3445,13 @@ mod tests {
 
     proptest! {
         /// Whatever arrives decodes to an entry or to an error, never to a panic, and what
-        /// decodes encodes back to the same bytes.
+        /// decodes encodes back to the same bytes, but for a command that does not match its CRC,
+        /// which is never encoded again.
         #[test]
         fn any_bytes_decode_safely(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
-            if let Ok(entry) = Entry::decode(&bytes) {
+            if let Ok(entry) = Entry::decode(&bytes)
+                && entry.commands.iter().all(|c| c.command != Command::Corrupt)
+            {
                 prop_assert_eq!(entry.encode().unwrap(), bytes.clone());
             }
             if let Ok(answer) = Answer::decode(&bytes) {

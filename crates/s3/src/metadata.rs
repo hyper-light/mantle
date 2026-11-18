@@ -72,10 +72,15 @@ impl MetadataError {
     }
 }
 
-/// Whether `name`, lowercase, is a field name a version keeps: a content header's, or a
-/// user-defined entry's.
+/// Whether `name`, in any case, is a field name a version keeps: a content header's, or a
+/// user-defined entry's. Compared where it lies, so a field no version keeps costs no copy.
 fn kept(name: &str) -> bool {
-    CONTENT.contains(&name) || name.starts_with(USER)
+    CONTENT
+        .iter()
+        .any(|content| content.eq_ignore_ascii_case(name))
+        || name
+            .get(..USER.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(USER))
 }
 
 /// RFC 9110 §5.6.2's `tchar`: the octets of a token, which a field name is.
@@ -115,21 +120,25 @@ fn field_value(value: &str) -> bool {
 /// of a streamed body rather than a coding of the object, is not kept in `Content-Encoding`:
 /// "Amazon S3 stores the resulting object without the `aws-chunked` value", and one left empty
 /// is no header (research/05 §1.8).
+///
+/// Each field's name is judged where it lies: only a field a version keeps is copied, its name
+/// lowercased once, and the list of them is made at their count, read first.
 pub fn of_request<'a>(
-    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    headers: impl IntoIterator<Item = (&'a str, &'a str), IntoIter: Clone>,
 ) -> Result<Vec<(String, String)>, MetadataError> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    let headers = headers.into_iter();
+    let count = headers.clone().filter(|(name, _)| kept(name)).count();
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(count);
     for (name, value) in headers {
-        let lower = name.to_ascii_lowercase();
-        if !kept(&lower) {
+        if !kept(name) {
             continue;
         }
-        match pairs.iter_mut().find(|(n, _)| *n == lower) {
+        match pairs.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
             Some((_, joined)) => {
                 joined.push(',');
                 joined.push_str(value);
             }
-            None => pairs.push((lower, value.to_owned())),
+            None => pairs.push((name.to_ascii_lowercase(), value.to_owned())),
         }
     }
     if let Some(at) = pairs.iter().position(|(n, _)| n == "content-encoding")

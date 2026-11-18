@@ -243,3 +243,64 @@ fn a_continuation_token_is_two_buffers_at_their_lengths() {
         assert_eq!(continuation_start(&token), Some(resume));
     }
 }
+
+/// `metadata::of_request`'s reading of a request's fields as it was before Lean doors step 6: each
+/// field's name lowercased into a string of its own to ask whether a version keeps it.
+fn reference_metadata<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    use mantle_s3::metadata::{CONTENT, USER};
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if !(CONTENT.contains(&lower.as_str()) || lower.starts_with(USER)) {
+            continue;
+        }
+        match pairs.iter_mut().find(|(n, _)| *n == lower) {
+            Some((_, joined)) => {
+                joined.push(',');
+                joined.push_str(value);
+            }
+            None => pairs.push((lower, value.to_owned())),
+        }
+    }
+    pairs
+}
+
+/// A request's metadata copies only the fields a version keeps, each judged where it lies: its
+/// content type and its user-defined metadata at S3's 2 KB (`metadata::MAX_USER`), each name
+/// lowercased once and each value copied once, into one list made at their count. The same
+/// request with as many fields no version keeps as S3's 8 KB of headers carries at their shortest
+/// (`X:` and CRLF, 4 octets; `route::MAX_HEADERS`) allocates no more.
+#[test]
+fn a_requests_metadata_copies_only_the_fields_a_version_keeps() {
+    use mantle_s3::metadata::{self, MAX_USER};
+    use mantle_s3::route::MAX_HEADERS;
+    let key = "author";
+    let value = "v".repeat(MAX_USER - key.len());
+    let name = format!("X-Amz-Meta-{key}");
+    let few = vec![
+        ("Host", "examplebucket.s3.amazonaws.com"),
+        ("Content-Type", "text/plain"),
+        (name.as_str(), value.as_str()),
+        ("x-amz-content-sha256", sigv4::EMPTY_SHA256),
+    ];
+    let shortest = "X:\r\n".len();
+    let mut many = few.clone();
+    many.extend(std::iter::repeat_n(("X", ""), MAX_HEADERS / shortest));
+    let (kept, few_made) = counted(|| metadata::of_request(few.iter().copied()));
+    assert_eq!(kept.unwrap().len(), 2);
+    let (kept, many_made) = counted(|| metadata::of_request(many.iter().copied()));
+    assert_eq!(kept.unwrap().len(), 2);
+    let (_, few_before) = counted(|| reference_metadata(few.iter().copied()));
+    let (_, many_before) = counted(|| reference_metadata(many.iter().copied()));
+    println!(
+        "metadata of {} fields: before {few_before:?}, now {few_made:?}; of {} fields: before \
+         {many_before:?}, now {many_made:?}",
+        few.len(),
+        many.len()
+    );
+    // The list, and each kept field's name and value.
+    assert_eq!(few_made, (1 + 2 * 2, 0));
+    assert_eq!(many_made, few_made);
+}

@@ -147,7 +147,8 @@ the process runs at once (hyper-rt `Facts::cpus_at_once`; `process::runtime`), i
 on the first shard and the runtime shut down at its end (`process::run_on_first_shard`). That
 task, with the node's ranges, log, transport and QUIC door, stays on the first shard; the S3
 connections go to the others, passing over a shard the runtime's watchdog sees stalled and one
-gone (§4.1). The replicas are not yet placed across the shards (§2.1).
+gone (§4.1). The replicas are not yet placed across the shards; §2.9 states how they will be, with
+the log and the native door, and the order of building.
 
 *As built (2026-11-17), the node's task Critical.* The node's task is spawned in hyper-rt's
 Critical class (`coop::Class`; hyper-raft docs/runtime.md §3.15), and the listener and every S3
@@ -916,8 +917,9 @@ slept.
 
 ### 2.1 Ranges on shards
 
-Each replica belongs to one shard for its life on the node, placed on the shard with the least
-measured work. A shard holds replicas of ranges whose logs are on any of the node's metadata
+Each replica belongs to one shard for its life in the process, placed by §2.9's rule when the node
+opens it: the shard past the first holding the fewest ranges. A later balancer moves a replica to
+the shard with the least measured work (§2.9). A shard holds replicas of ranges whose logs are on any of the node's metadata
 devices; a device's ranges spread over every shard, so one device's replicas are not held to
 one core. Cross-range group commit does not depend on which thread submits: each log's writer
 takes everything queued while its last flush ran (raft-log.md §3).
@@ -1420,6 +1422,122 @@ becomes:
   client's patience where it gave none, it is answered `SlowDown` (research/77 D1, D2). At most as
   many wait as the transport holds exchanges. It was answered `SlowDown` at once, which mantle's
   client took as a throttle and waited out over one to twenty seconds.
+
+### 2.9 A node's ranges, its log and its native door across its shards
+
+The owner's decision of 2026-11-18: a cell serves at least 10,000 small PUTs a second, and a node
+spreads its ranges, its log and its native door across its shards. Run r20 (a three-node cell on
+one Mac Studio, M3 Ultra, 32 cores; a release build of lean-doors `aef9efae`; a closed ladder of
+1-byte native PUTs) served 1,290 PUTs a second at 512 clients and 2,284 at 1,024, at 0.69 and
+0.74 ms of server CPU a PUT, the three nodes summed, and collapsed to 913 at 2,048, answered
+SlowDown. At 0.74 ms a PUT, 10,000 a second is about 7.4 cores across the cell, about 2.5 a node,
+where each node ran its ranges, its log's submitters, its transport and its QUIC door on its first
+shard (§1.2's note of 2026-11-17; audit 2026-11-12 §6: one core a node caps a cell well under
+10,000 PUTs a second). The sources are research/95.
+
+**A range's shard.** A range is placed when the node opens it, on one shard for its life in the
+process: the shard past the first that holds the fewest of the node's ranges, the first of those
+tied; a node of one shard holds every range on it (`node::spread`). The rule counts; it picks no
+number, and it is a function of the configuration's order of ranges and the shard count alone, so
+nothing on disk names a shard and a node started again with another CPU count places afresh at no
+cost: the log is the device's and a range's rows are its own engine store's (§6.6), neither a
+shard's. Redpanda does the same in kind: "every partition replica is assigned to a CPU core on a
+broker", each partition a Raft group, with "an even distribution of a topic's partition replicas
+across all cores in a broker", placed again "after broker startup, if core count increases or
+decreases" (research/95 §2); ScyllaDB balances its tablets "across shards in each node" (§3).
+Counting rather than hashing a range's group to a shard: a node holds few ranges, five in a cell
+of three (§6.6), and five groups hashed uniformly onto 31 shards share one with probability
+1 − (31·30·29·28·27)/31⁵, about 29%, where counting gives each its own whenever the shards past
+the first number at least the ranges, and otherwise holds every shard within one range of every
+other. The first shard is passed over because it carries the node's one UDP endpoint, its plane,
+its liveness stream and the S3 door's accept (below), as the S3 connections already pass over it
+(§4.1). A range moves between shards only by a later balancer, on measured work, as Redpanda's
+`core_balancing_continuous` and ScyllaDB's in-node tablet balancing do (research/95 §2–§3): §2.1's
+least measured work is that balancer's rule, and a move hands over the range's replica, its log
+handle and its engine whole, which nothing builds yet.
+
+**The log: one per device, fed by every shard.** A node keeps hyper-log's one log per device
+(raft-log.md §1), and a range on any shard submits its updates to it through its group's handle.
+hyper-log already serves this: the log is "a handle to its owner, which any number of threads may
+share by reference", its owner and its I/O thread are "two threads, whatever its number of groups
+or callers", and a submitter hears its answer through its own waker, which wakes the range's shard
+wherever the owner runs (research/95 §7). Its writer gathers every update that arrived while the
+last flush ran into one frame, so one flush commits every shard's ranges: group commit's rule that
+one write and flush commits the group (Helland et al., TR 88.1 §2; DeWitt et al., SIGMOD 1984,
+§5.2; research/71). A log for each shard is refused: each flush would commit one shard's ranges
+where one commits them all, a range's history would be tied to its shard so a changed CPU count
+moves logs, and each log runs two threads of its own. The hand-off costs one message on the
+owner's bounded channel and one wake a range's turn, not a command's, since a turn submits one
+update carrying all its commands' entries (§2.2). Research/71 measured that concurrency, not one
+writer, reaches a device's flush rate (btrfs: 124 flushes a second from one writer, 466 and 478
+from 6 and 16); one log gains that by keeping more than one frame's flush on the device at once,
+sized to the device's measured knee, a change to hyper-log (below), which keeps one flush
+committing every group. TiKV split its work the same way: Raft groups driven on a pool of threads,
+messages routed to each group's mailbox, and log writes handed to a separate writer pool of one
+thread by default (`raftstore.store-io-pool-size`; research/95 §4).
+
+**The transport and the native door: one UDP endpoint, which routes.** The node keeps one QUIC
+endpoint and one plane socket, on the first shard. The endpoint keeps every connection's packet
+protection, acknowledgements, congestion and streams, and hands each Raft message to the shard
+that holds its range (the message's header names the range, §3.2) and each native request to a
+shard past the first to be driven, the one with the fewest requests running, as an S3 connection
+is placed (§4.1). Endpoints on every shard sharing one port are refused for now: spreading one
+port's unicast datagrams over sockets is stated on Linux alone (`SO_REUSEPORT`, socket(7)); macOS
+states duplicate bindings and delivery of multicast and broadcast to each, and Windows calls the
+sockets sharing a port "indeterminate" (research/95 §5), so it is no portable path (CLAUDE.md §7).
+And a kernel spreads by address, which QUIC lets change under a connection, so a socket on the
+wrong shard must still route by the connection. QUIC allows that routing: an endpoint chooses its
+connection IDs by "an implementation-specific (and perhaps deployment-specific) method" that lets
+packets be routed back to it, but no observer outside it may correlate the IDs of one connection
+(RFC 9000 §5.1), and a packet is matched to its connection by its Destination Connection ID
+(§5.2). So the step past this one, if the first shard's share of a PUT's work is then measured to
+bind, writes the shard that holds a connection into the IDs the node issues, under a key, never in
+the clear; whichever socket receives a datagram hands it to that shard, which holds the
+connection's state; and on Linux, sockets sharing the port through `SO_REUSEPORT` spread the
+receiving. Both are hyper-transport's and hyper-quic's to build.
+
+**Requests across shards.** A native PUT's Block, File and Name commands go to three ranges that
+may be on three shards. The shard that drives the PUT sends each command to its range's shard on
+that shard's command lane and waits for the answer in a slot of its own, which the range's shard
+fills and whose waker it wakes: Seastar's explicit message passing between cores, where nothing is
+shared (research/95 §1). The commands keep the order the gateway gives them (gateway.md §2), each
+sent once the one before it is answered; this record changes no order. A node's own commands and
+reads (§6.6) take the same lanes.
+
+**Every queue between shards is bounded**, each sized so it refuses for room only past a bound
+the node already states, and each refusal typed (CLAUDE.md §2):
+
+| Queue | From, to | Bound | At the bound |
+|---|---|---|---|
+| Raft messages in | the endpoint, to a range's shard | the frames the transport admits from the peers at once: a lane's window for each peer (`lane_window`) | dropped and counted, as the network may drop it; Raft sends it again (§3.2) |
+| Raft messages out | a range's shard, to the endpoint | the same window a peer (`Remote::waiting`) | dropped and counted, as now |
+| Commands and reads | the asking shard, to a range's shard | the commands and reads the node holds at once (`command_asks`, `read_asks`) | refused, as `Node::command` and `Node::read` refuse one past them now (`NodeError::Asks`) |
+| Answers | a range's shard, to its asker | one slot an ask, taken when it is asked | cannot be refused |
+| Log updates | a range's shard, to the log's owner | hyper-log's bounded owner channel | `LogError::Busy`: the range waits for room (§2.2's stall) |
+| Native requests | the endpoint, to a driving shard | the exchanges the transport admits (§2.8's pool) | parked, then `SlowDown` at the client's deadline (§2.8) |
+| Chunk puts and gets | a driving shard, to the endpoint | `chunk_asks` | refused, as `Node::put_chunk` refuses now |
+
+A shard that ends takes its ranges with it, which nothing else holds, so the node stops and its
+next start recovers them from the log (§1.7), as it stops for a lost task now.
+
+**What stays on the first shard, and why.** The QUIC endpoint and the plane's socket, one UDP
+endpoint each, the portable path (above); the liveness stream, whose heartbeats arrive on the plane
+and whose writes go to the log like a range's (§3.5); the node's membership and its own statements;
+and the S3 door's accept, which hands each connection on (§4.1). With one shard, everything.
+
+**The order of building.** Each step is an hour's work, unit-tested and merged before the next:
+
+1. The rule, and the node's table of ranges by shard, every range still on the first shard.
+2. A shard's ranges driven by a task on that shard, with their own owner (`Owner`) and the log's
+   group handles; first, whether hyper-log's group handle and hyper-durable's shell may cross
+   threads, which, if not, is a hyper-raft change before this step.
+3. The Raft lanes in and out between the endpoint and the ranges' shards, routed by the table.
+4. The command and read lanes, and their answers.
+5. The rule over the runtime's shards, which places the ranges, and `lanes_per_peer` (§3.2) the
+   shards that run ranges, at most the ranges the node hosts.
+6. Native requests driven past the first shard.
+7. In hyper-raft: hyper-log's frames in flight past one, sized to the device's measured knee.
+8. In hyper-raft: connection IDs that name their shard, and datagrams routed by them.
 
 ## 3. Transport
 

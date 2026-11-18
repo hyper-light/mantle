@@ -298,6 +298,20 @@ rebuilt on other nodes, should come back as a new member, the owner chose that i
 own: it wipes its disks and rejoins. That needs the cell to issue an identity online to a node
 that asks. The sources are research/98.
 
+**Decided (2026-11-18), the coordinator, under the owner's rule that a question of robustness is
+decided on what is most robust, correct and efficient:**
+
+- *A machine kiln uninstalls or reports lost is banned* (`ban ID`) by kiln's supervisor at that
+  moment. Those are the moments a supervisor knows the machine's hands are no longer the cell's;
+  the ban writes it off as `gone ID` does and drops its ledger entry, so the machine, should it
+  come back, is never re-granted (below, *Hands are judged by a person*).
+- *Only a machine the cell gave up on (`Gone`, judged or stated) rejoins on its own; one that left
+  in order does not.* Its leave was its supervisor's statement that it goes, so the ledger holds
+  no entry for it (below) and its request is refused `Unknown`.
+- *The cell's issuer is signed by the cell's own offline authority, `mantle init`'s, not kiln's.*
+  A cell then re-grants with nothing outside it, the reason an online issuer kiln runs was not
+  taken (below), and kiln's authority, whichever way §10's question goes, signs no cell's issuer.
+
 **Who issues.** **Decided: the cell itself, under an issuer the authority makes once, offline; the
 authority's own key stays offline.** The authority signs one certificate, the cell's issuer: a CA
 whose pathLenConstraint is zero, so it signs node certificates and no further CA (RFC 5280
@@ -316,8 +330,8 @@ its members take its key; until then a request is refused `Unissued`.
 
 Not taken: an online issuer kiln runs, which would make coming back kiln's act and leave a cell kiln
 does not supervise (a laptop's, the tests') without it; and the authority's key online, which signs
-founders', gateways' and clients' certificates as well. Which authority is the cell's stays Ada's
-question (§10): either signs the issuer.
+founders', gateways' and clients' certificates as well. The cell's own authority signs the issuer,
+as decided above, whichever authority §10's question makes the cell's.
 
 **What the node presents.** Its written-off certificate and, over a TLS 1.3 handshake under
 mantle's enrollment protocol (an ALPN of its own, node.md §3.6), proof it holds that certificate's
@@ -575,7 +589,8 @@ The owner's to decide, none of which this design waits on:
 
 - Whether kiln runs mantle inside its own process, on threads kiln grants and kiln's runtime, or
   supervises a separate `mantle serve` (built).
-- Whether kiln's certificate authority is the cell's authority, or the cell keeps its own (§2).
+- Whether kiln's certificate authority is the cell's authority, or the cell keeps its own (§2). The
+  cell's issuer (§5.1) is signed by the cell's own, `mantle init`'s, either way (decided).
 - Whether `x86_64-pc-windows-gnu` joins the targets mantle builds and tests for.
 
 ## 11. Testing

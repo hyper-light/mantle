@@ -28,26 +28,39 @@
 //! collector leaves nothing released, every file is held or reclaimed and not both, every
 //! block left is one a file names, every chunk left one a block holds, and every mark is on a
 //! file held or released.
+//!
+//! Clients of two principals draw operations putting keys, each with a horizon, and one may
+//! carry the identity another principal's operation carries (docs/design/gateway.md §2.1). Any
+//! number of gateways attempt each operation at any step, each with a block and a file of its
+//! own, and an attempt handed over is delivered again as a copy at any later step; the collector
+//! forgets the rows whose horizon passed. After every step the operation record's five
+//! obligations hold: at most one effect per identity within its horizon, the first's answer to
+//! every attempt, no attempt within the horizon changing its key's rows, every attempt's file
+//! released once within its deadline, and the rows unchanged by a split or a merge, each with
+//! its key. With the row, the gateway's scope or the collector's horizon check removed, a
+//! schedule breaks one (`each_piece_of_the_operation_record_removed_is_caught`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use mantle_chunk::ChunkKey;
 use mantle_meta::block;
-use mantle_meta::engine::{Engine, Model, Rows};
+use mantle_meta::engine::{Engine, Model, Rows, Write};
 use mantle_meta::file::{self, Unsettled};
 use mantle_meta::key::{self, NameRow};
 use mantle_meta::merge::{self, Merger};
 use mantle_meta::name::{
-    self, Abort, Check, Checked, Complete, CreateUpload, GateChange, Listed, Match, Preconditions,
-    Put, PutPart, Split, Verdict,
+    self, Abort, Check, Checked, Complete, CreateUpload, Forget, GateChange, Listed, Match,
+    Mutation, Operated, Operation, Preconditions, Put, PutPart, Split, Verdict,
 };
 use mantle_meta::reclaim::{self, Reclaimer};
 use mantle_meta::record::{
-    BlockHeader, ChunkPlace, Descriptor, Extent, GateState, Lineage, Part, Referrer, Standing,
-    Target, Upload, Version, Versioning,
+    BlockHeader, ChunkPlace, Descriptor, Extent, GateState, Lineage, Made, Part, Referrer,
+    Standing, Target, Upload, Version, Versioning,
 };
 use mantle_meta::sweep::{Answer, BlockAnswer, BlockRequest, BlockSweep, Request, Sweep};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 
 const BUCKET: &str = "b";
 /// Keys writers use.
@@ -72,6 +85,28 @@ const PAGE: usize = 2;
 const ROUTES: usize = 8;
 /// Rows a merge resumed after its driver stopped may take.
 const MAX_ROWS: u64 = 64;
+/// Schedules the simulation runs, and the steps each takes at most.
+const CASES: u32 = 2_000;
+const STEPS: usize = 120;
+/// Principals clients act as: two, the fewest under which one can carry another's identity.
+const PRINCIPALS: u128 = 2;
+/// Horizons clients declare: as long as a gateway has for its next step, so attempts come both
+/// within and past it and the collector forgets rows between them; and the clock's last instant,
+/// which no schedule outlives (`name::Operation`).
+const HORIZONS: [u64; 2] = [HANDOVER, u64::MAX];
+
+/// The simulation whole, or with one piece of the operation record removed, which it must catch
+/// (docs/design/metadata.md §2, "Operations").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    Whole,
+    /// The range keeps no row of what an operation made: each is removed as it commits.
+    NoRow,
+    /// The gateway hands over the client's identity unscoped by its principal.
+    NoScope,
+    /// The collector forgets every row it reads, its horizon passed or not.
+    NoHorizon,
+}
 
 #[derive(Debug, Clone)]
 enum Action {
@@ -150,6 +185,27 @@ enum Action {
     Late(usize),
     /// Every merge a range's lineage shows in flight is resumed.
     MergeResume,
+    /// A client of a principal draws an operation putting a key, with a horizon.
+    Operate {
+        key: usize,
+        principal: usize,
+        horizon: usize,
+    },
+    /// A client of the other principal carries the identity an operation carries, on its key:
+    /// forged, or drawn the same.
+    Forge {
+        of: usize,
+        horizon: usize,
+    },
+    /// A gateway starts an attempt of an operation: a block and a file of its own, handed over
+    /// as the operation's at its later steps.
+    Attempt(usize),
+    /// A gateway attempting an operation takes its next step.
+    AdvanceAttempt(usize),
+    /// An attempt handed over is delivered again, a copy.
+    Copy(usize),
+    /// The collector forgets the operations each Name range holds whose horizon has passed.
+    Forget,
 }
 
 fn action() -> impl Strategy<Value = Action> {
@@ -182,7 +238,44 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (0usize..4).prop_map(Action::MergeStop),
         1 => (0usize..4).prop_map(Action::Late),
         1 => Just(Action::MergeResume),
+        1 => (0usize..4, 0usize..2, 0..HORIZONS.len()).prop_map(|(key, principal, horizon)| {
+            Action::Operate { key, principal, horizon }
+        }),
+        1 => (0usize..4, 0..HORIZONS.len()).prop_map(|(of, horizon)| Action::Forge { of, horizon }),
+        3 => (0usize..4).prop_map(Action::Attempt),
+        4 => (0usize..4).prop_map(Action::AdvanceAttempt),
+        1 => (0usize..4).prop_map(Action::Copy),
+        2 => Just(Action::Forget),
     ]
+}
+
+/// A client's operation: the principal authentication established, the identity the client
+/// drew, the key it puts, the versioning it puts under, its horizon, and its last effect.
+struct Op {
+    principal: u128,
+    raw: u128,
+    key: &'static str,
+    versioning: Versioning,
+    horizon_ns: u64,
+    effect: Option<Effect>,
+}
+
+/// What an operation's delivery made: the answer it got, and the range's time until which its
+/// row answers.
+struct Effect {
+    version: String,
+    etag: String,
+    expiry_ns: u64,
+}
+
+/// An attempt of operation `op` handed over: its file, the file's deadline, and the command,
+/// which a copy carries again.
+#[derive(Clone)]
+struct Delivered {
+    op: usize,
+    file: u128,
+    deadline_ns: u64,
+    command: name::Command,
 }
 
 /// A Name range: its rows, and the last entry its log applied.
@@ -204,6 +297,8 @@ struct Gateway {
     file: u128,
     versioning: Versioning,
     stage: Stage,
+    /// The operation it attempts, if its write carries one.
+    op: Option<usize>,
 }
 
 struct World {
@@ -241,6 +336,18 @@ struct World {
     written: BTreeSet<u128>,
     /// Files the collector took apart.
     reclaimed: BTreeSet<u128>,
+    variant: Variant,
+    ops: Vec<Op>,
+    /// The identity the next operation's client draws.
+    next_operation: u128,
+    /// Attempts handed over, which copies deliver again.
+    delivered: Vec<Delivered>,
+    /// Files whose attempt's delivery made a version.
+    made: BTreeSet<u128>,
+    /// Files of attempts answered from their operation's row, with their deadlines.
+    answered: BTreeMap<u128, u64>,
+    /// The obligations broken, as each was.
+    broken: Vec<String>,
 }
 
 /// The collector's work: a file released by Name range `range`.
@@ -260,9 +367,13 @@ struct Uploader {
 }
 
 impl World {
+    fn new() -> Self {
+        Self::with(Variant::Whole)
+    }
+
     /// A cell whose first Name range opened the bucket's gate and split at "m", the gateways
     /// knowing both halves.
-    fn new() -> Self {
+    fn with(variant: Variant) -> Self {
         let mut first = Model::default();
         first.install(0, name::first(1).unwrap()).unwrap();
         let mut w = Self {
@@ -295,6 +406,13 @@ impl World {
             uploaders: Vec::new(),
             written: BTreeSet::new(),
             reclaimed: BTreeSet::new(),
+            variant,
+            ops: Vec::new(),
+            next_operation: 0,
+            delivered: Vec::new(),
+            made: BTreeSet::new(),
+            answered: BTreeMap::new(),
+            broken: Vec::new(),
         };
         let open = name::Command::Gate(GateChange {
             bucket: BUCKET.into(),
@@ -509,13 +627,18 @@ impl World {
 
     /// The range that owns `key` now.
     fn holder(&mut self, key: &str) -> &mut Model {
+        let id = self.holder_id(key);
+        &mut self.names.get_mut(&id).unwrap().engine
+    }
+
+    fn holder_id(&mut self, key: &str) -> u64 {
         let route = key::route(BUCKET, key);
         let (id, _) = self
             .owners()
             .into_iter()
             .find(|(_, l)| l.now.holds(&route))
             .unwrap();
-        &mut self.names.get_mut(&id).unwrap().engine
+        id
     }
 
     fn file(&mut self, command: file::Command) -> file::Outcome {
@@ -540,46 +663,87 @@ impl World {
 
     fn act(&mut self, action: &Action) {
         self.clock += 10;
+        // A split or a merge's step carries every operation row with its key (obligation 5).
+        let carries = matches!(
+            action,
+            Action::Split { .. } | Action::MergeStep(_) | Action::MergeAbandon(_) | Action::Late(_)
+        );
+        let rows = carries.then(|| self.operation_rows());
+        self.step(action);
+        if let Some(rows) = rows
+            && self.operation_rows() != rows
+        {
+            self.broken.push(format!(
+                "5, carried with its key: {action:?} changed the operation rows"
+            ));
+        }
+    }
+
+    fn step(&mut self, action: &Action) {
         match *action {
-            Action::Write { key } => {
-                let (file, block) = (self.id(), self.id());
-                let place = ChunkPlace {
-                    volume: block % 3,
-                    key: ChunkKey {
-                        block,
-                        epoch: 1,
-                        index: 0,
-                    },
-                };
-                self.volumes.insert(slot(&place));
-                let outcome = self.block(block::Command::Write {
-                    block,
-                    header: BlockHeader {
-                        length: 1,
-                        data: 1,
-                        parity: 0,
-                        chunk_len: 1,
-                        crc32c: 0,
-                    },
-                    chunks: vec![place],
-                    file,
-                    handover_ns: HANDOVER,
-                    at_ns: self.proposed(),
-                });
-                let block::Outcome::Written { deadline_ns } = outcome else {
-                    panic!("{outcome:?}");
-                };
-                let versioning = if file.is_multiple_of(2) {
-                    Versioning::Enabled
-                } else {
-                    Versioning::Unversioned
-                };
-                self.gateways.push(Gateway {
+            Action::Write { key } => self.start(KEYS[key], None),
+            Action::Operate {
+                key,
+                principal,
+                horizon,
+            } => {
+                self.next_operation += 1;
+                self.ops.push(Op {
+                    principal: principal as u128,
+                    raw: self.next_operation,
                     key: KEYS[key],
-                    file,
-                    versioning,
-                    stage: Stage::Block { block, deadline_ns },
+                    versioning: versioning(self.ops.len()),
+                    horizon_ns: HORIZONS[horizon],
+                    effect: None,
                 });
+            }
+            Action::Forge { of, horizon } => {
+                if !self.ops.is_empty() {
+                    let of = &self.ops[of % self.ops.len()];
+                    let (principal, raw, key) = ((of.principal + 1) % PRINCIPALS, of.raw, of.key);
+                    // A principal's own operations never share an identity: a client draws
+                    // each afresh.
+                    if !self
+                        .ops
+                        .iter()
+                        .any(|o| o.raw == raw && o.principal == principal)
+                    {
+                        self.ops.push(Op {
+                            principal,
+                            raw,
+                            key,
+                            versioning: versioning(self.ops.len()),
+                            horizon_ns: HORIZONS[horizon],
+                            effect: None,
+                        });
+                    }
+                }
+            }
+            Action::Attempt(i) => {
+                if !self.ops.is_empty() {
+                    let op = i % self.ops.len();
+                    self.start(self.ops[op].key, Some(op));
+                }
+            }
+            Action::AdvanceAttempt(i) => {
+                let attempts: Vec<usize> = (0..self.gateways.len())
+                    .filter(|&j| self.gateways[j].op.is_some())
+                    .collect();
+                if !attempts.is_empty() {
+                    let g = self.gateways.swap_remove(attempts[i % attempts.len()]);
+                    self.advance(g);
+                }
+            }
+            Action::Copy(i) => {
+                if !self.delivered.is_empty() {
+                    let copy = self.delivered[i % self.delivered.len()].clone();
+                    self.deliver(&copy);
+                }
+            }
+            Action::Forget => {
+                for (id, _) in self.owners() {
+                    self.forget(id);
+                }
             }
             Action::Advance(i) => {
                 if !self.gateways.is_empty() {
@@ -716,6 +880,212 @@ impl World {
         }
     }
 
+    /// A gateway writes a chunk and its block, for a file of `key`, as an attempt of operation
+    /// `op` if it carries one.
+    fn start(&mut self, key: &'static str, op: Option<usize>) {
+        let (file, block) = (self.id(), self.id());
+        let place = ChunkPlace {
+            volume: block % 3,
+            key: ChunkKey {
+                block,
+                epoch: 1,
+                index: 0,
+            },
+        };
+        self.volumes.insert(slot(&place));
+        let outcome = self.block(block::Command::Write {
+            block,
+            header: BlockHeader {
+                length: 1,
+                data: 1,
+                parity: 0,
+                chunk_len: 1,
+                crc32c: 0,
+            },
+            chunks: vec![place],
+            file,
+            handover_ns: HANDOVER,
+            at_ns: self.proposed(),
+        });
+        let block::Outcome::Written { deadline_ns } = outcome else {
+            panic!("{outcome:?}");
+        };
+        let versioning = match op {
+            Some(op) => self.ops[op].versioning,
+            None => versioning(usize::try_from(file % 2).unwrap()),
+        };
+        self.gateways.push(Gateway {
+            key,
+            file,
+            versioning,
+            stage: Stage::Block { block, deadline_ns },
+            op,
+        });
+    }
+
+    /// The identity a gateway hands over for operation `op`: the client's, scoped to the
+    /// principal authentication established, collision-free as a 128-bit hash of the two is but
+    /// for chance; the client's own with the scope removed.
+    fn scoped(&self, op: usize) -> u128 {
+        let o = &self.ops[op];
+        match self.variant {
+            Variant::NoScope => o.raw,
+            _ => o.raw * PRINCIPALS + o.principal,
+        }
+    }
+
+    /// Delivers an attempt of an operation and judges the obligations its outcome bears on
+    /// (docs/design/gateway.md §2.1); `None` while a merge in flight holds its key.
+    fn deliver(&mut self, d: &Delivered) -> Option<name::Outcome> {
+        let key = self.ops[d.op].key;
+        let proposed = self.proposed();
+        let before_ns = mantle_meta::clock::now(self.holder(key), proposed).unwrap();
+        let within = self.ops[d.op]
+            .effect
+            .as_ref()
+            .is_some_and(|e| before_ns <= e.expiry_ns);
+        let rows = self.key_rows(key);
+        let outcome = self.send(key, &d.command)?;
+        match &outcome {
+            name::Outcome::Put { version } => {
+                let now = mantle_meta::clock::now(self.holder(key), 0).unwrap();
+                if let Some(e) = &self.ops[d.op].effect
+                    && now <= e.expiry_ns
+                {
+                    self.broken.push(format!(
+                        "1, one effect: operation {} made a second version at {now}, within its \
+                         first's horizon, to {}",
+                        d.op, e.expiry_ns
+                    ));
+                }
+                let op = &mut self.ops[d.op];
+                op.effect = Some(Effect {
+                    version: version.clone(),
+                    etag: format!("e{}", d.file),
+                    expiry_ns: now.saturating_add(op.horizon_ns),
+                });
+                self.made.insert(d.file);
+                if self.variant == Variant::NoRow {
+                    let (id, identity) = (self.holder_id(key), self.scoped(d.op));
+                    let range = self.names.get_mut(&id).unwrap();
+                    range.index += 1;
+                    let gone = Write::Delete(key::operation(BUCKET, key, identity));
+                    range.engine.apply(range.index, vec![gone]).unwrap();
+                }
+            }
+            name::Outcome::Answered(made) => {
+                let answer = match made {
+                    Made::Version {
+                        order, null, etag, ..
+                    } => Some((name::shown_id(*null, *order), etag.clone())),
+                    _ => None,
+                };
+                let first = self.ops[d.op]
+                    .effect
+                    .as_ref()
+                    .map(|e| (e.version.clone(), e.etag.clone()));
+                if first.is_none() || answer != first {
+                    self.broken.push(format!(
+                        "2, one answer: an attempt of operation {} was answered {made:?}, its \
+                         first delivery {first:?}",
+                        d.op
+                    ));
+                }
+                // A copy of a delivery that made a version leaves its file to the version.
+                if !self.made.contains(&d.file) && !self.answered.contains_key(&d.file) {
+                    if self.queued(d.file).is_empty() {
+                        self.broken.push(format!(
+                            "4, released once: attempt file {} answered from its row was not \
+                             released",
+                            d.file
+                        ));
+                    }
+                    self.answered.insert(d.file, d.deadline_ns);
+                }
+            }
+            _ => {}
+        }
+        if within && self.key_rows(key) != rows {
+            self.broken.push(format!(
+                "3, no stale replacement: an attempt of operation {} within its horizon changed \
+                 {key}'s rows",
+                d.op
+            ));
+        }
+        Some(outcome)
+    }
+
+    /// The collector forgets, a page at a time, the operations Name range `id` holds whose
+    /// horizon has passed at its time; with the horizon check removed, every one it reads.
+    fn forget(&mut self, id: u64) {
+        if self.variant == Variant::NoHorizon {
+            let r = self.names.get_mut(&id).unwrap();
+            let (mut from, to) = key::operations_all();
+            let mut gone = Vec::new();
+            while let Some((k, _)) = r.engine.next(&from, &to).unwrap() {
+                from = k.clone();
+                from.push(0);
+                gone.push(Write::Delete(k));
+            }
+            r.index += 1;
+            r.engine.apply(r.index, gone).unwrap();
+            return;
+        }
+        // The range holds at most a row per operation, which pages of `PAGE` rows pass in fewer
+        // pages than there are operations, and one more.
+        let mut from = Vec::new();
+        for _ in 0..=self.ops.len() {
+            let forget = name::Command::Forget(Forget {
+                from,
+                budget: u32::try_from(PAGE).unwrap(),
+                at_ns: self.proposed(),
+            });
+            match self.name(id, forget) {
+                name::Outcome::Forgot { next: Some(next) } => from = next,
+                // The last page; or a frozen range, which forgets nothing.
+                _ => return,
+            }
+        }
+    }
+
+    /// The operation rows of every range that owns its span.
+    fn operation_rows(&mut self) -> BTreeSet<(Vec<u8>, Vec<u8>)> {
+        let mut out = BTreeSet::new();
+        for range in self.owned() {
+            let (mut from, to) = key::operations_all();
+            while let Some((k, v)) = range.next(&from, &to).unwrap() {
+                from = k.clone();
+                from.push(0);
+                out.insert((k, v));
+            }
+        }
+        out
+    }
+
+    /// The rows of `key`'s versions, uploads and parts in the range that owns it.
+    fn key_rows(&mut self, key: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let range = self.holder(key);
+        let (mut from, to) = key::bucket_span(BUCKET);
+        let mut out = Vec::new();
+        while let Some((k, v)) = range.next(&from, &to).unwrap() {
+            from = k.clone();
+            from.push(0);
+            if key::decode_name(&k).is_some_and(|(_, of, _)| of == key) {
+                out.push((k, v));
+            }
+        }
+        out
+    }
+
+    /// The entries of the owners' queues of released files that release `file`.
+    fn queued(&mut self, file: u128) -> Vec<name::Released> {
+        self.owned()
+            .into_iter()
+            .flat_map(|r| name::released(r, u64::MAX, usize::MAX).unwrap())
+            .filter(|q| q.file == file)
+            .collect()
+    }
+
     /// The gateway's next step: its file, or its handover.
     fn advance(&mut self, mut g: Gateway) {
         match g.stage {
@@ -782,10 +1152,10 @@ impl World {
         }
     }
 
-    /// Hands the file over; false while a merge in flight holds its key, so the gateway tries
-    /// again later.
+    /// Hands the file over, as its operation's attempt if it carries one; false while a merge in
+    /// flight holds its key, so the gateway tries again later.
     fn handover(&mut self, g: &Gateway, deadline_ns: u64) -> bool {
-        let put = name::Command::Put(Put {
+        let put = Put {
             bucket: BUCKET.into(),
             incarnation: 1,
             key: g.key.into(),
@@ -797,7 +1167,12 @@ impl World {
                 marker: false,
                 null: false,
                 modified_ns: 0,
-                etag: "e".into(),
+                // Each attempt's own, so an answer names the attempt that made it.
+                etag: if g.op.is_some() {
+                    format!("e{}", g.file)
+                } else {
+                    "e".into()
+                },
                 size: 1,
                 checksum: None,
                 file: Some(g.file),
@@ -810,13 +1185,37 @@ impl World {
             default: None,
             id: 0,
             deadline_ns,
-        });
+        };
         let proposed = self.proposed();
         let late = mantle_meta::clock::now(self.holder(g.key), proposed).unwrap() > deadline_ns;
-        match self.send(g.key, &put) {
+        let outcome = match g.op {
+            None => self.send(g.key, &name::Command::Put(put)),
+            Some(op) => {
+                let operation = Operation {
+                    identity: self.scoped(op),
+                    horizon_ns: self.ops[op].horizon_ns,
+                };
+                let d = Delivered {
+                    op,
+                    file: g.file,
+                    deadline_ns,
+                    command: name::Command::Operated(Box::new(Operated {
+                        operation,
+                        mutation: Mutation::Put(put),
+                    })),
+                };
+                let outcome = self.deliver(&d);
+                if outcome.is_some() {
+                    self.delivered.push(d);
+                }
+                outcome
+            }
+        };
+        match outcome {
             None => return false,
             Some(name::Outcome::Put { .. }) => assert!(!late, "a late handover was taken"),
             Some(name::Outcome::Expired) => assert!(late, "a handover in time was refused"),
+            Some(name::Outcome::Answered(_)) if g.op.is_some() => {}
             Some(other) => panic!("{other:?}"),
         }
         true
@@ -1331,6 +1730,30 @@ impl World {
                 }
             }
         }
+        // A file an attempt answered from its row made is released once while its deadline
+        // stands. Past it the range releases a file unmarked, and a copy may release it again,
+        // which the reclaimer finds gone (`name::apply`).
+        let answered: Vec<(u128, u64)> = self.answered.iter().map(|(&f, &d)| (f, d)).collect();
+        for (f, deadline_ns) in answered {
+            let within = self
+                .queued(f)
+                .iter()
+                .filter(|q| q.released_ns <= deadline_ns)
+                .count();
+            if within > 1 {
+                self.broken.push(format!(
+                    "4, released once: attempt file {f} is released {within} times within its \
+                     deadline"
+                ));
+            }
+        }
+        if self.variant == Variant::Whole {
+            assert!(
+                self.broken.is_empty(),
+                "obligations broken: {:?}",
+                self.broken
+            );
+        }
     }
 
     /// The faults stop: every gateway still in flight takes its steps, every deadline passes,
@@ -1451,12 +1874,21 @@ fn last_instant(rows: &mut Model) -> u64 {
     mantle_meta::clock::now(rows, 0).unwrap() + 1
 }
 
+/// The versioning the `n`th writer puts under: versions kept and replaced, alternately.
+fn versioning(n: usize) -> Versioning {
+    if n.is_multiple_of(2) {
+        Versioning::Enabled
+    } else {
+        Versioning::Unversioned
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2_000))]
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
 
     #[test]
     fn what_a_gateway_never_handed_over_is_released_and_nothing_handed_over_is(
-        actions in prop::collection::vec(action(), 1..120),
+        actions in prop::collection::vec(action(), 1..STEPS),
     ) {
         let mut world = World::new();
         for action in &actions {
@@ -1464,6 +1896,34 @@ proptest! {
             world.check();
         }
         world.finish();
+    }
+}
+
+/// With each piece of the operation record removed in turn, some schedule breaks one of its
+/// obligations. The schedules are drawn by a runner of fixed seed, so every run judges the same
+/// ones, and from the simulation's own budget: a variant it could not break within that budget,
+/// it could not catch.
+#[test]
+fn each_piece_of_the_operation_record_removed_is_caught() {
+    for variant in [Variant::NoRow, Variant::NoScope, Variant::NoHorizon] {
+        let mut runner = TestRunner::deterministic();
+        let schedules = prop::collection::vec(action(), 1..STEPS);
+        let caught = (0..CASES).find_map(|case| {
+            let actions = schedules.new_tree(&mut runner).unwrap().current();
+            let mut world = World::with(variant);
+            for action in &actions {
+                world.act(action);
+                world.check();
+                if let Some(broken) = world.broken.first() {
+                    return Some((case, broken.clone()));
+                }
+            }
+            None
+        });
+        let Some((case, broken)) = caught else {
+            panic!("{variant:?}: no schedule of {CASES} broke an obligation");
+        };
+        println!("{variant:?}: schedule {case} broke {broken}");
     }
 }
 

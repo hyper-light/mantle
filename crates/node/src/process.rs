@@ -442,6 +442,43 @@ pub struct ProcessConfig {
     pub enlist: Option<Enlisting>,
     /// The gateway host's, for a node that hosts objects: none for one that refuses them.
     pub gateway: Option<GatewayConfig>,
+    /// The shards the node places its ranges over (`range_shards`, node.md §2.9).
+    pub range_shards: RangeShards,
+}
+
+/// The shards a node places its ranges over (`range_shards`, node.md §2.9): a mode its operator
+/// states, `first` where unstated, so a ladder measures both without a change to the code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RangeShards {
+    /// Every range on the node's first shard, beside its transport and its native door: ladder
+    /// r28 (lean-doors `54fda898`) served 2,779 PUTs a second best, where r40 (`ec7519e1`),
+    /// placed over the shards, served 641.
+    #[default]
+    First,
+    /// Each range on the shard past the first with the fewest of the node's ranges
+    /// (`node::spread`), each driven by a task on its shard.
+    Spread,
+}
+
+impl std::str::FromStr for RangeShards {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "first" => Ok(Self::First),
+            "spread" => Ok(Self::Spread),
+            other => Err(format!("{other} is not first or spread")),
+        }
+    }
+}
+
+impl std::fmt::Display for RangeShards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::First => "first",
+            Self::Spread => "spread",
+        })
+    }
 }
 
 /// What a node that hosts objects states (`GatewaySettings`), its root keys by their files.
@@ -558,6 +595,7 @@ pub const KEYS: &[&str] = &[
     "chunk_asks",
     "command_asks",
     "read_asks",
+    "range_shards",
     "domain",
     "root.max_nodes",
     "root.max_volumes",
@@ -614,6 +652,7 @@ pub const STATED_KEYS: &[&str] = &[
     "durability.target",
     "durability.repair_rate",
     "stop_ms",
+    "range_shards",
     "s3",
     "s3.region",
     "s3.certificate",
@@ -1063,6 +1102,7 @@ impl ProcessConfig {
             read_asks: lines.get("read_asks")?,
             enlist: enlisting(&lines)?,
             gateway: gateway(&lines)?,
+            range_shards: lines.maybe("range_shards")?.unwrap_or_default(),
         };
         if !config.rules.admit_sessions() {
             return Err(ProcessError::Value(
@@ -1804,6 +1844,7 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         target,
         repair,
         s3: s3_stated(&lines)?,
+        range_shards: lines.maybe("range_shards")?,
     })
 }
 
@@ -2226,12 +2267,18 @@ async fn serve(
     let connections = gateway
         .as_ref()
         .map_or(0, |g| u64::try_from(g.objects).unwrap_or(u64::MAX));
-    // The shards the node places its ranges over: its first alone, until a far range's refused
-    // proposal or read is answered rather than left to its asker's patience (node.md §2.9). Placed
-    // over every shard, ladder r40 (lean-doors ec7519e1, adas-mac-studio.local-2, 1 B, native door)
-    // served PUTs at 641/s best, at 128 clients, and left 86 unanswered at 256, where r28 (54fda898,
-    // ranges on the first shard) served 2,779/s at 1,024; GETs fell from 8,551/s to 2,190/s.
-    let shards = NonZeroUsize::MIN;
+    // The shards the node places its ranges over, as its operator states (`range_shards`, node.md
+    // §2.9): its first alone, or the runtime's shards that take tasks, its first and each past it a
+    // holder names. Placed over every shard, ladder r40 (lean-doors ec7519e1,
+    // adas-mac-studio.local-2, 1 B, native door) served PUTs at 641/s best, at 128 clients, and left
+    // 86 unanswered at 256, where r28 (54fda898, ranges on the first shard) served 2,779/s at 1,024;
+    // GETs fell from 8,551/s to 2,190/s.
+    let shards = match config.range_shards {
+        RangeShards::First => NonZeroUsize::MIN,
+        RangeShards::Spread => NonZeroUsize::MIN.checked_add(others.len()).ok_or_else(|| {
+            step(Step::Network)(ProcessError::Runtime("the node's shards".into()))
+        })?,
+    };
     let settings = NodeSettings {
         id: config.id,
         dir: config.dir.clone(),
@@ -3888,6 +3935,32 @@ mod tests {
         if let Some(encoded) = longest.encode(1) {
             assert!(encoded.len() <= CALIBRATION_BYTES);
         }
+    }
+
+    /// `range_shards` is a mode its operator states, `first` or `spread`, unstated where the file
+    /// names it not, and any other word refused naming the key (node.md §2.9).
+    #[test]
+    fn the_shards_a_nodes_ranges_take_are_first_or_spread() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let base = "id = 1\ndir = .\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = a.der\n\
+                    certificate = n.der\nkey = n.key\nvoters = 1\nrange = 1 root\n";
+        std::fs::write(&config, base).unwrap();
+        assert_eq!(read_stated(&config).unwrap().range_shards, None);
+        for (word, shards) in [
+            ("first", RangeShards::First),
+            ("spread", RangeShards::Spread),
+        ] {
+            std::fs::write(&config, format!("{base}range_shards = {word}\n")).unwrap();
+            assert_eq!(read_stated(&config).unwrap().range_shards, Some(shards));
+            assert_eq!(shards.to_string(), word);
+        }
+        std::fs::write(&config, format!("{base}range_shards = every\n")).unwrap();
+        assert!(matches!(
+            read_stated(&config),
+            Err(ProcessError::Value("range_shards", _))
+        ));
+        assert_eq!(RangeShards::default(), RangeShards::First);
     }
 
     /// A stated volume's directory may hold a space, its size after the last; a relative one is

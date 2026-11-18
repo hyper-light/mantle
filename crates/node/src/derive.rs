@@ -33,7 +33,7 @@ use mantle_range::{ConfState, Range, Settings};
 
 use crate::ask::ENTRIES_OUT;
 use crate::node::Hosted;
-use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig, S3Stated};
+use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig, RangeShards, S3Stated};
 use crate::storage::VolumeSettings;
 use mantle_protocol::classes::Role;
 
@@ -1729,6 +1729,8 @@ pub struct Stated {
     pub stop: Option<Duration>,
     /// The S3 endpoint, where its operator states it (node.md §4).
     pub s3: Option<S3Stated>,
+    /// The shards the node places its ranges over, where its operator states them (node.md §2.9).
+    pub range_shards: Option<RangeShards>,
 }
 
 /// Where a value comes from (node.md §1.4's table).
@@ -2417,6 +2419,18 @@ pub fn derive(
          period for a Linux container, 10 s, the shortest of the orchestrators' (Kubernetes 30 s, \
          systemd 90 s), so a stop ends before their SIGKILL (research 64; node.md §1.7)",
     );
+    let (range_shards, range_shards_why) = match stated.range_shards {
+        Some(shards) => (shards, Kind::Stated),
+        None => (RangeShards::First, Kind::Cited),
+    };
+    said.add(
+        "range_shards",
+        range_shards,
+        range_shards_why,
+        "the shards the node places its ranges over: as stated, or its first alone, as ladder r40 \
+         (lean-doors ec7519e1) measured placement over its shards slower than r28 (54fda898) with \
+         every range on the first (node.md §2.9)",
+    );
     let gateway_config = hosts.then(|| GatewayConfig {
         keys: stated.keys.clone(),
         handover_ns: gateway.handover_ns,
@@ -2461,6 +2475,7 @@ pub fn derive(
             read_asks: asked.reads,
             enlist: stated.enlist,
             gateway: gateway_config,
+            range_shards,
         },
         bases: said.0,
     })
@@ -4263,6 +4278,7 @@ mod tests {
             stop: None,
             target: None,
             s3: None,
+            range_shards: None,
         }
     }
 
@@ -4364,6 +4380,7 @@ mod tests {
             (config.chunk_asks, config.command_asks, config.read_asks)
         );
         assert_eq!(read.enlist, config.enlist);
+        assert_eq!(read.range_shards, config.range_shards);
         let (read, config) = (read.gateway.unwrap(), config.gateway.as_ref().unwrap());
         assert_eq!(read.keys, config.keys);
         assert_eq!(

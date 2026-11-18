@@ -706,6 +706,10 @@ enum BenchCommand {
         /// path lost them (src/relay.rs; docs/research/70, "Conditions"). Only the native door runs.
         #[arg(long)]
         relay: bool,
+        /// The shards each server of the cell places its ranges over, its `range_shards`: first,
+        /// every range on its first shard, or spread, over the shards past it (node.md §2.9).
+        #[arg(long, default_value = "first")]
+        range_shards: mantle_node::process::RangeShards,
     },
 }
 
@@ -1401,6 +1405,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         smoke,
         kinds,
         relay,
+        range_shards,
     } = command
     else {
         return Err("not mantle bench doors".to_owned());
@@ -1457,6 +1462,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         perf,
         kinds,
         relay,
+        range_shards,
     })
 }
 

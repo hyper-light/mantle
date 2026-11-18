@@ -18,6 +18,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Instant;
 
+use mantle_node::process::RangeShards;
+
 use super::place::Gateway;
 
 /// The founders a case's cell has: three, one failure domain each, so a block's three copies sit
@@ -363,8 +365,13 @@ pub struct Cell {
 
 impl Cell {
     /// A cell made in `dir`, which holds nothing yet, each founder's volume stated at
-    /// `volume_bytes`, every founder started and enlisted.
-    pub fn make(dir: &Path, volume_bytes: u64) -> Result<Self, CellError> {
+    /// `volume_bytes` and the shards it places its ranges over at `range_shards` (node.md §2.9),
+    /// every founder started and enlisted.
+    pub fn make(
+        dir: &Path,
+        volume_bytes: u64,
+        range_shards: RangeShards,
+    ) -> Result<Self, CellError> {
         let exe = std::env::current_exe().map_err(io("this program's path"))?;
         let machines = dir.join("machines.conf");
         let mut text = format!("max_nodes = {FOUNDERS}\nmax_volumes = {FOUNDERS}\n");
@@ -428,6 +435,13 @@ impl Cell {
                 "{} founders said, not {FOUNDERS}: {stdout}",
                 nodes.len()
             )));
+        }
+        // Each founder's operator's statements, `mantle init`'s, and the shards its ranges take.
+        for node in &nodes {
+            let config = node.dir.join("config");
+            let mut text = std::fs::read_to_string(&config).map_err(io("a founder's config"))?;
+            text.push_str(&format!("range_shards = {range_shards}\n"));
+            std::fs::write(&config, text).map_err(io("a founder's config"))?;
         }
         // Pinned before any founder starts: a founder reads its peers once, at its start.
         crate::init::pin_gateway(&mut Vec::new(), &out.join(super::place::GATEWAY), &out)

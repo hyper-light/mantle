@@ -432,8 +432,9 @@ measures the second, and derives the rest by these rules:
 
 *As built (2026-10-23).* `mantle serve CONFIG` reads a file of the first column's keys alone, each
 once (`id`, `dir`, `quic`, `plane`, `authority`, `certificate`, `key`, `voters`, `domain`,
-`root.max_nodes`, `root.max_volumes`, and, where stated, `memory`, the ceiling, and
-`durability.target`) and its repeated `peer`, `range`, `root_key` and `volume = DIR SIZE` lines; a
+`root.max_nodes`, `root.max_volumes`, and, where stated, `memory`, the ceiling,
+`durability.target` and `range_shards`, the shards its ranges take, `first` or `spread`, §2.9) and
+its repeated `peer`, `range`, `root_key` and `volume = DIR SIZE` lines; a
 key it does not know, a derived one among them, is refused at its line, as `mantle node` now
 refuses one it does not know (`process::STATED_KEYS`, `process::KEYS`). It takes each volume's
 device directory's `LOCK` first (§1.7 step 1; `storage::Locks`, handed to the volumes as they open),
@@ -1771,6 +1772,20 @@ range refuses (a full lane, a range not leading) is dropped and left to its aske
 waits on the device (`permit_blocking`). So `process::serve` places a node's ranges over its first
 shard alone (`NodeSettings::shards` one) until a far range's refusal is answered and the ladder
 measures placement over the shards past r28; the cluster suite still runs nodes over two shards.
+
+*As built (2026-11-18), the setting* (`process::RangeShards`, `range_shards`). Where a node's
+ranges go is a mode its operator states, so a ladder measures both arms without a change to the
+code: `range_shards = first`, every range on the node's first shard (`NodeSettings::shards` one),
+or `range_shards = spread`, the runtime's shards that take tasks, as step 5 placed them. It is
+`first` where unstated, as ladder r40 measured placement over the shards slower than r28 (above),
+until a ladder measures `spread` past it. Both `mantle serve`'s file (`process::STATED_KEYS`) and
+`mantle node`'s (`process::KEYS`) take it, any other word refused naming the key; `mantle serve`
+says it as a basis, `basis range_shards = first (cited: …)` where unstated and `(stated: …)` where
+stated. `mantle bench doors --range-shards first|spread` states it in each founder's file of the
+cell it makes (`transfer::Cell::make`, `first` by default and for `mantle bench transfer`), and
+its `doors run` line says it. Tested (`process::tests`): the key reads `first` and `spread`, is
+unstated where the file names it not, and refuses another word; `derive::tests` reads it back from
+the bases as the node runs with it.
 
 ## 3. Transport
 

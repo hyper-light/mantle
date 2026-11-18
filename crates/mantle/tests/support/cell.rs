@@ -1402,6 +1402,50 @@ impl Cell {
         Self::made_started(args, false, true, Network::Direct)
     }
 
+    /// A cell `mantle init` made as [`Cell::made`] makes it, each founder's memory stated at what
+    /// `mantle derive` says the node needs on this machine (`memory.need`), as an operator states
+    /// it, never a figure picked (docs/design/kubernetes.md): its floor at the most its devices can
+    /// be measured to take, with as many operations as one stock client asks of its S3 endpoint at
+    /// once, and every want whole. A figure picked passes some machine's floor, and the node
+    /// refuses it at its start: four gibibytes, below the floor of 4,940,600,296 bytes the nodes
+    /// derived on CI's windows-2025 runner (run 44286448798). The derivation measures each
+    /// founder's devices and keeps their profiles, which its first start takes.
+    pub(crate) fn made_at_need(args: impl FnOnce(&Path) -> Vec<String>) -> Self {
+        let mut cell = Self::made_unstarted(args, true, Network::Direct);
+        let founders: Vec<u64> = cell.made.keys().copied().collect();
+        for &id in &founders {
+            let config = cell.config_of(id);
+            keep_calibration(&cell.dirs[&id]);
+            let derived = Command::new(NODE)
+                .arg("derive")
+                .arg(&config)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                derived.status.success(),
+                "node {id}'s derivation: {}",
+                String::from_utf8_lossy(&derived.stderr)
+            );
+            let need = String::from_utf8_lossy(&derived.stdout)
+                .lines()
+                .filter_map(|line| Basis::parse(line.strip_prefix("basis ")?))
+                .find(|basis| basis.key == "memory.need")
+                .unwrap_or_else(|| panic!("node {id}'s derivation says no memory.need"))
+                .value;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&config)
+                .unwrap();
+            writeln!(file, "memory = {need}").unwrap();
+        }
+        for id in founders {
+            cell.start(id);
+        }
+        cell.introduce();
+        cell
+    }
+
     /// A cell `mantle init` made as [`Cell::made`] makes it, its founders past the first `started`
     /// by id made and never started: each joins the running cell when the test starts it
     /// (`Cell::start`, `Cell::introduce`), its volumes new to the cell's table.
@@ -3055,16 +3099,6 @@ pub(crate) fn chunk_key(n: u64) -> ChunkKey {
 /// `mantle init`'s arguments for a cell of three under `root`: a machines file's two founders and a
 /// `--node`'s, each with a volume of its own in a failure domain of its own.
 pub(crate) fn three_founders(root: &Path) -> Vec<String> {
-    founders_within(root, None)
-}
-
-/// [`three_founders`], each founder's memory stated at `memory` where given, as an operator
-/// states it (`memory = 1G`): a node derives what it runs from its allowance, its operations'
-/// count and its S3 listener's connections with it (node.md §2.8), so a test that holds every
-/// connection a listener serves states memory that makes that a count it can hold.
-pub(crate) fn founders_within(root: &Path, memory: Option<&str>) -> Vec<String> {
-    let stated = memory.map_or_else(String::new, |m| format!("memory = {m}\n"));
-    let flag = memory.map_or_else(String::new, |m| format!(",memory={m}"));
     let dirs: Vec<PathBuf> = (1..=3)
         .map(|n| {
             let dir = root.join(format!("d{n}"));
@@ -3076,7 +3110,7 @@ pub(crate) fn founders_within(root: &Path, memory: Option<&str>) -> Vec<String> 
     let mut text = String::from("max_nodes = 3\nmax_volumes = 3\n");
     for (n, dir) in dirs.iter().take(2).enumerate() {
         text.push_str(&format!(
-            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n{stated}",
+            "[node]\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\ndomain = rack-{n}\nvolume = {} 256M\n",
             dir.display()
         ));
     }
@@ -3086,7 +3120,7 @@ pub(crate) fn founders_within(root: &Path, memory: Option<&str>) -> Vec<String> 
         file.display().to_string(),
         "--node".into(),
         format!(
-            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M{flag}",
+            "quic=127.0.0.1:0,plane=127.0.0.1:0,domain=rack-2,volume={}:256M",
             dirs[2].display()
         ),
     ]

@@ -44,9 +44,10 @@ use s3::{Client, Key};
 
 /// A started cell of three, each node enlisted, and a client of each node's listener.
 fn started() -> (Cell, Vec<u64>, Vec<Client>) {
-    // Each founder at four gibibytes, so its listener serves as many connections as a test holds
+    // Each founder at what it needs on this machine, so its listener serves as many connections as
+    // one stock client opens, a count a test holds
     // (`the_listener_refuses_what_s3_refuses_and_closes_what_it_cannot_trust`).
-    let mut cell = Cell::made(|root| founders_within(root, Some("4G")));
+    let mut cell = Cell::made_at_need(three_founders);
     let ids: Vec<u64> = cell.dirs.keys().copied().collect();
     for &id in &ids {
         cell.enlisted(id);

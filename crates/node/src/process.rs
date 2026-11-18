@@ -2376,6 +2376,18 @@ async fn serve(
     let mut said_repair: Option<crate::node::RepairStatus> = None;
     // The longest poll of the node's shard as last said, 0 before the first saying.
     let mut said_poll = 0u64;
+    // Every shard of the node's runtime, its own first, none where the runtime registers none for
+    // it; and the stall said last of each, a shard's stalls said at most once each half serve
+    // period (`STALL_LINES_A_PERIOD`).
+    let holders: Vec<Option<SlotHolder>> = std::iter::once(
+        hyper_rt::registry::current_shard().and_then(hyper_rt::registry::holder_of),
+    )
+    .chain(others.iter().copied().map(Some))
+    .collect();
+    let mut said_stalls = vec![SaidStall::default(); holders.len()];
+    let stall_gap_ns = serve_ns
+        .checked_div(STALL_LINES_A_PERIOD)
+        .unwrap_or(serve_ns);
     let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
     let mut stop = Stop::new(config.stop);
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
@@ -2385,9 +2397,10 @@ async fn serve(
     // they are made into this one buffer and said together at the turn's end: one write and one
     // flush a turn that says anything, where each line was a `String` and a flush of its own. Its
     // storage is kept across the loop's turns, emptied each time it is said, so a turn regrows
-    // nothing: no pool, the loop's one buffer. Bound: one turn's lines, a line for each link and
-    // each range at most, and one each for the replaced, the movement, the held state, the
-    // longest poll, the log and the handovers, every line a few numbers long.
+    // nothing: no pool, the loop's one buffer. Bound: one turn's lines, a line for each link,
+    // each range and each shard's stall at most, and one each for the replaced, the movement, the
+    // held state, the longest poll, the log and the handovers, every line a few numbers long or,
+    // a stall's, its task's spawn site and label.
     let mut lines = String::new();
     let wrote = |e: std::fmt::Error| ProcessError::Runtime(e.to_string());
     loop {
@@ -2714,6 +2727,21 @@ async fn serve(
             .ok_or_else(|| ProcessError::Runtime("the node's loop runs on no shard".into()))?
             .longest_step_ns;
         said_poll = longest_poll_line(&mut lines, said_poll, longest_ns).map_err(wrote)?;
+        // Each shard's latest stall as the watchdog reported it, while the poll held the shard:
+        // the node's own is read once its poll ends and the loop turns again, another's as it
+        // happens, so a watcher that sees an exchange lost tells which shard was held, by which
+        // task, and whose the time was.
+        let now_ns = hyper_rt::futures::now_ns();
+        for (shard, (holder, said)) in holders.iter().zip(said_stalls.iter_mut()).enumerate() {
+            let report = holder.and_then(hyper_rt::watch::report);
+            stall_line(
+                &mut lines,
+                (shard, said),
+                report.as_ref(),
+                (now_ns, stall_gap_ns),
+            )
+            .map_err(wrote)?;
+        }
         let mut said = false;
         let mut room = (0u64, 0u64);
         for ((group, _), was) in config.ranges.iter().zip(told.iter_mut()) {
@@ -3193,6 +3221,74 @@ fn longest_poll_line(
     Ok(longest_ns)
 }
 
+/// The parts of the transport's serve period (`mantle_protocol::bounds::idle_timeout`) in each of
+/// which the node says one stall of a shard at most ([`stall_line`]): two. The watchdog reports a
+/// stall within twice its limit of the poll's start (hyper-rt `watch`), so it reports every stall
+/// as long as the serve period, the one that loses each exchange its shard carries, only where its
+/// limit is at most half the period; such a stall is then its shard's latest report for at least
+/// the period's other half, as the shard runs no other poll while it lasts. A shard said at most
+/// once each half period has each of those said, and at most two lines each period whatever it
+/// reports (docs/design/constants.md).
+const STALL_LINES_A_PERIOD: u64 = 2;
+
+/// What the node said last of one of its shards' stalls: the number of the watchdog's report it
+/// said, none before the first, and when, on the node's shard's clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SaidStall {
+    number: u64,
+    at_ns: Option<u64>,
+}
+
+/// `stall SHARD SITE LABEL HELD_NS CPU_NS WHOSE MISSED`, written onto `lines` where `report`, the
+/// latest stall hyper-rt's watchdog reported on the node's shard `shard` (its first the node's
+/// own), is newer than the one `said`, and `gap_ns` has passed since that was said, at `now_ns`:
+/// the shard; the spawn site of the task whose poll held it, `FILE:LINE`; its label; how long the
+/// poll had held the shard when reported and the CPU its thread ran meanwhile, in nanoseconds;
+/// whose the time was (`Whose::as_str`); and the reports since the one said that this one
+/// replaced unsaid. A site, label or CPU time the report lacks is `-`; a site's or label's
+/// whitespace and `%` are percent-encoded, so each stays one word.
+fn stall_line(
+    lines: &mut String,
+    (shard, said): (usize, &mut SaidStall),
+    report: Option<&hyper_rt::watch::StallReport>,
+    (now_ns, gap_ns): (u64, u64),
+) -> std::fmt::Result {
+    let Some(report) = report.filter(|report| report.number > said.number) else {
+        return Ok(());
+    };
+    if said
+        .at_ns
+        .is_some_and(|at| now_ns.saturating_sub(at) < gap_ns)
+    {
+        return Ok(());
+    }
+    write!(lines, "stall {shard} ")?;
+    match report.site {
+        Some(site) => {
+            word(lines, site.file())?;
+            write!(lines, ":{}", site.line())?;
+        }
+        None => lines.push('-'),
+    }
+    lines.push(' ');
+    match report.label {
+        Some(label) => word(lines, label.name)?,
+        None => lines.push('-'),
+    }
+    write!(lines, " {} ", report.held_ns)?;
+    match report.cpu_ns {
+        Some(cpu_ns) => write!(lines, "{cpu_ns}")?,
+        None => lines.push('-'),
+    }
+    let missed = report.number.saturating_sub(said.number).saturating_sub(1);
+    writeln!(lines, " {} {missed}", report.whose.as_str())?;
+    *said = SaidStall {
+        number: report.number,
+        at_ns: Some(now_ns),
+    };
+    Ok(())
+}
+
 /// The cell's repair as this node runs it (docs/design/repair.md §5): `repair LEADING SETTLED
 /// ROOT_APPLIED BLOCK_APPLIED REBUILT TIMING COMMANDS UNPLACED UNREADABLE CORRUPT WAITING SHORT LOST
 /// TAKERS RUNNING`, each flag 0 or 1, said each time it changes.
@@ -3451,6 +3547,102 @@ mod tests {
             3_072_000_001
         );
         assert_eq!(lines, "longest-poll 4200\nlongest-poll 3072000001\n");
+    }
+
+    /// A report of the watchdog's, numbered `number`, on a task spawned at `site` and labelled
+    /// `label`, held 3.072 s and a nanosecond, past the transport's idle timeout.
+    fn stalled(
+        number: u64,
+        (site, label): (
+            Option<&'static std::panic::Location<'static>>,
+            Option<&'static hyper_rt::slow::Label>,
+        ),
+        (cpu_ns, whose): (Option<u64>, hyper_rt::watch::Whose),
+    ) -> hyper_rt::watch::StallReport {
+        hyper_rt::watch::StallReport {
+            number,
+            task: hyper_rt::TaskId(hyper_rt::mem::Encoded::from_word(0)),
+            site,
+            label,
+            held_ns: 3_072_000_001,
+            cpu_ns,
+            whose,
+        }
+    }
+
+    /// A stall is said once, as its report is new, with its shard, its task's spawn site
+    /// `FILE:LINE`, its label, its hold and CPU time in nanoseconds, whose the time was and the
+    /// reports it replaced unsaid; what the report lacks is `-`, and a site's or label's whitespace
+    /// is percent-encoded so each stays one word. A report already said, or none, says nothing.
+    #[test]
+    fn a_stall_is_said_once_with_its_task_hold_and_whose() {
+        static LABEL: hyper_rt::slow::Label = hyper_rt::slow::Label::new("Put Object");
+        let site = std::panic::Location::caller();
+        let at = format!("{}:{}", site.file(), site.line());
+        let mut lines = String::new();
+        let mut said = SaidStall::default();
+        stall_line(&mut lines, (3, &mut said), None, (0, 1)).unwrap();
+        assert_eq!(lines, "");
+        let task = stalled(
+            1,
+            (Some(site), Some(&LABEL)),
+            (Some(2_000_000), hyper_rt::watch::Whose::Task),
+        );
+        stall_line(&mut lines, (3, &mut said), Some(&task), (10, 1)).unwrap();
+        assert_eq!(
+            lines,
+            format!("stall 3 {at} Put%20Object 3072000001 2000000 task 0\n")
+        );
+        // Said already: nothing, however long after.
+        stall_line(&mut lines, (3, &mut said), Some(&task), (u64::MAX, 1)).unwrap();
+        assert_eq!(lines.lines().count(), 1);
+        // The fourth report, the second and third replaced unsaid; no site, label or CPU time.
+        lines.clear();
+        let host = stalled(4, (None, None), (None, hyper_rt::watch::Whose::Host));
+        stall_line(&mut lines, (0, &mut said), Some(&host), (20, 1)).unwrap();
+        assert_eq!(lines, "stall 0 - - 3072000001 - host 2\n");
+        assert_eq!(
+            said,
+            SaidStall {
+                number: 4,
+                at_ns: Some(20)
+            }
+        );
+    }
+
+    /// However many stalls a shard reports, the node says at most one line of them each half
+    /// serve period: a watchdog reporting a stall at every turn of a node turning every
+    /// millisecond for a minute has its shard said at most once a gap, the first at once, and
+    /// each line's missed count says the reports it skipped, so the lines and the skipped sum to
+    /// every report but those after the last line.
+    #[test]
+    fn stall_lines_keep_to_their_rate_under_many_stalls() {
+        let serve_ns = u64::try_from(mantle_protocol::bounds::idle_timeout().as_nanos()).unwrap();
+        let gap_ns = serve_ns / STALL_LINES_A_PERIOD;
+        let span_ns = 60_000_000_000u64;
+        let turn_ns = 1_000_000u64;
+        let mut lines = String::new();
+        let mut said = SaidStall::default();
+        let mut number = 0;
+        let mut now_ns = 0;
+        while now_ns < span_ns {
+            number += 1;
+            let report = stalled(number, (None, None), (None, hyper_rt::watch::Whose::Task));
+            stall_line(&mut lines, (1, &mut said), Some(&report), (now_ns, gap_ns)).unwrap();
+            now_ns += turn_ns;
+        }
+        let said_lines = lines.lines().count() as u64;
+        assert!(said_lines > 1);
+        assert!(
+            said_lines <= span_ns / gap_ns + 1,
+            "{said_lines} lines in {span_ns} ns at one each {gap_ns} ns"
+        );
+        let missed: u64 = lines
+            .lines()
+            .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(said_lines + missed, said.number);
+        assert!(number - said.number <= gap_ns / turn_ns);
     }
 
     /// The table of what held the shard is said entry by entry, each field a name and one word,

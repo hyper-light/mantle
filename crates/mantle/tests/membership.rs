@@ -420,8 +420,9 @@ fn every_object_reads_back(cell: &mut Cell, load: &mut Steady, through: &[u64], 
         let node = through[at % through.len()];
         // A read refused or lost says the node it asked, and what the cell said last, with what it
         // said and was not yet taken: each range's status at each node, each node's links and its
-        // record of the others; each node's longest poll and how long ago it said it; and how long
-        // since each node's last status moved, as a poll still holding a node says nothing.
+        // record of the others; each node's longest poll and how long ago it said it; each node's
+        // latest stall on each shard and how long ago it said it; and how long since each node's
+        // last status moved, as a poll still holding a node says nothing.
         if !matches!(outcome, ObjectOutcome::Replied { reply, .. } if reply.status == ObjectStatus::Done)
         {
             cell.take_heard();
@@ -429,6 +430,11 @@ fn every_object_reads_back(cell: &mut Cell, load: &mut Steady, through: &[u64], 
                 .polls
                 .iter()
                 .map(|(id, (heard, longest))| (*id, (*longest, heard.elapsed())))
+                .collect();
+            let stalls: BTreeMap<(u64, u64), (Stall, Duration)> = cell
+                .stalls
+                .iter()
+                .map(|(at, (heard, stall))| (*at, (stall.clone(), heard.elapsed())))
                 .collect();
             let since: BTreeMap<u64, Duration> = cell
                 .log
@@ -438,7 +444,8 @@ fn every_object_reads_back(cell: &mut Cell, load: &mut Steady, through: &[u64], 
             panic!(
                 "{step}: {} natively through node {node}, read {at} of {}: {outcome:?}; status \
                  {:?}; links {:?}; standings {:?}; longest polls, each said how long ago \
-                 {polls:?}; since each node's last status {since:?}",
+                 {polls:?}; stalls by node and shard, each said how long ago {stalls:?}; since \
+                 each node's last status {since:?}",
                 key_of(*n),
                 numbers.len(),
                 cell.status,
@@ -801,4 +808,43 @@ fn a_longest_poll_line_parses_to_its_poll() {
     );
     assert_eq!(parse("longest-poll"), None);
     assert_eq!(parse("longest-poll 3.072s"), None);
+}
+
+/// A node's `stall` line, as its process writes it (`process::stall_line`), parses to the stall it
+/// says, which a refused read's dump and a quiet watch's show: its shard, its task's spawn site and
+/// label, its hold and CPU time, whose the time was and the reports left unsaid; a line of another
+/// shape parses to none.
+#[test]
+fn a_stall_line_parses_to_its_stall() {
+    assert_eq!(
+        parse("stall 2 crates/node/src/listener/mod.rs:396 PutObject 3072000001 12000 blocking 4"),
+        Some(Line::Stall(
+            2,
+            Stall {
+                site: "crates/node/src/listener/mod.rs:396".to_owned(),
+                label: "PutObject".to_owned(),
+                held: Duration::from_nanos(3_072_000_001),
+                cpu: Some(Duration::from_nanos(12_000)),
+                whose: "blocking".to_owned(),
+                missed: 4,
+            }
+        ))
+    );
+    assert_eq!(
+        parse("stall 0 - - 8000000 - unknown 0"),
+        Some(Line::Stall(
+            0,
+            Stall {
+                site: "-".to_owned(),
+                label: "-".to_owned(),
+                held: Duration::from_nanos(8_000_000),
+                cpu: None,
+                whose: "unknown".to_owned(),
+                missed: 0,
+            }
+        ))
+    );
+    assert_eq!(parse("stall 0 - - 8000000 - unknown"), None);
+    assert_eq!(parse("stall 0 - - 8ms - unknown 0"), None);
+    assert_eq!(parse("stall x - - 8000000 - unknown 0"), None);
 }

@@ -450,6 +450,9 @@ pub(crate) enum Line {
     /// The longest poll the node's shard has run since its process began, said as it grows: the
     /// longest the node's thread was held from every exchange it carries.
     LongestPoll(Duration),
+    /// A stall hyper-rt's watchdog reported on one of the node's shards, its first the node's own,
+    /// as the node said it, at most once a shard each half serve period.
+    Stall(u64, Stall),
     /// The node's log as it said with its last status: how long its flush had been out, if one
     /// was, and the longest an update has waited for its commit.
     Log(Option<Duration>, Duration),
@@ -539,6 +542,21 @@ pub(crate) struct Repairing {
 pub(crate) struct Lived {
     pub(crate) exposure: Duration,
     pub(crate) crashes: u64,
+}
+
+/// A stall as a node said it (`stall SHARD SITE LABEL HELD_NS CPU_NS WHOSE MISSED`): the spawn
+/// site of the task whose poll held the shard and its label, each `-` for none; how long the poll
+/// had held the shard when the watchdog reported it, and the CPU the shard's thread ran meanwhile,
+/// none where it had no reading; whose the time was; and the reports the node left unsaid before
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stall {
+    pub(crate) site: String,
+    pub(crate) label: String,
+    pub(crate) held: Duration,
+    pub(crate) cpu: Option<Duration>,
+    pub(crate) whose: String,
+    pub(crate) missed: u64,
 }
 
 pub(crate) fn parse(line: &str) -> Option<Line> {
@@ -648,6 +666,20 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
         ["longest-poll", longest] => Some(Line::LongestPoll(Duration::from_nanos(
             longest.parse().ok()?,
         ))),
+        ["stall", shard, site, label, held, cpu, whose, missed] => Some(Line::Stall(
+            shard.parse().ok()?,
+            Stall {
+                site: (*site).to_owned(),
+                label: (*label).to_owned(),
+                held: Duration::from_nanos(held.parse().ok()?),
+                cpu: match *cpu {
+                    "-" => None,
+                    cpu => Some(Duration::from_nanos(cpu.parse().ok()?)),
+                },
+                whose: (*whose).to_owned(),
+                missed: missed.parse().ok()?,
+            },
+        )),
         ["held", held] => Some(Line::Held(match *held {
             "0" => false,
             "1" => true,
@@ -727,6 +759,7 @@ pub(crate) fn movement(line: &Line) -> Option<Movement> {
         | Line::Room(..)
         | Line::Held(..)
         | Line::LongestPoll(..)
+        | Line::Stall(..)
         | Line::Volume(..)
         | Line::S3(..)
         | Line::S3Bound(..)
@@ -1119,6 +1152,9 @@ pub(crate) struct Cell {
     /// Each running node's longest poll as its process last said it, and when that was heard: a
     /// process says it as it grows, so when tells which stretch of the test ran it.
     pub(crate) polls: BTreeMap<u64, (Instant, Duration)>,
+    /// Each running node's latest stall on each of its shards as its process said it, and when
+    /// that was heard, by node and shard: one a node's shard at most.
+    pub(crate) stalls: BTreeMap<(u64, u64), (Instant, Stall)>,
     /// The bytes each node's transfers moved as it last said, and its transport's serve period: a
     /// transfer that lives moves within one, so the quiet period is never shorter.
     pub(crate) transfers: BTreeMap<u64, (u64, Duration)>,
@@ -1499,6 +1535,7 @@ impl Cell {
             log: BTreeMap::new(),
             room: BTreeMap::new(),
             polls: BTreeMap::new(),
+            stalls: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&founders.iter().map(|(id, _)| *id).collect::<Vec<_>>())),
@@ -1636,6 +1673,7 @@ impl Cell {
             log: BTreeMap::new(),
             room: BTreeMap::new(),
             polls: BTreeMap::new(),
+            stalls: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
@@ -1981,6 +2019,7 @@ impl Cell {
         self.log.remove(&id);
         self.room.remove(&id);
         self.polls.remove(&id);
+        self.stalls.retain(|(node, _), _| *node != id);
         self.transfers.remove(&id);
         self.hold();
     }
@@ -2006,6 +2045,7 @@ impl Cell {
                 | Line::Room(..)
                 | Line::Held(..)
                 | Line::LongestPoll(..)
+                | Line::Stall(..)
                 | Line::Volume(..)
                 | Line::S3(..)
                 | Line::S3Bound(..)
@@ -2153,7 +2193,7 @@ impl Cell {
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
                     "{what} at {at}: quiet for {quiet:?} with nothing moved, besides {:?} held still \
                      for the devices and {:?} the host held the watch: {:?}, progress {:?}, links \
-                     {:?}, log {:?}, room {:?}, longest polls {:?}, repairs {:?}",
+                     {:?}, log {:?}, room {:?}, longest polls {:?}, stalls {:?}, repairs {:?}",
                     self.held_for,
                     self.host_held,
                     self.status,
@@ -2162,6 +2202,7 @@ impl Cell {
                     self.log,
                     self.room,
                     self.polls,
+                    self.stalls,
                     self.repairs
                 ),
             }
@@ -2236,6 +2277,12 @@ impl Cell {
                     // A poll grown longer moves nothing: the cell moves as the node goes on.
                     Line::LongestPoll(longest) => {
                         self.polls.insert(id, (Instant::now(), longest));
+                        return;
+                    }
+                    // Nor does a stall: the node says it once its own shard is let go, or while
+                    // another shard is held.
+                    Line::Stall(shard, stall) => {
+                        self.stalls.insert((id, shard), (Instant::now(), stall));
                         return;
                     }
                     Line::Volume(volume) => {
@@ -2319,6 +2366,7 @@ impl Cell {
                     self.log.remove(&id);
                     self.room.remove(&id);
                     self.polls.remove(&id);
+                    self.stalls.retain(|(node, _), _| *node != id);
                     self.transfers.remove(&id);
                 }
             }

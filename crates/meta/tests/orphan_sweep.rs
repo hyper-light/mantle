@@ -29,17 +29,21 @@
 //! block left is one a file names, every chunk left one a block holds, and every mark is on a
 //! file held or released.
 //!
-//! Clients of two principals draw operations putting or deleting keys, each with a horizon, and
-//! one may carry the identity another principal's operation carries (docs/design/gateway.md
-//! §2.1). Any number of gateways attempt each operation at any step, each put attempt with a
-//! block and a file of its own, and an attempt handed over is delivered again as a copy at any
-//! later step; the collector forgets the rows whose horizon passed. After every step the
-//! operation record's five obligations hold: at most one effect per identity within its
-//! horizon, the first's answer to every attempt, no attempt within the horizon changing its
-//! key's rows, every attempt's file released once within its deadline, and the rows unchanged
-//! by a split or a merge, each with its key. With the row, the gateway's scope or the
-//! collector's horizon check removed, a schedule breaks one
-//! (`each_piece_of_the_operation_record_removed_is_caught`).
+//! Clients of two principals draw operations putting or deleting keys, creating uploads,
+//! putting their parts and completing them, each with a horizon; one may carry the identity
+//! another principal's operation carries, and a client may carry one of its own part's or
+//! completion's identities to another part or upload of the key, as a native client carries its
+//! upload's on every run (docs/design/gateway.md §2.1). Any number of gateways attempt each
+//! operation at any step, each put or part attempt with a block and a file of its own and each
+//! completion attempt with a composite file and an ETag of its own, and an attempt handed over
+//! is delivered again as a copy at any later step; the collector forgets the rows whose horizon
+//! passed. After every step the operation record's five obligations hold: at most one effect
+//! per identity within its horizon, every attempt within it answered from the row with the
+//! first's answer, so a retried completion is never rebuilt, no attempt within the horizon
+//! changing its key's rows, every attempt's file released once within its deadline, and the
+//! rows unchanged by a split or a merge, each with its key. With the row, the gateway's scope by
+//! principal, by part number or by upload, the collector's horizon check, or a completion's row
+//! removed, a schedule breaks one (`each_piece_of_the_operation_record_removed_is_caught`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -86,7 +90,9 @@ const PAGE: usize = 2;
 const ROUTES: usize = 8;
 /// Rows a merge resumed after its driver stopped may take.
 const MAX_ROWS: u64 = 64;
-/// Schedules the simulation runs, and the steps each takes at most.
+/// Schedules the simulation runs, and the steps each takes at most. A step draws at most one
+/// operation, upload or delivered attempt, so an action naming one of them by an index below
+/// `STEPS` can name each a schedule holds.
 const CASES: u32 = 2_000;
 const STEPS: usize = 120;
 /// Principals clients act as: two, the fewest under which one can carry another's identity.
@@ -107,6 +113,13 @@ enum Variant {
     NoScope,
     /// The collector forgets every row it reads, its horizon passed or not.
     NoHorizon,
+    /// The gateway hands over a part's identity unscoped by its part number.
+    NoPartNumber,
+    /// The gateway hands over a part's or a completion's identity unscoped by its upload.
+    NoUpload,
+    /// A completion keeps no row: a retry is rebuilt from the version it finds, as a write
+    /// carrying no operation is (`name::complete`).
+    Rebuilt,
 }
 
 #[derive(Debug, Clone)]
@@ -198,14 +211,43 @@ enum Action {
         principal: usize,
         horizon: usize,
     },
-    /// A client of the other principal carries the identity an operation carries, on its key:
-    /// forged, or drawn the same.
+    /// A client of a principal draws an operation creating an upload of a key.
+    OperateUpload {
+        key: usize,
+        principal: usize,
+        horizon: usize,
+    },
+    /// A client of a principal draws an operation putting part `number` of an upload: a native
+    /// client's carries its upload's identity, as every run of it does (docs/design/gateway.md
+    /// §2.1), and a stock client's one it draws.
+    OperatePart {
+        uploader: usize,
+        number: u16,
+        principal: usize,
+        horizon: usize,
+        native: bool,
+    },
+    /// A client of a principal draws an operation completing an upload.
+    OperateComplete {
+        uploader: usize,
+        principal: usize,
+        horizon: usize,
+    },
+    /// A client of the other principal carries the identity an operation carries, on its key
+    /// and to its write: forged, or drawn the same.
     Forge {
         of: usize,
         horizon: usize,
     },
-    /// A gateway starts an attempt of an operation: for a put, a block and a file of its own,
-    /// handed over as the operation's at its later steps; a delete, delivered at once.
+    /// A client carries the identity one of its part or completion operations carries to the
+    /// same write of another upload of the key.
+    Reuse {
+        of: usize,
+        uploader: usize,
+    },
+    /// A gateway starts an attempt of an operation: for a put or a part, a block and a file of
+    /// its own, handed over as the operation's at its later steps; for a completion, a
+    /// composite file of its own, delivered at once; a delete or an upload, delivered at once.
     Attempt(usize),
     /// A gateway attempting an operation takes its next step.
     AdvanceAttempt(usize),
@@ -251,25 +293,60 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (0usize..4, 0usize..2, 0..HORIZONS.len()).prop_map(|(key, principal, horizon)| {
             Action::OperateDelete { key, principal, horizon }
         }),
-        1 => (0usize..4, 0..HORIZONS.len()).prop_map(|(of, horizon)| Action::Forge { of, horizon }),
-        3 => (0usize..4).prop_map(Action::Attempt),
-        4 => (0usize..4).prop_map(Action::AdvanceAttempt),
-        1 => (0usize..4).prop_map(Action::Copy),
+        1 => (0usize..4, 0usize..2, 0..HORIZONS.len()).prop_map(|(key, principal, horizon)| {
+            Action::OperateUpload { key, principal, horizon }
+        }),
+        1 => (0..STEPS, 1u16..=3, 0usize..2, 0..HORIZONS.len(), any::<bool>()).prop_map(
+            |(uploader, number, principal, horizon, native)| Action::OperatePart {
+                uploader,
+                number,
+                principal,
+                horizon,
+                native,
+            }
+        ),
+        1 => (0..STEPS, 0usize..2, 0..HORIZONS.len()).prop_map(|(uploader, principal, horizon)| {
+            Action::OperateComplete { uploader, principal, horizon }
+        }),
+        1 => (0..STEPS, 0..HORIZONS.len()).prop_map(|(of, horizon)| Action::Forge { of, horizon }),
+        1 => (0..STEPS, 0..STEPS).prop_map(|(of, uploader)| Action::Reuse { of, uploader }),
+        3 => (0..STEPS).prop_map(Action::Attempt),
+        4 => (0..STEPS).prop_map(Action::AdvanceAttempt),
+        1 => (0..STEPS).prop_map(Action::Copy),
         2 => Just(Action::Forget),
     ]
 }
 
 /// A client's operation: the principal authentication established, the identity the client
-/// drew, the key it puts or deletes, the versioning it writes under, its horizon, and its last
-/// effect.
+/// drew, the key it writes and what it writes there, the versioning it writes under, its
+/// horizon, and its last effect.
 struct Op {
     principal: u128,
     raw: u128,
     key: &'static str,
-    delete: bool,
+    kind: Kind,
     versioning: Versioning,
     horizon_ns: u64,
     effect: Option<Effect>,
+}
+
+/// What an operation writes, which with its principal scopes its identity
+/// (docs/design/gateway.md §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kind {
+    Put,
+    Delete,
+    /// CreateMultipartUpload.
+    Upload,
+    /// UploadPart of part `number` to `upload`.
+    Part {
+        upload: String,
+        number: u16,
+    },
+    /// CompleteMultipartUpload of `upload`.
+    Complete {
+        upload: String,
+    },
 }
 
 /// What an operation's delivery made: the answer it got, and the range's time until which its
@@ -368,12 +445,15 @@ struct Collecting {
     reclaimer: Reclaimer,
 }
 
-/// A multipart upload in progress: its parts, by number, and the composite file its
-/// completion committed, if it did.
+/// A multipart upload in progress: the principal and identity its client created it with,
+/// which a native client carries on its every run; its parts, by number, as a completion
+/// lists them; and the composite file its completion committed, if it did.
 struct Uploader {
+    principal: u128,
+    raw: u128,
     key: &'static str,
     upload: String,
-    parts: Vec<(u16, u128)>,
+    parts: BTreeMap<u16, Listed>,
     completed: Option<u128>,
 }
 
@@ -703,43 +783,113 @@ impl World {
                 key,
                 principal,
                 horizon,
-            } => self.operate(KEYS[key], principal, horizon, false),
+            } => self.operate(KEYS[key], principal, horizon, Kind::Put),
             Action::OperateDelete {
                 key,
                 principal,
                 horizon,
-            } => self.operate(KEYS[key], principal, horizon, true),
-            Action::Forge { of, horizon } => {
-                if !self.ops.is_empty() {
-                    let of = &self.ops[of % self.ops.len()];
-                    let (principal, raw, key, delete) =
-                        ((of.principal + 1) % PRINCIPALS, of.raw, of.key, of.delete);
-                    // A principal's own operations never share an identity: a client draws
-                    // each afresh.
-                    if !self
-                        .ops
-                        .iter()
-                        .any(|o| o.raw == raw && o.principal == principal)
-                    {
-                        self.ops.push(Op {
-                            principal,
-                            raw,
+            } => self.operate(KEYS[key], principal, horizon, Kind::Delete),
+            Action::OperateUpload {
+                key,
+                principal,
+                horizon,
+            } => self.operate(KEYS[key], principal, horizon, Kind::Upload),
+            Action::OperatePart {
+                uploader,
+                number,
+                principal,
+                horizon,
+                native,
+            } => {
+                if !self.uploaders.is_empty() {
+                    let u = &self.uploaders[uploader % self.uploaders.len()];
+                    let (key, upload) = (u.key, u.upload.clone());
+                    let kind = Kind::Part { upload, number };
+                    if native {
+                        let run = Op {
+                            principal: u.principal,
+                            raw: u.raw,
                             key,
-                            delete,
+                            kind,
                             versioning: versioning(self.ops.len()),
                             horizon_ns: HORIZONS[horizon],
                             effect: None,
-                        });
+                        };
+                        self.draw(run);
+                    } else {
+                        self.operate(key, principal, horizon, kind);
+                    }
+                }
+            }
+            Action::OperateComplete {
+                uploader,
+                principal,
+                horizon,
+            } => {
+                if !self.uploaders.is_empty() {
+                    let u = &self.uploaders[uploader % self.uploaders.len()];
+                    let (key, upload) = (u.key, u.upload.clone());
+                    self.operate(key, principal, horizon, Kind::Complete { upload });
+                }
+            }
+            Action::Forge { of, horizon } => {
+                if !self.ops.is_empty() {
+                    let of = &self.ops[of % self.ops.len()];
+                    let forged = Op {
+                        principal: (of.principal + 1) % PRINCIPALS,
+                        raw: of.raw,
+                        key: of.key,
+                        kind: of.kind.clone(),
+                        versioning: versioning(self.ops.len()),
+                        horizon_ns: HORIZONS[horizon],
+                        effect: None,
+                    };
+                    self.draw(forged);
+                }
+            }
+            Action::Reuse { of, uploader } => {
+                // Each part or completion operation, with the upload it writes to.
+                let carried: Vec<(&Op, &String)> = self
+                    .ops
+                    .iter()
+                    .filter_map(|o| match &o.kind {
+                        Kind::Part { upload, .. } | Kind::Complete { upload } => Some((o, upload)),
+                        _ => None,
+                    })
+                    .collect();
+                if !carried.is_empty() {
+                    let (of, from) = carried[of % carried.len()];
+                    let on: Vec<&Uploader> = self
+                        .uploaders
+                        .iter()
+                        .filter(|u| u.key == of.key && &u.upload != from)
+                        .collect();
+                    if !on.is_empty() {
+                        let upload = on[uploader % on.len()].upload.clone();
+                        let kind = match of.kind {
+                            Kind::Part { number, .. } => Kind::Part { upload, number },
+                            _ => Kind::Complete { upload },
+                        };
+                        let reused = Op {
+                            principal: of.principal,
+                            raw: of.raw,
+                            key: of.key,
+                            kind,
+                            versioning: versioning(self.ops.len()),
+                            horizon_ns: of.horizon_ns,
+                            effect: None,
+                        };
+                        self.draw(reused);
                     }
                 }
             }
             Action::Attempt(i) => {
                 if !self.ops.is_empty() {
                     let op = i % self.ops.len();
-                    if self.ops[op].delete {
-                        self.attempt_delete(op);
-                    } else {
-                        self.start(self.ops[op].key, Some(op));
+                    match self.ops[op].kind {
+                        Kind::Put | Kind::Part { .. } => self.start(self.ops[op].key, Some(op)),
+                        Kind::Delete | Kind::Upload => self.attempt_at_once(op),
+                        Kind::Complete { .. } => self.attempt_complete(op),
                     }
                 }
             }
@@ -898,33 +1048,54 @@ impl World {
         }
     }
 
-    /// A client of `principal` draws an operation putting or deleting `key`.
-    fn operate(&mut self, key: &'static str, principal: usize, horizon: usize, delete: bool) {
+    /// A client of `principal` draws an operation writing `kind` to `key`, its identity afresh.
+    fn operate(&mut self, key: &'static str, principal: usize, horizon: usize, kind: Kind) {
         self.next_operation += 1;
-        self.ops.push(Op {
+        let op = Op {
             principal: principal as u128,
             raw: self.next_operation,
             key,
-            delete,
+            kind,
             versioning: versioning(self.ops.len()),
             horizon_ns: HORIZONS[horizon],
             effect: None,
-        });
+        };
+        self.draw(op);
     }
 
-    /// An attempt of delete operation `op`, delivered now.
-    fn attempt_delete(&mut self, op: usize) {
+    /// Takes a client's operation, unless its principal already carries its identity to the
+    /// same write of the same key: that is one operation, which every attempt carries.
+    fn draw(&mut self, op: Op) {
+        let same = self.ops.iter().any(|o| {
+            (o.principal, o.raw, o.key, &o.kind) == (op.principal, op.raw, op.key, &op.kind)
+        });
+        if !same {
+            self.ops.push(op);
+        }
+    }
+
+    /// An attempt of delete or upload operation `op`, delivered now: it carries no file.
+    fn attempt_at_once(&mut self, op: usize) {
         let o = &self.ops[op];
-        let delete = name::Delete {
-            bucket: BUCKET.into(),
-            incarnation: 1,
-            key: o.key.into(),
-            versioning: o.versioning,
-            named: None,
-            if_match: None,
-            at_ns: self.proposed(),
-            bypass: false,
-            owner: "o".into(),
+        let mutation = match o.kind {
+            Kind::Delete => Mutation::Delete(name::Delete {
+                bucket: BUCKET.into(),
+                incarnation: 1,
+                key: o.key.into(),
+                versioning: o.versioning,
+                named: None,
+                if_match: None,
+                at_ns: self.proposed(),
+                bypass: false,
+                owner: "o".into(),
+            }),
+            _ => Mutation::CreateUpload(CreateUpload {
+                bucket: BUCKET.into(),
+                incarnation: 1,
+                key: o.key.into(),
+                at_ns: self.proposed(),
+                upload: asked(),
+            }),
         };
         let operation = Operation {
             identity: self.scoped(op),
@@ -936,7 +1107,55 @@ impl World {
             deadline_ns: u64::MAX,
             command: name::Command::Operated(Box::new(Operated {
                 operation,
-                mutation: Mutation::Delete(delete),
+                mutation,
+            })),
+        };
+        if self.deliver(&d).is_some() {
+            self.delivered.push(d);
+        }
+    }
+
+    /// An attempt of completion operation `op`: a composite file of the parts its upload holds as
+    /// its client last learnt them, and an ETag naming the attempt, delivered now. A retry
+    /// answered from the row gets the first's ETag; one rebuilt from what it carries would not.
+    fn attempt_complete(&mut self, op: usize) {
+        let Kind::Complete { upload } = &self.ops[op].kind else {
+            return;
+        };
+        let key = self.ops[op].key;
+        let Some(u) = self
+            .uploaders
+            .iter()
+            .find(|u| u.key == key && &u.upload == upload)
+        else {
+            return;
+        };
+        if u.parts.is_empty() {
+            return;
+        }
+        let (upload, parts) = (
+            u.upload.clone(),
+            u.parts.values().cloned().collect::<Vec<_>>(),
+        );
+        let composite = self.id();
+        let deadline_ns = self.write_file(key, composite, composed(&parts));
+        let base = completion(key, upload, parts, composite, deadline_ns, self.proposed());
+        let complete = Complete {
+            versioning: self.ops[op].versioning,
+            etag: format!("m{composite}-{}", base.parts.len()),
+            ..base
+        };
+        let operation = Operation {
+            identity: self.scoped(op),
+            horizon_ns: self.ops[op].horizon_ns,
+        };
+        let d = Delivered {
+            op,
+            file: Some(composite),
+            deadline_ns,
+            command: name::Command::Operated(Box::new(Operated {
+                operation,
+                mutation: Mutation::Complete(complete),
             })),
         };
         if self.deliver(&d).is_some() {
@@ -988,14 +1207,35 @@ impl World {
     }
 
     /// The identity a gateway hands over for operation `op`: the client's, scoped to the
-    /// principal authentication established, collision-free as a 128-bit hash of the two is but
-    /// for chance; the client's own with the scope removed.
+    /// principal authentication established, the kind of write, and for a part its upload and
+    /// part number, for a completion its upload (docs/design/gateway.md §2.1). Each piece takes
+    /// a field of its own, so two identities agree only where every piece does, as a 128-bit
+    /// hash of them does but for chance; a piece removed leaves its field empty. The key takes
+    /// none: the range keeps each row under its object key (`key::operation`), so an upload's
+    /// identity is scoped by its key there, and no gateway can remove that.
     fn scoped(&self, op: usize) -> u128 {
         let o = &self.ops[op];
-        match self.variant {
-            Variant::NoScope => o.raw,
-            _ => o.raw * PRINCIPALS + o.principal,
-        }
+        let (kind, upload, number) = match &o.kind {
+            Kind::Put => (0, None, 0),
+            Kind::Delete => (1, None, 0),
+            Kind::Upload => (2, None, 0),
+            Kind::Part { upload, number } => (3, Some(upload), *number),
+            Kind::Complete { upload } => (4, Some(upload), 0),
+        };
+        let principal = match self.variant {
+            Variant::NoScope => 0,
+            _ => o.principal,
+        };
+        let number = match self.variant {
+            Variant::NoPartNumber => 0,
+            _ => number,
+        };
+        // An upload's ID is its initiation time (`key::version_id`).
+        let upload = match (upload, self.variant) {
+            (Some(upload), v) if v != Variant::NoUpload => key::parse_version_id(upload).unwrap(),
+            _ => 0,
+        };
+        o.raw << 96 | principal << 88 | kind << 80 | u128::from(number) << 64 | u128::from(upload)
     }
 
     /// Delivers an attempt of an operation and judges the obligations its outcome bears on
@@ -1010,13 +1250,28 @@ impl World {
             .is_some_and(|e| before_ns <= e.expiry_ns);
         let rows = self.key_rows(key);
         let outcome = self.send(key, &d.command)?;
+        let name::Command::Operated(operated) = &d.command else {
+            panic!("an attempt carries its operation");
+        };
         // What a delivery that went ahead answered, as an answer from its row says it.
-        let effect = match &outcome {
-            name::Outcome::Put { version } => Some(format!("{version} e{}", d.file.unwrap())),
-            name::Outcome::Deleted { marker, version } => Some(format!("{marker} {version:?}")),
+        let effect = match (&outcome, &operated.mutation) {
+            (name::Outcome::Put { version }, Mutation::Put(p)) => {
+                Some(format!("{version} {}", p.version.etag))
+            }
+            (name::Outcome::Put { version }, Mutation::Complete(c)) => {
+                Some(format!("{version} {}", c.etag))
+            }
+            (name::Outcome::Deleted { marker, version }, _) => {
+                Some(format!("{marker} {version:?}"))
+            }
+            (name::Outcome::Created { upload }, _) => Some(upload.clone()),
+            (name::Outcome::PartWritten, Mutation::PutPart(p)) => {
+                Some(format!("{} {}", p.part.file, p.part.etag))
+            }
             _ => None,
         };
         if let Some(answer) = effect {
+            self.follow(d.op, &outcome, &operated.mutation);
             let now = mantle_meta::clock::now(self.holder(key), 0).unwrap();
             if let Some(e) = &self.ops[d.op].effect
                 && now <= e.expiry_ns
@@ -1033,7 +1288,12 @@ impl World {
                 expiry_ns: now.saturating_add(op.horizon_ns),
             });
             self.made.extend(d.file);
-            if self.variant == Variant::NoRow {
+            let removed = match self.variant {
+                Variant::NoRow => true,
+                Variant::Rebuilt => matches!(operated.mutation, Mutation::Complete(_)),
+                _ => false,
+            };
+            if removed {
                 let (id, identity) = (self.holder_id(key), self.scoped(d.op));
                 let range = self.names.get_mut(&id).unwrap();
                 range.index += 1;
@@ -1041,13 +1301,23 @@ impl World {
                 range.engine.apply(range.index, vec![gone]).unwrap();
             }
         }
+        // Within its first effect's horizon an attempt finds the row and is answered from it:
+        // a completion retried is answered so, never rebuilt from what it carries.
+        if within && !matches!(outcome, name::Outcome::Answered(_)) {
+            self.broken.push(format!(
+                "2, one answer: an attempt of operation {} within its first's horizon was \
+                 answered {outcome:?}, not from its row",
+                d.op
+            ));
+        }
         if let name::Outcome::Answered(made) = &outcome {
             let answer = match made {
                 Made::Version {
                     order, null, etag, ..
                 } => format!("{} {etag}", name::shown_id(*null, *order)),
                 Made::Deleted { marker, version } => format!("{marker} {version:?}"),
-                other => format!("{other:?}"),
+                Made::Upload { initiated_ns } => key::version_id(*initiated_ns),
+                Made::Part { file, etag, .. } => format!("{file} {etag}"),
             };
             let first = self.ops[d.op].effect.as_ref().map(|e| e.answer.clone());
             if first.as_ref() != Some(&answer) {
@@ -1079,6 +1349,46 @@ impl World {
             ));
         }
         Some(outcome)
+    }
+
+    /// What a client learns from operation `op`'s effect: an upload to put parts to, a part its
+    /// upload holds, which a completion then lists, or its upload completed.
+    fn follow(&mut self, op: usize, outcome: &name::Outcome, mutation: &Mutation) {
+        let key = self.ops[op].key;
+        match (outcome, mutation) {
+            (name::Outcome::Created { upload }, _) => self.uploaders.push(Uploader {
+                principal: self.ops[op].principal,
+                raw: self.ops[op].raw,
+                key,
+                upload: upload.clone(),
+                parts: BTreeMap::new(),
+                completed: None,
+            }),
+            (name::Outcome::PartWritten, Mutation::PutPart(p)) => {
+                if let Some(u) = self
+                    .uploaders
+                    .iter_mut()
+                    .find(|u| u.key == key && u.upload == p.upload)
+                {
+                    let listed = Listed {
+                        number: p.number,
+                        etag: p.part.etag.clone(),
+                        file: p.part.file,
+                    };
+                    u.parts.insert(p.number, listed);
+                }
+            }
+            (name::Outcome::Put { .. }, Mutation::Complete(c)) => {
+                if let Some(u) = self
+                    .uploaders
+                    .iter_mut()
+                    .find(|u| u.key == key && u.upload == c.upload)
+                {
+                    u.completed = c.file;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The collector forgets, a page at a time, the operations Name range `id` holds whose
@@ -1261,13 +1571,34 @@ impl World {
                     identity: self.scoped(op),
                     horizon_ns: self.ops[op].horizon_ns,
                 };
+                let mutation = match &self.ops[op].kind {
+                    Kind::Part { upload, number } => Mutation::PutPart(PutPart {
+                        bucket: BUCKET.into(),
+                        incarnation: 1,
+                        key: g.key.into(),
+                        upload: upload.clone(),
+                        number: *number,
+                        part: Part {
+                            // Each attempt's own, so an answer names the attempt that made it.
+                            etag: format!("p{}", g.file),
+                            size: name::MIN_PART,
+                            checksum: None,
+                            file: g.file,
+                            modified_ns: 0,
+                            deadline_ns,
+                        },
+                        at_ns: self.proposed(),
+                        run: None,
+                    }),
+                    _ => Mutation::Put(put),
+                };
                 let d = Delivered {
                     op,
                     file: Some(g.file),
                     deadline_ns,
                     command: name::Command::Operated(Box::new(Operated {
                         operation,
-                        mutation: Mutation::Put(put),
+                        mutation,
                     })),
                 };
                 let outcome = self.deliver(&d);
@@ -1279,9 +1610,13 @@ impl World {
         };
         match outcome {
             None => return false,
-            Some(name::Outcome::Put { .. }) => assert!(!late, "a late handover was taken"),
+            Some(name::Outcome::Put { .. } | name::Outcome::PartWritten) => {
+                assert!(!late, "a late handover was taken");
+            }
             Some(name::Outcome::Expired) => assert!(late, "a handover in time was refused"),
             Some(name::Outcome::Answered(_)) if g.op.is_some() => {}
+            // A part of an upload completed or aborted, its file released as a refused write's.
+            Some(name::Outcome::NoSuchUpload) if g.op.is_some() => {}
             Some(other) => panic!("{other:?}"),
         }
         true
@@ -1379,27 +1714,24 @@ impl World {
         }
     }
 
+    /// A client creates an upload of `key` carrying no operation. Its runs carry the one
+    /// identity this client carries on every upload it creates, which only the scope by upload
+    /// keeps apart (docs/design/gateway.md §2.1); a client never draws 0 otherwise.
     fn create_upload(&mut self, key: &'static str) {
         let create = name::Command::CreateUpload(CreateUpload {
             bucket: BUCKET.into(),
             incarnation: 1,
             key: key.into(),
             at_ns: self.proposed(),
-            upload: Upload {
-                initiated_ns: 0,
-                owner: "o".into(),
-                headers: Vec::new(),
-                checksum: None,
-                retention: None,
-                legal_hold: None,
-                runs: None,
-            },
+            upload: asked(),
         });
         if let Some(name::Outcome::Created { upload }) = self.send(key, &create) {
             self.uploaders.push(Uploader {
+                principal: 0,
+                raw: 0,
                 key,
                 upload,
-                parts: Vec::new(),
+                parts: BTreeMap::new(),
                 completed: None,
             });
         }
@@ -1486,7 +1818,12 @@ impl World {
         });
         // A part refused, or held up by a merge, is released or left to the sweep.
         if let Some(name::Outcome::PartWritten) = self.send(key, &put) {
-            self.uploaders[i].parts.push((number, file));
+            let listed = Listed {
+                number,
+                etag: format!("p{number}"),
+                file,
+            };
+            self.uploaders[i].parts.insert(number, listed);
         }
     }
 
@@ -1497,47 +1834,16 @@ impl World {
         if u.parts.is_empty() || u.completed.is_some() != retry {
             return;
         }
-        let (key, upload, parts) = (u.key, u.upload.clone(), u.parts.clone());
+        let (key, upload) = (u.key, u.upload.clone());
+        let parts: Vec<Listed> = u.parts.values().cloned().collect();
         let composite = self.id();
-        let deadline_ns = self.write_file(
-            key,
-            composite,
-            parts
-                .iter()
-                .map(|&(_, file)| Extent {
-                    length: 1,
-                    target: Target::File(file),
-                })
-                .collect(),
-        );
+        let deadline_ns = self.write_file(key, composite, composed(&parts));
         let complete = name::Command::Complete(Complete {
-            bucket: BUCKET.into(),
-            incarnation: 1,
-            key: key.into(),
-            upload,
-            versioning: Versioning::Unversioned,
             preconditions: Preconditions {
                 if_match: refuse.then(|| Match::Tags(vec!["nope".into()])),
                 if_none_match: None,
             },
-            at_ns: self.proposed(),
-            parts: parts
-                .iter()
-                .map(|&(number, file)| Listed {
-                    number,
-                    etag: format!("p{number}"),
-                    file,
-                })
-                .collect(),
-            etag: format!("m-{}", parts.len()),
-            size: name::MIN_PART * parts.len() as u64,
-            checksum: None,
-            file: Some(composite),
-            default: None,
-            id: 0,
-            deadline_ns,
-            listing: [0; mantle_meta::record::LISTING],
-            native: false,
+            ..completion(key, upload, parts, composite, deadline_ns, self.proposed())
         });
         if let Some(name::Outcome::Put { .. }) = self.send(key, &complete)
             && !retry
@@ -1944,6 +2250,61 @@ fn last_instant(rows: &mut Model) -> u64 {
     mantle_meta::clock::now(rows, 0).unwrap() + 1
 }
 
+/// An upload as CreateMultipartUpload asks for it: its initiation time is the commit's.
+fn asked() -> Upload {
+    Upload {
+        initiated_ns: 0,
+        owner: "o".into(),
+        headers: Vec::new(),
+        checksum: None,
+        retention: None,
+        legal_hold: None,
+        runs: None,
+    }
+}
+
+/// The extents of a composite file of `parts`, in their order.
+fn composed(parts: &[Listed]) -> Vec<Extent> {
+    parts
+        .iter()
+        .map(|p| Extent {
+            length: 1,
+            target: Target::File(p.file),
+        })
+        .collect()
+}
+
+/// The completion of `upload` of `key` listing `parts`, combined into file `composite`: its
+/// ETag names their number, as the range checks (`name::complete`).
+fn completion(
+    key: &str,
+    upload: String,
+    parts: Vec<Listed>,
+    composite: u128,
+    deadline_ns: u64,
+    at_ns: u64,
+) -> Complete {
+    Complete {
+        bucket: BUCKET.into(),
+        incarnation: 1,
+        key: key.into(),
+        upload,
+        versioning: Versioning::Unversioned,
+        preconditions: Preconditions::default(),
+        at_ns,
+        etag: format!("m-{}", parts.len()),
+        size: name::MIN_PART * parts.len() as u64,
+        parts,
+        checksum: None,
+        file: Some(composite),
+        default: None,
+        id: 0,
+        deadline_ns,
+        listing: [0; mantle_meta::record::LISTING],
+        native: false,
+    }
+}
+
 /// The versioning the `n`th writer puts under: versions kept and replaced, alternately.
 fn versioning(n: usize) -> Versioning {
     if n.is_multiple_of(2) {
@@ -1975,7 +2336,14 @@ proptest! {
 /// it could not catch.
 #[test]
 fn each_piece_of_the_operation_record_removed_is_caught() {
-    for variant in [Variant::NoRow, Variant::NoScope, Variant::NoHorizon] {
+    for variant in [
+        Variant::NoRow,
+        Variant::NoScope,
+        Variant::NoHorizon,
+        Variant::NoPartNumber,
+        Variant::NoUpload,
+        Variant::Rebuilt,
+    ] {
         let mut runner = TestRunner::deterministic();
         let schedules = prop::collection::vec(action(), 1..STEPS);
         let caught = (0..CASES).find_map(|case| {
@@ -1995,6 +2363,74 @@ fn each_piece_of_the_operation_record_removed_is_caught() {
         };
         println!("{variant:?}: schedule {case} broke {broken}");
     }
+}
+
+/// An upload, a native client's part and a completion, each retried through another gateway
+/// within its horizon and the completion's attempt copied, spelled out: every retry is answered
+/// from its row with the first's upload, part file and ETag, or version and ETag, though each
+/// part and completion attempt carries its own file and ETag. With the completion's row
+/// removed, its retry is rebuilt and the simulation says so.
+#[test]
+fn a_retried_upload_part_and_completion_are_answered_from_their_rows() {
+    let schedule = [
+        Action::OperateUpload {
+            key: 0,
+            principal: 0,
+            horizon: 1,
+        },
+        Action::Attempt(0),
+        Action::Attempt(0),
+        Action::OperatePart {
+            uploader: 0,
+            number: 1,
+            principal: 1,
+            horizon: 1,
+            native: true,
+        },
+        Action::Attempt(1),
+        Action::AdvanceAttempt(0),
+        Action::AdvanceAttempt(0),
+        Action::Attempt(1),
+        Action::AdvanceAttempt(0),
+        Action::AdvanceAttempt(0),
+        Action::OperateComplete {
+            uploader: 0,
+            principal: 1,
+            horizon: 1,
+        },
+        Action::Attempt(2),
+        Action::Attempt(2),
+        Action::Copy(5),
+    ];
+    let mut w = World::new();
+    for action in &schedule {
+        w.act(action);
+        w.check();
+    }
+    assert_eq!(w.uploaders.len(), 1, "a retried upload made a second");
+    let u = &w.uploaders[0];
+    assert_eq!(u.parts.len(), 1);
+    assert!(u.completed.is_some());
+    // The part's and the completion's retries, each answered from its row, released their own
+    // files; the upload's retry carried none, and the copy's file is the retry's.
+    assert_eq!(w.answered.len(), 2, "{:?}", w.answered);
+    let first = |w: &World, op: usize| w.ops[op].effect.as_ref().unwrap().answer.clone();
+    assert_eq!(first(&w, 0), u.upload);
+    assert!(first(&w, 2).ends_with(&format!("m{}-1", u.completed.unwrap())));
+    w.finish();
+
+    let mut w = World::with(Variant::Rebuilt);
+    for action in &schedule {
+        w.act(action);
+        w.check();
+    }
+    assert!(
+        w.broken
+            .first()
+            .is_some_and(|b| b.contains("operation 2 within its first's horizon")),
+        "{:?}",
+        w.broken
+    );
 }
 
 /// The cases the sweeps exist for, spelled out: a gateway writes a block and its file and

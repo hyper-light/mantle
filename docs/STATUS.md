@@ -221,7 +221,7 @@ device directory locked against a second process, and answers chunk puts and get
 gateways as exchanges of their own class over QUIC: a put's bytes checked against the CRC-32C its
 sender computed before the volume writes them, answered once durable, and refused unread past
 what the volumes' writer queues hold; a get read at the device through its issuer from the
-node's shard (`mantle_chunk::Reader`) and verified before it is sent; each refusal typed. Tested
+node's first shard (`mantle_chunk::Reader`) and verified before it is sent; each refusal typed. Tested
 in one process (`crates/node/tests/cluster.rs`) and with `mantle node` processes
 (`crates/mantle/tests/node.rs`): a gateway puts chunks round three nodes and one is killed with
 `SIGKILL` mid-put. Every chunk acknowledged reads back whole after the node starts again on its
@@ -378,11 +378,10 @@ next rather than wait out the first's flush, quorum and answer; what needs an or
 answer before it, a PUT's block, file and name commands and the node's statements one out at a time
 (aef9efae, 053cb77d). The exactly-once simulation of lost replies, late copies and refusals runs
 with one entry out and with two, and a cluster test has a cut-off leader's two puts out side by
-side, each answered its own version by the new leader; no end-to-end suite or doors run has run on
-it, and its effect on the write path is unmeasured. The leader stamps every entry it proposes with
-its wall clock. Each node with volumes enlists itself and them as it starts, a node in another
-domain
-than the table holds refused; placement offers a block's volumes by a capacity-weighted highest
+side, each answered its own version by the new leader; no end-to-end suite or doors run has run
+on it, and its effect on the write path is unmeasured. The leader stamps every entry it proposes
+with its wall clock. Each node with volumes enlists itself and them as it starts, a node in another
+domain than the table holds refused; placement offers a block's volumes by a capacity-weighted highest
 random weight, one to a failure domain first ([research 63](research/63-placement-order.md)).
 Remaining: the table published to nodes that host no root range (architecture §4's constant-work
 loop), two random choices on credits once nodes advertise them, and copysets once a cell has the
@@ -667,10 +666,9 @@ client that asked only objects or chunks has a patience of its own and a chunk t
 a request's pace; an object's or a chunk's exchange is given at least the node's serve period, in
 which the node's notes of its work come three times, and at most the stock patience, the most a node
 waits on such work asked with no deadline, before any reply is measured
-(`crates/node/tests/client_patience.rs`, both cases failing before the change). CI's busy job fails
-the native suite on the same cause with the client unchanged, on both arms of an A/B of the chunk
-store's
-latest changes: a node's own asks are judged by the period its client gives it, so a node whose
+(`crates/node/tests/client_patience.rs`, both cases failing before the change). CI's busy job
+fails the native suite on the same cause with the client unchanged, on both arms of an A/B of the
+chunk store's latest changes: a node's own asks are judged by the period its client gives it, so a node whose
 ask of a peer takes most of a period loses to its client (7 of 36 read-backs cut), and a run cut
 while its node wrote is sent again, its first chunks left behind until the suite's small volumes
 refuse a run (2 of 36) ([measurements](measurements/2026-10-29-a-node-cut-while-it-works.md)).
@@ -1127,9 +1125,9 @@ arm64, a cell at rest 95,102 allocations where it was 96,375 and one serving 34,
 reports it (5e63283a). Open: 053cb77d records the test failing with the same counts on lean-doors
 before it as after, the host and the counts unstated, not yet traced. The node runs on hyper-rt's
 `Runtime`, its task launched on the first shard and the runtime shut down at its end, and
-`derive::threads` counts six threads of the node's own, the runtime's watchdog among them, and one a
-shard (adf6125b, a93c172a). A cell of three made by `mantle init` rolls one node at a time, each
-handing its ranges over, announcing its
+`derive::threads` counts six threads of the node's own, the runtime's watchdog among them, and one
+a shard (adf6125b, a93c172a). A cell
+of three made by `mantle init` rolls one node at a time, each handing its ranges over, announcing its
 end to its peers' liveness streams and started again from its directories, with no other member
 saying a range has no leader, and every object read back through every node after the roll, on two
 CPUs beside two or four busy loops and on one CPU: on CI's busy runners 0 of 48 rounds failed of the
@@ -1172,8 +1170,8 @@ peer, counted each closed connection's redial due, which ended every wait at onc
 3.7 s on macOS). The shard holds three, a closing node counts no redial due, and every orderly stop
 says its loop's timer waits, which the serve harness holds to none (with two timers the stop test
 fails); the serve suite's stops turn 4 to 61 times, where they turned 420 to 85,171.
-Remaining: Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler
-now holds
+Remaining:
+Windows' console close and shutdown taken as requests to stop, which hyper-rt's handler now holds
 for the owner's stop; a replicated range refusing puts at its engine's metadata share where its
 leader admits a command, since a refusal at apply would let members diverge; and hyper-raft's
 `cc5a65b` (a stop suspected as its announcement arrives, and answered, so a stop may announce before

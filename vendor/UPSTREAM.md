@@ -87,10 +87,29 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `3df5efa` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and seven commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
-in the hyper-raft repository's own objects and not yet pushed to its origin. Its seventh commit,
-`3df5efa`, changes hyper-log alone (mantle docs/design/durability.md §7.7, step 2b-ii): an unsealed
+**Every crate at `b4c7230` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
+and ten commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The branch is
+in the hyper-raft repository's own objects and not yet pushed to its origin. Its tenth commit,
+`b4c7230`, changes hyper-log alone (mantle docs/design/durability.md §7.7, step 2b-iii): a sealed
+log's persist records are laid in pieces too (format 6), each piece's MAC under the log's
+authentication key over the piece through its CRC, so a forged or altered piece, or an unsealed
+piece in a sealed log, is `LogError::Tampered`; a sealed log of whole records (format 4) moves to
+pieces at its open, and its mark is an unsealed record, which a binary before format 6 refuses as
+tampering. The mark records the file's block the slots were laid by and whether they lie at the
+area's end (`format::Mark`, which `Laid::pieces` now is), so the slots are found by the recorded
+block where the file's block changed but takes them; a binary of format 5 from before refuses such
+a mark, and its own marks are written again with the block. Where the device's unit is smaller
+than the recorded one, or the file's block does not take the slots, the open lays the area again in
+the device's unit and the file's block at the other end of the area, clear of the old slots and the
+mark: each slot written whole, a flush, the mark, a flush, so a crash leaves the old area or the
+new. The equivalence test's hashes are regenerated: each image differs only in the mark's
+confirmation field and CRC, and no transcript line but the crash images' hashes. New decoder width
+`piece_mac_at:take(4)`, with its row in docs/design/constants.md. Its ninth commit, `0a33647`,
+changes the wrapper files that hyper-raft's benches, e2e and comparison run the log over, none
+vendored here, to answer their file's atomic write unit. Its eighth commit, `e856e96`, changes
+hyper-block alone: a `SegmentedFile` answers its base's device's atomic write unit rather than the
+default. mantle's log runs on a `DeviceFile` (`crates/node` `open_log`), which asks the OS. Its
+seventh commit, `3df5efa`, changes hyper-log alone (mantle docs/design/durability.md §7.7, step 2b-ii): an unsealed
 log writes and reads its persist records in pieces of the device's atomic write unit (format 5), its
 frame's record, its confirmation and a lost frame's copy (which fills its slot, so no later frame's
 pieces hide it), each one write then a full flush, frames

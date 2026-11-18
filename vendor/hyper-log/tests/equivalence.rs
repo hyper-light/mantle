@@ -31,6 +31,10 @@
 //! its start and the records in slots past the whole ones: every image's bytes differ there and
 //! nowhere else, so the 96 crash lines' hashes and the images' changed, and every other line of the
 //! 24 transcripts, 4,032 of 4,128, is the one before (compared line by line).
+//! Since the mark records the file's block the slots are laid by (durability.md §7.7), every
+//! image differs from the one before only in the mark's bytes, its confirmation field and its CRC,
+//! at most 5 bytes in 33 to 47, so the 96 crash lines' hashes and the images' changed again, and
+//! every other line, 4,032 of 4,128, is the one before (compared line by line).
 //! Set `HYPER_LOG_EQUIVALENCE_OUT` to a directory to write each seed's transcript and image there
 //! for a byte-for-byte comparison.
 #![allow(
@@ -65,30 +69,30 @@ const SEEDS: u64 = 24;
 
 /// Per seed: the FNV-1a hash of the transcript and of the canonical device image.
 const EXPECTED: [(u64, u64); SEEDS as usize] = [
-    (0x76d14e998fd12f3f, 0x38ec9e2b39d92c7e),
-    (0x9283ddaf793be3b8, 0x0e65770661645bba),
-    (0x25e25824be008f90, 0x009d8444f955ae60),
-    (0x85bd48f535398bd2, 0xf599c0b36956a572),
-    (0x3a9a233e663f3533, 0x5aa0880235502eea),
-    (0xd9b73506fd04ad29, 0x089db3afe19656d0),
-    (0x449ad56a5b629511, 0x04f625932af39aa7),
-    (0x8747696fc58a96dc, 0x376186f82d82973c),
-    (0xda21b93bcfb89a9d, 0x58263b2e87dbccdf),
-    (0xd561dd651bb6bf08, 0x491cb50456cc4861),
-    (0x1c368099ba4a728e, 0xd8cb24edbf9e7cde),
-    (0x8293e6b46a8384ef, 0xe21b7485453d9ed4),
-    (0x48116af6d25662e1, 0x2e86aa7ceeb4c5fe),
-    (0xe971d42356280c16, 0x97bb9f91f6eaa150),
-    (0x71cb34573314b297, 0xd535b80411185ad0),
-    (0x37b8b256c023a8d4, 0x15eb86151eac5cd7),
-    (0x04d96457aafe7af1, 0x21ed3dc5dbe4fc1d),
-    (0x1a233fa6dcbe031e, 0x98ed36acb8f39b76),
-    (0x8904daa83d6482e5, 0x52277d80c53b4d0f),
-    (0x3372886e9bed2444, 0xcfc289ae78eb4fbb),
-    (0xccc5321a04080890, 0x57cf54947427b698),
-    (0x2809c503c1568859, 0x1e31c6710b681202),
-    (0x6447956f6442d955, 0xd435847bedf19620),
-    (0x5f8c72440c40eb73, 0x0b22676995b02073),
+    (0x5e7f53137e8d6787, 0xa296f6b32ecc966f),
+    (0xc2ccb04e3130228b, 0xe319a64c52c5be03),
+    (0x4c24279ce07bcef2, 0xd06a4643fa2c7d19),
+    (0xf17e7c83f08e424f, 0x93a4593b0ba69d57),
+    (0x063e3909d5d7e8fe, 0x76e9b745abd6136f),
+    (0x48522b01e2b22f43, 0x836ebfe9d5783d6d),
+    (0x43888cd6fa67abab, 0x207c0ec7239f4ffa),
+    (0xff69c0d390d9f348, 0x13e24101352821f1),
+    (0x8425e0caae0661e3, 0xee200283b7b62df2),
+    (0xe4c339724645cf7d, 0x25040681f9447698),
+    (0xb1036b863e5fdefb, 0x9ce44317946ae457),
+    (0xda14fb7824fce63e, 0x18fa818049211115),
+    (0xc22f9a54b1f5aa8d, 0x6429fdfefcfd3347),
+    (0x1caf6496a04cd033, 0xeff00e8e15c50e39),
+    (0x76c59ca93fa5cd8b, 0x05a35afb6742a8d1),
+    (0xf8e0831e14ed2763, 0xf2eea02491b96e2a),
+    (0xd990a7e35b5b96e1, 0x1619071e9f6d4fa0),
+    (0x6be3565a6ae0b10c, 0x391d1c37a2783327),
+    (0x19c8df4eb8ac870a, 0x51db8adb02146792),
+    (0x35ca771884fe5184, 0xebbe5f5164414b5a),
+    (0xa2eba6eb60f807e6, 0x3f54d100e0368219),
+    (0xf5f302cb1ef3f1f9, 0xebb61b3d0208619f),
+    (0x0eba2e1aed02e63e, 0x4b5cac9e4ca62065),
+    (0xb19f87f633b037cd, 0x62594dce18886a72),
 ];
 
 fn config() -> Config {

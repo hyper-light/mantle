@@ -671,3 +671,90 @@ fn a_sealed_entry_changed_with_its_crcs_recomputed_is_tampering() {
         refused.error
     );
 }
+
+/// A sealed log lays its persist records in pieces of the device's atomic write unit, each with
+/// its MAC (format 6), under a mark that is an unsealed record, which a binary before format 6
+/// refuses as tampering; it reads them back across a reopen. A piece changed with its CRC
+/// recomputed, so that only its MAC tells, is tampering.
+#[test]
+fn a_sealed_log_writes_its_persist_records_in_pieces_and_a_forged_piece_is_tampering() {
+    let log = Log::create_sealed(sim(9), config(16, 8), ID, keys(1, 2)).unwrap();
+    let unit = Alignment::new(512).unwrap();
+    let mark = hyper_log::format::Mark {
+        unit,
+        block: Some(Alignment::new(BLOCK).unwrap()),
+        at_end: false,
+    };
+    assert_eq!(log.laid().pieces, Some(mark));
+    let hard = |vote| HardState {
+        term: 5,
+        vote,
+        commit: 0,
+        held: None,
+    };
+    log.write(
+        1,
+        Update {
+            hard_state: Some(hard(2)),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    let file = log.close().unwrap();
+    let bytes = bytes_of(&file);
+    assert_eq!(
+        hyper_log::format::pieces_marked(&bytes, ID, true),
+        Some(mark)
+    );
+    let read = hyper_log::format::Persist::decode(&bytes).unwrap();
+    assert!(!read.sealed, "the mark is an unsealed record");
+    let (log, recovery) = Log::open_sealed(file, config(16, 8), ID, keys(1, 2)).unwrap();
+    assert_eq!(recovery.laid.pieces, Some(mark));
+    assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(2)));
+    log.write(
+        1,
+        Update {
+            hard_state: Some(hard(3)),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    let file = log.close().unwrap();
+    let bytes = bytes_of(&file);
+    // The pieces of format 6 in the persist area, each with its MAC after its CRC.
+    let pieces: Vec<usize> = (0..AREA as usize)
+        .step_by(512)
+        .filter(|&at| bytes[at..at + 4] == *b"MNLP" && bytes[at + 4] == 6)
+        .collect();
+    assert!(!pieces.is_empty());
+    for &at in &pieces {
+        let mac_at = hyper_log::format::piece_mac_at(&bytes[at..]).unwrap();
+        assert!(bytes[at + mac_at..at + mac_at + 32].iter().any(|&b| b != 0));
+    }
+    let (log, _) = Log::open_sealed(file, config(16, 8), ID, keys(1, 2)).unwrap();
+    assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(3)));
+    let file = log.close().unwrap();
+    // A piece's group changed, its CRC recomputed.
+    let bytes = bytes_of(&file);
+    let at = pieces[0];
+    let covered = hyper_log::format::piece_mac_at(&bytes[at..]).unwrap() - 4;
+    let mut block = AlignedBuf::zeroed(BLOCK, file.alignment()).unwrap();
+    let start = at / BLOCK * BLOCK;
+    block
+        .extend_from_slice(&bytes[start..start + BLOCK])
+        .unwrap();
+    let piece = &mut block.as_mut_slice()[at - start..];
+    piece[hyper_log::format::PIECE_HEADER_LEN] ^= 1;
+    let crc = hyper_log::codec::crc32c(&piece[..covered]);
+    piece[covered..covered + 4].copy_from_slice(&crc.to_le_bytes());
+    file.write_all_at(block.as_slice(), start as u64).unwrap();
+    file.sync_data().unwrap();
+    let refused = Log::try_open_sealed(file, config(16, 8), ID, keys(1, 2))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(refused.error, LogError::Tampered(_)),
+        "{:?}",
+        refused.error
+    );
+}

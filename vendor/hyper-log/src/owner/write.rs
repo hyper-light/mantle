@@ -1179,8 +1179,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         b.persist.groups.extend(updates.map(writer::persisted));
         b.record_bytes.clear();
         b.persist.sealed = self.seal.is_some();
-        // In pieces where the log's area is laid so (format 5), each a unit the device writes
-        // whole; whole otherwise, a sealed log's MAC after it (mantle durability.md §7.7).
+        // In pieces where the log's area is laid so (format 5, 6 sealed), each a unit the device
+        // writes whole; whole otherwise, a sealed log's MAC after it (mantle durability.md §7.7).
         let encoded = match self.p.area.pieces() {
             Some(pieces) => pieces.encode_into(&b.persist, &mut b.record_bytes),
             None => b.persist.encode_into(&mut b.record_bytes),
@@ -1201,6 +1201,10 @@ impl<F: BlockFile + 'static> Owner<F> {
         if let Some(mac) = mac {
             buf.extend_from_slice(&mac)
                 .map_err(|e| LogError::Disk(e.into()))?;
+        }
+        // A sealed log's pieces each carry their MAC, over the piece through its CRC (format 6).
+        if let (Some(seal), Some(pieces)) = (&self.seal, self.p.area.pieces()) {
+            crate::recover::seal_pieces(buf.as_mut_slice(), pieces.unit(), seal)?;
         }
         Ok(buf)
     }

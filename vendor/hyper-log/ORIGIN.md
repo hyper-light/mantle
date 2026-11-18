@@ -5,8 +5,11 @@
   - The imported tree hash equals mantle's `147f035:crates/log`
     (`96dc4f2375283a2db82644c41fb58edb49393a87`).
   - Its design is mantle's `docs/design/raft-log.md`, which this crate keeps citing; the on-disk
-    format is mantle's, unchanged (format 3, magics `MNLS`, `MNLF`, `MNLP`), so hyper-log reads the
-    files mantle-log wrote and writes the files it reads.
+    format was mantle's, unchanged (format 3, magics `MNLS`, `MNLF`, `MNLP`), so hyper-log read the
+    files mantle-log wrote and wrote the files it reads. Its persist records have since moved to
+    pieces of the device's atomic write unit (formats 5 and 6, "Persist records in pieces" below):
+    hyper-log still reads a file mantle-log wrote, and moves it to pieces at its open, and a binary
+    from before them refuses a file in pieces rather than misread it.
 
 ## L-1: moved, behaviour unchanged (commit `5bd0699`)
 
@@ -555,3 +558,36 @@ start is the log's.
 - **Test** (`tests/fetch.rs`): `a_write_is_not_held_behind_a_fetch_read_from_the_file`: 8 MiB in
   64 KiB entries on a file, fetched with the read held at the file, and another group's write
   durable while it is held; at `3d6640f` the write waited the test's 60 s bound.
+
+## Persist records in pieces (formats 5 and 6; mantle `docs/design/durability.md` §7.7, 2026-11-18)
+
+- **Formats.** A persist record is laid in pieces of the device's atomic write unit
+  (`BlockFile::atomic_unit`), each piece its header, its rows and its CRC, then zeros to the unit,
+  so that no crash tears a piece and a piece that fails its CRC is damage (`format::Pieces`).
+  Format 5 is an unsealed log's piece. Format 6 is a sealed log's: after its CRC, its MAC under the
+  log's authentication key over the piece through its CRC, so a piece whose CRC holds and whose MAC
+  does not is tampering (`LogError::Tampered`), as is an unsealed piece in a sealed log. Segment
+  headers and frames keep their formats (3, 4 sealed); a whole record of format 3 or 4 still reads.
+- **The mark** (`format::pieces_mark`). The persist area's start holds a whole persist record of
+  no groups of the other kind than the log's: format 4 in an unsealed log, 3 in a sealed one. It
+  records, under its CRC, the unit (the base-2 logarithm, in its first padding byte), the file's
+  block the slots were laid by (in its confirmation field), and whether the slots lie at the
+  area's end (its sequence, 1) or past the two whole slots (0). A binary from before format 5
+  reads it as a record of the other kind and refuses the log, an unsealed log as foreign, a sealed
+  one as tampered. A binary of format 5 before the block was recorded read a mark only of sequence
+  and confirmation 0, so it refuses these the same way; its own marks, the block unrecorded, read
+  here by the file's block and are written again with it.
+- **Laying again** (`recover::laid_area`). An open lays the area again where it must: a log of
+  whole records (format 3, 4 sealed) moves to pieces; an area whose pieces are larger than the
+  device's unit now, which a crash could tear, or whose slots the file's block does not take, is
+  laid again in the device's unit and the file's block, at the other end of the area. Each new slot
+  is written whole, then one flush, then the mark, then a flush; the new slots lie clear of the old
+  ones and of the mark, so a crash before the mark leaves the old area to read and lay again. An
+  area laid by a block the file's no longer is, which takes its slots, is read where the slots lie.
+- **Tests.** `recover`'s `a_sealed_record_in_pieces_carries_a_mac_in_each_and_a_forged_piece_is_tampering`,
+  `a_relay_across_a_crash_at_each_of_its_steps_keeps_the_old_records_or_the_new` (a power cut at
+  each write and flush of the re-lay, four seeds each, sealed and not),
+  `a_relay_reads_a_piece_torn_within_the_larger_unit_as_a_torn_record`,
+  `an_alignment_change_between_runs_reads_by_the_recorded_alignment`; `tests/sealed.rs`'s
+  `a_sealed_log_writes_its_persist_records_in_pieces_and_a_forged_piece_is_tampering`;
+  `tests/log.rs`'s `a_log_of_whole_records_opens_and_writes_in_pieces`.

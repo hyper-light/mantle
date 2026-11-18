@@ -1401,6 +1401,7 @@ numbers lands in hyper-raft and arrives with a snapshot; its row here changes wi
 | `vendor/hyper-log/src/format.rs` `UNCERTAIN` | format | `7` | Entries the group may lack. (format, unit or structural count: Entries the group may lack.) |
 | `vendor/hyper-log/src/format.rs` `persist_header:take(3)` | format | `3` | The width of the field the decoder reads, fixed by the encoding it reads. |
 | `vendor/hyper-log/src/format.rs` `persist_header:take(4)` | format | `4` | The width of the field the decoder reads, fixed by the encoding it reads. |
+| `vendor/hyper-log/src/format.rs` `piece_mac_at:take(4)` | format | `4` | The width of the field the decoder reads, fixed by the encoding it reads. |
 | `vendor/hyper-log/src/format.rs` `pieces_marked:take(2)` | format | `2` | The width of the field the decoder reads, fixed by the encoding it reads. |
 | `vendor/hyper-log/src/format.rs` `pieces_marked:take(4)` | format | `4` | The width of the field the decoder reads, fixed by the encoding it reads. |
 | `vendor/hyper-log/src/format.rs` `sealables_of:take(16)` | format | `16` | The width of the field the decoder reads, fixed by the encoding it reads. |

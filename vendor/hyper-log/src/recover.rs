@@ -339,10 +339,10 @@ pub(crate) fn persist_slot(
 
 /// Where a log's persist records lie in its persist area, and how they are laid (mantle
 /// docs/design/durability.md §7.7): whole (format 3, 4 sealed) in two slots from the area's start,
-/// or in pieces of the device's atomic write unit (format 5) in two slots past those, the area's
-/// start holding the mark of pieces ([`format::pieces_mark`]). The record of the frame of sequence
-/// `s` goes in slot `s mod 2`, so the record of the frame before it survives a torn write of this
-/// one.
+/// or in pieces of the device's atomic write unit (format 5, 6 sealed) in two slots past those, or
+/// at the area's end where a re-lay put them, the area's start holding the mark of pieces
+/// ([`format::pieces_mark`]). The record of the frame of sequence `s` goes in slot `s mod 2`, so
+/// the record of the frame before it survives a torn write of this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Area {
     /// The two slots' offsets, the even sequences' first.
@@ -351,6 +351,10 @@ pub(crate) struct Area {
     len: u64,
     /// The pieces the records are laid in; `None` where they are whole.
     pieces: Option<format::Pieces>,
+    /// The file's block the slots are laid by.
+    block: Alignment,
+    /// Whether the slots in pieces lie at the area's end.
+    at_end: bool,
 }
 
 impl Area {
@@ -361,23 +365,30 @@ impl Area {
             slots: (0, len),
             len,
             pieces: None,
+            block: align,
+            at_end: false,
         })
     }
 
-    /// An unsealed log's records in pieces of `unit`. Each slot starts at an offset the larger of
-    /// the unit and the file's block divides, so that it is both a place for whole pieces and a
-    /// write the file takes, and its length is a multiple of that: a piece stays one unit while the
-    /// write meets a direct file's alignment where that is the larger. The first slot lies past the
-    /// two whole ones, so a log moves to pieces without overwriting the records it carries
-    /// ([`move_to_pieces`]). `None` where the persist area does not hold both; a unit that holds
-    /// no row is refused.
+    /// Records in pieces of `unit`, a sealed log's each with its MAC. Each slot starts at an offset
+    /// the larger of the unit and the file's block divides, so that it is both a place for whole
+    /// pieces and a write the file takes, and its length is a multiple of that: a piece stays one
+    /// unit while the write meets a direct file's alignment where that is the larger. The first
+    /// slot lies past the two whole ones, so a log moves to pieces without overwriting the records
+    /// it carries ([`relay`]); or, `at_end`, the second ends where the last whole larger block of
+    /// the area does, so a re-lay from slots past the whole ones writes clear of them, and the
+    /// reverse. `None` where the persist area does not hold both; a unit that holds no row is
+    /// refused.
     pub(crate) fn in_pieces(
         config: &Config,
         align: Alignment,
         unit: Alignment,
+        sealed: bool,
+        at_end: bool,
     ) -> Result<Option<Self>, LogError> {
-        let whole = persist_slot(config, align, false)?;
-        let pieces = format::Pieces::new(unit, false).ok_or(LogError::Config(
+        let past = || LogError::Config("persist records past u64");
+        let whole = persist_slot(config, align, sealed)?;
+        let pieces = format::Pieces::new(unit, sealed).ok_or(LogError::Config(
             "the device's atomic write unit holds no persist row",
         ))?;
         let block = unit.max(align);
@@ -385,51 +396,83 @@ impl Area {
             .len(config.max_groups)
             .and_then(|len| u64::try_from(len).ok())
             .and_then(|len| block.up_u64(len))
-            .ok_or(LogError::Config("persist records past u64"))?;
-        let first = whole
+            .ok_or_else(past)?;
+        let after_whole = whole
             .checked_mul(2)
             .and_then(|end| block.up_u64(end))
-            .ok_or(LogError::Config("persist records past u64"))?;
-        let second = first
-            .checked_add(len)
-            .ok_or(LogError::Config("persist records past u64"))?;
-        let fits = second
-            .checked_add(len)
-            .is_some_and(|end| end <= persist_area(config));
+            .ok_or_else(past)?;
+        let both = len.checked_mul(2).ok_or_else(past)?;
+        let first = if at_end {
+            match block.down_u64(persist_area(config)).checked_sub(both) {
+                Some(first) => first,
+                None => return Ok(None),
+            }
+        } else {
+            after_whole
+        };
+        let second = first.checked_add(len).ok_or_else(past)?;
+        let fits = first >= after_whole
+            && second
+                .checked_add(len)
+                .is_some_and(|end| end <= persist_area(config));
         Ok(fits.then_some(Self {
             slots: (first, second),
             len,
             pieces: Some(pieces),
+            block: align,
+            at_end,
         }))
     }
 
-    /// The area a log's records are laid in, as it was found or made: in pieces of `pieces`, the
-    /// unit the area's mark records, or whole.
+    /// The area a log's records are laid in, as its persist area's mark says, or whole without one,
+    /// the file's block being `align`: in pieces of the mark's unit, by the block it records, or
+    /// by `align` where it records none.
     pub(crate) fn of(
         config: &Config,
         align: Alignment,
         sealed: bool,
-        pieces: Option<Alignment>,
+        mark: Option<format::Mark>,
     ) -> Result<Self, LogError> {
-        match pieces {
+        match mark {
             None => Self::whole(config, align, sealed),
-            Some(_) if sealed => Err(LogError::Config(
-                "a sealed log's persist records are whole (format 4)",
-            )),
-            Some(unit) => Self::in_pieces(config, align, unit)?.ok_or(LogError::Config(
+            Some(mark) => Self::in_pieces(
+                config,
+                mark.block.unwrap_or(align),
+                mark.unit,
+                sealed,
+                mark.at_end,
+            )?
+            .ok_or(LogError::Config(
                 "the persist area does not hold its records in pieces",
             )),
         }
     }
 
-    /// The unit the records are laid in pieces of; `None` where they are whole.
-    pub(crate) fn unit(&self) -> Option<Alignment> {
-        self.pieces.map(|p| p.unit())
+    /// The mark of this area's pieces; `None` where its records are whole.
+    pub(crate) fn mark(&self) -> Option<format::Mark> {
+        self.pieces.map(|p| format::Mark {
+            unit: p.unit(),
+            block: Some(self.block),
+            at_end: self.at_end,
+        })
     }
 
     /// The pieces the records are laid in; `None` where they are whole.
     pub(crate) fn pieces(&self) -> Option<format::Pieces> {
         self.pieces
+    }
+
+    /// Whether a file whose block is `block` writes this area's slots as they lie: each slot's
+    /// offset and length a multiple of the block, as the writer pads a record to it.
+    fn takes(&self, block: Alignment) -> bool {
+        [self.slots.0, self.slots.1, self.len]
+            .into_iter()
+            .all(|n| block.is_aligned_u64(n))
+    }
+
+    /// The bytes from the first slot's start to the second's end.
+    fn span(&self) -> Option<(u64, u64)> {
+        Some((self.slots.0, self.slots.1.checked_add(self.len)?))
     }
 
     /// The file offset of the slot of the frame of `sequence`.
@@ -451,7 +494,7 @@ impl Area {
     }
 
     /// The record's bytes as this area lays them: whole, a sealed log's MAC after it, or in
-    /// pieces.
+    /// pieces, a sealed log's each with its MAC.
     fn encode(
         &self,
         record: &format::Persist,
@@ -459,7 +502,11 @@ impl Area {
     ) -> Result<Vec<u8>, LogError> {
         let too_large = LogError::TooLarge(record.groups.len());
         if let Some(pieces) = self.pieces {
-            return pieces.encode(record).ok_or(too_large);
+            let mut bytes = pieces.encode(record).ok_or(too_large)?;
+            if let Some(sealer) = sealer {
+                seal_pieces(&mut bytes, pieces.unit(), sealer)?;
+            }
+            return Ok(bytes);
         }
         let mut bytes = record.encode().ok_or(too_large)?;
         if let Some(sealer) = sealer {
@@ -471,7 +518,10 @@ impl Area {
 
     /// The record log `id`'s slot at `at` holds, if one reads whole: a torn record in pieces is
     /// none, as a whole record that fails its checksum is; a piece damaged where the newest
-    /// record's go is [`LogError::Damaged`].
+    /// record's go is [`LogError::Damaged`]. In a sealed log each piece's MAC is checked once its
+    /// CRC holds, so a forged or altered piece is [`LogError::Tampered`]. The slot is read through
+    /// the file's transfer alignment, which its offset need not meet when the area is one being
+    /// moved from.
     fn read<F: BlockFile>(
         &self,
         file: &F,
@@ -479,29 +529,51 @@ impl Area {
         id: u128,
         sealer: Option<&Sealer>,
     ) -> Result<Option<format::Persist>, LogError> {
-        let size = usize::try_from(self.len).map_err(|_| LogError::Config("a persist slot"))?;
-        let align = file.layout_block();
-        let mut bytes = AlignedBuf::zeroed(size, align).map_err(|e| LogError::Disk(e.into()))?;
+        let slot = || LogError::Config("a persist slot");
+        let transfer = file.alignment();
+        let from = transfer.down_u64(at);
+        let to = at
+            .checked_add(self.len)
+            .and_then(|end| transfer.up_u64(end))
+            .ok_or_else(slot)?;
+        let size = to
+            .checked_sub(from)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(slot)?;
+        let skip = usize::try_from(at.checked_sub(from).ok_or_else(slot)?).map_err(|_| slot())?;
+        let len = usize::try_from(self.len).map_err(|_| slot())?;
+        let mut bytes =
+            AlignedBuf::zeroed(size, file.layout_block()).map_err(|e| LogError::Disk(e.into()))?;
         bytes.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
-        file.read_exact_at(bytes.as_mut_slice(), at)?;
+        file.read_exact_at(bytes.as_mut_slice(), from)?;
+        let bytes = bytes
+            .as_slice()
+            .get(skip..skip.checked_add(len).ok_or_else(slot)?)
+            .ok_or_else(slot)?;
         let record = match self.pieces {
-            None => format::Persist::decode(bytes.as_slice()),
-            Some(pieces) => match pieces.decode(bytes.as_slice())? {
-                format::Pieced::Whole(record) => Some(record),
-                format::Pieced::Empty | format::Pieced::Torn(_) => None,
-            },
+            None => format::Persist::decode(bytes),
+            Some(pieces) => {
+                let verify = |covered: &[u8], mac: &[u8]| match sealer {
+                    Some(sealer) => sealer.verify(covered, mac),
+                    None => Ok(()),
+                };
+                match pieces.decode_verified(bytes, verify)? {
+                    format::Pieced::Whole(record) => Some(record),
+                    format::Pieced::Empty | format::Pieced::Torn(_) => None,
+                }
+            }
         };
         let Some(record) = record.filter(|p| p.log == id) else {
             return Ok(None);
         };
         if self.pieces.is_some() {
-            if record.sealed {
+            if record.sealed && sealer.is_none() {
                 return Err(LogError::Foreign(
                     "a sealed persist record in an unsealed log",
                 ));
             }
         } else {
-            check_record(&record, bytes.as_slice(), sealer)?;
+            check_record(&record, bytes, sealer)?;
         }
         Ok(Some(record))
     }
@@ -537,28 +609,53 @@ impl Area {
     }
 }
 
-/// The unit an unsealed log `id`'s persist area records it laid in pieces, from the mark at its
-/// start; `None` where the area holds whole records. A sealed log's records are whole (format 4)
-/// until its pieces carry MACs, and a mark in a sealed log is refused as a record of the other
-/// kind ([`check_record`]).
-fn marked<F: BlockFile>(file: &F, id: u128, sealed: bool) -> Result<Option<Alignment>, LogError> {
-    if sealed {
-        return Ok(None);
+/// Writes each piece's MAC of a sealed log's record in pieces of `unit`, `bytes` as
+/// [`format::Pieces::encode`] laid them: over the piece through its CRC, in the room after it
+/// (format 6).
+pub(crate) fn seal_pieces(
+    bytes: &mut [u8],
+    unit: Alignment,
+    sealer: &Sealer,
+) -> Result<(), LogError> {
+    for piece in bytes.chunks_exact_mut(unit.get()) {
+        let at = format::piece_mac_at(piece).ok_or(LogError::Config("a sealed piece's MAC"))?;
+        let mac = sealer.mac(
+            piece
+                .get(..at)
+                .ok_or(LogError::Config("a sealed piece's MAC"))?,
+        )?;
+        crate::seal::put_at(
+            at.checked_add(MAC_LEN)
+                .and_then(|end| piece.get_mut(at..end)),
+            &mac,
+        )?;
     }
+    Ok(())
+}
+
+/// How log `id`'s persist area is laid in pieces, from the mark at its start; `None` where the
+/// area holds whole records.
+fn marked<F: BlockFile>(
+    file: &F,
+    id: u128,
+    sealed: bool,
+) -> Result<Option<format::Mark>, LogError> {
     let align = file.layout_block();
     let mut block = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
     block
         .set_len(align.get())
         .map_err(|e| LogError::Disk(e.into()))?;
     file.read_exact_at(block.as_mut_slice(), 0)?;
-    Ok(format::pieces_marked(block.as_slice(), id, false))
+    Ok(format::pieces_marked(block.as_slice(), id, sealed))
 }
 
-/// Writes the mark that log `id`'s persist area holds records in pieces of `unit`: one block at
-/// the area's start, where the first whole slot began.
-fn write_mark<F: BlockFile>(file: &F, id: u128, unit: Alignment) -> Result<(), LogError> {
-    let mark = format::pieces_mark(id, false, unit)
-        .ok_or(LogError::Config("the atomic write unit's logarithm"))?;
+/// Writes the mark that log `id`'s persist area is laid as `area` is: one block of the file's at
+/// the area's start, where the first whole slot began, which every area in pieces lies past.
+fn write_mark<F: BlockFile>(file: &F, id: u128, sealed: bool, area: &Area) -> Result<(), LogError> {
+    let mark = area
+        .mark()
+        .and_then(|mark| format::pieces_mark(id, sealed, mark))
+        .ok_or(LogError::Config("the persist area's mark"))?;
     let align = file.layout_block();
     let mut block = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
     block
@@ -569,38 +666,91 @@ fn write_mark<F: BlockFile>(file: &F, id: u128, unit: Alignment) -> Result<(), L
     Ok(())
 }
 
-/// Moves an unsealed log's persist area from whole records to pieces (durability.md §7.7). Each
-/// slot in pieces is written whole, zeros and the pieces of the record its whole slot holds, so
-/// that the slot holds only zeros and pieces, as their decoder assumes; then one flush; then the
-/// mark, then a flush. A crash before the mark is durable leaves the whole records, which the next
-/// open reads and moves again; after it, the pieces carry the same records in the same slots.
-fn move_to_pieces<F: BlockFile>(
+/// Lays log `id`'s persist records again, from `from` into `to`, in pieces (durability.md §7.7):
+/// a log of whole records moving to pieces, or one in pieces whose unit the device no longer
+/// writes atomically, or whose slots the file's block no longer takes. Each slot of `to` is written
+/// whole, zeros and the pieces of the record the same slot of `from` holds, so that it holds only
+/// zeros and pieces, as their decoder assumes; then one flush; then the mark, then a flush. `to`
+/// lies clear of `from` and of the mark, so a crash before the mark is durable leaves `from` as it
+/// was, which the next open reads and lays again; after it, `to` carries the same records in the
+/// same slots. The mark lies within the device's unit, which a crash leaves old or new. `tears`:
+/// `from`'s pieces are larger than the device's unit, so a crash may have torn one: a slot whose
+/// piece fails its checksum reads as a torn record, none, rather than damage.
+fn relay<F: BlockFile>(
     file: &F,
-    whole: &Area,
-    pieces: &Area,
-    id: u128,
+    (from, to): (&Area, &Area),
+    (id, sealer): (u128, Option<&Sealer>),
+    tears: bool,
 ) -> Result<(), LogError> {
-    let unit = pieces
-        .unit()
-        .ok_or(LogError::Config("a move to pieces lays no pieces"))?;
-    let size = usize::try_from(pieces.len).map_err(|_| LogError::Config("a persist slot"))?;
+    let clear = match (from.span(), to.span()) {
+        (Some(a), Some(b)) => a.1 <= b.0 || b.1 <= a.0,
+        _ => false,
+    };
+    if !clear {
+        return Err(LogError::Config(
+            "the persist area holds no slots in pieces clear of those it lays from",
+        ));
+    }
+    let size = usize::try_from(to.len).map_err(|_| LogError::Config("a persist slot"))?;
     let align = file.layout_block();
-    for (from, to) in [
-        (whole.slots.0, pieces.slots.0),
-        (whole.slots.1, pieces.slots.1),
-    ] {
+    for (old, new) in [(from.slots.0, to.slots.0), (from.slots.1, to.slots.1)] {
         let mut buf = AlignedBuf::zeroed(size, align).map_err(|e| LogError::Disk(e.into()))?;
-        if let Some(record) = whole.read(file, from, id, None)? {
-            buf.extend_from_slice(&pieces.encode(&record, None)?)
+        let record = match from.read(file, old, id, sealer) {
+            Err(LogError::Damaged(_)) if tears => None,
+            read => read?,
+        };
+        if let Some(record) = record {
+            buf.extend_from_slice(&to.encode(&record, sealer)?)
                 .map_err(|e| LogError::Disk(e.into()))?;
         }
         buf.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
-        file.write_all_at(buf.as_slice(), to)?;
+        file.write_all_at(buf.as_slice(), new)?;
     }
     file.sync_data()?;
-    write_mark(file, id, unit)?;
+    write_mark(file, id, sealer.is_some(), to)?;
     file.sync_data()?;
     Ok(())
+}
+
+/// The area log `id`'s persist records are laid in at its open, laid again first where they must
+/// be (durability.md §7.7): an area of whole records moves to pieces of the device's unit where
+/// the persist area holds them; an area in pieces stays as its mark records it, by the block it
+/// records whatever the file's is now, unless the device's unit is smaller than its pieces, which
+/// a crash could then tear, or the file's block does not take its slots: then it is laid again in
+/// the device's unit and the file's block, at the other end of the area. A mark from before the
+/// block was recorded is written again with the file's block, by which its slots lie.
+fn laid_area<F: BlockFile>(
+    file: &F,
+    config: &Config,
+    (id, sealer): (u128, Option<&Sealer>),
+    device: Alignment,
+) -> Result<Area, LogError> {
+    let align = file.layout_block();
+    let sealed = sealer.is_some();
+    let Some(mark) = marked(file, id, sealed)? else {
+        let whole = Area::whole(config, align, sealed)?;
+        return match Area::in_pieces(config, align, device, sealed, false)? {
+            Some(pieces) => {
+                relay(file, (&whole, &pieces), (id, sealer), false)?;
+                Ok(pieces)
+            }
+            None => Ok(whole),
+        };
+    };
+    let area = Area::of(config, align, sealed, Some(mark))?;
+    let tears = mark.unit > device;
+    if !tears && area.takes(align) {
+        if mark.block.is_none() {
+            write_mark(file, id, sealed, &area)?;
+            file.sync_data()?;
+        }
+        return Ok(area);
+    }
+    let to = Area::in_pieces(config, align, device, sealed, !mark.at_end)?.ok_or(
+        LogError::Config("the persist area does not hold its records laid again"),
+    )?;
+    relay(file, (&area, &to), (id, sealer), tears)?;
+    Ok(to)
 }
 
 /// A lost frame's persist record as copied into the other slot before its restore is written:
@@ -632,13 +782,9 @@ pub(crate) fn create<F: BlockFile>(
         return Err(LogError::Foreign("a new log needs an empty file"));
     }
     let device = file.atomic_unit()?;
-    // A new unsealed log lays its records in pieces where its persist area holds them: the file is
-    // empty, so the slots read as zeros, and the mark is written under the log's first flush.
-    let pieces = if sealer.is_some() {
-        None
-    } else {
-        Area::in_pieces(config, align, device.unit())?
-    };
+    // A new log lays its records in pieces where its persist area holds them: the file is empty,
+    // so the slots read as zeros, and the mark is written under the log's first flush.
+    let pieces = Area::in_pieces(config, align, device.unit(), sealer.is_some(), false)?;
     let block = align.get();
     let nonce = random_nonce()?;
     let at = persist_area(config);
@@ -698,14 +844,13 @@ pub(crate) fn create<F: BlockFile>(
         file.write_all_at(zeros.as_slice(), at)?;
     }
     file.write_all_at(bytes, at)?;
-    let unit = pieces.as_ref().and_then(Area::unit);
-    if let Some(unit) = unit {
-        write_mark(file, id, unit)?;
+    if let Some(pieces) = &pieces {
+        write_mark(file, id, sealer.is_some(), pieces)?;
     }
     file.sync_data()?;
     let laid = Laid {
         device,
-        pieces: unit,
+        pieces: pieces.as_ref().and_then(Area::mark),
     };
     let state = State {
         groups: HashMap::new(),
@@ -1296,23 +1441,10 @@ pub(crate) fn open<F: BlockFile>(
     }
     let replay = replay_live(&mut reader, &shape, &heads, &last, sealer.as_deref_mut())?;
     let (groups, mut damaged, fenced) = finish(replay.groups);
-    // 4a. The persist area as its mark says it is laid; an unsealed log of whole records moves to
-    // pieces of the device's unit where its area holds them, carrying its records
-    // (durability.md §7.7).
-    let area = match marked(file, id, sealed)? {
-        Some(unit) => Area::of(config, align, sealed, Some(unit))?,
-        None if sealed => Area::whole(config, align, sealed)?,
-        None => {
-            let whole = Area::whole(config, align, sealed)?;
-            match Area::in_pieces(config, align, device.unit())? {
-                Some(pieces) => {
-                    move_to_pieces(file, &whole, &pieces, id)?;
-                    pieces
-                }
-                None => whole,
-            }
-        }
-    };
+    // 4a. The persist area as its mark says it is laid, or laid again first: a log of whole
+    // records moves to pieces of the device's unit where its area holds them, carrying its
+    // records (durability.md §7.7).
+    let area = laid_area(file, config, (id, sealer.as_deref()), device.unit())?;
     // 4b. A frame after the last valid one may have been flushed and damaged since: its
     // persist record, written in the same flush, says what it held (AGL+18 §3.3.3).
     let (mut restores, copy, tail) = restores(
@@ -1355,7 +1487,7 @@ pub(crate) fn open<F: BlockFile>(
     };
     let laid = Laid {
         device,
-        pieces: area.unit(),
+        pieces: area.mark(),
     };
     let (state, recovery) =
         opened.into_state(heads, &last, shape.slots, &restores, (tail, laid))?;
@@ -1775,8 +1907,9 @@ mod tests {
     use hyper_block::buf::Alignment;
     use hyper_block::sim::{Crash, SimFile};
 
-    use super::{Area, check_record, persist_slot};
-    use crate::format::{self, Persist, Persisted, Written};
+    use super::{Area, check_record, laid_area, marked, persist_area, persist_slot, write_mark};
+    use crate::format::{self, MAC_LEN, Persist, Persisted, Written};
+    use crate::seal::Sealer;
     use crate::{Config, LogError, Waits};
 
     const ID: u128 = 0x7069_6563_6573;
@@ -1796,6 +1929,38 @@ mod tests {
 
     fn align(bytes: usize) -> Alignment {
         Alignment::new(bytes).unwrap()
+    }
+
+    fn sealer() -> Sealer {
+        let _ = hyper_seal::lock_keys(256);
+        let sealing = crate::seal::Sealing {
+            parent: hyper_seal::keys::WrappingKey::new(
+                hyper_seal::keys::KeyId([3; 16]),
+                0,
+                hyper_seal::Secret32::from_bytes(&[3; 32]).unwrap(),
+            ),
+            auth: hyper_seal::Secret32::from_bytes(&[4; 32]).unwrap(),
+        };
+        Sealer::new(sealing, ID).unwrap()
+    }
+
+    /// A simulated device of `block`-byte transfers and `sector`-byte atomic writes, holding
+    /// `image`, or the zeros of `cfg`'s persist area, flushed.
+    fn device(
+        block: usize,
+        sector: usize,
+        seed: u64,
+        image: Option<&[u8]>,
+        cfg: &Config,
+    ) -> SimFile {
+        let file = SimFile::new(align(block), align(sector), seed).unwrap();
+        let zeros = vec![0u8; usize::try_from(persist_area(cfg)).unwrap()];
+        let bytes = image.unwrap_or(&zeros);
+        let mut buf = hyper_block::buf::AlignedBuf::zeroed(bytes.len(), align(block)).unwrap();
+        buf.extend_from_slice(bytes).unwrap();
+        file.write_all_at(buf.padded().unwrap(), 0).unwrap();
+        file.sync_data().unwrap();
+        file
     }
 
     fn record(sequence: u64, groups: u64) -> Persist {
@@ -1835,8 +2000,10 @@ mod tests {
             let (unit, block) = (align(unit), align(block));
             let whole = Area::whole(&cfg, block, false).unwrap();
             let slot = persist_slot(&cfg, block, false).unwrap();
-            assert_eq!((whole.at(0), whole.at(1), whole.unit()), (0, slot, None));
-            let area = Area::in_pieces(&cfg, block, unit).unwrap().unwrap();
+            assert_eq!((whole.at(0), whole.at(1), whole.mark()), (0, slot, None));
+            let area = Area::in_pieces(&cfg, block, unit, false, false)
+                .unwrap()
+                .unwrap();
             let larger = unit.max(block);
             let pieces = area.pieces().unwrap();
             assert_eq!(pieces.unit(), unit, "a piece is one unit");
@@ -1852,31 +2019,58 @@ mod tests {
         // row is refused.
         let small = config(4 * 4096, 80);
         assert_eq!(
-            Area::in_pieces(&small, align(4096), align(4096)).unwrap(),
+            Area::in_pieces(&small, align(4096), align(4096), false, false).unwrap(),
             None
         );
         assert!(matches!(
-            Area::in_pieces(&cfg, align(4096), align(128)),
+            Area::in_pieces(&cfg, align(4096), align(128), false, false),
             Err(LogError::Config(_))
         ));
     }
 
     /// A binary from before format 5 reads the mark at the area's start as a whole persist
     /// record of the other kind, of the log's ID, and refuses the log there by its format check,
-    /// rather than read the pieces after it as no record.
+    /// rather than read the pieces after it as no record; a sealed log's mark is an unsealed
+    /// record, which such a binary refuses as tampering. A binary of format 5 from before the
+    /// block was recorded read a mark only of sequence and confirmation 0, and refuses one that
+    /// records the block the same way; its own marks read here, their block unrecorded.
     #[test]
     fn a_binary_before_pieces_refuses_a_log_in_pieces() {
-        let unit = align(4096);
-        let mark = format::pieces_mark(ID, false, unit).unwrap();
-        assert_eq!(format::pieces_marked(&mark, ID, false), Some(unit));
-        assert_eq!(format::pieces_marked(&mark, ID + 1, false), None);
-        assert_eq!(format::pieces_marked(&mark, ID, true), None);
-        let read = Persist::decode(&mark).expect("a whole record to a binary before pieces");
-        assert_eq!((read.log, read.sealed, read.groups.len()), (ID, true, 0));
-        assert!(matches!(
-            check_record(&read, &mark, None),
-            Err(LogError::Foreign(_))
-        ));
+        let mark = format::Mark {
+            unit: align(4096),
+            block: Some(align(512)),
+            at_end: true,
+        };
+        for sealed in [false, true] {
+            let bytes = format::pieces_mark(ID, sealed, mark).unwrap();
+            assert_eq!(format::pieces_marked(&bytes, ID, sealed), Some(mark));
+            assert_eq!(format::pieces_marked(&bytes, ID + 1, sealed), None);
+            assert_eq!(format::pieces_marked(&bytes, ID, !sealed), None);
+            let read = Persist::decode(&bytes).expect("a whole record to a binary before pieces");
+            assert_eq!((read.log, read.sealed, read.groups.len()), (ID, !sealed, 0));
+            assert_eq!((read.sequence, read.confirms), (1, 512));
+            if sealed {
+                let refused = check_record(&read, &bytes, Some(&sealer()));
+                assert!(matches!(refused, Err(LogError::Tampered(_))), "{refused:?}");
+            } else {
+                let refused = check_record(&read, &bytes, None);
+                assert!(matches!(refused, Err(LogError::Foreign(_))), "{refused:?}");
+            }
+        }
+        // The mark of a binary of format 5 from before the block was recorded: its slots lie
+        // past the whole ones, by the file's block.
+        let mut old = format::pieces_mark(ID, false, mark).unwrap();
+        old[24..40].fill(0);
+        let crc = crate::codec::crc32c(&old[..44]);
+        old[44..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            format::pieces_marked(&old, ID, false),
+            Some(format::Mark {
+                block: None,
+                at_end: false,
+                ..mark
+            })
+        );
         // A whole record is no mark.
         let whole = record(2, 3).encode().unwrap();
         assert_eq!(format::pieces_marked(&whole, ID, false), None);
@@ -1889,7 +2083,7 @@ mod tests {
     fn a_copy_over_a_later_frames_longer_record_reads() {
         let cfg = config(16 * 4096, 64);
         let file = SimFile::new(align(4096), align(512), 7).unwrap();
-        let area = Area::in_pieces(&cfg, file.layout_block(), align(512))
+        let area = Area::in_pieces(&cfg, file.layout_block(), align(512), false, false)
             .unwrap()
             .unwrap();
         let mut zeros =
@@ -1919,7 +2113,7 @@ mod tests {
             let file = SimFile::new(align(4096), align(512), seed).unwrap();
             let unit = file.atomic_unit().unwrap();
             assert!(unit.stated());
-            let area = Area::in_pieces(&cfg, file.layout_block(), unit.unit())
+            let area = Area::in_pieces(&cfg, file.layout_block(), unit.unit(), false, false)
                 .unwrap()
                 .unwrap();
             let (old, new) = (record(2, 20), record(4, 20));
@@ -1942,5 +2136,273 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&n| n > 0), "old, new, torn: {seen:?}");
+    }
+
+    /// A sealed log's record in pieces (format 6) carries a MAC in each piece and reads back
+    /// whole. A piece changed with its CRC recomputed, so that only its MAC tells, is tampering,
+    /// as is an unsealed piece in its place; one changed without its CRC is damage, as in an
+    /// unsealed log; and the pieces read under another log's key are tampering.
+    #[test]
+    fn a_sealed_record_in_pieces_carries_a_mac_in_each_and_a_forged_piece_is_tampering() {
+        let cfg = config(16 * 4096, 64);
+        let sealer = sealer();
+        let file = device(4096, 512, 11, None, &cfg);
+        let area = Area::in_pieces(&cfg, align(4096), align(512), true, false)
+            .unwrap()
+            .unwrap();
+        let sealed = Persist {
+            sealed: true,
+            ..record(2, 9)
+        };
+        assert!(area.pieces().unwrap().count(9).unwrap() > 1);
+        area.write(&file, &sealed, area.at(2), Some(&sealer))
+            .unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(
+            area.read(&file, area.at(2), ID, Some(&sealer)).unwrap(),
+            Some(sealed.clone())
+        );
+        let image = file.durable_image().unwrap();
+        let at = usize::try_from(area.at(2)).unwrap();
+        let mac_at = format::piece_mac_at(&image[at..]).unwrap();
+        assert!(
+            image[at + mac_at..at + mac_at + MAC_LEN]
+                .iter()
+                .any(|&b| b != 0)
+        );
+        // The second piece's first row's group, changed, its CRC recomputed.
+        let second = at + 512;
+        let covered = format::piece_mac_at(&image[second..]).unwrap() - 4;
+        let mut forged = image.clone();
+        forged[second + format::PIECE_HEADER_LEN] ^= 1;
+        let crc = crate::codec::crc32c(&forged[second..second + covered]);
+        forged[second + covered..second + covered + 4].copy_from_slice(&crc.to_le_bytes());
+        let file = device(4096, 512, 12, Some(&forged), &cfg);
+        assert!(matches!(
+            area.read(&file, area.at(2), ID, Some(&sealer)),
+            Err(LogError::Tampered(_))
+        ));
+        // Changed without its CRC: damage, never a torn write, since a piece is written whole.
+        let mut damaged = image.clone();
+        damaged[second + format::PIECE_HEADER_LEN] ^= 1;
+        let file = device(4096, 512, 13, Some(&damaged), &cfg);
+        assert!(matches!(
+            area.read(&file, area.at(2), ID, Some(&sealer)),
+            Err(LogError::Damaged(_))
+        ));
+        // An unsealed record's piece in a sealed log's slot.
+        let unsealed = format::Pieces::new(align(512), false)
+            .unwrap()
+            .encode(&record(2, 1))
+            .unwrap();
+        let mut planted = image.clone();
+        planted[second..second + 512].copy_from_slice(&unsealed);
+        let file = device(4096, 512, 14, Some(&planted), &cfg);
+        assert!(matches!(
+            area.read(&file, area.at(2), ID, Some(&sealer)),
+            Err(LogError::Tampered(_))
+        ));
+        // Another key's MACs.
+        let other = {
+            let _ = hyper_seal::lock_keys(256);
+            let sealing = crate::seal::Sealing {
+                parent: hyper_seal::keys::WrappingKey::new(
+                    hyper_seal::keys::KeyId([3; 16]),
+                    0,
+                    hyper_seal::Secret32::from_bytes(&[3; 32]).unwrap(),
+                ),
+                auth: hyper_seal::Secret32::from_bytes(&[5; 32]).unwrap(),
+            };
+            Sealer::new(sealing, ID).unwrap()
+        };
+        let file = device(4096, 512, 15, Some(&image), &cfg);
+        assert!(matches!(
+            area.read(&file, area.at(2), ID, Some(&other)),
+            Err(LogError::Tampered(_))
+        ));
+    }
+
+    /// The area of `cfg` in pieces of 4,096 bytes past the whole slots, by a 4,096-byte block, its
+    /// mark and two records written and flushed on `file`; the records.
+    fn laid_in_4096(file: &SimFile, cfg: &Config, sealer: Option<&Sealer>) -> (Persist, Persist) {
+        let sealed = sealer.is_some();
+        let area = Area::in_pieces(cfg, align(4096), align(4096), sealed, false)
+            .unwrap()
+            .unwrap();
+        let (even, odd) = (
+            Persist {
+                sealed,
+                ..record(2, 50)
+            },
+            Persist {
+                sealed,
+                ..record(3, 7)
+            },
+        );
+        area.write(file, &even, area.at(2), sealer).unwrap();
+        area.write(file, &odd, area.at(3), sealer).unwrap();
+        file.sync_data().unwrap();
+        write_mark(file, ID, sealed, &area).unwrap();
+        file.sync_data().unwrap();
+        (even, odd)
+    }
+
+    /// Power fails at each write and flush of an open's re-lay of a persist area in pieces of
+    /// 4,096 bytes on a device whose atomic write unit is 512, each unflushed sector kept or not:
+    /// after the crash the mark names the old area or the new, and the area it names holds both
+    /// records; the next open lays the area in 512-byte pieces at the area's end, both records
+    /// in their slots. Sealed or not.
+    #[test]
+    fn a_relay_across_a_crash_at_each_of_its_steps_keeps_the_old_records_or_the_new() {
+        let cfg = config(16 * 4096, 64);
+        for sealed in [false, true] {
+            let sealer = sealed.then(sealer);
+            let sealer = sealer.as_ref();
+            let mut seen = [0u32; 2];
+            // The re-lay's two slot writes, its flush, the mark and its flush; then one step
+            // past, where the re-lay is whole.
+            for ops in 0..=5 {
+                for seed in 0..4 {
+                    let file = device(4096, 512, ops * 8 + seed, None, &cfg);
+                    let (even, odd) = laid_in_4096(&file, &cfg, sealer);
+                    file.inject(hyper_block::sim::Fault::PowerCut { ops })
+                        .unwrap();
+                    let laid = laid_area(&file, &cfg, (ID, sealer), align(512));
+                    assert_eq!(laid.is_ok(), ops == 5, "ops {ops}: {laid:?}");
+                    file.crash(Crash::Random).unwrap();
+                    file.clear_faults().unwrap();
+                    let mark = marked(&file, ID, sealed).unwrap().unwrap();
+                    seen[usize::from(mark.unit == align(512))] += 1;
+                    let area = Area::of(&cfg, align(4096), sealed, Some(mark)).unwrap();
+                    for (sequence, record) in [(2, &even), (3, &odd)] {
+                        assert_eq!(
+                            area.read(&file, area.at(sequence), ID, sealer)
+                                .unwrap()
+                                .as_ref(),
+                            Some(record),
+                            "ops {ops} seed {seed}: {mark:?}"
+                        );
+                    }
+                    let area = laid_area(&file, &cfg, (ID, sealer), align(512)).unwrap();
+                    assert_eq!(
+                        area.mark().map(|m| (m.unit, m.at_end)),
+                        Some((align(512), true))
+                    );
+                    for (sequence, record) in [(2, &even), (3, &odd)] {
+                        assert_eq!(
+                            area.read(&file, area.at(sequence), ID, sealer)
+                                .unwrap()
+                                .as_ref(),
+                            Some(record)
+                        );
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&n| n > 0), "old, new: {seen:?}");
+        }
+    }
+
+    /// A piece of 4,096 bytes torn by a crash on a device whose unit is 512 fails its checksum,
+    /// which on a device that writes it whole would be damage: the re-lay reads its slot as a torn
+    /// record, none, and keeps the other slot's.
+    #[test]
+    fn a_relay_reads_a_piece_torn_within_the_larger_unit_as_a_torn_record() {
+        let cfg = config(16 * 4096, 64);
+        let mut torn = 0;
+        for seed in 0..32 {
+            let file = device(4096, 512, seed, None, &cfg);
+            let (_, odd) = laid_in_4096(&file, &cfg, None);
+            let area = Area::in_pieces(&cfg, align(4096), align(4096), false, false)
+                .unwrap()
+                .unwrap();
+            area.write(&file, &record(4, 50), area.at(4), None).unwrap();
+            file.crash(Crash::Random).unwrap();
+            if matches!(
+                area.read(&file, area.at(4), ID, None),
+                Err(LogError::Damaged(_))
+            ) {
+                torn += 1;
+                let area = laid_area(&file, &cfg, (ID, None), align(512)).unwrap();
+                assert_eq!(area.read(&file, area.at(4), ID, None).unwrap(), None);
+                assert_eq!(area.read(&file, area.at(3), ID, None).unwrap(), Some(odd));
+            }
+        }
+        assert!(torn > 0, "no crash tore a piece");
+    }
+
+    /// The slots lie by the block the mark records. Laid by a 4,096-byte block, they read on a
+    /// file whose block is 512, which takes them where they lie; laid by 512, on a file whose
+    /// block is 4,096, which does not take them, the open lays them again by 4,096 at the area's
+    /// end. A mark from before the block was recorded is written again with the file's block.
+    #[test]
+    fn an_alignment_change_between_runs_reads_by_the_recorded_alignment() {
+        let cfg = config(16 * 4096, 64);
+        let file = device(4096, 512, 21, None, &cfg);
+        let area = Area::in_pieces(&cfg, align(4096), align(512), false, false)
+            .unwrap()
+            .unwrap();
+        let (even, odd) = (record(2, 50), record(3, 7));
+        area.write(&file, &even, area.at(2), None).unwrap();
+        area.write(&file, &odd, area.at(3), None).unwrap();
+        write_mark(&file, ID, false, &area).unwrap();
+        file.sync_data().unwrap();
+        let image = file.durable_image().unwrap();
+        // The same bytes on a file of 512-byte blocks: by its own block the slots would lie
+        // elsewhere.
+        let by_512 = Area::in_pieces(&cfg, align(512), align(512), false, false)
+            .unwrap()
+            .unwrap();
+        assert_ne!(by_512.at(2), area.at(2));
+        let small = device(512, 512, 22, Some(&image), &cfg);
+        let found = laid_area(&small, &cfg, (ID, None), align(512)).unwrap();
+        assert_eq!(found, area);
+        assert_eq!(
+            found.read(&small, found.at(2), ID, None).unwrap(),
+            Some(even.clone())
+        );
+        assert_eq!(
+            found.read(&small, found.at(3), ID, None).unwrap(),
+            Some(odd.clone())
+        );
+        // Laid by 512, opened on a file of 4,096-byte blocks.
+        let small = device(512, 512, 23, None, &cfg);
+        by_512.write(&small, &even, by_512.at(2), None).unwrap();
+        by_512.write(&small, &odd, by_512.at(3), None).unwrap();
+        write_mark(&small, ID, false, &by_512).unwrap();
+        small.sync_data().unwrap();
+        assert!(!by_512.takes(align(4096)));
+        let large = device(4096, 512, 24, Some(&small.durable_image().unwrap()), &cfg);
+        let found = laid_area(&large, &cfg, (ID, None), align(512)).unwrap();
+        assert_eq!(
+            found.mark(),
+            Some(format::Mark {
+                unit: align(512),
+                block: Some(align(4096)),
+                at_end: true,
+            })
+        );
+        assert_eq!(
+            found.read(&large, found.at(2), ID, None).unwrap(),
+            Some(even.clone())
+        );
+        assert_eq!(
+            found.read(&large, found.at(3), ID, None).unwrap(),
+            Some(odd.clone())
+        );
+        // A mark from before the block was recorded: its slots by the file's block, the mark
+        // written again with it.
+        let mut old = image.clone();
+        old[24..40].fill(0);
+        let crc = crate::codec::crc32c(&old[..44]);
+        old[44..48].copy_from_slice(&crc.to_le_bytes());
+        let file = device(4096, 512, 25, Some(&old), &cfg);
+        assert_eq!(marked(&file, ID, false).unwrap().unwrap().block, None);
+        let found = laid_area(&file, &cfg, (ID, None), align(512)).unwrap();
+        assert_eq!(found, area);
+        assert_eq!(marked(&file, ID, false).unwrap(), area.mark());
+        assert_eq!(
+            found.read(&file, found.at(2), ID, None).unwrap(),
+            Some(even)
+        );
     }
 }

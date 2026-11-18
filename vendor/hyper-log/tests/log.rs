@@ -4401,7 +4401,12 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
     let cfg = config_now(16, 8);
     let log = Log::create(file, cfg, ID).unwrap();
     let unit = Alignment::new(512).unwrap();
-    assert_eq!(log.laid().pieces, Some(unit));
+    let mark = hyper_log::format::Mark {
+        unit,
+        block: Some(Alignment::new(BLOCK).unwrap()),
+        at_end: false,
+    };
+    assert_eq!(log.laid().pieces, Some(mark));
     assert!(
         log.laid().device.stated(),
         "the simulated device states its sector"
@@ -4419,7 +4424,7 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
     let image = file.durable_image().unwrap();
     assert_eq!(
         hyper_log::format::pieces_marked(&image, ID, false),
-        Some(unit)
+        Some(mark)
     );
     write_flushed(&file, &vec![0u8; AREA as usize], 0);
     for (from, to) in PIECES_SLOTS.into_iter().zip(WHOLE_SLOTS) {
@@ -4441,7 +4446,7 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
     })
     .unwrap();
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
-    assert_eq!(recovery.laid.pieces, Some(unit), "moved to pieces");
+    assert_eq!(recovery.laid.pieces, Some(mark), "moved to pieces");
     assert_eq!(recovery.tail, Tail::Lost { sequence: 2 });
     assert_eq!(recovery.restored, vec![1]);
     log.write(
@@ -4461,7 +4466,7 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
     let image = file.durable_image().unwrap();
     assert_eq!(
         hyper_log::format::pieces_marked(&image, ID, false),
-        Some(unit)
+        Some(mark)
     );
     let newest = valid_frames(&image).into_iter().map(|f| f.2).max().unwrap();
     let hyper_log::format::Pieced::Whole(record) =
@@ -4471,10 +4476,10 @@ fn a_log_of_whole_records_opens_and_writes_in_pieces() {
     };
     assert_eq!(record.sequence, newest);
     // A binary before pieces reads the mark as a sealed record in this unsealed log.
-    let mark = hyper_log::format::Persist::decode(&image).unwrap();
-    assert_eq!((mark.log, mark.sealed), (ID, true));
+    let read = hyper_log::format::Persist::decode(&image).unwrap();
+    assert_eq!((read.log, read.sealed), (ID, true));
     let (log, recovery) = Log::open(file, cfg, ID).unwrap();
-    assert_eq!(recovery.laid.pieces, Some(unit));
+    assert_eq!(recovery.laid.pieces, Some(mark));
     assert_eq!(recovery.tail, Tail::Torn);
     assert_eq!(log.view(1).unwrap().unwrap().last, 1);
     assert!(log.view(2).unwrap().is_some());

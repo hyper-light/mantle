@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use hyper_rt::retire::Pinned;
 
 use crate::DiskError;
+use crate::atomic::AtomicUnit;
 use crate::block::{BlockFile, Durable};
 use crate::buf::{AlignedBuf, Alignment};
 use crate::file::{CachingRequest, DeviceFile, sync_dir};
@@ -699,6 +700,16 @@ impl BlockFile for SegmentedFile {
         self.layout
     }
 
+    /// The base's device's: every segment lies beside the base, in its directory, on its device.
+    fn atomic_unit(&self) -> Result<AtomicUnit, DiskError> {
+        self.with(|open| {
+            open.segment(0)
+                .ok_or_else(|| beyond(&self.base, "a segmented file with no base"))?
+                .file
+                .atomic_unit()
+        })
+    }
+
     fn len(&self) -> Result<u64, DiskError> {
         self.with(|open| {
             open.discover_all()?;
@@ -989,6 +1000,26 @@ mod tests {
         let reopened = open(&base, 4);
         assert_eq!(reopened.len().unwrap(), 6 * 4096);
         assert_eq!((read(&reopened, 0), read(&reopened, 2 * 4096)), (1, 2));
+    }
+
+    /// A segmented file answers the atomic write unit of its base's device, as the OS states it
+    /// for the base opened alone, through its owner and through a handle made from it, rather than
+    /// the unit of a device that states none.
+    #[test]
+    fn a_segmented_file_reports_its_devices_atomic_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let file = create(&base, 4);
+        let alone = DeviceFile::open(
+            &base,
+            false,
+            CachingRequest::Buffered,
+            Alignment::new(ALIGN).unwrap(),
+        )
+        .unwrap();
+        let device = crate::atomic::atomic_unit(alone.std_file(), &base).unwrap();
+        assert_eq!(file.atomic_unit().unwrap(), device);
+        assert_eq!(file.try_clone().unwrap().atomic_unit().unwrap(), device);
     }
 
     /// Do: add 37 segments to a file bounded to 1,000, writing a page into each, and reopen it.

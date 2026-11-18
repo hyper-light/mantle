@@ -220,18 +220,20 @@ pub struct Recovery {
     pub laid: Laid,
 }
 
-/// The device's atomic write unit as the OS gave it, and the unit the log's persist records are
-/// laid in pieces of (mantle docs/design/durability.md §7.7). A node on a device that states no
+/// The device's atomic write unit as the OS gave it, and how the log's persist records are laid
+/// in pieces of a unit (mantle docs/design/durability.md §7.7). A node on a device that states no
 /// unit, its unit the conservative default, shows here with `device.stated()` false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Laid {
     /// The device's atomic write unit and where it was read.
     pub device: AtomicUnit,
-    /// The unit the persist records are laid in pieces of (format 5), the one the persist area's
-    /// mark records: it stays the area's when the device's differs, since the slots lie where it
-    /// put them. `None` where the records are whole: a sealed log's (format 4) until its pieces
-    /// carry MACs, or one whose persist area does not hold its slots in pieces (format 3).
-    pub pieces: Option<Alignment>,
+    /// How the persist records are laid in pieces (format 5, 6 sealed), as the persist area's mark
+    /// records it: its unit stays the area's where the device's is larger, and its block where the
+    /// file's differs but takes the slots, since the slots lie where they were put; a device whose
+    /// unit is smaller, or a file whose block does not take the slots, has the open lay them again.
+    /// `None` where the records are whole: one whose persist area does not hold its slots in
+    /// pieces (format 3, 4 sealed).
+    pub pieces: Option<format::Mark>,
 }
 
 impl Default for Laid {

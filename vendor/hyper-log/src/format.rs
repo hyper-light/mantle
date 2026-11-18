@@ -6,8 +6,8 @@
 //! header and payload. Each entry and proposal also carries a CRC-32C of its group, index,
 //! term and bytes, so one entry read back alone is verified, and verified as the one asked
 //! for. A persist record says what one frame's flush made durable, group by group, and is
-//! checksummed as a whole; in format 5 it is laid in pieces of the device's atomic write unit,
-//! each checksummed on its own ([`Pieces`]).
+//! checksummed as a whole; in format 5 (6 sealed) it is laid in pieces of the device's atomic
+//! write unit, each checksummed on its own and a sealed log's each with its MAC ([`Pieces`]).
 
 use std::num::NonZeroUsize;
 
@@ -39,7 +39,9 @@ pub const FORMAT_SEALED: u8 = 4;
 /// damage (mantle docs/design/durability.md §7.2). Only persist records take it: segment headers
 /// and frames keep theirs, and a whole record of format 3 or 4 still reads ([`Persist::decode`]).
 pub const FORMAT_PIECES: u8 = 5;
-/// 6: format 5's pieces in a sealed log, each with room for its MAC after its CRC.
+/// 6: format 5's pieces in a sealed log, each with its MAC after its CRC, under the log's
+/// authentication key over the piece through its CRC: a piece whose CRC holds and whose MAC does
+/// not is tampering, never a torn write.
 pub const FORMAT_SEALED_PIECES: u8 = 6;
 
 /// Bytes of the MAC a sealed log's segment header, frame and persist record end with: a full
@@ -1185,31 +1187,51 @@ impl Persist {
 /// no groups, its CRC after it ([`persist_len`] of none).
 pub const PIECES_MARK_LEN: usize = PERSIST_HEADER_LEN + 4;
 
-/// The mark that log `log`'s persist area holds its records in pieces laid in `unit` (format 5,
-/// durability.md §7.7): a whole persist record of the other kind than the log's (format 4 in an
-/// unsealed log, 3 in a sealed one), of no groups, sequence and confirmation 0, whose first
-/// padding byte is the base-2 logarithm of the unit, under the record's CRC. It lies at the start
-/// of the area, where every binary reads a slot. A binary from before format 5 reads it as a record
-/// of the other kind and refuses the log, as it refuses a sealed record in an unsealed log and the
-/// reverse, rather than read the pieces after it as no record.
-pub fn pieces_mark(log: u128, sealed: bool, unit: Alignment) -> Option<[u8; PIECES_MARK_LEN]> {
+/// How a log's persist area is laid in pieces, as the mark at its start records it (mantle
+/// docs/design/durability.md §7.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    /// The atomic write unit the records are laid in pieces of.
+    pub unit: Alignment,
+    /// The file's block the slots were laid by: the slots' offsets depend on it, so they are found
+    /// by it whatever the file's block is now. `None` in a mark from before it was recorded, whose
+    /// slots the file's own block lays, as the binary that wrote it laid them.
+    pub block: Option<Alignment>,
+    /// Whether the slots lie at the area's end, where a re-lay put them clear of the slots it
+    /// moved from, rather than past the two whole slots.
+    pub at_end: bool,
+}
+
+/// The mark that log `log`'s persist area holds its records in pieces as `mark` says (format 5,
+/// 6 sealed; durability.md §7.7): a whole persist record of the other kind than the log's (format 4
+/// in an unsealed log, 3 in a sealed one), of no groups, whose first padding byte is the base-2
+/// logarithm of the unit, its sequence 1 where the slots lie at the area's end and 0 where they lie
+/// past the whole slots, and what it confirms the file's block in bytes, all under the record's
+/// CRC. It lies at the start of the area, where every binary reads a slot. A binary from before
+/// format 5 reads it as a record of the other kind and refuses the log, as it refuses a sealed
+/// record in an unsealed log and the reverse (a sealed log's refusal being tampering), rather than
+/// read the pieces after it as no record. A binary of format 5 from before the block was recorded
+/// reads a mark only of sequence and confirmation 0, so it refuses these the same way, rather than
+/// lay the slots by a block of its own. `None` when the mark records no block.
+pub fn pieces_mark(log: u128, sealed: bool, mark: Mark) -> Option<[u8; PIECES_MARK_LEN]> {
+    let block = u64::try_from(mark.block?.get()).ok()?;
     let mut w = Writer::with_capacity(PIECES_MARK_LEN);
     w.bytes(&PERSIST_MAGIC);
     w.u8(if sealed { FORMAT } else { FORMAT_SEALED });
-    w.u8(u8::try_from(unit.get().trailing_zeros()).ok()?);
+    w.u8(u8::try_from(mark.unit.get().trailing_zeros()).ok()?);
     w.zeros(2);
     w.u128(log);
-    w.u64(0);
-    w.u64(0);
+    w.u64(u64::from(mark.at_end));
+    w.u64(block);
     w.u32(0);
     let crc = crate::codec::crc32c(w.as_slice());
     w.u32(crc);
     w.as_slice().try_into().ok()
 }
 
-/// The unit the persist area of log `log` is laid in, if `bytes` begin with its mark of pieces
-/// ([`pieces_mark`]) and the mark's checksum holds.
-pub fn pieces_marked(bytes: &[u8], log: u128, sealed: bool) -> Option<Alignment> {
+/// How the persist area of log `log` is laid in pieces, if `bytes` begin with its mark of pieces
+/// ([`pieces_mark`], or one from before the block was recorded) and the mark's checksum holds.
+pub fn pieces_marked(bytes: &[u8], log: u128, sealed: bool) -> Option<Mark> {
     let whole = bytes.get(..PIECES_MARK_LEN)?;
     let (body, crc) = whole.split_at(PIECES_MARK_LEN.checked_sub(4)?);
     if crate::codec::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
@@ -1219,13 +1241,49 @@ pub fn pieces_marked(bytes: &[u8], log: u128, sealed: bool) -> Option<Alignment>
     if r.take(4)? != PERSIST_MAGIC || r.u8()? != if sealed { FORMAT } else { FORMAT_SEALED } {
         return None;
     }
-    let unit = 1usize.checked_shl(u32::from(r.u8()?))?;
+    let unit = Alignment::new(1usize.checked_shl(u32::from(r.u8()?))?).ok()?;
     r.take(2)?;
-    let mark = (r.u128()?, r.u64()?, r.u64()?, r.u32()?);
-    if mark != (log, 0, 0, 0) {
+    let (at, at_end, block, groups) = (r.u128()?, r.u64()?, r.u64()?, r.u32()?);
+    (at == log && groups == 0).then_some(())?;
+    laid_by(unit, at_end, block)
+}
+
+/// A mark of pieces of `unit` whose sequence field is `at_end` and whose confirmation field is
+/// `block` ([`pieces_mark`]): 0 and 0 in a mark from before the block was recorded. `None` where
+/// they are neither.
+fn laid_by(unit: Alignment, at_end: u64, block: u64) -> Option<Mark> {
+    let at_end = match at_end {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let block = match block {
+        0 if !at_end => None,
+        0 => return None,
+        bytes => Some(Alignment::new(usize::try_from(bytes).ok()?).ok()?),
+    };
+    Some(Mark {
+        unit,
+        block,
+        at_end,
+    })
+}
+
+/// Where the MAC of the sealed piece at the start of `bytes` goes: past its header, its rows and
+/// its CRC, the bytes it covers. `None` where `bytes` begin with no piece of format 6.
+pub fn piece_mac_at(bytes: &[u8]) -> Option<usize> {
+    let mut r = Reader::new(bytes.get(..PIECE_HEADER_LEN)?);
+    if r.take(4)? != PERSIST_MAGIC || r.u8()? != FORMAT_SEALED_PIECES {
         return None;
     }
-    Alignment::new(unit).ok()
+    // On to the header's last field, the rows the piece holds: the magic, the format and that
+    // field are 9 of its bytes (`PIECE_HEADER_LEN`).
+    r.take(PIECE_HEADER_LEN.checked_sub(9)?)?;
+    usize::try_from(r.u32()?)
+        .ok()?
+        .checked_mul(PERSIST_GROUP_LEN)?
+        .checked_add(PIECE_HEADER_LEN)?
+        .checked_add(4)
 }
 
 /// How a persist record is cut into pieces for a device whose atomic write unit is `unit`: format
@@ -1401,15 +1459,45 @@ impl Pieces {
     /// zeros where nothing was written, and pieces. Where the newest record's pieces go, a piece that
     /// fails its own checksum, or bytes no write of a piece leaves, is [`LogError::Damaged`]: a
     /// piece is written atomically, so no crash leaves it so (durability.md §7.2). The units past
-    /// the newest record's hold older records' pieces and are not read. A sealed piece's MAC is the
-    /// caller's to verify, as [`Persist::decode`] leaves a whole record's.
+    /// the newest record's hold older records' pieces and are not read. In a sealed layout an
+    /// unsealed piece is [`LogError::Tampered`]; a sealed piece's MAC is the caller's to verify
+    /// ([`Pieces::decode_verified`]), as [`Persist::decode`] leaves a whole record's.
     pub fn decode(&self, slot: &[u8]) -> Result<Pieced, LogError> {
+        self.decode_verified(slot, |_, _| Ok(()))
+    }
+
+    /// [`Pieces::decode`], each sealed piece whose CRC holds given to `verify` with the bytes its
+    /// MAC covers, its header, rows and CRC, and the MAC after them, before it is read: a piece's
+    /// CRC holding, a MAC that does not is tampering, never a torn write, and `verify`'s error
+    /// ([`LogError::Tampered`]) is the decode's.
+    pub fn decode_verified(
+        &self,
+        slot: &[u8],
+        verify: impl Fn(&[u8], &[u8]) -> Result<(), LogError>,
+    ) -> Result<Pieced, LogError> {
         let unit = self.unit.get();
         let mut newest: Option<Piece> = None;
         let mut damaged = false;
         for bytes in slot.chunks_exact(unit) {
             match self.unit_of(bytes) {
-                Unit::Piece(p, _) => {
+                Unit::Piece(p, rows) => {
+                    if self.sealed {
+                        if !p.sealed {
+                            return Err(LogError::Tampered(
+                                "an unsealed persist record's piece in a sealed log",
+                            ));
+                        }
+                        let at = rows
+                            .len()
+                            .checked_add(PIECE_HEADER_LEN)
+                            .and_then(|len| len.checked_add(4))
+                            .ok_or(DAMAGED_PIECE)?;
+                        let (covered, rest) = bytes.split_at_checked(at).ok_or(DAMAGED_PIECE)?;
+                        let mac = rest.get(..MAC_LEN).ok_or(LogError::Tampered(
+                            "a persist record's piece cut short of its MAC",
+                        ))?;
+                        verify(covered, mac)?;
+                    }
                     if newest.is_none_or(|n| (p.sequence, p.confirms) > (n.sequence, n.confirms)) {
                         newest = Some(p);
                     }

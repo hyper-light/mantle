@@ -413,13 +413,39 @@ answered. Two cases reach it:
      `Torn`; a damaged piece is `LogError::Damaged`. New records keep the recorded unit when the
      device's differs, since the slots lie where that unit put them: a log moved to a device of a
      larger unit stays safe, its pieces inside the device's unit; one moved to a smaller unit could
-     tear a piece, which reads as damage and is refused, never as a lost answer. Re-laying such an
-     area in the device's unit at the open is left to 2b-iii.
-   - A sealed log keeps whole records (format 4) until its pieces carry MACs (2b-iii): without one
-     per piece, a piece would be a record no key vouches for.
+     tear a piece, which would read as damage; 2b-iii lays such an area again at the open.
 
-   2b-iii: sealed pieces with a MAC each (format 6), re-laying an area whose recorded unit is
-   larger than the device's, and hyper-log's ORIGIN.md.
+   2b-iii, built (hyper-raft `mantle-frame-flush`): sealed pieces, the file's block in the mark,
+   and an area laid again where its pieces would tear or its slots cannot be written.
+   - A sealed log lays its records in pieces too (format 6), each piece's MAC under the log's
+     authentication key over the piece through its CRC, in the room the format left after it.
+     Every sealed piece whose CRC holds is checked against its MAC as its slot is read: a forged
+     or altered piece, or an unsealed piece in a sealed log, is `LogError::Tampered`, a piece that
+     fails its CRC damage, as in an unsealed log. A sealed log of whole records (format 4) moves to
+     pieces at its open, its records' MACs checked as they are read. Its mark is the reverse of an
+     unsealed log's, an unsealed record in a sealed log, which a binary before format 6 refuses as
+     tampering. The mark itself carries no MAC: changing it moves where the slots are read, which
+     reads as damage or as no record, as zeroing a slot of whole records always could.
+   - The mark records the file's block the slots were laid by, in its confirmation field, and in
+     its sequence whether they lie at the area's end. The slots' offsets depend on the block, and
+     a file's block can change between runs (a direct file reopened buffered takes the device's
+     preferred block); the slots are found by the recorded block wherever the file's block takes
+     them, each slot's offset and length a multiple of it. A binary of format 5 from before read a
+     mark only of sequence and confirmation 0, so it refuses these as a record of the other kind
+     rather than lay the slots by a block of its own; its own marks read by the file's block, as
+     it laid them, and the open writes them again with it.
+   - Where the device's unit is smaller than the recorded one, or the file's block does not take
+     the recorded slots, the open lays the area again in the device's unit and the file's block,
+     at the other end of the area, as the move from whole records does: each new slot written
+     whole, zeros and the pieces of the record the old slot holds, one flush, then the mark and a
+     flush. The new slots lie clear of the old ones and of the mark, refused (`LogError::Config`)
+     where the area does not hold both; so a crash before the mark is durable leaves the old area,
+     which the next open reads and lays again, and the mark, within the device's unit, is old or
+     new. There a piece of the larger unit that fails its CRC may be a tear, and reads as a torn
+     record, none, rather than damage.
+   - Every wrapper of a real file passes its file's unit through (`BlockFile::atomic_unit`), a
+     `SegmentedFile` its base's device's. mantle's log runs on a `DeviceFile` (`crates/node`'s
+     `open_log`), which asks the OS.
 3. Each frame records whether it was answered at its flush; the open restores an `Undetermined`
    frame so answered as `Lost` is, and the simulation's faults of §7.6 run against it.
 4. The writer answers a frame at its flush where §7.5 allows, and the flushes a PUT are counted.

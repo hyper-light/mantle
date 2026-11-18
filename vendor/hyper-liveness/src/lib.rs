@@ -37,7 +37,8 @@
 //! wakes, each begun before its deadline and ended at or past it, whatever ended it
 //! ([`Liveness::on_wait`]): how late past its wakes the stream is polled while its owner waits for
 //! them, not what the owner's own work adds. `E[flush]` the mean of the
-//! durable completions reported, the margin
+//! durable completions reported, and of the stream's own proofs, the larger; each mean of the
+//! samples in their usual range, RFC 6298's tail over those before (`usual`), the margin
 //! bounded by one Cantelli factor on each heartbeat's lateness past its expected arrival (a slot
 //! the sender skipped or the network lost being the next one's lateness), which assumes no
 //! independence between heartbeats (`docs/timing.md` §2.2), the MTBF the Jeffreys posterior over
@@ -401,16 +402,21 @@ pub struct Liveness {
     run: u64,
     max_peers: usize,
     pairs: BTreeMap<PeerId, Pair>,
-    /// `G`: the lateness of the timed waits the owner reports ([`on_wait`](Self::on_wait)).
+    /// `G`: the lateness of the timed waits the owner reports ([`on_wait`](Self::on_wait)) in
+    /// their usual range (`usual`), judged by `wait_tail`, every wait's; judged apart from its disk,
+    /// of every wait, `every_wait` ([`granularity`](Self::granularity)).
     timer: Lateness,
+    wait_tail: FlushTail,
+    every_wait: Lateness,
     /// The wake the latest poll asked of the owner, and the most the owner has been past one: what
     /// a bound the owner states adds (Lifeguard's local health, measured: `docs/timing.md` §2.7),
     /// its own stalls and all.
     asked: Option<u64>,
     late_most: u64,
     flushes: Flushes,
-    /// Of those flushes, the ones within their tail as each came: the sender's floor in the disk
-    /// mode, whose heartbeats wait on no flush, so a stall's is no measure of what one costs.
+    /// Of those flushes, the ones in their usual range, judged by `flush_tail` (`usual`): the
+    /// sender's floor's `E[flush]`, so a stall's, or a hold's of the owner, is no measure of what
+    /// one costs.
     steady: Flushes,
     /// The same flushes' tail, RFC 6298's bound over them: what the node's own wait on its disk is
     /// judged against in the disk mode (kiln's CP-T2.2).
@@ -427,9 +433,11 @@ pub struct Liveness {
     /// The stream's own proof, from the poll that asked a liveness write to the poll that takes its
     /// durability: what a heartbeat waits on, the flush `Flushes` names (from waking to send, the
     /// write and the full flush), where a write's own start and durability leave out the time
-    /// before the device took it and after it answered. `proof_from` holds the ask of a write
-    /// durable since the last poll, which folds it.
+    /// before the device took it and after it answered: those in their usual range (`usual`),
+    /// judged by `proof_tail`, every proof's. `proof_from` holds the ask of a write durable since
+    /// the last poll, which folds it.
     proofs: Flushes,
+    proof_tail: FlushTail,
     proof_from: Option<u64>,
     /// The widest freshness its pairs held at the last poll: how long its detectors trust a peer
     /// past its latest heartbeat, what a stall of the disk's would have been suspected after.
@@ -622,6 +630,24 @@ fn earliest(wake: Option<u64>, pair: &Pair, local: &pair::Local, now_ns: u64) ->
     .min()
 }
 
+/// Whether a sample of one of the floor's measures, `sample_ns` (a log write's flush, the stream's
+/// proof, a wait's lateness), is in its usual range: within the tail of the samples before it as it
+/// came, RFC 6298's bound over them, `smoothed + max(4 · deviation, G)` (§2.2 and §2.3, alpha 1/8
+/// and beta 1/4, `G` the granularity as measured so far: `hyper_timing::FlushTail`), each sample
+/// folded into the tail once judged; the first, before any tail, is in. It is the rule the disk
+/// mode's floor took first (`docs/timing.md` §2.8, "the mean of its flushes within their tail as
+/// each came"), applied to every measure of the default mode's floor. A sample far past the range,
+/// a stall's or an owner's hold of minutes, is in no mean once any sample came before it, where a
+/// plain mean kept its share, each sample after diluting it by one part; and it widens the tail
+/// past itself (a quarter of its distance from the smoothed time is the deviation's step, and the
+/// tail adds four deviations), so the samples in the usual range after it are within it. A device
+/// that turns slow widens the same tail, its flushes are within it from the second, and the mean
+/// follows them up and stays.
+fn usual(tail: &FlushTail, sample_ns: u64, granularity: Option<Duration>) -> bool {
+    tail.tail(granularity.unwrap_or(Duration::ZERO))
+        .is_none_or(|tail| Duration::from_nanos(sample_ns) <= tail)
+}
+
 impl Liveness {
     /// A node with no pairs.
     pub fn new(settings: Settings) -> Result<Self, Refusal> {
@@ -634,6 +660,8 @@ impl Liveness {
             max_peers: settings.max_peers,
             pairs: BTreeMap::new(),
             timer: Lateness::new(settings.resolution),
+            wait_tail: FlushTail::new(),
+            every_wait: Lateness::new(settings.resolution),
             asked: None,
             late_most: 0,
             flushes: Flushes::new(),
@@ -643,6 +671,7 @@ impl Liveness {
             pending: None,
             flush_asked: None,
             proofs: Flushes::new(),
+            proof_tail: FlushTail::new(),
             proof_from: None,
             widest_freshness: None,
             durable: Durable::default(),
@@ -859,12 +888,11 @@ impl Liveness {
         );
         // A full fold keeps its mean.
         let _ = self.flushes.on_flush(started_ns, durable_ns);
-        // Judged against the tail as it stood before it: a stall's flush is past it.
-        let took = Duration::from_nanos(durable_ns.saturating_sub(started_ns));
-        let tail = self
-            .flush_tail
-            .tail(self.granularity().unwrap_or(Duration::ZERO));
-        if tail.is_none_or(|tail| took <= tail) {
+        if usual(
+            &self.flush_tail,
+            durable_ns.saturating_sub(started_ns),
+            self.granularity(),
+        ) {
             let _ = self.steady.on_flush(started_ns, durable_ns);
         }
         self.flush_tail.on_flush(started_ns, durable_ns);
@@ -1056,14 +1084,10 @@ impl Liveness {
             self.late_most = self.late_most.max(now_ns.saturating_sub(at));
             self.asked = None;
         }
-        // A liveness write durable since the last poll: its proof took from its ask to now.
-        if let Some(asked) = self.proof_from.take() {
-            // A full fold keeps its mean.
-            let _ = self.proofs.on_flush(asked, now_ns);
-        }
+        let granularity = self.granularity();
+        self.take_proof(now_ns, granularity);
         self.expose(now_ns);
         let mut wants_flush = false;
-        let granularity = self.granularity();
         let floor = self.floor_at(granularity);
         self.own_disk_slow = self.judge_own_disk(now_ns, granularity);
         let sender = pair::Sender {
@@ -1134,6 +1158,18 @@ impl Liveness {
         };
     }
 
+    /// A liveness write durable since the last poll: its proof took from its ask to `now_ns`.
+    fn take_proof(&mut self, now_ns: u64, granularity: Option<Duration>) {
+        let Some(asked) = self.proof_from.take() else {
+            return;
+        };
+        if usual(&self.proof_tail, now_ns.saturating_sub(asked), granularity) {
+            // A full fold keeps its mean.
+            let _ = self.proofs.on_flush(asked, now_ns);
+        }
+        self.proof_tail.on_flush(asked, now_ns);
+    }
+
     /// The node time watched since the last poll: each pair's peer, for the time between polls.
     fn expose(&mut self, now_ns: u64) {
         if let Some(last) = self.last_poll_ns {
@@ -1168,13 +1204,19 @@ impl Liveness {
     }
 
     /// The sender's stability floor, `E[flush] + G`, `E[flush]` the larger of a log write's mean
-    /// flush and the stream's own proof's (`proofs`): `None` before a flush is measured. Judged
-    /// apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), its heartbeats wait on no
-    /// flush, and `E[flush]` is the mean of the flushes within their tail as each came: a stall's,
-    /// past it, measures nothing a heartbeat costs. With every flush in it, the one that ended a
-    /// 13 s stall of every disk raised the floors of a lightly loaded group from 2 to 262 to 308 ms
-    /// at once, its links' intervals with them past the freshness their peers held them to, and
-    /// each suspected the others (kiln's CP-T2.2, a node judged apart asking no probe, Focal's 5a).
+    /// flush and the stream's own proof's (`proofs`): `None` before a flush is measured. Each mean,
+    /// and `G`'s ([`granularity`](Self::granularity)), is of the samples in their usual range
+    /// (`usual`): a stall's flush, or a poll the owner was held in for minutes, past it, measures
+    /// nothing a heartbeat costs. With every flush in it, the one that ended a 13 s stall of every
+    /// disk raised the floors of a lightly loaded group judged apart from its disk from 2 to 262 to
+    /// 308 ms at once, its links' intervals with them past the freshness their peers held them to,
+    /// and each suspected the others (kiln's CP-T2.2, a node judged apart asking no probe, Focal's
+    /// 5a); and a node held 218 s in one poll after a restart, its proof, flush and wait each a
+    /// sample of the hold among a few, sent at a floor of about 157 s that each later sample, a
+    /// heartbeat apart, diluted by one part, its peers and it judging each other as slowly
+    /// (mantle's membership test on CI's 1-CPU Linux leg). Judged apart from its disk
+    /// ([`set_disk_apart`](Self::set_disk_apart)), its heartbeats wait on no flush, and the proof
+    /// is no part of it.
     pub fn floor(&self) -> Option<Duration> {
         self.floor_at(self.granularity())
     }
@@ -1182,7 +1224,7 @@ impl Liveness {
     /// The floor at the granularity `G` already read.
     fn floor_at(&self, granularity: Option<Duration>) -> Option<Duration> {
         let flush = if self.apart {
-            self.steady.mean().or_else(|| self.flushes.mean())
+            self.steady.mean()
         } else {
             // A heartbeat's proof is proven only by a durability that falls after the slot before
             // it, and the poll that would send it comes a whole proof after the ask: with the
@@ -1190,7 +1232,7 @@ impl Liveness {
             // flushes returned at once (tmpfs: 0.4 to 5 µs, its proofs tens of µs) asked a flush
             // at every poll and sent nothing (hyper-liveness tests/processes.rs on adacachy2,
             // 10,683 slots skipped to 3 heartbeats sent). Never below a log write's flush.
-            self.flushes.mean().max(self.proofs.mean())
+            self.steady.mean().max(self.proofs.mean())
         }?;
         Some(flush.saturating_add(granularity.unwrap_or(Duration::ZERO)))
     }
@@ -1242,18 +1284,32 @@ impl Liveness {
     /// owner woken past its wakes by messages before its timer fired counted nothing, and its
     /// stream refused every heartbeat as unmeasured (§2.9). A wait for a deadline other than the
     /// wake asked is not the stream's and measures nothing.
+    /// Of these waits, `G` takes those in their usual range (`usual`): a poll the owner was held
+    /// in for minutes, past it, is no lateness of its wakes to come.
     pub fn on_wait(&mut self, deadline_ns: u64, woke_ns: u64) {
         if self.next_wake == Some(deadline_ns) {
+            let late_ns = woke_ns.saturating_sub(deadline_ns);
             // A full fold keeps its mean: `G` stands as measured.
-            let _ = self.timer.on_wait(deadline_ns, woke_ns);
+            if usual(&self.wait_tail, late_ns, self.granularity()) {
+                let _ = self.timer.on_wait(deadline_ns, woke_ns);
+            }
+            self.wait_tail.on_sample(late_ns);
+            let _ = self.every_wait.on_wait(deadline_ns, woke_ns);
         }
     }
 
     /// `G`, the mean lateness of the owner's waits for the stream's wakes
-    /// ([`on_wait`](Self::on_wait)), once one is measured, and never below the clock's resolution
-    /// ([`Settings::resolution`]).
+    /// ([`on_wait`](Self::on_wait)) in their usual range (`usual`), once one is measured, and
+    /// never below the clock's resolution ([`Settings::resolution`]). Judged apart from its disk
+    /// ([`set_disk_apart`](Self::set_disk_apart)), the mean of every wait, as before the rule: that
+    /// mode's floor took it for its flushes alone, and its stalled-disk runs, which compare the
+    /// suspicions of a run with a stall and one without to the millisecond, were derived with it.
     pub fn granularity(&self) -> Option<Duration> {
-        self.timer.granularity()
+        if self.apart {
+            self.every_wait.granularity()
+        } else {
+            self.timer.granularity()
+        }
     }
 
     /// The latest the owner has polled past a wake asked, or is past one at `now_ns`.
@@ -1328,5 +1384,171 @@ impl Liveness {
     /// owner keeps to start its next run from (`hyper_timing::Exposure::of`).
     pub fn history(&self) -> Exposure {
         self.exposure
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The floor's measures in their usual range (`usual`): a hold after a sample is in none of
+    //! them, a slow device raises them and keeps them raised, and the floor is never below the
+    //! stream's own proof.
+
+    use super::*;
+
+    const US: u64 = 1_000;
+    const MS: u64 = 1_000_000;
+    /// The poll CI's 1-CPU Linux leg held a node in, after a restart.
+    const HOLD: u64 = 218_000 * MS;
+    /// Where the hold falls among the samples: second, third and tenth. The first sample, before
+    /// any tail, is in its mean whatever it is (`usual`).
+    const AT: [u64; 3] = [1, 2, 9];
+
+    #[derive(Default)]
+    struct Sink {
+        flush: bool,
+    }
+
+    impl Output for Sink {
+        fn heartbeat(&mut self, _: PeerId, _: &[u8]) {}
+        fn flush(&mut self) {
+            self.flush = true;
+        }
+        fn change(&mut self, _: Change) {}
+    }
+
+    fn node(peers: u64) -> Liveness {
+        let mut node = Liveness::new(Settings {
+            local: 1,
+            run: 1,
+            max_peers: 4,
+            history: Exposure::new(),
+            resolution: Duration::from_nanos(1),
+        })
+        .unwrap();
+        for peer in 2..2 + peers {
+            node.attach(peer).unwrap();
+        }
+        node
+    }
+
+    #[test]
+    fn a_held_flush_is_in_no_floor() {
+        for at in AT {
+            let mut node = node(0);
+            let mut now = 0;
+            for k in 0..20 {
+                let took = if k == at { HOLD } else { MS };
+                now += took;
+                node.on_durable(Write::Log, now - took, now);
+                // The hold is in no mean, at it and after: the floor never leaves the usual flush.
+                assert_eq!(
+                    node.floor(),
+                    Some(Duration::from_nanos(MS)),
+                    "at {at}, k {k}"
+                );
+            }
+            // The plain mean, the floor's before: the hold's share, diluted by a part a sample.
+            assert!(node.flush_mean().unwrap() > Duration::from_nanos(HOLD / 20));
+        }
+    }
+
+    #[test]
+    fn a_held_wait_is_in_no_g() {
+        let late = 50 * US;
+        for at in AT {
+            let mut node = node(1);
+            let mut sink = Sink::default();
+            node.on_durable(Write::Liveness, 0, 100 * US);
+            let mut now = 200 * US;
+            node.poll(now, &mut sink);
+            for k in 0..20 {
+                if std::mem::take(&mut sink.flush) {
+                    node.on_durable(Write::Liveness, now, now);
+                    node.poll(now, &mut sink);
+                }
+                let wake = node.wake().expect("a heartbeat is always due");
+                assert!(now < wake);
+                let woke = wake + if k == at { HOLD } else { late };
+                node.on_wait(wake, woke);
+                now = woke;
+                node.poll(now, &mut sink);
+                assert_eq!(
+                    node.granularity(),
+                    Some(Duration::from_nanos(late)),
+                    "at {at}, k {k}"
+                );
+            }
+        }
+    }
+
+    /// The stream's proofs take 50 µs from the ask to the poll that takes the durability, the
+    /// device answering in 1 µs (a tmpfs's shape, 65cdd84), one proof held: the floor is never
+    /// below the proof, and the held one is in no floor.
+    #[test]
+    fn the_floor_is_never_below_the_proof() {
+        let proof = 50 * US;
+        for at in AT {
+            let mut node = node(1);
+            let mut sink = Sink::default();
+            let mut now = 0;
+            node.poll(now, &mut sink);
+            let mut proofs = 0;
+            for _ in 0..1_000 {
+                if proofs == 20 {
+                    break;
+                }
+                if std::mem::take(&mut sink.flush) {
+                    let asked = now;
+                    node.on_durable(Write::Liveness, asked, asked + US);
+                    now = asked + if proofs == at { HOLD } else { proof };
+                    node.poll(now, &mut sink);
+                    // Never below the proof, nor raised by the held one.
+                    assert_eq!(
+                        node.floor(),
+                        Some(Duration::from_nanos(proof)),
+                        "at {at}, proof {proofs}"
+                    );
+                    proofs += 1;
+                } else {
+                    // Polled at its wake, no wait reported: `G` unmeasured, the floor the proof.
+                    now = node.wake().expect("a heartbeat is always due");
+                    node.poll(now, &mut sink);
+                }
+            }
+            assert_eq!(proofs, 20, "at {at}");
+        }
+    }
+
+    #[test]
+    fn a_slow_device_raises_the_floor_and_keeps_it() {
+        let mut node = node(0);
+        let mut now = 0;
+        let mut flush = |node: &mut Liveness, took: u64| {
+            now += took;
+            node.on_durable(Write::Log, now - took, now);
+            node.floor().unwrap()
+        };
+        for _ in 0..100 {
+            assert_eq!(flush(&mut node, MS), Duration::from_nanos(MS));
+        }
+        // The device turns slow, 50 ms a flush, and stays so: the first slow one is past the tail,
+        // which it widens to hold the rest.
+        let mut last = flush(&mut node, 50 * MS);
+        assert_eq!(last, Duration::from_nanos(MS));
+        for _ in 1..900 {
+            let floor = flush(&mut node, 50 * MS);
+            assert!(floor > last, "{floor:?} after {last:?}");
+            last = floor;
+        }
+        // In the mean: every fast flush, and the slow ones after the first.
+        assert_eq!(last, Duration::from_nanos((100 * MS + 899 * 50 * MS) / 999));
+        // A device slow from its start: its floor is its flush from the first.
+        let mut slow = self::node(0);
+        let mut now = 0;
+        for _ in 0..10 {
+            now += 50 * MS;
+            slow.on_durable(Write::Log, now - 50 * MS, now);
+            assert_eq!(slow.floor(), Some(Duration::from_nanos(50 * MS)));
+        }
     }
 }

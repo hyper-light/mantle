@@ -71,13 +71,20 @@ fn at_rest(seed: u64) -> alloc::Counts {
 /// and on every host: nothing at rest draws at random, and a node's QUIC endpoint and its liveness
 /// stream keep the simulation's clock. With the host's, read as the endpoint was made and for the
 /// clock's resolution, the count was the machine's: at fb74b59 96,375 on a Linux x86_64 host,
-/// 94,195 on a macOS aarch64 one and 65,102 in a Linux aarch64 VM on that.
+/// 94,195 on a macOS aarch64 one and 65,102 in a Linux aarch64 VM on that. 95,642 since hyper-raft
+/// a575a44, whose default-mode floor takes the log writes' flush, the stream's proof and `G` each
+/// as the mean of the samples within their tail as each came (RFC 6298's bound over the samples
+/// before it): a proof the cell answered late, its shard's clock past the ask by more than the
+/// proofs' tail, no longer raises the floor, and the ten seconds ask 4,042 liveness writes where
+/// they asked 4,011, 31 more heartbeats' proofs, and count 540 allocations more, reallocations 0
+/// both. The rule changes no allocation site: what moved is when the stream sends and asks its
+/// writes, and the work that schedule gives.
 #[test]
 fn a_cell_at_rest_turns_without_remaking_what_a_turn_keeps() {
     let counts = at_rest(1);
     assert_eq!(
         (counts.allocations, counts.reallocations),
-        (95_102, 0),
+        (95_642, 0),
         "{counts:?}"
     );
 }
@@ -136,13 +143,20 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// 6 or 12 at once on this Mac. The bytes are 1,008 more than with the thread's IDs, 336 for each
 /// of the three clients' endpoints made inside the count: hyper-quic's endpoint holds its IDs'
 /// generator, 2,632 bytes where it was 2,312, and its configuration's and its own hashed generators
-/// are 32 bytes where they were 24.
+/// are 32 bytes where they were 24. At mantle f768f91f, before hyper-raft a575a44, this Mac counted
+/// 33,931 (2,008 reallocations, 16,057,317 bytes) every run: the 34,389 no longer held there, a
+/// drift of the commits since b834a708 that a575a44 did not make. 33,493 since a575a44, whose
+/// default-mode floor takes its flush, its proof and `G` each within their tail as each came (the
+/// cell at rest's count): the clients' run asks 420 liveness writes where it asked 481, ends
+/// 1.0 ms later on the virtual clock (862.4 ms against 861.4 ms), and counts 438 allocations
+/// fewer, 2,050 reallocations and 15,797,631 bytes. On Linux 33,544, this Mac's and the 51 its
+/// sockets' batched headers add, derived and not yet counted there.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_440
+        33_544
     } else {
-        34_389
+        33_493
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

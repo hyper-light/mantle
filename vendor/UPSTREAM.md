@@ -87,10 +87,19 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `4c033bb` (hyper-raft branch `mantle-frame-flush`: `mantle-shard-port`'s `85bd35f`
-and twenty-eight commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`. The
-branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
-commit, `4c033bb`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.17, hyper-rt ORIGIN.md): a
+**Every crate at `a575a44` (hyper-raft branch `mantle-frame-flush`, equal to `mantle-shard-port`:
+`85bd35f` and twenty-nine commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`.
+The branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
+commit, `a575a44`, changes hyper-liveness alone (hyper-raft docs/timing.md §2.4 and §2.8, "The
+floor's measures in their usual range"): the default mode's sender floor `E[flush] + G` takes the
+log writes' flush, the stream's own proof and `G` each as the mean of the samples within their tail
+as each came, RFC 6298's bound over the samples before it, the rule the disk mode's floor already
+took for its flushes (judged apart, `G` stays the mean of every wait). On CI's 1-CPU Linux leg a
+node the membership test held 218 s in one poll after a restart put a sample of the hold into each
+plain mean among a few, and heartbeated about every 157 s for hours, its peers and it judging each
+other as slowly. A hold after any sample is now in no mean; a device that turns slow raises the
+floor from its second slow flush and keeps it raised; the floor is never below the stream's proof
+in its usual range. The one before it, `4c033bb`, changes hyper-rt alone (hyper-raft docs/runtime.md §3.17, hyper-rt ORIGIN.md): a
 thread `Runtime::start` starts, a shard's worker or the watchdog, says it runs through a cell of
 hyper-rt's process-wide table (`startup.rs`) in place of a `std::sync::mpsc::sync_channel`, which
 whichever end dropped last freed: a started thread dropped its end after its send had woken the

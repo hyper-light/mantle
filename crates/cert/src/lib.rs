@@ -5,7 +5,10 @@
 //! The certificates are RFC 5280 v3 in DER (ITU-T X.690), their keys and signatures Ed25519 (RFC
 //! 8410) from AWS-LC, which the node's TLS provider verifies. An authority is self-signed and may
 //! sign certificates and nothing else (`keyUsage` keyCertSign and cRLSign, `basicConstraints`
-//! cA, both critical: RFC 5280 §4.2.1.3, §4.2.1.9). A node's certificate names it by one DNS name
+//! cA, both critical: RFC 5280 §4.2.1.3, §4.2.1.9). The cell's issuer ([`issuer`],
+//! docs/design/membership.md §5.1), which the authority signs, is a CA of node certificates alone
+//! (pathLenConstraint 0, keyCertSign alone), so a node's path is the authority's certificate alone
+//! or the issuer's under it ([`node_issued`]). A node's certificate names it by one DNS name
 //! in its `subjectAltName`, which a dial verifies against the name the peer is known by
 //! (RFC 5280 §4.2.1.6, RFC 6125); it is no authority, signs only (`digitalSignature`), and may
 //! serve either end of a connection (`extKeyUsage` serverAuth and clientAuth, §4.2.1.12). A client
@@ -316,6 +319,42 @@ pub fn granted_node(
     )
 }
 
+/// The cell's issuer's certificate (docs/design/membership.md §5.1): issued by the authority
+/// holding `authority_key` and named `authority_name`, for the issuer whose public key is
+/// `public_key`, named `name`, which is not the authority's, so a certificate's issuer says which
+/// of the two signed it. A CA of node certificates alone: `basicConstraints` cA with
+/// pathLenConstraint 0, so no CA follows it in a path (RFC 5280 §4.2.1.9, research/98 [7]), and
+/// `keyUsage` keyCertSign alone, both critical. What it signs is [`granted_node`]'s profile, its
+/// key and name passed there as an authority's.
+pub fn issuer(
+    authority_key: &KeyPair,
+    authority_name: &str,
+    public_key: &[u8],
+    name: &str,
+    (validity, serial): (Validity, Serial),
+) -> Result<Vec<u8>, CertError> {
+    check_name(authority_name)?;
+    check_name(name)?;
+    if name == authority_name {
+        return Err(CertError::Name);
+    }
+    if public_key.len() != 32 {
+        return Err(CertError::Key);
+    }
+    issue(
+        Signer::Ed25519(authority_key),
+        authority_name,
+        &Subject {
+            name,
+            key: SubjectKey::Ed25519(public_key),
+            organization: None,
+            grant: None,
+        },
+        (validity, serial),
+        Role::Issuer,
+    )
+}
+
 /// What a node's certificate names ([`node`], [`granted_node`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeNames<'a> {
@@ -374,6 +413,12 @@ pub fn fingerprint(certificate: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest(&SHA256, certificate).as_ref());
     out
+}
+
+/// The public key `certificate` certifies, Ed25519's 32 octets (RFC 8410 §4): what the holder of
+/// a key compares its own to before taking the certificate as its identity.
+pub fn public_key(certificate: &[u8]) -> Result<&[u8], CertError> {
+    Ok(read(certificate)?.public_key)
 }
 
 /// A client's certificate: issued by the authority holding `authority_key` and named
@@ -694,6 +739,8 @@ impl Signer<'_> {
 /// What a certificate is for, which its extensions state.
 enum Role<'a> {
     Authority,
+    /// The cell's issuer: a CA of leaves alone, a signer of certificates alone.
+    Issuer,
     Node {
         dns_name: &'a str,
     },
@@ -860,10 +907,23 @@ fn extension(
 /// and counted as unused (X.690 §11.2.2).
 const DIGITAL_SIGNATURE: (u8, u8) = (7, 0x80);
 const KEY_CERT_SIGN_AND_CRL_SIGN: (u8, u8) = (1, 0x06);
+const KEY_CERT_SIGN: (u8, u8) = (2, 0x04);
 
 fn extensions(out: &mut Vec<u8>, role: &Role<'_>) -> Result<(), CertError> {
     match role {
         Role::Authority => authority_extensions(out),
+        // cA TRUE and pathLenConstraint 0, then keyCertSign alone (RFC 5280 §4.2.1.9, §4.2.1.3).
+        Role::Issuer => {
+            extension(out, oid::BASIC_CONSTRAINTS, true, |v| {
+                nested(v, der::SEQUENCE, |b| {
+                    tlv(b, der::BOOLEAN, &[0xff])?;
+                    der::unsigned(b, &[0])
+                })
+            })?;
+            extension(out, oid::KEY_USAGE, true, |v| {
+                der::bits(v, KEY_CERT_SIGN.0, &[KEY_CERT_SIGN.1])
+            })
+        }
         Role::Client => leaf_extensions(out, &[oid::CLIENT_AUTH]),
         Role::Node { dns_name } => {
             leaf_extensions(out, &[oid::SERVER_AUTH, oid::CLIENT_AUTH])?;
@@ -1063,6 +1123,60 @@ pub fn issued_by(certificate: &[u8], authority: &[u8], now: u64) -> Result<(), C
     Ok(())
 }
 
+/// Whether `issuer` is the cell's issuer under the authority whose certificate is `authority`,
+/// valid `now` seconds after the Unix epoch: of exactly [`issuer`]'s profile (cA, pathLenConstraint
+/// 0, keyCertSign alone), named apart from the authority, and issued by it ([`issued_by`]).
+pub fn issuer_issued(issuer: &[u8], authority: &[u8], now: u64) -> Result<(), CertError> {
+    let read = read(issuer)?;
+    let mut profile = Vec::new();
+    extensions(&mut profile, &Role::Issuer)?;
+    if read.extensions != profile.as_slice() {
+        return Err(CertError::Malformed);
+    }
+    // The authority is self-signed, its issuer its subject, which the issuer's is not.
+    if issuer_is(authority, issuer)? {
+        return Err(CertError::Name);
+    }
+    issued_by(issuer, authority, now)
+}
+
+/// Who signed a node's certificate: the cell's authority, or the cell's issuer under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuedBy {
+    Authority,
+    Issuer,
+}
+
+/// Whether `certificate` is a node's certificate that the authority whose certificate is
+/// `authority` issued, or that the cell's issuer whose certificate is `issuer` issued under it,
+/// each valid `now`: RFC 5280 §6.1.3 (a)'s checks along a path of at most two, the issuer of
+/// exactly its profile ([`issuer_issued`]) and the certificate of exactly a node's
+/// ([`node_names`]). A longer path, an issuer's or an authority's certificate as a node's, and a
+/// certificate the issuer signed of any other profile are refused.
+pub fn node_issued(
+    certificate: &[u8],
+    issuer: Option<&[u8]>,
+    authority: &[u8],
+    now: u64,
+) -> Result<IssuedBy, CertError> {
+    node_names(certificate)?;
+    if issuer_is(certificate, authority)? {
+        issued_by(certificate, authority, now)?;
+        return Ok(IssuedBy::Authority);
+    }
+    let issuer = issuer.ok_or(CertError::Issuer)?;
+    issuer_issued(issuer, authority, now)?;
+    issued_by(certificate, issuer, now)?;
+    Ok(IssuedBy::Issuer)
+}
+
+/// Whether `certificate` names `issuer`'s subject as its issuer (RFC 5280 §4.1.2.4), byte for byte
+/// as this profile encodes both: of a chain the TLS stack verified to the cell's authority, whether
+/// the authority signed it rather than the issuer under it. No signature is checked here.
+pub fn issuer_is(certificate: &[u8], issuer: &[u8]) -> Result<bool, CertError> {
+    Ok(read(certificate)?.issuer == read(issuer)?.subject)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,14 +1222,34 @@ mod tests {
     }
 
     fn as_server(authority: &[u8], node: &[u8], name: &str) -> Result<(), hyper_tls::Error> {
+        chained_server(authority, &[], node, name)
+    }
+
+    fn as_client(authority: &[u8], node: &[u8]) -> Result<(), hyper_tls::Error> {
+        chained_client(authority, &[], node)
+    }
+
+    /// The node's certificate `node` verified as a server's, presented with `between`, the
+    /// certificates its chain passes through to the authority (RFC 8446 §4.4.2's
+    /// certificate_list after the end-entity's).
+    fn chained_server(
+        authority: &[u8],
+        between: &[&[u8]],
+        node: &[u8],
+        name: &str,
+    ) -> Result<(), hyper_tls::Error> {
         let provider = hyper_tls::crypto::aws_lc_rs::default_provider();
         let verifier = WebPkiServerVerifier::builder_with_provider(roots(authority), &provider)
             .build()
             .unwrap();
+        let between: Vec<CertificateDer<'_>> = between
+            .iter()
+            .map(|c| CertificateDer::from(c.to_vec()))
+            .collect();
         verifier
             .verify_server_cert(
                 &CertificateDer::from(node.to_vec()),
-                &[],
+                &between,
                 &ServerName::try_from(name.to_string()).unwrap(),
                 &[],
                 UnixTime::now(),
@@ -1123,13 +1257,26 @@ mod tests {
             .map(|_| ())
     }
 
-    fn as_client(authority: &[u8], node: &[u8]) -> Result<(), hyper_tls::Error> {
+    /// As [`chained_server`], a client's.
+    fn chained_client(
+        authority: &[u8],
+        between: &[&[u8]],
+        node: &[u8],
+    ) -> Result<(), hyper_tls::Error> {
         let provider = hyper_tls::crypto::aws_lc_rs::default_provider();
         let verifier = WebPkiClientVerifier::builder_with_provider(roots(authority), &provider)
             .build()
             .unwrap();
+        let between: Vec<CertificateDer<'_>> = between
+            .iter()
+            .map(|c| CertificateDer::from(c.to_vec()))
+            .collect();
         verifier
-            .verify_client_cert(&CertificateDer::from(node.to_vec()), &[], UnixTime::now())
+            .verify_client_cert(
+                &CertificateDer::from(node.to_vec()),
+                &between,
+                UnixTime::now(),
+            )
             .map(|_| ())
     }
 
@@ -1748,5 +1895,219 @@ mod tests {
         assert!(full.iter().all(|l| l.len() == 64) && !last.is_empty() && last.len() <= 64);
         assert_eq!(BASE64.decode(body.concat()).unwrap(), ca);
         assert!(text.ends_with('\n') && text.len() == text.capacity());
+    }
+
+    const AUTHORITY: &str = "mantle cell authority";
+    const ISSUER: &str = "mantle cell authority issuer";
+
+    /// A cell's authority, its issuer and the issuer's key.
+    fn issuer_chain() -> (KeyPair, Vec<u8>, KeyPair, Vec<u8>) {
+        let authority_key = KeyPair::generate().unwrap();
+        let ca = authority(
+            &authority_key,
+            AUTHORITY,
+            day_around_now(),
+            Serial::draw().unwrap(),
+        )
+        .unwrap();
+        let issuer_key = KeyPair::generate().unwrap();
+        let issuer_cert = issuer(
+            &authority_key,
+            AUTHORITY,
+            issuer_key.public_key(),
+            ISSUER,
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        (authority_key, ca, issuer_key, issuer_cert)
+    }
+
+    fn granted_by(signer: &KeyPair, signer_name: &str, id: u64, grant: u64) -> Vec<u8> {
+        granted_node(
+            signer,
+            signer_name,
+            KeyPair::generate().unwrap().public_key(),
+            (&format!("node-{id}"), grant),
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// The issuer's certificate is a CA whose pathLenConstraint is zero and a signer of
+    /// certificates alone, both critical (RFC 5280 §4.2.1.9, §4.2.1.3), issued by the authority;
+    /// it is named apart from the authority, and its key is the one it was made for.
+    #[test]
+    fn an_issuers_certificate_is_a_ca_of_leaves_alone_under_the_authority() {
+        let (authority_key, ca, issuer_key, issuer_cert) = issuer_chain();
+        let read = read(&issuer_cert).unwrap();
+        assert_eq!(
+            read.extensions,
+            [
+                // basicConstraints, critical: cA TRUE, pathLenConstraint 0.
+                &[
+                    0x30, 0x12, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x08
+                ][..],
+                &[0x30, 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x00],
+                // keyUsage, critical: keyCertSign alone, bit 5, two bits unused.
+                &[
+                    0x30, 0x0e, 0x06, 0x03, 0x55, 0x1d, 0x0f, 0x01, 0x01, 0xff, 0x04, 0x04
+                ],
+                &[0x03, 0x02, 0x02, 0x04],
+            ]
+            .concat()
+        );
+        issuer_issued(&issuer_cert, &ca, now()).unwrap();
+        assert_eq!(public_key(&issuer_cert).unwrap(), issuer_key.public_key());
+        assert!(!issuer_is(&issuer_cert, &issuer_cert).unwrap());
+        assert!(issuer_is(&issuer_cert, &ca).unwrap());
+        // Named as the authority, it could not be told from it.
+        assert_eq!(
+            issuer(
+                &authority_key,
+                AUTHORITY,
+                issuer_key.public_key(),
+                AUTHORITY,
+                (day_around_now(), Serial::draw().unwrap()),
+            ),
+            Err(CertError::Name)
+        );
+        // The authority is no issuer, nor is an issuer another authority signed.
+        assert_eq!(issuer_issued(&ca, &ca, now()), Err(CertError::Malformed));
+        let (_, other_ca, _, other_issuer) = issuer_chain();
+        assert_eq!(
+            issuer_issued(&other_issuer, &ca, now()),
+            Err(CertError::Signature)
+        );
+        assert_eq!(
+            issuer_issued(&issuer_cert, &other_ca, now()),
+            Err(CertError::Signature)
+        );
+    }
+
+    /// A node's certificate the issuer signed verifies through the issuer to the authority at
+    /// both ends of a connection, as one the authority signed still does directly, and says which
+    /// signed it; the issuer's absent from the chain, it is refused.
+    #[test]
+    fn a_node_certificate_the_issuer_signed_verifies_through_it_and_the_authoritys_still_does() {
+        let (authority_key, ca, issuer_key, issuer_cert) = issuer_chain();
+        let issued = granted_by(&issuer_key, ISSUER, 7, 1);
+        chained_server(&ca, &[&issuer_cert], &issued, "node-7").unwrap();
+        chained_client(&ca, &[&issuer_cert], &issued).unwrap();
+        assert!(as_server(&ca, &issued, "node-7").is_err());
+        assert!(as_client(&ca, &issued).is_err());
+        assert_eq!(
+            node_issued(&issued, Some(&issuer_cert), &ca, now()),
+            Ok(IssuedBy::Issuer)
+        );
+        assert_eq!(
+            node_names(&issued).unwrap(),
+            NodeNames {
+                name: "node-7",
+                grant: Some(1)
+            }
+        );
+        assert_eq!(
+            node_issued(&issued, None, &ca, now()),
+            Err(CertError::Issuer)
+        );
+        assert!(!issuer_is(&issued, &ca).unwrap());
+        let granted = granted_by(&authority_key, AUTHORITY, 8, 1);
+        as_server(&ca, &granted, "node-8").unwrap();
+        chained_client(&ca, &[&issuer_cert], &granted).unwrap();
+        assert!(issuer_is(&granted, &ca).unwrap());
+        for issuer in [None, Some(issuer_cert.as_slice())] {
+            assert_eq!(
+                node_issued(&granted, issuer, &ca, now()),
+                Ok(IssuedBy::Authority)
+            );
+        }
+        // Another cell's issuer is no issuer of this cell's.
+        let (_, _, other_key, other_issuer) = issuer_chain();
+        let foreign = granted_by(&other_key, ISSUER, 9, 1);
+        assert!(chained_client(&ca, &[&other_issuer], &foreign).is_err());
+        assert_eq!(
+            node_issued(&foreign, Some(&other_issuer), &ca, now()),
+            Err(CertError::Signature)
+        );
+    }
+
+    /// The issuer is refused as a leaf, and a CA it signs, an issuer or the authority's like, is
+    /// refused both as a leaf and in a path: a chain of three below the authority, the issuer's
+    /// pathLenConstraint passed, verifies nowhere.
+    #[test]
+    fn the_issuer_is_no_leaf_and_signs_no_ca_and_a_chain_of_three_is_refused() {
+        let (_, ca, issuer_key, issuer_cert) = issuer_chain();
+        assert!(as_server(&ca, &issuer_cert, "node-7").is_err());
+        assert!(as_client(&ca, &issuer_cert).is_err());
+        assert_eq!(
+            node_issued(&issuer_cert, Some(&issuer_cert), &ca, now()),
+            Err(CertError::Malformed)
+        );
+        let deeper_key = KeyPair::generate().unwrap();
+        let deeper = issuer(
+            &issuer_key,
+            ISSUER,
+            deeper_key.public_key(),
+            "mantle cell deeper issuer",
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        assert!(chained_client(&ca, &[&issuer_cert], &deeper).is_err());
+        let leaf = granted_by(&deeper_key, "mantle cell deeper issuer", 7, 1);
+        assert!(chained_server(&ca, &[&deeper, &issuer_cert], &leaf, "node-7").is_err());
+        assert!(chained_client(&ca, &[&deeper, &issuer_cert], &leaf).is_err());
+        assert_eq!(
+            node_issued(&leaf, Some(&deeper), &ca, now()),
+            Err(CertError::Issuer)
+        );
+        assert_eq!(
+            node_issued(&leaf, Some(&issuer_cert), &ca, now()),
+            Err(CertError::Issuer)
+        );
+    }
+
+    /// What the issuer signs is a node's or nothing: a client's certificate it signed verifies at
+    /// the TLS layer, as any leaf under a CA does, and is refused as a node's here, and its issuer
+    /// is not the authority, which the directory refuses as a client's.
+    #[test]
+    fn an_issuer_signed_certificate_of_another_profile_is_refused() {
+        let (_, ca, issuer_key, issuer_cert) = issuer_chain();
+        let client_cert = client(
+            &issuer_key,
+            ISSUER,
+            KeyPair::generate().unwrap().public_key(),
+            ("client-7", "123456789012"),
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        chained_client(&ca, &[&issuer_cert], &client_cert).unwrap();
+        assert_eq!(
+            node_issued(&client_cert, Some(&issuer_cert), &ca, now()),
+            Err(CertError::Malformed)
+        );
+        assert!(!issuer_is(&client_cert, &ca).unwrap());
+    }
+
+    /// A certificate's key reads back as the key it certifies, and from nothing but a certificate.
+    #[test]
+    fn a_certificates_public_key_reads_back() {
+        let (authority_key, ca, _, _) = issuer_chain();
+        assert_eq!(public_key(&ca).unwrap(), authority_key.public_key());
+        let key = KeyPair::generate().unwrap();
+        let cert = granted_node(
+            &authority_key,
+            AUTHORITY,
+            key.public_key(),
+            ("node-3", 2),
+            (day_around_now(), Serial::draw().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(public_key(&cert).unwrap(), key.public_key());
+        assert_ne!(
+            public_key(&cert).unwrap(),
+            KeyPair::generate().unwrap().public_key()
+        );
+        assert_eq!(public_key(&cert[1..]), Err(CertError::Malformed));
+        assert_eq!(public_key(b""), Err(CertError::Malformed));
     }
 }

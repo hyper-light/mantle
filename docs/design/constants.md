@@ -86,6 +86,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/cert/src/der.rs` `UTF8_STRING` | format | `0x0c` | Universal tag 12, UTF8String, which RFC 5280 §4.1.2.4 asks of new certificates' names. |
 | `crates/cert/src/lib.rs` `DIGITAL_SIGNATURE` | external | `(7, 0x80)` | The `keyUsage` bits (RFC 5280 §4.2.1.3) as a named-bit BIT STRING: trailing zero bits dropped and counted as unused (X.690 §11.2.2). (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
 | `crates/cert/src/lib.rs` `KEY_CERT_SIGN_AND_CRL_SIGN` | external | `(1, 0x06)` |  (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
+| `crates/cert/src/lib.rs` `KEY_CERT_SIGN` | external | `(2, 0x04)` | The cell's issuer's `keyUsage`, keyCertSign (bit 5) alone (RFC 5280 §4.2.1.3), two trailing zero bits unused (X.690 §11.2.2). (ITU-T/IETF object identifier or X.509 bits (unlisted: not a scalar)) |
 | `crates/cert/src/lib.rs` `KEY_ID_BYTES` | external | `20` | 20: a key identifier of 160 bits, the leftmost of the SHA-256 of the subjectPublicKey's bits (RFC 7093 §2, method 1). |
 | `crates/cert/src/lib.rs` `MAX_ENDPOINT_VALIDITY` | external | `71_280_000` | 825 days of 86,400 s, 71,280,000 s: Apple's platforms refuse a TLS server's certificate valid longer ("TLS server certificates must have a validity period of 825 days or fewer", support.apple.com/103769; research/84). |
 | `crates/cert/src/lib.rs` `PEM_LINE` | external | `64` | 64: the characters of each base64 line of a PEM document but the last (RFC 7468 §2). |

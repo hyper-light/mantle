@@ -1537,6 +1537,29 @@ fn exit(result: Result<(), String>) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// `mantle bench doors --range-shards` states the shards each server places its ranges over,
+    /// `first` where not given, and refuses another word (node.md §2.9).
+    #[test]
+    fn bench_doors_states_the_shards_its_servers_ranges_take() {
+        use clap::Parser;
+        use mantle_node::process::RangeShards;
+        let shards = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["mantle", "bench", "doors", "run"].iter().chain(args))
+                .map_err(|e| e.to_string())?;
+            let Command::Bench { command } = cli.command else {
+                return Err("not mantle bench".to_owned());
+            };
+            doors_options(command).map(|options| options.range_shards)
+        };
+        assert_eq!(shards(&[]), Ok(RangeShards::First));
+        assert_eq!(
+            shards(&["--range-shards", "spread"]),
+            Ok(RangeShards::Spread)
+        );
+        assert_eq!(shards(&["--range-shards", "first"]), Ok(RangeShards::First));
+        assert!(shards(&["--range-shards", "every"]).is_err());
+    }
+
     /// A machines file's founders come before the flags', and a cell's statement made in both is
     /// refused.
     #[test]

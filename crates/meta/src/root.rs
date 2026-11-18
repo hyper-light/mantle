@@ -162,12 +162,18 @@ pub struct Enlist {
 }
 
 /// A node joining under its grant, as it starts (membership.md §3): an enlistment, the grant its
-/// certificate carries and that certificate's SHA-256, and where its peers dial it.
+/// certificate carries and that certificate's SHA-256, whether the cell's issuer signed that
+/// certificate, and where its peers dial it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Join {
     pub node: u64,
     pub grant: u64,
     pub fingerprint: [u8; FINGERPRINT],
+    /// The cell's issuer signed its certificate, not the authority: its grant is the issuer's,
+    /// numbered by the root range at the re-grant that issued it, and judged by the ledger's
+    /// entry, never by the authority's window, so the two numberings never meet (membership.md
+    /// §5.1).
+    pub issued: bool,
     /// Its QUIC endpoint's and its plane's places, `HOST:PORT`, at most [`MAX_REACH`] bytes each.
     pub quic: String,
     pub plane: String,
@@ -190,13 +196,15 @@ pub enum Outcome {
     /// The table holds the node in another domain, or a volume on another node or of other
     /// bytes, or one gone, or the enlistment names a volume twice or a domain longer than
     /// [`MAX_DOMAIN`]; or a volume retired is not leaving; or a join names a member under another
-    /// grant or certificate, or a place past [`MAX_REACH`]: nothing changed.
+    /// grant or certificate, or a place past [`MAX_REACH`], or an issuer's joiner under another
+    /// grant or certificate than its re-grant: nothing changed.
     Conflict,
     /// The table would hold more nodes or volumes than the cell states: nothing changed.
     Full,
     /// The node's history holds at least what was stated.
     Kept,
-    /// The table holds no such node, whose history it would keep: nothing changed.
+    /// The table holds no such node, whose history it would keep, or the ledger no re-grant of an
+    /// issuer's joiner: nothing changed.
     Unknown,
     /// What became of a command on the principals.
     Principal(principal::Outcome),
@@ -218,7 +226,7 @@ pub enum Outcome {
     /// removed: nothing changed.
     Holding,
     /// The node is banned (membership.md §5.1): a ban taken, or a re-grant of a banned identity,
-    /// refused.
+    /// or the join of one re-granted before its ban, refused.
     Banned,
     /// A re-grant refused: the cell's setting is `rejoin off`.
     Off,
@@ -479,6 +487,8 @@ fn join<E: Rows>(engine: &mut E, j: &Join) -> Result<(Outcome, Vec<Write>), Meta
         return refused(Outcome::Conflict);
     }
     let held = membership(engine, j.node)?;
+    // The written-off member an issuer's joiner was re-granted for, whose entry its join drops.
+    let mut predecessor = None;
     if let Some(s) = &held {
         if s.grant != j.grant || s.fingerprint != j.fingerprint {
             return refused(Outcome::Conflict);
@@ -487,6 +497,11 @@ fn join<E: Rows>(engine: &mut E, j: &Join) -> Result<(Outcome, Vec<Write>), Meta
             State::Gone => return refused(Outcome::Gone),
             State::Removed => return refused(Outcome::Removed),
             State::Serving | State::Leaving => {}
+        }
+    } else if j.issued {
+        match regranted_as(engine, j)? {
+            Ok(old) => predecessor = Some(old),
+            Err(refusal) => return refused(refusal),
         }
     } else {
         let window = grants(engine)?;
@@ -513,8 +528,20 @@ fn join<E: Rows>(engine: &mut E, j: &Join) -> Result<(Outcome, Vec<Write>), Meta
             ..s
         },
         None => {
-            let window = spend(&grants(engine)?, j.grant, j.max_nodes)?;
-            writes.push(Write::Put(key::grants(), window.encode()?));
+            match predecessor {
+                // The issuer's grant was spent at the re-grant that numbered it; the predecessor's
+                // entry goes with the join it was kept for.
+                Some(old) => {
+                    writes.push(Write::Delete(key::ledger(old)));
+                    let mut count = ledger_count(engine)?;
+                    count.held = count.held.checked_sub(1).ok_or(MetaError::Corrupt)?;
+                    writes.push(Write::Put(key::written_off(), count.encode()));
+                }
+                None => {
+                    let window = spend(&grants(engine)?, j.grant, j.max_nodes)?;
+                    writes.push(Write::Put(key::grants(), window.encode()?));
+                }
+            }
             Membership {
                 state: State::Serving,
                 grant: j.grant,
@@ -530,6 +557,31 @@ fn join<E: Rows>(engine: &mut E, j: &Join) -> Result<(Outcome, Vec<Write>), Meta
     };
     writes.push(Write::Put(key::standing(j.node), standing.encode()?));
     Ok((outcome, writes))
+}
+
+/// The written-off member `j`, a node the issuer signed and the table does not hold, was re-granted
+/// as: the ledger's entry re-granted to its id under its grant and certificate, read of at most the
+/// entries the ledger holds. Refused `Unknown` where no entry was re-granted to it (evicted, or
+/// never), `Banned` where a person banned the old machine since, and `Conflict` where the entry
+/// holds its id under another grant or certificate.
+fn regranted_as<E: Rows>(engine: &mut E, j: &Join) -> Result<Result<u64, Outcome>, MetaError> {
+    let held = usize::try_from(ledger_count(engine)?.held).map_err(|_| MetaError::Corrupt)?;
+    let entries = ledger(engine, held)?;
+    let Some((old, entry, regranted)) = entries.iter().find_map(|(old, e)| {
+        e.regranted
+            .as_ref()
+            .filter(|r| r.node == j.node)
+            .map(|r| (*old, e, r))
+    }) else {
+        return Ok(Err(Outcome::Unknown));
+    };
+    if entry.banned {
+        return Ok(Err(Outcome::Banned));
+    }
+    if regranted.grant != j.grant || regranted.fingerprint != j.fingerprint {
+        return Ok(Err(Outcome::Conflict));
+    }
+    Ok(Ok(old))
 }
 
 /// A member gone for good (membership.md §5): serving or leaving, it is gone from now on, and every
@@ -1593,6 +1645,7 @@ mod tests {
             node,
             grant,
             fingerprint,
+            issued: false,
             quic: format!("10.0.0.{node}:7000"),
             plane: format!("10.0.0.{node}:7001"),
             domain: format!("rack-{node}"),
@@ -2143,6 +2196,105 @@ mod tests {
             apply(&mut m, 12, &regranting(2, 11, 2, 8)).unwrap(),
             Outcome::Regranted
         );
+    }
+
+    /// The join of node `node`, which the issuer signed under its `grant`, its certificate's
+    /// fingerprint `fingerprint`, with a volume `10 * node`.
+    fn issued_join(node: u64, grant: u64, fingerprint: [u8; FINGERPRINT]) -> Command {
+        let mut command = joined_as(node, grant, fingerprint, &[(u128::from(node) * 10, 100)]);
+        if let Command::Join(j) = &mut command {
+            j.issued = true;
+        }
+        command
+    }
+
+    /// A node the issuer signed joins by its re-grant, which the ledger's entry holds, and not by
+    /// the authority's window, whose grants it never spends: the same number under the authority
+    /// is another grant. Its join drops its predecessor's entry, and it restarts as any member.
+    /// Refused: one the ledger holds no re-grant of, one under another grant or certificate than
+    /// its re-grant, and one whose old machine was banned since its re-grant.
+    #[test]
+    fn an_issuers_joiner_is_judged_by_its_regrant_and_its_join_drops_the_entry() {
+        let mut m = three();
+        written_off_and_removed(&mut m, 4, 2);
+        assert_eq!(
+            apply(&mut m, 7, &Command::Delist { node: 2 }).unwrap(),
+            Outcome::Delisted
+        );
+        let fingerprint = [7 ^ 0xff; FINGERPRINT];
+        assert_eq!(
+            apply(&mut m, 8, &issued_join(9, 1, fingerprint)).unwrap(),
+            Outcome::Unknown
+        );
+        assert_eq!(
+            apply(&mut m, 9, &regranting(2, 9, 1, 7)).unwrap(),
+            Outcome::Granted { node: 9, grant: 1 }
+        );
+        let outcomes = applied(
+            &mut m,
+            10,
+            &[
+                issued_join(9, 2, fingerprint),
+                issued_join(9, 1, [0; FINGERPRINT]),
+                // Under the authority's numbering, grant 1 is founder 1's, long spent.
+                joined_as(9, 1, fingerprint, &[(90, 100)]),
+            ],
+        );
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Conflict,
+                Outcome::Conflict,
+                Outcome::Stale { top: 3 }
+            ]
+        );
+        assert_eq!(ledger_count(&mut m).unwrap().held, 1);
+        assert_eq!(
+            apply(&mut m, 13, &issued_join(9, 1, fingerprint)).unwrap(),
+            Outcome::Joined
+        );
+        let joined = membership(&mut m, 9).unwrap().unwrap();
+        assert_eq!(
+            (joined.state, joined.grant, joined.fingerprint),
+            (State::Serving, 1, fingerprint)
+        );
+        assert_eq!(ledgered(&mut m, 2).unwrap(), None);
+        assert_eq!(
+            ledger_count(&mut m).unwrap(),
+            WrittenOff { added: 1, held: 0 }
+        );
+        assert_eq!(grants(&mut m).unwrap().top, 3);
+        assert_eq!(issuer_grants(&mut m).unwrap().top, 1);
+        assert_eq!(
+            apply(&mut m, 14, &issued_join(9, 1, fingerprint)).unwrap(),
+            Outcome::Joined
+        );
+        // Member 3 re-granted as 12, and its old machine banned before 12 joins.
+        written_off_and_removed(&mut m, 15, 3);
+        let outcomes = applied(
+            &mut m,
+            18,
+            &[
+                Command::Delist { node: 3 },
+                regranting(3, 12, 2, 8),
+                Command::Ban {
+                    node: 3,
+                    max_nodes: 3,
+                    at_ns: 0,
+                },
+                issued_join(12, 2, [8 ^ 0xff; FINGERPRINT]),
+            ],
+        );
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Delisted,
+                Outcome::Granted { node: 12, grant: 2 },
+                Outcome::Banned,
+                Outcome::Banned
+            ]
+        );
+        assert_eq!(membership(&mut m, 12).unwrap(), None);
     }
 
     /// A ban writes a member off and bans its entry, or bans a written-off one's; the setting

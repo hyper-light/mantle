@@ -127,6 +127,8 @@ pub enum RejoinError {
     Stated(PathBuf, &'static str, usize),
     #[error("{}: no next key beside it", .0.display())]
     Keyless(PathBuf),
+    #[error("{}: certifies another key than the next key beside it", .0.display())]
+    Mismatched(PathBuf),
     #[error("the rejoin stands at {0:?}, not where {1} is taken")]
     Order(Resume, &'static str),
     #[error("{0} acts did not finish the rejoin's wipe and switch")]
@@ -298,7 +300,7 @@ pub fn resume<E: From<RejoinError>>(
 /// Rewrites the configuration to name the next identity, the one place it changes (step 5): the
 /// node its certificate names, the certificate and its key, each line of them replaced and every
 /// other kept. Refused, the configuration untouched, unless the certificate names a node and the
-/// key reads, owner-only, as a node's.
+/// key reads, owner-only, as a node's, the one the certificate certifies.
 fn switch(configured: &Configured) -> Result<u64, RejoinError> {
     let file = &configured.file;
     let next = other(file, configured_fingerprint(configured)?)?;
@@ -308,13 +310,25 @@ fn switch(configured: &Configured) -> Result<u64, RejoinError> {
         .map_err(|e| RejoinError::Certificate(at.clone(), e))?;
     let id =
         mantle_protocol::node_id(names.name).ok_or_else(|| RejoinError::Unnamed(at.clone()))?;
-    let key = next.key(file);
-    let pkcs8 = secret::read(&key).map_err(|e| RejoinError::Secret(key.clone(), e))?;
-    KeyPair::from_pkcs8(&pkcs8).map_err(|e| RejoinError::Certificate(key.clone(), e))?;
+    certifies(&certificate, &at, &next.key(file))?;
     let text = std::fs::read_to_string(file).map_err(io("read", file))?;
     let rewritten = switched(&text, file, (id, next))?;
     files::write(file, rewritten.as_bytes())?;
     Ok(id)
+}
+
+/// Whether `certificate`, kept at `at`, certifies the key at `key`, read owner-only as a node's:
+/// a certificate for another key would be an identity whose handshakes no peer takes.
+fn certifies(certificate: &[u8], at: &Path, key: &Path) -> Result<(), RejoinError> {
+    let pkcs8 = secret::read(key).map_err(|e| RejoinError::Secret(key.to_path_buf(), e))?;
+    let pair =
+        KeyPair::from_pkcs8(&pkcs8).map_err(|e| RejoinError::Certificate(key.to_path_buf(), e))?;
+    let certified = mantle_cert::public_key(certificate)
+        .map_err(|e| RejoinError::Certificate(at.to_path_buf(), e))?;
+    if certified != pair.public_key() {
+        return Err(RejoinError::Mismatched(at.to_path_buf()));
+    }
+    Ok(())
 }
 
 /// `text`, a configuration's lines, naming node `id` and the identity at `place`: its `id`,
@@ -396,6 +410,7 @@ pub fn keep_certificate(configured: &Configured, certificate: &[u8]) -> Result<(
     if mantle_protocol::node_id(names.name).is_none() {
         return Err(RejoinError::Unnamed(at));
     }
+    certifies(certificate, &at, &key)?;
     files::write(&at, certificate)?;
     Ok(())
 }
@@ -410,9 +425,14 @@ pub(crate) mod tests {
 
     /// A node's certificate naming node `id`, and its key.
     pub(crate) fn certificate(id: u64) -> (Vec<u8>, KeyPair) {
-        let authority = KeyPair::generate().unwrap();
         let key = KeyPair::generate().unwrap();
-        let der = mantle_cert::node(
+        (certificate_for(id, &key), key)
+    }
+
+    /// A node's certificate naming node `id`, for `key`.
+    pub(crate) fn certificate_for(id: u64, key: &KeyPair) -> Vec<u8> {
+        let authority = KeyPair::generate().unwrap();
+        mantle_cert::node(
             &authority,
             "cell",
             key.public_key(),
@@ -425,8 +445,7 @@ pub(crate) mod tests {
                 Serial::from_octets([7; 16]),
             ),
         )
-        .unwrap();
-        (der, key)
+        .unwrap()
     }
 
     /// The files the wipe deletes in a directory [`laid_out`] made, from it.
@@ -508,9 +527,37 @@ pub(crate) mod tests {
             next_key(&configured(file)).unwrap().public_key(),
             key.public_key()
         );
-        let (der, _) = certificate(id);
+        let der = certificate_for(id, &key);
         keep_certificate(&configured(file), &der).unwrap();
         der
+    }
+
+    /// The cell's answer is kept only where it certifies the next key, and the switch takes no
+    /// certificate for another key than the one beside it, the configuration untouched.
+    #[test]
+    fn a_certificate_for_another_key_is_refused_as_the_answer_and_at_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = laid_out(dir.path(), 5);
+        next_key(&configured(&file)).unwrap();
+        let (der, _) = certificate(9);
+        assert!(matches!(
+            keep_certificate(&configured(&file), &der),
+            Err(RejoinError::Mismatched(_))
+        ));
+        assert!(!dir.path().join("identity/next.der").exists());
+        std::fs::write(dir.path().join("identity/next.der"), &der).unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+        for _ in MEMBERS {
+            assert!(matches!(
+                act(&configured(&file)).unwrap(),
+                Some(Done::Deleted(_))
+            ));
+        }
+        assert!(matches!(
+            act(&configured(&file)),
+            Err(RejoinError::Mismatched(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
     }
 
     /// Every file under `dir` with its bytes, by its path from `dir`.

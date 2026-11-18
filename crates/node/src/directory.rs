@@ -21,7 +21,9 @@
 //! root range holds any: refused once its member is gone, or removed and kept as a learner no
 //! more, or its grant is spent and the root range holds no member of its id. The pinned table
 //! still names the gateways and the founders `mantle init` pinned, in a cell made before grants
-//! or by them.
+//! or by them. A certificate the cell's issuer signed (membership.md §5.1), its issuer not the
+//! authority, is a node's alone, admitted only as the member the root range holds under its
+//! fingerprint ([`Peers::authority`]).
 
 use std::net::SocketAddr;
 
@@ -87,6 +89,10 @@ pub struct Peers {
     /// the authority before this node's root range holds any row of them (membership.md §3 step
     /// 2), as it then admits them by their rows.
     seeds: Vec<PeerId>,
+    /// The cell's authority's certificate, which tells a certificate it signed from one the cell's
+    /// issuer under it signed ([`Peers::authority`]); none in a directory not told it, which takes
+    /// every chain its handshake verified as the authority's.
+    authority: Option<Vec<u8>>,
 }
 
 impl Peers {
@@ -118,7 +124,25 @@ impl Peers {
             named: Vec::new(),
             joining: Vec::new(),
             seeds: Vec::new(),
+            authority: None,
         }
+    }
+
+    /// Takes `certificate` as the cell's authority's (membership.md §2 rule 4, §5.1): a node's
+    /// certificate whose issuer is not its subject, the cell's issuer's, is admitted only as the
+    /// member the root range holds under its fingerprint, never by a grant window or as a seed, and
+    /// no client's certificate the issuer signed is admitted.
+    pub fn authority(&mut self, certificate: Vec<u8>) {
+        self.authority = Some(certificate);
+    }
+
+    /// Whether `certificate`, whose chain the handshake verified to the authority, was signed by
+    /// the cell's issuer rather than the authority; unreadable, it is taken as the issuer's, which
+    /// admits least.
+    fn by_issuer(&self, certificate: &[u8]) -> bool {
+        self.authority.as_ref().is_some_and(|authority| {
+            !mantle_cert::issuer_is(certificate, authority).unwrap_or(false)
+        })
     }
 
     /// Names `id` as a seed of this node's grant: a node it dials, admitted by its name under the
@@ -335,6 +359,7 @@ impl Directory for Peers {
             }
             return Some((pinned.peer.id, pinned.peer.role));
         }
+        let by_issuer = self.by_issuer(certificate);
         // A node's certificate, known by its name under the authority (membership.md §2).
         if let Ok(names) = mantle_cert::node_names(certificate) {
             let id = mantle_protocol::node_id(names.name)?;
@@ -342,6 +367,14 @@ impl Directory for Peers {
                 return None;
             }
             let fingerprint = mantle_cert::fingerprint(certificate);
+            // The issuer's: a member's under the fingerprint the root range committed, rule 2, and
+            // nothing else; its grant is the issuer's, which the authority's window does not judge.
+            if by_issuer {
+                if !self.member_admitted(id, &fingerprint) {
+                    return None;
+                }
+                return Some((id, Role::Node));
+            }
             if !self.node_admitted(id, names.grant, &fingerprint) {
                 return None;
             }
@@ -357,7 +390,7 @@ impl Directory for Peers {
             }
             return Some((id, Role::Node));
         }
-        if authenticated.dialed.is_some() {
+        if authenticated.dialed.is_some() || by_issuer {
             return None;
         }
         let names = mantle_cert::client_names(certificate).ok()?;
@@ -476,6 +509,99 @@ mod tests {
             fingerprint: mantle_cert::fingerprint(certificate),
             admitted,
         }
+    }
+
+    fn validity() -> (Validity, Serial) {
+        (
+            Validity {
+                not_before: 0,
+                not_after: u64::from(u32::MAX),
+            },
+            Serial::from_octets([7; 16]),
+        )
+    }
+
+    /// A node's certificate the cell's issuer signed is a node's alone (membership.md §2 rule 4,
+    /// §5.1): admitted as the member the root range holds under its fingerprint, and never by the
+    /// authority's grant window, as a seed, or as a client's; the authority's own are judged as
+    /// before. A directory told no authority takes every chain as the authority's.
+    #[test]
+    fn an_issuer_signed_certificate_is_admitted_only_at_a_members_fingerprint() {
+        let authority_key = KeyPair::generate().unwrap();
+        let authority =
+            mantle_cert::authority(&authority_key, "cell", validity().0, validity().1).unwrap();
+        let issuer_key = KeyPair::generate().unwrap();
+        mantle_cert::issuer(
+            &authority_key,
+            "cell",
+            issuer_key.public_key(),
+            "cell issuer",
+            validity(),
+        )
+        .unwrap();
+        let issued = |id: u64, grant: u64| {
+            mantle_cert::granted_node(
+                &issuer_key,
+                "cell issuer",
+                KeyPair::generate().unwrap().public_key(),
+                (&mantle_protocol::node_name(id), grant),
+                validity(),
+            )
+            .unwrap()
+        };
+        let (seven, eight) = (issued(7, 1), issued(8, 2));
+        let granted_nine = granted(&authority_key, 9, 3);
+        let mut peers = Peers::new(Vec::new(), 2);
+        peers.authority(authority);
+        peers.seed(8);
+        assert!(
+            peers
+                .set_members(Vec::new(), Grants::default(), 3)
+                .is_empty()
+        );
+        // New by the authority's window, and a seed: neither admits the issuer's.
+        assert_eq!(peers.identify(&seen(&seven, None)), None);
+        assert_eq!(peers.identify(&seen(&eight, Some(8))), None);
+        assert_eq!(
+            peers.identify(&seen(&granted_nine, None)),
+            Some((9, Role::Node))
+        );
+        // Joined: the member under its fingerprint, and no other certificate of its id.
+        peers.set_members(vec![member(7, &seven, true)], Grants::default(), 3);
+        assert_eq!(peers.identify(&seen(&seven, None)), Some((7, Role::Node)));
+        assert_eq!(
+            peers.identify(&seen(&seven, Some(7))),
+            Some((7, Role::Node))
+        );
+        assert_eq!(peers.identify(&seen(&issued(7, 1), None)), None);
+        peers.set_members(vec![member(7, &seven, false)], Grants::default(), 3);
+        assert_eq!(peers.identify(&seen(&seven, None)), None);
+        // A client's the issuer signed is no client.
+        let issued_client = mantle_cert::client(
+            &issuer_key,
+            "cell issuer",
+            KeyPair::generate().unwrap().public_key(),
+            (&mantle_protocol::client_name(5), "123456789012"),
+            validity(),
+        )
+        .unwrap();
+        assert_eq!(peers.identify(&seen(&issued_client, None)), None);
+        let authority_client = mantle_cert::client(
+            &authority_key,
+            "cell",
+            KeyPair::generate().unwrap().public_key(),
+            (&mantle_protocol::client_name(5), "123456789012"),
+            validity(),
+        )
+        .unwrap();
+        assert_eq!(
+            peers.identify(&seen(&authority_client, None)),
+            Some((5, Role::Client))
+        );
+        // Told no authority, as before: every chain the authority's.
+        let mut untold = Peers::new(Vec::new(), 0);
+        untold.set_members(Vec::new(), Grants::default(), 3);
+        assert_eq!(untold.identify(&seen(&seven, None)), Some((7, Role::Node)));
     }
 
     /// membership.md §2's rules: a granted node's certificate is admitted while its grant is new

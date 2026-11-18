@@ -209,7 +209,8 @@ fn an_overlay_keeps_its_rows_by_move() {
 }
 
 /// The ledger's commands in an entry, its rows and its answers are each one buffer at its length
-/// (docs/design/membership.md §5.1): a re-grant's certificate is written in place.
+/// (docs/design/membership.md §5.1): a re-grant's certificate is written in place, and an
+/// issuer's joiner's join carries its flag in place.
 #[test]
 fn the_ledgers_commands_rows_and_answers_are_each_one_buffer() {
     let regranted = Regranted {
@@ -239,6 +240,19 @@ fn the_ledgers_commands_rows_and_answers_are_each_one_buffer() {
             key: regranted.key,
             certificate: regranted.certificate.clone(),
             max_nodes: 3,
+        }),
+        root::Command::Join(root::Join {
+            node: regranted.node,
+            grant: regranted.grant,
+            fingerprint: regranted.fingerprint,
+            issued: true,
+            quic: "10.0.0.9:7000".into(),
+            plane: "10.0.0.9:7001".into(),
+            domain: "rack-9".into(),
+            volumes: vec![(90, 100)],
+            max_nodes: 3,
+            max_volumes: 6,
+            at_ns: 1,
         }),
     ];
     let entry = Entry {

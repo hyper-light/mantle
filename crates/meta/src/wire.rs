@@ -629,6 +629,7 @@ fn put_command(w: &mut Writer, command: &Command) -> Result<(), RecordError> {
             }
             w.u32(j.max_nodes);
             w.u32(j.max_volumes);
+            w.u8(u8::from(j.issued));
         }
         Command::Root(root::Command::Gone {
             node, max_nodes, ..
@@ -955,16 +956,22 @@ fn take_command(r: &mut Reader<'_>, at_ns: u64) -> Option<Command> {
                 for _ in 0..count {
                     volumes.push((r.u128()?, r.u64()?));
                 }
+                let (max_nodes, max_volumes) = (r.u32()?, r.u32()?);
                 root::Command::Join(root::Join {
                     node,
                     grant,
                     fingerprint,
+                    issued: match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    },
                     quic,
                     plane,
                     domain,
                     volumes,
-                    max_nodes: r.u32()?,
-                    max_volumes: r.u32()?,
+                    max_nodes,
+                    max_volumes,
                     at_ns,
                 })
             }
@@ -3048,6 +3055,7 @@ mod tests {
                 node: 4,
                 grant: u64::MAX,
                 fingerprint: [7; crate::record::FINGERPRINT],
+                issued: true,
                 quic: "[2001:db8::1]:7000".into(),
                 plane: "laptop.example:7001".into(),
                 domain: "desk".into(),

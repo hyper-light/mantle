@@ -281,24 +281,64 @@ struct Identity {
     credentials: Credentials,
     peers: Vec<Peer>,
     keys: Vec<(u32, WrappingKey)>,
-    /// The grant the node's certificate names, if it was granted, and that certificate's
-    /// fingerprint: what its join states (docs/design/membership.md §2, §3).
+    /// The grant the node's certificate names, if it was granted, whether the cell's issuer signed
+    /// it, and that certificate's fingerprint: what its join states (docs/design/membership.md
+    /// §2, §3, §5.1).
     grant: Option<u64>,
+    issued: bool,
     fingerprint: [u8; mantle_meta::record::FINGERPRINT],
 }
 
+/// What a node's join states of its certificate: the grant it names where it was granted, whether
+/// the cell's issuer signed it, and its fingerprint (docs/design/membership.md §2, §3, §5.1).
+type Joins = (Option<u64>, bool, [u8; mantle_meta::record::FINGERPRINT]);
+
+/// The cell's issuer's certificate and key, owner-only, beside the authority's certificate
+/// (docs/design/membership.md §5.1): kept by every member, as the root key is, where the cell has
+/// an issuer.
+pub const ISSUER: (&str, &str) = ("issuer.der", "issuer.key");
+
+/// The cell's issuer beside the authority's certificate at `at`, `authority` its bytes, where the
+/// cell has one: its certificate, of the issuer's profile and issued by the authority, valid `now`
+/// (`mantle_cert::issuer_issued`), and its key, owner-only, the one that certificate certifies.
+fn issuer(at: &Path, authority: &[u8], now: u64) -> Result<Option<Vec<u8>>, ProcessError> {
+    let (certificate, key) = (at.with_file_name(ISSUER.0), at.with_file_name(ISSUER.1));
+    if !certificate
+        .try_exists()
+        .map_err(|e| ProcessError::Read(certificate.clone(), e.to_string()))?
+    {
+        return Ok(None);
+    }
+    let der = read_file(&certificate)?;
+    mantle_cert::issuer_issued(&der, authority, now)
+        .map_err(|e| ProcessError::Certificate(certificate.clone(), e))?;
+    let pair = mantle_cert::KeyPair::from_pkcs8(&read_secret(&key)?)
+        .map_err(|e| ProcessError::Certificate(key.clone(), e))?;
+    let certified = mantle_cert::public_key(&der)
+        .map_err(|e| ProcessError::Certificate(certificate.clone(), e))?;
+    if certified != pair.public_key() {
+        return Err(ProcessError::Read(
+            key,
+            "not the key the issuer's certificate beside it certifies".into(),
+        ));
+    }
+    Ok(Some(der))
+}
+
 /// Reads the identity the configuration names: the node's `certificate` and `key`, the cell's
-/// `authority`, each of `peers`' certificates and each of `keys`' generations. The node's
-/// certificate and each peer's are refused unless the authority issued them and they are valid by
-/// this machine's clock (`mantle_cert::issued_by`, RFC 5280 §6.1.3 (a)), so a directory holding
-/// another cell's identity, or a peer pinned from another cell, refuses the start rather than
-/// every handshake.
+/// `authority` and its issuer beside it ([`ISSUER`]), each of `peers`' certificates and each of
+/// `keys`' generations. Each peer's certificate is refused unless the authority issued it, and the
+/// node's own unless the authority or the cell's issuer under it did, each valid by this machine's
+/// clock (`mantle_cert::issued_by`, `mantle_cert::node_issued`, RFC 5280 §6.1.3 (a)), so a
+/// directory holding another cell's identity, or a peer pinned from another cell, refuses the
+/// start rather than every handshake. A certificate the issuer signed is presented with the
+/// issuer's, the chain its peers verify to the authority.
 fn identity(
-    (certificate, key, authority): (&Path, &Path, &Path),
+    (certificate, key, authority_at): (&Path, &Path, &Path),
     peers: &[PeerLine],
     keys: &[(u32, PathBuf)],
 ) -> Result<Identity, ProcessError> {
-    let authority = read_file(authority)?;
+    let authority = read_file(authority_at)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| ProcessError::Runtime(e.to_string()))?
@@ -309,12 +349,19 @@ fn identity(
             .map_err(|e| ProcessError::Certificate(path.to_path_buf(), e))?;
         Ok(der)
     };
-    let own = issued(certificate)?;
+    let issuer = issuer(authority_at, &authority, now)?;
+    let own = read_file(certificate)?;
+    let signed = mantle_cert::node_issued(&own, issuer.as_deref(), &authority, now)
+        .map_err(|e| ProcessError::Certificate(certificate.to_path_buf(), e))?;
     let grant = mantle_cert::node_names(&own)
         .map_err(|e| ProcessError::Certificate(certificate.to_path_buf(), e))?
         .grant;
     let fingerprint = mantle_cert::fingerprint(&own);
-    let chain = vec![CertificateDer::from(own)];
+    let mut chain = vec![CertificateDer::from(own)];
+    let issued_by_issuer = signed == mantle_cert::IssuedBy::Issuer;
+    if issued_by_issuer && let Some(issuer) = issuer {
+        chain.push(CertificateDer::from(issuer));
+    }
     let mut known = Vec::with_capacity(peers.len());
     for peer in peers {
         known.push(Peer {
@@ -336,6 +383,7 @@ fn identity(
         peers: known,
         keys: root,
         grant,
+        issued: issued_by_issuer,
         fingerprint,
     })
 }
@@ -1756,6 +1804,7 @@ fn run_node(
         peers,
         keys,
         grant,
+        issued,
         fingerprint,
     } = identity;
     let gateway = config
@@ -1817,7 +1866,7 @@ fn run_node(
             config,
             storage,
             gateway,
-            (credentials, peers, (grant, fingerprint)),
+            (credentials, peers, (grant, issued, fingerprint)),
             (resolved, s3, others),
             (asked, at_once),
         )
@@ -2321,11 +2370,7 @@ async fn serve(
     config: ProcessConfig,
     storage: Storage,
     gateway: Option<GatewaySettings>,
-    (credentials, peers, (grant, fingerprint)): (
-        Credentials,
-        Vec<Peer>,
-        (Option<u64>, [u8; mantle_meta::record::FINGERPRINT]),
-    ),
+    (credentials, peers, (grant, issued, fingerprint)): (Credentials, Vec<Peer>, Joins),
     (resolved, s3, others): (Resolved, Option<S3Keys>, Vec<SlotHolder>),
     (asked, at_once): (Asked, SyncSender<Ended>),
 ) -> Result<(), ProcessError> {
@@ -2506,6 +2551,7 @@ async fn serve(
                     node: config.id,
                     grant,
                     fingerprint,
+                    issued,
                     quic: reached_at(config.reach.as_deref(), quic).map_err(step(Step::Network))?,
                     plane: reached_at(config.reach.as_deref(), plane)
                         .map_err(step(Step::Network))?,
@@ -4891,6 +4937,100 @@ mod tests {
         assert!(!retirement.judge(removed, 1, all.into_iter(), (2_000, PATIENCE)));
     }
 
+    /// A start takes its own certificate from the cell's authority, presented alone, or from the
+    /// cell's issuer under it, presented with the issuer's and its join saying so (membership.md
+    /// §5.1); and refuses one the issuer signed with no issuer beside the authority, an issuer key
+    /// its certificate does not certify, and a certificate signed by a CA under the issuer.
+    #[test]
+    fn a_start_takes_its_certificate_from_the_authority_or_its_issuer_and_no_deeper() {
+        use mantle_cert::{CertError, KeyPair, Serial, Validity};
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name);
+        let stated = (
+            Validity {
+                not_before: 0,
+                not_after: 253_402_300_799,
+            },
+            Serial::from_octets([7; 16]),
+        );
+        let authority_key = KeyPair::generate().unwrap();
+        let authority = mantle_cert::authority(&authority_key, "cell", stated.0, stated.1).unwrap();
+        crate::files::write(&at("authority.der"), &authority).unwrap();
+        let issuer_key = KeyPair::generate().unwrap();
+        let issuer = mantle_cert::issuer(
+            &authority_key,
+            "cell",
+            issuer_key.public_key(),
+            "cell issuer",
+            stated,
+        )
+        .unwrap();
+        let node_key = KeyPair::generate().unwrap();
+        crate::files::write_secret(&at("node.key"), node_key.pkcs8()).unwrap();
+        let signed_by = |signer: &KeyPair, name: &str| {
+            let der = mantle_cert::granted_node(
+                signer,
+                name,
+                node_key.public_key(),
+                ("node-7", 1),
+                stated,
+            )
+            .unwrap();
+            crate::files::write(&at("node.der"), &der).unwrap();
+            der
+        };
+        let start = || {
+            identity(
+                (&at("node.der"), &at("node.key"), &at("authority.der")),
+                &[],
+                &[],
+            )
+        };
+        let chain = |identity: &Identity| -> Vec<Vec<u8>> {
+            identity
+                .credentials
+                .chain
+                .iter()
+                .map(|c| c.to_vec())
+                .collect()
+        };
+        let granted = signed_by(&authority_key, "cell");
+        let started = start().unwrap();
+        assert_eq!(
+            (started.grant, started.issued, chain(&started)),
+            (Some(1), false, vec![granted])
+        );
+        let issued = signed_by(&issuer_key, "cell issuer");
+        assert!(matches!(
+            start(),
+            Err(ProcessError::Certificate(_, CertError::Issuer))
+        ));
+        crate::files::write(&at(ISSUER.0), &issuer).unwrap();
+        crate::files::write_secret(&at(ISSUER.1), issuer_key.pkcs8()).unwrap();
+        let started = start().unwrap();
+        assert_eq!(
+            (started.grant, started.issued, chain(&started)),
+            (Some(1), true, vec![issued, issuer.clone()])
+        );
+        crate::files::write_secret(&at(ISSUER.1), KeyPair::generate().unwrap().pkcs8()).unwrap();
+        assert!(matches!(start(), Err(ProcessError::Read(..))));
+        crate::files::write_secret(&at(ISSUER.1), issuer_key.pkcs8()).unwrap();
+        let deeper_key = KeyPair::generate().unwrap();
+        mantle_cert::issuer(
+            &issuer_key,
+            "cell issuer",
+            deeper_key.public_key(),
+            "cell deeper",
+            stated,
+        )
+        .unwrap();
+        signed_by(&deeper_key, "cell deeper");
+        assert!(matches!(
+            start(),
+            Err(ProcessError::Certificate(_, CertError::Issuer))
+        ));
+    }
+
     /// A start whose directory holds the rejoin marker and no next certificate is refused before
     /// anything is written in it: no run raised, so the node opens no log, dials no member and
     /// writes no liveness record (membership.md §5.1 step 2), the ask (step 3) not built yet. With
@@ -4914,8 +5054,8 @@ mod tests {
             other => panic!("not refused as retired: {other:?}"),
         }
         assert_eq!(before, listed());
-        crate::rejoin::next_key(&read(&file).unwrap()).unwrap();
-        let (der, _) = crate::rejoin::tests::certificate(9);
+        let key = crate::rejoin::next_key(&read(&file).unwrap()).unwrap();
+        let der = crate::rejoin::tests::certificate_for(9, &key);
         crate::rejoin::keep_certificate(&read(&file).unwrap(), &der).unwrap();
         match resume_rejoin(read(&file).unwrap(), read) {
             Err(ProcessError::Rejoined(9)) => {}

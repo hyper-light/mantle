@@ -1339,6 +1339,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .saturating_add(limits.admission.pending)
         };
         let mut directory = Peers::new(settings.peers.clone(), most_clients);
+        if let Some(authority) = settings.credentials.roots.first() {
+            directory.authority(authority.to_vec());
+        }
         for seed in &settings.seeds {
             directory.seed(*seed);
         }

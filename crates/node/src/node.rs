@@ -1112,6 +1112,13 @@ impl<E: Engine + 'static> Node<E> {
         let log = open_log(&settings.dir, settings.id, settings.log).map_err(at(Step::Storage))?;
         Self::open_on(settings, log).await
     }
+
+    /// The node's log's device, as the OS describes it, and how the log answers its frames and
+    /// why (hyper-log's `Log::laid`; docs/design/durability.md §7.5, §7.7 step 4): once confirmed,
+    /// and which fact of the device keeps it from answering at a frame's own flush.
+    pub fn laid(&self) -> hyper_log::Laid {
+        self.log.laid()
+    }
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
@@ -5067,5 +5074,47 @@ mod tests {
             assert!(!names_only_its_sender(&command, 8, true), "another node's");
             assert!(!names_only_its_sender(&command, 7, false), "a client's");
         }
+    }
+    /// The node's log reads its device's write cache where it reads its atomic write unit, and
+    /// says how it answers its frames from them (durability.md §7.5, §7.7 step 4): a log in
+    /// pieces on a device whose cache is volatile, or not stated, answers once confirmed for that;
+    /// on one the OS says writes through, once confirmed until the claim is measured. On this
+    /// Mac's SSD, which publishes no cache state: write-back, by fcntl(2)'s F_FULLFSYNC rule.
+    #[test]
+    fn the_nodes_log_says_how_it_answers_its_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LogConfig {
+            segment_bytes: 16 * 4096,
+            max_segments: 8,
+            max_groups: 2,
+            group_entries: 1 << 10,
+            group_bytes: 1 << 16,
+            group_cache: 1 << 12,
+            queue_submissions: 16,
+            waits: hyper_log::Waits::Measured,
+        };
+        let log = open_log(dir.path(), 1, config).unwrap();
+        let laid = log.laid();
+        assert!(
+            laid.pieces.is_some(),
+            "the node's log lays its records in pieces"
+        );
+        let file = std::fs::File::open(dir.path().join("log")).unwrap();
+        let device = hyper_block::write_cache::write_cache(&file, &dir.path().join("log")).unwrap();
+        assert_eq!(
+            laid.cache, device,
+            "the cache is the device's, as the OS gives it"
+        );
+        let answers = match device.cache() {
+            hyper_block::write_cache::WriteCache::WriteBack => hyper_log::Answers::WriteBack,
+            hyper_block::write_cache::WriteCache::WriteThrough
+            | hyper_block::write_cache::WriteCache::PowerProtected => {
+                hyper_log::Answers::Unmeasured
+            }
+        };
+        assert_eq!(laid.answers, answers);
+        log.close().unwrap();
+        let reopened = open_log(dir.path(), 1, config).unwrap();
+        assert_eq!(reopened.laid(), laid);
     }
 }

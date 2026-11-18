@@ -210,8 +210,10 @@ Status: design, 2026-11-17, the owner's decision 2 of research/71 ("Step 9, afte
 that day. Source: research/97 (AGL+18, cited by section and page). Built: the open's account of
 the frame past the last that reads (§7.7, step 1), the record in pieces (step 2), and the record's
 word on how its frame was answered, with the open's restore of a frame answered at its flush
-(step 3a) and the writer's setting of it (step 3c). Until step 4 lands, a frame is answered only
-once confirmed, as raft-log.md §6 describes.
+(step 3a) and the writer's setting of it (step 3c), the device's write cache (step 5), and step 4's
+first part: each log says how it answers and why, and its mark can refuse the binaries before
+answers at the flush. Until the rest of step 4 lands, a frame is answered only once confirmed, as
+raft-log.md §6 describes.
 
 A PUT's critical path holds seven flushes: the slowest replica's chunk, then the Block, File and
 Name commands, each a frame flushed and then confirmed by a second durable write (research/71,
@@ -355,6 +357,19 @@ answered. Two cases reach it:
   record (`RWF_ATOMIC`, research/02 §2.10) cannot tear one. On any other device the simulation's
   power cuts count the groups left waiting (§7.6), and the owner decides from that count whether
   frames there are answered at their flush or once confirmed. Until then they are confirmed.
+
+The OS's word on the cache is not enough on its own (CLAUDE.md §5). Linux's `write_cache` is the
+kernel's view: "Writing to this file can change the kernels view of the device, but it doesn't
+alter the device state", and an administrator who sets "write through" over a volatile cache
+"will also eliminate cache flushes issued by the kernel" (sysfs-block, research/02 §2.4), since
+for a queue without a volatile cache "the block layer completes empty REQ_PREFLUSH requests before
+entering the driver and strips off the REQ_PREFLUSH and REQ_FUA bits" (writeback_cache_control.rst,
+research/02 §2.9). So the measurement that would check the claim cannot be a write and flush timed
+against a write alone: on a queue marked write-through the flush never reaches the device, and costs
+nothing whether the device has no volatile cache or the attribute was set over one, agreeing with
+the attribute either way. Which measurement can check it is open (§7.7, step 4); until one is cited
+and built, a device the OS calls write-through or power-protected answers once confirmed, and says
+so (`Answers::Unmeasured`).
 
 The count, 2026-11-18 (`crates/node/tests/sim.rs`,
 `a_frame_torn_after_its_record_lands_is_marked_and_each_group_resolves_or_waits_reported`), over
@@ -518,7 +533,33 @@ answered; the node elected itself again and applied through every entry it answe
    Before any frame is answered at its flush, binaries of 2b, which read the bit's byte as padding
    and would cut such a frame as the torn tail, must refuse the log, as the mark made binaries
    before them refuse it (step 2b-ii). The device facts §7.5 names are step 5's write cache and
-   step 2b-i's atomic write unit.
+   step 2b-i's atomic write unit. 4a, built (hyper-raft `mantle-frame-flush` `abfca69`):
+   - The open and the create read the device's write cache (`BlockFile::write_cache`) where they
+     read its atomic write unit, and the log reports both with how it answers a frame's updates
+     and why (`Laid::cache`, `Laid::answers`; `Log::laid`, `Recovery::laid`; mantle's
+     `Node::laid`): `Whole`, records that cannot say a frame was answered at its flush;
+     `WriteBack`, a volatile cache or none stated, this Mac's internal SSD among them (`FullFsync`);
+     `Unmeasured`, a cache the OS states keeps a completed write, not yet checked by measuring
+     (§7.5). Every one answers once confirmed: a write is still its frame's flush and its
+     confirmation's.
+   - The mark of pieces says, in its sequence field's next bit, that the log may hold frames
+     answered at their flush (`format::Mark::at_flush`, `MARK_AT_FLUSH`). A binary from before
+     (hyper-raft `f3dae3b` and earlier) read that field only as 0 or 1: it reads such a mark as
+     none, then the area's start as a whole persist record of the other kind, and refuses the log
+     (`LogError::Foreign` unsealed, `Tampered` sealed), where it would cut such a frame, torn after
+     its record landed, as the torn tail. Such a mark always records its block. This binary reads
+     it, and every re-lay and every mark written again keeps it. Nothing sets it yet.
+
+   4b, not built: the writer answers a frame at its flush where its record says so (`AT_FLUSH`), its
+   log is in pieces, and either (a) the cache keeps a completed write, the claim measured, and the
+   record is written only once the frame's write completed, on a file whose completed write is the
+   device's (direct I/O, its slot already written so the file system logs nothing for it), or (b)
+   the device's atomic write unit holds the frame and its record written as one atomic write. Its
+   open sets the mark's bit, and flushes it, before the first such frame. Its tests: a simulated
+   device that keeps every completed write, beside hyper-block's `SimFile`, whose crash loses
+   unflushed writes; a frame answered at its flush there survives every crash point by §7.6's laws;
+   a write-back device, and a one- or two-voter group, never answer so. The measurement (a) needs is
+   open (§7.5): a write and flush timed against a write cannot check Linux's attribute.
 5. The device's write cache is read from the OS beside its atomic write unit, for step 4. Built
    (hyper-raft `mantle-frame-flush`): hyper-block `write_cache::write_cache` answers a
    `DeviceCache`, a `WriteCache` (`WriteThrough`, `PowerProtected`, `WriteBack`) with its `Source`

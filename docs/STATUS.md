@@ -1484,10 +1484,10 @@ targets. Each item is done when its test passes on every supported target.
     (gateway.md §5; node.md §2.5; metadata.md §2). Done when the linearizability checker accepts
     every history with every cache on and catches the four broken variants (node.md §9.1).
 16. **Integrity across the path**: per-segment plaintext CRCs and seals opened on another core,
-    the parity's random linear check, carried CRC tables to and from storage nodes, command CRCs
-    checked at apply, the engine's per-key-value protection, CRCs kept with cached rows, and
-    attribution per node and core (node.md §5.6; chunk-store.md §3.1; replica.md §2; engine.md
-    §3). Done when the flips and the faulty core of node.md §9.1 are caught at their boundaries
+    the parity's random linear check, carried CRC tables to and from storage nodes, the engine's
+    per-key-value protection, CRCs kept with cached rows, and attribution per node and core
+    (command CRCs are checked at apply and attributed to the gateway's node; its core remains)
+    (node.md §5.6; chunk-store.md §3.1; replica.md §2; engine.md §3). Done when the flips and the faulty core of node.md §9.1 are caught at their boundaries
     before acknowledgement or service, and the core is attributed; and CRC-64/NVME's Hamming
     distances at 64 KiB and 8 MiB are computed by a program that reproduces Koopman's CRC-32C and
     "Jones" figures (node.md §5.6).

@@ -1898,40 +1898,50 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Proposes an entry of commands to `group`, stamped with this node's wall clock as the
-    /// entry's time; only its leader takes it.
+    /// entry's time; only its leader takes it. The entry is encoded here, where it is built, each
+    /// command's CRC-32C computed over its bytes (docs/design/replica.md §2).
     pub fn propose(&mut self, group: u128, entry: &mut Entry) -> Result<(), NodeError> {
-        self.propose_asked(group, entry).map(|_| ())
+        entry.at_ns = self.wall.now_ns();
+        let data = entry.encode().map_err(mantle_range::ReplicaError::from)?;
+        self.propose_asked(group, data, entry.commands.len())
+            .map(|_| ())
     }
 
-    /// Proposes an entry as [`Node::propose`] does, under the ask it gives it: a far range that
-    /// refuses the entry names the ask (`shard::Out::Refused`), and its command's asker is
-    /// answered by it (`Node::refused_far`).
-    fn propose_asked(&mut self, group: u128, entry: &mut Entry) -> Result<u64, NodeError> {
+    /// Proposes the encoding `data` of an entry of `commands`, as [`Node::propose`] does, under
+    /// the ask it gives it: a far range that refuses the entry names the ask
+    /// (`shard::Out::Refused`), and its command's asker is answered by it (`Node::refused_far`).
+    /// Only the entry's time is set here (`mantle_meta::wire::stamp`): its commands' bytes, and
+    /// the CRC each carries from where it was built, go to every member as they came, never
+    /// encoded again over bytes that may already be wrong (replica.md §2; node.md §5.6).
+    fn propose_asked(
+        &mut self,
+        group: u128,
+        mut data: Vec<u8>,
+        commands: usize,
+    ) -> Result<u64, NodeError> {
         let Some(kept) = self.ranges.iter().find(|k| k.group == group) else {
             return Err(NodeError::Bounds(format!("no range {group:x} here")));
         };
         let (handle, max) = (kept.handle, kept.max_entry_bytes);
-        entry.at_ns = self.wall.now_ns();
+        mantle_meta::wire::stamp(&mut data, self.wall.now_ns())
+            .map_err(mantle_range::ReplicaError::from)?;
         let ask = self.next_ask;
         self.next_ask = ask.wrapping_add(1);
+        let commands = u64::try_from(commands).unwrap_or(u64::MAX);
         if let Some(far) = self.far.iter().find(|far| far.group == group) {
-            shard::propose(&self.shards, far, entry, max, ask)?;
+            shard::propose(&self.shards, far, data, max, ask)?;
             self.proposed_entries = self.proposed_entries.saturating_add(1);
-            self.proposed_commands = self
-                .proposed_commands
-                .saturating_add(u64::try_from(entry.commands.len()).unwrap_or(u64::MAX));
+            self.proposed_commands = self.proposed_commands.saturating_add(commands);
             return Ok(ask);
         }
         let shell = self
             .owner
             .get_mut(handle)
             .ok_or(NodeError::Bounds("a range's handle names nothing".into()))?;
-        mantle_range::propose_entry(shell, entry, max)?;
+        mantle_range::propose_encoded(shell, data, max)?;
         self.owner.schedule(handle);
         self.proposed_entries = self.proposed_entries.saturating_add(1);
-        self.proposed_commands = self
-            .proposed_commands
-            .saturating_add(u64::try_from(entry.commands.len()).unwrap_or(u64::MAX));
+        self.proposed_commands = self.proposed_commands.saturating_add(commands);
         Ok(ask)
     }
 
@@ -2168,6 +2178,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// counts as made.
     pub fn proposed(&self) -> (u64, u64) {
         (self.proposed_entries, self.proposed_commands)
+    }
+
+    /// The commands this node built that a range answered corrupt since it opened
+    /// (`Answer::Corrupt`): each one whose bytes no longer matched the CRC-32C this node computed
+    /// as it encoded them, every member finding the same mismatch, attributed to this node, their
+    /// gateway (docs/design/replica.md §2; node.md §5.6).
+    pub fn corrupt_commands(&self) -> u64 {
+        self.asking
+            .iter()
+            .map(|a| a.corrupt)
+            .fold(0, u64::saturating_add)
     }
 
     /// The lanes between this node's shards since it opened (node.md §2.9), every shard's summed:
@@ -3774,7 +3795,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         group: u128,
         body: &[u8],
     ) -> Result<(), NodeError> {
-        let Ok(mut entry) = Entry::decode(body) else {
+        let Ok(entry) = Entry::decode(body) else {
             return self.answer_status(exchange, command::Status::Malformed, 0);
         };
         let from_node = self.remotes.iter().any(|r| r.id == peer)
@@ -3786,7 +3807,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             return self.answer_status(exchange, command::Status::Forbidden, self.id);
         }
-        match self.propose_asked(group, &mut entry) {
+        // The gateway's encoding is proposed as it came, its commands' CRCs with it.
+        match self.propose_asked(group, body.to_vec(), entry.commands.len()) {
             Ok(ask) => {
                 self.commanded.push(Commanded {
                     origin: CommandOrigin::Exchange(exchange),
@@ -4513,7 +4535,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }) else {
             return Ok(());
         };
-        let proposed = self.propose_asked(group, &mut out.entry);
+        // The node's own entry is encoded here, where it was built, each command's CRC with it.
+        let proposed = out
+            .entry
+            .encode()
+            .map_err(|e| NodeError::Range(e.into()))
+            .and_then(|data| self.propose_asked(group, data, out.entry.commands.len()));
         let commands = out
             .entry
             .commands

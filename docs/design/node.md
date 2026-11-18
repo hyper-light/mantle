@@ -3264,7 +3264,7 @@ may already be wrong (research/31 §5.4–§5.5):
 | Storage node to gateway | the stored CRCs sent with the bytes and verified by the gateway |
 | Decode and open | the block's CRC-32C after decode; the segment's GCM tag at open |
 | Gateway to client | the AEAD; the S3 checksum headers when asked; on the native protocol a CRC-64/NVME per block (gateway.md §3) |
-| Range commands | a CRC computed where the command is built, at the gateway, and checked at apply on every replica (replica.md §2) |
+| Range commands | a CRC-32C per command, computed where the command is first encoded, at the gateway, carried by the leader in the gateway's bytes, and checked at apply on every replica: a mismatch is answered `Corrupt`, writes nothing, is sent again once and counted against the gateway's node (replica.md §2, as built) |
 | Engine | block checksums on read, per-key-value protection in memtables and write batches on (engine.md §3) |
 | Caches | every cached row keeps the CRC it was read with and every cached block its tag or CRC table, checked on each use (gateway.md §5) |
 

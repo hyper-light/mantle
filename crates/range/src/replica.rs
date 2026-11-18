@@ -283,7 +283,17 @@ pub fn propose_entry<L: LogStore, E: Engine>(
     entry: &wire::Entry,
     max_entry_bytes: u64,
 ) -> Result<(), ReplicaError> {
-    let data = entry.encode()?;
+    propose_encoded(shell, entry.encode()?, max_entry_bytes)
+}
+
+/// Proposes an entry's encoding `data` as it came, its time set (`wire::stamp`): its commands'
+/// bytes and the CRC each carries from where it was built go to every member as they are
+/// (docs/design/replica.md §2). Refused past the range's bound on an entry; only a leader takes it.
+pub fn propose_encoded<L: LogStore, E: Engine>(
+    shell: &mut Shell<L, E>,
+    data: Vec<u8>,
+    max_entry_bytes: u64,
+) -> Result<(), ReplicaError> {
     if u64::try_from(data.len()).map_or(true, |l| l > max_entry_bytes) {
         return Err(ReplicaError::EntryTooLarge {
             len: data.len(),

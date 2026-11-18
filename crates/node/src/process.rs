@@ -2581,6 +2581,10 @@ async fn serve(
                         )
                         .map_err(wrote)?;
                         lane_counts(&mut line, &node.lane_counts()).map_err(wrote)?;
+                        // The commands this node built that a range found corrupt, attributed to
+                        // it as their gateway (replica.md §2; node.md §5.6).
+                        write!(line, " corrupt_commands {}", node.corrupt_commands())
+                            .map_err(wrote)?;
                         // The table of the shard this task runs on, none where the runtime
                         // registers no table for it.
                         let slow = hyper_rt::registry::current_shard()

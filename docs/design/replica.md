@@ -138,6 +138,27 @@ gateway sends it again from the request it still holds; the failure is attribute
 gateway's node and core (node.md §5.6). The engine's per-key-value protection guards the rows
 after apply (engine.md §3).
 
+As built (2026-11-18): in an entry each command is its body's length, its body (session, serial,
+lowest serial unanswered, command) and the CRC-32C of the body, u32 each, computed as the entry is
+first encoded, where the command is built (`mantle_meta::wire::Sessioned`; `Node::propose` and the
+node's own `Node::propose_own` for the node's commands). The entry's time is outside every
+command's CRC: the leader sets it in the gateway's encoding in place (`wire::stamp`) and proposes
+the bytes as they came (`mantle_range::propose_encoded`, the far shard's `In::Propose` carrying
+the bytes), so no leader encodes a gateway's commands again. A body that does not match decodes as
+`Command::Corrupt`, the length framing it so a flip anywhere in it fences that command alone, and
+`apply_entry` answers it `Answer::Corrupt` before its session is read: nothing is written and its
+session is untouched, on every member alike. Its session and serial are as its bytes read them,
+so its answer reaches the command it was unless the flip was in them, which leaves that command
+to its deadline. The node that built it sends it again under its serial, as a command refused for
+room is, and a second mismatch is its caller's answer: two sendings at most, as a failed check is
+redone once (node.md §5.6). Each mismatch is counted against the node that built the command
+(`Node::corrupt_commands`, `corrupt_commands` in its `counts` line); macOS binds no worker to a
+core, so the count is the node's. A flip in a command's length leaves the entry undecodable, which
+fences the replica as before; the window for it is the leader's buffer between `stamp` and the
+log's frame CRC. Measured by `wire::tests::a_flipped_bit_in_any_commands_bytes_is_refused_corrupt_and_writes_nothing`
+(every bit of every kind's body and CRC), `apply::tests::a_corrupt_command_is_refused_alike_on_every_member_and_applies_once_sent_again`
+and `ask::tests::a_command_answered_corrupt_is_sent_again_once_under_its_serial`.
+
 **Members compare digests** (research/31 §5.8, D21). Replicas apply the same log
 deterministically, so a digest of a range's rows at an applied index is the same on every member
 whose state is right. Members compute it at an index the leader names, paced as the scrubber is,

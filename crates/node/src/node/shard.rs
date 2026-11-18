@@ -36,7 +36,6 @@ use mantle_meta::block;
 use mantle_meta::engine::Engine;
 use mantle_meta::record::{BlockHeader, ChunkPlace};
 use mantle_meta::root::{self, Fact};
-use mantle_meta::wire::Entry;
 use mantle_protocol::bounds;
 use mantle_protocol::classes::{self, NodeClasses};
 use mantle_range::membership::{Next, Replacement, Step, Toward};
@@ -61,10 +60,11 @@ pub(crate) enum In<E: Engine, S: LogStore> {
         sender: PeerId,
         message: Message,
     },
-    /// An entry proposed to a range, the most bytes the range takes in one, and its ask: one the
-    /// range refuses is answered at once by its ask ([`Out::Refused`]), as the node's own replica's
-    /// refusal is (node.md §2.9, step 4).
-    Propose(u128, Entry, u64, u64),
+    /// An entry's encoding proposed to a range, as it came, its commands' CRCs with it
+    /// (replica.md §2), the most bytes the range takes in one, and its ask: one the range refuses
+    /// is answered at once by its ask ([`Out::Refused`]), as the node's own replica's refusal is
+    /// (node.md §2.9, step 4).
+    Propose(u128, Vec<u8>, u64, u64),
     /// A change the node's liveness stream reported (hyper-durable's `Owner::believe`).
     Believe(Change),
     /// What the stream believes now of a peer a range came to share its group with
@@ -746,7 +746,7 @@ pub(crate) fn ask_read<E: Engine + 'static, S: LogStore>(
     }
 }
 
-/// Proposes `entry` to `far`'s range on its shard ([`In::Propose`]), at most `max` bytes, as ask
+/// Proposes the entry encoded as `data` to `far`'s range on its shard ([`In::Propose`]), at most `max` bytes, as ask
 /// `ask`, which the range's refusal names ([`Out::Refused`]). One whose lane has no room is refused
 /// `LaneFull`, as one its replica would refuse: a peer's command is answered `Refused` while the
 /// range leads here, which its asker asks again after its pause, and the node's own pauses
@@ -755,7 +755,7 @@ pub(crate) fn ask_read<E: Engine + 'static, S: LogStore>(
 pub(crate) fn propose<E: Engine + 'static, S: LogStore>(
     shards: &[Lanes<E, S>],
     far: &Far,
-    entry: &Entry,
+    data: Vec<u8>,
     max: u64,
     ask: u64,
 ) -> Result<(), NodeError> {
@@ -763,7 +763,7 @@ pub(crate) fn propose<E: Engine + 'static, S: LogStore>(
         .iter()
         .find(|lanes| lanes.shard() == far.shard)
         .ok_or(NodeError::ShardEnded(far.shard))?
-        .send(In::Propose(far.group, entry.clone(), max, ask))
+        .send(In::Propose(far.group, data, max, ask))
 }
 
 /// Asks `far`'s shard to hand its lead over ([`In::Transfer`]), past the voter `failed`: whether it
@@ -1207,13 +1207,13 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     self.owner.schedule(handle);
                 }
             }
-            In::Propose(group, entry, max, ask) => {
+            In::Propose(group, data, max, ask) => {
                 // A proposal the range refuses is answered by its ask at once, as the node's own
                 // replica's refusal is, so its asker asks again after its pause rather than at its
                 // patience's end (node.md §2.9, step 4).
                 let proposed = self.at(group).and_then(|handle| {
                     let replica = self.owner.get_mut(handle)?;
-                    let proposed = mantle_range::propose_entry(replica, &entry, max);
+                    let proposed = mantle_range::propose_encoded(replica, data, max);
                     self.owner.schedule(handle);
                     Some(proposed)
                 });
@@ -1725,7 +1725,7 @@ mod tests {
     use mantle_meta::engine::Model;
     use mantle_meta::name;
     use mantle_meta::record::{Version, Versioning};
-    use mantle_meta::wire::{Command, Sessioned};
+    use mantle_meta::wire::{Command, Entry, Sessioned};
     use mantle_range::{ConfState, Elections, GroupStore, Range};
 
     use super::*;
@@ -1962,7 +1962,12 @@ mod tests {
                 Out::Flushed(..) => {
                     flushed += 1;
                     lanes
-                        .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes, 0))
+                        .send(In::Propose(
+                            GROUP,
+                            put().encode().unwrap(),
+                            range.settings.max_entry_bytes,
+                            0,
+                        ))
                         .unwrap();
                 }
                 _ => {}
@@ -2036,7 +2041,12 @@ mod tests {
         let (mut lanes, moved, _) = leading(&rt, &log, &range);
         assert!(!moved.leading);
         lanes
-            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes, 0))
+            .send(In::Propose(
+                GROUP,
+                put().encode().unwrap(),
+                range.settings.max_entry_bytes,
+                0,
+            ))
             .unwrap();
         let Out::Applied(_, answer) = next(&mut lanes, "its entry applied", deadline(), |out| {
             !matches!(out, Out::Applied(..))
@@ -2127,7 +2137,12 @@ mod tests {
             commands: vec![(0, 1, None)],
         }];
         lanes
-            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes, 0))
+            .send(In::Propose(
+                GROUP,
+                put().encode().unwrap(),
+                range.settings.max_entry_bytes,
+                0,
+            ))
             .unwrap();
         let Out::Applied(group, applied) =
             next(&mut lanes, "its entry applied", deadline(), |out| {
@@ -2154,7 +2169,12 @@ mod tests {
         let log = log_in(dir.path(), &range);
         let (mut lanes, _, _) = leading(&rt, &log, &range);
         lanes
-            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes, 0))
+            .send(In::Propose(
+                GROUP,
+                put().encode().unwrap(),
+                range.settings.max_entry_bytes,
+                0,
+            ))
             .unwrap();
         let Out::Applied(_, answer) = next(&mut lanes, "its entry applied", deadline(), |out| {
             !matches!(out, Out::Applied(..))
@@ -2213,7 +2233,12 @@ mod tests {
             !matches!(out, Out::Applied(..))
         };
         leader
-            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes, 0))
+            .send(In::Propose(
+                GROUP,
+                put().encode().unwrap(),
+                range.settings.max_entry_bytes,
+                0,
+            ))
             .unwrap();
         let Out::Applied(_, answer) =
             next(&mut leader, "its entry applied", deadline(), &mut take_held)
@@ -2392,7 +2417,7 @@ mod tests {
             },
         ];
         let max = range.settings.max_entry_bytes;
-        propose(&shards, &far, &put(), max, 7).unwrap();
+        propose(&shards, &far, put().encode().unwrap(), max, 7).unwrap();
         let refused = |shards: &mut Vec<Lanes<Model, Stored>>| {
             let Out::Refused(group, ask, refusal) =
                 next(&mut shards[0], "the proposal refused", deadline(), |out| {
@@ -2407,7 +2432,7 @@ mod tests {
         let taken = refused_command(&mut commanded, GROUP, 7).unwrap();
         assert!(taken.origin == CommandOrigin::Own(3));
         assert_eq!(commanded.len(), 1, "the other command waits on");
-        propose(&shards, &far, &put(), 1, 8).unwrap();
+        propose(&shards, &far, put().encode().unwrap(), 1, 8).unwrap();
         assert_eq!(refused(&mut shards), (GROUP, 8, Refusal::TooLarge));
         assert!(refused_command(&mut commanded, GROUP + 1, 8).is_none());
         assert!(refused_command(&mut commanded, GROUP, 7).is_none());
@@ -2779,7 +2804,14 @@ mod tests {
         far.seen.leading = true;
 
         assert!(requested(Some(far.seen), GROUP, Arriving::Command) == Arriving::Command(GROUP));
-        propose(&shards, &far, &put(), range.settings.max_entry_bytes, 0).unwrap();
+        propose(
+            &shards,
+            &far,
+            put().encode().unwrap(),
+            range.settings.max_entry_bytes,
+            0,
+        )
+        .unwrap();
         let mut commanded = vec![Commanded {
             origin: CommandOrigin::Own(0),
             group: GROUP,
@@ -2831,7 +2863,7 @@ mod tests {
         far.seen.leading = true;
         let max = range.settings.max_entry_bytes;
         assert!(matches!(
-            propose(&shards, &far, &put(), max, 0),
+            propose(&shards, &far, put().encode().unwrap(), max, 0),
             Err(NodeError::LaneFull(1))
         ));
         // Counted by its kind, and no other.
@@ -2840,7 +2872,7 @@ mod tests {
         assert_eq!((full, held), (vec![("propose", 1)], 0));
         far.shard = 2;
         assert!(matches!(
-            propose(&shards, &far, &put(), max, 0),
+            propose(&shards, &far, put().encode().unwrap(), max, 0),
             Err(NodeError::ShardEnded(2))
         ));
     }
@@ -2915,7 +2947,12 @@ mod tests {
         let (mut lanes, _, _) = leading(&rt, &log, &range);
         lanes.send(In::Unreachable(2)).unwrap();
         lanes
-            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes, 0))
+            .send(In::Propose(
+                GROUP,
+                put().encode().unwrap(),
+                range.settings.max_entry_bytes,
+                0,
+            ))
             .unwrap();
         let Out::Applied(group, _) = next(&mut lanes, "its entry applied", deadline(), |out| {
             !matches!(out, Out::Applied(..))
@@ -3153,7 +3190,9 @@ mod tests {
                         // the next entry's append here, as the leader's next heartbeat would.
                         if shown.conf.voters == [1, 2] && !proposed {
                             let max = range.settings.max_entry_bytes;
-                            leader.send(In::Propose(GROUP, put(), max, 0)).unwrap();
+                            leader
+                                .send(In::Propose(GROUP, put().encode().unwrap(), max, 0))
+                                .unwrap();
                             proposed = true;
                         }
                         voters = shown.conf.voters;
@@ -3215,7 +3254,12 @@ mod tests {
         let name_log = log_in(name_dir.path(), &name);
         let (mut lanes, _, _) = leading(&rt, &name_log, &name);
         lanes
-            .send(In::Propose(GROUP, put(), name.settings.max_entry_bytes, 0))
+            .send(In::Propose(
+                GROUP,
+                put().encode().unwrap(),
+                name.settings.max_entry_bytes,
+                0,
+            ))
             .unwrap();
         let until = deadline();
         loop {
@@ -3375,7 +3419,12 @@ mod tests {
             }],
         };
         lanes
-            .send(In::Propose(GROUP, entry, range.settings.max_entry_bytes, 0))
+            .send(In::Propose(
+                GROUP,
+                entry.encode().unwrap(),
+                range.settings.max_entry_bytes,
+                0,
+            ))
             .unwrap();
         let until = deadline();
         while far.seen.applied <= facts.applied {

@@ -170,6 +170,15 @@ pub(crate) struct Asking {
     pub pauses: u32,
     /// The patience the members it asked last stated in a redirect, 0 for none.
     pub stated_patience_ns: u64,
+    /// The commands the range answered corrupt once (`Answer::Corrupt`) and that wait or are out
+    /// again: one answered so a second time is answered to its caller as such, so a command is
+    /// sent at most twice for its checksum, as a failed check is redone once and fails if the
+    /// second fails too (node.md §5.6; research/31 §5.7). At most the commands the range holds.
+    corrupted: Vec<CommandAsk>,
+    /// The commands of this node's the range answered corrupt since the node opened: each a
+    /// mismatch between a command's bytes and the CRC-32C this node computed as it built them,
+    /// attributed to this node, their gateway (replica.md §2; node.md §5.6).
+    pub corrupt: u64,
 }
 
 impl Asking {
@@ -186,7 +195,18 @@ impl Asking {
             backoff,
             pauses: 0,
             stated_patience_ns: 0,
+            corrupted: Vec::new(),
+            corrupt: 0,
         }
+    }
+
+    /// Whether the command asked as `ask` waits or is in an entry out.
+    fn holds(&self, ask: CommandAsk) -> bool {
+        let out = self.outs.iter().any(|o| match &o.carried {
+            Carried::Commands(commands) => commands.iter().any(|(a, _, _)| *a == ask),
+            Carried::Registration { .. } => false,
+        });
+        out || self.waiting.iter().any(|w| w.ask == ask)
     }
 
     /// The commands this range holds for the node: waiting and out.
@@ -425,6 +445,20 @@ impl Asking {
                         }
                         Answer::AnswersFull if current => Some(serial),
                         Answer::AnswersFull => None,
+                        // Its bytes did not match the CRC this node built them with, and nothing
+                        // of it was written (replica.md §2): it is sent again from what the node
+                        // holds, under its serial, since a copy of its entry still in flight may
+                        // apply it first; a second mismatch is its caller's answer.
+                        Answer::Corrupt => {
+                            self.corrupt = self.corrupt.saturating_add(1);
+                            if let Some(at) = self.corrupted.iter().position(|a| *a == ask) {
+                                self.corrupted.swap_remove(at);
+                                done.push((ask, CommandOutcome::Answered(Answer::Corrupt)));
+                                continue;
+                            }
+                            self.corrupted.push(ask);
+                            if current { Some(serial) } else { None }
+                        }
                         answer => {
                             done.push((ask, CommandOutcome::Answered(answer)));
                             continue;
@@ -441,6 +475,9 @@ impl Asking {
                 for wanted in again.into_iter().rev() {
                     self.waiting.push_front(wanted);
                 }
+                // A command answered or ended since its mismatch is no longer sent again.
+                let corrupted = std::mem::take(&mut self.corrupted);
+                self.corrupted = corrupted.into_iter().filter(|a| self.holds(*a)).collect();
                 // A session the range no longer holds ends every serial of it: the commands
                 // wait for the new session's.
                 if expired {
@@ -886,6 +923,43 @@ mod tests {
         assert_eq!(a.session, 0);
         assert!(a.waiting.iter().all(|w| w.serial.is_none()));
         assert_eq!(done.len(), 1);
+    }
+
+    /// A command a range answered corrupt (its bytes did not match the CRC this node built them
+    /// with, and nothing of it was written) is sent again from what the node holds, under its
+    /// serial; answered corrupt a second time, its caller is answered so: at most two sendings for
+    /// its checksum, each mismatch counted against this node (replica.md §2; node.md §5.6).
+    #[test]
+    fn a_command_answered_corrupt_is_sent_again_once_under_its_serial() {
+        let mut a = asking(&[wanted(1, 100), wanted(2, 100)]);
+        a.session = 5;
+        let mut done = Vec::new();
+        next_entry(&mut a, holding(2), (1, 1, 0), 0, &mut done);
+        let applied = Answer::Name(mantle_meta::name::Outcome::Put {
+            version: "v".into(),
+        });
+        answered(&mut a, vec![Answer::Corrupt, applied.clone()], &mut done);
+        assert_eq!(done, vec![(2, CommandOutcome::Answered(applied.clone()))]);
+        let serials: Vec<_> = a.waiting.iter().map(|w| (w.ask, w.serial)).collect();
+        assert_eq!(serials, vec![(1, Some(1))]);
+        assert_eq!(a.corrupt, 1);
+        // Sent again, the same command under the same serial, and corrupt again: answered so.
+        next_entry(&mut a, 1 << 20, (1, 1, 0), 0, &mut done);
+        let out = a.outs.front().cloned().unwrap();
+        assert_eq!(out.carried, Carried::Commands(vec![(1, 1, 100)]));
+        answered(&mut a, vec![Answer::Corrupt], &mut done);
+        assert_eq!(done[1], (1, CommandOutcome::Answered(Answer::Corrupt)));
+        assert!(a.waiting.is_empty() && a.outs.is_empty());
+        assert_eq!(a.corrupt, 2);
+        assert!(a.corrupted.is_empty());
+        // One answered corrupt once and applied when sent again leaves nothing behind.
+        a.waiting.push_back(wanted(3, 100));
+        next_entry(&mut a, 1 << 20, (1, 1, 0), 0, &mut done);
+        answered(&mut a, vec![Answer::Corrupt], &mut done);
+        next_entry(&mut a, 1 << 20, (1, 1, 0), 0, &mut done);
+        answered(&mut a, vec![applied.clone()], &mut done);
+        assert_eq!(done[2], (3, CommandOutcome::Answered(applied)));
+        assert!(a.corrupted.is_empty());
     }
 
     #[test]

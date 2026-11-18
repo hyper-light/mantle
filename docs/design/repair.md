@@ -38,7 +38,10 @@ seen, and a connection to it that ended with none since, which QUIC's idle timeo
 path (node.md §3.8 clock 1), is a node away. A node it has no link to, or none yet this run, it says
 nothing of. It never declares a node gone for the time it has been away: Carbonite shows a remote
 watcher cannot tell a transient failure from a permanent one (research/90 §2, [CAR06 §5]), and
-Dynamo makes departure an explicit act for the same reason ([DYN07 §4.8.1]).
+Dynamo makes departure an explicit act for the same reason ([DYN07 §4.8.1]). Membership's rule
+beside this record does, at the durability model's own time rather than a chosen one: the same
+leader asks a member `Gone` once its recorded absence passes `1/ρ` (membership.md §5;
+`members::gone_by`), after its chunks fell due (§2.3), as the merge settled (2026-11-16, §7).
 
 The root range keeps each node's presence (`record::Presence`): whether it is seen, since when in
 the range's time, and over its enlisted life the time seen and not seen, its absences and the
@@ -290,9 +293,6 @@ test. The leaving nodes' tests wait for their ends, which membership's leave now
 - **Capacity rebalancing.** Moves for disk space (GFS's "below-average free space") once a volume
   is at risk of refusing writes, judged by its cleaner's runway (chunk-store.md §8); today a joining
   machine fills only as new blocks choose it.
-- **A node joining that no founder's directory pins.** Admission by the authority's certificate is
-  node.md §11's open item, being built apart; the join here is a founder started late.
-- **Sizing a machine's volumes from the disk it can spare**, measured at its first start.
 - **Trimming kept places** past what masks the cell's churn, once space is short.
 - **Re-coding a block wider than the cell that remains.** A block as wide as the volumes left after
   a machine leaves for good cannot keep a chunk to a volume; re-coding it into a scheme the
@@ -303,3 +303,11 @@ test. The leaving nodes' tests wait for their ends, which membership's leave now
   time one; kept in the Block range, the measure would cost a leader change nothing.
 - **Repair's own priority against client work** beyond sharing the operation slots: the device
   dispatcher's background share (node.md §2.7).
+
+Two items this list held are built, by membership (2026-11-14, merged with repair on 2026-11-15):
+a node no founder's directory pins joins under a numbered grant from the cell's authority, admitted
+by the root range's rows (`mantle init grant`; membership.md §2, §3), where the join §7's tests
+make is still a founder started late; and a volume stated `volume = DIR spare KEEP` takes what its
+file system spares, less `KEEP` and what the node writes there besides, sized at its first start
+and kept as laid out from then (`derive::volume_sizes`; membership.md §3.1). A volume that grows
+and shrinks with its machine's free space after that is membership.md §12's.

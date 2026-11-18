@@ -96,24 +96,69 @@ fn point_at(dir: &Path, bound: &[(u64, SocketAddr)]) {
     std::fs::write(&path, kept).unwrap();
 }
 
-/// What `mantle --client DIR ARGS` said, its input `input` where given; refused unless it exited
-/// well.
-fn mantle(dir: &Path, args: &[&str], input: Option<&[u8]>) -> Vec<u8> {
-    let (status, out, err) = mantle_status(dir, args, input);
-    assert!(
-        status,
-        "mantle {args:?}: {}{}",
-        String::from_utf8_lossy(&out),
-        String::from_utf8_lossy(&err)
-    );
-    out
+/// How long past the cell's quiet period a command may go with nothing moved in the cell before the
+/// test gives it up, from the stock patience and the command's work: its client asks an operation
+/// at most `ATTEMPTS` times in a row with nothing taken, and each attempt dials its node, dials it
+/// again once its name is looked up again, and waits on its exchange, each of those three waits
+/// ending once the stock patience passes with nothing moving (`Client::period_ns`, research/77
+/// D2), then pauses at most `SLOWED_MOST` before the next (`Client::slowed_wait`). A command still
+/// running past that with the cell quiet waits on nothing a node will do.
+fn command_patience() -> Duration {
+    let waits_per_attempt = 3;
+    (mantle_protocol::bounds::STOCK_PATIENCE * waits_per_attempt + mantle_client::SLOWED_MOST)
+        * mantle_client::ATTEMPTS
 }
 
-fn mantle_status(dir: &Path, args: &[&str], input: Option<&[u8]>) -> (bool, Vec<u8>, Vec<u8>) {
-    let mut child = Command::new(NODE)
-        .arg("--client")
-        .arg(dir)
-        .args(args)
+/// What a command said, for a failure: its standard error whole, and the last line of its
+/// standard output, which may be an object's bytes.
+fn told(out: &[u8], err: &[u8]) -> String {
+    let out = String::from_utf8_lossy(out);
+    format!(
+        "its standard error {:?}, the last line of its standard output {:?}",
+        String::from_utf8_lossy(err),
+        out.lines().last().unwrap_or("")
+    )
+}
+
+/// Waits under the cell's watch, its quiet period longer by [`command_patience`], until `done`
+/// says what `child` did, waited for as `what`. Once the watch ends without it, the child is
+/// SIGKILLed and the test fails with the cell's account of its nodes, `what` and what `said`
+/// gives of the child's output.
+fn watching<T>(
+    cell: &mut Cell,
+    what: &str,
+    child: &mut Child,
+    mut done: impl FnMut(&mut Child) -> Option<T>,
+    said: impl FnOnce() -> String,
+) -> T {
+    let watched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cell.waiting_on(what, command_patience(), |_| done(child))
+    }));
+    match watched {
+        Ok(found) => found,
+        Err(quiet) => {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let why = quiet
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| quiet.downcast_ref::<&str>().copied())
+                .unwrap_or("the cell's watch ended");
+            panic!("{why}\n{what}: killed at the watch's end; {}", said())
+        }
+    }
+}
+
+/// `command` run to its end under the cell's watch ([`watching`]), `input` written to it where
+/// given and its output read as it comes, so neither pipe holds it: how it exited and what it said
+/// on standard output and standard error.
+fn watched(
+    cell: &mut Cell,
+    mut command: Command,
+    input: Option<&[u8]>,
+) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+    let what = format!("{command:?}");
+    let mut child = command
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -123,15 +168,73 @@ fn mantle_status(dir: &Path, args: &[&str], input: Option<&[u8]>) -> (bool, Vec<
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    if let Some(input) = input {
-        let mut stdin = child.stdin.take().unwrap();
-        // A command that ended before reading all of it closed the pipe: what it said tells why.
-        if let Err(e) = stdin.write_all(input) {
-            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
-        }
+    let writing = input.map(|input| {
+        let (mut stdin, input) = (child.stdin.take().unwrap(), input.to_vec());
+        std::thread::spawn(move || {
+            // A command that ended before reading all of it closed the pipe: what it said tells
+            // why.
+            if let Err(e) = stdin.write_all(&input) {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+            }
+        })
+    });
+    let read = |mut from: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut said = Vec::new();
+            from.read_to_end(&mut said).unwrap();
+            said
+        })
+    };
+    let mut out = Some(read(Box::new(child.stdout.take().unwrap())));
+    let mut err = Some(read(Box::new(child.stderr.take().unwrap())));
+    let joined = |out: &mut Option<JoinHandle<Vec<u8>>>, err: &mut Option<JoinHandle<Vec<u8>>>| {
+        (
+            out.take().unwrap().join().unwrap(),
+            err.take().unwrap().join().unwrap(),
+        )
+    };
+    let status = watching(
+        cell,
+        &what,
+        &mut child,
+        |child| child.try_wait().unwrap(),
+        || {
+            let (out, err) = joined(&mut out, &mut err);
+            told(&out, &err)
+        },
+    );
+    if let Some(writing) = writing {
+        writing.join().unwrap();
     }
-    let output = child.wait_with_output().unwrap();
-    (output.status.success(), output.stdout, output.stderr)
+    let (out, err) = joined(&mut out, &mut err);
+    (status, out, err)
+}
+
+/// What `mantle --client DIR ARGS` said, its input `input` where given; refused unless it exited
+/// well.
+fn mantle(cell: &mut Cell, dir: &Path, args: &[&str], input: Option<&[u8]>) -> Vec<u8> {
+    let (status, out, err) = mantle_status(cell, dir, args, input);
+    assert!(
+        status,
+        "mantle {args:?}: {}{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    out
+}
+
+/// `mantle --client DIR ARGS` run to its end under the cell's watch ([`watched`]): whether it
+/// exited well, and what it said on standard output and standard error.
+fn mantle_status(
+    cell: &mut Cell,
+    dir: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> (bool, Vec<u8>, Vec<u8>) {
+    let mut command = Command::new(NODE);
+    command.arg("--client").arg(dir).args(args);
+    let (status, out, err) = watched(cell, command, input);
+    (status.success(), out, err)
 }
 
 /// The account the cell's clients act for, as `mantle init` kept it beside the authority.
@@ -154,22 +257,21 @@ fn pins_nodes_alone(cell: &Cell) {
 }
 
 /// A client made by `mantle init client` in the cell's root.
-fn made_client(cell: &Cell, name: &str) -> PathBuf {
+fn made_client(cell: &mut Cell, name: &str) -> PathBuf {
     let dir = cell.out().parent().unwrap().join(name);
-    let made = Command::new(NODE)
-        .args(["init", "client"])
+    let mut init = Command::new(NODE);
+    init.args(["init", "client"])
         .arg(&dir)
         .arg("--cell")
-        .arg(cell.out())
-        .output()
-        .unwrap();
+        .arg(cell.out());
+    let (status, out, err) = watched(cell, init, None);
     assert!(
-        made.status.success(),
+        status.success(),
         "mantle init client: {}{}",
-        String::from_utf8_lossy(&made.stdout),
-        String::from_utf8_lossy(&made.stderr)
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
     );
-    let said = String::from_utf8(made.stdout).unwrap();
+    let said = String::from_utf8(out).unwrap();
     assert!(said.starts_with("client "), "{said}");
     point_at(&dir, &cell.bound_quic());
     dir
@@ -549,7 +651,7 @@ async fn through_the_library(mut client: Client, account: String) {
 fn a_client_looks_a_named_node_up_again_when_its_address_does_not_answer() {
     let mut cell = Cell::made_alone(three_founders);
     pins_nodes_alone(&cell);
-    let dir = made_client(&cell, "client");
+    let dir = made_client(&mut cell, "client");
     let bound = cell.bound_quic();
     let stale: Vec<(u64, SocketAddr)> = bound
         .iter()
@@ -623,7 +725,7 @@ fn a_client_looks_a_named_node_up_again_when_its_address_does_not_answer() {
 fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
     let mut cell = Cell::made_alone(three_founders);
     pins_nodes_alone(&cell);
-    let dir = made_client(&cell, "client");
+    let dir = made_client(&mut cell, "client");
     let bound = cell.bound_quic();
     let account = account(&cell);
 
@@ -648,8 +750,8 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
 
     // The command line, a process an operation.
     let said = |out: Vec<u8>| String::from_utf8(out).unwrap();
-    assert!(said(mantle(&dir, &["mb", "s3://cli"], None)).contains("made s3://cli"));
-    let buckets = said(mantle(&dir, &["ls"], None));
+    assert!(said(mantle(&mut cell, &dir, &["mb", "s3://cli"], None)).contains("made s3://cli"));
+    let buckets = said(mantle(&mut cell, &dir, &["ls"], None));
     assert!(
         buckets.contains(" cli") && buckets.contains(" native"),
         "{buckets}"
@@ -659,29 +761,50 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
     let object = bytes(4, (3 << 20) + 17);
     std::fs::write(&file, &object).unwrap();
     let file_text = file.display().to_string();
-    mantle(&dir, &["cp", &file_text, "s3://cli/from/file"], None);
+    mantle(
+        &mut cell,
+        &dir,
+        &["cp", &file_text, "s3://cli/from/file"],
+        None,
+    );
     let back = root.join("back.bin");
     let back_text = back.display().to_string();
-    mantle(&dir, &["cp", "s3://cli/from/file", &back_text], None);
+    mantle(
+        &mut cell,
+        &dir,
+        &["cp", "s3://cli/from/file", &back_text],
+        None,
+    );
     assert!(std::fs::read(&back).unwrap() == object);
     // Standard input past a part: put in parts of 8 MiB; and back on standard output.
     let streamed = bytes(5, (9 << 20) + 3);
-    mantle(&dir, &["cp", "-", "s3://cli/from/stdin"], Some(&streamed));
-    let out = mantle(&dir, &["cp", "s3://cli/from/stdin", "-"], None);
+    mantle(
+        &mut cell,
+        &dir,
+        &["cp", "-", "s3://cli/from/stdin"],
+        Some(&streamed),
+    );
+    let out = mantle(&mut cell, &dir, &["cp", "s3://cli/from/stdin", "-"], None);
     assert!(out == streamed, "standard output held other bytes");
-    let head = said(mantle(&dir, &["head", "s3://cli/from/stdin"], None));
+    let head = said(mantle(
+        &mut cell,
+        &dir,
+        &["head", "s3://cli/from/stdin"],
+        None,
+    ));
     assert!(head.contains(&format!("size {}", streamed.len())), "{head}");
     assert!(head.contains("checksum CRC64NVME "), "{head}");
-    let keys = said(mantle(&dir, &["ls", "s3://cli/from/"], None));
+    let keys = said(mantle(&mut cell, &dir, &["ls", "s3://cli/from/"], None));
     assert!(
         keys.contains(&format!("{} from/file", object.len()))
             && keys.contains(&format!("{} from/stdin", streamed.len())),
         "{keys}"
     );
-    assert!(said(mantle(&dir, &["ls", "s3://cli"], None)).contains("PRE from/"));
+    assert!(said(mantle(&mut cell, &dir, &["ls", "s3://cli"], None)).contains("PRE from/"));
 
     // The multipart steps: a part from a file and the last from standard input.
     let upload = said(mantle(
+        &mut cell,
         &dir,
         &["multipart", "create", "s3://cli/steps"],
         None,
@@ -691,6 +814,7 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
     let first_file = root.join("first.bin");
     std::fs::write(&first_file, &first).unwrap();
     let one = said(mantle(
+        &mut cell,
         &dir,
         &[
             "multipart",
@@ -704,6 +828,7 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
     ));
     let last = bytes(7, 4096);
     let two = said(mantle(
+        &mut cell,
         &dir,
         &[
             "multipart",
@@ -718,15 +843,22 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
         Some(&last),
     ));
     let parts = said(mantle(
+        &mut cell,
         &dir,
         &["multipart", "parts", "s3://cli/steps", upload],
         None,
     ));
     assert_eq!(parts.lines().count(), 2, "{parts}");
-    let uploads = said(mantle(&dir, &["multipart", "uploads", "s3://cli"], None));
+    let uploads = said(mantle(
+        &mut cell,
+        &dir,
+        &["multipart", "uploads", "s3://cli"],
+        None,
+    ));
     assert!(uploads.contains(upload), "{uploads}");
     let etag = |line: &str| line.split_whitespace().nth(1).unwrap().to_owned();
     let completed = said(mantle(
+        &mut cell,
         &dir,
         &[
             "multipart",
@@ -739,17 +871,19 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
         None,
     ));
     assert!(completed.contains("-2\""), "{completed}");
-    let out = mantle(&dir, &["cp", "s3://cli/steps", "-"], None);
+    let out = mantle(&mut cell, &dir, &["cp", "s3://cli/steps", "-"], None);
     assert!(
         out == [first, last].concat(),
         "the parts came back otherwise"
     );
     let aborted = said(mantle(
+        &mut cell,
         &dir,
         &["multipart", "create", "s3://cli/aborted"],
         None,
     ));
     mantle(
+        &mut cell,
         &dir,
         &["multipart", "abort", "s3://cli/aborted", aborted.trim()],
         None,
@@ -757,19 +891,19 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
 
     // Removed: an object gone, a bucket refused while it holds any, removed once empty.
     for key in ["from/file", "from/stdin"] {
-        mantle(&dir, &["rm", &format!("s3://cli/{key}")], None);
+        mantle(&mut cell, &dir, &["rm", &format!("s3://cli/{key}")], None);
     }
-    let (found, _, err) = mantle_status(&dir, &["head", "s3://cli/from/file"], None);
+    let (found, _, err) = mantle_status(&mut cell, &dir, &["head", "s3://cli/from/file"], None);
     assert!(!found && String::from_utf8_lossy(&err).contains("NoSuchKey"));
-    let (removed, _, err) = mantle_status(&dir, &["rb", "s3://cli"], None);
+    let (removed, _, err) = mantle_status(&mut cell, &dir, &["rb", "s3://cli"], None);
     assert!(
         !removed && String::from_utf8_lossy(&err).contains("BucketNotEmpty"),
         "{}",
         String::from_utf8_lossy(&err)
     );
-    mantle(&dir, &["rm", "s3://cli/steps"], None);
-    mantle(&dir, &["rb", "s3://cli"], None);
-    assert!(!said(mantle(&dir, &["ls"], None)).contains(" cli"));
+    mantle(&mut cell, &dir, &["rm", "s3://cli/steps"], None);
+    mantle(&mut cell, &dir, &["rb", "s3://cli"], None);
+    assert!(!said(mantle(&mut cell, &dir, &["ls"], None)).contains(" cli"));
 }
 
 /// A client whose certificate another authority issued is refused at its handshake, and so is
@@ -779,7 +913,7 @@ fn the_library_and_the_command_line_ask_s3s_operations_of_a_cell_of_three() {
 fn a_certificate_no_client_of_the_cells_holds_is_refused_at_its_handshake() {
     let mut cell = Cell::made_alone(three_founders);
     pins_nodes_alone(&cell);
-    let dir = made_client(&cell, "client");
+    let dir = made_client(&mut cell, "client");
     let bound = cell.bound_quic();
     let ours = settings(&dir, &bound);
     let now = SystemTime::now()
@@ -874,6 +1008,8 @@ fn a_certificate_no_client_of_the_cells_holds_is_refused_at_its_handshake() {
 /// A copy from standard input of `size` bytes into `s3://BUCKET/KEY`, a `mantle cp` process whose
 /// input the test writes and whose lines on standard error it reads as they come.
 struct Copying {
+    /// Its command line, as a failure names it.
+    what: String,
     child: std::process::Child,
     input: Option<std::process::ChildStdin>,
     lines: std::sync::mpsc::Receiver<String>,
@@ -885,11 +1021,14 @@ const RESUMED: &str = "resumed";
 
 impl Copying {
     fn start(dir: &Path, key: &str, size: usize) -> Self {
-        let mut child = Command::new(NODE)
+        let mut command = Command::new(NODE);
+        command
             .arg("--client")
             .arg(dir)
             .args(["cp", "-", &format!("s3://{RESUMED}/{key}")])
-            .args(["--size", &size.to_string()])
+            .args(["--size", &size.to_string()]);
+        let what = format!("{command:?}");
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -907,6 +1046,7 @@ impl Copying {
             }
         });
         Self {
+            what,
             child,
             input,
             lines,
@@ -914,12 +1054,40 @@ impl Copying {
         }
     }
 
-    /// Writes `bytes` to its input: returned once the copy read all but what the pipe holds. A
-    /// copy that ended before reading them closed the pipe: what it said, at its finish, tells why.
-    fn write(&mut self, bytes: &[u8]) {
-        if let Err(e) = self.input.as_mut().unwrap().write_all(bytes) {
-            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
-        }
+    /// Writes `bytes` to its input: returned once the copy read all but what the pipe holds,
+    /// waited for under the cell's watch ([`watching`]). A copy that ended before reading them
+    /// closed the pipe: what it said, at its finish, tells why.
+    fn write(&mut self, cell: &mut Cell, bytes: &[u8]) {
+        let (mut input, bytes) = (self.input.take().unwrap(), bytes.to_vec());
+        let writing = std::thread::spawn(move || {
+            if let Err(e) = input.write_all(&bytes) {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+            }
+            input
+        });
+        let what = format!("{}, its input written", self.what);
+        let Self {
+            child, lines, said, ..
+        } = self;
+        watching(
+            cell,
+            &what,
+            child,
+            |_| {
+                if writing.is_finished() {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            || {
+                while let Ok(line) = lines.try_recv() {
+                    said.push(line);
+                }
+                format!("its standard error {said:?}")
+            },
+        );
+        self.input = Some(writing.join().unwrap());
     }
 
     /// Takes its lines until one ends with `ending`, the cell's nodes heard meanwhile.
@@ -952,7 +1120,22 @@ impl Copying {
             std::io::Read::read_to_string(&mut out, &mut said).unwrap();
             said
         });
-        let status = cell.until(|_| self.child.try_wait().unwrap());
+        let what = format!("{}, its end", self.what);
+        let Self {
+            child, lines, said, ..
+        } = &mut self;
+        let status = watching(
+            cell,
+            &what,
+            child,
+            |child| child.try_wait().unwrap(),
+            || {
+                while let Ok(line) = lines.try_recv() {
+                    said.push(line);
+                }
+                format!("its standard error {said:?}")
+            },
+        );
         while let Ok(line) = self.lines.recv() {
             self.said.push(line);
         }
@@ -962,9 +1145,10 @@ impl Copying {
 
 /// The runs of the open upload of `key` as the cell holds them: their sizes, in order, by the
 /// command line's own listings.
-fn runs_held(dir: &Path, key: &str) -> Vec<u64> {
+fn runs_held(cell: &mut Cell, dir: &Path, key: &str) -> Vec<u64> {
     let said = |out: Vec<u8>| String::from_utf8(out).unwrap();
     let uploads = said(mantle(
+        cell,
         dir,
         &["multipart", "uploads", &format!("s3://{RESUMED}")],
         None,
@@ -977,6 +1161,7 @@ fn runs_held(dir: &Path, key: &str) -> Vec<u64> {
         .map(|words| words[1].to_owned())
         .unwrap_or_else(|| panic!("no open upload of {key}: {uploads}"));
     let parts = said(mantle(
+        cell,
         dir,
         &[
             "multipart",
@@ -1002,10 +1187,16 @@ fn committed(said: &[String]) -> Vec<u16> {
 }
 
 /// `key` holds `object`, read back whole, its ETag the MD5 of its bytes, as one PUT's is.
-fn holds(dir: &Path, key: &str, object: &[u8]) {
-    let got = mantle(dir, &["cp", &format!("s3://{RESUMED}/{key}"), "-"], None);
+fn holds(cell: &mut Cell, dir: &Path, key: &str, object: &[u8]) {
+    let got = mantle(
+        cell,
+        dir,
+        &["cp", &format!("s3://{RESUMED}/{key}"), "-"],
+        None,
+    );
     assert!(got == object, "{key} came back otherwise");
     let head = String::from_utf8(mantle(
+        cell,
         dir,
         &["head", &format!("s3://{RESUMED}/{key}")],
         None,
@@ -1023,6 +1214,7 @@ fn holds(dir: &Path, key: &str, object: &[u8]) {
 /// A copy resumed after a kill: it said it resumed at `offset` after `runs` runs, then committed
 /// every run after them and none before, and its object holds `object` and its MD5 as its ETag.
 fn resumed_whole(
+    cell: &mut Cell,
     dir: &Path,
     key: &str,
     (offset, runs, total): (u64, u16, u16),
@@ -1042,7 +1234,7 @@ fn resumed_whole(
         (runs + 1..=total).collect::<Vec<_>>(),
         "{said:?}"
     );
-    holds(dir, key, object);
+    holds(cell, dir, key, object);
 }
 
 /// A native upload streamed from standard input in runs the node cuts (gateway.md §2.1): a copy
@@ -1080,8 +1272,8 @@ fn a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once() {
     for group in groups {
         cell.converged(group);
     }
-    let dir = made_client(&cell, "client");
-    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    let dir = made_client(&mut cell, "client");
+    mantle(&mut cell, &dir, &["mb", &format!("s3://{RESUMED}")], None);
     let period = mantle_protocol::bounds::idle_timeout();
     let rate = u64::try_from(
         u128::from(mantle_gateway::layout::CHUNK) * 1_000_000_000 / (4 * period.as_nanos()),
@@ -1095,6 +1287,7 @@ fn a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once() {
     std::fs::write(&file, &object).unwrap();
     cell.pace(Some(Pace { rate, queue }));
     let (done, out, err) = mantle_status(
+        &mut cell,
         &dir,
         &[
             "cp",
@@ -1126,7 +1319,7 @@ fn a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once() {
             cell.standings
         );
     }
-    holds(&dir, "paced", &object);
+    holds(&mut cell, &dir, "paced", &object);
 }
 
 /// SIGKILLed once a run committed, and one SIGKILLed with a run half sent, each run again resumes
@@ -1136,8 +1329,8 @@ fn a_run_whose_copies_cross_slower_than_its_clients_period_is_sent_once() {
 #[test]
 fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_refused() {
     let mut cell = Cell::made_alone(three_founders);
-    let dir = made_client(&cell, "client");
-    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    let dir = made_client(&mut cell, "client");
+    mantle(&mut cell, &dir, &["mb", &format!("s3://{RESUMED}")], None);
     // With its length stated, a copy's runs are the least whole-block run.
     let run = least_run();
     let size = 4 * run + (1 << 20);
@@ -1148,6 +1341,7 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
     let object = bytes(10, 3 * run + 77);
     std::fs::write(&file, &object).unwrap();
     let (done, out, err) = mantle_status(
+        &mut cell,
         &dir,
         &[
             "cp",
@@ -1162,23 +1356,24 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
         .collect();
     assert!(done, "{}{said:?}", String::from_utf8_lossy(&out));
     assert_eq!(committed(&said), [1, 2, 3, 4], "{said:?}");
-    holds(&dir, "file", &object);
+    holds(&mut cell, &dir, "file", &object);
 
     // Killed once its second run committed, waiting on its input for the third.
     let object = bytes(11, size);
     let mut copying = Copying::start(&dir, "boundary", size);
-    copying.write(&object[..2 * run]);
+    copying.write(&mut cell, &object[..2 * run]);
     copying.until_said(
         &mut cell,
         &format!("run 2 committed, {} bytes durable", 2 * run),
     );
     copying.kill();
-    assert_eq!(runs_held(&dir, "boundary"), [run as u64; 2]);
+    assert_eq!(runs_held(&mut cell, &dir, "boundary"), [run as u64; 2]);
     let mut again = Copying::start(&dir, "boundary", size);
-    again.write(&object);
+    again.write(&mut cell, &object);
     let (done, out, said) = again.finish(&mut cell);
     assert!(done, "{out}{said:?}");
     resumed_whole(
+        &mut cell,
         &dir,
         "boundary",
         ((2 * run) as u64, 2, total),
@@ -1189,23 +1384,30 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
     // Killed with half its third run read and sent: the cell holds two runs, the half lost.
     let object = bytes(12, size);
     let mut copying = Copying::start(&dir, "mid", size);
-    copying.write(&object[..2 * run + run / 2]);
+    copying.write(&mut cell, &object[..2 * run + run / 2]);
     copying.until_said(
         &mut cell,
         &format!("run 2 committed, {} bytes durable", 2 * run),
     );
     copying.kill();
-    assert_eq!(runs_held(&dir, "mid"), [run as u64; 2]);
+    assert_eq!(runs_held(&mut cell, &dir, "mid"), [run as u64; 2]);
     let mut again = Copying::start(&dir, "mid", size);
-    again.write(&object);
+    again.write(&mut cell, &object);
     let (done, out, said) = again.finish(&mut cell);
     assert!(done, "{out}{said:?}");
-    resumed_whole(&dir, "mid", ((2 * run) as u64, 2, total), &said, &object);
+    resumed_whole(
+        &mut cell,
+        &dir,
+        "mid",
+        ((2 * run) as u64, 2, total),
+        &said,
+        &object,
+    );
 
     // Resumed from a source whose first run changed: its runs are not the object it now is.
     let object = bytes(13, size);
     let mut copying = Copying::start(&dir, "changed", size);
-    copying.write(&object[..2 * run]);
+    copying.write(&mut cell, &object[..2 * run]);
     copying.until_said(
         &mut cell,
         &format!("run 2 committed, {} bytes durable", 2 * run),
@@ -1214,17 +1416,23 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
     let mut changed = object.clone();
     changed[run / 2] ^= 0xff;
     let mut again = Copying::start(&dir, "changed", size);
-    again.write(&changed);
+    again.write(&mut cell, &changed);
     let (done, out, said) = again.finish(&mut cell);
     assert!(!done, "{out}{said:?}");
     assert!(said.iter().any(|l| l.contains("BadDigest")), "{said:?}");
-    let (found, _, err) = mantle_status(&dir, &["head", &format!("s3://{RESUMED}/changed")], None);
+    let (found, _, err) = mantle_status(
+        &mut cell,
+        &dir,
+        &["head", &format!("s3://{RESUMED}/changed")],
+        None,
+    );
     assert!(
         !found && String::from_utf8_lossy(&err).contains("NoSuchKey"),
         "{}",
         String::from_utf8_lossy(&err)
     );
     let uploads = String::from_utf8(mantle(
+        &mut cell,
         &dir,
         &["multipart", "uploads", &format!("s3://{RESUMED}")],
         None,
@@ -1243,14 +1451,14 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
 #[test]
 fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is_back() {
     let mut cell = Cell::made_alone(three_founders);
-    let dir = made_client(&cell, "client");
+    let dir = made_client(&mut cell, "client");
     let bound = cell.bound_quic();
-    mantle(&dir, &["mb", &format!("s3://{RESUMED}")], None);
+    mantle(&mut cell, &dir, &["mb", &format!("s3://{RESUMED}")], None);
     let run = least_run();
     let size = 4 * run + (1 << 20);
     let object = bytes(14, size);
     let mut copying = Copying::start(&dir, "node", size);
-    copying.write(&object[..2 * run + run / 2]);
+    copying.write(&mut cell, &object[..2 * run + run / 2]);
     copying.until_said(
         &mut cell,
         &format!("run 2 committed, {} bytes durable", 2 * run),
@@ -1260,7 +1468,7 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
     for id in killed {
         cell.kill(id);
     }
-    copying.write(&object[2 * run + run / 2..]);
+    copying.write(&mut cell, &object[2 * run + run / 2..]);
     let (done, out, said) = copying.finish(&mut cell);
     assert!(
         !done && said.iter().any(|l| l.ends_with("the upload: SlowDown")),
@@ -1283,12 +1491,19 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
     point_at(&dir, &cell.bound_quic());
     // The cell kept the upload's two runs through its lost quorum: read once it answers again, as
     // nothing could answer while two of its three nodes were gone.
-    assert_eq!(runs_held(&dir, "node"), [run as u64; 2]);
+    assert_eq!(runs_held(&mut cell, &dir, "node"), [run as u64; 2]);
     let mut again = Copying::start(&dir, "node", size);
-    again.write(&object);
+    again.write(&mut cell, &object);
     let (done, out, said) = again.finish(&mut cell);
     assert!(done, "{out}{said:?}");
-    resumed_whole(&dir, "node", ((2 * run) as u64, 2, 5), &said, &object);
+    resumed_whole(
+        &mut cell,
+        &dir,
+        "node",
+        ((2 * run) as u64, 2, 5),
+        &said,
+        &object,
+    );
 }
 
 /// research/89 through the library: metadata kept and returned; a version read by its ID, a
@@ -1679,7 +1894,7 @@ fn get_versionless(bucket: &str, key: &str) -> Op {
 fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_deletes() {
     let mut cell = Cell::made_alone(three_founders);
     pins_nodes_alone(&cell);
-    let dir = made_client(&cell, "client");
+    let dir = made_client(&mut cell, "client");
     let bound = cell.bound_quic();
     let settings = settings(&dir, &bound);
     let sockets = mantle_client::sockets(bound.len()).unwrap();
@@ -1717,14 +1932,26 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
     let file = root.join("blob89.bin");
     std::fs::write(&file, &object).unwrap();
     for door in ["native", "s3"] {
-        research_89_by_the_command_line(&dir, door, &file, &object);
+        research_89_by_the_command_line(&mut cell, &dir, door, &file, &object);
     }
-    let through =
-        |door: &str, args: &[&str]| said(mantle(&dir, &[&["--door", door], args].concat(), None));
+    let through = |cell: &mut Cell, door: &str, args: &[&str]| {
+        said(mantle(
+            cell,
+            &dir,
+            &[&["--door", door], args].concat(),
+            None,
+        ))
+    };
     for key in ["blob", "copy", "replaced", "parts"] {
         let heads: Vec<String> = ["native", "s3"]
             .iter()
-            .map(|door| through(door, &["head", &format!("s3://cli89-native/{key}")]))
+            .map(|door| {
+                through(
+                    &mut cell,
+                    door,
+                    &["head", &format!("s3://cli89-native/{key}")],
+                )
+            })
             .collect();
         assert_eq!(
             heads[0], heads[1],
@@ -1733,10 +1960,10 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
     }
     // Versions of the library's bucket: listed alike, one read and one removed by its ID through
     // the S3 door, and gone from the native door's listing.
-    let versions = through("native", &["ls", "--versions", "s3://kept/blob"]);
+    let versions = through(&mut cell, "native", &["ls", "--versions", "s3://kept/blob"]);
     assert_eq!(
         versions,
-        through("s3", &["ls", "--versions", "s3://kept/blob"])
+        through(&mut cell, "s3", &["ls", "--versions", "s3://kept/blob"])
     );
     let lines: Vec<&str> = versions.lines().collect();
     assert_eq!(
@@ -1754,6 +1981,7 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
         .to_owned();
     for door in ["native", "s3"] {
         let out = mantle(
+            &mut cell,
             &dir,
             &[
                 "--door",
@@ -1771,12 +1999,16 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
             "the first version by its ID through {door}"
         );
     }
-    let removed = through("s3", &["rm", "s3://kept/blob", "--version-id", &version]);
+    let removed = through(
+        &mut cell,
+        "s3",
+        &["rm", "s3://kept/blob", "--version-id", &version],
+    );
     assert_eq!(
         removed.trim(),
         format!("removed s3://kept/blob version {version}")
     );
-    let versions = through("native", &["ls", "--versions", "s3://kept/blob"]);
+    let versions = through(&mut cell, "native", &["ls", "--versions", "s3://kept/blob"]);
     assert!(!versions.contains(&version), "{versions}");
     // Several removed in one DeleteObjects through each door, a missing one among them, said
     // alike.
@@ -1785,6 +2017,7 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
         .map(|door| {
             let bucket = format!("s3://cli89-{door}");
             through(
+                &mut cell,
                 door,
                 &[
                     "rm",
@@ -1803,8 +2036,12 @@ fn the_library_and_the_command_line_keep_metadata_versions_copies_and_batch_dele
     assert_eq!(removals[0].lines().count(), 3, "{}", removals[0]);
     for door in ["native", "s3"] {
         for key in ["blob", "copy"] {
-            let (found, _, _) =
-                mantle_status(&dir, &["head", &format!("s3://cli89-{door}/{key}")], None);
+            let (found, _, _) = mantle_status(
+                &mut cell,
+                &dir,
+                &["head", &format!("s3://cli89-{door}/{key}")],
+                None,
+            );
             assert!(!found, "{door}'s {key} removed");
         }
     }
@@ -1817,26 +2054,40 @@ fn said(out: Vec<u8>) -> String {
 /// Research/89's object commands through `door` into the bucket `cli89-DOOR`: a file's copy with
 /// its content headers and user-defined metadata, headed; a copy within the cell that keeps them,
 /// and one that replaces them; a part copied by the cell from a range of an object.
-fn research_89_by_the_command_line(dir: &Path, door: &str, file: &Path, object: &[u8]) {
+fn research_89_by_the_command_line(
+    cell: &mut Cell,
+    dir: &Path,
+    door: &str,
+    file: &Path,
+    object: &[u8],
+) {
     let bucket = format!("s3://cli89-{door}");
     let at = |key: &str| format!("{bucket}/{key}");
-    let through = |args: &[&str]| said(mantle(dir, &[&["--door", door], args].concat(), None));
-    assert_eq!(through(&["mb", &bucket]).trim(), format!("made {bucket}"));
+    let through = |cell: &mut Cell, args: &[&str]| {
+        said(mantle(cell, dir, &[&["--door", door], args].concat(), None))
+    };
+    assert_eq!(
+        through(cell, &["mb", &bucket]).trim(),
+        format!("made {bucket}")
+    );
     let file_text = file.display().to_string();
-    through(&[
-        "cp",
-        &file_text,
-        &at("blob"),
-        "--content-type",
-        "application/vnd.oci.image.layer.v1.tar+zstd",
-        "--cache-control",
-        "immutable",
-        "--metadata",
-        "digest=sha256:cafe",
-        "--metadata",
-        "Kind=layer",
-    ]);
-    let head = through(&["head", &at("blob")]);
+    through(
+        cell,
+        &[
+            "cp",
+            &file_text,
+            &at("blob"),
+            "--content-type",
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "--cache-control",
+            "immutable",
+            "--metadata",
+            "digest=sha256:cafe",
+            "--metadata",
+            "Kind=layer",
+        ],
+    );
+    let head = through(cell, &["head", &at("blob")]);
     for line in [
         "cache-control immutable",
         "content-type application/vnd.oci.image.layer.v1.tar+zstd",
@@ -1846,52 +2097,61 @@ fn research_89_by_the_command_line(dir: &Path, door: &str, file: &Path, object: 
         assert!(head.lines().any(|l| l == line), "{door}: {line}: {head}");
     }
     // A copy within the cell keeps the source's metadata; under REPLACE it takes the command's.
-    let copied = through(&["cp", &at("blob"), &at("copy")]);
+    let copied = through(cell, &["cp", &at("blob"), &at("copy")]);
     assert!(
         copied.contains(&format!("-> {}", at("copy"))),
         "{door}: {copied}"
     );
-    let out = mantle(dir, &["--door", door, "cp", &at("copy"), "-"], None);
+    let out = mantle(cell, dir, &["--door", door, "cp", &at("copy"), "-"], None);
     assert!(out == object, "{door}: the copy's bytes");
-    let head = through(&["head", &at("copy")]);
+    let head = through(cell, &["head", &at("copy")]);
     assert!(
         head.lines().any(|l| l == "x-amz-meta-digest sha256:cafe"),
         "{door}: {head}"
     );
-    through(&[
-        "cp",
-        &at("blob"),
-        &at("replaced"),
-        "--content-type",
-        "text/plain",
-    ]);
-    let head = through(&["head", &at("replaced")]);
+    through(
+        cell,
+        &[
+            "cp",
+            &at("blob"),
+            &at("replaced"),
+            "--content-type",
+            "text/plain",
+        ],
+    );
+    let head = through(cell, &["head", &at("replaced")]);
     assert!(
         head.lines().any(|l| l == "content-type text/plain"),
         "{door}: {head}"
     );
     assert!(!head.contains("x-amz-meta-digest"), "{door}: {head}");
     // A part copy by the command line.
-    let upload = through(&["multipart", "create", &at("parts")]);
+    let upload = through(cell, &["multipart", "create", &at("parts")]);
     let upload = upload.trim();
-    let part = through(&[
-        "multipart",
-        "copy",
-        &at("parts"),
-        upload,
-        "1",
-        &at("blob"),
-        "--range",
-        "0-99",
-    ]);
+    let part = through(
+        cell,
+        &[
+            "multipart",
+            "copy",
+            &at("parts"),
+            upload,
+            "1",
+            &at("blob"),
+            "--range",
+            "0-99",
+        ],
+    );
     let tag = part.split_whitespace().nth(1).unwrap().to_owned();
-    through(&[
-        "multipart",
-        "complete",
-        &at("parts"),
-        upload,
-        &format!("1={tag}"),
-    ]);
-    let out = mantle(dir, &["--door", door, "cp", &at("parts"), "-"], None);
+    through(
+        cell,
+        &[
+            "multipart",
+            "complete",
+            &at("parts"),
+            upload,
+            &format!("1={tag}"),
+        ],
+    );
+    let out = mantle(cell, dir, &["--door", door, "cp", &at("parts"), "-"], None);
     assert!(out == object[..100], "{door}: the part copy's bytes");
 }

@@ -2792,13 +2792,16 @@ the depth as it makes a body's channel, whose capacity hyper-rt fixes then
 its read buffer, a head and a TLS record, in whole pieces, four, the four pieces of body the charge
 was counted holding. A put at the cap holds 288,737 octets above its connection at rest.
 
-A reply's channel keeps its depth of 2 (`REPLY_PIECES`) for now. Its argument is the body's turned
-round, the host giving and the connection taking, so it is learned the same way once its samples
-reach the one that learns: the time an answer waits in the channel ends where the connection takes
-it, on the connection's shard, while the depth's one writer is the host on the node's. Meanwhile a
-deeper reply channel moves no bytes the host does not already hold: what the channel has no room
-for waits in the host's own queue (`host::Local::pending`), and its depth bounds only how many of
-a get's pieces one turn of the node hands over.
+A reply's channel keeps its depth of 2 (`REPLY_PIECES`), not learned in this step. Its argument
+is the body's turned round, the host giving and the connection taking, but its samples are not the
+body's. The host gives a get's pieces a turn's worth at once, as many as the channel has room for
+(`Node::write_get`), so its time to give one is next to nothing within a turn and a ratio over it
+rides to the cap: the giving side's time is the gap between the node's turns, a measure of its
+own. And the time an answer waits in the channel ends where the connection takes it, on the
+connection's shard, while the depth's one writer is the host on the node's. Meanwhile a deeper
+reply channel moves no bytes the host does not already hold: what the channel has no room for
+waits in the host's own queue (`host::Local::pending`), and its depth bounds only how many of a
+get's pieces one turn of the node hands over.
 What the door makes of a head does not grow with its fields' count: they are read where the head
 holds them (`request::Parts`, `mantle_s3::sigv4::Fields`), no table of them made, which at 32
 octets a field held 60,160 for a head padded to 8 KB with 1,880 empty fields; and the metadata a

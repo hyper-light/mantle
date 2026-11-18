@@ -106,10 +106,13 @@ pods on CI runners measured depths of 1 to 316 on one disk, and one of 316 neede
 starts, so devices times depth cannot add up past it. On macOS its ceiling is the OS's own
 statement of what one process may run, `kern.wq_max_threads` (512 on the development machine),
 the cap Apple's workqueue under GCD and Swift concurrency applies to itself (26 §1.5, §2.5);
-elsewhere the pools exist only where io_uring is unusable, under the same budget, whose ceiling
-on Linux is the smaller of `kernel.threads-max` and the soft `RLIMIT_NPROC`, and on Windows the
-500 worker threads Microsoft states as a thread pool's default maximum ("Thread Pools", Best
-Practices) (`hyper_block::threads`). A pool that
+on Windows the pools carry every device's depth until its completion port is built, and on Linux
+they exist only where native AIO cannot carry the transfers, a measurement over a buffered file
+(`mantle_disk::measure`), a device's issuer holding its depth in the kernel on its one thread
+(as built 2026-11-14, above). All draw on the same budget, whose ceiling on Linux is the smaller
+of `kernel.threads-max` and the soft `RLIMIT_NPROC`, and on Windows the 500 worker threads
+Microsoft states as a thread pool's default maximum ("Thread Pools", Best Practices)
+(`hyper_block::threads`). A pool that
 would pass it is refused, naming the device and depth, before any thread exists (26
 recommendation 4); the device then runs at the depth the budget leaves.
 
@@ -138,6 +141,13 @@ so the engine takes its synchronous paths there, as on a thread with no shard: i
 writes and maintenance wait on that shard and hold up its transport while they do, which the
 liveness stream counts in its timer's granularity (the owner's own waits). Moving the replicas
 to metadata shards apart from the network's, as above, is still to build.
+
+*As built (2026-11-17).* The node runs on hyper-rt's multi-shard `Runtime`, a shard for each CPU
+the process runs at once (hyper-rt `Facts::cpus_at_once`; `process::runtime`), its task launched
+on the first shard and the runtime shut down at its end (`process::run_on_first_shard`). That
+task, with the node's ranges, log, transport and QUIC door, stays on the first shard; the S3
+connections go to the others, passing over a shard the runtime's watchdog sees stalled and one
+gone (§4.1). The replicas are not yet placed across the shards (§2.1).
 
 A granted core is what `std::thread::available_parallelism` reports: the operating system's
 answer, affinity masks and quotas included where it reports them. Three pools of that size
@@ -221,8 +231,10 @@ alone can keep 96 MiB per volume (audit §12.3). A laptop needs the smallest pop
 serves its work (audit §6.3), and more is granted by stating a ceiling.
 
 A configuration key the node does not know is refused, as the S3 layer's readers refuse what
-they do not know. `mantle status` prints every derived value with the input or constraint that
-bound it (audit §12.6).
+they do not know. Every derived value is said with the input or constraint that bound it (audit
+§12.6): by `mantle serve` before the node runs, a `basis` line each (below, as built 2026-10-23),
+and by `mantle derive CONFIG`, which says the same without serving (2026-11-14).
+`mantle status DIR` is the supervisor's readiness check alone (§1.6; kubernetes.md §5).
 
 *Planned for `mantle serve` (2026-10-21; research 64).* `mantle node`, the process the tests drive,
 is told every number it runs with. `mantle serve` is told only what the first column above names,
@@ -441,7 +453,7 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `volume` depth, read bytes, read gap, first-write penalty | measured | the device's calibration (chunk-store.md §7), kept in its `profile` (§1.6) and measured again when the device no longer matches it (§1.7) |
 | `engine.page_size`, the log's block | measured, derived | the device's write unit (hyper-block's `layout_block`), at least `MIN_PAGE`; the engine's page at least the least whose branch pages hold a row at the range's bounds (`mantle_engine::branch::least_page`, replica.md §2) |
 | `chunk_bytes` | cited | `mantle_gateway::layout::CHUNK` |
-| `durability.*` | cited, stated | the worst device class's annual failure rate an hour, since a block's chunks land on any device of the cell (`mantle_ec::durability`'s disk rate), with durability.md §5's yearly power-on restart taking a hundredth of the nodes; repair in research 15's day until repair is built and measured; the target S3's 10⁻¹¹ unless stated (`derive::rates`, `derive::target`) |
+| `durability.*` | cited, stated | the worst device class's annual failure rate an hour, since a block's chunks land on any device of the cell (`mantle_ec::durability`'s disk rate), with durability.md §5's yearly power-on restart taking a hundredth of the nodes; repair at the rate the cell states (`durability.repair_rate`, `mantle init --repair-rate`), else research 15's day until repair measures its own; the target S3's 10⁻¹¹ unless stated (`derive::rates_repaired`, `derive::target`) |
 | `range.max_entry_bytes` | derived | `mantle_meta::wire::largest_entry_bytes` (replica.md §7) |
 | `range.election_tick`, `range.heartbeat_tick` | cited | focal's 10 and 2 (§2.4), checked though ranges elect by suspicion, which takes no ticks |
 | `range.max_size_per_msg`, `range.max_uncommitted_size`, `range.max_committed_size_per_ready`, `range.max_inflight_msgs` | derived | an entry of the range's largest each append, apply and `Ready`; as many appends out to a follower and entries uncommitted as a range can hold, `ask::ENTRIES_OUT` an identity of the cell, each asking through as many entries out at once (`ask::Asking`), and one of the leader's own, its term's first entry or a change of configuration (`derive::in_flight`; Ongaro 2014 §3.6.2, §4): no asked entry waits unsent for a follower's round trip and flush, where two out had held each frame to a confirmation of its own and one made every frame wait (raft-log.md §6; research/71, step 9) |
@@ -1282,7 +1294,7 @@ does, is evaluated against the ownership rules it needs (audit §14.4), not adop
 
 | Step | What scheduling adds |
 |---|---|
-| Laptop | all of the above at one gateway, one device dispatcher and one shard: a tree of tens of KB, a cost table per operation from calibration, a Space-Saving table usually not full and so exact; the CLI on the native protocol and stock tools on the HTTP listener under one authority |
+| Laptop | all of the above at one gateway, one device dispatcher and its ranges on one shard (§1.2, as built 2026-11-17): a tree of tens of KB, a cost table per operation from calibration, a Space-Saving table usually not full and so exact; the CLI on the native protocol and stock tools on the HTTP listener under one authority |
 | Node | per-device cost models and budgets, many dispatchers; chunk devices chosen by two random choices on credits (§7) |
 | Cell | node credits and service counters between gateways and nodes (§3.3), tenants' contracts divided among gateways (§4.5), hedged chunk writes where measured tails justify them (§5.4) |
 | Region, fleet | a tenant's regional and global share divided by measured demand on longer intervals, summaries merged by addition (§4.5) |
@@ -1309,8 +1321,11 @@ becomes:
   dissertation's §6.3, RIFL's §4.2). A gateway never reports `AnswersFull` as a refusal: past its
   deadline the command is `Deadline`, which may still apply, once.
 - **The commands an entry carries: what waited, within its bytes.** One entry out a range, as
-  now, carries every command waiting that fits `max_entry_bytes`, LogCabin's double buffering,
-  whose batches "dynamically [adjust] to load" (research/87 §1).
+  then, carries every command waiting that fits `max_entry_bytes`, LogCabin's double buffering,
+  whose batches "dynamically [adjust] to load" (research/87 §1). Since 2026-11-17 a node keeps up
+  to `ask::ENTRIES_OUT` (two) entries out to a range at once, as many as its log has frames in
+  flight, each carrying what waited when it was made, and each asked, answered and given up on
+  its own (§6.6).
 - **The operations a node admits: learned.** The limit is the point of greatest power,
   Kleinrock's throughput over delay, which by Little's law rises below Denning and Buzen's
   saturation point and falls past it, so its maximum is the knee. The node finds it as BBR probes
@@ -2612,10 +2627,11 @@ B05), and each refusal is typed. It passes with a busy loop on every core.
 Each gateway holds one session with each range it writes to, registered by a `Register` command
 at first use (replica.md §1). Commands carry the session, a serial, and the lowest serial whose
 answer the gateway has not yet received, so the range forgets answers only once the gateway has
-them. A gateway keeps one entry out a session, carrying every command waiting that fits the
-entry's bytes; the range keeps their answers as its row holds them, and refuses the rest
-`AnswersFull` before they take effect, which the gateway asks again under their serials (§2.8).
-The rest wait at the gateway, bounded by the operations that ask them (§2.6).
+them. A gateway keeps up to as many entries out a session as the range's log has frames in
+flight, `ask::ENTRIES_OUT`, two (§6.6; one until 2026-11-17), each carrying every command waiting
+that fits the entry's bytes; the range keeps their answers as its row holds them, and refuses the
+rest `AnswersFull` before they take effect, which the gateway asks again under their serials
+(§2.8). The rest wait at the gateway, bounded by the operations that ask them (§2.6).
 
 Three answers need the gateway's handling, and replica.md §1 fixes each:
 
@@ -2797,6 +2813,14 @@ The `Engine` trait (`mantle_meta::engine`) gains what metadata.md §4 already na
 of files at an index, and export and ingest of files, for snapshots, splits and moves (§6.3,
 §6.4). `Engine::image` and `install`, which carry every row in memory, are retired with them
 (audit §5.4).
+
+*As built (2026-10-19).* The port gave way, by the owner's decision of 2026-10-06, to an engine of
+its own structure and format (engine-structure.md): the production engine is
+`mantle_engine::shard_db::ShardDb`, one instance per range replica in its own store file
+(`range-GROUP.store`, §1.6) on hyper-block's device file, with no write-ahead log of its own,
+held as the metadata layer's engine by `mantle_range::Stored` (metadata.md §4). Its page,
+extents and memtable are derived per node (§1.4). The trait has not yet gained the checkpoint of
+files, export or ingest: snapshots still carry every row through `image` and `install`.
 
 ### 6.2 Applied index, flush and truncation
 
@@ -3015,10 +3039,14 @@ A node exports what it measures, what it refused and why, alongside what succeed
 | Threads | the process's thread count from the OS against its derived bound (§1.2) |
 
 Latencies are kept as log-bucketed histograms, whose accuracy follows from the estimator
-(11 §14). `mantle status` prints the node's operating envelope: each derived limit, the value it
-took, and the input that bound it (audit §12.6), with the accounting audit §15.1 asks for
-evaluated on measured values, among them the node's memory as the sum of its owners and the
-heartbeat rate its led ranges cost.
+(11 §14). The node's operating envelope is each derived limit, the value it took, and the input
+that bound it (audit §12.6), with the accounting audit §15.1 asks for evaluated on measured values,
+among them the node's memory as the sum of its owners and the heartbeat rate its led ranges cost.
+As built, the limits, their values and their inputs are said once, as the node starts:
+`mantle serve` says each with its basis before it runs, and `mantle derive` says the same without
+serving (§1.4). A command that says a running node's envelope, with the accounting on measured
+values, is not built; `mantle status` is the supervisor's readiness check alone (§1.6;
+kubernetes.md §5).
 
 ## 9. Testing
 

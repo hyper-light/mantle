@@ -995,6 +995,51 @@ mod tests {
         }
     }
 
+    /// How long the test's thread waits on a fact the shards' lanes show before it fails: each step
+    /// it waits through is a write made durable and a lane's hop, so ten seconds is far past it on
+    /// a loaded host and fails only a wait that would never end (as `listener::shards`'s tests
+    /// bound theirs).
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// Why the test's thread stopped waiting on a shard's lane for `what` without it.
+    #[derive(Debug)]
+    enum Waited {
+        /// [`PATIENCE`] passed first.
+        Patience(&'static str),
+        /// The shard stopped, or its lane ended, first.
+        Stopped(&'static str, NodeError),
+    }
+
+    impl std::fmt::Display for Waited {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Patience(what) => write!(f, "waited {PATIENCE:?} for {what}"),
+                Self::Stopped(what, error) => write!(f, "the shard stopped before {what}: {error}"),
+            }
+        }
+    }
+
+    /// The next thing the shard gives, polled on the test's thread (hyper-rt's lanes have no timed
+    /// wait) until `until`, waited for as `what`.
+    fn taken(
+        lanes: &mut Lanes<Model, Stored>,
+        what: &'static str,
+        until: std::time::Instant,
+    ) -> Result<Out, Waited> {
+        loop {
+            match lanes.take() {
+                Ok(Some(Out::Stopped(error))) | Err(error) => {
+                    return Err(Waited::Stopped(what, error));
+                }
+                Ok(Some(out)) => return Ok(out),
+                Ok(None) if std::time::Instant::now() >= until => {
+                    return Err(Waited::Patience(what));
+                }
+                Ok(None) => std::thread::yield_now(),
+            }
+        }
+    }
+
     /// A shard's ends of its lanes, held by a test.
     type Ends = (ChannelReceiver<In<Model, Stored>>, Sender<Out>);
 
@@ -1038,8 +1083,9 @@ mod tests {
         // at each write its shard made durable, the vote's and the leader's first entry's among
         // them, until one is applied.
         let (mut flushed, mut applied) = (0, None);
+        let until = deadline();
         while applied.is_none() {
-            match lanes.from.blocking_recv().unwrap() {
+            match next(&mut lanes, "the proposal applied", until, |_| false) {
                 Out::Applied(group, answer) => applied = Some((group, answer)),
                 Out::Flushed(..) => {
                     flushed += 1;
@@ -1047,7 +1093,6 @@ mod tests {
                         .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
                         .unwrap();
                 }
-                Out::Stopped(error) => panic!("the shard stopped: {error}"),
                 _ => {}
             }
         }
@@ -1074,27 +1119,36 @@ mod tests {
         let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
         let mut lanes = Lanes::start(holder, 1, 1, 8).unwrap();
         lanes.send(In::Adopt(GROUP, Box::new(replica))).unwrap();
-        let mut messages = Vec::new();
+        let (mut messages, until) = (Vec::new(), deadline());
         loop {
-            match lanes.from.blocking_recv().unwrap() {
+            match next(&mut lanes, "the range shown leading", until, |_| false) {
                 Out::Seen(group, seen) if seen.leading => {
                     assert_eq!(group, GROUP);
                     return (lanes, moved, messages);
                 }
                 Out::Message(_, message) => messages.push(message),
-                Out::Stopped(error) => panic!("the shard stopped: {error}"),
                 _ => {}
             }
         }
     }
 
-    /// What the shard gives next past what `skip` passes over; a stop fails the test.
-    fn next(lanes: &mut Lanes<Model, Stored>, mut skip: impl FnMut(&Out) -> bool) -> Out {
+    /// When a wait begun now has waited [`PATIENCE`].
+    fn deadline() -> std::time::Instant {
+        std::time::Instant::now() + PATIENCE
+    }
+
+    /// What the shard gives next past what `skip` passes over, waited for as `what` until `until`.
+    fn next(
+        lanes: &mut Lanes<Model, Stored>,
+        what: &'static str,
+        until: std::time::Instant,
+        mut skip: impl FnMut(&Out) -> bool,
+    ) -> Out {
         loop {
-            match lanes.from.blocking_recv().unwrap() {
-                Out::Stopped(error) => panic!("the shard stopped: {error}"),
-                out if skip(&out) => {}
-                out => return out,
+            match taken(lanes, what, until) {
+                Ok(out) if skip(&out) => {}
+                Ok(out) => return out,
+                Err(waited) => panic!("{waited}"),
             }
         }
     }
@@ -1112,11 +1166,14 @@ mod tests {
         lanes
             .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
             .unwrap();
-        let Out::Applied(_, answer) = next(&mut lanes, |out| !matches!(out, Out::Applied(..)))
-        else {
+        let Out::Applied(_, answer) = next(&mut lanes, "its entry applied", deadline(), |out| {
+            !matches!(out, Out::Applied(..))
+        }) else {
             panic!("`next` gives only what it does not skip")
         };
-        let Out::Seen(group, seen) = next(&mut lanes, |out| !matches!(out, Out::Seen(..))) else {
+        let Out::Seen(group, seen) = next(&mut lanes, "its entry shown", deadline(), |out| {
+            !matches!(out, Out::Seen(..))
+        }) else {
             panic!("`next` gives only what it does not skip")
         };
         assert_eq!(group, GROUP);
@@ -1152,7 +1209,9 @@ mod tests {
             })
             .unwrap();
         let Out::Served(group, id, served) =
-            next(&mut lanes, |out| !matches!(out, Out::Served(..)))
+            next(&mut lanes, "the read served", deadline(), |out| {
+                !matches!(out, Out::Served(..))
+            })
         else {
             panic!("`next` gives only what it does not skip")
         };
@@ -1167,7 +1226,9 @@ mod tests {
             })
             .unwrap();
         let Out::Served(group, id, served) =
-            next(&mut lanes, |out| !matches!(out, Out::Served(..)))
+            next(&mut lanes, "the read served", deadline(), |out| {
+                !matches!(out, Out::Served(..))
+            })
         else {
             panic!("`next` gives only what it does not skip")
         };
@@ -1195,7 +1256,10 @@ mod tests {
         lanes
             .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
             .unwrap();
-        let Out::Applied(group, applied) = next(&mut lanes, |out| !matches!(out, Out::Applied(..)))
+        let Out::Applied(group, applied) =
+            next(&mut lanes, "its entry applied", deadline(), |out| {
+                !matches!(out, Out::Applied(..))
+            })
         else {
             panic!("`next` gives only what it does not skip")
         };
@@ -1219,14 +1283,16 @@ mod tests {
         lanes
             .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
             .unwrap();
-        let Out::Applied(_, answer) = next(&mut lanes, |out| !matches!(out, Out::Applied(..)))
-        else {
+        let Out::Applied(_, answer) = next(&mut lanes, "its entry applied", deadline(), |out| {
+            !matches!(out, Out::Applied(..))
+        }) else {
             panic!("`next` gives only what it does not skip")
         };
         // Asked once the range shows its entry applied and no write out, and again each time it
         // shows none out after a write passed it over.
+        let until = deadline();
         loop {
-            match next(&mut lanes, |_| false) {
+            match next(&mut lanes, "a compaction started", until, |_| false) {
                 Out::Compacted => break,
                 Out::Seen(_, seen) if seen.applied >= answer.index && seen.in_flight == 0 => {
                     lanes.send(In::Compact).unwrap();
@@ -1234,9 +1300,11 @@ mod tests {
                 _ => {}
             }
         }
+        let until = deadline();
         loop {
-            if let Out::Seen(_, seen) = next(&mut lanes, |out| !matches!(out, Out::Seen(..)))
-                && seen.writes.starts > 0
+            if let Out::Seen(_, seen) = next(&mut lanes, "the compaction made", until, |out| {
+                !matches!(out, Out::Seen(..))
+            }) && seen.writes.starts > 0
                 && seen.in_flight == 0
             {
                 break;
@@ -1246,12 +1314,6 @@ mod tests {
         rt.shutdown().unwrap();
         drop(log);
     }
-
-    /// How long the test's thread waits on a fact the shards' lanes show before it fails: each step
-    /// it waits through is a write made durable and a lane's hop, so ten seconds is far past it on
-    /// a loaded host and fails only a wait that would never end (as `listener::shards`'s tests
-    /// bound theirs).
-    const PATIENCE: Duration = Duration::from_secs(10);
 
     /// A range of voter 1 and learner 2, with each member's replica moved to a shard of its own
     /// before its first drive: the leader's log compacted past the learner's next entry, so the
@@ -1280,11 +1342,14 @@ mod tests {
         leader
             .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
             .unwrap();
-        let Out::Applied(_, answer) = next(&mut leader, &mut take_held) else {
+        let Out::Applied(_, answer) =
+            next(&mut leader, "its entry applied", deadline(), &mut take_held)
+        else {
             panic!("`next` gives only what it does not skip")
         };
+        let until = deadline();
         loop {
-            match next(&mut leader, |_| false) {
+            match next(&mut leader, "a compaction started", until, |_| false) {
                 Out::Compacted => break,
                 Out::Message(_, message) => held.push(message),
                 Out::Seen(_, seen) if seen.applied >= answer.index && seen.in_flight == 0 => {
@@ -1297,7 +1362,7 @@ mod tests {
         // the compaction's write is durable (hyper-durable's `Replica::durable`), and until then
         // the leader holds the learner's next entry and sends it in an append, which needs no
         // snapshot. The learner starts once the leader shows the write made and none out.
-        let until = std::time::Instant::now() + PATIENCE;
+        let until = deadline();
         loop {
             assert!(
                 std::time::Instant::now() < until,
@@ -1332,7 +1397,7 @@ mod tests {
         }
         // Each member's messages stepped by the other, the test's thread their network.
         let (mut sent, mut installed, mut appended) = (false, false, false);
-        let until = std::time::Instant::now() + PATIENCE;
+        let until = deadline();
         while !(sent && installed && appended) {
             assert!(
                 std::time::Instant::now() < until,

@@ -7,8 +7,14 @@ use mantle_meta::engine::Row;
 
 const FORMAT: u8 = 1;
 
+/// The rows' bytes, made at their length ([`encoded_len_of`]), so the buffer never grows.
 pub fn encode(rows: &[Row]) -> Option<Vec<u8>> {
-    let mut w = Writer::default();
+    let bytes = rows.iter().try_fold(0u64, |sum, (k, v)| {
+        sum.checked_add(u64::try_from(k.len()).ok()?)?
+            .checked_add(u64::try_from(v.len()).ok()?)
+    })?;
+    let len = encoded_len_of(u64::try_from(rows.len()).ok()?, bytes)?;
+    let mut w = Writer::with_capacity(usize::try_from(len).ok()?);
     w.u8(FORMAT);
     w.u64(u64::try_from(rows.len()).ok()?);
     for (k, v) in rows {
@@ -72,6 +78,61 @@ mod tests {
         bad[9] ^= 1;
         assert_eq!(decode(&bad), None);
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
+    }
+
+    /// `encode` as it was before Lean doors step 7, in a writer that grows.
+    fn reference(rows: &[Row]) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.u8(FORMAT);
+        w.u64(rows.len() as u64);
+        for (k, v) in rows {
+            w.u32(u32::try_from(k.len()).unwrap());
+            w.bytes(k);
+            w.u32(u32::try_from(v.len()).unwrap());
+            w.bytes(v);
+        }
+        let crc = mantle_crc::crc32c(w.as_slice());
+        w.u32(crc);
+        w.into_vec()
+    }
+
+    /// An image is one buffer made at its length, the bytes the encoder before step 7 wrote: no
+    /// rows, one, ten thousand of varied lengths, and one row of 64 MiB. Its bound, a u32 of bytes
+    /// (hyper-raft's wire), is past what a unit test holds twice over; the length is computed the
+    /// same way at every size.
+    #[test]
+    fn an_image_is_written_at_its_length() {
+        let many: Vec<Row> = (0..10_000usize)
+            .map(|i| (format!("key/{i}").into_bytes(), vec![9u8; i % 1000]))
+            .collect();
+        let cases = [
+            ("none", Vec::new()),
+            ("one", vec![(b"a".to_vec(), b"1".to_vec())]),
+            ("many", many),
+            (
+                "a large row",
+                vec![(b"large".to_vec(), vec![5u8; 64 << 20])],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (what, rows) in cases {
+            let (expected, before) = crate::counted(|| reference(&rows));
+            let (bytes, made) = crate::counted(|| encode(&rows).unwrap());
+            println!(
+                "image {what}: before {before:?}, now {made:?}, {} bytes",
+                bytes.len()
+            );
+            if made != (1, 0) || bytes.capacity() != bytes.len() {
+                wrong.push(format!(
+                    "{what}: (allocations, reallocations) {made:?}, capacity {} for {} bytes",
+                    bytes.capacity(),
+                    bytes.len()
+                ));
+            }
+            assert_eq!(bytes, expected, "{what}");
+            assert_eq!(decode(&bytes), Some(rows), "{what}");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// `encoded_len_of` counts what `encode` writes, for no rows, empty rows and rows of every

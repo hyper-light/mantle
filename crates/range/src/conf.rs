@@ -2,6 +2,8 @@
 //! that a restart tells the core the configuration of the state it opens at
 //! (docs/design/replica.md §4).
 
+use std::num::TryFromIntError;
+
 use hyper_raft::proto::ConfState;
 use mantle_codec::{Reader, Writer};
 use mantle_meta::key::{LOCAL, marker};
@@ -11,8 +13,20 @@ pub const ROW: &[u8] = &[LOCAL, marker::CONFIGURATION];
 
 const FORMAT: u8 = 1;
 
+/// The bytes of the CRC-32C a configuration ends in.
+const CRC_BYTES: usize = 4;
+
+/// The configuration's bytes, made at their length: counted first, then written once, the
+/// checksum after them.
 pub fn encode(conf: &ConfState) -> Option<Vec<u8>> {
-    let mut w = Writer::default();
+    let mut w = mantle_codec::encode(CRC_BYTES, |w| put(w, conf)).ok()?;
+    let crc = mantle_crc::crc32c(w.as_slice());
+    w.u32(crc);
+    Some(w.into_vec())
+}
+
+/// The configuration's fields, the checksum aside.
+fn put(w: &mut Writer, conf: &ConfState) -> Result<(), TryFromIntError> {
     w.u8(FORMAT);
     for list in [
         &conf.voters,
@@ -20,15 +34,13 @@ pub fn encode(conf: &ConfState) -> Option<Vec<u8>> {
         &conf.voters_outgoing,
         &conf.learners_next,
     ] {
-        w.u32(u32::try_from(list.len()).ok()?);
+        w.u32(u32::try_from(list.len())?);
         for id in list {
             w.u64(*id);
         }
     }
     w.u8(u8::from(conf.auto_leave));
-    let crc = mantle_crc::crc32c(w.as_slice());
-    w.u32(crc);
-    Some(w.into_vec())
+    Ok(())
 }
 
 pub fn decode(bytes: &[u8]) -> Option<ConfState> {
@@ -87,5 +99,82 @@ mod tests {
         let mut bad = bytes;
         bad[3] ^= 1;
         assert_eq!(decode(&bad), None);
+    }
+
+    /// `encode` as it was before Lean doors step 7, in a writer that grows.
+    fn reference(conf: &ConfState) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.u8(FORMAT);
+        for list in [
+            &conf.voters,
+            &conf.learners,
+            &conf.voters_outgoing,
+            &conf.learners_next,
+        ] {
+            w.u32(u32::try_from(list.len()).unwrap());
+            for id in list {
+                w.u64(*id);
+            }
+        }
+        w.u8(u8::from(conf.auto_leave));
+        let crc = mantle_crc::crc32c(w.as_slice());
+        w.u32(crc);
+        w.into_vec()
+    }
+
+    /// A configuration is one buffer made at its length, the bytes the encoder before step 7
+    /// wrote: none, one member, a joint configuration, and a thousand members on each list.
+    #[test]
+    fn a_configuration_is_written_at_its_length() {
+        let ids = |from: u64, n: u64| (from..from + n).collect::<Vec<u64>>();
+        let cases = [
+            ("none", ConfState::default()),
+            (
+                "one",
+                ConfState {
+                    voters: vec![1],
+                    ..ConfState::default()
+                },
+            ),
+            (
+                "joint",
+                ConfState {
+                    voters: ids(1, 5),
+                    learners: ids(6, 2),
+                    voters_outgoing: ids(1, 3),
+                    learners_next: ids(4, 1),
+                    auto_leave: true,
+                },
+            ),
+            (
+                "a thousand each",
+                ConfState {
+                    voters: ids(1, 1000),
+                    learners: ids(1001, 1000),
+                    voters_outgoing: ids(2001, 1000),
+                    learners_next: ids(3001, 1000),
+                    auto_leave: false,
+                },
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (what, conf) in cases {
+            let (expected, before) = crate::counted(|| reference(&conf));
+            let (bytes, made) = crate::counted(|| encode(&conf).unwrap());
+            println!(
+                "conf {what}: before {before:?}, now {made:?}, {} bytes",
+                bytes.len()
+            );
+            if made != (1, 0) || bytes.capacity() != bytes.len() {
+                wrong.push(format!(
+                    "{what}: (allocations, reallocations) {made:?}, capacity {} for {} bytes",
+                    bytes.capacity(),
+                    bytes.len()
+                ));
+            }
+            assert_eq!(bytes, expected, "{what}");
+            assert_eq!(decode(&bytes), Some(conf), "{what}");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

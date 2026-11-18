@@ -25,9 +25,12 @@ use crate::{conf, image};
 /// The row that holds the term of the last entry applied.
 pub const TERM: &[u8] = &[LOCAL, marker::TERM];
 
-/// A term's bytes: the term and its CRC-32C.
-fn encode_term(term: u64) -> Vec<u8> {
-    let mut w = Writer::default();
+/// The bytes of a term's row: the term and its CRC-32C.
+const TERM_BYTES: usize = 8 + 4;
+
+/// A term's bytes: the term and its CRC-32C, in a buffer made at their length.
+pub(crate) fn encode_term(term: u64) -> Vec<u8> {
+    let mut w = Writer::with_capacity(TERM_BYTES);
     w.u64(term);
     let crc = mantle_crc::crc32c(w.as_slice());
     w.u32(crc);
@@ -243,15 +246,14 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     }
 
     /// Every row as of the last entry applied, under the configuration held there: the image is
-    /// made on demand, so it is of everything applied (docs/design/replica.md §4).
+    /// made on demand, so it is of everything applied (docs/design/replica.md §4). It is made at
+    /// its length and moved into `into`, not copied.
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         let rows = self
             .engine
             .image()
             .map_err(|_| Fatal("the engine gave no image"))?;
-        let bytes = image::encode(&rows).ok_or(Fatal("a row past u32 bytes"))?;
-        into.clear();
-        into.extend_from_slice(&bytes);
+        *into = image::encode(&rows).ok_or(Fatal("a row past u32 bytes"))?;
         Ok((self.applied, self.configuration.clone()))
     }
 
@@ -306,5 +308,31 @@ mod tests {
         bad[0] ^= 1;
         assert_eq!(decode_term(&bad), None);
         assert_eq!(decode_term(&bytes[..bytes.len() - 1]), None);
+    }
+
+    /// `encode_term` as it was before Lean doors step 7, in a writer that grows.
+    fn reference_term(term: u64) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.u64(term);
+        let crc = mantle_crc::crc32c(w.as_slice());
+        w.u32(crc);
+        w.into_vec()
+    }
+
+    /// A term's row is one buffer made at its length, the bytes the encoder before step 7 wrote,
+    /// for the least term, one and the most.
+    #[test]
+    fn a_term_is_written_at_its_length() {
+        for term in [0, 1, u64::MAX] {
+            let (expected, before) = crate::counted(|| reference_term(term));
+            let (bytes, made) = crate::counted(|| encode_term(term));
+            println!(
+                "term {term}: before {before:?}, now {made:?}, {} bytes",
+                bytes.len()
+            );
+            assert_eq!((made, bytes.capacity()), ((1, 0), bytes.len()), "{term}");
+            assert_eq!(bytes, expected, "{term}");
+            assert_eq!(decode_term(&bytes), Some(term), "{term}");
+        }
     }
 }

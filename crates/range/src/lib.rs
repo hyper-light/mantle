@@ -33,3 +33,18 @@ pub use replica::{
     ready_held, remove,
 };
 pub use stored::{Stored, holds_rows};
+
+/// hyper-measure's counting allocator under the unit tests, which count what an encoder allocates
+/// (Lean doors step 7: a message whose length is known first is made at it).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
+
+/// The allocations and reallocations `f` makes on this thread.
+#[cfg(test)]
+fn counted<T>(f: impl FnOnce() -> T) -> (T, (u64, u64)) {
+    hyper_measure::alloc::begin();
+    let out = f();
+    let counts = hyper_measure::alloc::end();
+    (out, (counts.allocations, counts.reallocations))
+}

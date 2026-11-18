@@ -2828,16 +2828,56 @@ the depth as it makes a body's channel, whose capacity hyper-rt fixes then
 its read buffer, a head and a TLS record, in whole pieces, four, the four pieces of body the charge
 was counted holding. A put at the cap holds 288,737 octets above its connection at rest.
 
-A reply's channel keeps its depth of 2 (`REPLY_PIECES`), not learned in this step. Its argument
-is the body's turned round, the host giving and the connection taking, but its samples are not the
-body's. The host gives a get's pieces a turn's worth at once, as many as the channel has room for
-(`Node::write_get`), so its time to give one is next to nothing within a turn and a ratio over it
-rides to the cap: the giving side's time is the gap between the node's turns, a measure of its
-own. And the time an answer waits in the channel ends where the connection takes it, on the
-connection's shard, while the depth's one writer is the host on the node's. Meanwhile a deeper
-reply channel moves no bytes the host does not already hold: what the channel has no room for
-waits in the host's own queue (`host::Local::pending`), and its depth bounds only how many of a
-get's pieces one turn of the node hands over.
+*Since 2026-11-18 (the owner's rule, the reply's side).* A reply's channel holds the answers the
+node learns a reply needs in flight from its host (`door::Replying`), where it held 2 by fiat
+(`REPLY_PIECES`). Its argument is the body's turned round, the host giving and the connection
+taking, the connection writing one piece to its socket while the host gives the next. By Little's
+law the answers in the channel at once for a reply to go at its client's pace are the rate the
+connection writes them times the time each waits to be given: the host's mean time from one turn's
+answers to the next turn's, over the connection's mean time to write a piece, from taking it to its
+last octet written, none of it waiting for the host; rounded up, and at least one. The host's time
+is a turn's, not a piece's: a turn sends every piece the channel has room for at once
+(`Node::write_get`), so within a turn the time between two pieces is none, and a ratio taken over
+pieces would read a host that keeps pace as one that never waits. Each piece carries the instant of
+the turn that sent it, one for every piece a turn sends, a piece held for room
+(`host::Local::pending`) taking the turn that sends it; the connection counts a turn at each piece
+whose turn is not the last one's, the time between the two its sample, none for a reply's first
+turn, whose time is its driver's first read. The ratio of the means is the ratio of the sums times
+the pieces a turn gives, as measured: `⌈(Σ given × pieces) / (Σ written × turns)⌉`. The
+connection writes a turn's pieces before the next turn comes, or waits for it, so the time between
+turns is at least their writing, and the depth holds a turn's group: a host that keeps ahead gives
+a turn the room the connection made since its last, its turns that many writes apart, and one that
+falls behind gives its turns at its own pace, the depth the pieces the connection writes between
+them. A phase is as many turns as admission's phase measures (`admit::PHASE`, 267), turns the
+fewer samples of the two, and its depth replaces the last's. Until a phase is measured the depth
+is one, the least that moves a reply: its head, or the piece the host gives while the connection
+writes the last.
+
+The samples are taken where they happen, on the connection's shard, and learned where the body's
+depth is, on the node's: each connection adds its turns' and pieces' counts and times to atomics
+the door shares with the host (`Submitter::replied`), each time before its count, and the host alone
+takes them each turn before the door's requests (`Doorway::replies`), its count before its time,
+sums them into its phase and publishes the phase's depth, which a connection reads as it makes a
+reply's channel (`Submitter::reply_depth`). No lock is taken and the phase has one writer, as the
+body's does; a time added between the host's taking of a count and of its time waits a turn for
+its count, so a phase may hold a turn's time more or less for each connection writing as it ends.
+The depth is the node's, not a connection's: a connection's own phase would grow every connection
+past the bytes its charge was counted at (`CONNECTION_BYTES`), and the host's turns, the ratio's
+numerator, are the node's. Over clients of different paces the mean write is the faster clients',
+who write the most pieces, so the depth is theirs; a slower client's channel holds more than it
+needs, within the cap.
+
+A connection caps the depth as it makes a reply's channel at what the node's memory division gives
+it (`listener::most_answers`): the bytes `derive` charges each connection past its read buffer, a
+head, a TLS record and the piece it writes, taken from the channel, in whole pieces, three. A get
+at the cap holds four of the host's pieces, three in its channel and one it writes, the four pieces
+of body the charge was counted holding, and the host may hold one more for room
+(`host::Local::pending`), its own; the pieces are the bytes the get's window let go as the host
+took them (`Get::take`), so they are the connection's to bound. `tests/listener_memory.rs` makes
+each request at the first depths and at the caps of both channels: a get at the caps holds its
+two channels' larger rings beside what it holds at the first, 408 octets more over plain HTTP,
+within `REQUEST_BYTES` as at the first.
+
 What the door makes of a head does not grow with its fields' count: they are read where the head
 holds them (`request::Parts`, `mantle_s3::sigv4::Fields`), no table of them made, which at 32
 octets a field held 60,160 for a head padded to 8 KB with 1,880 empty fields; and the metadata a

@@ -117,9 +117,31 @@ pub const REQUEST_BYTES: usize = mantle_http::MAX_HEAD + PIECE + TLS_RECORD;
 /// one, the least that moves a body. Four at today's terms, the four pieces of body the charge was
 /// counted holding.
 pub fn most_pieces() -> usize {
-    let beside = PIECE
-        .saturating_add(mantle_http::MAX_HEAD)
-        .saturating_add(TLS_RECORD);
+    pieces_past(
+        PIECE
+            .saturating_add(mantle_http::MAX_HEAD)
+            .saturating_add(TLS_RECORD),
+    )
+}
+
+/// The most answers a get's reply holds in its channel from the host: the cap on the depth the
+/// node learns (`door::Replying`). The bytes the node's memory division gives each connection
+/// ([`CONNECTION_BYTES`]) past what a get's connection holds beside its channel, its own read
+/// buffer ([`PIECE`]), one head ([`mantle_http::MAX_HEAD`]), one TLS record ([`TLS_RECORD`]) and the
+/// piece it writes, taken from the channel ([`PIECE`]), in whole pieces, and at least one, the
+/// least that moves a reply. Three at today's terms: with the one it writes, the four pieces the
+/// charge was counted holding.
+pub fn most_answers() -> usize {
+    pieces_past(
+        PIECE
+            .saturating_add(PIECE)
+            .saturating_add(mantle_http::MAX_HEAD)
+            .saturating_add(TLS_RECORD),
+    )
+}
+
+/// The whole pieces [`CONNECTION_BYTES`] holds past `beside`, at least one.
+fn pieces_past(beside: usize) -> usize {
     usize::try_from(CONNECTION_BYTES)
         .unwrap_or(usize::MAX)
         .saturating_sub(beside)
@@ -504,6 +526,22 @@ mod tests {
             mantle_http::MAX_HEAD + most_pieces() * PIECE + TLS_RECORD
         );
         assert!(streamed_bytes() + PIECE <= charge);
+    }
+
+    /// The most answers a get's reply holds are what the charge for a connection holds past its
+    /// read buffer, a head, a TLS record and the piece it writes, at least one: with the piece it
+    /// writes, a get at that depth holds no more of the host's pieces than a put's queue at its
+    /// most.
+    #[test]
+    fn a_replys_channel_holds_what_the_charge_for_a_connection_holds() {
+        let beside = 2 * PIECE + mantle_http::MAX_HEAD + TLS_RECORD;
+        let charge = usize::try_from(CONNECTION_BYTES).unwrap();
+        assert_eq!(most_answers(), (charge - beside) / PIECE);
+        assert_eq!(most_answers(), 3);
+        assert_eq!(most_answers() + 1, most_pieces());
+        assert!(
+            PIECE + mantle_http::MAX_HEAD + TLS_RECORD + (most_answers() + 1) * PIECE <= charge
+        );
     }
 
     /// A listener spread over its runtime's second shard hands that shard the connection it

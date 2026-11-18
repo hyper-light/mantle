@@ -11,7 +11,9 @@
 //! The body's channel holds as many pieces as the node learned a body needs in flight ([`Depth`]):
 //! by Little's law, the host's time to take a piece over the connection's time to deliver one,
 //! each measured on the pieces themselves, so the body comes at its client's pace and the node
-//! holds no piece more.
+//! holds no piece more. A reply's channel holds as many answers as the node learned a reply needs
+//! in flight ([`Replying`]): the host's time from one turn's answers to the next's over the
+//! connection's time to write one, from the turn each piece carries and the connection's own clock.
 //!
 //! Before its operation, a request signed with a principal's key asks the node for that key
 //! ([`KeyAsk`]): the node reads the key's row and its principal's from the root range by
@@ -148,6 +150,79 @@ impl Depth {
     }
 }
 
+/// The answers a reply's channel holds, learned from the answers themselves (docs/design/node.md
+/// §4.3): the body's [`Depth`] turned round, the host giving and the connection taking. By Little's
+/// law (Little 1961) the answers in the channel at once for a reply to go at its client's pace are
+/// the rate the connection writes them times the time each waits to be given: the host's mean time
+/// from one turn's answers to the next turn's, over the connection's mean time to write one, from
+/// taking it to its last octet written, none of it waiting for the host; rounded up, and at least
+/// one. The host's time is a turn's, not a piece's: a turn sends every piece the channel has room
+/// for at once (`Node::write_get`), so within a turn the time between two is none, and its pieces
+/// wait for the turn together. The ratio of the means is the ratio of the sums times the pieces a
+/// turn gives, as measured: `⌈(Σ given × pieces) / (Σ written × turns)⌉`. The connection writes a
+/// turn's pieces before the next turn comes, or waits for it, so the time between turns is at least
+/// their writing and the depth holds a turn's group. A phase is as many turns as admission's phase
+/// measures (`admit::PHASE`), turns the fewer samples of the two, and its depth replaces the last's.
+/// Until a phase is measured the depth is one, the least that moves a reply: its head, or the piece
+/// the host gives while the connection writes the last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Replying {
+    turns: u64,
+    pieces: u64,
+    given_ns: u128,
+    written_ns: u128,
+}
+
+impl Replying {
+    /// The depth before any phase is measured: one answer.
+    pub const FIRST_ANSWERS: usize = 1;
+
+    /// Turns of the host's that gave their answers `given_ns` after the turns before them, in all,
+    /// and pieces the connections wrote in `written_ns`, in all: the phase's depth once these end
+    /// it. A product past a `u128` saturates, a depth past any cap.
+    pub fn add(
+        &mut self,
+        turns: u64,
+        pieces: u64,
+        given_ns: u64,
+        written_ns: u64,
+    ) -> Option<usize> {
+        self.turns = self.turns.saturating_add(turns);
+        self.pieces = self.pieces.saturating_add(pieces);
+        self.given_ns = self.given_ns.saturating_add(u128::from(given_ns));
+        self.written_ns = self.written_ns.saturating_add(u128::from(written_ns));
+        if self.turns < crate::admit::PHASE {
+            return None;
+        }
+        let given = self.given_ns.saturating_mul(u128::from(self.pieces.max(1)));
+        let written = self
+            .written_ns
+            .max(1)
+            .saturating_mul(u128::from(self.turns));
+        let depth = given.div_ceil(written).max(1);
+        *self = Self::default();
+        Some(usize::try_from(depth).unwrap_or(usize::MAX))
+    }
+}
+
+/// What the node learned of its doors' queues, which the listener's connections read as they make
+/// a request's channels: the depth of a body's ([`Depth`]) and of a reply's ([`Replying`]), the
+/// host their one writer; and what the connections wrote of their replies since the host last
+/// took it, which they add to and the host alone takes (`Doorway::replies`), each an atomic that
+/// needs no lock. A sample adds its time and then its count, so the host may take its time a turn
+/// before its count: a phase may hold a turn's time more or less for each connection writing as it
+/// ends, among its 267 turns. A sum holds what the connections wrote between two of the host's
+/// turns, so it wraps only past 2^64 nanoseconds of it, centuries.
+#[derive(Default)]
+struct Learned {
+    body: AtomicUsize,
+    reply: AtomicUsize,
+    turns: AtomicU64,
+    pieces: AtomicU64,
+    given_ns: AtomicU64,
+    written_ns: AtomicU64,
+}
+
 /// A piece of a reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
@@ -157,8 +232,9 @@ pub enum Answer {
     Ready,
     /// The reply: its status and the operation's facts.
     Head(Box<Reply>),
-    /// A get's bytes, in order.
-    Bytes(Bytes),
+    /// A get's bytes, in order, and the host's turn that sent them, one instant for every piece a
+    /// turn sends, which the node learns the reply's depth from ([`Replying`]).
+    Bytes(Bytes, Instant),
     /// Every byte written.
     End,
     /// The operation failed past its head: the connection ends with the response unfinished, as
@@ -175,10 +251,11 @@ pub struct Doorway {
     /// One request taken from the channel to learn that one waits, ahead of the rest.
     held: Option<Asked>,
     slowed: Arc<Slowings>,
-    /// The phase of pieces under way, and the depth the last phase learned, which the listener's
-    /// connections read as they make a body's channel.
+    /// The phases of a body's pieces and of a reply's turns under way, and what the last of each
+    /// learned, which the listener's connections read as they make a request's channels.
     depth: Depth,
-    learned: Arc<AtomicUsize>,
+    replying: Replying,
+    learned: Arc<Learned>,
 }
 
 /// The listener's end: where it submits requests, and the waker of the node that takes them.
@@ -187,7 +264,7 @@ pub struct Submitter {
     requests: Sender<Asked>,
     node: Waker,
     slowed: Arc<Slowings>,
-    learned: Arc<AtomicUsize>,
+    learned: Arc<Learned>,
 }
 
 /// The S3 requests the listener answered `503 SlowDown`, a count for each cause in
@@ -203,13 +280,18 @@ struct Slowings([AtomicU64; Slowed::ALL.len()]);
 pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtError> {
     let (requests, taken) = channel(capacity)?;
     let slowed = Arc::new(Slowings::default());
-    let learned = Arc::new(AtomicUsize::new(Depth::FIRST));
+    let learned = Arc::new(Learned {
+        body: AtomicUsize::new(Depth::FIRST),
+        reply: AtomicUsize::new(Replying::FIRST_ANSWERS),
+        ..Learned::default()
+    });
     Ok((
         Doorway {
             requests: taken,
             held: None,
             slowed: Arc::clone(&slowed),
             depth: Depth::default(),
+            replying: Replying::default(),
             learned: Arc::clone(&learned),
         },
         Submitter {
@@ -247,7 +329,24 @@ impl Doorway {
         };
         let taken_ns = u64::try_from(paced.sent.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(depth) = self.depth.took(taken_ns, delivered_ns) {
-            self.learned.store(depth, Ordering::Relaxed);
+            self.learned.body.store(depth, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes what the connections wrote of their replies since the host last did: samples of the
+    /// reply's phase ([`Replying`]), and the phase's depth for the connections once it ends. The
+    /// host takes them each turn, before the door's requests.
+    pub fn replies(&mut self) {
+        let learned = &self.learned;
+        // The counts before the times, the order a connection adds them in turned round: a count
+        // taken is never without its time, which its connection added before it (`Release`, seen
+        // by the `Acquire` here); a time added between the two waits for its count a turn.
+        let turns = learned.turns.swap(0, Ordering::Acquire);
+        let pieces = learned.pieces.swap(0, Ordering::Acquire);
+        let given_ns = learned.given_ns.swap(0, Ordering::Relaxed);
+        let written_ns = learned.written_ns.swap(0, Ordering::Relaxed);
+        if let Some(depth) = self.replying.add(turns, pieces, given_ns, written_ns) {
+            learned.reply.store(depth, Ordering::Relaxed);
         }
     }
 
@@ -302,7 +401,29 @@ impl Submitter {
     /// The pieces the node last learned a body needs in flight to its host ([`Depth`]), which a
     /// connection caps at what its memory holds as it makes a body's channel.
     pub fn depth(&self) -> usize {
-        self.learned.load(Ordering::Relaxed)
+        self.learned.body.load(Ordering::Relaxed)
+    }
+
+    /// The answers the node last learned a reply needs in flight from its host ([`Replying`]), which
+    /// a connection caps at what its memory holds as it makes a reply's channel.
+    pub fn reply_depth(&self) -> usize {
+        self.learned.reply.load(Ordering::Relaxed)
+    }
+
+    /// A turn's pieces of a reply the connection wrote: `pieces` of them in `written_ns`, each
+    /// timed from its taking to its last octet written and at least a nanosecond, and the host's
+    /// time from its turn before to the turn that gave them, none for a reply's first turn, whose
+    /// time is its driver's first read. The node's host takes them at its next turn
+    /// ([`Doorway::replies`]).
+    pub fn replied(&self, given_ns: Option<u64>, pieces: u64, written_ns: u64) {
+        let learned = &self.learned;
+        // Each time before its count (`Doorway::replies`).
+        learned.written_ns.fetch_add(written_ns, Ordering::Relaxed);
+        learned.pieces.fetch_add(pieces, Ordering::Release);
+        if let Some(given_ns) = given_ns {
+            learned.given_ns.fetch_add(given_ns, Ordering::Relaxed);
+            learned.turns.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Counts an S3 request the listener answers `503 SlowDown` for `cause`, which the node says
@@ -345,6 +466,85 @@ mod tests {
         // A phase forgets the last: the slow phase before says nothing of this one.
         assert_eq!(phase(&mut depth, 1_000_000, 1_000), Some(1_000));
         assert_eq!(phase(&mut depth, 1_000, 1_000), Some(1));
+    }
+
+    /// A phase's turns, each `given_ns` after the turn before, with `pieces` pieces a turn written
+    /// in `written_ns` each: the depth the phase's last turn gives, none before it.
+    fn turns(
+        replying: &mut Replying,
+        given_ns: u64,
+        pieces: u64,
+        written_ns: u64,
+    ) -> Option<usize> {
+        let written = pieces * written_ns.max(1);
+        for _ in 1..crate::admit::PHASE {
+            assert_eq!(replying.add(1, pieces, given_ns, written), None);
+        }
+        replying.add(1, pieces, given_ns, written)
+    }
+
+    /// A reply's depth is the host's time from one turn's answers to the next's over the
+    /// connection's time to write one, rounded up, once a phase of turns is measured: never below
+    /// one, a turn's group held where the connection writes it before the next turn, and each phase
+    /// its own.
+    #[test]
+    fn a_replys_depth_is_the_answers_written_while_the_host_gives_a_turns() {
+        let mut replying = Replying::default();
+        // Turns 300 µs apart, one piece a turn written in 100 µs: three in flight.
+        assert_eq!(turns(&mut replying, 300_000, 1, 100_000), Some(3));
+        // 250 µs over 100 µs, rounded up.
+        assert_eq!(turns(&mut replying, 250_000, 1, 100_000), Some(3));
+        // A host whose turns come quicker than a piece is written, or at once: one.
+        assert_eq!(turns(&mut replying, 10_000, 1, 100_000), Some(1));
+        assert_eq!(turns(&mut replying, 0, 1, 100_000), Some(1));
+        // Turns of three pieces each, written in 100 µs, 300 µs apart: the turn's group, three.
+        assert_eq!(turns(&mut replying, 300_000, 3, 100_000), Some(3));
+        // The same turns to a connection that writes in half the time: twice the group.
+        assert_eq!(turns(&mut replying, 300_000, 3, 50_000), Some(6));
+        // A write too quick to time is a nanosecond's.
+        assert_eq!(turns(&mut replying, 7, 1, 0), Some(7));
+        // A phase forgets the last: the slow phase before says nothing of this one.
+        assert_eq!(turns(&mut replying, 1_000_000, 1, 1_000), Some(1_000));
+        assert_eq!(turns(&mut replying, 1_000, 1, 1_000), Some(1));
+        // Times past any sum saturate: a depth past any cap, which the connection caps.
+        assert_eq!(turns(&mut replying, u64::MAX, 1, 1), Some(usize::MAX));
+        // A phase is its turns, not its pieces: none before them, however many pieces.
+        let mut replying = Replying::default();
+        assert_eq!(replying.add(0, 10 * crate::admit::PHASE, 0, 0), None);
+        assert_eq!(replying.add(crate::admit::PHASE - 1, 0, 0, 0), None);
+        // 10 ns a turn over 1 ns a piece.
+        let pieces = 10 * crate::admit::PHASE;
+        assert_eq!(
+            replying.add(1, 0, 10 * crate::admit::PHASE, pieces),
+            Some(10)
+        );
+    }
+
+    /// A connection reads the reply's depth the node learned from what its connections wrote: one
+    /// before a phase, a reply's first turn no sample, nothing until the host takes it, and a
+    /// phase's depth once it has.
+    #[test]
+    fn a_connection_reads_the_reply_depth_the_node_learned() {
+        let (mut doorway, submitter) = doorway(1, Waker::noop().clone()).unwrap();
+        assert_eq!(submitter.reply_depth(), Replying::FIRST_ANSWERS);
+        for _ in 0..crate::admit::PHASE {
+            submitter.replied(None, 1, 1_000);
+        }
+        doorway.replies();
+        assert_eq!(submitter.reply_depth(), Replying::FIRST_ANSWERS);
+        // Turns 4 ms apart, two pieces each written in 1 ms: four in flight.
+        for _ in 0..crate::admit::PHASE {
+            submitter.replied(Some(4_000_000), 2, 2_000_000);
+        }
+        assert_eq!(submitter.reply_depth(), Replying::FIRST_ANSWERS);
+        doorway.replies();
+        // The first phase's pieces with no turn wrote quicker, so the depth is past four.
+        assert!(submitter.reply_depth() >= 4, "{}", submitter.reply_depth());
+        for _ in 0..crate::admit::PHASE {
+            submitter.replied(Some(4_000_000), 2, 2_000_000);
+        }
+        doorway.replies();
+        assert_eq!(submitter.reply_depth(), 4);
     }
 
     /// The listener's connections read the depth the node learned: one before any phase, a body's

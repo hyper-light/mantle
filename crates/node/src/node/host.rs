@@ -3190,6 +3190,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let exchange = match &mut job.door {
             Door::Exchange(exchange) => *exchange,
             Door::Local(local) => {
+                // Every piece this turn sends carries the turn, the one held from the last turn's
+                // among them: the node learns the reply's depth from the time between turns its
+                // connection sees (`door::Replying`).
+                let turn = std::time::Instant::now();
+                for answer in &mut local.pending {
+                    if let door::Answer::Bytes(_, at) = answer {
+                        *at = turn;
+                    }
+                }
                 // A piece is taken from the driver only once the last is sent, so the channel holds
                 // what the client has yet to read and the driver the rest of its window.
                 loop {
@@ -3204,7 +3213,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     let took = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                     getting.written = getting.written.saturating_add(took);
                     self.moved = self.moved.saturating_add(took);
-                    if local.offer(door::Answer::Bytes(bytes)) == Sent::Gone {
+                    if local.offer(door::Answer::Bytes(bytes, turn)) == Sent::Gone {
                         return Ok(true);
                     }
                 }

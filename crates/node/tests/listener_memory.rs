@@ -36,7 +36,7 @@ use hyper_tls::pki_types::{CertificateDer, ServerName};
 use hyper_tls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version};
 use mantle_cert::{EndpointKey, EndpointName, Serial, Validity};
 use mantle_node::door::{self, Piece};
-use mantle_node::listener::{Listener, PIECE, Settings, most_pieces, tasks};
+use mantle_node::listener::{Listener, PIECE, Settings, most_answers, most_pieces, tasks};
 use mantle_node::process::AccessKey;
 use mantle_protocol::bounds::STOCK_PATIENCE;
 
@@ -536,7 +536,7 @@ impl<T: std::io::Read + Write> ReadWrite for T {}
 
 /// The host's side of one request, as a node's driver answers it: a put's body taken piece by
 /// piece and each piece let go as it comes, as the driver takes it into its own window; a get's
-/// bytes the static object's, in pieces.
+/// bytes the static object's, in pieces, each sent at a turn of its own.
 async fn host(method: Method, size: usize, mut request: Box<door::Request>) {
     use mantle_protocol::object::{Reply, Status};
     let reply = |size: u64| Reply {
@@ -564,7 +564,7 @@ async fn host(method: Method, size: usize, mut request: Box<door::Request>) {
                 let bytes = bytes::Bytes::from_static(piece);
                 request
                     .reply
-                    .send(door::Answer::Bytes(bytes))
+                    .send(door::Answer::Bytes(bytes, Instant::now()))
                     .await
                     .unwrap();
             }
@@ -614,8 +614,9 @@ async fn settled(since: Instant) {
     }
 }
 
-/// The depth of a put's queue a request is made at: the node's first, before it has measured any,
-/// or the most a body's queue holds (`listener::most_pieces`).
+/// The depths of a request's queues it is made at: the node's first, before it has measured any,
+/// or the most a body's queue holds (`listener::most_pieces`) and a reply's
+/// (`listener::most_answers`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Depth {
     First,
@@ -624,7 +625,7 @@ enum Depth {
 
 /// The listener thread's counts from one connection at rest, its kept buffers made by the same
 /// request before, to the second request's answer read whole by its client and the request let
-/// go, a put's queue at `depth`.
+/// go, its queues at `depth`.
 fn one_request(
     over: Over,
     (method, size, padded): (Method, usize, Padded),
@@ -652,6 +653,16 @@ fn one_request(
                     });
                 }
                 assert!(submitter.depth() >= most_pieces());
+                // And the reply's, past its cap by turns a second apart, each piece written in a
+                // nanosecond, which the host takes at its turn.
+                for _ in 0..10_000 {
+                    if submitter.reply_depth() >= most_answers() {
+                        break;
+                    }
+                    submitter.replied(Some(1_000_000_000), 1, 1);
+                    doorway.replies();
+                }
+                assert!(submitter.reply_depth() >= most_answers());
             }
             let authority = chain.as_ref().map(|c| c.authority.clone());
             let settings = Settings {
@@ -716,12 +727,15 @@ fn one_request(
 /// counted is the door's: its request, its pieces, its TLS records, and the host's reply it
 /// answers from.
 ///
-/// Each request is made at the depth of a put's queue before the node has measured any, one piece,
-/// and at the most a body's queue holds (`listener::most_pieces`), the depth the node learns driven
-/// past it. At the most, a put whose body comes in more than one piece, a read or a TLS record each,
-/// holds `listener::streamed_bytes`: one head and one TLS record, and the pieces in the host's
-/// queue, at most its depth of them. The connection waits for the queue's room before it copies a
-/// piece, so it holds none beside them.
+/// Each request is made at the depths of its queues before the node has measured any, one piece and
+/// one answer, and at the most a body's queue and a reply's hold (`listener::most_pieces`,
+/// `listener::most_answers`), the depths the node learns driven past them. At the most, a put whose
+/// body comes in more than one piece, a read or a TLS record each, holds `listener::streamed_bytes`:
+/// one head and one TLS record, and the pieces in the host's queue, at most its depth of them. The
+/// connection waits for the queue's room before it copies a piece, so it holds none beside them. A
+/// get at the most holds within the same bound as at the first: the pieces in its reply's channel
+/// are the host's, and its channels' larger rings, a few hundred octets more, are within a head's
+/// room.
 ///
 /// A head padded to S3's 8 KB with empty fields, CRLF-ended (about 1,880 of them) or ended by a
 /// lone LF (the most a head carries, about 2,500), holds no more: the door reads a head's fields

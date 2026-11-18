@@ -2395,6 +2395,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// unread, until a job ends and the listener's next answer taken turns the node again. A
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
+        // What the connections wrote of their replies since the last turn: the reply's depth's
+        // samples (`door::Replying`).
+        if let Some(doorway) = self.doorway.as_mut() {
+            doorway.replies();
+        }
         loop {
             let (gateway, learned) = (self.gateway.as_ref(), &self.put_window);
             // A key a connection asks before its operation takes no slot of the host's: it is

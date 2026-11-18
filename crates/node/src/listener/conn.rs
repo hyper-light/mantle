@@ -51,9 +51,6 @@ fn patience_ns() -> u64 {
 /// receive chunk (`crate::node::PIECE`), so a put's driver takes the same pieces by either door.
 pub const PIECE: usize = hyper_transport::RECEIVE_CHUNK;
 
-/// A reply's answers in flight from the host: its head, or a get's piece while the last is sent.
-const REPLY_PIECES: usize = 2;
-
 /// How a connection ended.
 enum Ended {
     /// The client closed it between requests.
@@ -532,11 +529,13 @@ impl Connection {
     ) -> Result<bool, ()> {
         let mut unread = has_body(framing) && body.is_some();
         let slow = |submitter: &Submitter| respond::slowed(submitter.slowed(door::Slowed::Door));
-        // The body's channel holds the pieces the node learned a body needs in flight, within what
-        // the node's memory gives a connection (`super::most_pieces`): fixed as it is made.
+        // The body's channel holds the pieces the node learned a body needs in flight, and the
+        // reply's the answers it learned a reply needs, each within what the node's memory gives a
+        // connection (`super::most_pieces`, `super::most_answers`): fixed as they are made.
         let depth = self.door.depth().min(super::most_pieces()).max(1);
+        let reply_depth = self.door.reply_depth().min(super::most_answers()).max(1);
         let (Ok((pieces, taken)), Ok((answers, mut replies))) =
-            (channel::<Piece>(depth), channel::<Answer>(REPLY_PIECES))
+            (channel::<Piece>(depth), channel::<Answer>(reply_depth))
         else {
             return self
                 .refuse(&slow(&self.door), resource, ids, (version, head), unread)
@@ -614,7 +613,7 @@ impl Connection {
                 }
                 // A reply's end, or bytes, with no head before them: the host's word is not
                 // whole, and nothing of it can be answered as done.
-                Ok(Answer::Bytes(_) | Answer::End | Answer::Failed) | Err(_) => {
+                Ok(Answer::Bytes(..) | Answer::End | Answer::Failed) | Err(_) => {
                     let failed = respond::refusal(Status::Failed);
                     return self
                         .refuse(&failed, resource, ids, (version, head), unread)
@@ -627,7 +626,9 @@ impl Connection {
     /// A get's bytes, as the host gives them, until their end: `length` of them, as the head
     /// in `output` said, which goes in one write with the first of them. A reply that fails or
     /// ends short ends the connection with the response unfinished, so no client takes a short
-    /// body for the object's (node.md §4.4).
+    /// body for the object's (node.md §4.4). Each turn of the host's that gave pieces, and each
+    /// piece's writing, timed from its taking to its last octet written, are the reply depth's
+    /// samples (`door::Replying`), told the node at each turn's first piece and at the end.
     async fn object(
         &mut self,
         replies: &mut hyper_rt::sync::ChannelReceiver<Answer>,
@@ -638,11 +639,26 @@ impl Connection {
         };
         let mut sent = 0u64;
         let mut head = true;
+        // The host's turn that gave the last piece, and the pieces of it written and their time.
+        let mut turn: Option<std::time::Instant> = None;
+        let (mut pieces, mut written_ns) = (0u64, 0u64);
         loop {
             let answer = replies.recv().await;
+            let taken = std::time::Instant::now();
             self.door.wake();
             match answer {
-                Ok(Answer::Bytes(bytes)) => {
+                Ok(Answer::Bytes(bytes, given)) => {
+                    if turn != Some(given) {
+                        // A turn's first piece: the time since the turn before, none for the
+                        // reply's first, whose time is its driver's first read; and the last
+                        // turn's writing.
+                        let since = turn.map(|turn| {
+                            u64::try_from(given.saturating_duration_since(turn).as_nanos())
+                                .unwrap_or(u64::MAX)
+                        });
+                        self.door.replied(since, pieces, written_ns);
+                        (turn, pieces, written_ns) = (Some(given), 0, 0);
+                    }
                     sent = u64::try_from(bytes.len())
                         .ok()
                         .and_then(|n| sent.checked_add(n))
@@ -654,8 +670,12 @@ impl Connection {
                         .await
                         .map_err(|_| ())?;
                     head = false;
+                    let took = u64::try_from(taken.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    pieces = pieces.saturating_add(1);
+                    written_ns = written_ns.saturating_add(took.max(1));
                 }
                 Ok(Answer::End) if sent == length => {
+                    self.door.replied(None, pieces, written_ns);
                     // An empty object's head goes alone.
                     if head {
                         self.io.write(&self.output).await.map_err(|_| ())?;

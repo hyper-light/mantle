@@ -94,6 +94,10 @@ struct Job {
 /// listener wakes the stub as it wakes a node: at each submission, each piece sent and each answer
 /// taken.
 fn host(doorway: &mut Doorway, jobs: &mut Vec<Job>, object: &Bytes) {
+    // The turn every piece it sends carries, and what the connections wrote of their replies, as a
+    // node takes them each turn.
+    let turn = Instant::now();
+    doorway.replies();
     while let Some(asked) = doorway.take() {
         let request = match asked {
             door::Asked::Op(request) => *request,
@@ -127,7 +131,7 @@ fn host(doorway: &mut Doorway, jobs: &mut Vec<Job>, object: &Bytes) {
                 let mut at = 0usize;
                 while at < object.len() {
                     let end = at.saturating_add(PIECE).min(object.len());
-                    answers.push_back(Answer::Bytes(object.slice(at..end)));
+                    answers.push_back(Answer::Bytes(object.slice(at..end), Instant::now()));
                     at = end;
                 }
                 answers.push_back(Answer::End);
@@ -159,7 +163,11 @@ fn host(doorway: &mut Doorway, jobs: &mut Vec<Job>, object: &Bytes) {
                 Ok(Some(Piece::Refused(_))) | Err(_) => return false,
             }
         }
-        while let Some(answer) = job.answers.pop_front() {
+        while let Some(mut answer) = job.answers.pop_front() {
+            // Each piece carries the turn that sends it, as a node's do.
+            if let Answer::Bytes(_, at) = &mut answer {
+                *at = turn;
+            }
             match job.request.reply.try_send(answer) {
                 Ok(()) => {}
                 Err(SyncError::Full(answer)) => {

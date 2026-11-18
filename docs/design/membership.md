@@ -192,15 +192,19 @@ standard input (one running), the steps a supervisor runs without a person:
    leaving node stays up through this, serving the reads repair copies from.
 5. With no volume of it left in the table and no range having it vote, the root range's leader
    asks `Remove { node }`: removed. The leaving node, still a learner of the root range, applies
-   it and says `left`. It stays admitted while the root range keeps it as a learner (§2 rule 2),
-   and serves on, so the leader hears that its storage holds the commit that removed it: a member's
-   answers carry its durable commit (hyper-raft core step R-6), and a leader elected meanwhile,
-   whose tracker starts empty, hears it again. The leader then drops it from the root range's
-   configuration (a learner dropped sooner would never hear of its own removal), and, once no range
-   names it, asks `Delist { node }`: its rows go. Each member refuses its identity once it applies
-   the drop, and the leaving node, at the first refusal since its removal, stops in order and exits
-   0. Refused at the removal itself, as the members first did, it could not answer: it either never
-   heard its removal or was never heard, and the leader kept it as a learner for good.
+   it and says `left` once its own replica holds its row `Removed` (a row not read yet says
+   nothing of its volumes). It stays admitted while the root range keeps it as a learner (§2
+   rule 2), and serves on, so the leader hears that its storage holds the commit that removed it:
+   a member's answers carry its durable commit (hyper-raft core step R-6), and a leader elected
+   meanwhile, whose tracker starts empty, hears it again. The leader then drops it from the root
+   range's configuration (a learner dropped sooner would never hear of its own removal), and, once
+   no range names it, asks `Delist { node }`: its rows go. Each member refuses its identity once it
+   applies the drop, and the leaving node, at the first refusal since its removal by a member its
+   replica holds serving or leaving, stops in order and exits 0 (`Departure::settle` in
+   `crate::process`). A link its own handshake refused, to a member gone, removed or delisted,
+   says nothing of its own standing and does not stop it. Refused at the removal itself, as the
+   members first did, it could not answer: it either never heard its removal or was never heard,
+   and the leader kept it as a learner for good.
 
 A leave never completes while its volumes hold a chunk the cell needs: until repair has retired
 them, the node waits in step 4, which keeps every acknowledged object as whole as it was.

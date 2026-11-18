@@ -2967,7 +2967,7 @@ enum Departure {
     /// Removed, as its own replica of the root range applied it: it said `left`, and serves on,
     /// admitted as the root range's learner, so the root range's leader hears that its storage
     /// holds the commit that removed it, which the leader waits for before it drops the learner
-    /// (membership.md §4 step 5); a leader elected meanwhile hears it from it again. A peer's
+    /// (membership.md §4 step 5); a leader elected meanwhile hears it from it again. A member's
     /// refusal of its identity says the cell has dropped it, the leader having heard: each
     /// peer's link endings as counted at its removal, so a refusal from before does not count.
     Removed(Vec<(u64, u64)>),
@@ -3042,35 +3042,67 @@ impl Departure {
                 Some(other) => Err(ProcessError::Enlist(format!("the leave: {other:?}"))),
                 None => Ok(None),
             },
-            Self::Leaving => {
-                let removed = node
-                    .cell()
-                    .and_then(|cell| cell.member(node.id()))
-                    .is_none_or(|row| row.state == MemberState::Removed);
-                if removed {
-                    *self = Self::Removed(node.links().map(|l| (l.peer, l.ended)).collect());
-                    Ok(Some("left\n"))
-                } else {
-                    Ok(None)
+            Self::Leaving | Self::Removed(_) => {
+                let cell = node.cell();
+                let standing = |id| cell.and_then(|c| c.member(id)).map(|row| row.state);
+                let said = self.settle(standing, node.id(), node.links());
+                if matches!(self, Self::Left) {
+                    node.stop();
                 }
+                Ok(said)
+            }
+            Self::Staying | Self::Left | Self::Draining => Ok(None),
+        }
+    }
+
+    /// A leave's end, judged from what the node `own` holds once the root range holds it leaving:
+    /// `standing` each member's state as its own replica of the root range holds it, and its
+    /// links. What to say, if anything.
+    ///
+    /// Removed only once its own row says so: the root range removes a member only once no volume
+    /// of it is left in the table (membership.md §1, `Leaving` to `Removed`), so its chunks have
+    /// moved off; a row not read yet, or still leaving, says nothing of that. Then stopped only at
+    /// a refusal of its identity since its removal by a member its replica holds serving or
+    /// leaving: those admit it until they apply its drop from the root range, which its leader
+    /// asks only once it heard that the node's storage holds its removal (§4 step 5), and refuse
+    /// it at once from then (§2). A link this node's own handshake refused, to a member gone,
+    /// removed or delisted, says nothing of its own standing.
+    fn settle(
+        &mut self,
+        standing: impl Fn(u64) -> Option<MemberState>,
+        own: u64,
+        mut links: impl Iterator<Item = Link>,
+    ) -> Option<&'static str> {
+        match self {
+            Self::Leaving if standing(own) == Some(MemberState::Removed) => {
+                *self = Self::Removed(links.map(|l| (l.peer, l.ended)).collect());
+                Some("left\n")
             }
             Self::Removed(ended) => {
-                let refused = node.links().any(|l| {
+                let dropped = links.any(|l| {
                     l.refusal == Some(Refusal::Identity)
                         && ended
                             .iter()
                             .find(|(peer, _)| *peer == l.peer)
                             .is_none_or(|(_, then)| l.ended > *then)
+                        && matches!(
+                            standing(l.peer),
+                            Some(MemberState::Serving | MemberState::Leaving)
+                        )
                 });
-                if refused {
+                if dropped {
                     *self = Self::Left;
-                    node.stop();
-                    Ok(Some("stopping\n"))
+                    Some("stopping\n")
                 } else {
-                    Ok(None)
+                    None
                 }
             }
-            Self::Staying | Self::Left | Self::Draining => Ok(None),
+            Self::Staying
+            | Self::Wanting(_)
+            | Self::Asking(_)
+            | Self::Leaving
+            | Self::Left
+            | Self::Draining => None,
         }
     }
 }
@@ -4294,5 +4326,68 @@ mod tests {
             matches!(&ran, Err(ProcessError::Runtime(e)) if e.contains("without its output")),
             "{ran:?}"
         );
+    }
+
+    /// A leave ends in order (membership.md §4): `left` only once the node's own replica of the
+    /// root range holds its row removed, which the root range applies only once no volume of it
+    /// is left in the table (§1), and the stop only at a refusal of its identity since then by a
+    /// member its replica holds serving or leaving. A refusal from before its removal, a link
+    /// ending another way, and its own handshakes' refusals of a member gone, removed or delisted
+    /// do not stop it.
+    #[test]
+    fn a_leaver_stops_only_once_its_leave_is_complete() {
+        let link = |peer: u64, ended: u64, refusal: Option<Refusal>| Link {
+            peer,
+            keyed: false,
+            dials: 0,
+            ended,
+            suspected: 0,
+            suspect: false,
+            refusal,
+        };
+        let identity = Some(Refusal::Identity);
+        // Node 1 leaves; 2 and 3 serve, 4 is gone, 5 removed, 6 delisted.
+        let rows = |own: Option<MemberState>| {
+            move |id: u64| match id {
+                1 => own,
+                2 | 3 => Some(MemberState::Serving),
+                4 => Some(MemberState::Gone),
+                5 => Some(MemberState::Removed),
+                _ => None,
+            }
+        };
+        let mut leave = Departure::Leaving;
+        // Its row not read yet, leaving, or gone: not removed, whatever its links say.
+        for own in [None, Some(MemberState::Leaving), Some(MemberState::Gone)] {
+            let links = [link(2, 1, identity), link(3, 1, identity)];
+            assert_eq!(leave.settle(rows(own), 1, links.into_iter()), None);
+            assert!(matches!(leave, Departure::Leaving));
+        }
+        // Removed: `left`, each link's endings counted then, so 2's refusal from before counts
+        // no more.
+        let removed = rows(Some(MemberState::Removed));
+        let links = [link(2, 1, identity), link(3, 0, None)];
+        assert_eq!(leave.settle(removed, 1, links.into_iter()), Some("left\n"));
+        assert!(matches!(leave, Departure::Removed(_)));
+        assert_eq!(leave.settle(removed, 1, links.into_iter()), None);
+        // A serving member's link ending another way, and this node's own refusals of members
+        // gone, removed and delisted: no stop.
+        let links = [
+            link(2, 1, identity),
+            link(3, 1, Some(Refusal::Closed)),
+            link(4, 1, identity),
+            link(5, 2, identity),
+            link(6, 1, identity),
+        ];
+        assert_eq!(leave.settle(removed, 1, links.into_iter()), None);
+        assert!(matches!(leave, Departure::Removed(_)));
+        // A serving member refused it since its removal: the cell dropped it, and it stops.
+        let links = [link(2, 1, identity), link(3, 2, identity)];
+        assert_eq!(
+            leave.settle(removed, 1, links.into_iter()),
+            Some("stopping\n")
+        );
+        assert!(matches!(leave, Departure::Left));
+        assert_eq!(leave.settle(removed, 1, links.into_iter()), None);
     }
 }

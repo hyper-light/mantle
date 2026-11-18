@@ -604,8 +604,19 @@ async fn told(from: &std::sync::mpsc::Receiver<u16>, since: Instant) -> u16 {
     }
 }
 
+/// The listener's thread back at its connection's rest, within a stock client's patience: a client
+/// can read an answer whole before its connection has taken the reply's end from the host and let
+/// the request go (1,884 octets of a TLS 1.3 GET were once still held), so a count waits on that
+/// fact, not on the answer alone, and one never back at rest is counted as it stands.
+async fn settled(since: Instant) {
+    while alloc::read().live > 0 && since.elapsed() <= STOCK_PATIENCE {
+        hyper_rt::futures::sleep(1_000_000).await.unwrap();
+    }
+}
+
 /// The listener thread's counts from one connection at rest, its kept buffers made by the same
-/// request before, to the second request's answer read whole by its client.
+/// request before, to the second request's answer read whole by its client and the request let
+/// go.
 fn one_request(
     over: Over,
     (method, size, padded): (Method, usize, Padded),
@@ -649,6 +660,7 @@ fn one_request(
                 let second = next(&mut doorway, started).await;
                 host(method, size, second).await;
                 let second = told(&answered, started).await;
+                settled(started).await;
                 let counts = alloc::end();
                 (counts, first, second)
             };

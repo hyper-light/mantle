@@ -409,23 +409,43 @@ fn every_object_reads_back(cell: &mut Cell, load: &mut Steady, through: &[u64], 
         })
         .collect();
     let read = cell.objects(gets);
-    for (outcome, n) in read.iter().zip(&numbers) {
-        // A read refused says what the cell said last: each range's status at each node, each
-        // node's links and its record of the others.
+    for (at, (outcome, n)) in read.iter().zip(&numbers).enumerate() {
+        let node = through[at % through.len()];
+        // A read refused or lost says the node it asked, and what the cell said last, with what it
+        // said and was not yet taken: each range's status at each node, each node's links and its
+        // record of the others; each node's longest poll and how long ago it said it; and how long
+        // since each node's last status moved, as a poll still holding a node says nothing.
         if !matches!(outcome, ObjectOutcome::Replied { reply, .. } if reply.status == ObjectStatus::Done)
         {
+            cell.take_heard();
+            let polls: BTreeMap<u64, (Duration, Duration)> = cell
+                .polls
+                .iter()
+                .map(|(id, (heard, longest))| (*id, (*longest, heard.elapsed())))
+                .collect();
+            let since: BTreeMap<u64, Duration> = cell
+                .log
+                .iter()
+                .map(|(id, (heard, ..))| (*id, heard.elapsed()))
+                .collect();
             panic!(
-                "{step}: {} natively: {outcome:?}; status {:?}; links {:?}; standings {:?}",
+                "{step}: {} natively through node {node}, read {at} of {}: {outcome:?}; status \
+                 {:?}; links {:?}; standings {:?}; longest polls, each said how long ago \
+                 {polls:?}; since each node's last status {since:?}",
                 key_of(*n),
+                numbers.len(),
                 cell.status,
                 cell.links,
                 cell.standings
             );
         }
         assert_eq!(
-            done(outcome, &format!("{step}: {} natively", key_of(*n))),
+            done(
+                outcome,
+                &format!("{step}: {} natively through node {node}", key_of(*n))
+            ),
             object_bytes(*n, OBJECT_BYTES),
-            "{step}: {} read back natively other than it was put by {:?}",
+            "{step}: {} read back natively through node {node} other than it was put by {:?}",
             key_of(*n),
             load.acked[n]
         );
@@ -447,7 +467,7 @@ fn every_object_reads_back(cell: &mut Cell, load: &mut Steady, through: &[u64], 
         assert_eq!(
             response.body,
             object_bytes(*n, OBJECT_BYTES),
-            "{step}: {} read back through S3 other than it was put by {:?}",
+            "{step}: {} read back through S3 of node {node} other than it was put by {:?}",
             key_of(*n),
             load.acked[n]
         );
@@ -762,4 +782,16 @@ fn a_member_with_nothing_to_move_leaves_whole_and_one_stated_gone_is_refused() {
         &founders,
         "after a member was stated gone",
     );
+}
+
+/// A node's `longest-poll` line, as its process writes it (`process::longest_poll_line`), parses
+/// to the poll it says, which a refused read's dump shows; a line of another shape parses to none.
+#[test]
+fn a_longest_poll_line_parses_to_its_poll() {
+    assert_eq!(
+        parse("longest-poll 3072000001"),
+        Some(Line::LongestPoll(Duration::from_nanos(3_072_000_001)))
+    );
+    assert_eq!(parse("longest-poll"), None);
+    assert_eq!(parse("longest-poll 3.072s"), None);
 }

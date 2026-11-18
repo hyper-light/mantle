@@ -447,6 +447,9 @@ pub(crate) enum Line {
     },
     /// Whether the node waits on its own device (`Node::held`), said as it changes.
     Held(bool),
+    /// The longest poll the node's shard has run since its process began, said as it grows: the
+    /// longest the node's thread was held from every exchange it carries.
+    LongestPoll(Duration),
     /// The node's log as it said with its last status: how long its flush had been out, if one
     /// was, and the longest an update has waited for its commit.
     Log(Option<Duration>, Duration),
@@ -642,6 +645,9 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
                 running: running.parse().ok()?,
             }))
         }
+        ["longest-poll", longest] => Some(Line::LongestPoll(Duration::from_nanos(
+            longest.parse().ok()?,
+        ))),
         ["held", held] => Some(Line::Held(match *held {
             "0" => false,
             "1" => true,
@@ -720,6 +726,7 @@ pub(crate) fn movement(line: &Line) -> Option<Movement> {
         | Line::Log(..)
         | Line::Room(..)
         | Line::Held(..)
+        | Line::LongestPoll(..)
         | Line::Volume(..)
         | Line::S3(..)
         | Line::S3Bound(..)
@@ -1109,6 +1116,9 @@ pub(crate) struct Cell {
     /// Each running node's log refusals for room as its process last said them: its rounds of
     /// compaction and its liveness stream's waits.
     pub(crate) room: BTreeMap<u64, (u64, u64)>,
+    /// Each running node's longest poll as its process last said it, and when that was heard: a
+    /// process says it as it grows, so when tells which stretch of the test ran it.
+    pub(crate) polls: BTreeMap<u64, (Instant, Duration)>,
     /// The bytes each node's transfers moved as it last said, and its transport's serve period: a
     /// transfer that lives moves within one, so the quiet period is never shorter.
     pub(crate) transfers: BTreeMap<u64, (u64, Duration)>,
@@ -1485,6 +1495,7 @@ impl Cell {
             links: BTreeMap::new(),
             log: BTreeMap::new(),
             room: BTreeMap::new(),
+            polls: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&founders.iter().map(|(id, _)| *id).collect::<Vec<_>>())),
@@ -1620,6 +1631,7 @@ impl Cell {
             links: BTreeMap::new(),
             log: BTreeMap::new(),
             room: BTreeMap::new(),
+            polls: BTreeMap::new(),
             transfers: BTreeMap::new(),
             relay: (network == Network::Relayed)
                 .then(|| Relay::start(&(1..=nodes).collect::<Vec<_>>())),
@@ -1950,6 +1962,7 @@ impl Cell {
         self.held.remove(&id);
         self.log.remove(&id);
         self.room.remove(&id);
+        self.polls.remove(&id);
         self.transfers.remove(&id);
         self.hold();
     }
@@ -1974,6 +1987,7 @@ impl Cell {
                 | Line::Log(..)
                 | Line::Room(..)
                 | Line::Held(..)
+                | Line::LongestPoll(..)
                 | Line::Volume(..)
                 | Line::S3(..)
                 | Line::S3Bound(..)
@@ -2081,14 +2095,15 @@ impl Cell {
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
                     "quiet for {quiet:?} with nothing moved, besides {:?} held still for the \
                      devices and {:?} the host held the watch: {:?}, progress {:?}, links {:?}, \
-                     log {:?}, room {:?}",
+                     log {:?}, room {:?}, longest polls {:?}",
                     self.held_for,
                     self.host_held,
                     self.status,
                     self.progress,
                     self.links,
                     self.log,
-                    self.room
+                    self.room,
+                    self.polls
                 ),
             }
         }
@@ -2157,6 +2172,11 @@ impl Cell {
                     // whose log refuses every write may count refusals for good.
                     Line::Room(compactions, waits) => {
                         self.room.insert(id, (compactions, waits));
+                        return;
+                    }
+                    // A poll grown longer moves nothing: the cell moves as the node goes on.
+                    Line::LongestPoll(longest) => {
+                        self.polls.insert(id, (Instant::now(), longest));
                         return;
                     }
                     Line::Volume(volume) => {
@@ -2239,6 +2259,7 @@ impl Cell {
                     self.held.remove(&id);
                     self.log.remove(&id);
                     self.room.remove(&id);
+                    self.polls.remove(&id);
                     self.transfers.remove(&id);
                 }
             }
@@ -2703,7 +2724,7 @@ pub(crate) fn objects(
                 match client.object(node, &op, &data, u64::MAX).await {
                     Ok(outcome) => outcomes.push(outcome),
                     Err(error) => {
-                        let why = format!("object operation {done}: {error}");
+                        let why = format!("object operation {done} through node {node}: {error}");
                         let _ = tell.send(Heard::Told(Told::Failed(id, why)));
                         return outcomes;
                     }
@@ -2773,20 +2794,22 @@ pub(crate) fn gateway(
             }
             let mut outcomes = Vec::with_capacity(ops.len());
             for (done, op) in (1..).zip(ops) {
-                let outcome = match op {
-                    Chunked::Put(node, volume, key, bytes, crc32c) => {
+                let (node, outcome) = match op {
+                    Chunked::Put(node, volume, key, bytes, crc32c) => (
+                        node,
                         client
                             .put_chunk(node, (volume, key), &bytes, crc32c, u64::MAX)
-                            .await
-                    }
-                    Chunked::Get(node, volume, key, range) => {
-                        client.get_chunk(node, (volume, key), range, u64::MAX).await
-                    }
+                            .await,
+                    ),
+                    Chunked::Get(node, volume, key, range) => (
+                        node,
+                        client.get_chunk(node, (volume, key), range, u64::MAX).await,
+                    ),
                 };
                 match outcome {
                     Ok(outcome) => outcomes.push(outcome),
                     Err(error) => {
-                        let why = format!("chunk operation {done}: {error}");
+                        let why = format!("chunk operation {done} through node {node}: {error}");
                         let _ = tell.send(Heard::Told(Told::Failed(GATEWAY, why)));
                         return outcomes;
                     }

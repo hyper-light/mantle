@@ -2178,6 +2178,8 @@ async fn serve(
     let mut said_room: Option<(u64, u64)> = None;
     // The cell's repair on this node as last said, none before the first saying.
     let mut said_repair: Option<crate::node::RepairStatus> = None;
+    // The longest poll of the node's shard as last said, 0 before the first saying.
+    let mut said_poll = 0u64;
     let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(|e| talk(format!("{e:?}")))?;
     let mut stop = Stop::new(config.stop);
     // Whether standard input may say more: a node that does not end with it runs on once it closes,
@@ -2188,8 +2190,8 @@ async fn serve(
     // flush a turn that says anything, where each line was a `String` and a flush of its own. Its
     // storage is kept across the loop's turns, emptied each time it is said, so a turn regrows
     // nothing: no pool, the loop's one buffer. Bound: one turn's lines, a line for each link and
-    // each range at most, and one each for the replaced, the movement, the held state, the log
-    // and the handovers, every line a few numbers long.
+    // each range at most, and one each for the replaced, the movement, the held state, the
+    // longest poll, the log and the handovers, every line a few numbers long.
     let mut lines = String::new();
     let wrote = |e: std::fmt::Error| ProcessError::Runtime(e.to_string());
     loop {
@@ -2489,6 +2491,14 @@ async fn serve(
             writeln!(lines, "held {}", u8::from(held)).map_err(wrote)?;
             said_held = Some(held);
         }
+        // The longest poll the node's shard has run, said as it grows: a poll holds the one thread
+        // every exchange the node carries waits on, so a poll past the transport's idle timeout
+        // (`mantle_protocol::bounds::idle_timeout`) loses each exchange, and a watcher that sees
+        // one lost tells from this line whether a poll held the node that long.
+        let longest_ns = hyper_rt::futures::shard_counters()
+            .ok_or_else(|| ProcessError::Runtime("the node's loop runs on no shard".into()))?
+            .longest_step_ns;
+        said_poll = longest_poll_line(&mut lines, said_poll, longest_ns).map_err(wrote)?;
         let mut said = false;
         let mut room = (0u64, 0u64);
         for ((group, _), was) in config.ranges.iter().zip(told.iter_mut()) {
@@ -2953,6 +2963,21 @@ fn status_line(lines: &mut String, group: u128, now: &Status) -> std::fmt::Resul
     )
 }
 
+/// `longest-poll NS`, written onto `lines` where `longest_ns`, the longest poll the node's shard
+/// has run (hyper-rt's `Counters::longest_step_ns`: one task's poll by the wall clock, since the
+/// process began), is past the one last `said`: the longest said now.
+fn longest_poll_line(
+    lines: &mut String,
+    said: u64,
+    longest_ns: u64,
+) -> Result<u64, std::fmt::Error> {
+    if longest_ns <= said {
+        return Ok(said);
+    }
+    writeln!(lines, "longest-poll {longest_ns}")?;
+    Ok(longest_ns)
+}
+
 /// The cell's repair as this node runs it (docs/design/repair.md §5): `repair LEADING SETTLED
 /// ROOT_APPLIED BLOCK_APPLIED REBUILT TIMING COMMANDS UNPLACED UNREADABLE CORRUPT WAITING SHORT LOST
 /// TAKERS RUNNING`, each flag 0 or 1, said each time it changes.
@@ -3132,6 +3157,22 @@ mod tests {
         status_line(&mut before, 0x2a, &status(54)).unwrap();
         status_line(&mut after, 0x2a, &status(56)).unwrap();
         assert_ne!(before, after, "two statuses of a node measuring read alike");
+    }
+
+    /// The longest poll is said as it grows and only then: a turn whose longest is no longer than
+    /// the one said says nothing, and one past it says it, `longest-poll NS`, which is then the one
+    /// said. The longest a process starts from, none, says nothing.
+    #[test]
+    fn the_longest_poll_is_said_as_it_grows() {
+        let mut lines = String::new();
+        assert_eq!(longest_poll_line(&mut lines, 0, 0).unwrap(), 0);
+        assert_eq!(longest_poll_line(&mut lines, 0, 4_200).unwrap(), 4_200);
+        assert_eq!(longest_poll_line(&mut lines, 4_200, 4_200).unwrap(), 4_200);
+        assert_eq!(
+            longest_poll_line(&mut lines, 4_200, 3_072_000_001).unwrap(),
+            3_072_000_001
+        );
+        assert_eq!(lines, "longest-poll 4200\nlongest-poll 3072000001\n");
     }
 
     #[test]

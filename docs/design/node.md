@@ -316,10 +316,11 @@ measures the second, and derives the rest by these rules:
   one for the first's role (`derive::shard_shape`, as `process::runtime` sizes them), at 11,875
   bytes, 206 a task slot, 84 a timer, 397 a readiness waiter and 16 a slot of its waiters' table,
   the power of two at or past twice them, and 64 a control entry, as many as the host's
-  calibration gives a shard (the `ring` basis line); and with an S3 listener its lane to each
+  calibration gives a shard (the `ring` basis line); the classes the first shard's queue makes as
+  the node's task takes Critical there, 192 bytes and 9 a task slot; and with an S3 listener its lane to each
   shard past the first, 1,576 bytes and 88 for each connection the listener holds at once
   (`listener::tasks`). At ten shards and 256 connections served, 3.6 MB stated against 2.6 MB
-  counted on macOS arm64: a waiter's 397 holds Windows' table of its outstanding polls, 188 of
+  counted on macOS arm64 (3,605,177 and 2,560,629 bytes): a waiter's 397 holds Windows' table of its outstanding polls, 188 of
   them, derived from its sizes; a lane's 88, Windows' socket of 8 octets where a descriptor is 4);
   and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:

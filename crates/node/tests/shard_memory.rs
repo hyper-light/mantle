@@ -23,6 +23,7 @@ use std::sync::mpsc::sync_channel;
 use std::task::Waker;
 
 use hyper_measure::alloc;
+use hyper_rt::coop::Class;
 use hyper_rt::runtime::{Runtime, RuntimeConfig, WakeTracking};
 use mantle_node::derive::{self, ShardShape};
 use mantle_node::listener::{Listener, Settings};
@@ -99,6 +100,28 @@ fn lanes(rt: &Runtime, served: u64) -> u64 {
     })
     .unwrap();
     u64::try_from(heard.recv().unwrap()).unwrap()
+}
+
+/// What a shard of `shape` makes as a task on it first takes `class`, past what a Normal task
+/// spawned alike makes, counted on the shard's thread around the spawn: the queue's classes
+/// (hyper-rt `queue::Kept`) and the class's lists, the node's task being Critical on the first
+/// shard (`process::run_on_first_shard`).
+fn classed(shape: &ShardShape, class: Class) -> u64 {
+    let spawned = |class| {
+        let rt = Runtime::start(&config(1, shape, 4)).unwrap();
+        let (told, heard) = sync_channel(1);
+        rt.spawn_on(rt.shard_ids()[0], async move {
+            alloc::begin();
+            hyper_rt::futures::spawn_detached_as(class, std::future::pending::<()>()).unwrap();
+            let live = alloc::end().live;
+            told.try_send(live).unwrap();
+        })
+        .unwrap();
+        let live = heard.recv().unwrap();
+        rt.shutdown().unwrap();
+        live
+    };
+    u64::try_from(spawned(class) - spawned(Class::Normal)).unwrap()
 }
 
 /// Each of the runtime's figures is what the running code holds for it: what one more shard, task
@@ -182,6 +205,25 @@ fn each_figure_of_the_runtime_holds_what_it_counts() {
         + 4 * derive::SHARD_RING_BYTES;
     assert!(shard <= derive::SHARD_BYTES + counted, "{shard}");
 
+    // The node's task Critical on the first shard: the queue's classes and Critical's lists.
+    let critical = classed(&base, Class::Critical);
+    let critical_slots = classed(
+        &ShardShape {
+            tasks: 1028,
+            ..base
+        },
+        Class::Critical,
+    ) - critical;
+    eprintln!("Critical at four tasks {critical}; 1,024 tasks more {critical_slots}");
+    assert!(
+        critical_slots <= 1024 * derive::CRITICAL_SLOT_BYTES,
+        "{critical_slots}"
+    );
+    assert!(
+        critical <= derive::CRITICAL_BYTES + 4 * derive::CRITICAL_SLOT_BYTES,
+        "{critical}"
+    );
+
     // A lane: its own and its connections', one for each the listener holds at once.
     let rt = Runtime::start(&config(3, &base, 4)).unwrap();
     let one_lane = |served| {
@@ -223,7 +265,8 @@ fn the_floor_holds_the_nodes_runtime_at_every_shape() {
                 for ring in [1, 16, 1024] {
                     let shape = derive::shard_shape(listening, peers).unwrap();
                     let runtime = config(shards, &shape, ring);
-                    let mut held = started(&runtime);
+                    // The node's task Critical on the first shard.
+                    let mut held = started(&runtime) + classed(&shape, Class::Critical);
                     if let Some(served) = listening.filter(|_| shards > 1) {
                         let rt = Runtime::start(&runtime).unwrap();
                         held += lanes(&rt, served);

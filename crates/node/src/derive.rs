@@ -1268,6 +1268,20 @@ pub const SHARD_INTEREST_SLOT_BYTES: u64 = 16;
 /// measured on macOS arm64, 40 an entry and 24 a poll of the batch, from 5 entries to 1,024.
 pub const SHARD_RING_BYTES: u64 = 64;
 
+/// What the first shard's queue makes as the node's task takes the Critical class
+/// (`process::run_on_first_shard`; hyper-rt `queue::Kept`, made once a shard's first task takes a
+/// class other than Normal, and kept): the classes' own state and Critical's lists' besides their
+/// slots. Counted on the shard's thread around the spawn, a Critical spawn's count less a Normal
+/// one's of the same future (`tests/shard_memory.rs`, macOS arm64, 2026-11-17): 228 at four task
+/// slots, 192 less their 36. No other task of the node takes a class, and none of it is the
+/// driver's, so no platform holds more.
+pub const CRITICAL_BYTES: u64 = 192;
+
+/// What the first shard's queue makes for each of its task slots as the node's task takes the
+/// Critical class: the slot's class, an octet, and its places in Critical's two lists, four octets
+/// each. Counted on macOS arm64: 9,216 for 1,024 slots more, 9 a slot.
+pub const CRITICAL_SLOT_BYTES: u64 = 9;
+
 /// What the S3 listener's lane to a shard past the first holds besides its connections: the lane,
 /// its channel's and count's own state, and its taker's task as it is handed to the shard.
 /// Measured on the listener's thread around `Listener::spread` (`tests/shard_memory.rs`, macOS
@@ -1319,9 +1333,10 @@ pub fn shard_shape(listening: Option<u64>, peers: usize) -> Option<ShardShape> {
 
 /// What the node's runtime holds of its `shards` shards, each of `shape` with `ring` control
 /// entries, beside their threads' stacks ([`stacks`]): its own ([`RUNTIME_BYTES`]); each shard's
-/// fixed bytes, its tasks', timers', waiters', waiters' table's and control entries'; and where an
-/// S3 listener serves `listening` connections, its lane to each shard past the first, each holding
-/// as many as the listener holds at once (`listener::tasks`).
+/// fixed bytes, its tasks', timers', waiters', waiters' table's and control entries'; the classes
+/// the first shard's queue makes as the node's task takes Critical there ([`CRITICAL_BYTES`]); and
+/// where an S3 listener serves `listening` connections, its lane to each shard past the first, each
+/// holding as many as the listener holds at once (`listener::tasks`).
 pub fn runtime_bytes(
     shards: usize,
     shape: &ShardShape,
@@ -1346,12 +1361,16 @@ pub fn runtime_bytes(
             .checked_add(LANE_BYTES)?,
         None => 0,
     };
+    let critical = CRITICAL_SLOT_BYTES
+        .checked_mul(count(shape.tasks)?)?
+        .checked_add(CRITICAL_BYTES)?;
     let shards = count(shards)?;
     // The shards past the first, each with a lane: none past a lone shard.
     let lanes = shards.saturating_sub(1).checked_mul(lane)?;
     shards
         .checked_mul(shard)?
         .checked_add(RUNTIME_BYTES)?
+        .checked_add(critical)?
         .checked_add(lanes)
 }
 
@@ -3448,8 +3467,9 @@ mod tests {
 
     /// Each shard is sized for the first's role: the node's task and launcher, the timers its task
     /// holds, and with an S3 listener a task, a timer and a socket for each connection it holds at
-    /// once, two waiters a socket; the runtime holds each shard at those, and a lane to each shard
-    /// past the first holding as many connections.
+    /// once, two waiters a socket; the runtime holds each shard at those, the classes the node's
+    /// Critical task makes on the first, and a lane to each shard past the first holding as many
+    /// connections.
     #[test]
     fn the_runtime_holds_each_shard_at_the_firsts_shape_and_a_lane_past_the_first() {
         assert_eq!(
@@ -3477,13 +3497,15 @@ mod tests {
             + 2048 * SHARD_INTEREST_SLOT_BYTES
             + 16 * SHARD_RING_BYTES;
         let lane = LANE_BYTES + 266 * LANE_CONNECTION_BYTES;
+        // The node's task Critical on the first shard alone.
+        let critical = CRITICAL_BYTES + 268 * CRITICAL_SLOT_BYTES;
         assert_eq!(
             runtime_bytes(1, &shape, 16, Some(256)),
-            Some(RUNTIME_BYTES + shard)
+            Some(RUNTIME_BYTES + shard + critical)
         );
         assert_eq!(
             runtime_bytes(10, &shape, 16, Some(256)),
-            Some(RUNTIME_BYTES + 10 * shard + 9 * lane)
+            Some(RUNTIME_BYTES + 10 * shard + critical + 9 * lane)
         );
         // No listener, no lane.
         let alone = shard_shape(None, 4).unwrap();
@@ -3491,6 +3513,8 @@ mod tests {
             runtime_bytes(10, &alone, 16, None),
             Some(
                 RUNTIME_BYTES
+                    + CRITICAL_BYTES
+                    + 2 * CRITICAL_SLOT_BYTES
                     + 10 * (SHARD_BYTES
                         + 2 * SHARD_TASK_BYTES
                         + 3 * SHARD_TIMER_BYTES

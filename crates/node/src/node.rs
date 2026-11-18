@@ -1900,8 +1900,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Proposes an entry of commands to `group`, stamped with this node's wall clock as the
     /// entry's time; only its leader takes it. The entry is encoded here, where it is built, each
     /// command's CRC-32C computed over its bytes (docs/design/replica.md §2).
-    pub fn propose(&mut self, group: u128, entry: &mut Entry) -> Result<(), NodeError> {
-        entry.at_ns = self.wall.now_ns();
+    pub fn propose(&mut self, group: u128, entry: &Entry) -> Result<(), NodeError> {
         let data = entry.encode().map_err(mantle_range::ReplicaError::from)?;
         self.propose_asked(group, data, entry.commands.len())
             .map(|_| ())

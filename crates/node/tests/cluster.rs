@@ -750,8 +750,8 @@ async fn run<E: Engine + Send + 'static>(
                 }
             }
             // A node that no longer leads refuses it, and the test proposes again at the leader.
-            Either::Second(Ok(Order::Propose(mut entry))) => {
-                let _ = node.propose(GROUP, &mut entry);
+            Either::Second(Ok(Order::Propose(entry))) => {
+                let _ = node.propose(GROUP, &entry);
             }
             Either::Second(Ok(Order::Replace(failed, joining))) => {
                 if let Err(error) = node.replace(GROUP, failed, joining) {

@@ -1671,6 +1671,38 @@ handle a range that left holds. Left: the membership's reads and steps of a far 
 range's rows, configurations, transfers and caught-up checks), its replacement, its repair, and
 the host's table reads (2e).
 
+*As built (2026-11-18), a far range's configuration, its steps toward the members, and its
+replacement* (`crates/node/src/node/shard.rs`, `crates/node/src/node/members.rs`). What the
+membership reads of a range's configuration (`Node::configuration`, whether the root range keeps a
+member as a learner, whether any range names a member) is read, for a far range, as its shard
+reported it after the drive that changed it (`shard::Configured`, `Out::Configured`, kept on
+`Far`), as its status is (2b): the configuration it applied, whether a change of it is pending,
+and, while it leads, each learner's progress: the commit it last said its storage holds, by which
+the root range's leader keeps a removed member a learner until it holds its removal (membership.md
+§4 step 5), and whether it is caught up, by which a learner is made a voter (§6). A voter's
+progress is not reported: it moves with every entry, which would add a report at nearly every
+drive under load, and only a hand-over's heir reads it, which the shard chooses. The root range's
+leader's duties read whether it leads as its member shows it (`Node::is_leader`). Each turn, for
+each far range shown leading, with no change pending, no hand-over under way and no replacement,
+the node works the target out from the cell's rows and what the range showed, and hands it to the
+range's shard (`In::Toward`) only where a step is due by what it showed (`Toward::step`, each voter
+taken as caught up), so a range at its target, or one waiting on a learner, costs its lane
+nothing; the shard steps it from what its replica shows then (`shard::step_toward`, by which the
+node steps its own). A full lane drops it: the target is worked out afresh at the next turn. A
+replacement of a far range (`Node::replace`) is held on `Far` until its lane takes it
+(`In::Replace`), at the next turn's take while the lane is full, as a snapshot's end is, since one
+dropped would never progress; the shard keeps it, steps it at each of its turns while the range
+leads there (`shard::step_replacement`, by which the node steps its own) and hands it back done
+(`Out::Replaced`), which `Node::take_replaced` reports as the node's own; one the node was told
+before the range moved goes with it. The shard's reports wait for room, as all it gives does.
+Tested (`node::shard`): a learner added through a far range's lane is seen in the configuration it
+shows, with its progress; a voter is added to a far range and removed from it through its lane,
+node 2 learning, made a voter once caught up, then removed, the test standing in for the node's
+turns; and a far range's replacement, told before the range led, progresses to done and is handed
+back. Left for 2e: the root range's rows where it is far (`Node::read_members`, which reads none
+of a far root range's yet, so the membership's steps wait on its rows; and the host's `table`
+reads), and repair.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

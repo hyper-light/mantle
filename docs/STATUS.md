@@ -221,8 +221,8 @@ device directory locked against a second process, and answers chunk puts and get
 gateways as exchanges of their own class over QUIC: a put's bytes checked against the CRC-32C its
 sender computed before the volume writes them, answered once durable, and refused unread past
 what the volumes' writer queues hold; a get read at the device through its issuer from the
-node's first shard (`mantle_chunk::Reader`) and verified before it is sent; each refusal typed. Tested
-in one process (`crates/node/tests/cluster.rs`) and with `mantle node` processes
+node's first shard (`mantle_chunk::Reader`) and verified before it is sent; each refusal typed.
+Tested in one process (`crates/node/tests/cluster.rs`) and with `mantle node` processes
 (`crates/mantle/tests/node.rs`): a gateway puts chunks round three nodes and one is killed with
 `SIGKILL` mid-put. Every chunk acknowledged reads back whole after the node starts again on its
 volume. A lost put either landed whole or not at all, and is stored when retried. This holds with
@@ -379,9 +379,10 @@ answer before it, a PUT's block, file and name commands and the node's statement
 (aef9efae, 053cb77d). The exactly-once simulation of lost replies, late copies and refusals runs
 with one entry out and with two, and a cluster test has a cut-off leader's two puts out side by
 side, each answered its own version by the new leader; no end-to-end suite or doors run has run
-on it, and its effect on the write path is unmeasured. The leader stamps every entry it proposes
-with its wall clock. Each node with volumes enlists itself and them as it starts, a node in another
-domain than the table holds refused; placement offers a block's volumes by a capacity-weighted highest
+on it, and its effect on the write path is unmeasured.
+The leader stamps every entry it proposes with its wall
+clock. Each node with volumes enlists itself and them as it starts, a node in another domain
+than the table holds refused; placement offers a block's volumes by a capacity-weighted highest
 random weight, one to a failure domain first ([research 63](research/63-placement-order.md)).
 Remaining: the table published to nodes that host no root range (architecture §4's constant-work
 loop), two random choices on credits once nodes advertise them, and copysets once a cell has the
@@ -667,8 +668,9 @@ a request's pace; an object's or a chunk's exchange is given at least the node's
 which the node's notes of its work come three times, and at most the stock patience, the most a node
 waits on such work asked with no deadline, before any reply is measured
 (`crates/node/tests/client_patience.rs`, both cases failing before the change). CI's busy job
-fails the native suite on the same cause with the client unchanged, on both arms of an A/B of the
-chunk store's latest changes: a node's own asks are judged by the period its client gives it, so a node whose
+fails the native
+suite on the same cause with the client unchanged, on both arms of an A/B of the chunk store's
+latest changes: a node's own asks are judged by the period its client gives it, so a node whose
 ask of a peer takes most of a period loses to its client (7 of 36 read-backs cut), and a run cut
 while its node wrote is sent again, its first chunks left behind until the suite's small volumes
 refuse a run (2 of 36) ([measurements](measurements/2026-10-29-a-node-cut-while-it-works.md)).
@@ -1438,8 +1440,9 @@ targets. Each item is done when its test passes on every supported target.
     take the right `B` and plan, and C1–C3 run on each OS's devices.
 11. **The derived scrub period** from the workload, bandwidth and durability bounds, per device,
     with the binding bound said beside the period (chunk-store.md §9.1; durability.md §5; derived
-    values are said by `mantle serve`'s `basis` lines, `mantle status` being the supervisor's
-    readiness check, and node.md §8's command for the node's operating envelope is not built). Done
+    values are said a `basis` line each by `mantle serve`, and by `mantle derive` without serving,
+    `mantle status` being the supervisor's readiness check; node.md §8's command for the node's
+    operating envelope is not built). Done
     when a simulated 24 TB disk at 550 TB/yr scrubs no more often than its workload bound and the
     durability model counts latent errors detected at the chosen period.
 

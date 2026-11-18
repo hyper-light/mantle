@@ -287,9 +287,10 @@ measures the second, and derives the rest by these rules:
   whole; a page buffer, a point read's page, a checkpoint page and an extent's run), each extent's
   allocator count, free or pending slot, map bit and map word apart, charged with the extent's
   resident metadata from what memory remains (`shard_db::measured_per_extent`); and the threads
-  the node starts (`derive::threads`: its shard's, standard input's and output's, the
-  log's two, each device's issuer, with a worker a read of its depth where a pool carries it
-  (macOS, Windows; `Issuer::device_threads`), each volume's writer, cleaner and scrubber), each at
+  the node starts (`derive::threads`: its own, which starts its shard and waits for its end,
+  its shard's, standard input's and output's, the log's two, each device's issuer, with a
+  worker a read of its depth where a pool carries it (macOS, Windows;
+  `Issuer::device_threads`), each volume's writer, cleaner and scrubber), each at
   Rust's default stack of 2 MiB, reserved whole; and each range's member
   (`derive::range_bytes`, hyper-durable's holds at the bounds hyper-raft's limits put on each:
   what it keeps of each member of its configuration; the entries not yet durable, a leader's

@@ -1182,8 +1182,9 @@ pub fn liveness_bytes(peers: usize) -> Option<u64> {
         .checked_mul(ring)
 }
 
-/// The threads a node starts beside the process's own, which waits for it to end: its shard's,
-/// which the process's own leaves at once on a stop that ends it so (`process::start`); its
+/// The threads a node starts beside the process's own, which waits for it to end: its own, which
+/// the process's own leaves at once on a stop that ends it so (`process::start`), and which starts
+/// its shard and waits for the node's end there (`process::run_on_first_shard`); its shard's; its
 /// standard input's and output's, its log's and its log's device's; for each device holding
 /// volumes, its issuer (`hyper_block::issuer::Issuer::start_device`), on Linux one thread whatever
 /// the device's depth, the kernel holding its transfers, and elsewhere that thread and a worker for
@@ -1191,7 +1192,7 @@ pub fn liveness_bytes(peers: usize) -> Option<u64> {
 /// volume its writer and its cleaner, and its scrubber where it scrubs. `devices` are those
 /// devices' depths, `volumes` whether each scrubs.
 pub fn threads(devices: &[usize], volumes: &[bool]) -> Option<u64> {
-    let mut threads = 5u64;
+    let mut threads = 6u64;
     for &depth in devices {
         let issuer = hyper_block::issuer::Issuer::device_threads(depth)?;
         threads = threads.checked_add(u64::try_from(issuer).ok()?)?;
@@ -3236,7 +3237,7 @@ mod tests {
         assert_eq!(a.reads, g.objects);
     }
 
-    /// The node's own five threads, and each device's issuer and workers and each volume's
+    /// The node's own six threads, and each device's issuer and workers and each volume's
     /// writer, cleaner and scrubber where it scrubs, each a 2 MiB stack.
     #[test]
     fn the_threads_are_the_nodes_own_and_its_storages() {
@@ -3249,11 +3250,11 @@ mod tests {
                 depth + 1
             }
         };
-        assert_eq!(threads(&[], &[]), Some(5));
-        assert_eq!(threads(&[2], &[true]), Some(5 + issuer(2) + 3));
+        assert_eq!(threads(&[], &[]), Some(6));
+        assert_eq!(threads(&[2], &[true]), Some(6 + issuer(2) + 3));
         assert_eq!(
             threads(&[1, 4], &[true, false]),
-            Some(5 + issuer(1) + issuer(4) + 3 + 2)
+            Some(6 + issuer(1) + issuer(4) + 3 + 2)
         );
         assert_eq!(stacks(10), Some(20 << 20));
     }

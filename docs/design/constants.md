@@ -1219,7 +1219,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/node/src/derive.rs` `gateway:window` | guessed | `1` | blocks a PUT holds going down and a GET holds reading. Refused (audit 2026-11-12 §6): a floor taken as the operating value; an 8 MiB+ object's next block waits a Block command (~17 ms, research/71). Replace: blocks in flight = measured block commit latency × the client's measured body rate / block size (Little), within the memory each operation may hold |
 | `crates/node/src/derive.rs` `range_bytes:max(4)` | derived | `4` | a vector's capacity as it grows: std's growth rule |
 | `crates/node/src/derive.rs` `served:operations` | derived | `1` | The operations a node that serves no S3 serves at least: its first, at the most one is charged (`most_charged`), every operation admitted alone; a native client asks one at a time (`mantle_client`). One that serves S3 serves `listener::STOCK_CLIENT`. |
-| `crates/node/src/derive.rs` `threads:threads` | derived | `5u64` | threads counted for the floor: counted |
+| `crates/node/src/derive.rs` `threads:threads` | derived | `6u64` | threads counted for the floor: counted |
 | `crates/node/src/derive.rs` `volume:fragments_per_chunk` | derived | `1` | fragments a chunk may have: structural |
 | `crates/node/src/listener/respond.rs` `document:status` | external | `200` | 200 OK (RFC 9110 §15.3.1). |
 | `crates/node/src/listener/respond.rs` `reply:status` | external | `304` | 304 Not Modified (RFC 9110 §15.4.5). |
@@ -1228,6 +1228,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/node/src/node/members.rs` `SECONDS_AN_HOUR` | derived | `3_600.0` | Unit conversion: 3,600 seconds an hour, the unit of the durability model's repair rate (`durability.repair_rate`, repairs an hour), whose mean is the absence past which a member is judged gone (docs/design/membership.md §5). |
 | `crates/node/src/place.rs` `key:(1u64 << 53)` | external | `1u64 << 53` | 2^53: an IEEE 754 binary64's significand holds 53 bits, so the draw is uniform in [0, 1) (IEEE Std 754-2019 §3.6). |
 | `crates/node/src/process.rs` `run_node:workers` | derived | `1` | name lookups at once: structural |
+| `crates/node/src/process.rs` `run_on_first_shard:sync_channel(1)` | derived | `1` | A channel of one slot: the one value sent on it, the node's task's output or its launcher's refusal to spawn the task, never both. |
 | `crates/node/src/process.rs` `runtime:shards` | picked | `1` | cores the node's event loop runs on: both doors, every range, the transport. Refused (audit 2026-11-12 §6): a fixed count of one core whatever the host measures: a 1 B PUT costs 4.7–6.7 M server instructions (research/71 ledger, servers summed), so one core a node caps a cell well under 10,000 PUTs/s. Replace: shards from the measured cores (hyper-rt Facts::cores, as RuntimeConfig::from_calibration derives), ranges and connections placed across them |
 | `crates/protocol/src/bounds.rs` `limits:lanes_per_peer` | inherited | `1` | Raft lanes a peer opens. Refused (audit 2026-11-12 §6): inherits shards = 1. Replace: a lane a shard once shards are derived |
 | `crates/protocol/src/object.rs` `take_digests:take(16)` | format | `16` | The width of the field the decoder reads, fixed by the encoding it reads. |

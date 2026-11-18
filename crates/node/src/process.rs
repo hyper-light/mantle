@@ -122,7 +122,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_log::{Config as LogConfig, LogStats, Waits};
 use hyper_rt::combine::{Either, Either3, race2, race3};
 use hyper_rt::machine::calibration::{Calibration, Policy};
-use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
+use hyper_rt::runtime::{Runtime, RuntimeConfig};
 use hyper_rt::signal::Signal;
 use hyper_timing::Histogram;
 use hyper_transport::Refusal;
@@ -1630,20 +1630,62 @@ fn run_node(
             .map_or(0, |g| u64::try_from(g.objects).unwrap_or(u64::MAX))
     });
     let runtime = runtime(&config, listening).map_err(step(Step::Network))?;
-    let mut rt = LocalRuntime::new(&runtime)
+    let rt = Runtime::start(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
-    let ran = rt
-        .block_on(serve(
+    let ran = run_on_first_shard(rt, move || {
+        serve(
             config,
             storage,
             gateway,
             (credentials, peers, (grant, fingerprint)),
             (resolved, s3),
             (asked, at_once),
-        ))
-        .map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
+        )
+    })?;
     drop(node);
     ran
+}
+
+/// Runs the future `make` makes on `rt`'s first shard until it ends, then shuts `rt` down: what the
+/// future left running on its shards is cancelled and joined before this returns, as
+/// `LocalRuntime::block_on` does with what its root leaves. `make` crosses to the shard's thread
+/// and makes the future there, in a launcher that spawns it on that shard and ends, as hyper-rt's
+/// `tcp::serve` makes a connection's handler on the shard that serves it: the future need not be
+/// `Send`. Its output comes back on a channel of one slot, the one value sent on it: the output, or
+/// the launcher's refusal to spawn it. A task that ends without either, unwound or its shard
+/// lost, drops its sender, which ends the wait.
+fn run_on_first_shard<M, F, T>(rt: Runtime, make: M) -> Result<T, ProcessError>
+where
+    M: FnOnce() -> F + Send + 'static,
+    F: Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    let (tell, heard) = sync_channel(1);
+    let launch = async move {
+        let refused = tell.clone();
+        let made = make();
+        let task = async move {
+            let _ = tell.try_send(Ok(made.await));
+        };
+        if let Err(e) = hyper_rt::futures::spawn_detached(task) {
+            let _ = refused.try_send(Err(e));
+        }
+    };
+    let ran = rt
+        .shard_ids()
+        .first()
+        .ok_or_else(|| "a runtime of no shard".to_string())
+        .and_then(|first| rt.spawn_on(*first, launch).map_err(|e| format!("{e:?}")))
+        .and_then(|()| match heard.recv() {
+            Ok(sent) => sent.map_err(|e| format!("{e:?}")),
+            Err(_) => Err("the node's task ended without its output".to_string()),
+        });
+    // Every shard stops whether or not the task ran; a shard's own failure is why the task ended
+    // without its output, or a failure of its own after it.
+    let ended = rt
+        .shutdown()
+        .map_err(|e| ProcessError::Runtime(format!("{e:?}")));
+    ended.and(ran.map_err(ProcessError::Runtime))
 }
 
 /// The S3 listener `keys` state, its door open on `node`: where it listens, its region, keys and
@@ -1990,10 +2032,11 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
 const TIMERS: usize = 3;
 
 /// One shard, calibrated on this machine (hyper-rt `RuntimeConfig::from_calibration`), sized by
-/// what the node holds: its one task and the timers it holds at once ([`TIMERS`]), and a socket
-/// for its endpoint, each connection and its plane, each read and written; with an S3 listener, a
-/// task and a timer for each connection it holds at once, served or answered refused
-/// (`listener::tasks`), and a socket for the listener and each of those connections.
+/// what the node holds: its one task, the launcher that spawns it there ([`run_on_first_shard`]),
+/// the timers the task holds at once ([`TIMERS`]), and a socket for its endpoint, each connection
+/// and its plane, each read and written; with an S3 listener, a task and a timer for each
+/// connection it holds at once, served or answered refused (`listener::tasks`), and a socket for
+/// the listener and each of those connections.
 fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = calibration
@@ -2009,8 +2052,9 @@ fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConf
             .map_err(|_| ProcessError::Runtime("the S3 listener's connections".into()))?,
         None => 0,
     };
+    // The node's task and its launcher, which holds a slot of its own as it spawns the node's.
     let tasks = connections
-        .checked_add(1)
+        .checked_add(2)
         .ok_or_else(|| ProcessError::Runtime("the node's tasks".into()))?;
     let timers = TIMERS
         .checked_add(connections)
@@ -3657,5 +3701,87 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// A runtime of `shards` shards, each with `tasks` task slots, as the listener's tests build one.
+    fn started(shards: u16, tasks: usize) -> Runtime {
+        Runtime::start(&RuntimeConfig {
+            shards,
+            tasks_per_shard: tasks,
+            timers_per_shard: 1,
+            interests_per_shard: hyper_rt::runtime::interests_for(tasks),
+            ring_entries: 1,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: 1,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: usize::try_from(hyper_rt::machine::facts::Facts::query().page.base)
+                .unwrap(),
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        })
+        .unwrap()
+    }
+
+    /// Sets its flag as it is dropped.
+    struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The node's task runs on its runtime's first shard, made there, so it need not be `Send`; and
+    /// what it leaves running is cancelled and joined before its output is handed on, the runtime
+    /// shut down: nothing it spawned outlives the call.
+    #[test]
+    fn the_node_runs_on_its_runtimes_first_shard_and_nothing_it_leaves_outlives_the_runtime() {
+        // The launcher, the node's task and the task it leaves running.
+        let rt = started(2, 3);
+        let first = rt.shard_ids()[0];
+        let left = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Dropped(std::sync::Arc::clone(&left));
+        let ran = run_on_first_shard(rt, move || async move {
+            hyper_rt::futures::spawn_detached(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+            // Held across an await: the task is not `Send`.
+            let here = std::rc::Rc::new(hyper_rt::futures::shard_id());
+            hyper_rt::futures::yield_now().await;
+            *here
+        })
+        .unwrap();
+        assert_eq!(ran, Some(first));
+        assert!(left.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// A shard of one task slot refuses the node's task, the launcher holding the slot as it
+    /// spawns it, and the refusal is the call's typed failure: the node's runtime counts a slot for
+    /// each.
+    #[test]
+    fn a_shard_with_no_slot_beside_the_launchers_refuses_the_node_typed() {
+        let ran = run_on_first_shard(started(1, 1), || async {});
+        assert!(
+            matches!(&ran, Err(ProcessError::Runtime(e)) if e.contains("TooManyTasks")),
+            "{ran:?}"
+        );
+    }
+
+    /// A node's task that unwinds ends the wait for its output, which would otherwise never end,
+    /// with a typed failure.
+    #[test]
+    fn a_node_task_that_unwinds_ends_the_wait_typed() {
+        let ran: Result<(), ProcessError> = run_on_first_shard(started(1, 2), || async {
+            panic!("the node's task unwinds");
+        });
+        assert!(
+            matches!(&ran, Err(ProcessError::Runtime(e)) if e.contains("without its output")),
+            "{ran:?}"
+        );
     }
 }

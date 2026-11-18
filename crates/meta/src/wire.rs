@@ -981,67 +981,103 @@ fn take_bucket(r: &mut Reader<'_>, at_ns: u64) -> Option<bucket::Command> {
     })
 }
 
+/// The tag before a write that carries its client's operation, the operation's identity and
+/// horizon after it and then the write: entries written before operations decode as they did.
+const OPERATION: u8 = 24;
+
+/// A version's write, PutObject's, CopyObject's or a completion's.
+fn put_put(w: &mut Writer, p: &name::Put) -> Result<(), RecordError> {
+    w.u8(0);
+    put_target(w, &p.bucket, p.incarnation, &p.key)?;
+    w.u8(p.versioning.code());
+    put_preconditions(w, &p.preconditions)?;
+    put_option(w, p.ordered_ns);
+    record::put_record(w, |w| p.version.put(w))?;
+    put_default(w, p.default);
+    w.u128(p.id);
+    w.u64(p.deadline_ns);
+    Ok(())
+}
+
+/// DeleteObject.
+fn put_delete(w: &mut Writer, d: &name::Delete) -> Result<(), RecordError> {
+    w.u8(1);
+    put_target(w, &d.bucket, d.incarnation, &d.key)?;
+    w.u8(d.versioning.code());
+    put_named(w, d.named);
+    put_match(w, d.if_match.as_ref())?;
+    w.u8(u8::from(d.bypass));
+    record::put_bytes(w, d.owner.as_bytes())?;
+    Ok(())
+}
+
+/// CreateMultipartUpload, or a native upload's Open.
+fn put_create_upload(w: &mut Writer, c: &name::CreateUpload) -> Result<(), RecordError> {
+    w.u8(2);
+    put_target(w, &c.bucket, c.incarnation, &c.key)?;
+    record::put_record(w, |w| c.upload.put(w))?;
+    Ok(())
+}
+
+/// UploadPart, UploadPartCopy, or a native upload's run.
+fn put_put_part(w: &mut Writer, p: &name::PutPart) -> Result<(), RecordError> {
+    // A native upload's run takes a tag of its own, so entries written before runs
+    // decode as they did.
+    w.u8(if p.run.is_some() { 21 } else { 3 });
+    put_target(w, &p.bucket, p.incarnation, &p.key)?;
+    record::put_str(w, &p.upload)?;
+    w.u16(p.number);
+    record::put_record(w, |w| p.part.put(w))?;
+    if let Some(run) = &p.run {
+        put_run(w, run);
+    }
+    Ok(())
+}
+
+/// CompleteMultipartUpload, or a native upload's Finish.
+fn put_complete(w: &mut Writer, c: &name::Complete) -> Result<(), RecordError> {
+    // As a run's: a native upload's completion takes a tag of its own.
+    w.u8(if c.native { 22 } else { 4 });
+    put_target(w, &c.bucket, c.incarnation, &c.key)?;
+    record::put_str(w, &c.upload)?;
+    w.u8(c.versioning.code());
+    put_preconditions(w, &c.preconditions)?;
+    record::put_len(w, c.parts.len())?;
+    for part in &c.parts {
+        w.u16(part.number);
+        record::put_str(w, &part.etag)?;
+        w.u128(part.file);
+    }
+    record::put_str(w, &c.etag)?;
+    w.u64(c.size);
+    put_checksum(w, c.checksum.as_ref())?;
+    record::put_file(w, c.file);
+    w.bytes(&c.listing);
+    put_default(w, c.default);
+    w.u128(c.id);
+    w.u64(c.deadline_ns);
+    Ok(())
+}
+
 fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
     match c {
-        name::Command::Put(p) => {
-            w.u8(0);
-            put_target(w, &p.bucket, p.incarnation, &p.key)?;
-            w.u8(p.versioning.code());
-            put_preconditions(w, &p.preconditions)?;
-            put_option(w, p.ordered_ns);
-            record::put_record(w, |w| p.version.put(w))?;
-            put_default(w, p.default);
-            w.u128(p.id);
-            w.u64(p.deadline_ns);
-        }
-        name::Command::Delete(d) => {
-            w.u8(1);
-            put_target(w, &d.bucket, d.incarnation, &d.key)?;
-            w.u8(d.versioning.code());
-            put_named(w, d.named);
-            put_match(w, d.if_match.as_ref())?;
-            w.u8(u8::from(d.bypass));
-            record::put_bytes(w, d.owner.as_bytes())?;
-        }
-        name::Command::CreateUpload(c) => {
-            w.u8(2);
-            put_target(w, &c.bucket, c.incarnation, &c.key)?;
-            record::put_record(w, |w| c.upload.put(w))?;
-        }
-        name::Command::PutPart(p) => {
-            // A native upload's run takes a tag of its own, so entries written before runs
-            // decode as they did.
-            w.u8(if p.run.is_some() { 21 } else { 3 });
-            put_target(w, &p.bucket, p.incarnation, &p.key)?;
-            record::put_str(w, &p.upload)?;
-            w.u16(p.number);
-            record::put_record(w, |w| p.part.put(w))?;
-            if let Some(run) = &p.run {
-                put_run(w, run);
+        name::Command::Operated(o) => {
+            w.u8(OPERATION);
+            w.u128(o.operation.identity);
+            w.u64(o.operation.horizon_ns);
+            match &o.mutation {
+                name::Mutation::Put(p) => put_put(w, p)?,
+                name::Mutation::Delete(d) => put_delete(w, d)?,
+                name::Mutation::CreateUpload(c) => put_create_upload(w, c)?,
+                name::Mutation::PutPart(p) => put_put_part(w, p)?,
+                name::Mutation::Complete(c) => put_complete(w, c)?,
             }
         }
-        name::Command::Complete(c) => {
-            // As a run's: a native upload's completion takes a tag of its own.
-            w.u8(if c.native { 22 } else { 4 });
-            put_target(w, &c.bucket, c.incarnation, &c.key)?;
-            record::put_str(w, &c.upload)?;
-            w.u8(c.versioning.code());
-            put_preconditions(w, &c.preconditions)?;
-            record::put_len(w, c.parts.len())?;
-            for part in &c.parts {
-                w.u16(part.number);
-                record::put_str(w, &part.etag)?;
-                w.u128(part.file);
-            }
-            record::put_str(w, &c.etag)?;
-            w.u64(c.size);
-            put_checksum(w, c.checksum.as_ref())?;
-            record::put_file(w, c.file);
-            w.bytes(&c.listing);
-            put_default(w, c.default);
-            w.u128(c.id);
-            w.u64(c.deadline_ns);
-        }
+        name::Command::Put(p) => put_put(w, p)?,
+        name::Command::Delete(d) => put_delete(w, d)?,
+        name::Command::CreateUpload(c) => put_create_upload(w, c)?,
+        name::Command::PutPart(p) => put_put_part(w, p)?,
+        name::Command::Complete(c) => put_complete(w, c)?,
         name::Command::Abort(a) => {
             w.u8(5);
             put_target(w, &a.bucket, a.incarnation, &a.key)?;
@@ -1113,6 +1149,11 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
             w.u128(d.file);
             w.u128(d.owner);
         }
+        name::Command::Forget(f) => {
+            w.u8(23);
+            record::put_bytes(w, &f.from)?;
+            w.u32(f.budget);
+        }
         name::Command::Split(s) => {
             w.u8(13);
             w.u64(s.generation);
@@ -1154,7 +1195,18 @@ fn put_name(w: &mut Writer, c: &name::Command) -> Result<(), RecordError> {
 }
 
 fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
-    Some(match r.u8()? {
+    let mut tag = r.u8()?;
+    let operation = if tag == OPERATION {
+        let operation = name::Operation {
+            identity: r.u128()?,
+            horizon_ns: r.u64()?,
+        };
+        tag = r.u8()?;
+        Some(operation)
+    } else {
+        None
+    };
+    let command = match tag {
         0 => {
             let (bucket, incarnation, key) = take_target(r)?;
             name::Command::Put(name::Put {
@@ -1343,6 +1395,11 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             owner: r.u128()?,
             at_ns,
         }),
+        23 => name::Command::Forget(name::Forget {
+            from: record::take_bytes(r)?,
+            budget: r.u32()?,
+            at_ns,
+        }),
         8 => {
             let (bucket, incarnation, key) = take_target(r)?;
             let named = take_named(r)?;
@@ -1372,6 +1429,14 @@ fn take_name(r: &mut Reader<'_>, at_ns: u64) -> Option<name::Command> {
             })
         }
         _ => return None,
+    };
+    // Only a write that makes a version, an upload, a part or a delete carries an operation.
+    Some(match operation {
+        None => command,
+        Some(operation) => name::Command::Operated(Box::new(name::Operated {
+            operation,
+            mutation: name::Mutation::of(command)?,
+        })),
     })
 }
 
@@ -1720,6 +1785,20 @@ fn put_name_outcome(w: &mut Writer, o: &name::Outcome) -> Result<(), RecordError
             w.u64(*offset);
             w.u8(u8::from(*ended));
         }
+        O::Answered(made) => {
+            w.u8(41);
+            made.put(w)?;
+        }
+        O::Forgot { next } => {
+            w.u8(42);
+            match next {
+                None => w.u8(0),
+                Some(next) => {
+                    w.u8(1);
+                    record::put_bytes(w, next)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1860,6 +1939,14 @@ fn take_name_outcome(r: &mut Reader<'_>) -> Option<name::Outcome> {
             offset: r.u64()?,
             ended: take_bool(r)?,
         },
+        41 => O::Answered(record::Made::take(r)?),
+        42 => O::Forgot {
+            next: match r.u8()? {
+                0 => None,
+                1 => Some(record::take_bytes(r)?),
+                _ => return None,
+            },
+        },
         _ => return None,
     })
 }
@@ -1888,8 +1975,9 @@ pub fn least_entry_bytes() -> Result<usize, RecordError> {
 /// a gateway sends, in the session wrapping it carries. A range whose `max_entry_bytes` or log
 /// frame is smaller refuses a request S3 allows (audit §16.5). The largest is a
 /// CompleteMultipartUpload of 10,000 parts, each with its 32-digit ETag, of the longest
-/// bucket and key, with the most preconditions a request's headers hold, or the file of parts
-/// it writes, of 10,000 extents; each is encoded here at its longest and the larger taken.
+/// bucket and key, with the most preconditions a request's headers hold and its client's
+/// operation, or the file of parts it writes, of 10,000 extents; each is encoded here at its
+/// longest and the larger taken.
 pub fn largest_entry_bytes() -> Result<usize, RecordError> {
     // S3's limits: a request's headers within 8 KB and 10,000 parts, with the longest bucket and
     // key. An upload ID is one the Name range made, and a gateway sends no other.
@@ -1946,7 +2034,15 @@ pub fn largest_entry_bytes() -> Result<usize, RecordError> {
     };
     let mut largest = 0usize;
     for command in [
-        Command::Name(Box::new(name::Command::Complete(complete))),
+        Command::Name(Box::new(name::Command::Operated(Box::new(
+            name::Operated {
+                operation: name::Operation {
+                    identity: u128::MAX,
+                    horizon_ns: u64::MAX,
+                },
+                mutation: name::Mutation::Complete(complete),
+            },
+        )))),
         Command::File(write),
     ] {
         largest = largest.max(alone(command).encode()?.len());
@@ -2014,13 +2110,17 @@ fn longest_lineage() -> record::Lineage {
 /// Bytes of the largest answer a range gives a command a node sends, which a session keeps until
 /// its gateway acknowledges it, as many as its row holds (`session::Touched::fits`), so a
 /// session's row holds one at least where it keeps no other (`derive::cell`): a completion's, with its
-/// checksum at its longest; one carrying a version or an upload's ID; or one carrying the
-/// range's lineage at its longest, as a range that no longer holds a key answers. A block
-/// check's verdicts and a Name range's checked marks answer a sweep, which sizes its checks to
-/// the bound; each is encoded here and the larger taken.
+/// checksum at its longest; one carrying a version or an upload's ID; what an operation made, as
+/// its row answers an attempt of it; or one carrying the range's lineage at its longest, as a
+/// range that no longer holds a key answers. A block check's verdicts, a Name range's checked
+/// marks and the page its operations are forgotten in answer a sweep and the collector, which
+/// size their pages to the bound; each is encoded here and the larger taken.
 pub fn largest_answer_bytes() -> Result<usize, RecordError> {
     let version = crate::key::version_id(u64::MAX);
+    let made = longest_made();
     let answers = [
+        Answer::Name(name::Outcome::Answered(made[0].clone())),
+        Answer::Name(name::Outcome::Answered(made[1].clone())),
         Answer::Name(name::Outcome::Completed {
             version: version.clone(),
             size: u64::MAX,
@@ -2104,14 +2204,43 @@ pub fn largest_row_bytes() -> Result<usize, RecordError> {
         policy: "p".repeat(crate::principal::MAX_POLICY),
         keys: vec!["K".repeat(mantle_s3::account::KEY_ID_CHARS); mantle_s3::account::MAX_KEYS],
     };
+    let [made_version, made_part] = longest_made();
+    let operation = |made| record::OperationRow {
+        incarnation: u64::MAX,
+        expiry_ns: u64::MAX,
+        made,
+    };
     let rows = [
         version.encode()?,
         upload.encode()?,
         part.encode()?,
         longest_lineage().encode()?,
         principal.encode()?,
+        operation(made_version).encode()?,
+        operation(made_part).encode()?,
     ];
     Ok(rows.iter().map(Vec::len).max().unwrap_or(0))
+}
+
+/// What an operation makes at its longest, as its row keeps it and an attempt of it is answered:
+/// a version with its ETag and checksum at their longest, and a part with its own.
+fn longest_made() -> [record::Made; 2] {
+    [
+        record::Made::Version {
+            order: u64::MAX,
+            null: true,
+            etag: longest_etag(),
+            size: u64::MAX,
+            checksum: Some(longest_checksum()),
+        },
+        record::Made::Part {
+            file: u128::MAX,
+            etag: "e".repeat(ETAG_HEX),
+            size: u64::MAX,
+            checksum: Some(longest_checksum().value),
+            modified_ns: u64::MAX,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -2297,7 +2426,7 @@ mod tests {
             epoch: 1,
             index: 0,
         };
-        vec![
+        let mut commands = vec![
             Command::Register {
                 owner: 7,
                 run: 3,
@@ -2786,7 +2915,32 @@ mod tests {
             }),
             Command::Root(root::Command::Remove { node: 4 }),
             Command::Root(root::Command::Delist { node: 4 }),
-        ]
+            // Since 2026-11-17, last, so every earlier command's vector keeps its line: the
+            // collector forgetting a page of operations.
+            named(name::Command::Forget(name::Forget {
+                from: crate::key::operation("b", "k", u128::MAX),
+                budget: u32::MAX,
+                at_ns,
+            })),
+        ];
+        // And every write an operation's record answers for, carrying its client's operation.
+        let operated: Vec<Command> = commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Name(n) => name::Mutation::of((**n).clone()).map(|mutation| {
+                    named(name::Command::Operated(Box::new(name::Operated {
+                        operation: name::Operation {
+                            identity: u128::MAX - 1,
+                            horizon_ns: 7,
+                        },
+                        mutation,
+                    })))
+                }),
+                _ => None,
+            })
+            .collect();
+        commands.extend(operated);
+        commands
     }
 
     #[test]
@@ -2955,6 +3109,35 @@ mod tests {
                 N::Thawed(Box::new(lineage)),
                 N::Resolved,
                 N::Miscombined,
+                // Since 2026-11-17: an attempt answered from its operation's row, of each kind
+                // of thing an operation makes, and a page of operations forgotten.
+                N::Answered(record::Made::Version {
+                    order: 7,
+                    null: true,
+                    etag: "e".into(),
+                    size: 5,
+                    checksum: Some(Checksum {
+                        algorithm: 2,
+                        parts: 3,
+                        value: vec![9; 8],
+                    }),
+                }),
+                N::Answered(record::Made::Part {
+                    file: u128::MAX,
+                    etag: "p".into(),
+                    size: 0,
+                    checksum: None,
+                    modified_ns: 11,
+                }),
+                N::Answered(record::Made::Upload { initiated_ns: 13 }),
+                N::Answered(record::Made::Deleted {
+                    marker: true,
+                    version: Some("0000000000001".into()),
+                }),
+                N::Forgot { next: None },
+                N::Forgot {
+                    next: Some(crate::key::operation("b", "k", 1)),
+                },
             ]
             .map(Answer::Name),
         );

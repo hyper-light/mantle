@@ -360,7 +360,30 @@ layers removes them, as Tectonic's does [01 §1.6].
   property test extended: every attempt of every identity delivered at any step, across
   gateways, splits and clocks that run behind, with at most one effect, the same answer, no stale
   replacement and each file released once; removing the row, its scope or its horizon check
-  fails it.
+  fails it. *As built in the Name range (2026-11-17):* a write carrying its operation is
+  `name::Command::Operated`, the write with its `Operation` (the identity as its gateway scoped
+  it, and the horizon), on the log behind tag 24 and then the write's own tag, so entries written
+  before decode as they did. Its row (`record::OperationRow`) is keyed `(OPERATIONS, bucket, key,
+  identity)` in a space of its own ordered by object key (`key::operation`), which a split's child
+  takes and a merge brings back with the key's rows and marks (`key::name_spans`); it holds the
+  bucket's incarnation, the commit's range time plus the horizon, and what the write made
+  (`record::Made`): a version's order, ETag, size and checksum, a part's file, ETag, size,
+  checksum and time, an upload's initiation, or a delete's marker and version. An attempt whose
+  row the range holds, under the same incarnation and for the same kind of write, is answered
+  `Outcome::Answered` from it before its mark is read, and applies nothing; its file, unless the
+  range marked it already, is released and marked as a refused write's, so a copy of it releases
+  nothing more. The collector's `Forget` reads a page of the range's operation rows in key order
+  and removes those its time has passed, recording that time as a write's. Unit tests in name.rs
+  check the obligations on one range: a copy of the first delivery and two attempts through other
+  gateways get the first's version ID and ETag and make no version, each attempt's file is
+  released once and the first's never, an attempt after a later write replaces nothing, a refused
+  attempt records nothing, a row goes only past its horizon, and a split's child answers for the
+  keys it took. Not yet built: the host making `Operated` from a request's identity, scoped by
+  principal, kind of write, upload and part number, and answering `Answered` through both doors;
+  the server's maximum horizon (STATUS item 9); the collector's driver for `Forget`, since nodes
+  run no collector yet; `Expired` for a native attempt past its horizon, which needs each attempt
+  to carry its operation's deadline, as a write carries its file's; and the orphan-sweep
+  simulation's attempts.
 - **Resumable native uploads** (research/30 §3.5, D3). A native upload is a multipart upload
   whose parts, runs, are numbered by the range as the gateway hands them over, each committed
   with the upload row's new durable offset and hash states in one transaction, so the offset

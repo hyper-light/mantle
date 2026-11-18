@@ -332,8 +332,9 @@ object may pass 5 GiB. The Finish reads every run, holds the object to the clien
 full-object CRC, `BadDigest` with nothing written on any difference, and gives the finished MD5 as
 the ETag at most 5 GiB and the multipart ETag of the runs' MD5s past it (`complete::Completion::
 native`). An object one run holds is put whole by the client, the same bytes, ETag and checksum in
-one exchange. Not yet built: the operation identity's record (STATUS item 9), so an Open asked
-again after its answer was lost opens a second, empty upload, which the journal never names and an
+one exchange. Not yet built: the host's use of the operation identity's record, which the Name
+range keeps (metadata.md §2, "Operations", as built; STATUS item 9), so an Open asked again after
+its answer was lost opens a second, empty upload, which the journal never names and an
 abort or the bucket's lifecycle removes; the source's identity, resume horizon and checksum
 algorithms beyond one CRC in the Open; SSE-C, which the native protocol does not carry; and the
 gateway's closing of a stalled run at its last whole segment.

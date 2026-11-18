@@ -513,6 +513,51 @@ impl Mark {
     }
 }
 
+/// An operation's row in the Name range (docs/design/metadata.md §2, "Operations"): what the
+/// first delivery of a client's operation made and the answer it got, which every later attempt
+/// carrying the operation's identity is answered with, nothing applied; kept until the range's
+/// time passes `expiry_ns`, when the collector may forget it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRow {
+    /// The bucket's incarnation the operation was made under: an attempt under another, a bucket
+    /// made again under the same name, is not the operation's.
+    pub incarnation: u64,
+    /// The range's time at the commit, and the horizon the operation carried, added: the row
+    /// answers until the range's time passes it.
+    pub expiry_ns: u64,
+    pub made: Made,
+}
+
+/// What an operation's first delivery made, and so the answer every attempt of it gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Made {
+    /// A version, by a PUT, a copy or a completion: its order, whether it is the null version,
+    /// and its ETag, size and checksum.
+    Version {
+        order: u64,
+        null: bool,
+        etag: String,
+        size: u64,
+        checksum: Option<Checksum>,
+    },
+    /// An upload's part: the file its row named, and its ETag, size, checksum and time.
+    Part {
+        file: u128,
+        etag: String,
+        size: u64,
+        checksum: Option<Vec<u8>>,
+        modified_ns: u64,
+    },
+    /// An upload, whose ID its initiation time names (`key::version_id`).
+    Upload { initiated_ns: u64 },
+    /// A delete: whether the version it made or removed is a delete marker, and that version's
+    /// ID, as `name::Outcome::Deleted` says them.
+    Deleted {
+        marker: bool,
+        version: Option<String>,
+    },
+}
+
 /// Where a block came from: the file it was made for, which alone may name it, the Block
 /// range's time it was written, and the time by which that file's write must name it, which
 /// the writer renews while its body streams in (docs/design/metadata.md §2).
@@ -978,6 +1023,140 @@ impl Holder {
             })
         })();
         decoded(holder, &r, "holder")
+    }
+}
+
+impl OperationRow {
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        record(|w| {
+            w.u64(self.incarnation);
+            w.u64(self.expiry_ns);
+            self.made.put(w)
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut r = open(bytes, "operation")?;
+        let row = (|| {
+            Some(Self {
+                incarnation: r.u64()?,
+                expiry_ns: r.u64()?,
+                made: Made::take(&mut r)?,
+            })
+        })();
+        decoded(row, &r, "operation")
+    }
+}
+
+impl Made {
+    /// Writes what was made, as an operation's row and an answer from it carry it: its kind,
+    /// then its fields.
+    pub(crate) fn put(&self, w: &mut Writer) -> Result<(), RecordError> {
+        match self {
+            Made::Version {
+                order,
+                null,
+                etag,
+                size,
+                checksum,
+            } => {
+                w.u8(0);
+                w.u64(*order);
+                w.u8(u8::from(*null));
+                put_str(w, etag)?;
+                w.u64(*size);
+                match checksum {
+                    None => w.u8(0),
+                    Some(c) => {
+                        w.u8(1);
+                        w.u8(c.algorithm);
+                        w.u16(c.parts);
+                        put_bytes(w, &c.value)?;
+                    }
+                }
+            }
+            Made::Part {
+                file,
+                etag,
+                size,
+                checksum,
+                modified_ns,
+            } => {
+                w.u8(1);
+                w.u128(*file);
+                put_str(w, etag)?;
+                w.u64(*size);
+                match checksum {
+                    None => w.u8(0),
+                    Some(value) => {
+                        w.u8(1);
+                        put_bytes(w, value)?;
+                    }
+                }
+                w.u64(*modified_ns);
+            }
+            Made::Upload { initiated_ns } => {
+                w.u8(2);
+                w.u64(*initiated_ns);
+            }
+            Made::Deleted { marker, version } => {
+                w.u8(3);
+                w.u8(u8::from(*marker));
+                match version {
+                    None => w.u8(0),
+                    Some(version) => {
+                        w.u8(1);
+                        put_str(w, version)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take(r: &mut Reader<'_>) -> Option<Self> {
+        let flag = |r: &mut Reader<'_>| match r.u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
+        Some(match r.u8()? {
+            0 => Made::Version {
+                order: r.u64()?,
+                null: flag(r)?,
+                etag: take_str(r)?,
+                size: r.u64()?,
+                checksum: match flag(r)? {
+                    false => None,
+                    true => Some(Checksum {
+                        algorithm: r.u8()?,
+                        parts: r.u16()?,
+                        value: take_bytes(r)?,
+                    }),
+                },
+            },
+            1 => Made::Part {
+                file: r.u128()?,
+                etag: take_str(r)?,
+                size: r.u64()?,
+                checksum: match flag(r)? {
+                    false => None,
+                    true => Some(take_bytes(r)?),
+                },
+                modified_ns: r.u64()?,
+            },
+            2 => Made::Upload {
+                initiated_ns: r.u64()?,
+            },
+            3 => Made::Deleted {
+                marker: flag(r)?,
+                version: match flag(r)? {
+                    false => None,
+                    true => Some(take_str(r)?),
+                },
+            },
+            _ => return None,
+        })
     }
 }
 
@@ -2606,7 +2785,82 @@ mod tests {
             }
             .encode()
             .unwrap()),
+            // Since 2026-11-17: an operation's row of each kind, last, so every earlier row's
+            // vector keeps its line.
+            hex(operation_rows()[0].encode().unwrap()),
+            hex(operation_rows()[1].encode().unwrap()),
+            hex(operation_rows()[2].encode().unwrap()),
+            hex(operation_rows()[3].encode().unwrap()),
         ]
+    }
+
+    /// An operation's row of each kind of thing an operation makes.
+    fn operation_rows() -> [OperationRow; 4] {
+        let row = |made| OperationRow {
+            incarnation: 3,
+            expiry_ns: u64::MAX,
+            made,
+        };
+        [
+            row(Made::Version {
+                order: 7,
+                null: true,
+                etag: "e".into(),
+                size: 5 << 20,
+                checksum: Some(Checksum {
+                    algorithm: 2,
+                    parts: 0,
+                    value: vec![9; 8],
+                }),
+            }),
+            row(Made::Part {
+                file: u128::MAX,
+                etag: "p".into(),
+                size: 0,
+                checksum: Some(vec![1; 4]),
+                modified_ns: 11,
+            }),
+            row(Made::Upload { initiated_ns: 13 }),
+            row(Made::Deleted {
+                marker: true,
+                version: Some("0000000000001".into()),
+            }),
+        ]
+    }
+
+    /// An operation's row reads back as written, and a flipped bit or a cut anywhere is refused.
+    #[test]
+    fn an_operation_row_reads_back_and_damage_is_corrupt() {
+        let unchecked = OperationRow {
+            incarnation: 0,
+            expiry_ns: 0,
+            made: Made::Version {
+                order: 1,
+                null: false,
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+            },
+        };
+        let undeleted = OperationRow {
+            made: Made::Deleted {
+                marker: false,
+                version: None,
+            },
+            ..unchecked.clone()
+        };
+        for row in operation_rows().into_iter().chain([unchecked, undeleted]) {
+            let bytes = row.encode().unwrap();
+            assert_eq!(OperationRow::decode(&bytes), Ok(row));
+            for i in 0..bytes.len() * 8 {
+                let mut damaged = bytes.clone();
+                damaged[i / 8] ^= 1 << (i % 8);
+                assert!(OperationRow::decode(&damaged).is_err());
+            }
+            for cut in 0..bytes.len() {
+                assert!(OperationRow::decode(&bytes[..cut]).is_err());
+            }
+        }
     }
 
     /// Every kind of row is the bytes its golden vector holds, which the format wrote before

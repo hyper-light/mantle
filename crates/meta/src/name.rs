@@ -20,7 +20,8 @@ use crate::error::{MetaError, reserved};
 use crate::key::{self, NULL_VERSION, NameRow};
 use crate::record::{
     self, Checksum, DefaultRetention, Descriptor, Gate, GateState, Holder, How, LISTING, Lineage,
-    Mark, Part, Retention, RetentionMode, RunMd5, Runs, Standing, Taken, Upload, Version,
+    Made, Mark, OperationRow, Part, Retention, RetentionMode, RunMd5, Runs, Standing, Taken,
+    Upload, Version,
 };
 
 pub use crate::record::Verdict;
@@ -121,6 +122,8 @@ pub enum Command {
     CreateUpload(CreateUpload),
     PutPart(PutPart),
     Complete(Complete),
+    /// One of the writes above, carrying its client's operation (docs/design/gateway.md §2.1).
+    Operated(Box<Operated>),
     Abort(Abort),
     Retain(Retain),
     Hold(Hold),
@@ -130,6 +133,7 @@ pub enum Command {
     Check(Check),
     Unmark(Unmark),
     Disown(Disown),
+    Forget(Forget),
     Split(Split),
     Freeze(Freeze),
     /// Applied by [`merge`], which reads the frozen range's rows; [`apply`] refuses it.
@@ -147,12 +151,17 @@ impl Command {
     /// own queue of released files goes with no key.
     fn moved(&self, now: &Descriptor) -> bool {
         let away = |bucket: &str, key: &str| !now.holds(&key::route(bucket, key));
+        if let Some((writing, _)) = self.writing() {
+            let (bucket, key, _) = writing.target();
+            return away(bucket, key);
+        }
         match self {
-            Self::Put(c) => away(&c.bucket, &c.key),
-            Self::Delete(c) => away(&c.bucket, &c.key),
-            Self::CreateUpload(c) => away(&c.bucket, &c.key),
-            Self::PutPart(c) => away(&c.bucket, &c.key),
-            Self::Complete(c) => away(&c.bucket, &c.key),
+            Self::Put(_)
+            | Self::Delete(_)
+            | Self::CreateUpload(_)
+            | Self::PutPart(_)
+            | Self::Complete(_)
+            | Self::Operated(_) => false,
             Self::Abort(c) => away(&c.bucket, &c.key),
             Self::Retain(c) => away(&c.bucket, &c.key),
             Self::Hold(c) => away(&c.bucket, &c.key),
@@ -165,18 +174,27 @@ impl Command {
             Self::Freeze(f) => f.generation != now.generation,
             Self::Merge(m) => m.generation != now.generation,
             Self::Abandon(a) => a.generation != now.generation,
-            Self::Reclaim(_) | Self::Resolve(_) | Self::End(_) | Self::Thaw(_) => false,
+            Self::Reclaim(_)
+            | Self::Forget(_)
+            | Self::Resolve(_)
+            | Self::End(_)
+            | Self::Thaw(_) => false,
         }
     }
 
     /// The bucket and incarnation a write to objects names; `None` for the gates' commands.
     fn write_to(&self) -> Option<(&str, u64)> {
+        if let Some((writing, _)) = self.writing() {
+            let (bucket, _, incarnation) = writing.target();
+            return Some((bucket, incarnation));
+        }
         match self {
-            Self::Put(c) => Some((&c.bucket, c.incarnation)),
-            Self::Delete(c) => Some((&c.bucket, c.incarnation)),
-            Self::CreateUpload(c) => Some((&c.bucket, c.incarnation)),
-            Self::PutPart(c) => Some((&c.bucket, c.incarnation)),
-            Self::Complete(c) => Some((&c.bucket, c.incarnation)),
+            Self::Put(_)
+            | Self::Delete(_)
+            | Self::CreateUpload(_)
+            | Self::PutPart(_)
+            | Self::Complete(_)
+            | Self::Operated(_) => None,
             Self::Abort(c) => Some((&c.bucket, c.incarnation)),
             Self::Retain(c) => Some((&c.bucket, c.incarnation)),
             Self::Hold(c) => Some((&c.bucket, c.incarnation)),
@@ -186,6 +204,7 @@ impl Command {
             | Self::Check(_)
             | Self::Unmark(_)
             | Self::Disown(_)
+            | Self::Forget(_)
             | Self::Split(_)
             | Self::Freeze(_)
             | Self::Merge(_)
@@ -196,13 +215,27 @@ impl Command {
         }
     }
 
+    /// The write a command makes, if it is one an operation's record answers for, and the
+    /// client's operation it carries, if any.
+    fn writing(&self) -> Option<(Writing<'_>, Option<Operation>)> {
+        Some(match self {
+            Self::Put(c) => (Writing::Put(c), None),
+            Self::Delete(c) => (Writing::Delete(c), None),
+            Self::CreateUpload(c) => (Writing::CreateUpload(c), None),
+            Self::PutPart(c) => (Writing::PutPart(c), None),
+            Self::Complete(c) => (Writing::Complete(c), None),
+            Self::Operated(o) => (o.mutation.writing(), Some(o.operation)),
+            _ => return None,
+        })
+    }
+
     /// What names a write that makes a version or a part: its file, which a version or part
     /// will reference if the write goes ahead, or, for a write that carries none, the ID the
     /// gateway drew for it; with the key it is for, the time of the entry that carries it, and
     /// its handover deadline.
     fn carries(&self) -> Option<Carried<'_>> {
-        let (bucket, key, file, id, at_ns, deadline_ns) = match self {
-            Self::Put(c) => (
+        let (bucket, key, file, id, at_ns, deadline_ns) = match self.writing()?.0 {
+            Writing::Put(c) => (
                 &c.bucket,
                 &c.key,
                 c.version.file,
@@ -210,7 +243,7 @@ impl Command {
                 c.at_ns,
                 c.deadline_ns,
             ),
-            Self::PutPart(c) => (
+            Writing::PutPart(c) => (
                 &c.bucket,
                 &c.key,
                 Some(c.part.file),
@@ -218,8 +251,8 @@ impl Command {
                 c.at_ns,
                 c.part.deadline_ns,
             ),
-            Self::Complete(c) => (&c.bucket, &c.key, c.file, c.id, c.at_ns, c.deadline_ns),
-            _ => return None,
+            Writing::Complete(c) => (&c.bucket, &c.key, c.file, c.id, c.at_ns, c.deadline_ns),
+            Writing::Delete(_) | Writing::CreateUpload(_) => return None,
         };
         Some(Carried {
             bucket,
@@ -241,6 +274,98 @@ struct Carried<'a> {
     file: Option<u128>,
     at_ns: u64,
     deadline_ns: u64,
+}
+
+/// A client's operation, which every attempt of it carries, through any gateway
+/// (docs/design/gateway.md §2.1): its identity, as its gateway scoped it to what authentication
+/// established, and how long the range's record of it answers its attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Operation {
+    pub identity: u128,
+    /// The horizon the client declared, capped by the server's (docs/design/metadata.md §2,
+    /// "Operations"): the record answers until the range's time passes its commit plus this.
+    pub horizon_ns: u64,
+}
+
+/// A write carrying its client's operation: the range commits it with a record of what it made,
+/// and answers every later attempt carrying the operation from that record, applying nothing
+/// (docs/design/metadata.md §2, "Operations").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operated {
+    pub operation: Operation,
+    pub mutation: Mutation,
+}
+
+/// The writes an operation's record answers for: a version, by a PUT, a copy or a completion;
+/// an upload; a part; a delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mutation {
+    Put(Put),
+    Delete(Delete),
+    CreateUpload(CreateUpload),
+    PutPart(PutPart),
+    Complete(Complete),
+}
+
+impl Mutation {
+    fn writing(&self) -> Writing<'_> {
+        match self {
+            Self::Put(c) => Writing::Put(c),
+            Self::Delete(c) => Writing::Delete(c),
+            Self::CreateUpload(c) => Writing::CreateUpload(c),
+            Self::PutPart(c) => Writing::PutPart(c),
+            Self::Complete(c) => Writing::Complete(c),
+        }
+    }
+
+    /// The write a command makes, if it is one an operation's record answers for: what a
+    /// command decoded behind an operation's tag must be.
+    pub fn of(command: Command) -> Option<Self> {
+        Some(match command {
+            Command::Put(c) => Self::Put(c),
+            Command::Delete(c) => Self::Delete(c),
+            Command::CreateUpload(c) => Self::CreateUpload(c),
+            Command::PutPart(c) => Self::PutPart(c),
+            Command::Complete(c) => Self::Complete(c),
+            _ => return None,
+        })
+    }
+}
+
+/// One of the writes an operation's record answers for, as a command or an operated command
+/// holds it.
+#[derive(Debug, Clone, Copy)]
+enum Writing<'a> {
+    Put(&'a Put),
+    Delete(&'a Delete),
+    CreateUpload(&'a CreateUpload),
+    PutPart(&'a PutPart),
+    Complete(&'a Complete),
+}
+
+impl<'a> Writing<'a> {
+    /// The bucket, key and incarnation the write is for.
+    fn target(self) -> (&'a str, &'a str, u64) {
+        match self {
+            Self::Put(c) => (&c.bucket, &c.key, c.incarnation),
+            Self::Delete(c) => (&c.bucket, &c.key, c.incarnation),
+            Self::CreateUpload(c) => (&c.bucket, &c.key, c.incarnation),
+            Self::PutPart(c) => (&c.bucket, &c.key, c.incarnation),
+            Self::Complete(c) => (&c.bucket, &c.key, c.incarnation),
+        }
+    }
+
+    /// Whether `made` is what this write makes: a version a PUT's or a completion's, a part a
+    /// part's, an upload an upload's, a delete a delete's.
+    fn makes(self, made: &Made) -> bool {
+        matches!(
+            (self, made),
+            (Self::Put(_) | Self::Complete(_), Made::Version { .. })
+                | (Self::PutPart(_), Made::Part { .. })
+                | (Self::CreateUpload(_), Made::Upload { .. })
+                | (Self::Delete(_), Made::Deleted { .. })
+        )
+    }
 }
 
 /// A new version of `key`: PutObject, CopyObject's destination, or a completed upload.
@@ -545,6 +670,21 @@ pub struct Disown {
     pub at_ns: u64,
 }
 
+/// The collector forgets the operations whose horizon has passed (docs/design/metadata.md §2,
+/// "Operations"): a page of the range's operation rows, read in key order from `from`, each
+/// removed once the range's time has passed its expiry. The time is recorded as a write's, so an
+/// attempt that comes after, even one a leader whose clock runs behind proposed, reads a time
+/// past the expiry of a row it no longer finds. The range forgets only rows it holds, its own
+/// keys' since a split takes its child's and a merge brings the frozen range's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forget {
+    /// The operation row the page begins at: empty for the range's first.
+    pub from: Vec<u8>,
+    /// Rows the page reads at most, which bounds the entry's work.
+    pub budget: u32,
+    pub at_ns: u64,
+}
+
 /// A file's mark: the key it is under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Marked {
@@ -658,6 +798,10 @@ pub enum Outcome {
     Miscombined,
     /// `404 NoSuchBucket`: the range holds no open gate for the write's incarnation.
     NoSuchBucket,
+    /// An attempt of an operation the range made before, through this gateway or another: what
+    /// the first delivery made, which the attempt is answered as it was, nothing applied
+    /// (docs/design/metadata.md §2, "Operations").
+    Answered(Made),
     /// A gate moved, or a retry found it moved.
     GateMoved,
     /// The gate is not where the step expects: the coordinator reads the bucket again.
@@ -695,6 +839,9 @@ pub enum Outcome {
     Awaits { deadline_ns: u64 },
     /// A part file given back: `released` if the composite adopted it and it is released now.
     Disowned { released: bool },
+    /// A page of the range's operations read, those past their horizon forgotten: where the
+    /// next page begins, `None` once the range holds no more.
+    Forgot { next: Option<Vec<u8>> },
     /// The command was routed by a descriptor the range no longer matches: it took nothing,
     /// and this is where its span went.
     Moved(Box<Lineage>),
@@ -734,15 +881,37 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         engine.apply(index, writes)?;
         return Ok(outcome);
     }
+    let marked = match command.carries() {
+        Some(c) => engine
+            .get(&key::mark(c.bucket, c.key, c.id))?
+            .map(|mark| Mark::decode(&mark))
+            .transpose()?,
+        None => None,
+    };
+    let expired = match command.carries() {
+        Some(c) => clock::now(engine, c.at_ns)? > c.deadline_ns,
+        None => false,
+    };
+    // An attempt of a client's operation the range made, through any gateway, after any restart,
+    // or a copy of one: answered as the operation's first delivery was, from its row, applying
+    // nothing, so no operation has two effects and no attempt replaces what a later write made.
+    // The attempt's own file, made for it alone, is released as a refused write's is, once: a
+    // copy of the attempt finds it marked (docs/design/metadata.md §2, "Operations").
+    if let Some(made) = made_before(engine, command)? {
+        let writes = match (command.carries(), marked) {
+            (Some(c), None) => refused_file(engine, &c, expired)?,
+            _ => Vec::new(),
+        };
+        engine.apply(index, writes)?;
+        return Ok(Outcome::Answered(made));
+    }
     // A write carrying a file the range has marked, or a write with no file whose ID it has
     // marked, is a copy of one it applied, delivered again after its session forgot it
     // (docs/design/replica.md §1). Applied again it could make a second version, or be
     // refused and release a file a version or a composite holds: it is answered as the first
     // was, and takes and releases nothing.
-    if let Some(c) = command.carries()
-        && let Some(mark) = engine.get(&key::mark(c.bucket, c.key, c.id))?
-    {
-        let outcome = copy(command, Mark::decode(&mark)?);
+    if let Some(mark) = marked {
+        let outcome = copy(command, mark);
         engine.apply(index, vec![])?;
         return Ok(outcome);
     }
@@ -750,18 +919,18 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Some((bucket, incarnation)) => admits(engine, bucket, incarnation)?,
         None => true,
     };
-    let expired = match command.carries() {
-        Some(c) => clock::now(engine, c.at_ns)? > c.deadline_ns,
-        None => false,
-    };
     let (outcome, writes) = match command {
         _ if !admitted => (Outcome::NoSuchBucket, Vec::new()),
         _ if expired => (Outcome::Expired, Vec::new()),
-        Command::Put(p) => put(engine, p)?,
-        Command::Delete(d) => delete(engine, d)?,
-        Command::CreateUpload(c) => create_upload(engine, c)?,
-        Command::PutPart(p) => put_part(engine, p)?,
-        Command::Complete(c) => complete(engine, c)?,
+        Command::Put(_)
+        | Command::Delete(_)
+        | Command::CreateUpload(_)
+        | Command::PutPart(_)
+        | Command::Complete(_)
+        | Command::Operated(_) => match command.writing() {
+            Some((writing, operation)) => write(engine, writing, operation)?,
+            None => (Outcome::Invalid, Vec::new()),
+        },
         Command::Abort(a) => abort(engine, a)?,
         Command::Retain(r) => retain(engine, r)?,
         Command::Hold(h) => hold(engine, h)?,
@@ -774,6 +943,7 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
         Command::Check(c) => check(engine, c)?,
         Command::Unmark(u) => unmark(engine, u)?,
         Command::Disown(d) => disown(engine, d)?,
+        Command::Forget(f) => forget(engine, f)?,
         Command::Split(s) => split(engine, s)?,
         Command::Freeze(f) => freeze(&lineage, f)?,
         Command::Abandon(_) => refuse(lineage.clone())?,
@@ -791,21 +961,115 @@ pub fn apply<E: Rows>(engine: &mut E, index: u64, command: &Command) -> Result<O
     // and nothing marks it.
     let mut writes = writes;
     if let Some(c) = command.carries()
-        && let Some(file) = c.file
         && !matches!(outcome, Outcome::Put { .. } | Outcome::PartWritten)
     {
-        let now = clock::now(engine, c.at_ns)?;
-        writes.push(release(now, c.bucket, c.key, file)?);
-        if !expired {
-            let mark = Mark {
-                how: How::Refused,
-                deadline_ns: c.deadline_ns,
-            };
-            writes.push(Write::Put(key::mark(c.bucket, c.key, file), mark.encode()));
-        }
+        writes.extend(refused_file(engine, &c, expired)?);
     }
     engine.apply(index, writes)?;
     Ok(outcome)
+}
+
+/// The writes that release the file a write carried and the range did not take, refused or
+/// answered from its operation's row: the gateway wrote it for this write alone. One refused
+/// within its deadline is marked too, for the sweep and for a copy of the write. One past its
+/// deadline is not: it may come after the sweep settled the file, and a mark would stay; if the
+/// sweep comes by after, it releases the file a second time, which the reclaimer finds gone
+/// (docs/design/metadata.md §2). A write with no file releases nothing.
+fn refused_file<E: Rows>(
+    engine: &mut E,
+    c: &Carried<'_>,
+    expired: bool,
+) -> Result<Vec<Write>, MetaError> {
+    let Some(file) = c.file else {
+        return Ok(Vec::new());
+    };
+    let now = clock::now(engine, c.at_ns)?;
+    let mut writes = vec![release(now, c.bucket, c.key, file)?];
+    if !expired {
+        let mark = Mark {
+            how: How::Refused,
+            deadline_ns: c.deadline_ns,
+        };
+        writes.push(Write::Put(key::mark(c.bucket, c.key, file), mark.encode()));
+    }
+    Ok(writes)
+}
+
+/// What the operation a write carries made, where the range holds its row: under the bucket's
+/// incarnation the write names, and of the write's kind, a row of another being another
+/// operation's, which only a hash's collision would give, since the gateway scopes an identity
+/// by the kind of write (docs/design/gateway.md §2.1).
+fn made_before<E: Rows>(engine: &mut E, command: &Command) -> Result<Option<Made>, MetaError> {
+    let Some((writing, Some(operation))) = command.writing() else {
+        return Ok(None);
+    };
+    let (bucket, key, incarnation) = writing.target();
+    let Some(row) = engine.get(&key::operation(bucket, key, operation.identity))? else {
+        return Ok(None);
+    };
+    let row = OperationRow::decode(&row)?;
+    if row.incarnation == incarnation && writing.makes(&row.made) {
+        Ok(Some(row.made))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Applies one of the writes an operation's record answers for, recording what it made with
+/// `operation` where it carries one and goes ahead.
+fn write<E: Rows>(
+    engine: &mut E,
+    writing: Writing<'_>,
+    operation: Option<Operation>,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    match writing {
+        Writing::Put(p) => put(engine, p, operation),
+        Writing::Delete(d) => delete(engine, d, operation),
+        Writing::CreateUpload(c) => create_upload(engine, c, operation),
+        Writing::PutPart(p) => put_part(engine, p, operation),
+        Writing::Complete(c) => complete(engine, c, operation),
+    }
+}
+
+/// The row recording what operation `operation` made of `key` in `bucket`, committed at the
+/// range's time `now_ns`, which answers its attempts until that time plus its horizon has passed.
+/// A horizon past the clock's last instant lasts until that instant.
+fn recorded(
+    bucket: &str,
+    key: &str,
+    incarnation: u64,
+    operation: Operation,
+    now_ns: u64,
+    made: Made,
+) -> Result<Write, MetaError> {
+    let row = OperationRow {
+        incarnation,
+        expiry_ns: now_ns.saturating_add(operation.horizon_ns),
+        made,
+    };
+    Ok(Write::Put(
+        key::operation(bucket, key, operation.identity),
+        row.encode()?,
+    ))
+}
+
+/// Forgets the operations of a page of the range's rows whose horizon has passed at the range's
+/// time, which the entry records (`Forget`).
+fn forget<E: Rows>(engine: &mut E, f: &Forget) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let (now, clock) = clock::tick(engine, f.at_ns)?;
+    let mut writes = vec![clock];
+    let (first, end) = key::operations_all();
+    let mut at = f.from.clone().max(first);
+    for _ in 0..f.budget {
+        let Some((k, v)) = engine.next(&at, &end)? else {
+            return Ok((Outcome::Forgot { next: None }, writes));
+        };
+        at = after(&k);
+        if now > OperationRow::decode(&v)?.expiry_ns {
+            writes.push(Write::Delete(k));
+        }
+    }
+    Ok((Outcome::Forgot { next: Some(at) }, writes))
 }
 
 /// The range's lineage: its descriptor, and the child of its last split.
@@ -1364,7 +1628,11 @@ fn collect<E: Rows>(engine: &mut E, c: &Collect) -> Result<(Outcome, Vec<Write>)
     Ok((Outcome::Collected { done }, writes))
 }
 
-fn put<E: Rows>(engine: &mut E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn put<E: Rows>(
+    engine: &mut E,
+    p: &Put,
+    operation: Option<Operation>,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (bucket, key, versioning) = (p.bucket.as_str(), p.key.as_str(), p.versioning);
     let (preconditions, at_ns, ordered_ns, version) =
         (&p.preconditions, p.at_ns, p.ordered_ns, &p.version);
@@ -1437,6 +1705,16 @@ fn put<E: Rows>(engine: &mut E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaEr
     if version.file.is_none() {
         writes.push(queue(time, bucket, key, p.id, false)?);
     }
+    if let Some(operation) = operation {
+        let made = Made::Version {
+            order,
+            null,
+            etag: written.etag.clone(),
+            size: written.size,
+            checksum: written.checksum.clone(),
+        };
+        writes.push(recorded(bucket, key, p.incarnation, operation, time, made)?);
+    }
     Ok((
         Outcome::Put {
             version: shown_id(null, order),
@@ -1445,7 +1723,32 @@ fn put<E: Rows>(engine: &mut E, p: &Put) -> Result<(Outcome, Vec<Write>), MetaEr
     ))
 }
 
-fn delete<E: Rows>(engine: &mut E, d: &Delete) -> Result<(Outcome, Vec<Write>), MetaError> {
+/// A delete, recorded with its operation where it carries one and went ahead.
+fn delete<E: Rows>(
+    engine: &mut E,
+    d: &Delete,
+    operation: Option<Operation>,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
+    let (outcome, mut writes) = removal(engine, d)?;
+    if let (Some(operation), Outcome::Deleted { marker, version }) = (operation, &outcome) {
+        let made = Made::Deleted {
+            marker: *marker,
+            version: version.clone(),
+        };
+        let now = clock::now(engine, d.at_ns)?;
+        writes.push(recorded(
+            &d.bucket,
+            &d.key,
+            d.incarnation,
+            operation,
+            now,
+            made,
+        )?);
+    }
+    Ok((outcome, writes))
+}
+
+fn removal<E: Rows>(engine: &mut E, d: &Delete) -> Result<(Outcome, Vec<Write>), MetaError> {
     let (bucket, key, versioning) = (d.bucket.as_str(), d.key.as_str(), d.versioning);
     let (named, if_match, at_ns) = (d.named, d.if_match.as_ref(), d.at_ns);
     if let Some(if_match) = if_match {
@@ -1574,6 +1877,7 @@ fn delete<E: Rows>(engine: &mut E, d: &Delete) -> Result<(Outcome, Vec<Write>), 
 fn create_upload<E: Rows>(
     engine: &mut E,
     c: &CreateUpload,
+    operation: Option<Operation>,
 ) -> Result<(Outcome, Vec<Write>), MetaError> {
     // A native upload begins with no run, its run within S3's part sizes and whole segments,
     // and as many runs as a file holds enough for its stated length (`run_length`).
@@ -1603,6 +1907,17 @@ fn create_upload<E: Rows>(
         ),
         row.encode()?,
     ));
+    if let Some(operation) = operation {
+        let made = Made::Upload { initiated_ns: time };
+        writes.push(recorded(
+            &c.bucket,
+            &c.key,
+            c.incarnation,
+            operation,
+            time,
+            made,
+        )?);
+    }
     Ok((Outcome::Created { upload }, writes))
 }
 
@@ -1617,7 +1932,11 @@ fn runs_fit(runs: &Runs) -> bool {
         })
 }
 
-fn put_part<E: Rows>(engine: &mut E, p: &PutPart) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn put_part<E: Rows>(
+    engine: &mut E,
+    p: &PutPart,
+    operation: Option<Operation>,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
     if !(1..=MAX_PART_NUMBER).contains(&p.number) || p.part.size > MAX_PART {
         return Ok((Outcome::Invalid, Vec::new()));
     }
@@ -1692,10 +2011,32 @@ fn put_part<E: Rows>(engine: &mut E, p: &PutPart) -> Result<(Outcome, Vec<Write>
         key::mark(&p.bucket, &p.key, p.part.file),
         mark.encode(),
     ));
+    if let Some(operation) = operation {
+        let made = Made::Part {
+            file: p.part.file,
+            etag: p.part.etag.clone(),
+            size: p.part.size,
+            checksum: p.part.checksum.clone(),
+            modified_ns: p.part.modified_ns,
+        };
+        let now = clock::now(engine, p.at_ns)?;
+        writes.push(recorded(
+            &p.bucket,
+            &p.key,
+            p.incarnation,
+            operation,
+            now,
+            made,
+        )?);
+    }
     Ok((Outcome::PartWritten, writes))
 }
 
-fn complete<E: Rows>(engine: &mut E, c: &Complete) -> Result<(Outcome, Vec<Write>), MetaError> {
+fn complete<E: Rows>(
+    engine: &mut E,
+    c: &Complete,
+    operation: Option<Operation>,
+) -> Result<(Outcome, Vec<Write>), MetaError> {
     let Some(upload_row) = upload(engine, &c.bucket, &c.key, &c.upload)? else {
         // A retry of a complete that committed finds the version it made (05 §4.4).
         let made = match key::parse_version_id(&c.upload) {
@@ -1815,6 +2156,7 @@ fn complete<E: Rows>(engine: &mut E, c: &Complete) -> Result<(Outcome, Vec<Write
             id: c.id,
             deadline_ns: c.deadline_ns,
         },
+        operation,
     )?;
     if matches!(outcome, Outcome::Put { .. }) {
         // Parts not listed are discarded with the upload (05 §4.4); those listed are now the
@@ -5771,5 +6113,249 @@ mod tests {
         let queue = released(&mut r.engine, u64::MAX, 10).unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].released_ns / MS, 20);
+    }
+
+    /// An attempt of operation `identity`, horizon `horizon_ns`, putting `key` in a versioned
+    /// bucket at `at_ns` with `file` and `etag`, as a gateway hands it over.
+    fn attempt(
+        key: &str,
+        identity: u128,
+        horizon_ns: u64,
+        at_ns: u64,
+        file: u128,
+        etag: &str,
+    ) -> Command {
+        Command::Operated(Box::new(Operated {
+            operation: Operation {
+                identity,
+                horizon_ns,
+            },
+            mutation: Mutation::Put(Put {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: key.into(),
+                versioning: Versioning::Enabled,
+                preconditions: Preconditions::default(),
+                at_ns,
+                ordered_ns: None,
+                version: Version {
+                    file: Some(file),
+                    ..object(etag)
+                },
+                default: None,
+                id: file,
+                deadline_ns: u64::MAX,
+            }),
+        }))
+    }
+
+    /// How many times the range's queue of released files holds `file`.
+    fn releases(r: &mut Range, file: u128) -> usize {
+        released(&mut r.engine, u64::MAX, usize::MAX)
+            .unwrap()
+            .iter()
+            .filter(|q| q.file == file)
+            .count()
+    }
+
+    /// The five obligations of an operation's record on one range (docs/design/gateway.md
+    /// §2.1): its first delivery commits a version with the row; a copy of it, and an attempt
+    /// through another gateway with a file and an ETag of its own, are answered with the first
+    /// delivery's version and ETag and apply nothing; the attempt's own file is released once,
+    /// however often it is sent, and the first's never; and an attempt after a later write
+    /// replaces nothing.
+    #[test]
+    fn an_operation_has_one_effect_and_every_attempt_its_first_answer() {
+        let mut r = Range::new();
+        let first = attempt("k", 7, 1_000, 1_100, 500, "e1");
+        let Outcome::Put { version } = r.run(first.clone()) else {
+            panic!("the first delivery was refused");
+        };
+        let made = |r: &mut Range| match r.versions("k").last() {
+            Some((id, false, etag)) => (id.clone(), etag.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(made(&mut r), (version.clone(), "e1".to_owned()));
+        let answered = |o: Outcome| match o {
+            Outcome::Answered(Made::Version {
+                order, null, etag, ..
+            }) => (shown_id(null, order), etag),
+            other => panic!("{other:?}"),
+        };
+        // A copy of the first, and an attempt through another gateway, twice.
+        assert_eq!(answered(r.run(first)), (version.clone(), "e1".to_owned()));
+        let retry = attempt("k", 7, 1_000, 1_200, 501, "e2");
+        for _ in 0..2 {
+            assert_eq!(
+                answered(r.run(retry.clone())),
+                (version.clone(), "e1".to_owned())
+            );
+        }
+        assert_eq!(r.versions("k").len(), 1, "an attempt made a second version");
+        assert_eq!((releases(&mut r, 500), releases(&mut r, 501)), (0, 1));
+        // A later write is current; an attempt after it answers the first and replaces nothing.
+        r.clock = 1_300;
+        assert!(matches!(
+            r.put("k", "e3", Versioning::Enabled),
+            Outcome::Put { .. }
+        ));
+        let late = attempt("k", 7, 1_000, 1_400, 502, "e4");
+        assert_eq!(answered(r.run(late)), (version, "e1".to_owned()));
+        let versions = r.versions("k");
+        assert_eq!(versions.len(), 2);
+        assert_eq!(
+            versions[0].2, "e3",
+            "a stale attempt replaced a later write"
+        );
+        assert_eq!(releases(&mut r, 502), 1);
+        // Another principal's identity, scoped apart by its gateway, is another operation.
+        assert!(matches!(
+            r.run(attempt("k", 8, 1_000, 1_500, 503, "e5")),
+            Outcome::Put { .. }
+        ));
+        assert_eq!(r.versions("k").len(), 3);
+    }
+
+    /// A first attempt the range refuses records nothing, since it changed nothing: a later
+    /// attempt of the operation is judged afresh, and goes ahead once nothing refuses it.
+    #[test]
+    fn a_refused_attempt_records_nothing_and_the_next_is_judged_afresh() {
+        let mut r = Range::new();
+        assert!(matches!(
+            r.put("k", "e0", Versioning::Unversioned),
+            Outcome::Put { .. }
+        ));
+        let unless_there = |file| {
+            let Command::Operated(mut o) = attempt("k", 9, 1_000, 2_000, file, "e1") else {
+                panic!("an attempt carries its operation");
+            };
+            if let Mutation::Put(p) = &mut o.mutation {
+                p.preconditions.if_none_match = Some(Match::Any);
+                p.versioning = Versioning::Unversioned;
+            }
+            Command::Operated(o)
+        };
+        assert_eq!(r.run(unless_there(600)), Outcome::PreconditionFailed);
+        assert_eq!(r.engine.get(&key::operation("b", "k", 9)).unwrap(), None);
+        assert_eq!(releases(&mut r, 600), 1);
+        assert!(matches!(
+            r.delete("k", Versioning::Unversioned, None),
+            Outcome::Deleted { .. }
+        ));
+        assert!(matches!(r.run(unless_there(601)), Outcome::Put { .. }));
+        assert!(matches!(r.run(unless_there(602)), Outcome::Answered(_)));
+    }
+
+    /// The collector forgets an operation's row once the range's time has passed its commit
+    /// plus its horizon, a page at a time, and records the time it judged by, so an entry a
+    /// leader whose clock runs behind proposes after it reads a time at least as late.
+    #[test]
+    fn the_collector_forgets_an_operation_only_past_its_horizon() {
+        let mut r = Range::new();
+        assert!(matches!(
+            r.run(attempt("a", 1, 100, 3_000, 700, "e")),
+            Outcome::Put { .. }
+        ));
+        assert!(matches!(
+            r.run(attempt("b", 2, 100, 3_000, 701, "e")),
+            Outcome::Put { .. }
+        ));
+        let rows = |r: &mut Range| {
+            [1, 2].map(|id| {
+                let k = if id == 1 { "a" } else { "b" };
+                r.engine.get(&key::operation("b", k, id)).unwrap().is_some()
+            })
+        };
+        let forget = |r: &mut Range, from: Vec<u8>, at_ns: u64| {
+            r.run(Command::Forget(Forget {
+                from,
+                budget: 1,
+                at_ns,
+            }))
+        };
+        // Within the horizon: a page of one row, read and kept, then the next.
+        let Outcome::Forgot { next: Some(next) } = forget(&mut r, Vec::new(), 3_050) else {
+            panic!("a page of one row ends the range's rows");
+        };
+        assert_eq!(
+            forget(&mut r, next, 3_050),
+            Outcome::Forgot {
+                next: Some(after(&key::operation("b", "b", 2)))
+            }
+        );
+        assert_eq!(rows(&mut r), [true, true]);
+        // Past it, both go, and the page past the last says so.
+        let Outcome::Forgot { next: Some(next) } = forget(&mut r, Vec::new(), 4_000) else {
+            panic!("the first page");
+        };
+        assert!(matches!(
+            forget(&mut r, next.clone(), 4_000),
+            Outcome::Forgot { .. }
+        ));
+        assert_eq!(
+            forget(&mut r, after(&key::operation("b", "b", 2)), 4_000),
+            Outcome::Forgot { next: None }
+        );
+        assert_eq!(rows(&mut r), [false, false]);
+        assert!(clock::now(&mut r.engine, 0).unwrap() >= 4_000);
+        // An attempt after the row went is past the horizon its client stated: a new write, as
+        // S3 makes one.
+        assert!(matches!(
+            r.run(attempt("a", 1, 100, 1_000, 702, "e")),
+            Outcome::Put { .. }
+        ));
+    }
+
+    /// A split gives its child the operations of the keys it takes, and the range keeps the
+    /// rest: an attempt is answered from the row by whichever range holds its key.
+    #[test]
+    fn a_split_carries_operations_with_their_keys() {
+        let mut r = Range::new();
+        assert!(matches!(
+            r.run(attempt("a", 1, 1_000, 5_000, 800, "e")),
+            Outcome::Put { .. }
+        ));
+        assert!(matches!(
+            r.run(attempt("x", 2, 1_000, 5_000, 801, "e")),
+            Outcome::Put { .. }
+        ));
+        let s = Split {
+            generation: 1,
+            at: key::route("b", "m"),
+            child: 2,
+        };
+        let made = child(&mut r.engine, &s).unwrap().unwrap();
+        let mut rows = made.rows;
+        for (k, v) in r.engine.image().unwrap() {
+            if made.spans.iter().any(|(from, to)| *from <= k && k < *to) {
+                rows.push((k, v));
+            }
+        }
+        let mut taken = Range {
+            engine: Model::default(),
+            ..Range::new()
+        };
+        taken.engine.install(0, rows).unwrap();
+        assert!(matches!(r.run(Command::Split(s)), Outcome::Split(_)));
+        assert_eq!(r.engine.get(&key::operation("b", "x", 2)).unwrap(), None);
+        assert!(
+            taken
+                .engine
+                .get(&key::operation("b", "a", 1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            r.run(attempt("a", 1, 1_000, 5_100, 802, "e")),
+            Outcome::Answered(_)
+        ));
+        assert!(matches!(
+            r.run(attempt("x", 2, 1_000, 5_100, 803, "e")),
+            Outcome::Moved(_)
+        ));
+        assert!(matches!(
+            taken.run(attempt("x", 2, 1_000, 5_100, 803, "e")),
+            Outcome::Answered(_)
+        ));
     }
 }

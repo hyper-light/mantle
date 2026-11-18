@@ -66,10 +66,17 @@ pub const REVERSE: u8 = 0x02;
 /// object key as its rows are: a split cuts them at the same key, and listings never see them
 /// (docs/design/metadata.md §2).
 pub const MARKS: u8 = 0x03;
+/// The Name range's operation rows: what each client operation made and the answer its first
+/// delivery got, until its horizon passes, ordered by object key as its rows are, so a split cuts
+/// them at the same key and listings never see them (docs/design/metadata.md §2, "Operations").
+pub const OPERATIONS: u8 = 0x04;
 
 /// After an object key's routing key in the marks' space: one of its marks. A file ID may
 /// begin with 0xFF, which would read as an escaped 0x00 of the key.
 const MARK: u8 = 1;
+/// After an object key's routing key in the operations' space: one of its operations, for the
+/// same reason as a mark's byte.
+const OPERATION: u8 = 1;
 
 /// Name-layer rows under `(bucket, key)`, in the order they sort.
 const NULL: u8 = 1;
@@ -234,10 +241,10 @@ pub fn bucket_routes(bucket: &str) -> (Vec<u8>, Vec<u8>) {
     (from, past)
 }
 
-/// The rows of the Name layer's spaces, its objects' and its marks', whose routing keys lie in
-/// `[from, to)`, or from `from` on when `to` is `None`.
-pub fn name_spans(from: &[u8], to: Option<&[u8]>) -> [(Vec<u8>, Vec<u8>); 2] {
-    [DATA, MARKS].map(|space| {
+/// The rows of the Name layer's spaces, its objects', its marks' and its operations', whose
+/// routing keys lie in `[from, to)`, or from `from` on when `to` is `None`.
+pub fn name_spans(from: &[u8], to: Option<&[u8]>) -> [(Vec<u8>, Vec<u8>); 3] {
+    [DATA, MARKS, OPERATIONS].map(|space| {
         let mut lo = sized(from.len().saturating_add(1));
         lo.push(space);
         lo.extend_from_slice(from);
@@ -329,6 +336,40 @@ fn marks_of(bucket: &str) -> Vec<u8> {
     out.push(MARKS);
     put_string(&mut out, bucket.as_bytes());
     out
+}
+
+/// The key of the Name range's row of operation `identity` on `key` in `bucket`: the identity as
+/// its gateway scoped it to what authentication established (`name::scoped`).
+pub fn operation(bucket: &str, key: &str, identity: u128) -> Vec<u8> {
+    let mut out = sized(
+        objects_len(bucket)
+            .saturating_add(string_len(key.as_bytes()))
+            .saturating_add(1 + 16),
+    );
+    out.push(OPERATIONS);
+    put_string(&mut out, bucket.as_bytes());
+    put_string(&mut out, key.as_bytes());
+    out.push(OPERATION);
+    out.extend_from_slice(&identity.to_be_bytes());
+    out
+}
+
+/// The bucket, key and identity an operation row's key names; `None` if it is not one.
+pub fn decode_operation(k: &[u8]) -> Option<(String, String, u128)> {
+    let rest = k.strip_prefix(&[OPERATIONS])?;
+    let (bucket, rest) = take_string(rest)?;
+    let (key, rest) = take_string(rest)?;
+    let rest = rest.strip_prefix(&[OPERATION])?;
+    Some((
+        String::from_utf8(bucket).ok()?,
+        String::from_utf8(key).ok()?,
+        u128::from_be_bytes(rest.try_into().ok()?),
+    ))
+}
+
+/// Every key of the operations' space: its first, and a key past its last.
+pub fn operations_all() -> (Vec<u8>, Vec<u8>) {
+    (vec![OPERATIONS], vec![OPERATIONS.saturating_add(1)])
 }
 
 /// The key of a file in the File range's queue of files whose handover is not yet settled, or
@@ -915,15 +956,16 @@ pub fn least_bytes() -> usize {
 /// Bytes of the longest key a range writes from a request S3 admits: an object's row under S3's
 /// longest bucket name and key (`wire::MAX_BUCKET`, `wire::MAX_KEY`), every byte of the key the
 /// zero its escape doubles, with the longest suffix a row of it adds, a part of an upload under
-/// the longest upload ID, or a mark's file. Every other key is a range's own few bytes, an ID,
-/// or a bucket's or an owner's name (`wire::MAX_OWNER`). A command whose row's key passes the
-/// range's bound is refused whole (`apply::apply_entry`).
+/// the longest upload ID, a mark's file or an operation's identity. Every other key is a range's
+/// own few bytes, an ID, or a bucket's or an owner's name (`wire::MAX_OWNER`). A command whose
+/// row's key passes the range's bound is refused whole (`apply::apply_entry`).
 pub fn largest_bytes() -> usize {
     let bucket = "b".repeat(crate::wire::MAX_BUCKET);
     let key = "\0".repeat(crate::wire::MAX_KEY);
     let upload = version_id(u64::MAX).into_bytes();
     let part = name(&bucket, &key, &NameRow::Part(upload, u16::MAX)).len();
     part.max(mark(&bucket, &key, u128::MAX).len())
+        .max(operation(&bucket, &key, u128::MAX).len())
 }
 
 /// Crockford's base-32 alphabet, which ascends in ASCII.
@@ -982,6 +1024,7 @@ mod tests {
             name(&bucket, &key, &NameRow::Upload(upload.clone())),
             name(&bucket, &key, &NameRow::Part(upload, u16::MAX)),
             mark(&bucket, &key, u128::MAX),
+            operation(&bucket, &key, u128::MAX),
             self::bucket(&bucket),
             gate(&bucket),
             attempt(&bucket),
@@ -1112,7 +1155,8 @@ mod tests {
 
     proptest! {
         /// A span between routing keys holds, in each space, the rows of exactly the object
-        /// keys whose routing keys it holds: a mark whose file ID begins with 0xFF included.
+        /// keys whose routing keys it holds: a mark whose file ID, or an operation whose
+        /// identity, begins with 0xFF included.
         #[test]
         fn a_routing_span_bounds_every_row_of_its_keys(
             bucket in route_text(),
@@ -1125,14 +1169,23 @@ mod tests {
             let at = route(&bucket, &key);
             let (lo, hi) = (route(&lo.0, &lo.1), hi.map(|(b, k)| route(&b, &k)));
             let inside = lo <= at && hi.as_ref().is_none_or(|hi| at < *hi);
-            let [data, marks] = name_spans(&lo, hi.as_deref());
-            for (row, (from, to)) in [(name(&bucket, &key, &r), data), (mark(&bucket, &key, file), marks)] {
+            let [data, marks, operations] = name_spans(&lo, hi.as_deref());
+            let rows = [
+                (name(&bucket, &key, &r), data),
+                (mark(&bucket, &key, file), marks),
+                (operation(&bucket, &key, file), operations.clone()),
+            ];
+            for (row, (from, to)) in rows {
                 prop_assert_eq!(from <= row && row < to, inside);
             }
+            let (all_from, all_to) = operations_all();
+            prop_assert!(all_from <= operations.0 && operations.1 <= all_to);
             prop_assert_eq!(decode_route(&at), Some((bucket.clone(), key.clone())));
             let (first, past) = bucket_routes(&bucket);
             prop_assert!(first <= at && at < past);
-            prop_assert_eq!(decode_mark(&mark(&bucket, &key, file)), Some((bucket, key, file)));
+            prop_assert_eq!(decode_mark(&mark(&bucket, &key, file)), Some((bucket.clone(), key.clone(), file)));
+            prop_assert_eq!(decode_operation(&operation(&bucket, &key, file)), Some((bucket, key, file)));
+            prop_assert_eq!(decode_operation(&mark("b", "k", file)), None);
         }
 
         /// Routing keys order as their `(bucket, key)` pairs, and a bucket's routes hold only

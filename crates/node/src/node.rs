@@ -1588,6 +1588,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
         }
+        for lanes in &mut self.shards {
+            lanes.tell_lost()?;
+        }
         Ok(())
     }
 
@@ -2790,7 +2793,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// What this node kept for `peer`'s connection, which is gone: the plane's keys from it, the
     /// frames its lane had no room for, and each range's progress to the peer, which Raft probes
-    /// again. The link says unkeyed until a connection is made again (`Event::Connected`).
+    /// again: a far range's, which shares its group with the peer, by its shard, told at the
+    /// turn's take (`shard::Lanes::tell_lost`). The link says unkeyed until a connection is made
+    /// again (`Event::Connected`).
     fn unkey(&mut self, peer: PeerId) {
         // A client's connection is its own to make again.
         let Some(remote) = self.remotes.iter_mut().find(|r| r.id == peer) else {
@@ -2802,6 +2807,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         for kept in &self.ranges {
             if let Some(shell) = self.owner.get_mut(kept.handle) {
                 let _ = shell.report_unreachable(peer);
+            }
+        }
+        for lanes in &mut self.shards {
+            if self
+                .far
+                .iter()
+                .any(|far| far.shard == lanes.shard() && far.peers.binary_search(&peer).is_ok())
+            {
+                lanes.lost(peer);
             }
         }
     }

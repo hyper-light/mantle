@@ -70,6 +70,9 @@ pub(crate) enum In<E: Engine, S: LogStore> {
     Compact,
     /// Whether a snapshot a range sent member `to` arrived (`Replica::report_snapshot`).
     Reported { group: u128, to: u64, arrived: bool },
+    /// A peer's connection went: each range that shares its group with it is told
+    /// (`Replica::report_unreachable`), as the node's shard tells its own (`Node::unkey`).
+    Unreachable(PeerId),
     /// The stop's hand-over of a range's lead ([`transfer`]), past the voter `failed` whose
     /// transfer its core gave up: the voter it goes to told back ([`Out::Handing`]).
     Transfer { group: u128, failed: Option<u64> },
@@ -442,6 +445,9 @@ pub(crate) struct Lanes<E: Engine, S: LogStore> {
     from: ChannelReceiver<Out>,
     /// What a look for the shard's output took and the node has yet to handle ([`Lanes::arrived`]).
     held: Option<Out>,
+    /// The peers whose connection went that the shard is yet to be told of ([`Lanes::lost`]):
+    /// each once, so at most the node's peers.
+    lost: Vec<PeerId>,
 }
 
 impl<E, S> Lanes<E, S>
@@ -468,6 +474,7 @@ where
             into,
             from,
             held: None,
+            lost: Vec::new(),
         })
     }
 }
@@ -512,6 +519,35 @@ impl<E: Engine + 'static, S: LogStore> Lanes<E, S> {
                 NodeError::ShardEnded(self.shard)
             }
         })
+    }
+
+    /// Holds that `peer`'s connection went, for the shard to be told at the turn's take
+    /// ([`Lanes::tell_lost`]), each peer once.
+    pub(crate) fn lost(&mut self, peer: PeerId) {
+        if !self.lost.contains(&peer) {
+            self.lost.push(peer);
+        }
+    }
+
+    /// Tells the shard of each peer whose connection went ([`In::Unreachable`]) while its lane has
+    /// room, and holds the rest for the next turn's, as the ends of snapshots are held
+    /// (`Node::report_far`): a range's leader told gives up the window it sent that peer ahead of
+    /// its answers, which went with the connection, and probes it again from what it is known to
+    /// hold (hyper-raft's `MsgUnreachable`, etcd raft's `ReportUnreachable`); dropped, the leader
+    /// would wait on that window until the peer's answers after its next connection undo it. A
+    /// held report costs one entry a peer. A shard whose task ended is refused `ShardEnded`, which
+    /// stops the node.
+    pub(crate) fn tell_lost(&mut self) -> Result<(), NodeError> {
+        while let Some(&peer) = self.lost.first() {
+            match self.send(In::Unreachable(peer)) {
+                Ok(()) => {
+                    self.lost.remove(0);
+                }
+                Err(NodeError::LaneFull(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Whether the shard gave something the node has yet to take, or ended. A look that finds
@@ -710,6 +746,20 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                     // A replica that refuses it is fenced, which its next drive reports.
                     let _ = replica.report_snapshot(to, arrived);
                     self.owner.schedule(handle);
+                }
+            }
+            In::Unreachable(peer) => {
+                for kept in &self.ranges {
+                    let Some(replica) = self.owner.get_mut(kept.handle) else {
+                        continue;
+                    };
+                    if !replica.peers().any(|other| other == peer) {
+                        continue;
+                    }
+                    // One a replica waiting for room refuses is lost, as the node's own is
+                    // (`Node::unkey`): the peer's next reply, or its silence, moves its progress.
+                    let _ = replica.report_unreachable(peer);
+                    self.owner.schedule(kept.handle);
                 }
             }
             In::Transfer { group, failed } => {
@@ -1215,6 +1265,7 @@ mod tests {
             into,
             from,
             held: None,
+            lost: Vec::new(),
         };
         (lanes, (taken, given))
     }
@@ -2017,5 +2068,54 @@ mod tests {
             propose(&shards, &far, &put(), max),
             Err(NodeError::ShardEnded(2))
         ));
+    }
+
+    /// A peer whose connection went is told to a far range's shard ([`In::Unreachable`]) once its
+    /// lane has room, held while the lane holds all it takes, each peer once however often it was
+    /// lost meanwhile; one held for a shard whose task ended stops the node, typed.
+    #[test]
+    fn a_lost_peer_is_told_to_the_shard_once_its_lane_has_room() {
+        let (mut lanes, (mut taken, given)) = unstarted(1);
+        lanes.send(measured()).unwrap();
+        lanes.lost(2);
+        lanes.lost(3);
+        lanes.lost(2);
+        lanes.tell_lost().unwrap();
+        assert_eq!(lanes.lost, vec![2, 3], "held while the lane is full");
+        assert!(matches!(taken.try_recv(), Ok(Some(In::Measure(_)))));
+        lanes.tell_lost().unwrap();
+        assert_eq!(lanes.lost, vec![3]);
+        assert!(matches!(taken.try_recv(), Ok(Some(In::Unreachable(2)))));
+        lanes.tell_lost().unwrap();
+        assert!(lanes.lost.is_empty());
+        assert!(matches!(taken.try_recv(), Ok(Some(In::Unreachable(3)))));
+        assert!(matches!(taken.try_recv(), Ok(None)), "each peer told once");
+        lanes.lost(4);
+        drop((taken, given));
+        assert!(matches!(lanes.tell_lost(), Err(NodeError::ShardEnded(1))));
+    }
+
+    /// A far range's shard told a peer's connection went goes on driving its ranges: one that
+    /// shares no group with the peer is untouched, and answers its next proposal.
+    #[test]
+    fn a_far_ranges_shard_takes_a_lost_peer_and_goes_on() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let (mut lanes, _, _) = leading(&rt, &log, &range);
+        lanes.send(In::Unreachable(2)).unwrap();
+        lanes
+            .send(In::Propose(GROUP, put(), range.settings.max_entry_bytes))
+            .unwrap();
+        let Out::Applied(group, _) = next(&mut lanes, "its entry applied", deadline(), |out| {
+            !matches!(out, Out::Applied(..))
+        }) else {
+            panic!("`next` gives only what it does not skip")
+        };
+        assert_eq!(group, GROUP);
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
     }
 }

@@ -190,16 +190,22 @@ pub fn stdout(depth: usize, chunk: usize) -> Result<Stdout, RtError> {
 
 impl Stdout {
     /// Writes all of `buf`, a chunk at a time, awaiting a free buffer while the writer is behind.
+    ///
+    /// Each chunk awaits room on the writer's channel, then a buffer, then is handed over with no await
+    /// between, so a write dropped at either await (a caller racing it against other work, as mantle's client
+    /// races its sink against its transport) took no buffer and handed over nothing of that chunk. Each await
+    /// may answer `Pending` with its operation undone, the task's turn spent (`crate::coop`); a buffer held
+    /// across the hand-off's await was dropped with such a write, and once the pool's every buffer had gone so,
+    /// the next write waited for good for one no thread would hand back (`tests/stdout_dropped_write.rs`).
     pub async fn write_all(&mut self, mut buf: &[u8]) -> Result<(), RtError> {
         while !buf.is_empty() {
+            let room = self.out.reserve().await.map_err(|_| closed())?;
             let mut buffer = self.empty.recv().await.map_err(|_| closed())?;
             let n = buffer.capacity().min(buf.len());
             let (now, rest) = buf.split_at(n);
             buffer.extend_from_slice(now);
             buf = rest;
-            self.out
-                .send(OutMessage(OutInner::Bytes(buffer)))
-                .await
+            room.send(OutMessage(OutInner::Bytes(buffer)))
                 .map_err(|_| closed())?;
         }
         Ok(())

@@ -238,6 +238,14 @@ impl DeframerVecBuffer {
     }
 
     /// Resize the internal `buf` if necessary for reading more bytes.
+    ///
+    /// The buffer grows a read at a time as records need it, its capacity exactly its length, to
+    /// a record at its largest on the wire at most ([`MAX_WIRE_SIZE`]), and keeps that size across
+    /// records and idles: a connection reading records back to back, or resting between them,
+    /// neither lets it go nor grows it again. Only a handshake message joined past one record (to
+    /// `MAX_HANDSHAKE_SIZE`) takes it further, and once that message is consumed the buffer goes
+    /// back to what the next read needs. Upstream also shrank it to one read whenever it held no
+    /// message, to keep an idle connection small (VENDORED.md §13).
     fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), &'static str> {
         /// TLS allows for handshake messages of up to 16MB.  We
         /// restrict that to 64KB to limit potential for denial-of-
@@ -266,13 +274,17 @@ impl DeframerVecBuffer {
         // If we can and need to increase the buffer size to allow a 4k read, do so. After
         // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
         // make sure to reduce the buffer size again (large messages should be rare).
-        // Also, reduce the buffer size if there are neither full nor partial messages in it,
-        // which usually means that the other side suspended sending data.
         // `used` is below `allow_max` here, so the sum does not saturate.
         let need_capacity = Ord::min(allow_max, self.used.saturating_add(READ_SIZE));
-        if need_capacity > self.buf.len() {
+        if let Some(more) = need_capacity
+            .checked_sub(self.buf.len())
+            .filter(|more| *more > 0)
+        {
+            // Exactly the read's room: `resize` alone grows the capacity by doubling, which takes a
+            // record at its largest to 32 KiB, past `MAX_WIRE_SIZE`.
+            self.buf.reserve_exact(more);
             self.buf.resize(need_capacity, 0);
-        } else if self.used == 0 || self.buf.len() > allow_max {
+        } else if self.buf.len() > allow_max {
             self.buf.resize(need_capacity, 0);
             self.buf.shrink_to(need_capacity);
         }

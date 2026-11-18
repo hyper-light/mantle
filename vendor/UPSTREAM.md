@@ -87,10 +87,25 @@ command on the six targets.
 
 ## hyper-raft (shared crates)
 
-**Every crate at `a575a44` (hyper-raft branch `mantle-frame-flush`, equal to `mantle-shard-port`:
-`85bd35f` and twenty-nine commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`.
+**Every crate at `0ad9275` (hyper-raft branch `mantle-frame-flush`, equal to `mantle-shard-port`:
+`85bd35f` and thirty-one commits), with no local delta**, taken by `scripts/snapshot-hyper-raft.py`.
 The branch is in the hyper-raft repository's own objects and not yet pushed to its origin. Its last
-commit, `a575a44`, changes hyper-liveness alone (hyper-raft docs/timing.md §2.4 and §2.8, "The
+commit, `0ad9275`, changes hyper-rt alone (hyper-raft docs/runtime.md §6.2): a standard-output write
+dropped before it is ready takes no buffer of the writer's pool. `Stdout::write_all` took a buffer, then
+awaited its hand-off's send, which the turn charge (§3.14) may answer `Pending` with the value kept in
+the send, so a write dropped there dropped its buffer. The client races each sink write against its
+transport and drops a write the transport overtook (`mantle_client::Sink`), and the CLI's two buffers
+went one by one on its slice of microseconds: on CI's one-CPU Linux leg every `cp s3://BUCKET/KEY -` of
+`crates/mantle/tests/native.rs` then waited for good for a buffer no thread would hand back, its shard
+parked and its writer thread idle (kiln r61). Each chunk now reserves room on the writer's channel, then
+takes a buffer, then hands it over with no await between; hyper-rt's `tests/stdout_dropped_write.rs`
+drops 500 writes part-way on a runtime shaped as the CLI's and was red at its second round before. The
+one before it, `ae7d0f6`, changes hyper-tls alone (hyper-tls VENDORED.md §13): a connection's read
+buffer grows with its capacity reserved exactly, to a record at its largest on the wire
+(`MAX_WIRE_SIZE`, 18,437 bytes) and no more, and keeps it across records and idles, where upstream's
+rule shrank it at every drain and Vec's doubling took it to 32 KiB, four reallocations for each PUT over
+TLS whose body fills a record (`crates/node/tests/listener_memory.rs`). The one before it, `a575a44`,
+changes hyper-liveness alone (hyper-raft docs/timing.md §2.4 and §2.8, "The
 floor's measures in their usual range"): the default mode's sender floor `E[flush] + G` takes the
 log writes' flush, the stream's own proof and `G` each as the mean of the samples within their tail
 as each came, RFC 6298's bound over the samples before it, the rule the disk mode's floor already

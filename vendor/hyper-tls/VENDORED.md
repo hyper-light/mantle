@@ -628,3 +628,45 @@ conforms and the allocation counts' comparison, a test dependency only.
 
 Counts unchanged (`tests/alloc_per_handshake.rs`): a TLS 1.3 handshake 281 allocations, mutual
 401, TLS 1.2 140, against upstream's 293, 419 and 142.
+
+## 13. A connection's read buffer holds a record across records and idles (2026-11-18)
+
+- **Upstream's rule.** The deframer's buffer (`msgs/deframer/buffers.rs`, `prepare_read`) grows a
+  read (4,096 bytes) at a time, to a record at its largest on the wire (`MAX_WIRE_SIZE`, 18,437
+  bytes: the 5-byte header, RFC 8446 §5.1, and 2^14 bytes of plaintext with the 2,048 bytes TLS 1.2
+  lets protection add, RFC 5246 §6.2.3, more than TLS 1.3's 256, RFC 8446 §5.2), or to 64 KiB
+  while it joins a handshake message. It shrank the buffer back to one read whenever it held
+  neither a whole nor a partial message, "which usually means that the other side suspended sending
+  data" (upstream's comment), and after a joined handshake message past a record ("large messages
+  should be rare"). rustls 0.20 held a fixed `Box<[u8; MAX_WIRE_SIZE]>` for every connection; 0.21
+  made the buffer grow from one read, join handshake messages to 64 KiB and shrink when drained, so
+  an idle connection holds one read (read in the 0.20.8 and 0.21.2 crates.io sources, which name no
+  issue for it).
+- **What it cost.** A connection reading records at their largest let the buffer go at every drain
+  and grew it again for the next: `resize` doubles a `Vec`'s capacity, so 4,096 to 8,192, 16,384
+  and 32,768 bytes, three reallocations growing it and a fourth shrinking it a record, and a capacity
+  of 32 KiB, past `MAX_WIRE_SIZE`, while it held one. Found by mantle's `listener_memory.rs`: four
+  reallocations for each PUT over TLS whose body fills a record.
+- **Now.** The buffer grows a read at a time with its capacity reserved exactly (`reserve_exact`),
+  so a record at its largest leaves it at `MAX_WIRE_SIZE` and no more, and it keeps that size across
+  records and idles. A joined handshake message past a record still takes it to 64 KiB, and once
+  that is consumed it goes back to what the next read needs, as upstream. A connection never sent a
+  record past one read still holds one read.
+- **Why holding is right here.** A connection's read buffer is now fixed: at most `MAX_WIRE_SIZE`,
+  the record its consumers already charge every connection (mantle's listener: `CONNECTION_BYTES`,
+  measured with a request in flight, and `listener::REQUEST_BYTES`'s TLS record). Upstream shrank to
+  keep an idle connection's memory small; a consumer that reserves a record for each connection it
+  admits gains nothing from that, and paid four reallocations a record for it.
+- **Test.** `tests/alloc_per_record.rs`, counting the server's side of a TLS 1.3 and a TLS 1.2
+  connection: the first record at its largest grows the buffer in four reallocations by 14,341
+  bytes, to `MAX_WIRE_SIZE` exactly; 64 more, each drained and followed by a read that finds the
+  peer idle, reallocate nothing. Under upstream's rule it fails: the first record's reads grow the
+  buffer in three reallocations by 28,672 bytes, to 32 KiB, and the idle read gives them back in a
+  fourth. Each record's plaintext is still copied out of the buffer into a block of its own
+  (`CommonState::take_received_plaintext`), one allocation a record, which the test states.
+- **Oracle.** Unit 254, api 237, api_ffdhe 5, certificate_decoding 2, client_cert_verifier 4, e2e,
+  ech 2, key_log_file_env 2, over_hyper_rt 1, process_provider 1, server_cert_verifier 6,
+  unbuffered 27, doctests 15 (3 ignored), `alloc_per_handshake` and `alloc_per_record`: all pass.
+  Handshakes allocate as before, no more than upstream's in any shape; with Ed25519 their
+  reallocations equal upstream's and their bytes stay below, since no handshake's records take the
+  buffer past one read.

@@ -568,6 +568,19 @@ pub struct TrunkStats {
     /// ([`Trunk::add_parts`]): what the root's compactions of one input would have written again
     /// (research/57 §7).
     pub parted_entries: u64,
+    /// Packed memtables incorporated: those whose branches went straight into the root's pivots'
+    /// bundles ([`Trunk::add_parts`]), and those that went in flight to be compacted.
+    pub packings_parted: u64,
+    pub packings_inflight: u64,
+    /// Gets through the trunk, the branches their paths listed (the pending parts and, at each
+    /// node, the pivot's live in-flight branches and its bundle's), the filters they asked, and
+    /// the branches whose filter passed them, each read by its leaf index's descent (a trie
+    /// floor) and a leaf: what a get reads its way through, a source a get's path lists being a
+    /// filter to ask and, past it, a trie to walk ([`Trunk::get_hashed`]).
+    pub gets: u64,
+    pub get_sources: u64,
+    pub get_probes: u64,
+    pub get_reads: u64,
     /// The trunk's shape when these were taken ([`Trunk::levels`]), a depth an element from the
     /// root, depths past the last summed into it.
     pub shape: [LevelShape; SHAPE_DEPTHS],
@@ -975,12 +988,16 @@ impl Trunk {
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
         self.gets = self.gets.saturating_add(1);
+        self.stats.gets = self.stats.gets.saturating_add(1);
         for p in self.pending.iter_mut().rev() {
             let Some(b) = p.part_mut(key) else {
                 continue;
             };
-            b.probes = b.probes.saturating_add(1);
-            if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
+            self.stats.get_sources = self.stats.get_sources.saturating_add(1);
+            if !Self::passes(&mut self.stats, b, hash) {
+                continue;
+            }
+            if let Some(op) = b.get_passed_async(store, key, value).await? {
                 return Ok(Some(op));
             }
         }
@@ -1004,6 +1021,7 @@ impl Trunk {
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
+                self.stats.get_sources = self.stats.get_sources.saturating_add(1);
             }
             std::hint::black_box(touched);
             for bundle in inflight
@@ -1013,15 +1031,19 @@ impl Trunk {
                 .rev()
             {
                 for b in bundle.covering_mut(key) {
-                    b.probes = b.probes.saturating_add(1);
-                    if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
+                    if !Self::passes(&mut self.stats, b, hash) {
+                        continue;
+                    }
+                    if let Some(op) = b.get_passed_async(store, key, value).await? {
                         return Ok(Some(op));
                     }
                 }
             }
             for b in pivot.bundle.branches.iter_mut() {
-                b.probes = b.probes.saturating_add(1);
-                if let Some(op) = b.get_hashed_async(store, key, hash, value).await? {
+                if !Self::passes(&mut self.stats, b, hash) {
+                    continue;
+                }
+                if let Some(op) = b.get_passed_async(store, key, value).await? {
                     return Ok(Some(op));
                 }
             }
@@ -1033,6 +1055,19 @@ impl Trunk {
         Err(corrupt())
     }
 
+    /// Whether `b`'s filter passes a key of filter hash `hash`, counted as a get's probe on the
+    /// branch ([`Branch::probes`]) and the trunk, and as a read where it passes
+    /// ([`TrunkStats::get_reads`]).
+    fn passes(stats: &mut TrunkStats, b: &mut Branch, hash: u64) -> bool {
+        b.probes = b.probes.saturating_add(1);
+        stats.get_probes = stats.get_probes.saturating_add(1);
+        let passes = b.filter.may_contain(hash);
+        if passes {
+            stats.get_reads = stats.get_reads.saturating_add(1);
+        }
+        passes
+    }
+
     /// [`Self::get_hashed`], counting each filter's probes on its branch ([`Branch::probes`]).
     fn find<F: BlockFile>(
         &mut self,
@@ -1042,12 +1077,16 @@ impl Trunk {
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
         self.gets = self.gets.saturating_add(1);
+        self.stats.gets = self.stats.gets.saturating_add(1);
         for p in self.pending.iter_mut().rev() {
             let Some(b) = p.part_mut(key) else {
                 continue;
             };
-            b.probes = b.probes.saturating_add(1);
-            if let Some(op) = b.get_hashed(store, key, hash, value)? {
+            self.stats.get_sources = self.stats.get_sources.saturating_add(1);
+            if !Self::passes(&mut self.stats, b, hash) {
+                continue;
+            }
+            if let Some(op) = b.get_passed(store, key, value)? {
                 return Ok(Some(op));
             }
         }
@@ -1071,6 +1110,7 @@ impl Trunk {
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
+                self.stats.get_sources = self.stats.get_sources.saturating_add(1);
             }
             std::hint::black_box(touched);
             for bundle in inflight
@@ -1080,15 +1120,19 @@ impl Trunk {
                 .rev()
             {
                 for b in bundle.covering_mut(key) {
-                    b.probes = b.probes.saturating_add(1);
-                    if let Some(op) = b.get_hashed(store, key, hash, value)? {
+                    if !Self::passes(&mut self.stats, b, hash) {
+                        continue;
+                    }
+                    if let Some(op) = b.get_passed(store, key, value)? {
                         return Ok(Some(op));
                     }
                 }
             }
             for b in pivot.bundle.branches.iter_mut() {
-                b.probes = b.probes.saturating_add(1);
-                if let Some(op) = b.get_hashed(store, key, hash, value)? {
+                if !Self::passes(&mut self.stats, b, hash) {
+                    continue;
+                }
+                if let Some(op) = b.get_passed(store, key, value)? {
                     return Ok(Some(op));
                 }
             }

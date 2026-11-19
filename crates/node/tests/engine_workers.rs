@@ -388,3 +388,193 @@ fn an_install_the_store_holds_on_the_shard_alone_it_holds_with_a_worker() {
     .join()
     .unwrap();
 }
+
+/// The rows of a PUT burst a metadata range's engine takes: 40,000, within the 20,000 to 60,000
+/// a cell's three ranges take for 20,000 small PUTs.
+const BURST: u64 = 40_000;
+
+/// Row `i` of the burst in the order many clients' PUTs interleave: a Name range's version key
+/// and record, sized as [`row`]'s, the keys spread over the range by a stride prime to the burst.
+fn burst_row(i: u64) -> (Vec<u8>, Vec<u8>) {
+    row(i * 7_919 % BURST)
+}
+
+/// What the gets and one-row seeks of every row cost through the trunk, each a thousandth of a
+/// source a row, and the trunk's shape: the branches its pivots' bundles and in-flight lists
+/// hold, the most one bundle holds, and the in-flight bundles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadCost {
+    jobs: u64,
+    get_sources: u64,
+    get_probes: u64,
+    get_reads: u64,
+    seek_sources: u64,
+    seek_opened: u64,
+    height: usize,
+    branches: u64,
+    most: u64,
+    inflight: u64,
+    pivots: u64,
+    parted: u64,
+    whole: u64,
+    parted_entries: u64,
+    flushes: u64,
+    pivot_compactions: u64,
+    leaf_compactions: u64,
+    whole_consolidations: u64,
+    consolidations: u64,
+    entries_written: u64,
+}
+
+/// The trunk's maintenance jobs applied: its compactions, flushes and splits.
+fn jobs(t: &mantle_engine::trunk::TrunkStats) -> u64 {
+    t.pivot_compactions + t.leaf_compactions + t.flushes + t.splits
+}
+
+/// Reads every row of the burst back, a get and a one-row seek as a range's lookups make, and
+/// counts what they cost a row through the trunk, in thousandths.
+fn read_cost<F: BlockFile + 'static>(db: &mut mantle_engine::shard_db::ShardDb<F>) -> ReadCost {
+    let before = db.stats().1;
+    let mut value = Vec::new();
+    let mut rows = mantle_engine::rows::Rows::new();
+    for i in 0..BURST {
+        let (k, v) = row(i);
+        assert!(db.get(&k, &mut value).unwrap(), "row {i}");
+        assert_eq!(value, v);
+        let mut end = k.clone();
+        end.push(0);
+        rows.clear();
+        db.scan_rows(&k, Some(&end), 1, &mut rows).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+    let after = db.stats().1;
+    let per = |a: u64, b: u64| (a - b) * 1_000 / BURST;
+    let levels = after.shape;
+    ReadCost {
+        jobs: jobs(&after),
+        get_sources: per(after.get_sources, before.get_sources),
+        get_probes: per(after.get_probes, before.get_probes),
+        get_reads: per(after.get_reads, before.get_reads),
+        seek_sources: per(after.scan_sources, before.scan_sources),
+        seek_opened: per(after.scan_opened, before.scan_opened),
+        height: db.shape().unwrap().0,
+        branches: levels.iter().map(|l| l.branches).sum(),
+        most: levels.iter().map(|l| l.most).max().unwrap_or(0),
+        inflight: levels.iter().map(|l| l.inflight).sum(),
+        pivots: levels.iter().map(|l| l.pivots).sum(),
+        parted: after.packings_parted,
+        whole: after.packings_inflight,
+        parted_entries: after.parted_entries,
+        flushes: after.flushes,
+        pivot_compactions: after.pivot_compactions,
+        leaf_compactions: after.leaf_compactions,
+        whole_consolidations: after.whole_consolidations,
+        consolidations: after.consolidations,
+        entries_written: after.entries_written,
+    }
+}
+
+/// A range's engine under the node's derived configuration (`derive::engine` of a cell's rules on
+/// a device of 4 KiB writes), opened as `process::engine` opens it, with `workers` maintenance
+/// workers or none, takes the burst; then its read costs, at once and after each doubling of the
+/// maintenance jobs applied since, until none is owed.
+fn burst_costs(workers: usize) -> Vec<ReadCost> {
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.store");
+        mantle_engine::store::permit_blocking();
+        let (_, rules) = mantle_node::derive::cell(3).unwrap();
+        let engine = mantle_node::derive::engine(4096, 1 << 30, &rules).unwrap();
+        shard()
+            .block_on(async move {
+                let open = |create: bool| {
+                    DeviceFile::open(
+                        &path,
+                        create,
+                        CachingRequest::Buffered,
+                        Alignment::new(4096).unwrap(),
+                    )
+                };
+                let mut db = mantle_engine::shard_db::ShardDb::create(
+                    open(true).unwrap(),
+                    engine.store,
+                    engine.memtable_bytes,
+                    engine.trunk,
+                )
+                .unwrap();
+                if workers > 0 {
+                    let again = path.clone();
+                    db.set_workers_within(
+                        move || {
+                            DeviceFile::open(
+                                &again,
+                                false,
+                                CachingRequest::Buffered,
+                                Alignment::new(4096).unwrap(),
+                            )
+                            .map_err(|e| mantle_engine::Error::Io {
+                                op: "open",
+                                detail: e.to_string(),
+                            })
+                        },
+                        workers,
+                    )
+                    .unwrap();
+                }
+                for i in 0..BURST {
+                    let (k, v) = burst_row(i);
+                    db.put(&k, &v).unwrap();
+                }
+                let start = jobs(&db.stats().1);
+                let mut costs = vec![read_cost(&mut db)];
+                let mut next = 1;
+                // Each idle step applies at most a pass's jobs; the trunk's queue is bounded by
+                // its nodes, so the steps end.
+                for _ in 0..1_000_000 {
+                    if !db.owed() {
+                        break;
+                    }
+                    db.idle_step(engine.trunk.leaf_entries).unwrap();
+                    if jobs(&db.stats().1) - start >= next {
+                        costs.push(read_cost(&mut db));
+                        next *= 2;
+                    }
+                }
+                assert!(!db.owed(), "maintenance never caught up");
+                costs.push(read_cost(&mut db));
+                costs
+            })
+            .unwrap()
+    })
+    .join()
+    .unwrap()
+}
+
+/// A get or a seek through a range's engine, with its worker or inline, lists no more sources than
+/// the trunk's bound for its height while maintenance is busy (`TrunkConfig::sources_most`), and,
+/// once none is owed, holds no in-flight bundle and no pivot bundle past `fanout + 1` branches
+/// (docs/design/engine-structure.md, Flush). The counts are printed, worker beside inline: how far
+/// the worker's idle layout differs from inline's depends on its pace (engine-structure.md;
+/// the commit that added this test), so no run's comparison is asserted.
+#[test]
+fn reads_with_a_worker_or_inline_stay_within_the_trunks_bounds() {
+    let (_, rules) = mantle_node::derive::cell(3).unwrap();
+    let engine = mantle_node::derive::engine(4096, 1 << 30, &rules).unwrap();
+    eprintln!("engine {engine:?}");
+    let inline = burst_costs(0);
+    let worker = burst_costs(ENGINE_WORKERS);
+    for (mode, costs) in [("inline", &inline), ("worker", &worker)] {
+        for c in costs {
+            eprintln!("{mode} {c:?}");
+            let most = engine.trunk.sources_most(c.height) as u64 * 1_000;
+            assert!(c.get_sources <= most, "{mode} {c:?} past {most}");
+            assert!(c.seek_sources <= most, "{mode} {c:?} past {most}");
+        }
+        let idle = costs.last().unwrap();
+        assert_eq!(idle.inflight, 0, "{mode} {idle:?}");
+        assert!(
+            idle.most <= engine.trunk.fanout as u64 + 1,
+            "{mode} {idle:?}"
+        );
+    }
+}

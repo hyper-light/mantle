@@ -157,12 +157,16 @@ impl Job {
     /// Whether its work is held, by a peer or a device: an ask of its own out, or a chunk waiting
     /// for room at a volume or in the transport toward it.
     fn held(&self) -> bool {
-        !self.pending.is_empty()
-            || match &self.work {
-                Work::Put(putting) => putting.put.as_ref().is_some_and(Put::waits_for_room),
-                Work::Copy(copying) => copying.put.as_ref().is_some_and(Put::waits_for_room),
-                _ => false,
-            }
+        !self.pending.is_empty() || self.waits_for_room()
+    }
+
+    /// Whether a chunk of its put waits for room at a volume or in the transport toward it.
+    fn waits_for_room(&self) -> bool {
+        match &self.work {
+            Work::Put(putting) => putting.put.as_ref().is_some_and(Put::waits_for_room),
+            Work::Copy(copying) => copying.put.as_ref().is_some_and(Put::waits_for_room),
+            _ => false,
+        }
     }
 
     /// What to do while its work is held: vouch within its patience, answer a refusal past it,
@@ -181,15 +185,18 @@ impl Job {
 
     /// Its next bound or working beat, while its own work is held. A get whose reply began
     /// and whose patience passed is vouched for no more and needs no beat; a get still reading
-    /// its version must wake at the bound even through the local S3 door.
+    /// its version must wake at the bound even through the local S3 door. A put whose chunk waits
+    /// for room is due at the beat on either door: no answer of its own comes to turn the node
+    /// when a peer's volume frees room, so the node offers it room again then
+    /// (`Node::step_host`).
     fn due_ns(&self, now: u64, beat: u64) -> Option<u64> {
         if self.bounded(now) == Bounded::Unvouched {
             return None;
         }
         let bound = self.bound_ns();
         Some(match self.door {
-            Door::Exchange(_) => bound.min(now.saturating_add(beat)),
-            Door::Local(_) => bound,
+            Door::Local(_) if !self.waits_for_room() => bound,
+            Door::Exchange(_) | Door::Local(_) => bound.min(now.saturating_add(beat)),
         })
     }
 
@@ -1798,8 +1805,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         for at in 0..self.jobs.len() {
             self.take_answers(at)?;
         }
-        if freed {
+        // A chunk refused for room at a peer's volume hears nothing when that volume frees room
+        // (its queue held by others' writes or by its cleaner, as a filling volume's is), and with
+        // no other chunk of this node answered nothing offered it room again before its client's
+        // patience: it is offered room again at each beat it waits, a probe timeout, as a held
+        // job is vouched for (research/77 D2), at most once a beat.
+        let now = hyper_rt::futures::now_ns();
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let waiting = self.jobs.iter().any(Job::waits_for_room);
+        let due = waiting && now >= self.room_offered_ns.saturating_add(beat);
+        if freed || due {
             self.offer_room()?;
+        }
+        if freed || due || !waiting {
+            self.room_offered_ns = now;
         }
         self.bound_jobs()?;
         // The step that held the turn longest, and its operation's label.
@@ -6029,6 +6048,112 @@ mod tests {
         assert_eq!(job.bounded(patience + 1), Bounded::Held);
         job.deadline_ns = Some(patience + 1);
         assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
+    }
+
+    /// An S3 put whose chunks every volume refused for want of room is due at its beat, as a
+    /// native one is, so the node turns to offer them room again (`Node::step_host`): it was due
+    /// only at its client's patience, and nothing turned the node when a peer's volume freed room,
+    /// so the fill suite's S3 put sat quiet (CI run 44454089741, linux-x86_64).
+    #[test]
+    fn an_s3_put_waiting_for_room_is_due_at_its_beat() {
+        let commit = Commit::Object(name::Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: 0,
+            ordered_ns: None,
+            version: Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".into(),
+                headers: Vec::new(),
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            },
+            default: None,
+            id: 0,
+            deadline_ns: 0,
+        });
+        let data = DataKey::generate().unwrap();
+        let bytes = data.wrap(&WrappingKey::generate().unwrap()).unwrap();
+        let keys = Keys {
+            file: 7,
+            data,
+            wrapped: WrappedKey {
+                by: Wrapper::Root(1),
+                bytes,
+            },
+        };
+        let body = Body {
+            length: 1,
+            checksum: None,
+            content_md5: false,
+        };
+        let holding = Holding {
+            handover_ns: 1,
+            window: 1,
+        };
+        let layout = Layout::new(durability::Scheme::Copies(3)).unwrap();
+        let mut put = Put::new(commit, body, keys, layout, holding, Box::new(Random), 0).unwrap();
+        assert_eq!(put.feed(b"x").unwrap(), 1);
+        put.end(&Expected::default()).unwrap();
+        let (id, place) = put.poll().unwrap();
+        let put::Request::Place { width, .. } = place else {
+            panic!("{place:?}");
+        };
+        let volumes = (0..u128::try_from(width).unwrap()).collect();
+        put.answer(id, put::Answer::Volumes(volumes)).unwrap();
+        let chunks: Vec<_> = std::iter::from_fn(|| put.poll()).collect();
+        for (id, _) in chunks {
+            put.answer(id, put::Answer::Busy).unwrap();
+        }
+        assert!(put.waits_for_room());
+        let (_body, body) = hyper_rt::sync::channel(1).unwrap();
+        let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
+        let job = Job {
+            door: Door::Local(Box::new(Local {
+                body,
+                reply,
+                ended: None,
+                pending: VecDeque::new(),
+                ready: false,
+            })),
+            principal: "client".into(),
+            work: Work::Put(Box::new(Putting {
+                bucket: "b".into(),
+                key: "k".into(),
+                part: None,
+                id: 1,
+                length: 1,
+                preconditions: Preconditions::default(),
+                expected: Expected::default(),
+                trailing: None,
+                trailer: Vec::new(),
+                put: Some(put),
+                carry: Vec::new(),
+                taken: 1,
+                waiting: VecDeque::new(),
+                run: None,
+                metadata: Vec::new(),
+            })),
+            pending: Vec::new(),
+            deadline_ns: None,
+            moved_ns: 1,
+            admitted_ns: Some(1),
+            charge: 0,
+            window: 1,
+            label: None,
+        };
+        assert!(job.held() && job.waits_for_room());
+        assert_eq!(job.due_ns(5, 2), Some(7), "the S3 door's put, at its beat");
     }
 
     fn refused(work: &Work) -> Option<Status> {

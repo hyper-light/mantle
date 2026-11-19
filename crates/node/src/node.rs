@@ -1019,6 +1019,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     stored: Vec<Done>,
     /// Whether a volume answered a put since the host last offered its puts room.
     room_freed: bool,
+    /// When, on the shard's clock, the host last offered its puts room, or last had none waiting
+    /// for it: a put whose chunk waits for room is offered it again a beat after (`step_host`).
+    room_offered_ns: u64,
     /// The chunk puts and gets this node asked of its peers and not yet answered; at most
     /// `chunk_asks` of them.
     chunks_out: Vec<ChunkOut>,
@@ -1507,6 +1510,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             storage: std::mem::take(&mut settings.storage),
             stored: Vec::new(),
             room_freed: false,
+            room_offered_ns: 0,
             chunks_out: Vec::new(),
             chunk_asks: settings.chunk_asks,
             next_chunk: 0,

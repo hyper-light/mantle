@@ -2375,7 +2375,11 @@ less than a datagram moved, or after the peer had the whole request and a period
    2026-11-01, research/77 D2, as Quiver reviewed it). A chunk
    refused for want of room, a volume's `Busy` or the transport's `Budget`, is asked again of the
    same volume once a chunk is answered or a volume answers a put, not sent on and the block left
-   `Unplaced`. So a get paused between blocks while a peer reads its chunk is not cut, nor a run
+   `Unplaced`; and at each beat it waits, at most once a beat (`Node::step_host`), on either door:
+   a peer's volume whose queue other writes or its cleaner hold, as a filling volume's is, tells
+   the asker nothing when it frees room, and with no other chunk of the node out nothing asked it
+   again before the client's patience. The S3 door's put, due only at that patience, then sat
+   quiet with nothing to turn the node (the serve suite's fill, CI run 44454089741). So a get paused between blocks while a peer reads its chunk is not cut, nor a run
    whose copies take their peers longer to receive than its client's period (CI's busy runner,
    2026-10-31: sending a run's 8.3 MB copy took up to 7.5 s, and vouched for as its bytes went the
    cut runs went from 100 to 1 in 24 rounds, measurements/2026-10-29-a-node-cut-while-it-works.md),

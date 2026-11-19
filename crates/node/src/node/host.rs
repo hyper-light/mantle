@@ -115,6 +115,15 @@ pub(crate) struct Parked {
     until_ns: u64,
 }
 
+/// A parked request, found by its exchange as the exchange ends (`Node::job_lost`).
+impl super::keyed::Key for Parked {
+    type Of = ExchangeId;
+
+    fn key(&self) -> ExchangeId {
+        self.exchange
+    }
+}
+
 /// What the host waits on for an operation: a command, a read, or a chunk it asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Pending {
@@ -3708,10 +3717,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 let door = exchange
                     .and_then(|exchange| self.replies.get_mut(exchange))
                     .map(|(_, replies)| &mut replies.driving);
-                let fed = self
-                    .feeding
-                    .iter_mut()
-                    .filter(|(fed, _)| Some(*fed) == exchange)
+                let fed = exchange
+                    .and_then(|exchange| self.feeding.get_mut(exchange))
                     .map(|(_, feeding)| &mut feeding.driving);
                 for driving in door.into_iter().chain(fed) {
                     *driving = None;
@@ -3826,7 +3833,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 let Some((exchange, mut replies)) = self.replies.take(at) else {
                     break;
                 };
-                for (_, feeding) in self.feeding.extract_if(.., |(fed, _)| *fed == exchange) {
+                if let Some((_, feeding)) = self.feeding.remove(exchange) {
                     replies.body = Some(feeding.let_go());
                 }
                 self.host.doors.give_replies(replies);
@@ -3855,7 +3862,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .map(|(_, replies)| replies.admitted());
             if let Some(admitted) = draining {
                 // A body the node's task reads for the job is read and dropped there.
-                if self.feeding.iter().any(|(fed, _)| *fed == exchange) {
+                if self.feeding.contains(exchange) {
                     return Wrote::Still;
                 }
                 match self.drop_body(exchange, admitted) {
@@ -3918,7 +3925,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 Fed::Over => {
                     self.fed = true;
-                    let (exchange, feeding) = self.feeding.swap_remove(at);
+                    let Some((exchange, feeding)) = self.feeding.take(at) else {
+                        break;
+                    };
                     let sender = feeding.let_go();
                     if let Some((_, replies)) = self.replies.get_mut(exchange) {
                         replies.body = Some(sender);
@@ -3942,7 +3951,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             piece,
             ..
         } = self;
-        let Some((exchange, feeding)) = feeding.get_mut(at) else {
+        let Some((exchange, feeding)) = feeding.at_mut(at) else {
             return Fed::Over;
         };
         let exchange = *exchange;
@@ -4092,12 +4101,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             ..
         } = self;
         let now = hyper_rt::futures::now_ns();
-        parked.retain(|p| p.exchange != exchange);
+        parked.remove(exchange);
         // An exchange's one feeding, its body's sender given back with its door's half.
         let mut lent = feeding
-            .iter()
-            .position(|(fed, _)| *fed == exchange)
-            .map(|at| feeding.swap_remove(at).1.let_go());
+            .remove(exchange)
+            .map(|(_, feeding)| feeding.let_go());
         // Its door's halves given back, kept for the next request, its body's sender with it.
         if let Some((_, mut lost)) = replies.remove(exchange) {
             if let Some(sender) = lent.take() {

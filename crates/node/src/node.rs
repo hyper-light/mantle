@@ -66,7 +66,7 @@ use crate::frame;
 use crate::layout::Layout;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
-use keyed::{Key, Keyed, KeyedOn, On};
+use keyed::{Key, Keyed, KeyedOn, On, Queued};
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object;
@@ -1339,8 +1339,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     pooled: usize,
     /// Native object requests past the admission's room, in the order they came, their bodies
     /// unread (`host::Parked`): at most `parked_most`, the exchanges the transport holds at once,
-    /// which every parked request's is one of.
-    parked: VecDeque<host::Parked>,
+    /// which every parked request's is one of. Taken first come first (`Node::take_parked`), and
+    /// one whose exchange ends found by it in one probe (`keyed::Queued`, `Node::job_lost`).
+    parked: Queued<host::Parked>,
     parked_most: usize,
     /// When, on the shard's clock, the parked requests' askers were last told their requests are
     /// held (`Node::take_parked`), all at once half a beat apart; none since none was parked.
@@ -1360,8 +1361,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The volume table's applied index the driving shards were last told.
     driving_table: Option<u64>,
     /// The exchange's half of each native put's body, read from its exchange for its job (node.md
-    /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's.
-    feeding: Vec<(ExchangeId, host::Feeding)>,
+    /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's. Each found
+    /// by its exchange in one probe (`keyed::Keyed`); fed each turn in no order a body depends on,
+    /// a removal moving the last into its slot.
+    feeding: Keyed<(ExchangeId, host::Feeding)>,
     /// The piece the node's task reads native bodies into, a piece at a time (`read_piece`): a
     /// put's fields past their first read, its body's pieces before each is copied into its
     /// feeding's storage, the piece its admission charged it for, and what is left of an admitted
@@ -1832,12 +1835,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             driving: Vec::new(),
             driving_table: None,
             gateway,
-            parked: VecDeque::new(),
+            parked: Queued::default(),
             parked_most: exchanges,
             parked_vouched_ns: None,
             held_vouched_ns: None,
             windows: crate::window::Windows::default(),
-            feeding: Vec::new(),
+            feeding: Keyed::default(),
             piece: Vec::new(),
             fed: false,
             replies: Keyed::default(),

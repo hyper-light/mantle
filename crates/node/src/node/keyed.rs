@@ -5,7 +5,7 @@
 //! keeps its jobs' (`host::Slots`), so an event finds its entry in one probe rather than a search
 //! of every entry.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
 use hyper_transport::ExchangeId;
@@ -303,6 +303,100 @@ impl<T: On> KeyedOn<T> {
     }
 }
 
+/// Entries in the order they came, each found by its key in one probe of the map of their places:
+/// a queue whose order its owner depends on (`Node::parked`, taken first come first), which a
+/// swap-remove would break, and whose entries leave from anywhere as their exchanges end. Each
+/// entry's place is the count of pushes before it, the entries a B-tree by place, its first the
+/// oldest. Bound: its owner's, each entry's key once.
+pub(super) struct Queued<T: Key> {
+    entries: BTreeMap<u64, T>,
+    places: HashMap<T::Of, u64>,
+    next: u64,
+}
+
+impl<T: Key> Default for Queued<T> {
+    /// None, which allocates nothing (`BTreeMap::new`, `HashMap::new`).
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            places: HashMap::new(),
+            next: 0,
+        }
+    }
+}
+
+impl<T: Key> Queued<T> {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Its entries, oldest first.
+    pub(super) fn iter(&self) -> std::collections::btree_map::Values<'_, u64, T> {
+        self.entries.values()
+    }
+
+    /// Its oldest entry.
+    pub(super) fn front(&self) -> Option<&T> {
+        self.entries.first_key_value().map(|(_, entry)| entry)
+    }
+
+    /// Its oldest entry taken out.
+    pub(super) fn pop_front(&mut self) -> Option<T> {
+        let (_, entry) = self.entries.pop_first()?;
+        self.places.remove(&entry.key());
+        #[cfg(test)]
+        self.audit();
+        Some(entry)
+    }
+
+    /// Holds `entry`, last. An entry already holding its key, which no caller pushes (each holds
+    /// its own exchange), is taken out and given back, so the map stays exact. Places count up
+    /// from the last renumbering; one past a `u64`'s, which no node's pushes reach, renumbers the
+    /// entries held from 0 in their order first.
+    pub(super) fn push_back(&mut self, entry: T) -> Option<T> {
+        let displaced = self.remove(entry.key());
+        let place = match self.next.checked_add(1) {
+            Some(next) => std::mem::replace(&mut self.next, next),
+            None => self.renumbered(),
+        };
+        self.places.insert(entry.key(), place);
+        self.entries.insert(place, entry);
+        #[cfg(test)]
+        self.audit();
+        displaced
+    }
+
+    /// The entries held renumbered from 0 in their order: the place the next entry takes.
+    fn renumbered(&mut self) -> u64 {
+        let entries = std::mem::take(&mut self.entries);
+        self.places.clear();
+        let mut place = 0;
+        for entry in entries.into_values() {
+            self.places.insert(entry.key(), place);
+            self.entries.insert(place, entry);
+            place = place.saturating_add(1);
+        }
+        self.next = place.saturating_add(1);
+        place
+    }
+
+    /// The entry holding `key` taken out, wherever it is: one probe of its place, and the B-tree's
+    /// removal there.
+    pub(super) fn remove(&mut self, key: T::Of) -> Option<T> {
+        #[cfg(test)]
+        tests::PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
+        let place = self.places.remove(&key)?;
+        let entry = self.entries.remove(&place);
+        #[cfg(test)]
+        self.audit();
+        entry
+    }
+}
+
 impl<T: Key> Extend<T> for Keyed<T> {
     /// Each pushed, as [`Keyed::push`] holds one.
     fn extend<I: IntoIterator<Item = T>>(&mut self, entries: I) {
@@ -314,7 +408,7 @@ impl<T: Key> Extend<T> for Keyed<T> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{Key, Keyed, KeyedOn, On};
+    use super::{Key, Keyed, KeyedOn, On, Queued};
 
     thread_local! {
         /// The probes this thread made of a keyed list's slots ([`Keyed::slot`]).
@@ -359,6 +453,27 @@ pub(super) mod tests {
                 self.by.len(),
                 on,
                 "a second key no entry holds, or two entries holding one"
+            );
+        }
+    }
+
+    impl<T: Key> Queued<T> {
+        /// The oracle, after each change: its places agree with a full recount, each entry's key
+        /// at its own place, every place before the next, and no other key held.
+        pub(in crate::node) fn audit(&self) {
+            for (place, entry) in &self.entries {
+                let key = entry.key();
+                assert_eq!(self.places.get(&key), Some(place), "{key:?}");
+                assert!(
+                    *place < self.next,
+                    "{key:?} at {place}, the next {}",
+                    self.next
+                );
+            }
+            assert_eq!(
+                self.places.len(),
+                self.entries.len(),
+                "a key's place no entry holds, or two entries holding one key"
             );
         }
     }
@@ -742,5 +857,78 @@ pub(super) mod tests {
         assert_eq!(after[1], 4 * usize::try_from(ASKED).unwrap(), "two a list");
         let own = usize::try_from(OWN).unwrap();
         assert_eq!((commanded.len(), reading.len()), (own, own));
+    }
+
+    /// Pushes, removals from the front, the middle and the end, a displacing push and a
+    /// renumbering at a `u64`'s end each keep the places exact (the audit after each change), and
+    /// the entries left come out in the order they came.
+    #[test]
+    fn a_queues_places_keep_its_order_through_each_removal() {
+        let mut queued = Queued::default();
+        for key in 0..64 {
+            assert_eq!(queued.push_back(Entry(key, "first")), None);
+        }
+        assert_eq!(queued.pop_front(), Some(Entry(0, "first")));
+        assert_eq!(queued.remove(31), Some(Entry(31, "first")), "the middle");
+        assert_eq!(queued.remove(63), Some(Entry(63, "first")), "the last");
+        assert_eq!(queued.remove(31), None, "gone");
+        assert_eq!(queued.push_back(Entry(5, "again")), Some(Entry(5, "first")));
+        queued.next = u64::MAX;
+        assert_eq!(queued.push_back(Entry(64, "renumbered")), None);
+        assert_eq!(queued.next, 62, "the 61 held, then the one pushed");
+        let order: Vec<u64> = queued.iter().map(|entry| entry.0).collect();
+        let mut expected: Vec<u64> = (1..63).filter(|key| *key != 31 && *key != 5).collect();
+        expected.extend([5, 64]);
+        assert_eq!(order, expected);
+        assert_eq!(queued.front(), Some(&Entry(1, "first")));
+        assert_eq!(queued.len(), expected.len());
+        while queued.pop_front().is_some() {}
+        assert!(queued.is_empty());
+    }
+
+    /// An exchange lost lets go of its job's parked request and its body's feeding
+    /// (`Node::job_lost`), each found by its exchange in one probe (`Queued::remove`,
+    /// `Keyed::remove`): 1,024 requests parked, in the order they came, and 2,048 put bodies
+    /// feeding; a loss on each feeding's exchange, then on each parked one's. Before, each loss
+    /// walked every parked request (`retain`) and searched the feedings.
+    #[test]
+    fn a_lost_exchanges_parked_request_and_feeding_are_found_with_no_scan() {
+        const PARKED: u64 = 1024;
+        const FEEDING: u64 = 2048;
+        let (mut parked, mut feeding) = (Queued::default(), Keyed::default());
+        for exchange in 0..FEEDING {
+            feeding.push(Entry(exchange, "feeding"));
+        }
+        for exchange in 10_000..10_000 + PARKED {
+            parked.push_back(Entry(exchange, "parked"));
+        }
+        let (mut before, mut after) = ([0; 2], [0; 2]);
+        probes();
+        for exchange in 0..FEEDING {
+            before[0] += parked.len() + searched(&feeding, exchange);
+            assert!(parked.remove(exchange).is_none() && feeding.remove(exchange).is_some());
+        }
+        after[0] = probes();
+        for exchange in (10_000..10_000 + PARKED).rev() {
+            before[1] += parked.len() + feeding.len();
+            assert!(parked.remove(exchange).is_some() && feeding.remove(exchange).is_none());
+        }
+        after[1] = probes();
+        println!(
+            "{PARKED} parked, {FEEDING} feeding: a loss on each feeding's exchange {} probes ({} \
+             visited by the walks), on each parked one's {} ({})",
+            after[0], before[0], after[1], before[1]
+        );
+        assert_eq!(
+            after[0],
+            2 * usize::try_from(FEEDING).unwrap(),
+            "two probes a loss"
+        );
+        assert_eq!(
+            after[1],
+            2 * usize::try_from(PARKED).unwrap(),
+            "two probes a loss"
+        );
+        assert!(parked.is_empty() && feeding.is_empty());
     }
 }

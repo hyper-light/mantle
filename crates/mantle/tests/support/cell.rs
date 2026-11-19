@@ -2677,6 +2677,7 @@ impl Cell {
                     }
                     Line::Rejoined(new) => {
                         self.rejoined.insert(id, new);
+                        self.know_rejoined(id, new);
                     }
                     Line::Ban(member, outcome) => {
                         self.bans.insert(member, outcome);
@@ -2844,8 +2845,29 @@ impl Cell {
     pub(crate) fn bound_quic(&self) -> Vec<(u64, SocketAddr)> {
         self.running
             .iter()
-            .filter_map(|(id, r)| Some((*id, r.bound?.0)))
+            // A directory whose process rejoined runs as the node its new identity names.
+            .filter_map(|(id, r)| Some((*self.rejoined.get(id).unwrap_or(id), r.bound?.0)))
             .collect()
+    }
+
+    /// Records node `new`, the identity directory `id`'s process rejoined as (membership.md §5.1),
+    /// by the certificate and key its switched configuration names, so the test's clients know it
+    /// as they know a node `grant` made: the node says `rejoined` once its configuration names them.
+    fn know_rejoined(&mut self, id: u64, new: u64) {
+        let config = self.config_of(id);
+        let dir = config.parent().unwrap().to_path_buf();
+        let text = std::fs::read_to_string(&config).unwrap();
+        let named = |key: &str| {
+            text.lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once('=')?;
+                    (k.trim() == key).then(|| dir.join(v.trim()))
+                })
+                .unwrap_or_else(|| panic!("{}: no {key} line", config.display()))
+        };
+        let (certificate, key) = (named("certificate"), named("key"));
+        let der = std::fs::read(&certificate).unwrap();
+        self.pki.nodes.insert(new, (certificate, key, der));
     }
 
     /// Opens the bucket's gate, which every put needs, through the writer client.
@@ -3024,6 +3046,11 @@ impl Cell {
         let id = object_client(client);
         self.client_begins(id);
         let done = ops.len() as u64;
+        // An operation through a directory whose process rejoined goes to the node it runs as.
+        let ops = ops
+            .into_iter()
+            .map(|(node, op, data)| (*self.rejoined.get(&node).unwrap_or(&node), op, data))
+            .collect();
         let (settings, bound) = (self.pki.object_settings(id), self.bound_quic());
         let tell = self.tell.clone();
         let thread = std::thread::spawn(move || objects(settings, bound, ops, tell));

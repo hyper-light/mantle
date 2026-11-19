@@ -13059,4 +13059,58 @@ pub(super) mod tests {
         let (_, due) = visits(&host, &stub);
         assert_eq!(due, Some(now + vouch_every(beat)));
     }
+
+    /// A host's keys (`Earliest`) against a plain list of each job's key, through a long run of
+    /// jobs pushed, keyed, let go of their keys and swap-removed as `Host::push`, `Host::rekey` and
+    /// `Host::remove` do, drawn from a fixed seed: after each, every slot's key and the least are
+    /// the list's, each entry is named by its slot, and no key is less than its parent's.
+    #[test]
+    fn a_hosts_keys_agree_with_a_list_of_them() {
+        // A fixed xorshift64 (Marsaglia, 2003): the same run each time.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut draw = |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        let mut keys = Earliest::default();
+        let mut listed: Vec<Option<u64>> = Vec::new();
+        let mut most = 0;
+        for _ in 0..20_000 {
+            let drawn = draw(8);
+            if drawn <= 2 && listed.len() < 512 {
+                keys.grow();
+                listed.push(None);
+                let at = listed.len() - 1;
+                let key = (draw(4) > 0).then(|| draw(64));
+                keys.set(at, key);
+                listed[at] = key;
+            } else if drawn <= 5 && !listed.is_empty() {
+                let at = usize::try_from(draw(listed.len() as u64)).unwrap();
+                // Ties are common: keys from a small range.
+                let key = (draw(5) > 0).then(|| draw(64));
+                keys.set(at, key);
+                listed[at] = key;
+            } else if !listed.is_empty() {
+                let at = usize::try_from(draw(listed.len() as u64)).unwrap();
+                keys.swap_remove(at);
+                listed.swap_remove(at);
+            }
+            most = most.max(listed.len());
+            assert_eq!(keys.first(), listed.iter().flatten().min().copied());
+            assert_eq!(keys.place.len(), listed.len());
+            for (at, key) in listed.iter().enumerate() {
+                assert_eq!(keys.key(at), *key, "slot {at}");
+            }
+            for (place, (key, at)) in keys.heap.iter().enumerate() {
+                assert_eq!(keys.place[*at], Some(place));
+                if place > 0 {
+                    assert!(keys.heap[(place - 1) / 2].0 <= *key, "order at {place}");
+                }
+            }
+            assert_eq!(keys.heap.len(), listed.iter().flatten().count());
+        }
+        assert_eq!(most, 512, "the run reached its most jobs");
+    }
 }

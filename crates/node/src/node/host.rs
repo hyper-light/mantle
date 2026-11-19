@@ -703,10 +703,10 @@ impl Host {
     }
 
     /// Job `at`'s keys from its state at `now`, the shard's clock: its beat or bound where its work
-    /// is held (`Job::due_ns`), and its put's next renewal (`Job::renewal_ns`). Set as it is pushed,
-    /// as its turn ends and as a piece of a chunk it asked moves: between its turns nothing else
-    /// moves its state (the host's step answers it, offers it room and bounds it just before its
-    /// turn). A key set at a turn can only come before the job's due at a later time, never
+    /// is held (`Job::due_ns`), and its put's next renewal (`Job::renewal_ns`). Set as it is
+    /// pushed, as its turn ends and as a piece of a chunk it asked moves: between its turns nothing
+    /// else moves its state (the host's step answers it, offers it room and bounds it just before
+    /// its turn). A key set at a turn can only come before the job's due at a later time, never
     /// after: a beat or vouch counted from its turn rather than from a later `now`, or a bound
     /// that passed with its reply begun, after which it needs no turn. Such a key costs one turn,
     /// which keys it again.
@@ -12958,8 +12958,8 @@ pub(super) mod tests {
 
     /// What the scan `Host::due` made before visits of `host`'s jobs, served by `stub`, at the
     /// shard's `now`, and the due it finds: every job's asks until one is answered, each against
-    /// every answer waiting (the `Serve::answered` it called searched them); then every job once for its put's
-    /// renewal and once more for its beat or bound.
+    /// every answer waiting (the `Serve::answered` it called searched them); then every job once
+    /// for its put's renewal and once more for its beat or bound.
     fn scanned_due(host: &Host, stub: &Stub, now: u64) -> (usize, Option<u64>) {
         let mut visited = 0;
         for job in &host.jobs {
@@ -13061,7 +13061,7 @@ pub(super) mod tests {
         assert_eq!(visited, usize::try_from(OTHERS).unwrap() + 1);
         assert!(scanned > usize::try_from(JOBS * OTHERS).unwrap());
 
-        // Its answer taken at the next step: the job replied, its keys let go; the rest keep theirs.
+        // Its answer taken at the next step: the job replied, its keys let go, the rest kept.
         host.step(&mut stub).unwrap();
         assert_eq!(host.jobs.len(), usize::try_from(JOBS).unwrap() - 1);
         let (_, due) = visits(&host, &stub);

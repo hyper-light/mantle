@@ -16,7 +16,7 @@
 use hyper_block::block::BlockFile;
 use mantle_engine::rows::Rows as EngineRows;
 use mantle_engine::shard_db::ShardDb;
-use mantle_engine::store::Config;
+use mantle_engine::store::{Config, IoStats};
 use mantle_engine::trunk::TrunkConfig;
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
 use mantle_meta::session::Rules;
@@ -82,6 +82,19 @@ impl<F: BlockFile + 'static> Stored<F> {
             value: Vec::new(),
             rows: EngineRows::new(),
         }
+    }
+
+    /// Gives gets and lookups a cache of `pages` of the store's pages, each verified as it was
+    /// read or written, replacing any it had; none at 0 (`ShardDb::set_cache`). Without one,
+    /// every page a get or a lookup needs is read from the device again.
+    pub fn set_cache(&mut self, pages: usize) {
+        self.db.set_cache(pages);
+    }
+
+    /// The store's reads since the engine opened: the pages read from the device, and the reads
+    /// its cache served and missed (`ShardDb::stats`).
+    pub fn io_stats(&self) -> IoStats {
+        self.db.stats().2
     }
 
     /// The rows of `[from, to)` (to the end with no `to`), all of them, into the scan buffer.

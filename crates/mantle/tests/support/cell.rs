@@ -150,8 +150,10 @@ pub(crate) const MEMTABLE: usize = STORE_PAGE;
 
 /// Every number the nodes run with, as the range's process test and the cluster test state them:
 /// the range's settings and rules, and the log's and the engine's sizes (the engine's own small test
-/// configuration, crates/engine/tests/pool_startup.rs). The calibration's probe budget is the node's
-/// own (`probe_budget_ms`).
+/// configuration, crates/engine/tests/pool_startup.rs), its page cache every page its store may
+/// hold, 256 extents of four 4 KiB pages, as a node whose memory holds its engines' wants caches
+/// them (`derive::engine_cache_wants_for`). The calibration's probe budget is the node's own
+/// (`probe_budget_ms`).
 pub(crate) const STATED: &str = "\
 range.election_tick = 10
 range.heartbeat_tick = 2
@@ -169,6 +171,7 @@ log.queue_submissions = 16
 log.waits = measured
 engine.extent_pages = 4
 engine.max_extents = 256
+engine.cache_bytes = 4194304
 engine.fanout = 3
 engine.leaf_entries = 96
 stop_ms = 10000

@@ -507,7 +507,20 @@ serves every read the engine does not. The store keeps its own cache of verified
 The buffered row's memory is the OS's, outside the process and unbounded; the cache's is
 the owner's and bounded. The uncached fills' tail beside them stayed steady: p99.9 67–74 µs,
 p99.99 230–235 µs at 1.5 and 2 GiB, where buffered fills on this busy machine reached 2.4–5.3
-ms. How the cache is sized against a node's memory, and the F2 hot region, are E8's next part.
+ms. The F2 hot region is E8's next part.
+
+**Sized against a node's memory (2026-11-18).** A node gives each range's engine a cache of
+`engine.cache_bytes`, as many pages as those bytes hold, as it creates or opens the engine
+(`process::engine`, `Stored::set_cache`). The bytes are derived (node.md §1.4): each engine wants
+every page of the extents its rows take for the objects the cell's volumes hold, the estimate its
+resident metadata's want counts (`derive::engine_cache_wants_for`), and that want is shared with
+the volumes' indexes' and the engines' metadata's under the owner's rule D (research/87 §4):
+whole while memory past the floor holds them all, each the same part of its want when it holds
+less, before the operations take what is left (`derive::shares`). The node's engines run no
+memory budget (`ShardDb::set_memory`, `follow_machine`) and no record cache. Before, they ran with
+none, and every page a get or a one-row lookup needed was a `pread` on the node's busy shard: 100
+repeated gets of 1,100 Name-sized rows read 100 pages, and none with the derived cache
+(`derive::tests::a_range_opened_as_the_node_opens_it_reads_its_pages_from_its_derived_cache`).
 
 ## 6. Scheduling flush and compaction
 

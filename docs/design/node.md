@@ -280,10 +280,27 @@ measures the second, and derives the rest by these rules:
   rows, 89,208 millionths of an extent's bytes, and its allocator's own (`derive::engine_wants_for`,
   `shard_db::MEASURED_METADATA_PPM`, the owner's choice of 2026-10-23 over its statement for any
   keys, which holds a twentieth of the rows); an engine as many extents as its share holds
-  (`derive::engine_within`). What no want takes goes to the engines, each up to what its share of
-  the node directory's device holds: an empty object, a delete marker and an upload in progress
-  make rows that no volume bounds. An engine had wanted its device's whole share: on the box's 8 TB
-  file system the five engines took 16.25 GB of the 16.3 GB a 16 GiB node had past its floor, for
+  (`derive::engine_within`). Each engine's page cache is a data want beside them, under the owner's
+  rule D (research/87 §4, 2026-11-18): every page of those same extents, at the store's page size,
+  since the store's bytes an object are its file's length at its most, its pages as filled and
+  compaction's room counted, and the cache keeps live pages alone
+  (`derive::engine_cache_wants_for`); its share is `engine.cache_bytes`, as many verified pages as
+  it holds (`ShardDb::set_cache`, given as each range's engine is created or opened,
+  `process::engine`), at most its store's pages. With no cache every page a get or a one-row lookup
+  needed was a `pread` on the node's busy shard: 100 repeated gets of 1,100 Name-sized rows read 100
+  pages and 100 lookups 100, and none with the derived cache
+  (`derive::tests::a_range_opened_as_the_node_opens_it_reads_its_pages_from_its_derived_cache`). Its
+  want is the largest of the data's, about 11 times an engine's metadata's: at an object a 4 KiB
+  block on each node, five engines' caches want 2.2 times their volumes' bytes, so a host holding
+  less runs its operations at their least, one, and gives the index and the metadata the same part
+  of their wants as the caches take (a 16 GiB host with one 8 GiB volume: each cache 2.45 GB of its
+  3.86 GB want, the index 469 MB of its 738 MB, one operation, where 64 GiB holds every want whole
+  and 52,503 operations; a ladder founder's 32 GiB volume on a 96 GiB host of 32 cores: each cache
+  whole at 15.4 GB, 10,024 operations past them; `derive::tests`). What no want takes goes to the
+  engines' metadata, each up to what its share of the node directory's device holds: an empty
+  object, a delete marker and an upload in progress make rows that no volume bounds. An engine had
+  wanted its device's whole share: on the box's 8 TB file system the five engines took 16.25 GB of
+  the 16.3 GB a 16 GiB node had past its floor, for
   rows the cell never made, while each index took 33.6 MB, held 95,297 fragments and refused the
   rest (measurements/2026-10-28-transfer-scale.md). Longer keys hold more an
   extent, so the engine holds its share itself: a put that would pack its memtable while its
@@ -474,7 +491,9 @@ measures the second, and derives the rest by these rules:
   rows completes on the VM at 64 GiB and at 96 GiB on the final build, recovery exact (at 64 GiB
   3.49 million puts, 18,174 gets and 10,207 seeks a second); at 96 GiB its gets and seeks 1.24 and
   1.26 of a fixed 32 GiB cache's and its fill 0.85, the same build at that fixed cache 1.06, 1.34
-  and 1.13 of data-layer's (docs/research/65 §9). *Open:* kept memtables take the
+  and 1.13 of data-layer's (docs/research/65 §9). A node's ranges take no such budget: each
+  range's engine holds the page cache its share derives (`engine.cache_bytes`, above) and no
+  record cache. *Open:* kept memtables take the
   budget's idle part before any read misses, and with the memory moved between the regions cost a
   billion rows' fill 15% against a fixed cache (§9); and hyper-rt reads no process's resident memory
   on Windows, so a shard there leaves nothing free for what grows outside its account (§9). And the
@@ -535,6 +554,7 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry with the shell's bytes, its groups (the ranges and the liveness stream's), a checkpoint's cadence and what a group holds uncommitted past it of one `Ready` each (`mantle_range::ready_held`: as many entries as its bytes make of the least entry a range proposes, 13 bytes, and the term's empty first one, and its bytes with each entry's 5-byte shell), a cache of one largest entry a group, and a file holding every group's retention at once beside the least file the log runs in: a `Ready` goes in greedy parts of a frame's room, any two in a row more than a room, each a segment at most (`derive::log`). Before, entries were counted at the shell's 5 bytes, 2.6 times too many, and the file was the least, which one group's retention filled: a write past it is refused `Full`. Its memory: each group's slots, a deque doubled past its retained entries at hyper-log's 56 bytes a slot, its handle's unapplied entries and its cache, one group's slots again while they grow, and ten segments of the log's own buffers (`derive::log_bytes`; `tests/log_memory.rs`: every group at its retention, 112.6 MB at the peak of a 225.9 MB bound) |
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
+| `engine.cache_bytes` | derived | each range's engine's page cache, as many verified pages as its bytes hold (`ShardDb::set_cache`, given as `process::engine` creates or opens the range's engine): its share of what remains of memory past the floor, beside the indexes' and the engines' metadata's under rule D, its want every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`, `derive::shares`), at most its store's pages |
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
 | `transport_bytes` | derived | the transport's floor: what it holds besides QUIC's windows, the connections' state at the most connections it holds (`bounds::connections_state`) and the receive ring's growth at its most (`bounds::ring_growth`) among it, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`) |
 | `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |

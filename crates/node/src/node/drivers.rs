@@ -50,6 +50,17 @@ impl Drivers {
             *running = less;
         }
     }
+
+    /// A request placed on `from` runs on `to` instead, its lane having refused it (node.md §2.9
+    /// step 6f): its place in the count moved there, so it is counted on the shard that runs it
+    /// until its job ends. `None`, the count as it was, where `to` is past the drivers' or its
+    /// count would pass what a `usize` counts.
+    pub(super) fn moved(&mut self, from: usize, to: usize) -> Option<()> {
+        let running = self.running.get_mut(to)?;
+        *running = running.checked_add(1)?;
+        self.ended(from);
+        Some(())
+    }
 }
 
 #[cfg(test)]
@@ -98,6 +109,23 @@ mod tests {
         let placed: Vec<usize> = (0..4).map(|_| drivers.place().unwrap()).collect();
         assert_eq!(placed, vec![2, 2, 2, 3]);
         assert_eq!(drivers.running, vec![0, 3, 3, 3]);
+    }
+
+    #[test]
+    fn a_request_a_lane_refused_is_counted_on_the_shard_that_runs_it() {
+        let mut drivers = over(3);
+        assert_eq!((drivers.place(), drivers.place()), (Some(1), Some(2)));
+        // The second shard's lane refused its request: it runs on the first, counted there.
+        assert_eq!(drivers.moved(1, 0), Some(()));
+        assert_eq!(drivers.running, vec![1, 0, 1]);
+        // The rule places the next on the shard that gave its place back.
+        assert_eq!(drivers.place(), Some(1));
+        // Its end gives the first shard's place back.
+        drivers.ended(0);
+        assert_eq!(drivers.running, vec![0, 1, 1]);
+        // A shard past the drivers' counts nothing, the request's place kept where it was.
+        assert_eq!(drivers.moved(1, 3), None);
+        assert_eq!(drivers.running, vec![0, 1, 1]);
     }
 
     #[test]

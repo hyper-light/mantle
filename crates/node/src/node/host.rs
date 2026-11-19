@@ -3028,8 +3028,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some(lanes) => lanes.hand(request),
                 None => Some(request),
             };
-            // Run here: its door wakes no shard, as the node's task steps its job in its turn.
+            // Run here: counted on the first shard, which runs it, until its job ends; its door
+            // wakes no shard, as the node's task steps its job in its turn.
             if let Some(mut request) = refused {
+                if let Some(from) = request.driven
+                    && self.drivers.moved(from, 0).is_some()
+                {
+                    request.driven = Some(0);
+                }
                 request.half.node = None;
                 let door = self
                     .replies

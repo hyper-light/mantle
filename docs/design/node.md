@@ -2491,6 +2491,15 @@ each shard's with its own task's and its host's. Tested: the lane's count reache
 the latest superseding (`node::driving`), and the put and get handed above, once ended, are
 counted there whole, the put's body taken and the get's bytes given, twice the object (`node::host`).
 
+*As built (2026-11-19), its third piece: a refused request counted where it runs* (6f,
+`Drivers::moved`, `Node::hand_off`). A request whose lane gives it back (its lane full, or its
+shard's task gone) runs on the first shard, so its place in the rule's count moves there and its
+job's shard says the first (`Handover::driven`), its end giving that place back; the shard it was
+placed on counts one fewer, so the rule places the next there. A move past the drivers' shards, or
+a count past a `usize`'s, moves nothing, and the place stays where it was. Tested
+(`node::drivers`): a request moved from the second shard to the first is counted on the first, the
+next placed on the second, the end given back to the first, and a move past the shards refused.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

@@ -1411,9 +1411,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     driving_table: Option<u64>,
     /// The exchange's half of each native put's body, read from its exchange for its job (node.md
     /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's. Each found
-    /// by its exchange in one probe (`keyed::Keyed`); fed each turn in no order a body depends on,
-    /// a removal moving the last into its slot.
-    feeding: Keyed<(ExchangeId, host::Feeding)>,
+    /// by its exchange in one probe and marked at each event that can let it move
+    /// (`host::Feedings`); those marked fed at each turn in no order a body depends on.
+    feeding: host::Feedings,
     /// The piece the node's task reads native bodies into, a piece at a time (`read_piece`): a
     /// put's fields past their first read, its body's pieces before each is copied into its
     /// feeding's storage, the piece its admission charged it for, and what is left of an admitted
@@ -1436,7 +1436,7 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// exchange taking more: the next turn is due at once, for its job to give the next piece.
     replied: bool,
     /// The exchanges whose native job gave its door something to act on, each named by its job,
-    /// from whichever shard it runs on, for the turn to visit its reply alone
+    /// from whichever shard it runs on, for the turn to visit its reply and feeding alone
     /// (`host::Marks`): at most twice the exchanges the transport holds.
     marks: host::Marks,
     /// The native requests the host admitted running on each of the node's shards, the count the
@@ -1900,7 +1900,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             parked_vouched_ns: None,
             held_vouched_ns: None,
             windows: crate::window::Windows::default(),
-            feeding: Keyed::default(),
+            feeding: host::Feedings::default(),
             piece: Vec::new(),
             fed: false,
             replies: host::Writes::default(),
@@ -3526,9 +3526,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.read_exchange(exchange)
             }
-            // A job's body is read, and its reply written, at the host's turn: its reply, which
-            // reads the rest of a body its job let go of, visited there.
+            // A job's body is read, and its reply written, at the host's turn: its feeding and its
+            // reply, which reads the rest of a body its job let go of, visited there.
             Event::BodyReady { exchange } if self.hosts(exchange) => {
+                self.feeding.mark(exchange);
                 self.replies.mark(exchange);
                 Ok(())
             }

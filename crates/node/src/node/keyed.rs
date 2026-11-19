@@ -753,7 +753,7 @@ impl<K: Copy + Eq + Hash> Marked<K> {
 
 /// A [`Keyed`] list with the set of its entries something made ready ([`Marked`]), each marked at
 /// every event that can let it move and visited at the next turn, where a walk of every entry
-/// visited thousands that could not move (`Node::write_replies`). An entry
+/// visited thousands that could not move (`Node::write_replies`, `Node::feed_bodies`). An entry
 /// is marked as it is pushed, since nothing looked at it yet, and its mark let go with it. A turn
 /// takes the marks to visit ([`Readied::begin_visits`]), so an entry marked again while it is
 /// visited is visited at the next turn, not again in this one. Bound: its owner's, each entry's key
@@ -806,6 +806,10 @@ impl<T: Key> Readied<T> {
 
     pub(super) fn contains(&self, key: T::Of) -> bool {
         self.entries.contains(key)
+    }
+
+    pub(super) fn get_mut(&mut self, key: T::Of) -> Option<&mut T> {
+        self.entries.get_mut(key)
     }
 
     /// Holds `entry`, last, marked, as [`Keyed::push`].

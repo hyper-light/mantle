@@ -3,7 +3,8 @@ name: repro-volfill
 # `a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors`, whose HTTP PUT of o5 waits
 # with no progress past the test's 600 s about four runs in five at every perf-10k merge since
 # c3e73e7d (run 44575349545). It passed on every target at lean-doors' c33e5bf0 (CI 43330931920):
-# sixteen commits between, and c33e5bf0 again. A failed run marks a commit; two passes clear it.
+# round 2: the sixteen commits from cb88c723 (two passes) to 89ddbc3e (a failure), each run until
+# it fails or passes three times.
 on:
   push:
     branches: ["repro/**"]
@@ -17,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sha: [c3e73e7d, d107ffe8, 89ddbc3e, cb88c723, ba19f00f, 692c3388, f70a5b9b, 86962c80, bad4aadd, 20eb7c89, fb9ce28a, 0ae45327, 2ac5645d, 27a78b06, 14395f7d, 7c8d8ddd, c33e5bf0]
+        sha: [89ddbc3e, d07f606f, 9a312b2b, 0f93ff47, d19a1296, a6c132be, 12996f37, f768f91f, 65200579, f70d9573, 5af959c3, d6267781, 7f2c9d24, ef1af705, 8b246468, 2dd70bbe]
     name: volumes fill at ${{ matrix.sha }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -33,7 +34,7 @@ jobs:
         run: cargo test -p mantle --test serve --locked --no-run
       - name: The volumes-fill test
         run: |
-          for i in 1 2; do
+          for i in 1 2 3; do
             start=$(date +%s)
             if timeout 1800 cargo test -p mantle --test serve --locked a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors -- --exact > out-$i.txt 2>&1; then
               echo "run $i passed at ${{ matrix.sha }} in $(($(date +%s) - start)) s"

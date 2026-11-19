@@ -999,3 +999,105 @@ fn changed(seed: u64, voters: u64, change: impl Fn(&Sim, u64) -> (u64, u64)) {
         }
     });
 }
+
+/// A cell of one voter grows to two under the clients' load, each node asking a read of its own
+/// every 20 ms as a gateway's request does (`Node::read`), and the new voter's device holds its
+/// writes for 1 s from its promotion, as a new member's busy disk does. Every read asked after the
+/// device answers again is answered, or ended past its range's budget, within the cell's quiet
+/// period (`Sim::quiet`) of its asking (CLAUDE.md §2). Seen while looking for CI gates run
+/// 44510117734's "2 nodes" SlowDown (`crates/mantle/tests/membership.rs`), which a cell grown to
+/// two voters answered a GET: on seed 1 the new voter's reads, opened while the founder held them
+/// for a quorum its held device could not give, filled its exchange table, and each open the table
+/// refused kept its message's room in the transport's budget for good (hyper-transport's
+/// `Core::open`, vendor/UPSTREAM.md), asked again at every turn while its member named the
+/// leader; its budget full, every reply's head and lane frame after was refused `Budget`, and it
+/// answered none of its own reads again, its clock without a leader never started while its member
+/// trusted the leader.
+#[test]
+fn a_new_voters_own_reads_are_answered_after_its_device_held_its_writes_at_its_promotion() {
+    for seed in seeds(&[1, 2]) {
+        own_reads_after_a_held_promotion(seed);
+    }
+}
+
+fn own_reads_after_a_held_promotion(seed: u64) {
+    let mut cell = Sim::with_spare(seed, 1);
+    cell.until("the founder leads", |c| {
+        if c.members[&1].status.is_some_and(|s| s.leader == 1) {
+            Some(())
+        } else {
+            None
+        }
+    });
+    cell.open_bucket();
+    let ops = (2 * (log_config().group_entries + 1)).div_ceil(CLIENTS);
+    let stops = cell.start_workload(ops);
+    cell.done_by(ops, 1);
+    cell.replace(cell.nodes + 1, 2);
+    let every = 20_000_000u64.max(2 * cell.longest_ns());
+    let hold = 1_000_000_000u64;
+    let (mut promoted, mut released, mut next) = (None::<u64>, None::<u64>, 0u64);
+    cell.until("the new voter's device answers again", |c| {
+        let now = c.now_ns();
+        if promoted.is_none() && !c.replaced.is_empty() {
+            promoted = Some(now);
+            c.hold_writes(2, true);
+        }
+        if let Some(at) = promoted
+            && now >= at + hold
+        {
+            c.hold_writes(2, false);
+            released = Some(now);
+            return Some(());
+        }
+        if now >= next {
+            c.own_read(1, now);
+            c.own_read(2, now);
+            next = now + every;
+        }
+        None
+    });
+    let released = released.unwrap();
+    let bound = cell.quiet();
+    // Reads asked after the release, each node's, until every one of them is answered: those
+    // still out, oldest first, and the answers taken so far.
+    let mut out: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+    let mut answered: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut taken = 0;
+    let end = released + 10 * bound;
+    cell.until("every read asked after the release answered", |c| {
+        let now = c.now_ns();
+        if now >= next && now < end {
+            for id in [1, 2] {
+                c.own_read(id, now);
+                out.push_back((id, now));
+            }
+            next = now + every;
+        }
+        for r in &c.own_reads[taken..] {
+            answered.insert((r.0, r.1));
+        }
+        taken = c.own_reads.len();
+        out.retain(|asked| !answered.contains(asked));
+        if let Some((id, at)) = out.front() {
+            assert!(
+                now < at + bound,
+                "seed {seed}: node {id}'s own read asked {} ns after the release unanswered past \
+                 {bound} ns; node 1 answered {}, node 2 {}; statuses {:?}",
+                at - released,
+                c.own_reads.iter().filter(|r| r.0 == 1).count(),
+                c.own_reads.iter().filter(|r| r.0 == 2).count(),
+                c.members
+                    .iter()
+                    .map(|(id, m)| (*id, m.status))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if now >= end && out.is_empty() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    drop(stops);
+}

@@ -66,6 +66,9 @@ const MOST_NODES: u64 = 5;
 pub const CLIENT: u64 = MOST_NODES + 1;
 /// The clients, each its own identity and session: one for each node of a cell of three.
 pub const CLIENTS: u64 = NODES;
+
+/// The reads of its own a node of a cell with a spare keeps out at once ([`Sim::own_read`]).
+const OWN_READS: usize = 64;
 /// The authority's name.
 const AUTHORITY: &str = "mantle simulated cell";
 /// RFC 5280 §4.1.2.5: the notAfter of a certificate with no well-defined expiration,
@@ -477,6 +480,9 @@ enum Order {
     /// Replace the first with the second in the range (`Node::replace`): a first the range never
     /// named makes it the second's promotion alone, a learner first and a voter once caught up.
     Replace(u64, u64),
+    /// A read of the range the node asks itself, as a gateway's request does (`Node::read`),
+    /// under the test's tag; asked of no one where the node holds as many of its own as it keeps.
+    OwnRead(u64),
 }
 
 /// What a task tells the test.
@@ -504,6 +510,9 @@ enum Report {
     Part(u64, Part),
     /// A replacement a node's member ended while it led: the member replaced and the one joined.
     Replaced(u64, u64),
+    /// A node's own read under the test's tag, answered: whether it ended past its range's budget
+    /// without a leader that serves it (`ReadOutcome::Deadline`).
+    OwnRead(u64, u64, bool),
 }
 
 /// A node's task: opens the node on its log, reports where it listens, then turns it, each turn
@@ -536,6 +545,7 @@ async fn run_node(
         }
     };
     let mut told: Option<Status> = None;
+    let mut own_reads: Vec<(u64, u64)> = Vec::new();
     loop {
         let ended = {
             let turn = pin!(node.turn());
@@ -559,6 +569,16 @@ async fn run_node(
                     return;
                 }
             }
+            Either::Second(Ok(Order::OwnRead(tag))) => {
+                let query = mantle_node::read::Query::Current {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                };
+                if let Ok(ask) = node.read(GROUP, query, u64::MAX, mantle_node::ask::Wait::Request)
+                {
+                    own_reads.push((ask, tag));
+                }
+            }
             Either::Second(Ok(Order::Replace(failed, joining))) => {
                 if let Err(error) = node.replace(GROUP, failed, joining) {
                     let _ = reports.send(Report::Failed(id, error.to_string()));
@@ -574,6 +594,19 @@ async fn run_node(
             }
             // The test is done.
             Either::Second(Err(_)) => return,
+        }
+        let mut at = 0;
+        while let Some((ask, tag)) = own_reads.get(at).copied() {
+            match node.take_read(ask) {
+                Some(outcome) => {
+                    own_reads.remove(at);
+                    let deadline = matches!(outcome, mantle_node::ask::ReadOutcome::Deadline);
+                    if reports.send(Report::OwnRead(id, tag, deadline)).is_err() {
+                        return;
+                    }
+                }
+                None => at += 1,
+            }
         }
         for (_, replaced) in node.take_replaced() {
             if reports
@@ -659,6 +692,11 @@ pub struct Sim {
     moved_at: u64,
     /// Each replacement a node's member ended while it led, in the order reported.
     pub replaced: Vec<(u64, u64)>,
+    /// Each node's own read answered ([`Sim::own_read`]): the node, the tag, whether it ended past
+    /// its range's budget, and when the test took it.
+    pub own_reads: Vec<(u64, u64, bool, u64)>,
+    /// The reads of its own each node keeps out at once: none but in a cell with a spare.
+    read_asks: usize,
     /// The node starts so far, each drawing its endpoint's seed afresh.
     starts: u64,
     /// The transport budget each node holds, from its statement.
@@ -799,6 +837,8 @@ impl Sim {
             learns: Vec::new(),
             moved_at: 0,
             replaced: Vec::new(),
+            own_reads: Vec::new(),
+            read_asks: if nodes > voters { OWN_READS } else { 0 },
             starts: 0,
             budget,
         };
@@ -874,7 +914,7 @@ impl Sim {
             chunk_bytes: CHUNK_BYTES,
             chunk_asks: 0,
             command_asks: 0,
-            read_asks: 0,
+            read_asks: self.read_asks,
             // The run's clock from the Unix epoch: only differences of the times the ranges stamp
             // matter to the commands the simulation runs, and a seed replays them.
             wall: Wall::From(0),
@@ -929,6 +969,16 @@ impl Sim {
             .bound
             .map(|(q, p)| vec![q.port(), p.port()])
             .unwrap_or_default()
+    }
+
+    /// Has node `id` ask a read of the range of its own under `tag`, as a gateway's request does.
+    pub fn own_read(&mut self, id: u64, tag: u64) {
+        if let Some(orders) = &self.members[&id].orders {
+            orders
+                .try_send(Order::OwnRead(tag))
+                .map_err(|_| "a node's orders are full")
+                .unwrap();
+        }
     }
 
     /// Tells every running node to replace `failed` with `joining` in the range: whichever leads,
@@ -1160,6 +1210,10 @@ impl Sim {
                     panic!("seed {}: client {id} failed: {why}", self.seed)
                 }
                 Report::Replaced(failed, joining) => self.replaced.push((failed, joining)),
+                Report::OwnRead(id, tag, deadline) => {
+                    let now = self.rt.now_ns();
+                    self.own_reads.push((id, tag, deadline, now));
+                }
                 Report::Part(id, part) => {
                     self.parts.insert(id, part);
                 }

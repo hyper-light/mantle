@@ -3098,6 +3098,18 @@ patience its exchange is refused `Budget`, which needs no room and its asker hea
 (`Replies::wait_for_room`, research/77 D1, D2); a reply no message holds, a field past its bound,
 refuses its exchange `FrameBound`. A job never ends with its exchange open.
 
+An open the exchange table refuses gives its message's room back (2026-11-19). hyper-transport's
+`Core::open` reserved the request's prefix and head and put them in the exchange it offered the
+table; refused `Exchanges` at the table's bound, the exchange went and its reservation with it,
+never given back, as a dropped `Reservation` gives nothing back. A node whose reads waited on their
+leader asked again at a full table and filled its budget so: on the node simulation's new voter,
+whose reads the founder held for a quorum its held device could not give, 9,025 refused opens kept
+324,900 bytes, after which every open, every reply's head and every lane frame was refused
+`Budget`, and the node answered none of its own reads again while its member trusted the leader
+(CI gates run 44510117734's "2 nodes" SlowDown, the same reads ended past the budget where the
+detectors had not judged). The room is now held apart until the table takes the exchange, and
+released when it refuses it (vendor/UPSTREAM.md).
+
 Past its floor the transport is given its want where memory allows (2026-11-19). At the floor
 each share is QUIC's initial window, 12,000 bytes (RFC 9002 §7.2), below a receive chunk's 65,527,
 so the endpoint's pool of chunks is empty and every datagram is copied into a buffer of its own
@@ -4325,7 +4337,15 @@ names a leader stops nothing there: a member that cannot elect follows the leade
 (`Raft::stop_asking`), which a node cut from it never reaches. That budget is the longer of what the
 members stated in their redirects, their expected election, and one round of asking each node, each
 given the transport's idle timeout (RFC 9000 §10.1). While an exchange to a leader is open the
-transport's progress rules judge it (§3.8), so a slow step that moves is never cut. A step the
+transport's progress rules judge it (§3.8), so a slow step that moves is never cut. A read
+asked of a leader its member trusts that answers nothing, its opens refused or its exchanges ended
+unanswered, has a second clock (2026-11-19): from its first ask since a node last answered it, any
+reply resetting it, over the budget where nothing judges; its member's trust stops only the first
+clock, and on the node simulation's new voter (seed 1) a read so asked again for good was never
+ended, a gateway's GET on it waiting out its client. A round of asking that found no node to answer
+pauses the step by its backoff, and the pause ends early only where no leader was named when it
+began: one taken while the member named a leader that answered nothing is waited out, never ended
+at once to ask that leader again at every turn. A step the
 node's own member took, leading with a trusted quorum, is the range at work: a leader whose disk or
 connections stop it is suspected by its followers as a crashed one is (hyper-liveness's flush
 proof; the plane is keyed by the connection), so the range elects another and the step follows it.

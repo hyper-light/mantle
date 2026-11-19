@@ -878,6 +878,63 @@ fn exchanges_past_the_stream_limit_wait_their_turn_and_the_table_is_bounded() {
     assert_eq!(server.answered, 6);
 }
 
+/// An open the exchange table refuses gives its message's room back (mantle's local change,
+/// vendor/UPSTREAM.md): asked again while the table is full, as an owner does while its exchanges
+/// wait on their peer, the budget holds what the exchanges in the table hold and no more, and the
+/// replies come. Before, each refused open kept its prefix's and head's bytes for good, and a
+/// full table asked again filled the budget: every open, reply head and lane frame after was
+/// refused `Budget`.
+#[test]
+fn an_open_the_exchange_table_refuses_gives_its_room_back() {
+    let pair = Pair::new();
+    let mut tight = limits();
+    tight.streams_per_connection = 2;
+    tight.exchanges = 6;
+    let mut net = connected::<Mantle, Mantle>(&pair, tight, 256 << 20);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    for seed in 0..6 {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(1_000),
+                PERIOD,
+            )
+            .unwrap();
+    }
+    let used = net.a.budget().used();
+    for seed in 0..1_000u32 {
+        assert_eq!(
+            asker.ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                u8::try_from(seed % 256).unwrap(),
+                Some(1_000),
+                PERIOD
+            ),
+            Err(Refusal::Exchanges)
+        );
+    }
+    assert_eq!(
+        net.a.budget().used(),
+        used,
+        "the refused opens kept no room"
+    );
+    run(&mut net, &mut asker, &mut server);
+    assert!(
+        asker
+            .asked
+            .iter()
+            .all(|asked| asked.refused.is_none() && asked.read == 1_000)
+    );
+    assert_eq!(server.answered, 6);
+}
+
 /// A connection whose packets replies answer asks its peer to acknowledge within RFC 9000's
 /// default max_ack_delay (`Acknowledgement::Replies`, docs/transport.md §4ak): from the hundredth
 /// packet on, a reply sent 5 ms after its request carries the request's acknowledgement, where a

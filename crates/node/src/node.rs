@@ -4515,6 +4515,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Some(since.saturating_add(self.leader_budget_ns(self.patience(group), stated_ns)))
     }
 
+    /// When a read, asked `via` and first asked unanswered `since`, has waited on nodes that
+    /// answer nothing for its range's budget without a leader (node.md §5.4): one round of asking
+    /// each node, each given the transport's idle timeout, or what the members last stated, as
+    /// [`Self::leader_budget_ns`] gives where no member judges, since a member trusting a leader
+    /// that answers nothing judges nothing of it. `None` while it is out on an exchange, which the
+    /// transport's progress rules judge, or asked of this node's own member, or never unanswered.
+    fn unanswered_end(&self, via: Via, since: Option<u64>, stated_ns: u64) -> Option<u64> {
+        if !matches!(via, Via::Unasked | Via::Paused { .. }) {
+            return None;
+        }
+        Some(since?.saturating_add(self.leader_budget_ns(None, stated_ns)))
+    }
+
     /// Replies a status alone and ends the exchange.
     /// A chunk put's head, checked before its body is read: what its body is read as, or the
     /// status it is answered with once its body is read and dropped (no such volume here, a head
@@ -5106,7 +5119,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         if asking.tried >= nodes {
             asking.tried = 0;
-            pause(self.id, asking, id, now, true);
+            // A pause for want of a leader ends once this node's member names one; one taken while
+            // its member named a leader that answered nothing is waited out, never ended at once
+            // to ask it again at every turn (CLAUDE.md §2).
+            pause(self.id, asking, id, now, known == 0);
             return Ok(());
         }
         let next = self
@@ -5365,6 +5381,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             backoff: bounds::initial_pto(),
             pauses: 0,
             leaderless_since: None,
+            unanswered_since: None,
             stated_patience_ns: 0,
         });
         Ok(ask)
@@ -5407,7 +5424,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 out.stated_patience_ns,
                 now,
             );
-            let leaderless = request && spent;
+            let unanswered = self
+                .unanswered_end(via, out.unanswered_since, out.stated_patience_ns)
+                .is_some_and(|end| now >= end);
+            let leaderless = request && (spent || unanswered);
             self.reads_out
                 .change_at(at, |out| out.leaderless_since = since);
             if deadline_ns > now && !leaderless {
@@ -5479,6 +5499,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 // room): asked again after a pause, the time without a leader that serves it
                 // counted.
                 out.leaderless_since.get_or_insert(now);
+                // Asked of its own member, not of a node that answers nothing.
+                out.unanswered_since = None;
                 out.via = if asked {
                     Via::Local
                 } else {
@@ -5519,14 +5541,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if out.tried >= nodes || target == 0 {
                 out.tried = 0;
                 let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
+                // A pause for want of a leader ends once this node's member names one; one taken
+                // while its member named a leader that answered nothing is waited out, never
+                // ended at once to ask it again at every turn (CLAUDE.md §2).
                 out.via = Via::Paused {
                     at_ns,
-                    leaderless: true,
+                    leaderless: known == 0,
                 };
                 out.leaderless_since.get_or_insert(now);
                 return None;
             }
             out.tried = out.tried.saturating_add(1);
+            out.unanswered_since.get_or_insert(now);
             Some((target, out.query.encode()))
         });
         let Some((target, body)) = asked.flatten() else {
@@ -5587,6 +5613,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Via::Exchange { peer, .. }) = self.reads_out.get(ask).map(|out| out.via) else {
             return Ok(());
         };
+        self.reads_out
+            .change(ask, |out| out.unanswered_since = None);
         let status = head
             .as_ref()
             .map_or(command::Status::Malformed, |h| h.status);
@@ -5664,7 +5692,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 };
                 // Or, a request's, its range's budget spent without a leader that can serve it.
                 let unled = if r.wait == Wait::Request {
-                    self.unled_end(r.group, r.via, r.leaderless_since, r.stated_patience_ns)
+                    let unled =
+                        self.unled_end(r.group, r.via, r.leaderless_since, r.stated_patience_ns);
+                    let unanswered =
+                        self.unanswered_end(r.via, r.unanswered_since, r.stated_patience_ns);
+                    unled.into_iter().chain(unanswered).min()
                 } else {
                     None
                 };

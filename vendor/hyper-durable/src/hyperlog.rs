@@ -501,7 +501,17 @@ fn storage(e: &LogError) -> StorageError {
     }
 }
 
-/// The log's refusal or failure as a write's fault.
+/// The log's refusal or failure as a write's fault, each named: no variant falls under another's
+/// words, and one the log adds fails to build here until it is named (mantle: vendor/UPSTREAM.md;
+/// a fence once read only "the log refused a write the group cannot take", whatever the log said).
+///
+/// Room another write frees is waited for; a write sent behind a refusal is made again. The rest
+/// fence the replica. A failed write or flush (`Fenced`, `Disk`) leaves the device's contents
+/// unknown, `Closed` ends the log, and `Damaged` is acknowledged state lost. `Invalid` is an
+/// update the group as the log holds it cannot take, and `TooLarge` a record no frame holds: the
+/// replica's own layout broke the log's rules, and making the same write again is refused the
+/// same way, so it stops with the log's reason. The others are no answer to a write: a read's
+/// (`Unavailable`, `Compacted`, `Corrupt`), another writer's (`Claimed`), or an open's.
 fn fault(e: &LogError) -> Fault {
     match e {
         LogError::Backlog(_) => Fault::Room("the group's retained bound"),
@@ -509,12 +519,31 @@ fn fault(e: &LogError) -> Fault {
         LogError::TooManyGroups(_) => Fault::Room("the log's groups"),
         LogError::Busy => Fault::Room("the log's queue"),
         LogError::Behind(_) => Fault::Behind,
-        LogError::Fenced => Fault::Failed("the log is fenced"),
+        LogError::Invalid { reason, .. } => {
+            Fault::FailedFor("the log refused an update the group cannot take", reason)
+        }
+        LogError::Damaged(reason) => Fault::FailedFor("the group is damaged", reason),
+        LogError::Fenced => Fault::Failed("the log is fenced after a failed write or flush"),
         LogError::Closed => Fault::Failed("the log is closed"),
         LogError::Disk(_) => Fault::Failed("the device failed"),
         LogError::TooLarge(_) => Fault::Failed("a record larger than a frame"),
-        LogError::Damaged(_) => Fault::Failed("the group is damaged"),
-        _ => Fault::Failed("the log refused a write the group cannot take"),
+        LogError::Unavailable { .. } => Fault::Failed("the group holds no entry asked for"),
+        LogError::Compacted { .. } => Fault::Failed("an entry the group compacted"),
+        LogError::Corrupt { .. } => Fault::Failed("an entry read back does not verify"),
+        LogError::Claimed(_) => Fault::Failed("the group is written through its handle"),
+        LogError::Foreign(reason) => Fault::FailedFor("the file is not this log", reason),
+        LogError::SealedWithoutKeys => {
+            Fault::Failed("the log is sealed and was opened without its keys")
+        }
+        LogError::UnsealedWithKeys => {
+            Fault::Failed("the log is not sealed and was opened with keys")
+        }
+        LogError::Config(reason) => Fault::FailedFor("the log's configuration is invalid", reason),
+        LogError::Unfit(_) => Fault::Failed("no log configuration derives from the facts given"),
+        LogError::Tampered(reason) => Fault::FailedFor("the sealed log was tampered with", reason),
+        LogError::Seal(_) => {
+            Fault::Failed("a sealed log's key could not be made, wrapped or unwrapped")
+        }
     }
 }
 
@@ -881,5 +910,79 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         c.runs
             .iter()
             .any(|r| matches!(r.step, Step::Waiting | Step::Reading(_)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper_block::DiskError;
+    use hyper_log::{LogError, Unfit};
+
+    use super::fault;
+    use crate::store::Fault;
+
+    /// Every refusal the log answers a write with is named: room another write frees is waited
+    /// for and a write sent behind a refusal made again, and every other variant fences with
+    /// words no other shares, `Invalid`'s and `Damaged`'s own reasons among them. A fence once
+    /// read "the log refused a write the group cannot take" for any of eleven variants, the
+    /// log's reason dropped. `Seal` is named by the same match; its error cannot be made here.
+    #[test]
+    fn every_refusal_of_the_log_is_named_and_only_room_and_order_are_waited_out() {
+        let group = 7;
+        for (e, room) in [
+            (LogError::Backlog(group), "the group's retained bound"),
+            (LogError::Full, "the log's segments"),
+            (LogError::TooManyGroups(4), "the log's groups"),
+            (LogError::Busy, "the log's queue"),
+        ] {
+            assert_eq!(fault(&e), Fault::Room(room), "{e}");
+            assert!(fault(&e).changed_nothing(), "{e}");
+        }
+        assert_eq!(fault(&LogError::Behind(group)), Fault::Behind);
+        assert!(fault(&LogError::Behind(group)).changed_nothing());
+        let fences = [
+            LogError::Invalid {
+                group,
+                reason: "entries at or before the start",
+            },
+            LogError::Damaged("a live frame does not verify"),
+            LogError::Fenced,
+            LogError::Closed,
+            LogError::Disk(DiskError::Misaligned {
+                offset: 1,
+                len: 2,
+                align: 4096,
+            }),
+            LogError::TooLarge(1 << 30),
+            LogError::Unavailable { group, index: 9 },
+            LogError::Compacted { group, first: 9 },
+            LogError::Corrupt { group, index: 9 },
+            LogError::Claimed(group),
+            LogError::Foreign("the file is empty"),
+            LogError::SealedWithoutKeys,
+            LogError::UnsealedWithKeys,
+            LogError::Config("a key record"),
+            LogError::Unfit(Unfit::Zero("the segment's size")),
+            LogError::Tampered("a frame's MAC fails"),
+        ];
+        let mut texts: Vec<String> = Vec::new();
+        for e in &fences {
+            let f = fault(e);
+            assert!(!f.changed_nothing(), "{e} is waited out: {f}");
+            let text = f.to_string();
+            assert!(!texts.contains(&text), "{e} shares its words: {text}");
+            texts.push(text);
+        }
+        assert_eq!(
+            texts.first().map(String::as_str),
+            Some(
+                "the write failed: the log refused an update the group cannot take: entries at \
+                 or before the start"
+            )
+        );
+        assert_eq!(
+            texts.get(1).map(String::as_str),
+            Some("the write failed: the group is damaged: a live frame does not verify")
+        );
     }
 }

@@ -173,6 +173,11 @@ pub enum Fault {
     /// §5).
     #[error("the write failed: {0}")]
     Failed(&'static str),
+    /// The write failed as [`Fault::Failed`] does, for a reason the store stated with it: what
+    /// failed, then the store's own words for why (mantle: vendor/UPSTREAM.md, a log's refusal
+    /// named).
+    #[error("the write failed: {0}: {1}")]
+    FailedFor(&'static str, &'static str),
 }
 
 impl Fault {

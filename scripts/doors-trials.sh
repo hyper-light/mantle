@@ -7,7 +7,7 @@
 #   OUT=DIR MACHINE=M scripts/doors-trials.sh plan       write DIR/plan.tsv, the batch's cases in order
 #   OUT=DIR MACHINE=M scripts/doors-trials.sh run        run each planned case not yet run
 #   OUT=DIR MACHINE=M scripts/doors-trials.sh case SEQ   run the planned case SEQ alone
-#   python3 scripts/doors-tables.py DIR                  regenerate the tables and the trial report
+#   python3 scripts/doors-tables.py DIR [COMPARE]        regenerate the tables and the trial report
 #
 # MACHINE is box (Linux x86_64: CPUSET 8-15, each case in a systemd memory scope), mac (macOS
 # arm64: no CPU binding and no memory limit, so cpu1, cpu2 and memfloor are excluded) or vm (the
@@ -28,7 +28,9 @@
 # Environment: CYCLES (Williams cycles, 1), FULL_CONDITIONS (every size and the set),
 # MID_CONDITIONS (64 KiB, 8 MiB and the set; the rest LEAN), TAIL_CONDITIONS (the conditions that
 # also run the tail case: TAIL_ARGS, sizes at the 3,688 operations a p99.9 needs, measurement.md
-# §5a), VOLUME (a founder's volume, passed as --volume when set), and the matrices below.
+# §5a), VOLUME (a founder's volume, passed as --volume when set), and the matrices below; on the
+# box BOX_CPU0 and BOX_CPUS (a runner's CPUs, cpus_of), PORT (a comparator's) and CLAIM (a runner
+# beside others, its cases claimed first).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -228,11 +230,15 @@ plan() {
 }
 
 # The CPUs a case's processes take, and how many busy loops share them.
+# On the box a runner's eight CPUs are BOX_CPUS where it is given: the box numbers a core's two
+# threads n and n+16 (lscpu), so runners side by side each take whole cores, both threads
+# ("8-11,24-27"), and no case shares a core with another runner's. One and two CPUs are the first
+# one and two cores' first threads, from BOX_CPU0.
 cpus_of() {
   case $MACHINE:$1 in
     box:cpu1) echo "${BOX_CPU0:-8}" ;;
     box:cpu2) echo "${BOX_CPU0:-8}-$((${BOX_CPU0:-8} + 1))" ;;
-    box:*) echo "${BOX_CPU0:-8}-$((${BOX_CPU0:-8} + 7))" ;;
+    box:*) echo "${BOX_CPUS:-${BOX_CPU0:-8}-$((${BOX_CPU0:-8} + 7))}" ;;
     vm:cpu1) echo 0 ;; vm:cpu2) echo 0-1 ;; vm:*) echo "0-$(($(vm_cpus) - 1))" ;;
     *) echo all ;;
   esac
@@ -476,6 +482,10 @@ run_case() {
     return 0
   fi
   mkdir -p "$WORK"
+  # A case run again after its runner stopped mid-case finds the data that run left, and its cell
+  # refuses to be made over it (`File exists`, the box's quiet A1 and C-tail, the Mac's quiet A1):
+  # its data is removed before it starts, as after it ends.
+  remove_work "$name"
   cpus=$(cpus_of "$cond")
   busy=$(busy_of "$cond")
   memory=$S3_MEMORY
@@ -521,7 +531,9 @@ run_case() {
   esac
   [ "$MACHINE" = box ] && { systemctl --user stop "doors-$name.scope" 2> /dev/null || true; }
   host end >> "$RAW/$name.host"
-  stop_busy "$name" "${pids[@]}"
+  # A case with no busy loops has none to stop: bash 3.2, macOS's, takes an empty array's
+  # expansion under `set -u` for an unbound variable, which bash 4.4 does not.
+  stop_busy "$name" ${pids[@]+"${pids[@]}"}
   remove_work "$name"
   if [ "$rc" -eq 0 ]; then
     echo "completed $(($(date +%s) - began))" > "$RAW/$name.status"
@@ -550,7 +562,7 @@ case ${1:-} in
       run_case "$seq"
       echo "$(date -u +%FT%TZ) $seq" >> "$OUT/progress"
     done
-    python3 -I "$ROOT/scripts/doors-tables.py" "$OUT"
+    python3 -I "$ROOT/scripts/doors-tables.py" "$OUT" "$COMPARE"
     ;;
   case) run_case "$2" ;;
   endpoint-case) shift; endpoint_case "$@" ;;

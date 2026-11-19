@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The tables and the trial report of a `mantle bench doors` batch (scripts/doors-trials.sh),
-regenerated from its raw outputs alone: python3 scripts/doors-tables.py DIR writes DIR/tables.md
-and DIR/trial-report.md. Standard library only.
+regenerated from its raw outputs alone: python3 scripts/doors-tables.py DIR [COMPARE] writes DIR/tables.md
+and DIR/trial-report.md, with the comparators' configurations from COMPARE/COMPARATORS.md (the box's
+mantle-compare by default). Standard library only.
 
 A cell is a machine x door (or comparator) x operation x size x condition x arm; a tail case's arm
 carries -tail, its own cells. Its n is the transfers its cases measured; its quantiles are each
@@ -24,8 +25,15 @@ P999_N = 3688
 OPS = ["PUT", "PUT-STREAM", "GET", "GET-RANGE", "HEAD", "DELETE", "LIST", "MPU-CREATE", "MPU-PART",
        "MPU-LIST-PARTS", "MPU-COMPLETE", "MPU-ABORT"]
 CONDS = ["quiet", "busy1x", "busy2x", "cpu1", "cpu2", "memfloor"]
-ARMS = ["A1", "A2", "C", "minio", "garage", "seaweedfs", "rustfs"]
+ARMS = ["A1", "A2", "C", "F", "FC", "minio", "garage", "seaweedfs", "rustfs"]
 ARMS += [a + "-tail" for a in ARMS]
+# The counting builds' arms: the baseline's (C) and the final build's (FC).
+COUNTING = ("C", "C-tail", "FC", "FC-tail")
+# Each measure's better direction, for the final build against the baseline: +1 where more is better.
+BETTER = {"ops/s": 1, "p50": -1, "p99": -1, "p99.9": -1, "instructions/op": -1}
+# The counting arms' measures, the final build's (FC) against the baseline's (C).
+COUNTED = ("allocs/op", "reallocs/op", "moved/op", "bytes/op", "peak_live/request", "peak_live/connection",
+           "minor_faults/op", "client_allocs/op", "client_bytes/op")
 # The failure kinds a phase's note names (crates/mantle/src/bench_doors.rs `Failure::tag`).
 NOTE_KINDS = ("excluded:", "failure:", "refusal:", "unanswered:")
 
@@ -158,7 +166,7 @@ def per_op_cpu(p):
     return None if user is None or system is None else user + system
 
 
-def main(top):
+def main(top, compare_dir):
     raw = top / "raw"
     lines = (top / "plan.tsv").read_text().splitlines()
     header = lines[0].split("\t")
@@ -220,7 +228,8 @@ def main(top):
     w("ops/s is the phase's operations over its elapsed time; lateness p99 is how late an operation started "
       "after its intended start (open loop): where it is near the latency, the door ran at its capacity and the "
       "latency is mostly the queue's.\n")
-    w("Arms A1 and A2 are the timed build (the A/A pair), C the counting build; comparators run the HTTP door "
+    w("Arms A1 and A2 are the timed build (the A/A pair), C the counting build; F and FC are the final build's "
+      "timed and counting builds (step 10), in the same rows; comparators run the HTTP door "
       "with A1 as the harness; an arm's -tail cases ask 3,688 operations a sized phase. cpu = the servers' "
       "user+system ns/op (from /proc ticks); instr and cycles = `perf stat` user-space counts of the servers' "
       "processes over the phase; L1d miss = their L1 data-cache load misses/op and cache miss = the kernel's "
@@ -254,7 +263,7 @@ def main(top):
           f"{show(med(ps, 'datagrams/op'))} | {total(ps, 'refused')} | {total(ps, 'unanswered')} | "
           f"{total(ps, 'skipped')} | {total(ps, 'differed')} | {total(ps, 'failed')} |")
 
-    w("\n## Counts per operation (the counting arms, C and C-tail)\n")
+    w("\n## Counts per operation (the counting arms, C and FC, with their -tail cases)\n")
     w("The servers' allocator counts per operation across the cell's three `mantle serve` processes; their peak "
       "live heap over the phase above what they held as it began, over the most requests out at once (per request) "
       "and over the connections the phase held (per connection); the client's (mantle-client or the HTTP request "
@@ -262,7 +271,7 @@ def main(top):
     w("| machine | door | op | size | cond | arm | allocs/op | reallocs/op | moved/op | bytes/op | peak/request | "
       "peak/connection | client allocs/op | client bytes/op | harness allocs/op | harness peak B | footprint B | threads |")
     w("|" + "---|" * 18)
-    for key in sorted((k for k in cells if k[5] in ("C", "C-tail")), key=sort_key):
+    for key in sorted((k for k in cells if k[5] in COUNTING), key=sort_key):
         ps = cells[key]
         f = {k: show(med(ps, k)) for k in
              ("allocs/op", "reallocs/op", "moved/op", "bytes/op", "peak_live/request", "peak_live/connection",
@@ -319,6 +328,70 @@ def main(top):
         p90 = absd[min(len(absd) - 1, int(0.9 * len(absd)))]
         w(f"| {machine} | {cond} | {measure} | {len(d)} | {show(statistics.median(absd))} | {show(p90)} | "
           f"{show(statistics.median(d))} |")
+
+    # The final build against the baseline: F against A1 (F-tail against A1-tail), each measure beside the
+    # A/A band of its machine and condition; FC's counts against C's.
+    def band_p90(machine, cond, measure):
+        d = sorted(abs(x) for x in band.get((machine, cond, measure), []))
+        return d[min(len(d) - 1, int(0.9 * len(d)))] if d else None
+
+    finals = [k for k in sorted(cells, key=sort_key) if k[5] in ("A1", "A1-tail")
+              and k[:5] + (k[5].replace("A1", "F"),) in cells]
+    if finals:
+        w("\n## The final build against the baseline, cell by cell (F against A1)\n")
+        w("(F − A1) / A1 in percent for each measure both arms resolve; `+` marks a difference past the "
+          "90th percentile of its machine and condition's A/A band in the better direction, `−` in the worse, "
+          "none within it (an effect inside the band is not resolved by this batch).\n")
+        w("| machine | door | op | size | cond | arms | " + " | ".join(measures) + " |")
+        w("|" + "---|" * (6 + len(measures)))
+        verdict = {}
+        for key in finals:
+            arm = key[5]
+            final = cells[key[:5] + (arm.replace("A1", "F"),)]
+            row = []
+            for measure in measures:
+                a, b = value(cells[key], measure), value(final, measure)
+                if not a or b is None:
+                    row.append("-")
+                    continue
+                d = (b - a) / a * 100
+                edge = band_p90(key[0], key[4], measure)
+                mark = ""
+                if edge is not None and abs(d) > edge:
+                    mark = " +" if d * BETTER[measure] > 0 else " −"
+                v = verdict.setdefault((key[0], key[4], measure), {"d": [], "+": 0, "−": 0})
+                v["d"].append(d)
+                if mark:
+                    v[mark.strip()] += 1
+                row.append(f"{d:+.1f}%{mark}")
+            w(f"| {' | '.join(key[:5])} | {arm}/{arm.replace('A1', 'F')} | " + " | ".join(row) + " |")
+
+        w("\n## The final build against the baseline by condition\n")
+        w("Per machine and condition: the cells both arms resolve, the median signed difference, and the cells "
+          "past the A/A band's 90th percentile, better and worse.\n")
+        w("| machine | cond | measure | cells | median signed diff % | A/A p90 % | better past band | worse past band |")
+        w("|---|---|---|---|---|---|---|---|")
+        for (machine, cond, measure) in sorted(verdict, key=lambda k: (
+                MACHINES.index(k[0]) if k[0] in MACHINES else 99, CONDS.index(k[1]) if k[1] in CONDS else 99, k[2])):
+            v = verdict[(machine, cond, measure)]
+            w(f"| {machine} | {cond} | {measure} | {len(v['d'])} | {show(statistics.median(v['d']))} | "
+              f"{show(band_p90(machine, cond, measure))} | {v['+']} | {v['−']} |")
+
+    counted = [k for k in sorted(cells, key=sort_key) if k[5] in ("C", "C-tail")
+               and k[:5] + (k[5].replace("C", "FC"),) in cells]
+    if counted:
+        w("\n## The final build's counts against the baseline's (FC against C)\n")
+        w("Each cell's C value → FC value; the counting builds count every allocation, so a change in a count is "
+          "the code's, not noise's.\n")
+        w("| machine | door | op | size | cond | arms | " + " | ".join(COUNTED) + " |")
+        w("|" + "---|" * (6 + len(COUNTED)))
+        for key in counted:
+            final = cells[key[:5] + (key[5].replace("C", "FC"),)]
+            row = []
+            for measure in COUNTED:
+                a, b = med(cells[key], measure), med(final, measure)
+                row.append("-" if a is None and b is None else f"{show(a)} → {show(b)}")
+            w(f"| {' | '.join(key[:5])} | {key[5]}/{key[5].replace('C', 'FC')} | " + " | ".join(row) + " |")
 
     w("\n## Transfers behind each reported p99.9\n")
     resolved = [(k, ps) for k, ps in cells.items() if p999(ps) is not None]
@@ -396,10 +469,10 @@ def main(top):
           f"{show(mem / 1048576 if mem else None)} | {st.get('psi_io_some10', '-')}→{en.get('psi_io_some10', '-')} | "
           f"{show(r.get('user_s'))} | {show(r.get('system_s'))} | {show(rss_mib)} | {r.get('majflt', '-')} |")
 
-    compare = Path("/home/adalundhe/Projects/mantle-compare/COMPARATORS.md")
+    compare = compare_dir / "COMPARATORS.md"
     if compare.exists():
         text = compare.read_text()
-        w("\n## Comparator configurations (from mantle-compare/COMPARATORS.md)\n")
+        w(f"\n## Comparator configurations (from {compare})\n")
         start = text.find("| Comparator |")
         w(text[start:text.find("\n\n", start)].strip())
         w("")
@@ -450,6 +523,6 @@ def main(top):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: doors-tables.py BATCH-DIR")
-    main(Path(sys.argv[1]))
+    if len(sys.argv) not in (2, 3):
+        sys.exit("usage: doors-tables.py BATCH-DIR [COMPARE-DIR]")
+    main(Path(sys.argv[1]), Path(sys.argv[2] if len(sys.argv) == 3 else "/home/adalundhe/Projects/mantle-compare"))

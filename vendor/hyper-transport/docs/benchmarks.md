@@ -76,6 +76,39 @@ A second run of the committed tree measured 0.05 µs at every `n` without lanes 
 them. A call costs the same beside 1,023 heads waiting and 512 frames as beside one: 162 times less than
 before at 1,023 without lanes, 3,900 times less with them. Neither allocates.
 
+## A vouch beside open exchanges (2026-11-19)
+
+`benches/vouch.rs`: one connection, node 2 asked `n + 1` head-only requests, each holding a stream
+(the stream limit is 1,024), answering none; timed are node 2's vouches (`Endpoint::working`) for
+each of them in turn, as a node vouches for every parked request it holds, about 2^20 vouches a row
+after a tenth as many to warm up. After the first, each finds its connection's note pending and
+the clock never moves, so every sweep is the same calls on the same state. Simulated network,
+real CPU time.
+
+Why: a macOS `sample` of a node of the three-node cell serving native GETs (perf-10k `39ca69bd`,
+2026-11-19) put `tally::Table::settle` at 23% of its first shard's busy time, 88% of it under
+`Endpoint::working` → `with_exchange` → `Core::progress`: each vouch, which sets two flags, ran a
+full progress pass over its connection, and marked its exchange changed in the tally so the pass
+recounted it.
+
+Apple M5 Max (18 cores), macOS 26.4.1, rustc 1.98.1, release profile; the host shared (load
+average 24), the two builds run three times each, interleaved. Before is perf-10k at
+`39ca69bd` with the bench; after, the vouch sets the exchange's mark untouched
+(`Table::set_vouch`) and the connection's note pending, and places the connection's deadline
+again only when that moved it (the first vouch since the last note), with no pass.
+
+| Open beside it | Before: time per vouch, three runs | After: time per vouch, three runs |
+|---|---|---|
+| 1 | 32.0, 32.6, 32.7 ns | 2.4, 2.2, 2.2 ns |
+| 32 | 33.5, 32.7, 33.4 ns | 2.7, 2.3, 2.4 ns |
+| 256 | 34.0, 33.2, 42.9 ns | 4.7, 2.2, 2.4 ns |
+| 1023 | 35.0, 32.8, 35.2 ns | 3.0, 2.7, 2.8 ns |
+
+About 33 ns before, about 2.4 ns after, at any `n`: fourteen times less. The pass's cost here is
+its fixed part with everything in cache, one connection whose requests wait on their owner and
+which the pass passes over (`Core::next_visit`); in the node each vouch's pass ran over another
+connection's state, cold, among 2,048, which the sample's share reflects and this bench does not.
+
 ## A reservation beside spare buffers (2026-11-19)
 
 `benches/budget.rs`: a `Fixed` budget keeping `n` spare buffers, given back at capacities from 64

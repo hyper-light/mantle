@@ -1514,6 +1514,81 @@ fn a_body_paused_while_its_server_says_it_is_at_work_is_waited_for() {
     assert!(took < PERIOD * 4, "{took:?}");
 }
 
+/// Vouches `times` for `served`, node 2's: none runs a progress pass, marks an exchange changed in
+/// the tally or makes a note.
+fn vouch_quietly(net: &mut Net<Node<Mantle>, Node<Mantle>>, served: ExchangeId, times: usize) {
+    let (passes, notes) = (net.b.oracle_passes(), net.b.stats().notes_made);
+    assert_eq!(net.b.oracle_touched(), 0);
+    for _ in 0..times {
+        net.b.working(served);
+    }
+    assert_eq!(net.b.oracle_passes(), passes, "a vouch ran a progress pass");
+    assert_eq!(
+        net.b.oracle_touched(),
+        0,
+        "a vouch marked an exchange changed"
+    );
+    assert_eq!(net.b.stats().notes_made, notes, "a vouch made a note");
+}
+
+/// A vouch marks its exchange and its connection and nothing more: the note comes as it came when
+/// a progress pass followed each vouch, one a beat at most, made at the connection's turn its
+/// deadline brings once the note is due (mantle, 2026-11-19: that pass cost a serving node about
+/// a fifth of its busiest thread). Do: ask node 2 a head-only request; vouch for it there 1,000
+/// times, at once; then, part of a beat later, 1,000 times again, and move the clock timer by
+/// timer. Expect: no vouch runs a pass, marks an exchange or makes a note; the first note is made
+/// at the instant of the first vouches, the second exactly a beat after it, and each names the
+/// exchange once.
+#[test]
+fn an_exchange_vouched_for_many_times_between_notes_is_named_once_when_the_note_is_due() {
+    const VOUCHES: usize = 1_000;
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let beat = limits().serve_period / 3;
+    let progress = Progress::new(PERIOD).unwrap();
+    net.a
+        .open(net.now, 2, Kind::Get, &[1, 2, 3, 4], None, progress)
+        .unwrap();
+    let mut served = None;
+    net.until(TURNS, |net| {
+        served = served.or_else(|| {
+            events(&mut net.b)
+                .into_iter()
+                .find_map(|event| match event {
+                    Event::Request { exchange, .. } => Some(exchange),
+                    _ => None,
+                })
+        });
+        served.is_some()
+    });
+    let served = served.unwrap();
+    // The first note is due as the first vouch comes: the connection's deadline says so, and its
+    // turn at that instant makes the note.
+    let first = net.now;
+    vouch_quietly(&mut net, served, VOUCHES);
+    assert!(net.b.poll_timeout().is_some_and(|due| due <= first));
+    net.b.handle_timeout(first);
+    assert_eq!(net.b.stats().notes_made, 1);
+    net.exchange();
+    assert_eq!(net.a.stats().notes_heard, 1);
+    // The next is due a beat after the first was made, however many vouches came meanwhile.
+    net.advance_within(beat / 4);
+    assert!(net.now > first && net.now < first + beat);
+    vouch_quietly(&mut net, served, VOUCHES);
+    while net.b.stats().notes_made < 2 {
+        assert!(net.now < first + beat, "no note by {:?}", net.now - first);
+        net.exchange();
+        net.advance_within(beat / 4);
+    }
+    assert_eq!(net.now, first + beat);
+    net.exchange();
+    assert_eq!(net.a.stats().notes_heard, 2);
+    assert_eq!(
+        (net.a.oracle_mismatches(), net.b.oracle_mismatches()),
+        (0, 0)
+    );
+}
+
 /// The notes' lane is the endpoint's own: its owner's frame on it, or a hold of it, is refused.
 #[test]
 fn the_notes_lane_is_refused_to_its_owner() {

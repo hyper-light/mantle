@@ -723,6 +723,9 @@ struct Core<C: Classes, B, D> {
     /// Settled sums that differed from their fold.
     #[cfg(feature = "oracle")]
     mismatches: u64,
+    /// Progress passes run (`Core::progress`).
+    #[cfg(feature = "oracle")]
+    passes: u64,
     /// The events the owner has not polled, at most [`Limits::event_bound`].
     events: VecDeque<Waiting<C>>,
     peers: Vec<PeerEntry<C::Role>>,
@@ -1022,6 +1025,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 oracle: false,
                 #[cfg(feature = "oracle")]
                 mismatches: 0,
+                #[cfg(feature = "oracle")]
+                passes: 0,
                 events: VecDeque::new(),
                 peers: Vec::new(),
                 now,
@@ -1675,6 +1680,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         exchange: ExchangeId,
         into: &mut Reservation,
     ) -> Result<usize, Refusal> {
+        // A body not arriving, its head not yet in or its last byte read (mantle's read for the
+        // checksum, which waits for the trailer), reads nothing and changes nothing a progress
+        // pass acts on: none follows it, as none follows a vouch ([`Endpoint::working`]).
+        let state = self
+            .core
+            .exchanges
+            .get(exchange.0)
+            .ok_or(Refusal::UnknownExchange)?
+            .incoming
+            .state;
+        if state != In::Body {
+            return Ok(0);
+        }
         self.with_exchange(exchange, |core, conn, id| core.read_body(conn, id, into))
     }
 
@@ -1731,11 +1749,28 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// Said as work moves and never on a timer, a stuck owner falls silent and its asker gives it
     /// up as before. An exchange this side asked, or one whose reply was written whole, is passed
     /// over.
+    ///
+    /// It marks the exchange and its connection and nothing else: no progress pass follows it, as
+    /// one follows a call that moves an exchange ([`Endpoint::write_body`]), since the note is made
+    /// at the connection's turn its deadline brings once the note is due (`Core::note_due`), and
+    /// a vouch changes nothing else a pass acts on. A pass after each cost a serving node about a
+    /// fifth of its busiest thread (mantle, 2026-11-19: `Table::settle` 23% of the shard, 88% of
+    /// that under this call; docs/benchmarks.md, "A vouch beside open exchanges").
     pub fn working(&mut self, exchange: ExchangeId) {
-        let _ = self.with_exchange(exchange, |core, conn, id| {
-            core.vouch(conn, id);
-            Ok(())
-        });
+        let Some(key) = self
+            .core
+            .exchanges
+            .get(exchange.0)
+            .map(|exchange| exchange.connection)
+        else {
+            return;
+        };
+        let Some(Some(conn)) = self.conns.get_mut(key) else {
+            return;
+        };
+        if self.core.vouch(conn, exchange.0) {
+            self.rearm_later(key);
+        }
     }
 
     /// Bytes for a message of `class`, from the endpoint's budget: what the owner reads bodies
@@ -1945,6 +1980,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     #[cfg(feature = "oracle")]
     pub fn oracle_settles(&self) -> u64 {
         self.core.exchanges.settled()
+    }
+
+    /// How many progress passes the endpoint ran over its connections: a call that moves nothing
+    /// a pass acts on runs none ([`Endpoint::working`]).
+    #[cfg(feature = "oracle")]
+    pub fn oracle_passes(&self) -> u64 {
+        self.core.passes
+    }
+
+    /// The exchanges marked changed since the running sums were last settled: a call that changes
+    /// nothing they count marks none ([`Endpoint::working`]).
+    #[cfg(feature = "oracle")]
+    pub fn oracle_touched(&self) -> usize {
+        self.core.exchanges.touched()
     }
 
     /// What the endpoint holds and what it refused.
@@ -3578,13 +3627,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         into: &mut Reservation,
     ) -> Result<usize, Refusal> {
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
-        exchange.ready_sent = false;
+        // Only a body arriving is read (`Endpoint::read_body`): `ready_sent` is read in no other
+        // state, and the head's arrival sets it.
         if exchange.incoming.state != In::Body {
-            return match exchange.incoming.state {
-                In::Prefix | In::Head | In::Trailer | In::Whole | In::Finished => Ok(0),
-                In::Body => Err(Refusal::Order),
-            };
+            return Ok(0);
         }
+        exchange.ready_sent = false;
         let stream = exchange.stream.ok_or(Refusal::Order)?;
         let incoming = &mut exchange.incoming;
         let room = into.room().min(incoming.left);
@@ -4275,6 +4323,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// After anything reached `conn`: start waiting exchanges, write what is buffered, wake
     /// writers that can write again, judge deadlines, write lanes, and tune the window.
     fn progress(&mut self, now: Instant, conn: &mut Conn<C::Role>) {
+        #[cfg(feature = "oracle")]
+        {
+            self.passes = self.passes.saturating_add(1);
+        }
         if conn.peer.is_none() || conn.lost {
             return;
         }
@@ -4426,20 +4478,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     /// Exchange `id`'s owner is at work on it ([`Endpoint::working`]): the next note names it, if it
-    /// is a peer's and its reply is not yet written whole.
-    fn vouch(&mut self, conn: &mut Conn<C::Role>, id: u64) {
-        let Some(exchange) = self.exchanges.get_mut(id) else {
-            return;
+    /// is a peer's and its reply is not yet written whole. Its mark is nothing the tally counts
+    /// (`Table::set_vouch`). Whether `conn`'s note came due by it, which moves the connection's
+    /// deadline: only the first vouch since its last note was made, once that note is written
+    /// whole.
+    fn vouch(&mut self, conn: &mut Conn<C::Role>, id: u64) -> bool {
+        let Some(exchange) = self.exchanges.get(id) else {
+            return false;
         };
         if exchange.opened
             || exchange.ended
             || exchange.stream.is_none()
             || exchange.out.state == Out::Finished
         {
-            return;
+            return false;
         }
-        exchange.vouch = true;
-        conn.notes.pending = true;
+        self.exchanges.set_vouch(id, true);
+        let due = self.note_due(conn);
+        conn.notes.pending.get_or_insert(self.now);
+        self.note_due(conn) != due
     }
 
     /// A beat between notes on a connection: the serve period, the least any asker of this
@@ -4452,13 +4509,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     /// When `conn`'s next note is due: once an owner vouched since the last was made and that one
-    /// is written whole, a beat after it was made.
+    /// is written whole, a beat after it was made; the first, as the first vouch came.
     fn note_due(&self, conn: &Conn<C::Role>) -> Option<Instant> {
         let notes = &conn.notes;
-        if !notes.pending || notes.written < notes.note.len() {
+        let vouched = notes.pending?;
+        if notes.written < notes.note.len() {
             return None;
         }
-        Some(notes.made.map_or(self.now, |made| {
+        Some(notes.made.map_or(vouched, |made| {
             made.checked_add(self.beat()).unwrap_or(made)
         }))
     }
@@ -4478,21 +4536,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             if conn.notes.note.try_reserve(bound).is_err() {
                 return;
             }
+            // The marks are taken untouched (`Table::set_vouch`): a note made recounts nothing.
             for &id in &conn.exchanges {
-                let Some(exchange) = self.exchanges.get_mut(id) else {
-                    continue;
-                };
-                if !std::mem::replace(&mut exchange.vouch, false) {
+                if !self.exchanges.set_vouch(id, false) {
                     continue;
                 }
-                if let Some(stream) = exchange.stream
+                if let Some(exchange) = self.exchanges.get(id)
+                    && let Some(stream) = exchange.stream
                     && !exchange.ended
                     && exchange.out.state != Out::Finished
                 {
                     VarInt::from(stream).encode(&mut conn.notes.note);
                 }
             }
-            conn.notes.pending = false;
+            conn.notes.pending = None;
             conn.notes.made = Some(now);
             if !conn.notes.note.is_empty() {
                 self.stats.notes_made = self.stats.notes_made.saturating_add(1);

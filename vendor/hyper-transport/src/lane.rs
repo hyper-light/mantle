@@ -131,8 +131,9 @@ pub(crate) struct NotesOut {
     pub(crate) written: usize,
     /// When the last note was made: the next waits a beat from it.
     pub(crate) made: Option<Instant>,
-    /// An owner vouched for an exchange since the last note was made.
-    pub(crate) pending: bool,
+    /// When an owner first vouched for an exchange since the last note was made: the first note
+    /// is due then, an instant the connection's deadline can hold, not whenever it is asked.
+    pub(crate) pending: Option<Instant>,
 }
 
 /// Where a lane from a peer stands.

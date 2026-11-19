@@ -490,14 +490,39 @@ impl<F: BlockFile + 'static> GroupStore<F> {
     }
 }
 
-/// The log's error as the core reads it.
+/// The log's error as the core reads it, each named as [`fault`] names a write's, with no
+/// wildcard (mantle: vendor/UPSTREAM.md; every other variant once read "the log failed"). A read
+/// the core asks again for is `Compacted`, `Unavailable` or, for a full queue of fetches, `Busy`;
+/// the rest fence the replica with their words.
 fn storage(e: &LogError) -> StorageError {
     match e {
         LogError::Compacted { .. } => StorageError::Compacted,
         LogError::Unavailable { .. } => StorageError::Unavailable,
         // The log's queue of fetches was full: the core asks again when it next sends.
         LogError::Busy => StorageError::LogTemporarilyUnavailable,
-        _ => StorageError::Other("the log failed"),
+        LogError::Corrupt { .. } => StorageError::Other("an entry read back does not verify"),
+        LogError::Damaged(_) => StorageError::Other("the group's acknowledged records are damaged"),
+        LogError::Fenced => StorageError::Other("the log is fenced after a failed write or flush"),
+        LogError::Closed => StorageError::Other("the log is closed"),
+        LogError::Disk(_) => StorageError::Other("the device failed a read"),
+        LogError::Full => StorageError::Other("the log is full of live records"),
+        LogError::TooLarge(_) => StorageError::Other("a record larger than a frame"),
+        LogError::TooManyGroups(_) => StorageError::Other("the log holds its most groups"),
+        LogError::Backlog(_) => StorageError::Other("the group would retain past its bound"),
+        LogError::Invalid { .. } => StorageError::Other("an update the group cannot take"),
+        LogError::Behind(_) => StorageError::Other("a write sent behind a refused one"),
+        LogError::Claimed(_) => StorageError::Other("the group is written through its handle"),
+        LogError::Foreign(_) => StorageError::Other("the file is not this log"),
+        LogError::SealedWithoutKeys => {
+            StorageError::Other("the log is sealed and was opened without its keys")
+        }
+        LogError::UnsealedWithKeys => {
+            StorageError::Other("the log is not sealed and was opened with keys")
+        }
+        LogError::Config(_) => StorageError::Other("the log's configuration is invalid"),
+        LogError::Unfit(_) => StorageError::Other("no log configuration derives from the facts"),
+        LogError::Tampered(_) => StorageError::Other("the sealed log was tampered with"),
+        LogError::Seal(_) => StorageError::Other("a sealed log's key failed"),
     }
 }
 
@@ -984,5 +1009,64 @@ mod tests {
             texts.get(1).map(String::as_str),
             Some("the write failed: the group is damaged: a live frame does not verify")
         );
+    }
+
+    /// Every error a read of the log meets is named as the core reads it: a read it asks again
+    /// for stays `Compacted`, `Unavailable` or `LogTemporarilyUnavailable`, and every other
+    /// variant has words no other shares, where they once all read "the log failed".
+    #[test]
+    fn every_error_of_a_read_of_the_log_is_named() {
+        use hyper_raft::StorageError;
+
+        use super::storage;
+
+        let group = 7;
+        assert_eq!(
+            storage(&LogError::Compacted { group, first: 9 }),
+            StorageError::Compacted
+        );
+        assert_eq!(
+            storage(&LogError::Unavailable { group, index: 9 }),
+            StorageError::Unavailable
+        );
+        assert_eq!(
+            storage(&LogError::Busy),
+            StorageError::LogTemporarilyUnavailable
+        );
+        let failures = [
+            LogError::Corrupt { group, index: 9 },
+            LogError::Damaged("a live frame does not verify"),
+            LogError::Fenced,
+            LogError::Closed,
+            LogError::Disk(DiskError::Misaligned {
+                offset: 1,
+                len: 2,
+                align: 4096,
+            }),
+            LogError::Full,
+            LogError::TooLarge(1 << 30),
+            LogError::TooManyGroups(4),
+            LogError::Backlog(group),
+            LogError::Invalid {
+                group,
+                reason: "entries at or before the start",
+            },
+            LogError::Behind(group),
+            LogError::Claimed(group),
+            LogError::Foreign("the file is empty"),
+            LogError::SealedWithoutKeys,
+            LogError::UnsealedWithKeys,
+            LogError::Config("a key record"),
+            LogError::Unfit(Unfit::Zero("the segment's size")),
+            LogError::Tampered("a frame's MAC fails"),
+        ];
+        let mut texts: Vec<String> = Vec::new();
+        for e in &failures {
+            let read = storage(e);
+            assert!(matches!(read, StorageError::Other(_)), "{e}: {read}");
+            let text = read.to_string();
+            assert!(!texts.contains(&text), "{e} shares its words: {text}");
+            texts.push(text);
+        }
     }
 }

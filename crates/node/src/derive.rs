@@ -925,15 +925,24 @@ pub fn engine_wants_for(engine: &Engine, objects: u64) -> Option<u64> {
     extents.checked_mul(mantle_engine::shard_db::measured_per_extent(&engine.store)?)
 }
 
+/// The extents an engine opens with: its superblocks' and one more for its rows.
+const OPENS_WITH: u64 = 2;
+
+/// What `engine`'s resident metadata takes for the extents it opens with ([`OPENS_WITH`]), the
+/// least of its want in [`shares`]: a share below it is one [`engine_within`] refuses.
+pub fn engine_least(engine: &Engine) -> Option<u64> {
+    mantle_engine::shard_db::measured_per_extent(&engine.store)?.checked_mul(OPENS_WITH)
+}
+
 /// `engine` with as many extents as `metadata` bytes of the node's memory hold at the metadata
 /// measured at the densest rows and their allocator's own
 /// (`mantle_engine::shard_db::measured_per_extent`), at most its device's share holds, and the
-/// superblocks' extent and one more at least.
+/// extents it opens with at least ([`OPENS_WITH`]).
 pub fn engine_within(engine: Engine, metadata: u64) -> Result<Engine, DeriveError> {
     let per_extent = mantle_engine::shard_db::measured_per_extent(&engine.store)
         .ok_or(DeriveError::Overflow("an extent's metadata"))?;
     let held = metadata.checked_div(per_extent).unwrap_or(0);
-    if held < 2 {
+    if held < OPENS_WITH {
         return Err(DeriveError::Metadata {
             bytes: metadata,
             per_extent,
@@ -2289,8 +2298,15 @@ pub fn derive(
     // What remains, shared: each index wants a fragment at each of its volume's blocks, and each
     // engine the rows of the objects those fragments make across the cell, so both fill together.
     let held_objects = cell_blocks(fragments, spread)?;
-    let engine_want =
-        engine_wants_for(&made, held_objects).ok_or(overflow("an engine's metadata"))?;
+    // And each engine at least the extents it opens with ([`engine_least`]): a node with no
+    // volume of its own counts no fragment, yet its ranges hold the cell's rows as every member's
+    // do, and with no want its engines took what the operations' share left, which on CI's macOS
+    // runner, 7 GiB, was nothing, and the node refused to start (`DeriveError::Metadata`,
+    // 2026-11-19).
+    let engine_want = engine_wants_for(&made, held_objects)
+        .zip(engine_least(&made))
+        .map(|(want, least)| want.max(least))
+        .ok_or(overflow("an engine's metadata"))?;
     let mut all = wants;
     all.resize(
         stated
@@ -4701,6 +4717,60 @@ mod tests {
     /// but their floors together pass the machine. Its need, its floor at the deepest its queue lets
     /// calibration measure with every want whole, passes the machine: no memory it states starts
     /// it there.
+    /// A node of the membership suite granted with no volume of its own (`mantle init grant`, the
+    /// founders its seeds, the four test clients pinned as gateways) starts on CI's three-core
+    /// 7 GiB macOS runner at every depth its device may measure: it counts no fragment, so its
+    /// engines' wants were none and they took what the operations' share left, nothing there, and
+    /// it refused to start (`DeriveError::Metadata`, CI run 44420627795). Each engine now wants at
+    /// least the extents it opens with, which the operations' share leaves it.
+    #[test]
+    fn a_node_with_no_volume_on_cis_macos_runner_keeps_its_engines_the_extents_they_open_with() {
+        let granted = || {
+            let mut s = Stated {
+                s3: Some(crate::process::S3Stated {
+                    listen: "127.0.0.1:7480".parse().unwrap(),
+                    region: "us-east-1".into(),
+                    names: Vec::new(),
+                    certificate: at("/node/s3/cert.der"),
+                    key: at("/node/s3/key.der"),
+                    access: Vec::new(),
+                }),
+                enlist: Some(Enlisting {
+                    root: 0x10,
+                    domain: "doomed".into(),
+                    max_nodes: 5,
+                    max_volumes: 5,
+                }),
+                ..stated(1)
+            };
+            s.volumes.clear();
+            s.peers.retain(|p| p.role == Role::Node);
+            for id in 6..=9 {
+                s.peers
+                    .push(peer(id, Role::Gateway, "/node/identity/c.der", None));
+            }
+            s
+        };
+        for depth in [4, 64, 256] {
+            let mut measured = deep(256, depth);
+            measured.cores = 3;
+            measured.memory = machine(7 << 30, None);
+            measured.volumes.clear();
+            let derived = derive(granted(), &measured, &mut fresh)
+                .unwrap_or_else(|e| panic!("depth {depth}: {e}"));
+            let per_extent =
+                mantle_engine::shard_db::measured_per_extent(&derived.config.store).unwrap();
+            assert!(
+                said_bytes(&derived, "engine.metadata_bytes") >= per_extent * OPENS_WITH,
+                "depth {depth}"
+            );
+            assert!(
+                derived.config.store.max_extents >= OPENS_WITH,
+                "depth {depth}"
+            );
+        }
+    }
+
     #[test]
     fn a_membership_founder_on_cis_macos_runner_starts_at_its_issuers_stacks() {
         let founder = || {

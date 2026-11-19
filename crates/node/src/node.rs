@@ -1232,7 +1232,8 @@ impl<E: Engine + 'static, L: NodeLog> Taking<'_, E, L> {
 }
 
 /// The node's task's waker as the sources of its answers hold it (its logs, its volumes, the S3
-/// listener's door): a wake records that it came, then wakes the task. A wake ends whichever await
+/// listener's door), and a range shard's task's as its ranges' logs hold it (`shard::run`): a wake
+/// records that it came, then wakes the task. A wake ends whichever await
 /// of the task it finds, and one that came while the process said a line between turns ended that
 /// await rather than the node's wait, which then slept with the request or answer in hand until
 /// its next due: a timer's period, not the event (node.md §2.2). The wait takes the record first

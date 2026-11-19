@@ -20,6 +20,8 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -41,9 +43,9 @@ use mantle_protocol::classes::{self, NodeClasses};
 use mantle_range::membership::{Replacement, Step, Toward};
 use mantle_range::{Applied, ConfState, LogStore, RangeMachine};
 
-use super::NodeError;
 use super::answers::Answers;
 use super::members::Rows;
+use super::{NodeError, Woken};
 use crate::read::{Query, Read};
 
 /// A range's replica, as the node's shard and a range's shard hold it.
@@ -1191,9 +1193,12 @@ struct Shard<E: Engine, S: LogStore> {
     /// The reads' contexts the replicas gave back this turn, each with its range; kept for its
     /// storage, at most the reads taken.
     served: Vec<(u128, Vec<u8>)>,
-    /// The task's waker, which a compaction's write wakes, and whether the node's shard asked a
-    /// round of compaction ([`In::Compact`]) the shard has yet to make.
+    /// The waker its ranges' logs answer through, a compaction's write and a member's catch-up
+    /// read as well as a write: the task's, wrapped in a flag ([`Woken`]) the wait takes first.
     waker: Waker,
+    woken: Arc<Woken>,
+    /// Whether the node's shard asked a round of compaction ([`In::Compact`]) the shard has yet to
+    /// make.
     compact: bool,
     /// Where the node's shard asked its ranges' engines back ([`In::Release`]).
     release: Option<OneshotSender<Vec<(u128, E)>>>,
@@ -1693,7 +1698,11 @@ async fn run<E: Engine + 'static, S: LogStore>(
     // Its replicas apply through the engine's synchronous calls, as the node's own shard's do: a
     // metadata shard, which may wait on the device (node.md §1.2, §2.9).
     mantle_engine::store::permit_blocking();
-    let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
+    let woken = Arc::new(Woken {
+        task: poll_fn(|context| Poll::Ready(context.waker().clone())).await,
+        woken: AtomicBool::new(false),
+    });
+    let waker = Waker::from(Arc::clone(&woken));
     let mut shard = Shard {
         owner: Owner::new(vec![waker.clone(); slots]),
         ranges: Vec::with_capacity(slots),
@@ -1705,6 +1714,7 @@ async fn run<E: Engine + 'static, S: LogStore>(
         reads_most: capacity,
         served: Vec::new(),
         waker,
+        woken,
         compact: false,
         release: None,
         upkeep: super::upkeep::Upkeep::default(),
@@ -1712,6 +1722,9 @@ async fn run<E: Engine + 'static, S: LogStore>(
     let mut arrived = None;
     loop {
         let began = std::time::Instant::now();
+        // The turn looks at every source of the task's wakes from here, so a wake that came before
+        // is this turn's to answer, and one that comes after is kept for the wait.
+        shard.woken.take();
         let mut stopped = arrived.take().and_then(|sent| shard.take(sent).err());
         for _ in 0..capacity {
             if stopped.is_some() {
@@ -1753,9 +1766,14 @@ async fn run<E: Engine + 'static, S: LogStore>(
             let _ = given.send(Out::Stopped(error)).await;
             return;
         }
-        // With work still queued or maintenance owed the task yields once, so the shard's other
-        // tasks run between its turns, and turns again.
-        if shard.owner.has_work() || shard.answered() || shard.upkeep.owed() {
+        // With work still queued, an answer in, maintenance owed or a wake come since the turn
+        // began, the task yields once, so the shard's other tasks run between its turns, and turns
+        // again. A wake ends whichever await of the task it finds, and one that came while the
+        // task waited for the lane's room above (a member's catch-up page read, which no look here
+        // finds) ended that wait, not the one below, which slept to the range's next deadline with
+        // the page in hand. Every source the owner and compaction answer through wakes through the
+        // flag ([`Woken`]), so the wake is kept, and taken at the turn it brings.
+        if shard.woken.take() || shard.owner.has_work() || shard.answered() || shard.upkeep.owed() {
             hyper_rt::futures::yield_now().await;
             continue;
         }
@@ -3096,6 +3114,220 @@ mod tests {
         drop(lanes);
         rt.shutdown().unwrap();
         drop(log);
+    }
+
+    /// What a [`Paging`] store's catch-up was asked: the drives that called it, and the waker the
+    /// last one gave it, the shard's, which a page's read wakes as it is answered.
+    #[derive(Default)]
+    struct Pager {
+        drives: std::sync::atomic::AtomicU64,
+        waker: std::sync::Mutex<Option<Waker>>,
+    }
+
+    impl Pager {
+        fn drives(&self) -> u64 {
+            self.drives.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A group's log held in memory (hyper-durable's `RamStore`) with a page of a member's
+    /// catch-up being read at every drive, as a leader's store has while a lagging member's page
+    /// is read from its log's file (`LogStore::catch_up`): each drive's call is counted and its
+    /// waker kept ([`Pager`]), for the test to wake as the read is answered.
+    struct Paging {
+        store: hyper_durable::RamStore,
+        pager: std::sync::Arc<Pager>,
+    }
+
+    impl LogStore for Paging {
+        type Hold = <hyper_durable::RamStore as LogStore>::Hold;
+
+        fn held(&self) -> Option<&Self::Hold> {
+            self.store.held()
+        }
+
+        fn release(&mut self, met: &Self::Hold) {
+            self.store.release(met);
+        }
+
+        fn depth(&self) -> usize {
+            self.store.depth()
+        }
+
+        fn view(&self) -> Result<hyper_durable::StoreView, hyper_durable::Fault> {
+            self.store.view()
+        }
+
+        fn bounds(&self) -> Result<(hyper_durable::Point, u64), hyper_raft::StorageError> {
+            self.store.bounds()
+        }
+
+        fn term(&self, index: u64) -> Result<u64, hyper_raft::StorageError> {
+            self.store.term(index)
+        }
+
+        fn entries(
+            &self,
+            low: u64,
+            high: u64,
+            max_bytes: u64,
+            into: &mut Vec<hyper_raft::proto::Entry>,
+        ) -> Result<(), hyper_raft::StorageError> {
+            self.store.entries(low, high, max_bytes, into)
+        }
+
+        fn visit(
+            &self,
+            low: u64,
+            high: u64,
+            page: u64,
+            visit: &mut dyn FnMut(hyper_durable::EntryRef<'_>) -> bool,
+        ) -> Result<(), hyper_raft::StorageError> {
+            self.store.visit(low, high, page, visit)
+        }
+
+        fn proposals(
+            &self,
+            into: &mut Vec<hyper_raft::proto::Entry>,
+        ) -> Result<(), hyper_raft::StorageError> {
+            self.store.proposals(into)
+        }
+
+        fn released(&self) -> Result<u64, hyper_raft::StorageError> {
+            self.store.released()
+        }
+
+        fn room(&self) -> bool {
+            self.store.room()
+        }
+
+        fn submit(
+            &mut self,
+            write: &hyper_durable::Write<'_>,
+            waker: &Waker,
+        ) -> Result<(), hyper_durable::Fault> {
+            self.store.submit(write, waker)
+        }
+
+        fn poll(&mut self) -> Option<Result<(), hyper_durable::Fault>> {
+            self.store.poll()
+        }
+
+        fn write_now(
+            &mut self,
+            write: &hyper_durable::Write<'_>,
+        ) -> Result<(), hyper_durable::Fault> {
+            self.store.write_now(write)
+        }
+
+        fn keep_after(&mut self, index: u64) {
+            self.store.keep_after(index);
+        }
+
+        fn kept_bytes(&self) -> u64 {
+            self.store.kept_bytes()
+        }
+
+        fn catch_up(&mut self, waker: &Waker, _: &[u64], _: &mut Vec<u64>) -> bool {
+            self.pager
+                .drives
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.pager.waker.lock().unwrap() = Some(waker.clone());
+            true
+        }
+    }
+
+    /// A wake a range shard's task takes while it waits for room in its lane to the node's shard,
+    /// a member's catch-up page read here, turns the task once its sends are done, at that instant,
+    /// rather than at its range's next deadline; and turns it once. The task runs on hyper-rt's
+    /// simulated runtime, whose clock moves only when the test moves it, and the test holds both
+    /// lanes: two proposals its range refuses give two answers to a lane that holds one, so the
+    /// task waits for room; the test wakes it there, runs it, then empties the lane.
+    #[test]
+    fn a_wake_a_range_shard_takes_while_it_waits_for_its_lanes_room_turns_it_once_sent() {
+        let mut sim = hyper_rt::SimRuntime::new(
+            &RuntimeConfig {
+                shards: 1,
+                tasks_per_shard: 2,
+                timers_per_shard: 2,
+                interests_per_shard: hyper_rt::runtime::interests_for(2),
+                ring_entries: 1,
+                step_budget_ns: 1_000_000_000,
+                timer_tick_ns: 100_000,
+                batch: 1,
+                pin: false,
+                cores: Vec::new(),
+                page_bytes: usize::try_from(hyper_rt::machine::facts::Facts::query().page.base)
+                    .unwrap(),
+                spin_ns: 0,
+                wake_tracking: None,
+                latency_objective_ns: None,
+            },
+            1,
+        )
+        .unwrap();
+        let shard = sim.shard_ids()[0];
+        let (into, taken) = channel(4).unwrap();
+        let (given, mut from) = channel(1).unwrap();
+        sim.spawn_on(shard, run::<Model, Paging>(taken, given, 1, 4))
+            .unwrap();
+        let range = one_member();
+        let pager = std::sync::Arc::new(Pager::default());
+        let store = Answers::new(Paging {
+            store: hyper_durable::RamStore::new(),
+            pager: std::sync::Arc::clone(&pager),
+        });
+        let mut engine = Model::default();
+        engine.install(0, name::first(1).unwrap()).unwrap();
+        engine.persist().unwrap();
+        // A sole voter, which leads at its first drives: the writes it makes are answered at once.
+        let replica =
+            mantle_range::open_shell(1, store, engine, &range, 1, Elections::Suspicion).unwrap();
+        // What the node's shard takes from the lane, each taking letting the task send the next:
+        // the refusals among it.
+        let mut take = |sim: &mut hyper_rt::SimRuntime, now: u64| {
+            let mut refusals = 0;
+            while let Ok(Some(out)) = from.try_recv() {
+                assert!(!matches!(out, Out::Stopped(_)), "the shard stopped");
+                refusals += u32::from(matches!(out, Out::Refused(..)));
+                sim.run_until(now);
+            }
+            refusals
+        };
+        let now = sim.now_ns();
+        let sent = into.try_send(In::Adopt(GROUP, Box::new(replica)));
+        assert!(sent.is_ok(), "the range handed to its shard");
+        sim.run_until(now);
+        take(&mut sim, now);
+        let before = pager.drives();
+        assert!(before > 0, "the shard drove its range");
+        // Two proposals past the most bytes the range takes in one, which it refuses at once
+        // with nothing written: two answers, and the lane holds one.
+        for ask in [1, 2] {
+            let sent = into.try_send(In::Propose(GROUP, put().encode().unwrap(), 1, ask));
+            assert!(sent.is_ok(), "the proposal handed to the shard");
+        }
+        sim.run_until(now);
+        let waiting = pager.drives();
+        assert!(waiting > before, "the turn drove the range");
+        // The page is read while the task waits for the lane's room: the wake ends that wait.
+        let waker = pager.waker.lock().unwrap().clone().unwrap();
+        waker.wake_by_ref();
+        sim.run_until(now);
+        assert_eq!(pager.drives(), waiting, "no turn while the lane is full");
+        // The node's shard takes what its lane holds: the task sends the rest, then turns for the
+        // page read, at the same instant, once.
+        assert_eq!(
+            take(&mut sim, now),
+            2,
+            "both refusals, one past the lane's room"
+        );
+        assert_eq!(
+            pager.drives(),
+            waiting + 1,
+            "the task turned once for the page read while it waited for room"
+        );
+        assert_eq!(sim.now_ns(), now, "and no deadline passed");
     }
 
     /// A range whose engine fails stops the node with the engine's own error in its text, beside

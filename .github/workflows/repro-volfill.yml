@@ -1,8 +1,9 @@
 name: repro-volfill
 # Bisect, all at once: crates/mantle/tests/serve.rs
-# `a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors` at perf-10k's merges since
-# c3e73e7d, to find the one whose HTTP PUT of o5 waits with no progress past the test's 600 s (CI gates
-# 44547229268 on 5fbd5059, linux-x86_64; reproduced on macOS aarch64).
+# `a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors`, whose HTTP PUT of o5 waits
+# with no progress past the test's 600 s about four runs in five at every perf-10k merge since
+# c3e73e7d (run 44575349545). It passed on every target at lean-doors' c33e5bf0 (CI 43330931920):
+# sixteen commits between, and c33e5bf0 again. A failed run marks a commit; two passes clear it.
 on:
   push:
     branches: ["repro/**"]
@@ -16,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sha: [c3e73e7d, 96d9d0b9, 24113426, a9ab2a16, 1254391d, 068ee7a1, 7b780a63, 05c14470, 279b7f3a, d220e170, c1589e30, 88a2bc1f, b3f016e3, 9ec351b7]
+        sha: [c3e73e7d, d107ffe8, 89ddbc3e, cb88c723, ba19f00f, 692c3388, f70a5b9b, 86962c80, bad4aadd, 20eb7c89, fb9ce28a, 0ae45327, 2ac5645d, 27a78b06, 14395f7d, 7c8d8ddd, c33e5bf0]
     name: volumes fill at ${{ matrix.sha }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -32,10 +33,15 @@ jobs:
         run: cargo test -p mantle --test serve --locked --no-run
       - name: The volumes-fill test
         run: |
-          start=$(date +%s)
-          if timeout 1800 cargo test -p mantle --test serve --locked a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors -- --exact > out.txt 2>&1; then
-            echo "PASSED at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
-          else
-            echo "FAILED at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
-            grep -m 5 -E "panicked at|not so" out.txt | cut -c1-300 || true
-          fi
+          for i in 1 2; do
+            start=$(date +%s)
+            if timeout 1800 cargo test -p mantle --test serve --locked a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors -- --exact > out-$i.txt 2>&1; then
+              echo "run $i passed at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
+            else
+              echo "run $i failed at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
+              grep -m 3 -E "panicked at|not so" out-$i.txt | cut -c1-300 || true
+              echo "VERDICT BAD ${{ matrix.sha }}"
+              exit 0
+            fi
+          done
+          echo "VERDICT GOOD ${{ matrix.sha }}"

@@ -15,7 +15,7 @@
 
 use hyper_block::block::BlockFile;
 use mantle_engine::rows::Rows as EngineRows;
-use mantle_engine::shard_db::ShardDb;
+use mantle_engine::shard_db::{FlushStats, ShardDb};
 use mantle_engine::store::{Config, IoStats};
 use mantle_engine::trunk::{TrunkConfig, TrunkStats};
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
@@ -127,6 +127,13 @@ impl<F: BlockFile + 'static> Stored<F> {
     /// their inputs on the engine's own thread at once (`ShardDb::stats`).
     pub fn trunk_stats(&self) -> TrunkStats {
         self.db.stats().1
+    }
+
+    /// The engine's maintenance outside the trunk since it opened: its packings, and its idle
+    /// steps, the units they did and those that left their wait to a worker's message
+    /// (`ShardDb::stats`).
+    pub fn flush_stats(&self) -> FlushStats {
+        self.db.stats().0
     }
 
     /// The rows of `[from, to)` (to the end with no `to`), all of them, into the scan buffer.
@@ -254,7 +261,9 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
     /// The engine's idle step that waits for nothing (`ShardDb::idle_step_now`), in SILK's order:
     /// the packing first, then the trunk's work and its workers' results, then the consolidations
     /// seeks paid for, then the cache's. A puts-only or reads-only range otherwise paid it only at
-    /// its next put or checkpoint. One that failed fences the engine, as a failed apply does.
+    /// its next put or checkpoint. Work that waits on a job out on a worker answers none done and
+    /// work owed, the owner's task woken by the worker's next message. One that failed fences the
+    /// engine, as a failed apply does.
     fn upkeep(&mut self, budget: u64) -> Result<(u64, bool), EngineError> {
         if self.fault.is_some() {
             return Err(EngineError::Fenced);

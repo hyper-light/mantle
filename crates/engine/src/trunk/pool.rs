@@ -658,6 +658,10 @@ pub struct Pool {
     /// ([`ShardDb::feed_from`](crate::shard_db::ShardDb)): the message may have brought a
     /// starved feed's buffer back. Wrapping: only its change is read.
     accepted: u64,
+    /// The pool's moves since it began: messages taken from the workers, jobs handed to them and
+    /// results delivered to their owners. An owner's step that moved none only looked
+    /// ([`ShardDb::idle_step_now`](crate::shard_db::ShardDb)). Wrapping: only its change is read.
+    moves: u64,
     /// Terminal jobs are abandoned, their refills refused, before the job channels close.
     closing: bool,
     /// Every worker dropped its store and return sender, including its device attachment.
@@ -729,6 +733,7 @@ impl Pool {
             attach: None,
             waiting: false,
             accepted: 0,
+            moves: 0,
             closing: false,
             closed: false,
             close_error: None,
@@ -886,6 +891,44 @@ impl Pool {
                 Ok(None)
             }
             Err(error) => Err(Error::Io {
+                op: "take a worker's message",
+                detail: format!("{error:?}"),
+            }),
+        }
+    }
+
+    /// Asks the workers' next message to wake the runtime task polling now, for an owner that
+    /// waits for nothing and turns again when woken
+    /// ([`ShardDb::idle_step_now`](crate::shard_db::ShardDb)): a message come already is taken and
+    /// accepted from `store`, `Some(true)`; otherwise the task waits on the channel back, as
+    /// [`Self::receive`] does, and the next message sent wakes it once, `Some(false)`. `None` off
+    /// a runtime task, or once the channel closed for the pool's close: no task to wake, so the
+    /// owner looks again as before.
+    pub(crate) fn wake_on_message<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+    ) -> Result<Option<bool>, Error> {
+        use std::future::Future;
+        let Some(task) = hyper_rt::futures::current_task() else {
+            return Ok(None);
+        };
+        let waker = hyper_rt::waker::waker_for(task.0);
+        let mut cx = std::task::Context::from_waker(&waker);
+        // One poll: a value waiting is taken, else the task's word is left on the channel, which
+        // the next send wakes (a refusal of the task's turn wakes it at once instead).
+        let polled = std::pin::pin!(self.messages.recv()).poll(&mut cx);
+        match polled {
+            std::task::Poll::Pending => Ok(Some(false)),
+            std::task::Poll::Ready(Ok(message)) => self.accept(store, message).map(|_| Some(true)),
+            std::task::Poll::Ready(Err(hyper_rt::sync::SyncError::NotOnShardThread(()))) => {
+                Ok(None)
+            }
+            std::task::Poll::Ready(Err(hyper_rt::sync::SyncError::Closed(())))
+                if self.closing && self.back.is_none() =>
+            {
+                Ok(None)
+            }
+            std::task::Poll::Ready(Err(error)) => Err(Error::Io {
                 op: "take a worker's message",
                 detail: format!("{error:?}"),
             }),
@@ -1297,6 +1340,7 @@ impl Pool {
         w.owner = Some(owner);
         w.job = self.handed;
         w.topped.clear();
+        self.moves = self.moves.wrapping_add(1);
         let ticket = Ticket {
             worker: at,
             job: self.handed,
@@ -1370,6 +1414,7 @@ impl Pool {
             if let Some(at) = self.undelivered.iter().position(|(o, _)| *o == owner)
                 && let Some((_, back)) = self.undelivered.swap_remove_back(at)
             {
+                self.moves = self.moves.wrapping_add(1);
                 return Ok(Some(back));
             }
             if !self.next(store, wait && self.out_for(owner))? {
@@ -1451,6 +1496,7 @@ impl Pool {
     ) -> Result<bool, Error> {
         self.waiting = false;
         self.accepted = self.accepted.wrapping_add(1);
+        self.moves = self.moves.wrapping_add(1);
         match message {
             Message::Ready { result, .. } => result?,
             Message::Retired { worker, result } => {
@@ -1644,6 +1690,12 @@ impl Pool {
     /// Messages taken from the workers since the pool began, wrapping: only its change is read.
     pub fn accepted(&self) -> u64 {
         self.accepted
+    }
+
+    /// The pool's moves since it began: messages taken, jobs handed out and results delivered.
+    /// Wrapping: only its change is read.
+    pub(crate) fn moves(&self) -> u64 {
+        self.moves
     }
 
     /// Whether a job of `owner`'s is out, or back and not yet taken.

@@ -1607,9 +1607,11 @@ mod tests {
     #[test]
     fn what_cannot_be_stated_is_refused() {
         let key = KeyPair::generate().unwrap();
+        // One read: two may straddle a second, and a span of one second is stated.
+        let at = now();
         let backwards = Validity {
-            not_before: now(),
-            not_after: now(),
+            not_before: at,
+            not_after: at,
         };
         assert_eq!(
             authority(&key, "cell", backwards, Serial::draw().unwrap()),

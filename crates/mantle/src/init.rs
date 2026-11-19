@@ -1717,6 +1717,16 @@ mod tests {
         text.parse().unwrap()
     }
 
+    /// The time, in whole seconds since the Unix epoch, to check a certificate made before this
+    /// call at. Its maker reads the clock and makes it valid from that second, so a time read
+    /// before the making can fall a second short and be refused as not yet valid.
+    fn after_issue() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     #[test]
     fn sizes_are_bytes_or_a_power_of_1024() {
         assert_eq!(parse_bytes("4096"), Ok(4096));
@@ -2036,16 +2046,14 @@ mod tests {
             "quic=127.0.0.1:9102,plane=127.0.0.1:9202",
         ]);
         let authority = Authority::read(&out).unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let mut issued: Vec<(u64, Vec<u8>)> = Vec::new();
         for _ in 0..4 {
             let (id, certificate, key) = authority.issue_client().unwrap();
             assert_ne!(id, 0);
             assert!(authority.nodes.iter().all(|(node, _)| *node != id));
-            mantle_cert::issued_by(&certificate, &authority.certificate, now).unwrap();
+            let now = after_issue();
+            mantle_cert::issued_by(&certificate, &authority.certificate, now)
+                .unwrap_or_else(|e| panic!("client {id}'s certificate checked at {now}: {e:?}"));
             assert_eq!(
                 mantle_cert::public_key(&certificate).unwrap(),
                 key.public_key()
@@ -2088,10 +2096,6 @@ mod tests {
             ..Cell::default()
         };
         init(&mut Vec::new(), &out, &cell).unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let authority_dir = out.join("authority");
         let authority = std::fs::read(authority_dir.join("authority.der")).unwrap();
         let mut holders = vec![authority_dir.clone()];
@@ -2110,7 +2114,12 @@ mod tests {
         assert_eq!(holders.len(), 3);
         let held = |dir: &Path| -> Vec<u8> {
             let der = std::fs::read(dir.join(ISSUER.0)).unwrap();
-            mantle_cert::issuer_issued(&der, &authority, now).unwrap();
+            // At each check: the issuer `issuer` makes below is valid from a later second than
+            // the founding's.
+            let now = after_issue();
+            mantle_cert::issuer_issued(&der, &authority, now).unwrap_or_else(|e| {
+                panic!("{} checked at {now}: {e:?}", dir.join(ISSUER.0).display())
+            });
             let key = dir.join(ISSUER.1);
             assert!(files::owner_only(&key).unwrap(), "{}", key.display());
             let pair = KeyPair::from_pkcs8(&mantle_node::secret::read(&key).unwrap()).unwrap();

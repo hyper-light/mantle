@@ -1646,10 +1646,12 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
      `derive::shard_shape`, `node::shard_lanes_bytes`): each native request admitted, its fields
      read, is handed to the shard 6a's rule picks among those `NodeSettings::shards` names past the
      first, passing over one hyper-rt's watchdog sees held past its limit (`Lane::takes`); one a
-     lane refuses runs on the first shard. `process::serve` starts each driving shard's task;
-     `derive::shard_shape` and the memory floor count it and its lanes. Tested: requests spread by
-     the count, one a lane refuses runs on the first, and the cluster suite over two shards serves
-     its PUTs and GETs so.
+     lane refuses runs on the first shard, its place in the count moved there. `process::serve`
+     starts each driving shard's task; `derive::shard_shape` and the memory floor count it and its
+     lanes. Tested: requests spread by the count, and one a lane refuses runs on the first, counted
+     there. No node test runs the object host (each opens its nodes with no gateway), so the native
+     suite (`crates/mantle/tests/native.rs`) run under `range_shards = spread` is the end-to-end
+     test, and the ladder the measure.
    - *6g, a far range's commands from the driving shard* (`shard::In::Propose`, `shard::Refusal`,
      `Node::propose_asked`, `Asking`): a command or read of a range this node leads on a shard
      past the first goes from the driving shard to that range's shard on its command lane, its

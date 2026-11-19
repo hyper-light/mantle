@@ -389,10 +389,15 @@ measures the second, and derives the rest by these rules:
   allocator at a chunk each share than at its floor: 33,116 allocations and 16,163,710 bytes
   against 34,319 and 17,557,473 on macOS aarch64, the datagrams it carries cut from chunks, not
   copied. Every operation's windows hold a chunk, its client's connections' and its pool's, so
-  each operation more costs them: a ladder founder's 32 GiB volume on a 96 GiB host of 32 cores runs 58,965 operations where
-  71,522 ran at QUIC's initial window (36ad012b), the 16 GiB host 10,414 where 13,764, and a
-  founder on CI's 7 GiB runner measuring four deep 27 where 31, the transport 9.47 GB and
-  1.67 GB past its floor on the first two (`derive::tests`). Where what remains past the capacity
+  each operation more costs them: on macOS a ladder founder's 32 GiB volume on a 96 GiB host of 32
+  cores runs 58,965 operations where 71,522 ran at QUIC's initial window (36ad012b), the 16 GiB
+  host 10,414 where 13,764, and a founder on CI's 7 GiB runner measuring four deep 27 where 31,
+  the transport 9.47 GB and 1.67 GB past its floor on the first two (`derive::tests`). On Linux
+  each operation also holds its client's train in a receive's batch, which takes a train from
+  each peer and client at once (recvmmsg(2) with `UDP_GRO`): a 64 KiB buffer of the transport's
+  receive ring and of the plane's socket and its messages' headers, 133,520 bytes
+  (`bounds::ring_growth`, hyper-rt `Io::held_bound`), so the first two run 54,591 and 9,264
+  where macOS runs 59,412 and 10,396 (c1589e30). Where what remains past the capacity
   wants and the operations served holds less than their connections' growth, the operations are
   those served, and each share's window is past the initial one by the part over the shares
   (`bounds::limits`): CI's founder measuring 64 or 256 deep runs ten at the floor. What no
@@ -3070,7 +3075,7 @@ a performance want in rule D's order (§1.4): after the capacity wants and the o
 node serves, whole for the connections those operations open while what remains holds it; then
 each operation more costs its client's windows at a chunk, so every operation's windows hold a
 chunk and its datagrams land without a copy, at fewer operations for it (10,414 where 13,764 at
-the initial window on a 16 GiB host).
+the initial window on a 16 GiB host, macOS; §1.4 gives Linux's).
 Windows past a chunk at a path's bandwidth-delay product wait on the transport: its ceiling is
 fixed when the endpoint is made (`Limits::window_ceiling`), before any round trip is measured, so
 a ceiling past a chunk would be a guess at the path, and a share past the one the budget funds

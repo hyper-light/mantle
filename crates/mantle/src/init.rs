@@ -132,7 +132,10 @@ const LAYERS: [Layer; 5] = [
 
 #[derive(Debug)]
 pub enum Error {
+    /// What init says could not be written to its output.
     Output(std::io::Error),
+    /// A file or directory init reads, looks for or makes, which failed: what was being done.
+    Io(&'static str, std::io::Error),
     /// A founder's statements that do not read: which, and why.
     Founder(String, String),
     /// A machines file's line that does not read: the file, the line and why.
@@ -152,6 +155,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Output(e) => write!(f, "writing output: {e}"),
+            Self::Io(what, e) => write!(f, "{what}: {e}"),
             Self::Founder(spec, why) => write!(f, "the founder {spec:?}: {why}"),
             Self::File(path, line, why) => write!(f, "{}, line {line}: {why}", path.display()),
             Self::Cell(why) => write!(f, "the cell: {why}"),
@@ -168,10 +172,9 @@ impl fmt::Display for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
-    }
+/// An I/O failure named by what init was doing ([`Error::Io`]).
+fn doing(what: &'static str) -> impl Fn(std::io::Error) -> Error {
+    move |e| Error::Io(what, e)
 }
 
 impl From<hyper_block::DiskError> for Error {
@@ -652,7 +655,8 @@ fn profile(
          [profile {PROFILE}]\nregion = {region}\nendpoint_url = {url}\n"
     );
     if url.starts_with("https:") {
-        let absolute = std::path::absolute(&pem)?;
+        let absolute =
+            std::path::absolute(&pem).map_err(doing("naming the endpoint's authority's file"))?;
         let path = absolute
             .to_str()
             .ok_or_else(|| Error::Cell(format!("{} is not UTF-8", absolute.display())))?;
@@ -782,7 +786,7 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Output(e)),
+        Err(e) => return Err(Error::Io("looking in the directory it makes", e)),
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -888,13 +892,14 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
         &authority_dir.join(GRANTS),
         ids.len().to_string().as_bytes(),
     )?;
-    writeln!(said, "cell {authority_name}")?;
+    writeln!(said, "cell {authority_name}").map_err(Error::Output)?;
     writeln!(
         said,
         "authority {}: its keys sign every member's certificate and every S3 endpoint's; keep \
          them",
         authority_dir.display()
-    )?;
+    )
+    .map_err(Error::Output)?;
     let mut first = None;
     for (at, (founder, &id)) in cell.founders.iter().zip(&ids).enumerate() {
         let dir = if one {
@@ -944,7 +949,8 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
             founder.quic,
             founder.plane,
             founder.s3()
-        )?;
+        )
+        .map_err(Error::Output)?;
         first.get_or_insert((founder, dir));
     }
     let s3 = out.join("s3");
@@ -962,7 +968,8 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
         access.account,
         access.id,
         cell.region()
-    )?;
+    )
+    .map_err(Error::Output)?;
     match profile {
         Some(config) => writeln!(
             said,
@@ -970,14 +977,16 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
              AWS_PROFILE={PROFILE}",
             config.display(),
             s3.join("credentials").display()
-        )?,
+        )
+        .map_err(Error::Output)?,
         None => writeln!(
             said,
             "s3 profile {PROFILE}: credentials {} and the endpoint's authority {}; no founder's \
              endpoint has a port and a name init can state, so no config names one",
             s3.join("credentials").display(),
             s3.join("authority.pem").display()
-        )?,
+        )
+        .map_err(Error::Output)?,
     }
     match first {
         Some((founder, dir)) if one => measure(said, founder, &dir),
@@ -985,7 +994,8 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
             writeln!(
                 said,
                 "each founder measures its host and its devices at its first `mantle serve`"
-            )?;
+            )
+            .map_err(Error::Output)?;
             Ok(())
         }
     }
@@ -1012,7 +1022,7 @@ pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Erro
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Output(e)),
+        Err(e) => return Err(Error::Io("looking in the directory it makes", e)),
     }
     let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
     let id = loop {
@@ -1078,7 +1088,8 @@ pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Erro
         "client {id} {}: account {account}, {} nodes",
         out.display(),
         nodes.len()
-    )?;
+    )
+    .map_err(Error::Output)?;
     Ok(())
 }
 
@@ -1125,7 +1136,8 @@ impl Authority {
                     cell.display()
                 ))
             })?;
-        let text = std::fs::read_to_string(authority_dir.join(CELL))?;
+        let text = std::fs::read_to_string(authority_dir.join(CELL))
+            .map_err(doing("reading the cell's file"))?;
         let mut name = None;
         let mut account = None;
         let mut nodes: Vec<(u64, String)> = Vec::new();
@@ -1178,7 +1190,8 @@ impl Authority {
             return Err(Error::Cell("the cell file names no node".into()));
         }
         let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
-        let certificate = std::fs::read(authority_dir.join("authority.der"))?;
+        let certificate = std::fs::read(authority_dir.join("authority.der"))
+            .map_err(doing("reading the cell's authority"))?;
         let key = mantle_node::secret::read(&authority_dir.join("authority.key"))
             .map_err(|e| Error::Cert(e.to_string()))
             .and_then(|pkcs8| KeyPair::from_pkcs8(&pkcs8).map_err(cert))?;
@@ -1207,10 +1220,13 @@ impl Authority {
     /// has one (docs/design/membership.md §5.1).
     fn issuer(&self) -> Result<Option<(Vec<u8>, KeyPair)>, Error> {
         let (certificate, key) = (self.dir.join(ISSUER.0), self.dir.join(ISSUER.1));
-        if !certificate.try_exists()? {
+        if !certificate
+            .try_exists()
+            .map_err(doing("looking for a certificate"))?
+        {
             return Ok(None);
         }
-        let der = std::fs::read(&certificate)?;
+        let der = std::fs::read(&certificate).map_err(doing("reading a certificate"))?;
         let pair = mantle_node::secret::read(&key)
             .map_err(|e| Error::Cert(e.to_string()))
             .and_then(|pkcs8| {
@@ -1265,7 +1281,10 @@ fn keep_issuer(dir: &Path, certificate: &[u8], key: &KeyPair) -> Result<(), Erro
 pub fn issuer(said: &mut impl Write, cell: &Path) -> Result<(), Error> {
     let authority = Authority::read(cell)?;
     let at = authority.dir.join(ISSUER.0);
-    if at.try_exists()? {
+    if at
+        .try_exists()
+        .map_err(doing("looking for the cell's issuer"))?
+    {
         return Err(Error::Cell(format!(
             "{}: the cell has its issuer already, which its authority signs once",
             at.display()
@@ -1283,12 +1302,13 @@ pub fn issuer(said: &mut impl Write, cell: &Path) -> Result<(), Error> {
         said,
         "issuer {}: it signs the certificates of the nodes the cell re-grants; every member keeps          it",
         at.display()
-    )?;
+    ).map_err(Error::Output)?;
     for (id, _) in &authority.nodes {
         let identity = cell.join(format!("node-{id}")).join("identity");
         if identity.join("authority.der").is_file() {
             keep_issuer(&identity, &certificate, &key)?;
-            writeln!(said, "issuer kept by node {id} {}", identity.display())?;
+            writeln!(said, "issuer kept by node {id} {}", identity.display())
+                .map_err(Error::Output)?;
         }
     }
     Ok(())
@@ -1353,7 +1373,7 @@ pub fn pin_gateway(said: &mut impl Write, out: &Path, cell: &Path) -> Result<u64
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Output(e)),
+        Err(e) => return Err(Error::Io("looking in the directory it makes", e)),
     }
     let authority = Authority::read(cell)?;
     let founders = authority.nodes;
@@ -1373,7 +1393,8 @@ pub fn pin_gateway(said: &mut impl Write, out: &Path, cell: &Path) -> Result<u64
             .join(format!("gateway-{id}.der")),
         &certificate,
     )?;
-    let cell_text = std::fs::read_to_string(authority.dir.join(CELL))?;
+    let cell_text = std::fs::read_to_string(authority.dir.join(CELL))
+        .map_err(doing("reading the cell's file"))?;
     files::write(
         &authority.dir.join(CELL),
         format!("{cell_text}gateway = {id}\n").as_bytes(),
@@ -1383,7 +1404,8 @@ pub fn pin_gateway(said: &mut impl Write, out: &Path, cell: &Path) -> Result<u64
         let dir = founder_dir(cell, *founder, founders.len());
         files::write(&dir.join(&pinned), &certificate)?;
         let config = dir.join("config");
-        let mut text = std::fs::read_to_string(&config)?;
+        let mut text =
+            std::fs::read_to_string(&config).map_err(doing("reading a founder's configuration"))?;
         text.push_str(&format!("peer = {id} gateway {pinned}\n"));
         files::write(&config, text.as_bytes())?;
     }
@@ -1392,7 +1414,8 @@ pub fn pin_gateway(said: &mut impl Write, out: &Path, cell: &Path) -> Result<u64
         "gateway {id} {}: pinned by {} founders",
         out.display(),
         founders.len()
-    )?;
+    )
+    .map_err(Error::Output)?;
     Ok(id)
 }
 
@@ -1421,7 +1444,7 @@ pub fn grant(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Output(e)),
+        Err(e) => return Err(Error::Io("looking in the directory it makes", e)),
     }
     let authority = Authority::read(cell)?;
     let (max_nodes, max_volumes) = authority.bounds.ok_or_else(|| {
@@ -1440,7 +1463,8 @@ pub fn grant(
     let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
     // The grant's number, kept before anything is issued under it.
     let grants_file = authority.dir.join(GRANTS);
-    let last: u64 = std::fs::read_to_string(&grants_file)?
+    let last: u64 = std::fs::read_to_string(&grants_file)
+        .map_err(doing("reading the cell's grants"))?
         .trim()
         .parse()
         .map_err(|_| Error::Cell(format!("{}: not a grant's number", grants_file.display())))?;
@@ -1510,7 +1534,8 @@ pub fn grant(
     .find(|path| path.is_file())
     .ok_or_else(|| Error::Cell("no root key beside the authority".into()))?;
     let root_key = mantle_node::secret::read(&root_key).map_err(|e| Error::Cert(e.to_string()))?;
-    let credentials = std::fs::read_to_string(cell.join("s3").join("credentials"))?;
+    let credentials = std::fs::read_to_string(cell.join("s3").join("credentials"))
+        .map_err(doing("reading the cell's S3 credentials"))?;
     let secret = credentials
         .lines()
         .find_map(|line| line.strip_prefix("aws_secret_access_key = "))
@@ -1578,7 +1603,8 @@ pub fn grant(
                 .dir
                 .join("gateways")
                 .join(format!("gateway-{gateway}.der")),
-        )?;
+        )
+        .map_err(doing("reading a gateway's certificate"))?;
         files::write(&out.join(&pinned), &der)?;
         text.push_str(&format!("peer = {gateway} gateway {pinned}\n"));
     }
@@ -1613,7 +1639,8 @@ pub fn grant(
     }
     files::write(&out.join("config"), text.as_bytes())?;
     // The cell file names it, for the grants and the clients after it.
-    let mut cell_text = std::fs::read_to_string(authority.dir.join(CELL))?;
+    let mut cell_text = std::fs::read_to_string(authority.dir.join(CELL))
+        .map_err(doing("reading the cell's file"))?;
     let quic = founder
         .dialed(founder.quic)
         .unwrap_or_else(|| founder.quic.to_string());
@@ -1629,7 +1656,8 @@ pub fn grant(
         founder.quic,
         founder.plane,
         founder.s3()
-    )?;
+    )
+    .map_err(Error::Output)?;
     Ok((id, number))
 }
 
@@ -1643,7 +1671,8 @@ fn measure(said: &mut impl Write, founder: &Founder, dir: &Path) -> Result<(), E
         said,
         "measured this machine: {}",
         dir.join("calibration").display()
-    )?;
+    )
+    .map_err(Error::Output)?;
     let locks = mantle_node::storage::Locks::take(founder.volumes.iter().map(|(d, _)| d.as_path()))
         .map_err(|e| Error::Measure(e.to_string()))?;
     for (volume, _) in &founder.volumes {
@@ -1663,7 +1692,7 @@ fn measure(said: &mut impl Write, founder: &Founder, dir: &Path) -> Result<(), E
             profile.read_bytes,
             profile.read_gap,
             if profile.prewrite { "yes" } else { "no" }
-        )?;
+        ).map_err(Error::Output)?;
     }
     drop(locks);
     Ok(())

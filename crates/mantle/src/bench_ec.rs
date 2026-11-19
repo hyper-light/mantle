@@ -20,6 +20,7 @@ use crate::display;
 
 #[derive(Debug)]
 pub enum Error {
+    /// The benchmark's rows could not be written to its output.
     Output(std::io::Error),
     Ec(EcError),
 }
@@ -30,12 +31,6 @@ impl std::fmt::Display for Error {
             Self::Output(e) => write!(f, "writing output: {e}"),
             Self::Ec(e) => write!(f, "erasure coding: {e}"),
         }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
     }
 }
 
@@ -67,7 +62,8 @@ pub fn ec(
         "most lost",
         "data chunk",
         "parity"
-    )?;
+    )
+    .map_err(Error::Output)?;
     for &(data, parity) in codes {
         let code = Code::new(data, parity)?;
         for &size in sizes {
@@ -107,8 +103,9 @@ pub fn ec(
                 display::rate(read_most),
                 display::rate(repair_data),
                 display::rate(repair_parity),
-            )?;
-            out.flush()?;
+            )
+            .map_err(Error::Output)?;
+            out.flush().map_err(Error::Output)?;
         }
     }
     Ok(())

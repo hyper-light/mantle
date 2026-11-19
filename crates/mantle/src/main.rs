@@ -782,7 +782,8 @@ fn stated_cell(
 ) -> Result<init::Cell, init::Error> {
     let mut cell = match file {
         Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(init::Error::Output)?;
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| init::Error::Io("reading the machines file", e))?;
             init::parse_file(path, &text)?
         }
         None => init::Cell::default(),
@@ -1063,6 +1064,19 @@ fn object_command(command: &Command) -> Option<Result<client::Command, String>> 
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // The descriptors the process may hold, raised to the most it may take before anything opens
+    // one (`mantle_node::descriptors`): a node derives its connections within them, and a bench
+    // checks its clients fit them.
+    if matches!(
+        cli.command,
+        Command::Node { .. }
+            | Command::Serve { .. }
+            | Command::Derive { .. }
+            | Command::Bench { .. }
+    ) && let Err(e) = mantle_node::descriptors::raise()
+    {
+        return exit(Err(format!("the process's descriptors: {e}")));
+    }
     // A node writes its lines through the runtime's own writer thread: this thread holds no
     // lock on standard output for it.
     match &cli.command {

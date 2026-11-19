@@ -55,6 +55,7 @@ const HANDOVER: u64 = 1 << 40;
 
 #[derive(Debug)]
 pub enum Error {
+    /// The benchmark's rows could not be written to its output.
     Output(std::io::Error),
     Put(PutError),
     Get(GetError),
@@ -78,12 +79,6 @@ impl std::fmt::Display for Error {
             Self::Layout(e) => write!(f, "layout: {e}"),
             Self::Unexpected(what) => write!(f, "unexpected: {what}"),
         }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
     }
 }
 
@@ -743,7 +738,8 @@ pub fn gateway(
         out,
         "  {:<10} {:>8} {:>11} {:>7} {:>8} {:>11} {:>7} {:>8} {:>11}",
         "scheme", "object", "PUT", "rounds", "all out", "GET", "rounds", "all out", "GET 1 lost"
-    )?;
+    )
+    .map_err(Error::Output)?;
     let wrapping = WrappingKey::generate()?;
     for &scheme in schemes {
         let layout = Layout::new(scheme)?;
@@ -808,17 +804,19 @@ pub fn gateway(
                 get_rounds,
                 wide_get_rounds,
                 display::rate(lost_rate),
-            )?;
-            out.flush()?;
+            )
+            .map_err(Error::Output)?;
+            out.flush().map_err(Error::Output)?;
         }
     }
     if !loads.is_empty() {
-        writeln!(out)?;
+        writeln!(out).map_err(Error::Output)?;
         writeln!(
             out,
             "  {:<10} {:>8} {:>8} {:>10} {:>11} {:>10} {:>10} {:>10} {:>8}",
             "scheme", "object", "clients", "offered", "PUT", "p50", "p99", "late p99", "threads"
-        )?;
+        )
+        .map_err(Error::Output)?;
     }
     for &load in loads {
         for &scheme in schemes {
@@ -858,13 +856,14 @@ pub fn gateway(
                     display::nanos(c.latency.p99()),
                     display::nanos(c.lateness.p99()),
                     drive::thread_count(),
-                )?;
-                out.flush()?;
+                )
+                .map_err(Error::Output)?;
+                out.flush().map_err(Error::Output)?;
             }
         }
     }
-    writeln!(out)?;
-    writeln!(out, "  completion driver alone     p50        max    runs")?;
+    writeln!(out).map_err(Error::Output)?;
+    writeln!(out, "  completion driver alone     p50        max    runs").map_err(Error::Output)?;
     for parts in [1u16, 1_000, 10_000] {
         let (median, slowest, runs) = times(step, || completion(parts))?;
         writeln!(
@@ -874,7 +873,8 @@ pub fn gateway(
             display::nanos(u64::try_from(median.as_nanos()).unwrap_or(u64::MAX)),
             display::nanos(u64::try_from(slowest.as_nanos()).unwrap_or(u64::MAX)),
             runs
-        )?;
+        )
+        .map_err(Error::Output)?;
     }
     Ok(())
 }

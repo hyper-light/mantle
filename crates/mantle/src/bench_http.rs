@@ -21,6 +21,7 @@ use crate::display;
 
 #[derive(Debug)]
 pub enum Error {
+    /// The benchmark's rows could not be written to its output.
     Output(std::io::Error),
     Http(String),
 }
@@ -31,12 +32,6 @@ impl std::fmt::Display for Error {
             Self::Output(e) => write!(f, "writing output: {e}"),
             Self::Http(e) => write!(f, "the codec: {e}"),
         }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
     }
 }
 
@@ -117,7 +112,8 @@ pub fn http(out: &mut impl Write, step: Duration) -> Result<(), Error> {
         out,
         "  {:<44} {:>10} {:>11} {:>12}",
         "operation", "a second", "each", "head bytes"
-    )?;
+    )
+    .map_err(Error::Output)?;
     let largest = largest();
     for (what, head) in [
         ("parse a PutObject head", PUT),
@@ -211,8 +207,9 @@ fn row(
         display::count(rate),
         format!("{ns:.0} ns"),
         bytes.map_or_else(|| "-".to_owned(), display::rate),
-    )?;
-    out.flush()?;
+    )
+    .map_err(Error::Output)?;
+    out.flush().map_err(Error::Output)?;
     Ok(())
 }
 

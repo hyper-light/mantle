@@ -7,6 +7,7 @@
 //!
 //! - [`client`]: a client of the cell's ranges, asking their leaders to apply entries.
 //! - [`command`]: a command for a range as a client asks it and a node answers it.
+//! - [`descriptors`]: the most descriptors the process may hold, raised at its start and read back.
 //! - [`directory`]: the peers a connection may name, by certificate.
 //! - [`enroll`]: the cell's issuer on a member, and the re-grant the root range's leader signs.
 //! - [`frame`]: a range's Raft message as it travels.
@@ -40,6 +41,7 @@ pub mod chunk;
 pub mod client;
 pub mod command;
 pub mod derive;
+pub mod descriptors;
 pub mod directory;
 pub mod door;
 pub mod enroll;

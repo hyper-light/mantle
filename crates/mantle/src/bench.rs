@@ -62,6 +62,7 @@ use crate::drive;
 
 #[derive(Debug)]
 pub enum Error {
+    /// The benchmark's rows could not be written to its output.
     Output(std::io::Error),
     Disk(hyper_block::DiskError),
     Chunk(ChunkError),
@@ -82,12 +83,6 @@ impl fmt::Display for Error {
             Self::Worker => write!(f, "a benchmark worker stopped unexpectedly"),
             Self::Spawn(e) => write!(f, "starting a benchmark worker: {e}"),
         }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
     }
 }
 
@@ -219,15 +214,15 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
     }
     plan.rate = options.rate;
     plan.segment_size = options.segment_size.and_then(|s| u64::try_from(s).ok());
-    writeln!(out, "{}", path.display())?;
+    writeln!(out, "{}", path.display()).map_err(Error::Output)?;
     // The volume is formatted and read as mantle would here, which the device measurement
     // decides; without one it is not pre-written and reads one at a time.
     let mut prewrite = false;
     let mut reads = Reads::default();
     let mut measured = None;
     if !options.skip_device {
-        writeln!(out, "measuring the device (about 30 s)")?;
-        out.flush()?;
+        writeln!(out, "measuring the device (about 30 s)").map_err(Error::Output)?;
+        out.flush().map_err(Error::Output)?;
         let device = calibrate::calibrate(
             path,
             align,
@@ -235,7 +230,7 @@ pub fn chunk(out: &mut impl Write, path: &Path, options: &Options) -> Result<(),
             &calibrate::Plan::standard(align, id.queue_depth),
         )
         .map_err(Error::Disk)?;
-        report_device(out, &device, &id.file_system.kind)?;
+        report_device(out, &device, &id.file_system.kind).map_err(Error::Output)?;
         prewrite = mantle_disk::profile::prewrite(&id.file_system.kind, &device);
         if let (Some(random), Some(sequential)) = (
             device.random_read_saturation(),
@@ -381,8 +376,9 @@ fn run(
         reads.depth,
         reads.waiting,
         display::capacity(reads.gap)
-    )?;
-    out.flush()?;
+    )
+    .map_err(Error::Output)?;
+    out.flush().map_err(Error::Output)?;
 
     // As many writers as the store's queue admits: what it takes in two batches
     // (Limits::queue_bytes), so none is refused with Busy.
@@ -408,7 +404,8 @@ fn run(
         "  first pass     {} writing {} chunks into blocks never written before",
         display::rate(filled.bytes_per_sec()),
         display::size(fill_size)
-    )?;
+    )
+    .map_err(Error::Output)?;
     let deleters = config.limits.queue_requests().max(1);
     deletes(&v, path, &keys, deleters)?;
 
@@ -416,7 +413,8 @@ fn run(
         out,
         "  each row is the median of a point's rounds, ± the wider side of its 95% interval (–\n  \
          when the rounds are too few or not independent); rounds in two states take a row each"
-    )?;
+    )
+    .map_err(Error::Output)?;
     writeln!(
         out,
         "  {:<14} {:>9} {:>10} {:>12} {:>5} {:>6} {:>10} {:>10} {:>10} {:>8} {:>10}",
@@ -435,7 +433,8 @@ fn run(
         "p99.9",
         "threads",
         "late p99"
-    )?;
+    )
+    .map_err(Error::Output)?;
     let budget = volume / 3;
     let mut point = 1u64;
     for &size in &plan.sizes {
@@ -482,7 +481,8 @@ fn run(
                 writers,
                 size,
                 &put,
-            )?;
+            )
+            .map_err(Error::Output)?;
             if !get.ops_per_sec.is_empty() {
                 rows(
                     out,
@@ -490,12 +490,13 @@ fn run(
                     readers,
                     size,
                     &get,
-                )?;
-                rows(out, "  file layer", readers, size, &direct)?;
+                )
+                .map_err(Error::Output)?;
+                rows(out, "  file layer", readers, size, &direct).map_err(Error::Output)?;
             }
             if !range.ops_per_sec.is_empty() {
                 let name = format!("  {} range", display::size(smallest));
-                rows(out, &name, readers, smallest, &range)?;
+                rows(out, &name, readers, smallest, &range).map_err(Error::Output)?;
             }
         }
     }
@@ -512,7 +513,8 @@ fn run(
         display::nanos(nanos(started.elapsed())),
         report.frames,
         display::capacity(v.log_bytes())
-    )?;
+    )
+    .map_err(Error::Output)?;
     v.close();
     Ok(())
 }

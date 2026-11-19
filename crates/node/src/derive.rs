@@ -37,6 +37,7 @@ use crate::process::{
     Enlisting, GatewayConfig, NativeShards, PeerLine, ProcessConfig, RangeShards, S3Stated,
 };
 use crate::storage::VolumeSettings;
+use mantle_protocol::bounds::CONNECTIONS_PER_PEER;
 use mantle_protocol::classes::Role;
 
 /// focal's election timeout and heartbeat interval in ticks (docs/design/node.md §2.4), which
@@ -179,8 +180,16 @@ pub struct Gateway {
 /// serves first ([`served`]), and as many operations more at the least one holds as the share
 /// then holds; never fewer than the operations served where the share holds them at the least,
 /// the bytes past them its parts', and at least one, its bytes at least the most one operation is
-/// charged ([`most_charged`]), where the share holds less: every operation is admitted alone.
-pub fn operations(share: u64, beside: u64, charges: &Charges, serving: Served) -> (usize, u64) {
+/// charged ([`most_charged`]), where the share holds less: every operation is admitted alone. Never
+/// more than `most`, the operations the process's descriptors hold ([`descriptor_operations`]), at
+/// least one, which [`derive`] refuses to start without.
+pub fn operations(
+    share: u64,
+    beside: u64,
+    charges: &Charges,
+    serving: Served,
+    most: u64,
+) -> (usize, u64) {
     let floor = most_charged(charges);
     let held = serving.bytes.max(floor);
     let each = charges.least().saturating_add(beside).max(1);
@@ -195,7 +204,8 @@ pub fn operations(share: u64, beside: u64, charges: &Charges, serving: Served) -
     let count = by_least
         .min(by_held)
         .max(serving.operations.min(by_least).min(by_floor))
-        .max(1);
+        .max(1)
+        .min(most.max(1));
     let bytes = share
         .saturating_sub(count.saturating_mul(beside))
         .max(floor);
@@ -801,6 +811,15 @@ pub enum DeriveError {
     Measurements { stated: usize, measured: usize },
     #[error("range {group:x}'s store: {why}")]
     Store { group: u128, why: String },
+    #[error(
+        "the process may hold {limit} descriptors, short of the {fixed} the node holds whatever its operations and the {each} each of its {operations} operations holds beside them"
+    )]
+    Descriptors {
+        limit: u64,
+        fixed: u64,
+        each: u64,
+        operations: u64,
+    },
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -1289,6 +1308,205 @@ pub fn liveness_bytes(peers: usize) -> Option<u64> {
         .ok()?
         .checked_add(2)?
         .checked_mul(ring)
+}
+
+/// Standard input, output and error, which every process holds open (POSIX's `STDIN_FILENO`,
+/// `STDOUT_FILENO` and `STDERR_FILENO`; Windows' three standard handles).
+pub const STDIO_DESCRIPTORS: u64 = 3;
+
+/// What one of the runtime's shards holds on Linux: its epoll instance, its kick's eventfd, and the
+/// timerfd it waits on where the kernel has no `epoll_pwait2` (hyper-rt `epoll.rs`, `driver.rs`).
+pub const EPOLL_SHARD_DESCRIPTORS: u64 = 3;
+
+/// What one of the runtime's shards holds on macOS and the BSDs: its kqueue, which its kick is an
+/// `EVFILT_USER` event of (hyper-rt `kqueue.rs`).
+pub const KQUEUE_SHARD_DESCRIPTORS: u64 = 1;
+
+/// What one of the runtime's shards holds on Windows: its completion port and the AFD device its
+/// sockets' readiness comes through (hyper-rt `iocp.rs`, `afd.rs`).
+pub const IOCP_SHARD_DESCRIPTORS: u64 = 2;
+
+/// What one of the runtime's shards holds on this platform ([`EPOLL_SHARD_DESCRIPTORS`],
+/// [`KQUEUE_SHARD_DESCRIPTORS`], [`IOCP_SHARD_DESCRIPTORS`]).
+pub fn shard_descriptors() -> u64 {
+    if cfg!(target_os = "linux") {
+        EPOLL_SHARD_DESCRIPTORS
+    } else if cfg!(windows) {
+        IOCP_SHARD_DESCRIPTORS
+    } else {
+        KQUEUE_SHARD_DESCRIPTORS
+    }
+}
+
+/// What a device's issuer holds on Linux: the eventfd its kernel AIO context's completions ring
+/// (hyper-block `aio/linux.rs`); the context itself is no descriptor (io_setup(2)). Elsewhere a pool
+/// of threads carries its transfers and it holds none.
+pub const AIO_ISSUER_DESCRIPTORS: u64 = 1;
+
+/// What the runtime's signal thread reads the signals it is handed from on Unix, a pipe's two ends
+/// (hyper-rt `signal.rs`).
+pub const SIGNAL_PIPE_DESCRIPTORS: u64 = 2;
+
+/// What a volume holds: its file and its directory's lock, which it keeps (`storage::Locks`,
+/// `Storage::open_locked`).
+pub const VOLUME_DESCRIPTORS: u64 = 2;
+
+/// What the node directory holds: its lock (`Locks::node`), its readiness lock (`Layout::take_live`)
+/// and the log's file (`node::open_log`).
+pub const DIRECTORY_DESCRIPTORS: u64 = 3;
+
+/// What a file the node keeps by replacing it whole holds at once (`files::write`): the temporary,
+/// written, flushed and closed before the rename, then the directory, flushed after it; one
+/// descriptor at a time, one file at a time from the node's task.
+pub const KEEPING_DESCRIPTORS: u64 = 1;
+
+/// What a name lookup holds at once, one at a time (`crate::names`): a socket for each name server
+/// the resolver asks, at most `MAXNS`, 3 (resolv.conf(5)), and a file it reads (`/etc/hosts`,
+/// nsswitch.conf(5)).
+pub const LOOKUP_DESCRIPTORS: u64 = 4;
+
+/// The transport's own sockets: its endpoint's listener (hyper-rt-transport `Driver::bind`) and the
+/// datagram plane's (hyper-rt-transport `plane.rs`).
+pub const TRANSPORT_DESCRIPTORS: u64 = 2;
+
+/// The S3 listener's own beside the connections it serves and answers refused: its listening
+/// socket, and the one connection past both budgets it accepts and closes as it comes
+/// (`listener::Listener::start`).
+pub const LISTENER_DESCRIPTORS: u64 = 2;
+
+/// The descriptors a node holds whatever its operations (node.md §1.4): standard input, output and
+/// error; each of its `shards` shards' poller ([`EPOLL_SHARD_DESCRIPTORS`],
+/// [`KQUEUE_SHARD_DESCRIPTORS`], [`IOCP_SHARD_DESCRIPTORS`]); the signal thread's pipe on Unix; each
+/// of its `volumes` volumes' file and lock, and an issuer of its own on Linux, a volume counted as
+/// a device ([`AIO_ISSUER_DESCRIPTORS`]); the node directory's locks and log; a file kept and a
+/// name looked up at once; each of its `ranges` ranges' store, one file; the transport's endpoint
+/// and plane, and each of its `peers` peers' connections, [`CONNECTIONS_PER_PEER`] of them, each a
+/// socket of its own where the platform lets a connected socket share the endpoint's port
+/// (hyper-rt-transport's driver, "a socket for each peer"); and, where it serves S3 (`listening`),
+/// the listener's own socket, the connections it answers refused ([`crate::listener::REFUSING`])
+/// and the one it closes as it comes. `None` past a `u64`.
+pub fn fixed_descriptors(
+    shards: usize,
+    volumes: usize,
+    ranges: usize,
+    peers: usize,
+    listening: bool,
+) -> Option<u64> {
+    let shard = shard_descriptors();
+    let issuer = if cfg!(target_os = "linux") {
+        AIO_ISSUER_DESCRIPTORS
+    } else {
+        0
+    };
+    let signals = if cfg!(unix) {
+        SIGNAL_PIPE_DESCRIPTORS
+    } else {
+        0
+    };
+    let listener = if listening {
+        LISTENER_DESCRIPTORS.checked_add(crate::listener::REFUSING)?
+    } else {
+        0
+    };
+    let peer_sockets = u64::try_from(peers.max(1))
+        .ok()?
+        .checked_mul(u64::try_from(CONNECTIONS_PER_PEER).ok()?)?;
+    STDIO_DESCRIPTORS
+        .checked_add(u64::try_from(shards).ok()?.checked_mul(shard)?)?
+        .checked_add(signals)?
+        .checked_add(
+            u64::try_from(volumes)
+                .ok()?
+                .checked_mul(VOLUME_DESCRIPTORS.checked_add(issuer)?)?,
+        )?
+        .checked_add(DIRECTORY_DESCRIPTORS)?
+        .checked_add(KEEPING_DESCRIPTORS)?
+        .checked_add(LOOKUP_DESCRIPTORS)?
+        .checked_add(u64::try_from(ranges).ok()?)?
+        .checked_add(TRANSPORT_DESCRIPTORS)?
+        .checked_add(peer_sockets)?
+        .checked_add(listener)
+}
+
+/// The descriptors one operation holds at most: its native client's connections, as many as a
+/// peer's ([`CONNECTIONS_PER_PEER`]), each a socket of its own ([`fixed_descriptors`]), the node
+/// admitting a client for each operation ([`gateway`]); and where the node serves S3
+/// (`listening`), the listener's connection, one for each operation (`listener::Settings`).
+pub fn operation_descriptors(listening: bool) -> Option<u64> {
+    let native = u64::try_from(CONNECTIONS_PER_PEER).ok()?;
+    if listening {
+        native.checked_add(1)
+    } else {
+        Some(native)
+    }
+}
+
+/// The cell's nodes and the gateways a node pins, from its `peers` lines, its `seeds` and its
+/// cell's bound on nodes where it states one: the nodes its lines name and itself, or the bound
+/// where more; the transport's peers are the nodes but itself and the gateways. `None` past a
+/// `usize`.
+pub fn cell_lines(
+    peers: &[PeerLine],
+    seeds: usize,
+    enlist: Option<&Enlisting>,
+) -> Option<(usize, usize)> {
+    let node_lines = peers
+        .iter()
+        .filter(|p| p.role == Role::Node)
+        .count()
+        .checked_add(seeds)?
+        .checked_add(1)?;
+    let cell_nodes = enlist
+        .and_then(|e| usize::try_from(e.max_nodes).ok())
+        .unwrap_or(0)
+        .max(node_lines);
+    let gateway_lines = peers.iter().filter(|p| p.role != Role::Node).count();
+    Some((cell_nodes, gateway_lines))
+}
+
+/// Whether a node of `shards` shards, `volumes` volumes, `ranges` ranges and the peers its `peers`
+/// lines, `seeds` and `enlist` make ([`cell_lines`]), serving S3 or not (`listening`), holds its
+/// `operations` within `limit` descriptors: the descriptors it holds at its most, or the refusal
+/// naming them. `mantle node` runs the numbers it is told, so its start checks them here, as
+/// `mantle serve` derives none past them ([`derive`]).
+pub fn within_descriptors(
+    limit: u64,
+    (shards, volumes, ranges): (usize, usize, usize),
+    (peers, seeds, enlist): (&[PeerLine], usize, Option<&Enlisting>),
+    listening: bool,
+    operations: usize,
+) -> Result<u64, DeriveError> {
+    let overflow = DeriveError::Overflow("the node's descriptors");
+    let (cell_nodes, gateway_lines) = cell_lines(peers, seeds, enlist).ok_or(overflow)?;
+    let transport_peers = cell_nodes
+        .saturating_sub(1)
+        .checked_add(gateway_lines)
+        .ok_or(DeriveError::Overflow("the transport's peers"))?;
+    let fixed = fixed_descriptors(shards, volumes, ranges, transport_peers, listening)
+        .ok_or(DeriveError::Overflow("the node's descriptors"))?;
+    let each = operation_descriptors(listening)
+        .ok_or(DeriveError::Overflow("an operation's descriptors"))?;
+    let operations =
+        u64::try_from(operations).map_err(|_| DeriveError::Overflow("the operations"))?;
+    let held = each
+        .checked_mul(operations)
+        .and_then(|held| held.checked_add(fixed))
+        .ok_or(DeriveError::Overflow("the node's descriptors"))?;
+    if held > limit {
+        return Err(DeriveError::Descriptors {
+            limit,
+            fixed,
+            each,
+            operations,
+        });
+    }
+    Ok(held)
+}
+
+/// The operations a process that may hold `limit` descriptors holds past the `fixed` its node
+/// holds whatever its operations, each holding `each`.
+pub fn descriptor_operations(limit: u64, fixed: u64, each: u64) -> u64 {
+    limit.saturating_sub(fixed).checked_div(each).unwrap_or(0)
 }
 
 /// The threads a node starts beside the process's own, which waits for it to end: its own, which
@@ -1814,6 +2032,9 @@ pub struct Measured {
     pub meta: Device,
     /// Each volume's device, in the volumes' order.
     pub volumes: Vec<VolumeFacts>,
+    /// The most descriptors the process may hold open at once, raised at its start and read back
+    /// (`crate::descriptors`).
+    pub descriptors: u64,
 }
 
 /// A volume's bytes as its `volume` line states them (docs/design/membership.md §3.1).
@@ -2062,21 +2283,9 @@ pub fn derive(
 
     // The cell's identities: its nodes, as many as it states it holds where it states it, else this
     // one and the nodes its lines name, and the gateways it pins (docs/design/membership.md §9).
-    let node_lines = stated
-        .peers
-        .iter()
-        .filter(|p| p.role == Role::Node)
-        .count()
-        .checked_add(stated.seeds.len())
-        .and_then(|n| n.checked_add(1))
-        .ok_or(overflow("the cell's nodes"))?;
-    let cell_nodes = stated
-        .enlist
-        .as_ref()
-        .and_then(|e| usize::try_from(e.max_nodes).ok())
-        .unwrap_or(0)
-        .max(node_lines);
-    let gateway_lines = stated.peers.iter().filter(|p| p.role != Role::Node).count();
+    let (cell_nodes, gateway_lines) =
+        cell_lines(&stated.peers, stated.seeds.len(), stated.enlist.as_ref())
+            .ok_or(overflow("the cell's nodes"))?;
     let identities = cell_nodes
         .checked_add(gateway_lines)
         .and_then(|n| u64::try_from(n).ok())
@@ -2186,6 +2395,33 @@ pub fn derive(
         })
         .collect();
     let messages = messages()?;
+    // The transport's peers: the cell's other nodes and the gateways it pins.
+    let transport_peers = cell_nodes
+        .saturating_sub(1)
+        .checked_add(gateway_lines)
+        .ok_or(overflow("the transport's peers"))?;
+    // The descriptors: what the node holds whatever its operations, and what each holds beside,
+    // within the process's limit (node.md §1.4).
+    let listening = hosts && stated.s3.is_some();
+    let fixed_held = fixed_descriptors(
+        measured.cores,
+        stated.volumes.len(),
+        ranges,
+        transport_peers,
+        listening,
+    )
+    .ok_or(overflow("the node's descriptors"))?;
+    let each_held =
+        operation_descriptors(listening).ok_or(overflow("an operation's descriptors"))?;
+    let by_descriptors = descriptor_operations(measured.descriptors, fixed_held, each_held);
+    if measured.descriptors < fixed_held || (hosts && by_descriptors == 0) {
+        return Err(DeriveError::Descriptors {
+            limit: measured.descriptors,
+            fixed: fixed_held,
+            each: each_held,
+            operations: u64::from(hosts),
+        });
+    }
     // The shards the node places its ranges over, which its runtime's shards are sized for.
     let (range_shards, range_shards_why) = match stated.range_shards {
         Some(shards) => (shards, Kind::Stated),
@@ -2222,10 +2458,7 @@ pub fn derive(
         };
         let clients = if hosts { gateway.clients } else { 0 };
         let mut bounds = mantle_protocol::bounds::Stated {
-            peers: cell_nodes
-                .saturating_sub(1)
-                .checked_add(gateway_lines)
-                .ok_or(overflow("the transport's peers"))?,
+            peers: transport_peers,
             // A range's messages go to the cell's other nodes alone (`Node::send`).
             replicas: cell_nodes.saturating_sub(1),
             clients,
@@ -2554,10 +2787,25 @@ pub fn derive(
             .checked_add(each)
             .and_then(|share| share.checked_add(slack))
             .ok_or(overflow("the operations' share"))?;
-        let (objects, bytes) = operations(share, each, &charges, serving);
+        let (by_memory, _) = operations(share, each, &charges, serving, u64::MAX);
+        let (objects, bytes) = operations(share, each, &charges, serving, by_descriptors);
         let native = native(&charges, each).ok_or(overflow("a native operation's bound"))?;
+        say_descriptors(
+            &mut said,
+            measured.descriptors,
+            (fixed_held, each_held),
+            by_descriptors,
+            objects < by_memory,
+        );
         (objects, bytes, Some(native))
     } else {
+        say_descriptors(
+            &mut said,
+            measured.descriptors,
+            (fixed_held, each_held),
+            0,
+            false,
+        );
         (0, 0, None)
     };
     let gateway = gateway(objects, objects_bytes)?;
@@ -3360,6 +3608,48 @@ fn say_objects(
             "S3's eleven nines a year, applied to each block (durability.md §1)",
         );
     }
+}
+
+/// The process's descriptor limit, what the node holds whatever its operations and what each holds
+/// beside, and the operations the rest holds: `bound` where they bind `gateway.objects`, fewer than
+/// the memory holds.
+fn say_descriptors(said: &mut Said, limit: u64, (fixed, each): (u64, u64), most: u64, binds: bool) {
+    said.add(
+        "descriptors.limit",
+        limit,
+        Kind::Measured,
+        "the most descriptors the process may hold open, its soft RLIMIT_NOFILE raised to the hard \
+         limit at its start and read back, on macOS at most kern.maxfilesperproc; Windows' 2^24 \
+         handles a process (crate::descriptors)",
+    );
+    said.add(
+        "descriptors.fixed",
+        fixed,
+        Kind::Derived,
+        "what the node holds whatever its operations: stdio, each shard's poller, the signal pipe, \
+         each volume's file, lock and issuer, the directory's locks and log, a file kept and a \
+         name looked up at once, each range's store, the transport's endpoint and plane and two \
+         sockets a peer, and the S3 listener's own and its refusals' (derive::fixed_descriptors)",
+    );
+    said.add(
+        "descriptors.each",
+        each,
+        Kind::Derived,
+        "what one operation holds beside: its native client's two connections, a socket each, and \
+         its S3 connection where the node serves S3 (derive::operation_descriptors)",
+    );
+    said.add(
+        "descriptors.operations",
+        most,
+        if binds { Kind::Bound } else { Kind::Derived },
+        if binds {
+            "the operations the descriptors past the fixed hold, fewer than the memory holds: they \
+             bound gateway.objects, the S3 listener's connections and the native clients"
+        } else {
+            "the operations the descriptors past the fixed hold, none fewer than the memory holds: \
+             gateway.objects is the memory's"
+        },
+    );
 }
 
 fn say_native(said: &mut Said, native: u64) {
@@ -4545,19 +4835,19 @@ mod tests {
             operations: 1,
             bytes: most,
         };
-        let (count, bytes) = operations(share, beside, &charges, one);
+        let (count, bytes) = operations(share, beside, &charges, one, u64::MAX);
         let count = u64::try_from(count).unwrap();
         assert_eq!(count, share / (charges.least() + beside));
         assert_eq!(bytes, share - count * beside);
         assert!(bytes >= most && bytes >= count * charges.least());
-        assert_eq!(operations(1, beside, &charges, one), (1, most));
+        assert_eq!(operations(1, beside, &charges, one, u64::MAX), (1, most));
         // Bytes held for what the node serves come first, the operations past them each at the
         // least.
         let held = Served {
             operations: 10,
             bytes: share / 2,
         };
-        let (count, bytes) = operations(share, beside, &charges, held);
+        let (count, bytes) = operations(share, beside, &charges, held, u64::MAX);
         let count = u64::try_from(count).unwrap();
         assert!(bytes >= held.bytes, "{bytes} of {}", held.bytes);
         assert_eq!(count, (share - held.bytes) / beside);
@@ -4567,7 +4857,7 @@ mod tests {
             operations: 10,
             bytes: share * 2,
         };
-        let (count, bytes) = operations(share, beside, &charges, short);
+        let (count, bytes) = operations(share, beside, &charges, short, u64::MAX);
         assert_eq!(count, 10);
         assert_eq!(bytes, share - 10 * beside);
         let g = gateway(7, 9).unwrap();
@@ -5040,6 +5330,7 @@ mod tests {
                     formatted: None,
                 })
                 .collect(),
+            descriptors: 1 << 20,
         }
     }
 
@@ -5805,6 +6096,142 @@ mod tests {
         }
         let short = derive(s3(Some(need - 1)), &deep(316, 316), &mut fresh).unwrap();
         assert_eq!(said_bytes(&short, "volume.1.index_bytes"), index_want);
+    }
+
+    /// Where the process's descriptors past those the node holds whatever its operations hold fewer
+    /// operations than its memory does, they bind, and the node says so: it runs as many as they
+    /// hold, its S3 listener serves as many connections and it admits as many native clients, the
+    /// descriptors it holds at its most within the limit. Where its memory holds fewer, the
+    /// descriptors change nothing. A limit short of the fixed descriptors and one operation's
+    /// refuses the start.
+    #[test]
+    fn the_descriptor_limit_bounds_the_operations_where_it_is_the_smaller() {
+        let s3 = Stated {
+            s3: Some(crate::process::S3Stated {
+                listen: "127.0.0.1:7480".parse().unwrap(),
+                region: "us-east-1".into(),
+                names: Vec::new(),
+                certificate: at("/node/s3/cert.der"),
+                key: at("/node/s3/key.der"),
+                access: Vec::new(),
+            }),
+            ..stated(1)
+        };
+        let kind = |derived: &Derived| {
+            derived
+                .bases
+                .iter()
+                .find(|b| b.key == "descriptors.operations")
+                .unwrap()
+                .kind
+        };
+        let roomy = derive(s3.clone(), &facts(1), &mut fresh).unwrap();
+        let by_memory = said_bytes(&roomy, "gateway.objects");
+        let fixed = said_bytes(&roomy, "descriptors.fixed");
+        let each = said_bytes(&roomy, "descriptors.each");
+        assert_eq!(
+            each, 3,
+            "a native client's two sockets and an S3 connection"
+        );
+        assert!(by_memory >= 2, "{by_memory} operations");
+        assert_eq!(kind(&roomy), Kind::Derived);
+        assert!(said_bytes(&roomy, "descriptors.operations") >= by_memory);
+
+        let most = by_memory / 2;
+        let limit = fixed + each * most + (each - 1);
+        let bound = derive(
+            s3.clone(),
+            &Measured {
+                descriptors: limit,
+                ..facts(1)
+            },
+            &mut fresh,
+        )
+        .unwrap();
+        assert_eq!(said_bytes(&bound, "descriptors.limit"), limit);
+        assert_eq!(said_bytes(&bound, "descriptors.operations"), most);
+        assert_eq!(said_bytes(&bound, "gateway.objects"), most);
+        assert_eq!(kind(&bound), Kind::Bound);
+        let gateway = bound.config.gateway.as_ref().unwrap();
+        assert_eq!(u64::try_from(gateway.clients).unwrap(), most);
+        assert!(fixed + each * u64::try_from(gateway.objects).unwrap() <= limit);
+
+        let short = Measured {
+            descriptors: fixed + each - 1,
+            ..facts(1)
+        };
+        assert!(matches!(
+            derive(s3, &short, &mut fresh),
+            Err(DeriveError::Descriptors { .. })
+        ));
+    }
+
+    /// `mantle node` runs the operations it is told: within the limit its start says the
+    /// descriptors they take, past it the start is refused, naming them; `derive`'s own bound is
+    /// within it at its limit.
+    #[test]
+    fn a_told_node_past_its_descriptors_is_refused() {
+        let s3 = Stated {
+            s3: Some(crate::process::S3Stated {
+                listen: "127.0.0.1:7480".parse().unwrap(),
+                region: "us-east-1".into(),
+                names: Vec::new(),
+                certificate: at("/node/s3/cert.der"),
+                key: at("/node/s3/key.der"),
+                access: Vec::new(),
+            }),
+            ..stated(1)
+        };
+        let measured = Measured {
+            descriptors: 1_024,
+            ..facts(1)
+        };
+        let derived = derive(s3.clone(), &measured, &mut fresh).unwrap();
+        let objects = derived.config.gateway.as_ref().unwrap().objects;
+        let check = |operations| {
+            within_descriptors(
+                1_024,
+                (measured.cores, s3.volumes.len(), s3.ranges.len()),
+                (&s3.peers, s3.seeds.len(), s3.enlist.as_ref()),
+                true,
+                operations,
+            )
+        };
+        let held = check(objects).unwrap();
+        assert!(held <= 1_024, "{held}");
+        assert_eq!(
+            held,
+            said_bytes(&derived, "descriptors.fixed")
+                + said_bytes(&derived, "descriptors.each") * u64::try_from(objects).unwrap()
+        );
+        let past = usize::try_from(said_bytes(&derived, "descriptors.operations")).unwrap() + 1;
+        match check(past) {
+            Err(DeriveError::Descriptors {
+                limit, operations, ..
+            }) => assert_eq!((limit, operations), (1_024, u64::try_from(past).unwrap())),
+            other => panic!("{past} operations within 1,024 descriptors: {other:?}"),
+        }
+    }
+
+    /// A node holds a fixed descriptor for each shard's poller, volume and range more, and its
+    /// peers' sockets, two a peer; its S3 listener adds its own socket, its refusals' and the one
+    /// it closes as it comes, and each operation one connection.
+    #[test]
+    fn the_fixed_descriptors_grow_with_what_the_node_holds() {
+        let base = fixed_descriptors(1, 1, 1, 1, false).unwrap();
+        let shard = fixed_descriptors(2, 1, 1, 1, false).unwrap() - base;
+        assert!((1..=3).contains(&shard), "{shard} a shard");
+        assert!(fixed_descriptors(1, 2, 1, 1, false).unwrap() - base >= VOLUME_DESCRIPTORS);
+        assert_eq!(fixed_descriptors(1, 1, 2, 1, false).unwrap() - base, 1);
+        assert_eq!(fixed_descriptors(1, 1, 1, 2, false).unwrap() - base, 2);
+        assert_eq!(
+            fixed_descriptors(1, 1, 1, 1, true).unwrap() - base,
+            LISTENER_DESCRIPTORS + crate::listener::REFUSING
+        );
+        assert_eq!(operation_descriptors(false), Some(2));
+        assert_eq!(operation_descriptors(true), Some(3));
+        assert_eq!(descriptor_operations(1_024, 100, 3), 308);
+        assert_eq!(descriptor_operations(99, 100, 3), 0);
     }
 
     /// The floor's allowance is a stated ceiling where one is: the node refuses one past what the OS

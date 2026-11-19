@@ -41,7 +41,8 @@ pub struct Groups {
 impl Groups {
     /// The groups a founder's configuration at `config` names.
     pub fn read(config: &Path) -> Result<Self, TransferError> {
-        let text = std::fs::read_to_string(config)?;
+        let text = std::fs::read_to_string(config)
+            .map_err(super::doing("reading a founder's configuration"))?;
         let (mut root, mut name, mut file, mut block) = (None, None, None, None);
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -125,14 +126,16 @@ impl Gateway {
     /// its identity in the cell's [`GATEWAY`], its reader bound at `bind`.
     pub fn open(cell: &Path, bind: SocketAddr) -> Result<Self, TransferError> {
         let dir = cell.join(GATEWAY);
-        let config = std::fs::read_to_string(dir.join("config"))?;
+        let config = std::fs::read_to_string(dir.join("config"))
+            .map_err(super::doing("reading the gateway's configuration"))?;
         let id = config
             .lines()
             .find_map(|line| line.strip_prefix("id = "))
             .and_then(|id| id.trim().parse().ok())
             .ok_or_else(|| unread("the gateway's id"))?;
         let identity = dir.join("identity");
-        let certificate = std::fs::read(identity.join("gateway.der"))?;
+        let certificate = std::fs::read(identity.join("gateway.der"))
+            .map_err(super::doing("reading the gateway's certificate"))?;
         let key = mantle_node::secret::read(&identity.join("gateway.key"))
             .map_err(|e| unread(&e.to_string()))?;
         let nodes = crate::init::Authority::read(cell)
@@ -145,11 +148,15 @@ impl Gateway {
             let at = crate::init::founder_dir(cell, *founder, nodes.len());
             founders.push((
                 *founder,
-                std::fs::read(at.join("identity").join("node.der"))?,
+                std::fs::read(at.join("identity").join("node.der"))
+                    .map_err(super::doing("reading a node's certificate"))?,
             ));
             if groups.is_none() {
                 groups = Some(Groups::read(&at.join("config"))?);
-                authority = Some(std::fs::read(at.join("identity").join("authority.der"))?);
+                authority = Some(
+                    std::fs::read(at.join("identity").join("authority.der"))
+                        .map_err(super::doing("reading the cell's authority"))?,
+                );
             }
         }
         Ok(Self {

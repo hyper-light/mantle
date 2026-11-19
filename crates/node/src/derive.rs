@@ -4597,8 +4597,10 @@ mod tests {
     /// each operation's windows held a chunk: the floor at the operations served and the
     /// capacity wants, which the transport's growth and the operations past those never raise.
     /// Its floor counts the lanes of the shards its ranges are placed over, its first alone
-    /// (5f3839f2): 291,834,348 bytes less than at every one of its 32 shards.
-    const NEED_96_GIB: u64 = 13_714_099_022;
+    /// (5f3839f2): 291,834,348 bytes less than at every one of its 32 shards. A connection's state
+    /// holds its lanes' unsent bytes by rank since hyper-transport kept them as sums
+    /// (`lane::Unsent`, vendor/UPSTREAM.md): 1,248 bytes more over the connections it counts.
+    const NEED_96_GIB: u64 = 13_714_100_270;
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
     /// as they were before the caches were wants: a founder of the membership suite's cell holds

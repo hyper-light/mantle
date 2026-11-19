@@ -116,13 +116,66 @@ impl Reservation {
     }
 }
 
+/// The classes the spare buffers are kept in: a buffer's capacity in sixty-fourths of its power of
+/// two, TLSF's two-level index (Masmano, Ripoll, Crespo and Real, "TLSF: a New Dynamic Memory
+/// Allocator for Real-Time Systems", ECRTS 2004, §3), so the class a size is in, and the first class
+/// past it that holds a buffer, are each found in constant time. A power of two's classes are the
+/// bits of one word of the occupancy map.
+const CLASS_BITS: u32 = u64::BITS.trailing_zeros();
+/// The classes of one power of two: one word's bits.
+const PER_POWER: usize = 1 << CLASS_BITS;
+/// Every class: a word's for each of a `usize`'s powers of two.
+const CLASSES: usize = PER_POWER << CLASS_BITS;
+/// The occupancy map's words, a bit for each class.
+const WORDS: usize = CLASSES / PER_POWER;
+/// The end of a list of slots: above every slot, there being fewer than `u32::MAX`.
+const NONE: u32 = u32::MAX;
+
+/// The class of a buffer of `capacity` bytes: below [`PER_POWER`], its capacity; from it, the power
+/// of two it is in and the sixty-fourth of it. A larger capacity is in the same class or a later
+/// one, so a buffer of a later class than a size's holds that size.
+fn class(capacity: usize) -> usize {
+    if capacity < PER_POWER {
+        return capacity;
+    }
+    let power = usize::BITS
+        .saturating_sub(1)
+        .saturating_sub(capacity.leading_zeros());
+    let part = capacity
+        .checked_shr(power.saturating_sub(CLASS_BITS))
+        .unwrap_or(0)
+        % PER_POWER;
+    usize::try_from(power)
+        .unwrap_or(0)
+        .saturating_mul(PER_POWER)
+        .saturating_add(part)
+        .min(CLASSES.saturating_sub(1))
+}
+
 /// A budget of a fixed number of bytes, recycling the buffers it hands out: the accountant the
 /// tests, the benchmarks and a single process use. Reservations past `capacity` are refused.
+///
+/// A reservation takes the spare buffer last given back of its size's class if that holds it, else
+/// one of the first later class holding any, else the largest class's, grown: constant time
+/// whatever the spares number. mantle: it searched every spare buffer for the smallest that held
+/// the grant, and a node keeps one for each peer and client it may serve, so a range leader's first
+/// shard spent 6.7% of itself in the search (2026-11-19, vendor/UPSTREAM.md).
 #[derive(Debug)]
 pub struct Fixed {
     capacity: u64,
     used: u64,
-    spare: Vec<Vec<u8>>,
+    /// The spare buffers, each in a slot: at most `max_spare` slots.
+    slots: Vec<Vec<u8>>,
+    /// Each slot's next: in its class's list while it holds a buffer, in the free slots' after.
+    next: Vec<u32>,
+    /// Each class's last given back, [`CLASSES`] of them.
+    heads: Vec<u32>,
+    /// Which classes hold a buffer.
+    occupied: [u64; WORDS],
+    /// The first slot holding no buffer.
+    free: u32,
+    /// The spare buffers held.
+    spare: usize,
     max_spare: usize,
     refused: u64,
 }
@@ -133,7 +186,12 @@ impl Fixed {
         Self {
             capacity,
             used: 0,
-            spare: Vec::with_capacity(max_spare),
+            slots: Vec::new(),
+            next: Vec::new(),
+            heads: vec![NONE; CLASSES],
+            occupied: [0; WORDS],
+            free: NONE,
+            spare: 0,
             max_spare,
             refused: 0,
         }
@@ -145,6 +203,121 @@ impl Fixed {
     /// The reservations refused so far.
     pub fn refused(&self) -> u64 {
         self.refused
+    }
+
+    fn mark(&mut self, class: usize, held: bool) {
+        let bit = 1u64
+            .checked_shl(u32::try_from(class % PER_POWER).unwrap_or(0))
+            .unwrap_or(0);
+        if let Some(word) = self.occupied.get_mut(class / PER_POWER) {
+            if held {
+                *word |= bit;
+            } else {
+                *word &= !bit;
+            }
+        }
+    }
+
+    /// The first class from `from` on that holds a buffer.
+    fn first_from(&self, from: usize) -> Option<usize> {
+        let mut mask = u64::MAX
+            .checked_shl(u32::try_from(from % PER_POWER).unwrap_or(0))
+            .unwrap_or(0);
+        for word in from / PER_POWER..WORDS {
+            let bits = self.occupied.get(word)? & mask;
+            if bits != 0 {
+                let bit = usize::try_from(bits.trailing_zeros()).ok()?;
+                return word.checked_mul(PER_POWER)?.checked_add(bit);
+            }
+            mask = u64::MAX;
+        }
+        None
+    }
+
+    /// The last class up to `to` that holds a buffer.
+    fn last_to(&self, to: usize) -> Option<usize> {
+        let top = to.min(CLASSES.saturating_sub(1));
+        let highest = u64::BITS.saturating_sub(1);
+        let below = highest.saturating_sub(u32::try_from(top % PER_POWER).unwrap_or(highest));
+        let mut mask = u64::MAX.checked_shr(below).unwrap_or(0);
+        for word in (0..=top / PER_POWER).rev() {
+            let bits = self.occupied.get(word)? & mask;
+            if bits != 0 {
+                let bit = usize::try_from(highest.saturating_sub(bits.leading_zeros())).ok()?;
+                return word.checked_mul(PER_POWER)?.checked_add(bit);
+            }
+            mask = u64::MAX;
+        }
+        None
+    }
+
+    /// Whether the buffer class `class` gives next holds `wanted` bytes.
+    fn head_holds(&self, class: usize, wanted: usize) -> bool {
+        self.heads
+            .get(class)
+            .and_then(|slot| usize::try_from(*slot).ok())
+            .and_then(|slot| self.slots.get(slot))
+            .is_some_and(|buffer| buffer.capacity() >= wanted)
+    }
+
+    /// The buffer class `class` gives next, out of its list.
+    fn take(&mut self, class: usize) -> Option<Vec<u8>> {
+        let slot = *self.heads.get(class)?;
+        let at = usize::try_from(slot).ok()?;
+        let buffer = std::mem::take(self.slots.get_mut(at)?);
+        let next = std::mem::replace(self.next.get_mut(at)?, self.free);
+        self.free = slot;
+        if let Some(head) = self.heads.get_mut(class) {
+            *head = next;
+        }
+        if next == NONE {
+            self.mark(class, false);
+        }
+        self.spare = self.spare.saturating_sub(1);
+        Some(buffer)
+    }
+
+    /// Keeps `buffer` for reuse, first in its class's list, if fewer than `max_spare` are kept.
+    fn keep(&mut self, buffer: Vec<u8>) {
+        if buffer.capacity() == 0 || self.spare >= self.max_spare {
+            return;
+        }
+        let class = class(buffer.capacity());
+        let Some(head) = self.heads.get(class).copied() else {
+            return;
+        };
+        let slot = if self.free == NONE {
+            let Some(slot) = u32::try_from(self.slots.len())
+                .ok()
+                .filter(|slot| *slot != NONE)
+            else {
+                return;
+            };
+            if self.slots.try_reserve(1).is_err() || self.next.try_reserve(1).is_err() {
+                return;
+            }
+            self.slots.push(Vec::new());
+            self.next.push(NONE);
+            slot
+        } else {
+            self.free
+        };
+        let Some(at) = usize::try_from(slot).ok() else {
+            return;
+        };
+        let (Some(place), Some(link)) = (self.slots.get_mut(at), self.next.get_mut(at)) else {
+            return;
+        };
+        if slot == self.free {
+            self.free = *link;
+        }
+        *place = buffer;
+        *link = head;
+        if let Some(first) = self.heads.get_mut(class) {
+            *first = slot;
+        }
+        self.mark(class, true);
+        self.spare = self.spare.saturating_add(1);
     }
 }
 
@@ -163,23 +336,17 @@ impl<K> Budget<K> for Fixed {
         let buffer = match lane {
             Lane::Window => Vec::new(),
             Lane::Class(_) => {
-                // The smallest spare that holds the grant, or else the largest: a buffer that
-                // already holds it is never grown.
-                let fits = (0..self.spare.len())
-                    .filter(|at| {
-                        self.spare
-                            .get(*at)
-                            .is_some_and(|spare| spare.capacity() >= wanted)
-                    })
-                    .min_by_key(|at| self.spare.get(*at).map_or(usize::MAX, Vec::capacity));
-                let largest = || {
-                    (0..self.spare.len())
-                        .max_by_key(|at| self.spare.get(*at).map_or(0, Vec::capacity))
+                // The last given back of its class if it holds the grant, else one of the first
+                // later class, which does, else the largest class's: a buffer that already holds
+                // the grant is never grown.
+                let at = class(wanted);
+                let from = if self.head_holds(at, wanted) {
+                    Some(at)
+                } else {
+                    self.first_from(at.saturating_add(1))
+                        .or_else(|| self.last_to(at))
                 };
-                let mut buffer = fits
-                    .or_else(largest)
-                    .map(|at| self.spare.swap_remove(at))
-                    .unwrap_or_default();
+                let mut buffer = from.and_then(|from| self.take(from)).unwrap_or_default();
                 buffer.clear();
                 buffer.reserve_exact(wanted);
                 buffer
@@ -190,10 +357,7 @@ impl<K> Budget<K> for Fixed {
 
     fn release(&mut self, reservation: Reservation) {
         self.used = self.used.saturating_sub(reservation.granted);
-        let buffer = reservation.into_buffer();
-        if buffer.capacity() > 0 && self.spare.len() < self.max_spare {
-            self.spare.push(buffer);
-        }
+        self.keep(reservation.into_buffer());
     }
 }
 
@@ -217,6 +381,74 @@ mod tests {
         assert_eq!(second.bytes().as_ptr(), pointer, "the buffer was reused");
         let window = Budget::<()>::reserve(&mut budget, 60, Lane::Window).unwrap();
         assert_eq!((window.granted(), window.room()), (60, 60));
+    }
+
+    /// A reservation takes a spare buffer that holds it without growing one, and of the smallest
+    /// class that holds it: the spares of other classes are not visited.
+    #[test]
+    fn a_reservation_takes_a_spare_of_the_first_class_that_holds_it() {
+        let mut budget = Fixed::new(1 << 30, 8);
+        let reserve = |budget: &mut Fixed, bytes: u64| {
+            Budget::<()>::reserve(budget, bytes, Lane::Class(())).unwrap()
+        };
+        let made: Vec<Reservation> = [64, 4_096, 65_536]
+            .into_iter()
+            .map(|bytes| reserve(&mut budget, bytes))
+            .collect();
+        let pointers: Vec<*const u8> = made.iter().map(|each| each.bytes().as_ptr()).collect();
+        for each in made {
+            Budget::<()>::release(&mut budget, each);
+        }
+        let head = reserve(&mut budget, 1_000);
+        assert_eq!(head.bytes().as_ptr(), pointers[1], "the 4,096-byte spare");
+        let piece = reserve(&mut budget, 65_536);
+        assert_eq!(piece.bytes().as_ptr(), pointers[2], "the 65,536-byte spare");
+        let small = reserve(&mut budget, 64);
+        assert_eq!(small.bytes().as_ptr(), pointers[0], "the 64-byte spare");
+        Budget::<()>::release(&mut budget, small);
+        // None holds 70,000: the largest is taken and grown.
+        let grown = reserve(&mut budget, 70_000);
+        let grown = grown.into_buffer();
+        assert!(grown.capacity() >= 70_000);
+        assert_eq!(budget.spare, 0);
+    }
+
+    /// Whatever the sizes, every buffer handed out holds its grant, the bytes reserved are counted
+    /// exactly, and no more than `max_spare` buffers are kept.
+    #[test]
+    fn spares_are_bounded_and_every_buffer_holds_its_grant() {
+        let mut budget = Fixed::new(1 << 40, 16);
+        let mut held = Vec::new();
+        let mut size = 1u64;
+        for round in 0..2_000u64 {
+            size = size
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bytes = (size >> 33) % (1 << (round % 20 + 1));
+            let reservation = Budget::<()>::reserve(&mut budget, bytes, Lane::Class(())).unwrap();
+            assert_eq!(reservation.room(), bytes);
+            let buffer = reservation.into_buffer();
+            assert!(
+                buffer.capacity() as u64 >= bytes,
+                "{bytes} in {}",
+                buffer.capacity()
+            );
+            held.push(Reservation::new(bytes, buffer));
+            if round % 3 == 0 {
+                for each in held.drain(..) {
+                    Budget::<()>::release(&mut budget, each);
+                }
+            }
+            let kept = budget
+                .slots
+                .iter()
+                .filter(|slot| slot.capacity() > 0)
+                .count();
+            assert_eq!(kept, budget.spare);
+            assert!(budget.spare <= 16 && budget.slots.len() <= 16);
+        }
+        let total: u64 = held.iter().map(Reservation::granted).sum();
+        assert_eq!(budget.used(), total);
     }
 
     #[test]

@@ -74,6 +74,50 @@ impl LaneOut {
     }
 }
 
+/// What a connection's outgoing lanes hold unsent, by the rank of each frame's class: the front
+/// frame's bytes not yet written, and every other frame's whole. `Core::demand_above` reads it for
+/// every write an exchange or lane makes. mantle: it scanned every queued frame of every lane to
+/// find it, with the progress pass more than half of a range leader's busiest shard (2026-11-19,
+/// vendor/UPSTREAM.md); it is kept here as frames are queued, written and dropped. Exact: at most
+/// 2^32 lanes of at most 2^32 frames of at most 2^64 bytes sum below 2^128.
+#[derive(Debug, Default)]
+pub(crate) struct Unsent {
+    /// Indexed by rank: at most 256 entries, a rank being a `u8`.
+    by_rank: Vec<u128>,
+}
+
+impl Unsent {
+    /// `bytes` of a frame of `rank` wait to be written.
+    pub(crate) fn add(&mut self, rank: u8, bytes: usize) {
+        let at = usize::from(rank);
+        if self.by_rank.len() <= at {
+            self.by_rank.resize(at.saturating_add(1), 0);
+        }
+        if let Some(sum) = self.by_rank.get_mut(at) {
+            *sum = sum.saturating_add(u128::try_from(bytes).unwrap_or(u128::MAX));
+        }
+    }
+
+    /// `bytes` of a frame of `rank` were written, or dropped unwritten.
+    pub(crate) fn sub(&mut self, rank: u8, bytes: usize) {
+        if let Some(sum) = self.by_rank.get_mut(usize::from(rank)) {
+            *sum = sum.saturating_sub(u128::try_from(bytes).unwrap_or(u128::MAX));
+        }
+    }
+
+    /// Every lane's frames were dropped.
+    pub(crate) fn clear(&mut self) {
+        self.by_rank.iter_mut().for_each(|sum| *sum = 0);
+    }
+
+    /// What frames of classes more urgent than `rank` hold unsent, clamped to `u64` as the
+    /// saturating fold it replaced gave it.
+    pub(crate) fn above(&self, rank: u8) -> u64 {
+        let sum: u128 = self.by_rank.iter().take(usize::from(rank)).sum();
+        u64::try_from(sum).unwrap_or(u64::MAX)
+    }
+}
+
 /// The notes this side sends a peer on a connection ([`crate::NOTES_LANE`]): at most one a beat,
 /// each the stream ids of the exchanges it serves whose owners said since the last that their work
 /// advanced ([`crate::Endpoint::working`]).

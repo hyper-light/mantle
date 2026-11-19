@@ -163,6 +163,20 @@ pub(crate) fn visits<K>(exchange: &Exchange<K>) -> bool {
             && !exchange.stream_blocked)
 }
 
+/// Which of its connection's visit lists a visited `exchange` is in, of a table of classes ranked
+/// below `ranks`: the first holds the exchanges queued for a stream, which take streams in the order
+/// they were made whatever their class; then one for each rank, the exchanges of that class holding
+/// a stream, which move only by credit their class may take (`Core::allowed`); and last one for any
+/// of a rank past the classes, which a pass always visits. A pass skips a rank's list while its
+/// class may take no credit: each of them would write nothing and wake no one
+/// (`Core::next_visit`).
+pub(crate) fn slot<K>(exchange: &Exchange<K>, ranks: u8) -> usize {
+    if exchange.stream.is_none() {
+        return 0;
+    }
+    usize::from(exchange.rank.min(ranks)).saturating_add(1)
+}
+
 /// The endpoint's exchanges, each connection's sums over them, and the exchanges touched since
 /// the sums were last settled.
 #[derive(Debug)]
@@ -172,9 +186,9 @@ pub(crate) struct Table<K> {
     /// Indexed by the connection's key; a key's tally is made when an exchange first counts on it.
     tallies: Vec<Tally>,
     ranks: u8,
-    /// Indexed by the connection's key: the exchanges a progress pass visits, as (order, id),
-    /// sorted by order.
-    actives: Vec<Vec<(u64, u64)>>,
+    /// Indexed by the connection's key, then by [`slot`]: the exchanges a progress pass visits, as
+    /// (order, id), each list sorted by order. A connection's lists are its classes' ranks and two.
+    actives: Vec<Vec<Vec<(u64, u64)>>>,
     /// The order the next exchange made takes.
     next_order: u64,
     /// Indexed by the connection's key: a binary min-heap of (due, id), one entry for each
@@ -255,8 +269,11 @@ impl<K> Table<K> {
         if let Some(heap) = self.deadlines.get_mut(exchange.connection) {
             deadlines::remove(heap, &mut self.positions, id);
         }
-        if exchange.active
-            && let Some(active) = self.actives.get_mut(exchange.connection)
+        if let Some(slot) = exchange.active
+            && let Some(active) = self
+                .actives
+                .get_mut(exchange.connection)
+                .and_then(|lists| lists.get_mut(slot))
             && let Ok(at) = active.binary_search(&(exchange.order, id))
         {
             active.remove(at);
@@ -300,13 +317,44 @@ impl<K> Table<K> {
             .map(|(due, _)| *due)
     }
 
-    /// The exchanges of connection `key` a progress pass visits, settled, in the order they were
-    /// made, appended to `into`.
-    pub(crate) fn active(&mut self, key: usize, into: &mut Vec<u64>) {
+    /// The first exchange of connection `key`'s visit list `slot` made after the one made at
+    /// `after` (from the first, for none), settled: a binary search of the one list, which the
+    /// exchanges of every other list, and those of this one made before, do not lengthen.
+    pub(crate) fn listed_after(
+        &mut self,
+        key: usize,
+        slot: usize,
+        after: Option<u64>,
+    ) -> Option<(u64, u64)> {
         self.settle();
-        if let Some(active) = self.actives.get(key) {
-            into.extend(active.iter().map(|(_, id)| *id));
-        }
+        let list = self.actives.get(key)?.get(slot)?;
+        let at = after.map_or(0, |after| {
+            list.partition_point(|(order, _)| *order <= after)
+        });
+        list.get(at).copied()
+    }
+
+    /// Every exchange of connection `key`'s visit lists, settled, as (order, id, slot), in the order
+    /// they were made: the oracle's full visit compares them with the fold.
+    #[cfg(feature = "oracle")]
+    pub(crate) fn listed(&mut self, key: usize) -> Vec<(u64, u64, usize)> {
+        self.settle();
+        let mut listed: Vec<(u64, u64, usize)> = self
+            .actives
+            .get(key)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .flat_map(|(slot, list)| list.iter().map(move |(order, id)| (*order, *id, slot)))
+            .collect();
+        listed.sort_unstable();
+        listed
+    }
+
+    /// The ranks the table's classes have.
+    #[cfg(feature = "oracle")]
+    pub(crate) fn ranks(&self) -> u8 {
+        self.ranks
     }
 
     pub(crate) fn hold(&mut self, id: u64) -> bool {
@@ -369,15 +417,15 @@ impl<K> Table<K> {
             };
             exchange.touched = false;
             let key = exchange.connection;
-            let visited = visits(exchange);
-            let revisit = (visited != exchange.active).then_some(exchange.order);
+            let visited = visits(exchange).then(|| slot(exchange, self.ranks));
+            let revisit = (visited != exchange.active).then_some((exchange.order, exchange.active));
             exchange.active = visited;
             let due = exchange.carry.due();
             let deadline = due != exchange.deadline;
             exchange.deadline = due;
             let share = Counted::of(exchange);
-            if let Some(order) = revisit {
-                self.revisit(key, (order, id), visited);
+            if let Some((order, from)) = revisit {
+                self.revisit(key, (order, id), from, visited);
             }
             if deadline {
                 self.redeadline(key, id, due);
@@ -391,20 +439,28 @@ impl<K> Table<K> {
         }
     }
 
-    /// Puts `entry` (order, id) into connection `key`'s visit set, or takes it out.
-    fn revisit(&mut self, key: usize, entry: (u64, u64), visited: bool) {
+    /// Moves `entry` (order, id) from connection `key`'s visit list `from` to its list `to`: into
+    /// one, out of one, or from one to another.
+    fn revisit(&mut self, key: usize, entry: (u64, u64), from: Option<usize>, to: Option<usize>) {
         if self.actives.len() <= key {
             self.actives.resize_with(key.saturating_add(1), Vec::new);
         }
-        let Some(active) = self.actives.get_mut(key) else {
+        let Some(lists) = self.actives.get_mut(key) else {
             return;
         };
-        match (visited, active.binary_search(&entry)) {
-            (true, Err(at)) => active.insert(at, entry),
-            (false, Ok(at)) => {
-                active.remove(at);
-            }
-            _ => {}
+        let wanted = usize::from(self.ranks).saturating_add(2);
+        if lists.len() < wanted {
+            lists.resize_with(wanted, Vec::new);
+        }
+        if let Some(list) = from.and_then(|slot| lists.get_mut(slot))
+            && let Ok(at) = list.binary_search(&entry)
+        {
+            list.remove(at);
+        }
+        if let Some(list) = to.and_then(|slot| lists.get_mut(slot))
+            && let Err(at) = list.binary_search(&entry)
+        {
+            list.insert(at, entry);
         }
     }
 

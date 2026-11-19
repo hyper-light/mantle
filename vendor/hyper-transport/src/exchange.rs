@@ -291,8 +291,9 @@ pub(crate) struct Exchange<K> {
     /// Its place in the order exchanges were made, the endpoint's whole life: the order its
     /// connection's exchanges are visited in.
     pub(crate) order: u64,
-    /// It is in its connection's set of exchanges a progress pass visits (`tally::visits`).
-    pub(crate) active: bool,
+    /// The list of its connection's exchanges a progress pass visits that it is in, if it is in one
+    /// (`tally::visits`, `tally::slot`).
+    pub(crate) active: Option<usize>,
     /// Its index in its connection's list of exchanges.
     pub(crate) at: usize,
     /// The due time its connection's deadline heap holds for it, if any (`tally::Table`).

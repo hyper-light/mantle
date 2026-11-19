@@ -266,12 +266,16 @@ impl Job {
         Some(match self.door {
             _ if self.waits_for_room() => bound.min(now.saturating_add(beat)),
             Door::Local(_) => bound,
-            Door::Native(..) => bound.min(self.vouched_ns.unwrap_or(now).saturating_add(beat)),
+            Door::Native(..) => bound.min(
+                self.vouched_ns
+                    .unwrap_or(now)
+                    .saturating_add(vouch_every(beat)),
+            ),
         })
     }
 
-    /// Tells its asker its work is held, through its native door, at most once a beat unless its
-    /// work moved since it last did: a vouch reaches the asker in the next note on its connection,
+    /// Tells its asker its work is held, through its native door, at most twice a beat
+    /// (`vouch_every`) unless its work moved since it last did: a vouch reaches the asker in the next note on its connection,
     /// notes at most a beat apart, and its asker judges the exchange by it (hyper-transport's
     /// `Endpoint::working`; research/77 D1, said as work moves, and D2, each beat while held). One
     /// told at every turn, thousands a beat on a loaded node, said nothing more and cost the most
@@ -282,9 +286,10 @@ impl Job {
         let Door::Native(_, native) = &self.door else {
             return;
         };
+        let every = vouch_every(beat);
         let due = self
             .vouched_ns
-            .is_none_or(|vouched| self.moved_ns > vouched || now >= vouched.saturating_add(beat));
+            .is_none_or(|vouched| self.moved_ns > vouched || now >= vouched.saturating_add(every));
         if due {
             native.held();
             self.vouched_ns = Some(now);
@@ -2749,9 +2754,19 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
 /// When, on the shard's clock, the parked requests' askers are next told their requests are held,
 /// all at once: at `now` where none was told since none was parked, else a `beat` after they last
 /// were at `vouched_ns`, as a held job's asker is (`Job::vouch`'s reasons). A request parked behind
-/// others is told within a beat of parking, as each is a beat after its last.
+/// others is told within half a beat of parking, as each is half a beat after its last.
 fn parked_vouch_ns(vouched_ns: Option<u64>, now: u64, beat: u64) -> u64 {
-    vouched_ns.map_or(now, |vouched| vouched.saturating_add(beat))
+    vouched_ns.map_or(now, |vouched| vouched.saturating_add(vouch_every(beat)))
+}
+
+/// How often a held request's asker is told so, on a `beat`: every half beat. A vouch reaches the
+/// asker in the next note on its connection, notes a beat apart, so one told a beat after the last,
+/// at a turn just after a note went out, is named two beats after the note before; its asker gives
+/// it up a serve period, three beats, after it last heard (hyper-transport `Endpoint::working`,
+/// `NOTES_A_PERIOD`). Told every half beat, a held request is named in notes at most a beat and a
+/// half apart, the margin it had told at every turn, at two vouches a beat, each a flag.
+fn vouch_every(beat: u64) -> u64 {
+    beat.checked_div(2).unwrap_or(beat).max(1)
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
@@ -2868,7 +2883,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// (`crate::admit`); one whose exchange ended is let go, and one whose client stops waiting
     /// (its deadline, or a stock client's patience) or whose node stops is answered `SlowDown`.
     /// Those still parked are held by the host, as a job whose asks are out is: each tells its
-    /// asker so (research/77 D1, D2), all at once a beat apart ([`parked_vouch_ns`]), at the first
+    /// asker so (research/77 D1, D2), all at once half a beat apart ([`parked_vouch_ns`]), at the first
     /// turn they are held since none was.
     pub(super) fn take_parked(&mut self) {
         let now = hyper_rt::futures::now_ns();
@@ -4400,7 +4415,7 @@ impl Host {
             }
             match job.bounded(now) {
                 Bounded::SlowDown => self.slow_job(node, at, door::Slowed::Patience)?,
-                // The job says so on its door, once a beat or as its work moves, and the node's
+                // The job says so on its door, twice a beat or as its work moves, and the node's
                 // task tells its exchange's asker (`Replies::write`).
                 Bounded::Held => job.vouch(now, beat),
                 // A chunk read waiting for room is the node's own wait, which no transport ends:
@@ -12111,7 +12126,7 @@ pub(super) mod tests {
 
     /// Native requests whose work is held and still, their asks out: each turn told every asker
     /// its work is held, as many calls into the transport as requests at every turn (the native
-    /// GET bench's node, 2026-11-19); now each is told at its first turn held and then once a beat.
+    /// GET bench's node, 2026-11-19); now each is told at its first turn held and then twice a beat.
     /// With the shard's clock still, as a test's thread reads it, turns after the first tell none.
     #[test]
     fn held_requests_are_vouched_for_at_their_first_turn_not_at_each() {
@@ -12140,10 +12155,11 @@ pub(super) mod tests {
         assert_eq!(host.jobs.len(), HELD, "each still held");
     }
 
-    /// A held request is vouched for a beat after its last vouch, at every beat, however often the
-    /// node turns between, and at once at the turn after its work moved (research/77 D1, D2): at
-    /// most one vouch a beat each while still, never more than a beat between two. Its host's next
-    /// turn is due when its next vouch is (`Host::due`), so an idle node turns for it in time.
+    /// A held request is vouched for half a beat after its last vouch (`vouch_every`), however
+    /// often the node turns between, and at once at the turn after its work moved (research/77 D1,
+    /// D2): at most two vouches a beat each while still, never more than half a beat between two
+    /// where the node turns that often. Its host's next turn is due when its next vouch is
+    /// (`Host::due`), so an idle node turns for it in time.
     #[test]
     fn a_held_request_is_vouched_for_within_each_beat_and_as_its_work_moves() {
         const HELD: usize = 8;
@@ -12170,7 +12186,8 @@ pub(super) mod tests {
                     assert!(told <= 1, "one vouch a turn at most");
                     if told == 1 {
                         if let Some(at) = last[job] {
-                            assert!(now - at <= beat, "job {job} vouched {} ns after", now - at);
+                            let most = (beat / per_beat).max(vouch_every(beat));
+                            assert!(now - at <= most, "job {job} vouched {} ns after", now - at);
                         }
                         last[job] = Some(now);
                         per_beat_told[usize::try_from((now - 1) / beat).unwrap()] += 1;
@@ -12178,14 +12195,18 @@ pub(super) mod tests {
                 }
                 // Its next turn is due by its next vouch.
                 let due = host.due(&stub).unwrap();
-                let next = last.iter().flatten().min().unwrap() + beat;
+                let next = last.iter().flatten().min().unwrap() + vouch_every(beat);
                 assert!(due <= next, "due {due}, next vouch {next}");
                 now += beat / per_beat;
             }
+            // Turning once a beat, each turn vouches; turning more often, two a beat each, the
+            // last beat's bucket holding only its first turn.
+            let mut expected =
+                vec![HELD * if per_beat == 1 { 1 } else { 2 }; usize::try_from(BEATS).unwrap()];
+            expected.push(HELD);
             assert_eq!(
-                per_beat_told,
-                vec![HELD; usize::try_from(BEATS).unwrap() + 1],
-                "{HELD} held, still, turning {per_beat} times a beat: {HELD} vouches a beat"
+                per_beat_told, expected,
+                "{HELD} held, still, turning {per_beat} times a beat"
             );
         }
 
@@ -12213,16 +12234,17 @@ pub(super) mod tests {
     }
 
     /// Requests parked for want of room are each told they are held at the first turn they are
-    /// held, then all at once a beat apart (`Node::take_parked`), the node's turn due then
-    /// (`Node::parked_due`): N parked and still tell N a beat, where every turn told N.
+    /// held, then all at once half a beat apart (`Node::take_parked`, `vouch_every`), the node's
+    /// turn due then (`Node::parked_due`): N parked and still tell 2N a beat, where every turn told
+    /// N.
     #[test]
-    fn parked_requests_are_vouched_for_once_a_beat() {
+    fn parked_requests_are_vouched_for_twice_a_beat() {
         const PARKED: usize = 32;
         const BEATS: u64 = 3;
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
         // None told since none was parked: told at once.
         assert_eq!(parked_vouch_ns(None, 5, beat), 5);
-        assert_eq!(parked_vouch_ns(Some(5), 6, beat), 5 + beat);
+        assert_eq!(parked_vouch_ns(Some(5), 6, beat), 5 + vouch_every(beat));
         let mut vouched = None;
         let mut told = vec![0usize; usize::try_from(BEATS).unwrap() + 1];
         let mut turns = 0;
@@ -12234,14 +12256,18 @@ pub(super) mod tests {
                 vouched = Some(now);
             }
             // The next turn comes by the next vouch.
-            assert!(parked_vouch_ns(vouched, now, beat) <= now + beat);
+            assert!(parked_vouch_ns(vouched, now, beat) <= now + vouch_every(beat));
             now += beat / 16;
         }
         assert!(turns > 16 * usize::try_from(BEATS).unwrap());
+        // Two a beat, the last beat's bucket holding only its first turn.
+        let mut expected = vec![2 * PARKED; usize::try_from(BEATS).unwrap()];
+        expected.push(PARKED);
         assert_eq!(
             told,
-            vec![PARKED; usize::try_from(BEATS).unwrap() + 1],
-            "{PARKED} parked over {turns} turns: {PARKED} vouches a beat, {} before",
+            expected,
+            "{PARKED} parked over {turns} turns: {} vouches a beat, {} before",
+            2 * PARKED,
             PARKED * turns
         );
     }

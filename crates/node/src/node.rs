@@ -1196,7 +1196,7 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     parked: VecDeque<host::Parked>,
     parked_most: usize,
     /// When, on the shard's clock, the parked requests' askers were last told their requests are
-    /// held (`Node::take_parked`), all at once a beat apart; none since none was parked.
+    /// held (`Node::take_parked`), all at once half a beat apart; none since none was parked.
     parked_vouched_ns: Option<u64>,
     /// What the node measured of its puts' and its gets' blocks and bodies, the windows each
     /// holds (`crate::window`).

@@ -223,13 +223,18 @@ def main(top):
     w("Arms A1 and A2 are the timed build (the A/A pair), C the counting build; comparators run the HTTP door "
       "with A1 as the harness; an arm's -tail cases ask 3,688 operations a sized phase. cpu = the servers' "
       "user+system ns/op (from /proc ticks); instr and cycles = `perf stat` user-space counts of the servers' "
-      "processes over the phase; faults = minor faults/op; wire = the door's wire bytes/op (the native door's UDP "
+      "processes over the phase; L1d miss = their L1 data-cache load misses/op and cache miss = the kernel's "
+      "generic cache misses/op from the same count, which are the last-level cache's on Intel, the L2's on AMD Zen "
+      "and the L1 data cache's on Arm (measurement.md §12), each scaled by perf where it multiplexed the counters "
+      "(the phase line's perf_counted, the least share of its measurement time counted); a dash where perf did "
+      "not count it; faults = minor faults/op; wire = the door's wire bytes/op (the native door's UDP "
       "payloads, the HTTP door's TCP octets); dgrams = the native door's datagrams/op. ref/unans/skip/diff are the "
       "operations refused, never answered, skipped (their put had failed) and read back differing; failed are the "
       "checks' failures.\n")
     w("| machine | door | op | size | cond | arm | n | ops/s | lateness p99 | p50 [95%] | p99 | p99.9 | p99.99 | max "
-      "| cpu ns/op | instr/op | cycles/op | faults/op | wire B/op | dgrams/op | ref | unans | skip | diff | failed |")
-    w("|" + "---|" * 25)
+      "| cpu ns/op | instr/op | cycles/op | L1d miss/op | cache miss/op | faults/op | wire B/op | dgrams/op | ref "
+      "| unans | skip | diff | failed |")
+    w("|" + "---|" * 27)
     for key in sorted(cells, key=sort_key):
         ps = cells[key]
         machine, door, op, size, cond, arm = key
@@ -244,7 +249,8 @@ def main(top):
         w(f"| {machine} | {door} | {op} | {size} | {cond} | {arm} | {n} | {rate} | {show(med(ps, 'lateness_p99'))} | "
           f"{p50} | {q['p99']} | {show(p999(ps))} | {q['p99.99']} | {q['max']} | "
           f"{show(median(per_op_cpu(p) for p in ps), 0)} | {show(med(ps, 'instructions/op'), 0)} | "
-          f"{show(med(ps, 'cycles/op'), 0)} | {show(med(ps, 'minor_faults/op'))} | {show(med(ps, 'wire_bytes/op'), 0)} | "
+          f"{show(med(ps, 'cycles/op'), 0)} | {show(med(ps, 'l1d_misses/op'))} | {show(med(ps, 'cache_misses/op'))} | "
+          f"{show(med(ps, 'minor_faults/op'))} | {show(med(ps, 'wire_bytes/op'), 0)} | "
           f"{show(med(ps, 'datagrams/op'))} | {total(ps, 'refused')} | {total(ps, 'unanswered')} | "
           f"{total(ps, 'skipped')} | {total(ps, 'differed')} | {total(ps, 'failed')} |")
 

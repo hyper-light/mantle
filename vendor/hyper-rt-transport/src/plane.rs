@@ -1,6 +1,19 @@
 //! The datagram plane's socket: its own, beside the endpoint's (mantle note 32 §3.5). Each datagram it
 //! opens comes with when it arrived on the shard's clock, the kernel's receive stamp where the platform
 //! gives one: what a node-pair heartbeat is judged by (hyper-raft docs/timing.md §2.4).
+//!
+//! **A receive costs what it receives** (mantle: vendor/UPSTREAM.md). The socket is asked only while
+//! it may hold datagrams: as it is made, once its read readiness fires, and while its last receive left
+//! some. Its readiness is hyper-rt's one-shot wait, which every driver reports while datagrams are
+//! queued, not only as one arrives (epoll's `EPOLLONESHOT` without `EPOLLET` is level-triggered, and a
+//! re-arm through `EPOLL_CTL_MOD` polls the socket again, epoll(7); kqueue's `EV_ADD` of `EVFILT_READ`
+//! reports a socket whose receive buffer holds data, kqueue(2); an AFD poll completes at once on a
+//! socket with data, as does the simulation fabric's wait). So a wait armed after a receive emptied the
+//! socket fires for a datagram that came between the two, and one that came while the process was
+//! stopped, its stamp the kernel's from its arrival. An empty socket costs no system call: before, each
+//! poll of the receive asked the kernel, and on Linux made a whole batch's headers for it.
+//! [`PlaneSocket::receive_ready`] asks the kernel whatever the readiness says, for a caller that must
+//! know what was queued at a clock reading it took.
 
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
@@ -10,7 +23,7 @@ use std::task::{Context, Poll};
 use hyper_datagram::{Fence, Opened, PeerId, Plane, Refusal};
 use hyper_rt::RtError;
 use hyper_rt::readiness::Ready;
-use hyper_rt::udp::{Arrival, Batched, Io, IoStats};
+use hyper_rt::udp::{Arrival, Batched, Io, IoStats, Queued};
 
 use crate::TURNS;
 
@@ -21,6 +34,9 @@ pub struct PlaneSocket {
     socket: Batched,
     readable: Option<Ready>,
     writable: Option<Ready>,
+    /// Whether the socket may hold datagrams: as it is made, once its read readiness fired, and
+    /// while its last receive left some. Otherwise it is asked nothing until its readiness fires.
+    may_hold: bool,
 }
 
 impl PlaneSocket {
@@ -35,6 +51,7 @@ impl PlaneSocket {
             socket,
             readable: None,
             writable: None,
+            may_hold: true,
         }
     }
 
@@ -87,26 +104,89 @@ impl PlaneSocket {
         poll_fn(|context| self.poll_receive(context, plane, fence, &mut deliver)).await
     }
 
-    /// Opens every datagram already queued on the socket, without waiting (hyper-rt asks the kernel on
-    /// every receive, so a datagram that arrived through a stop of the process is taken with its stamp).
-    /// At most [`TURNS`] batches; returns how many datagrams.
+    /// Opens every datagram queued on the socket when it is called, without waiting and whatever its
+    /// readiness says: the kernel is asked, so a datagram that arrived before the call, through a
+    /// stop of the process too, is taken with its stamp. For a caller that judges what came by a
+    /// clock reading it took before the call (a heartbeat stream polled at that reading), and at a
+    /// start or after a hold. At most [`TURNS`] batches; returns how many datagrams.
     pub fn receive_ready(
         &mut self,
         plane: &mut Plane,
         fence: &dyn Fence,
         mut deliver: impl FnMut(Arrival, Result<Opened<'_>, Refusal>),
     ) -> Result<usize, RtError> {
+        self.may_hold = true;
         let mut total = 0usize;
         for _ in 0..TURNS {
-            let count = self.socket.receive(|arrival, datagram| {
-                deliver(arrival, plane.open(datagram, fence));
-            })?;
-            if count == 0 {
+            let count = self.take(plane, fence, &mut deliver)?;
+            total = total.saturating_add(count);
+            if count == 0 || !self.may_hold {
                 break;
             }
-            total = total.saturating_add(count);
         }
         Ok(total)
+    }
+
+    /// Opens, without waiting, what the socket's readiness says may be queued: the socket is asked
+    /// only while it may hold datagrams (its readiness fired since a receive emptied it, or its last
+    /// receive left some), and its read readiness is armed for `context`'s task once it is empty, so
+    /// an empty socket costs no system call. What came since the shard last read its driver waits
+    /// for the readiness that tells of it. At most [`TURNS`] batches; returns how many datagrams.
+    pub fn receive_readable(
+        &mut self,
+        context: &mut Context<'_>,
+        plane: &mut Plane,
+        fence: &dyn Fence,
+        mut deliver: impl FnMut(Arrival, Result<Opened<'_>, Refusal>),
+    ) -> Result<usize, RtError> {
+        let mut total = 0usize;
+        for _ in 0..TURNS {
+            if !self.fired(context)? {
+                break;
+            }
+            let count = self.take(plane, fence, &mut deliver)?;
+            total = total.saturating_add(count);
+            if count == 0 && self.may_hold {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Whether the socket's last receive emptied it: it found nothing, or took fewer than it offered
+    /// room for, and it is asked again only once its readiness fires.
+    pub fn emptied(&self) -> bool {
+        !self.may_hold
+    }
+
+    /// One batch from the socket, opened with `plane` under `fence`; whether the socket may hold
+    /// more is kept for the next receive.
+    fn take(
+        &mut self,
+        plane: &mut Plane,
+        fence: &dyn Fence,
+        deliver: &mut impl FnMut(Arrival, Result<Opened<'_>, Refusal>),
+    ) -> Result<usize, RtError> {
+        let (count, ended) = self.socket.receive_batch(|arrival, datagram| {
+            deliver(arrival, plane.open(datagram, fence));
+        })?;
+        self.may_hold = ended == Queued::More;
+        Ok(count)
+    }
+
+    /// Whether the socket may hold datagrams: it may already, or its read readiness, armed for
+    /// `context`'s task while it may not, fired.
+    fn fired(&mut self, context: &mut Context<'_>) -> Result<bool, RtError> {
+        if self.may_hold {
+            return Ok(true);
+        }
+        let readable = self.readable.get_or_insert_with(|| self.socket.readable());
+        if let Poll::Ready(outcome) = Pin::new(readable).poll(context) {
+            self.readable = None;
+            outcome?;
+            self.may_hold = true;
+        }
+        Ok(self.may_hold)
     }
 
     fn poll_receive(
@@ -120,22 +200,21 @@ impl PlaneSocket {
             if self.socket.pending() {
                 let _ = self.socket.send();
             }
-            let count = match self.socket.receive(|arrival, datagram| {
-                deliver(arrival, plane.open(datagram, fence));
-            }) {
-                Ok(count) => count,
+            match self.fired(context) {
+                Ok(true) => match self.take(plane, fence, deliver) {
+                    // Calls that handed nothing over (astray reports, datagrams passed over) and
+                    // left more: the rest at the task's next poll, after the shard's other tasks.
+                    Ok(0) if self.may_hold => {
+                        context.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    // Emptied: its readiness is armed next.
+                    Ok(0) => continue,
+                    Ok(count) => return Poll::Ready(Ok(count)),
+                    Err(error) => return Poll::Ready(Err(error)),
+                },
+                Ok(false) => {}
                 Err(error) => return Poll::Ready(Err(error)),
-            };
-            if count > 0 {
-                return Poll::Ready(Ok(count));
-            }
-            let readable = self.readable.get_or_insert_with(|| self.socket.readable());
-            if let Poll::Ready(outcome) = Pin::new(readable).poll(context) {
-                self.readable = None;
-                if let Err(error) = outcome {
-                    return Poll::Ready(Err(error));
-                }
-                continue;
             }
             if self.socket.pending() {
                 let writable = self.writable.get_or_insert_with(|| self.socket.writable());

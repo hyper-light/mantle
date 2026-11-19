@@ -1031,6 +1031,17 @@ impl Batched {
     /// how many, 0 when none had (await [`Batched::readable`]). At most [`Io::batch`] calls, so a socket
     /// that keeps reporting astray datagrams cannot hold the shard.
     pub fn receive(&mut self, deliver: impl FnMut(Arrival, &mut [u8])) -> Result<usize, RtError> {
+        self.receive_batch(deliver).map(|(received, _)| received)
+    }
+
+    /// [`Batched::receive`], and how it ended: [`Queued::Emptied`] when the socket held nothing more
+    /// as its last call returned (it found nothing, or on Linux filled fewer places than it
+    /// offered), so that its owner asks it again only once its readiness fires; [`Queued::More`]
+    /// when it may hold more.
+    pub fn receive_batch(
+        &mut self,
+        deliver: impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<(usize, Queued), RtError> {
         if self.buffers.is_empty() {
             return Err(RtError::BadConfig {
                 what: "a lent socket receives into its owner's ring (Batched::receive_with)",
@@ -1049,7 +1060,7 @@ impl Batched {
         self.lend(ring);
         let received = self.receive_turns(ring.batch, deliver);
         self.lend(ring);
-        received
+        received.map(|(received, _)| received)
     }
 
     /// Takes, into `ring`, the datagrams that were queued when the receive began, with the rest of
@@ -1162,30 +1173,40 @@ impl Batched {
         &mut self,
         turns: usize,
         mut deliver: impl FnMut(Arrival, &mut [u8]),
-    ) -> Result<usize, RtError> {
+    ) -> Result<(usize, Queued), RtError> {
         let mut delivered = 0usize;
         let mut bytes_taken = 0u64;
         let mut handed = |arrival: Arrival, bytes: &mut [u8]| {
             bytes_taken = bytes_taken.saturating_add(as_u64(bytes.len()));
             deliver(arrival, bytes);
         };
+        let mut ended = Queued::More;
         for _ in 0..turns {
             match self.receive_some(&mut handed)? {
-                ReceiveStep::Delivered { datagrams, .. } => {
+                ReceiveStep::Delivered {
+                    datagrams, drained, ..
+                } => {
                     delivered = delivered.saturating_add(datagrams);
-                    if self.one_call_takes_the_batch() {
+                    if drained {
+                        ended = Queued::Emptied;
+                    }
+                    if drained || self.one_call_takes_the_batch() {
                         break;
                     }
                 }
                 ReceiveStep::Skipped => {}
-                ReceiveStep::Empty => break,
+                ReceiveStep::Empty => {
+                    self.stats.receives_empty = self.stats.receives_empty.saturating_add(1);
+                    ended = Queued::Emptied;
+                    break;
+                }
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 ReceiveStep::Astray => self.stats.astray = self.stats.astray.saturating_add(1),
             }
         }
         self.stats.received = self.stats.received.saturating_add(as_u64(delivered));
         self.stats.received_bytes = self.stats.received_bytes.saturating_add(bytes_taken);
-        Ok(delivered)
+        Ok((delivered, ended))
     }
 
     /// Whether one receive call takes a whole batch (Linux's `recvmmsg` on a real socket).

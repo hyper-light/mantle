@@ -874,6 +874,85 @@ fn a_receive_that_fills_fewer_places_than_it_offers_asks_no_more() {
     .unwrap();
 }
 
+/// Takes `count` datagrams from `receiver` through `ring`, awaiting its readiness while it holds
+/// none: each with its arrival and its bytes.
+#[cfg(target_os = "linux")]
+async fn take_through(
+    receiver: &mut Batched,
+    ring: &mut Ring,
+    count: usize,
+) -> Vec<(Arrival, Vec<u8>)> {
+    let mut seen = Vec::new();
+    while seen.len() < count {
+        let (got, _) = receiver
+            .receive_queued(ring, u64::MAX, 16, |arrival, bytes| {
+                seen.push((arrival, bytes.to_vec()));
+            })
+            .unwrap();
+        if got.datagrams == 0 {
+            receiver.readable().await.unwrap();
+        }
+    }
+    seen
+}
+
+/// Do: on Linux, one datagram taken through a ring of one buffer, then a train of [`DATAGRAMS`]
+/// datagrams of [`DATAGRAM_BYTES`] sent in one segmented send and taken through the same ring, then
+/// the ring grown to four buffers and a datagram of each of four lengths taken. Expect: the train
+/// arrives cut back into its datagrams, each the kernel's stamp, though the call before wrote back a
+/// control of the stamp alone (a coalesced message's control is the segment's size beside it); the
+/// four arrive whole in the grown ring's buffers. A receive's headers are made once and kept, and
+/// each call gives every message its whole name and control again and points each iovec at the
+/// buffer it is lent.
+#[cfg(target_os = "linux")]
+#[test]
+fn kept_headers_take_each_calls_controls_and_buffers_afresh() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let mut sender = Batched::bind(loopback, Io { batch: DATAGRAMS }, false).unwrap();
+        let mut receiver = Batched::bind_lent(loopback, true).unwrap();
+        let mut ring = Ring::new(Io { batch: 8 }).unwrap();
+        let to = receiver.local_addr().unwrap();
+        assert!(receiver.stats().kernel_stamps, "the kernel stamps on Linux");
+
+        assert_eq!(
+            sender.send_segments(to, &[7; DATAGRAM_BYTES], DATAGRAM_BYTES),
+            1
+        );
+        let first = take_through(&mut receiver, &mut ring, 1).await;
+        assert_eq!(first[0].1, vec![7; DATAGRAM_BYTES]);
+        assert!(first[0].0.kernel);
+
+        let train = vec![9; DATAGRAMS * DATAGRAM_BYTES];
+        assert_eq!(sender.send_segments(to, &train, DATAGRAM_BYTES), DATAGRAMS);
+        let cut = take_through(&mut receiver, &mut ring, DATAGRAMS).await;
+        assert_eq!(cut.len(), DATAGRAMS);
+        for (arrival, bytes) in &cut {
+            assert_eq!(
+                bytes,
+                &vec![9; DATAGRAM_BYTES],
+                "one datagram, cut back out"
+            );
+            assert!(arrival.kernel, "each datagram the kernel's stamp");
+        }
+
+        ring.resize(4).unwrap();
+        let lengths = [1usize, 50, 300, 1_200];
+        for (index, length) in lengths.iter().enumerate() {
+            let bytes = vec![u8::try_from(index).unwrap(); *length];
+            assert_eq!(sender.send_segments(to, &bytes, *length), 1);
+        }
+        let four = take_through(&mut receiver, &mut ring, lengths.len()).await;
+        for (index, (arrival, bytes)) in four.iter().enumerate() {
+            assert_eq!(bytes, &vec![u8::try_from(index).unwrap(); lengths[index]]);
+            assert_eq!(arrival.from, sender.local_addr().unwrap());
+            assert!(arrival.kernel);
+        }
+    })
+    .unwrap();
+}
+
 /// Queues `count` one-byte datagrams for `receiver` and takes them through `ring` in one drain,
 /// begun at `began_ns`; the messages it took, how it ended, and the receive calls and the empty
 /// ones it made.

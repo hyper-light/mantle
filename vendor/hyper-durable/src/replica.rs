@@ -1795,44 +1795,67 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.tell_applied()
     }
 
-    /// Sends each member a leader catches up from its store the page the store has read for it
-    /// (`LogStore::catch_up`, `docs/durable.md` §8): the store reads it off this thread, and the
-    /// core, told meanwhile that the store does not hold it yet, sends it now.
+    /// Sends each member a leader catches up from its store the pages the store has read for it
+    /// (`LogStore::catch_up`, `docs/durable.md` §8): the store reads them off this thread, and the
+    /// core, told meanwhile that the store does not hold them yet, sends them now, while the
+    /// member's credit admits them (`Config::max_inflight_msgs`). Each round sends each member
+    /// waiting at a page read one of them and asks the store again, which lets go the runs passed
+    /// and opens the next as it does at every drive, so its window holds: one read out for the
+    /// group, and for each member the run that holds its next index and the one after it. Sent one
+    /// page a drive, a member had the rest of its credit only with its acknowledgement of that page,
+    /// a round trip at every run read (mantle: vendor/UPSTREAM.md).
     fn stream_catch_up(
         &mut self,
         waker: &Waker,
         out: &mut Output<M::Answer>,
     ) -> Result<(), ReplicaError> {
         let id = self.id();
+        let leads = self.is_leader();
         let mut lows = std::mem::take(&mut self.lows);
         let mut pages = std::mem::take(&mut self.pages);
         let mut waiting = std::mem::take(&mut self.waiting);
-        lows.clear();
-        pages.clear();
-        waiting.clear();
-        if self.is_leader() {
-            let others = self
+        // A member takes a page a round until its credit is spent (a probe's one, a window's
+        // `max_inflight_msgs`), and the round after the last finds none to send.
+        let rounds = self.node.raft.config().max_inflight_msgs.saturating_add(1);
+        let mut sent = Ok(());
+        let mut any = false;
+        for round in 0..=rounds {
+            lows.clear();
+            pages.clear();
+            waiting.clear();
+            if leads {
+                let others = self
+                    .node
+                    .raft
+                    .tracker()
+                    .iter()
+                    .filter(|&(member, _)| member != id);
+                lows.extend(others.map(|(_, progress)| progress.next_index));
+            }
+            self.catching_up = self.node.store_mut().log.catch_up(waker, &lows, &mut pages);
+            let read = self
                 .node
                 .raft
                 .tracker()
                 .iter()
-                .filter(|&(member, _)| member != id);
-            lows.extend(others.map(|(_, progress)| progress.next_index));
+                .filter(|&(member, progress)| {
+                    member != id && !progress.is_paused() && pages.contains(&progress.next_index)
+                });
+            waiting.extend(read.map(|(member, _)| member));
+            if waiting.is_empty() || round == rounds {
+                break;
+            }
+            sent = waiting
+                .iter()
+                .try_for_each(|&member| self.node.send_append(member));
+            any = true;
+            if sent.is_err() {
+                break;
+            }
         }
-        self.catching_up = self.node.store_mut().log.catch_up(waker, &lows, &mut pages);
-        let read = self
-            .node
-            .raft
-            .tracker()
-            .iter()
-            .filter(|&(member, progress)| member != id && pages.contains(&progress.next_index));
-        waiting.extend(read.map(|(member, _)| member));
-        let sent = waiting
-            .iter()
-            .try_for_each(|&member| self.node.send_append(member));
         (self.lows, self.pages, self.waiting) = (lows, pages, waiting);
         self.must(sent)?;
-        if !self.waiting.is_empty() {
+        if any {
             let messages = self.node.messages_now();
             self.emit(messages, out);
         }

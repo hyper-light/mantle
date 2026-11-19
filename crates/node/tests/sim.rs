@@ -1101,3 +1101,79 @@ fn own_reads_after_a_held_promotion(seed: u64) {
     });
     drop(stops);
 }
+
+/// A lone command's answer waits on its paths and its devices, never on a timer's period: a client
+/// one switch from a cell of three asks the leader one command at a time, and once its connection
+/// is up each is answered within its stages' own times (the client's path to the leader, the
+/// leader's to a follower and back, which its own flush overlaps, and the leader's back to the
+/// client, each at most the profile's longest one-way delay; the simulated device answers each
+/// write as it is asked) plus a step of the test's clock at each end. A wait on a beat, a heartbeat,
+/// a batching window or a node's next due time would take a timer's period past it (the beat is
+/// `bounds::initial_pto`, about a second; the liveness stream's heartbeats are measured, many
+/// round trips apart).
+#[test]
+fn a_lone_command_is_answered_within_its_paths_times_not_a_timers_period() {
+    for seed in seeds(&[1, 7]) {
+        // Odd seeds are cells of three; seeds 1 and 7 one switch apart (`cell::PROFILES`).
+        let mut cell = Sim::new(seed);
+        let leader = cell.leader();
+        cell.judged();
+        let mut order: Vec<u64> = (1..=cell.nodes).collect();
+        order.sort_by_key(|id| *id != leader);
+        let asking = cell.asking(CLIENT, &order);
+        let bound = 4 * cell.longest_ns() + 2 * cell.step_ns();
+        for serial in 1..=16 {
+            let commits: BTreeMap<u64, u64> = cell
+                .members
+                .iter()
+                .map(|(id, m)| (*id, m.status.map_or(0, |s| s.commit)))
+                .collect();
+            let at = cell.now_ns();
+            asking
+                .try_send((GROUP, registration(CLIENT, 1, serial)))
+                .map_err(|_| "the client's asks are full")
+                .unwrap();
+            // When each node's commit first passed where it stood as the client asked.
+            let mut committed: BTreeMap<u64, u64> = BTreeMap::new();
+            let (answer, _) = cell.until("the client's answer", |c| {
+                note(c, &commits, at, &mut committed);
+                c.asked.take()
+            });
+            let answered = cell.now_ns() - at;
+            assert!(
+                matches!(answer.as_deref(), Ok([Answer::Registered { .. }])),
+                "seed {seed}: registration {serial} answered {answer:?}"
+            );
+            cell.until("every node commits it", |c| {
+                note(c, &commits, at, &mut committed);
+                if committed.len() == commits.len() {
+                    Some(())
+                } else {
+                    None
+                }
+            });
+            eprintln!(
+                "seed {seed}: command {serial}: the leader {leader} committed at {} ns, the client \
+                 answered at {answered} ns, each node committed at {committed:?} ns",
+                committed[&leader]
+            );
+            // The first command waits for its client's connection too.
+            if serial > 1 {
+                assert!(
+                    answered <= bound,
+                    "seed {seed}: command {serial} answered after {answered} ns, past its paths' \
+                     {bound} ns"
+                );
+            }
+        }
+    }
+}
+
+/// Notes the time, from `at`, at which each node's commit first passed where `commits` has it.
+fn note(cell: &Sim, commits: &BTreeMap<u64, u64>, at: u64, committed: &mut BTreeMap<u64, u64>) {
+    for (id, member) in &cell.members {
+        if member.status.is_some_and(|s| s.commit > commits[id]) {
+            committed.entry(*id).or_insert(cell.now_ns() - at);
+        }
+    }
+}

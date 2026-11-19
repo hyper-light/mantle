@@ -1210,6 +1210,17 @@ taken ahead of its replica is kept in front of the store's next (`node::answers`
 takes its answers in the order the log gave them. The look costs one check of each range with a
 write out; a waker that named its range (hyper-durable's `Owner::woken`) would spare even that.
 
+The look missed a source: the S3 listener's door, whose requests and body pieces tell of
+themselves only by a wake. A lone client's next PUT comes as the turn that answered its last one
+ends, and where that turn moved a range's commit, as it does on the node that leads the Name
+range, the process says a line: a request whose wake that await spent waited at the door for the
+node's next due time, the liveness stream's next heartbeat or its idle timeout, a timer's period
+rather than the request. So the waker every source
+holds (the logs, the volumes, the door) is the task's wrapped in a flag (`node::Woken`): each wake
+sets it before it wakes the task, and the wait takes it first, turning the node at once where one
+came since the last wait looked. A wake spent between turns is kept, from any source, and each
+turns the node once.
+
 A turn remakes nothing it keeps (research/71, step 5). The transport's events it takes, the
 replicas it drives with what each drive said, and the Raft messages they give each keep their
 storage across turns, emptied as they are handled, and the ranges' groups are looked up where the

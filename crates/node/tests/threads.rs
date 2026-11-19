@@ -58,6 +58,9 @@ fn a_volume_starts_the_threads_the_derivation_counts() {
     let started = threads() - before;
     // The node's own six, its runtime's watchdog among them, and its shard's are its process's,
     // not its storage's.
-    assert_eq!(started, derive::threads(1, &[depth], &[true]).unwrap() - 7);
+    assert_eq!(
+        started,
+        derive::threads(1, &[depth], &[true], 0).unwrap() - 7
+    );
     drop(storage);
 }

@@ -2,8 +2,10 @@
 //! metadata shard, docs/design/node.md §1.2) runs the engine as a thread with no shard does: its
 //! writes pay their shares of the trunk's maintenance synchronously, reading at once with no
 //! issuer, and a range's every row deleted and written again, as a snapshot's install does, reads
-//! back. A shard whose owner did not state it refuses the engine's synchronous calls. Each test
-//! runs on a thread of its own, since the statement is its thread's.
+//! back. Given maintenance workers, its compactions and packings run on them and the shard waits
+//! for their results where it must, as a plain thread does, though hyper-rt's channel refuses a
+//! shard's thread a blocking take. A shard whose owner did not state it refuses the engine's
+//! synchronous calls. Each test runs on a thread of its own, since the statement is its thread's.
 #![allow(
     clippy::unwrap_used,
     clippy::panic,
@@ -58,13 +60,20 @@ fn shard() -> LocalRuntime {
 }
 
 fn file(path: &Path) -> DeviceFile {
+    opened(path, true).unwrap()
+}
+
+fn opened(path: &Path, create: bool) -> Result<DeviceFile, Error> {
     DeviceFile::open(
         path,
-        true,
+        create,
         CachingRequest::Buffered,
         Alignment::new(CONFIG.page_size).unwrap(),
     )
-    .unwrap()
+    .map_err(|e| Error::Io {
+        op: "open a worker's file",
+        detail: e.to_string(),
+    })
 }
 
 /// A row as a Name range's are sized: a version's key and its record.
@@ -110,6 +119,61 @@ fn a_shard_that_may_wait_runs_the_engine_synchronously() {
                 assert_eq!(every_row(&mut db), second);
             })
             .unwrap();
+    })
+    .join()
+    .unwrap();
+}
+
+/// With workers, every checkpoint waits for the packing and the compactions out on them, which
+/// took a worker's message with a blocking take hyper-rt refuses on a shard's thread: the first
+/// checkpoint failed, "take a worker's message", and fenced the store. The shard now waits on the
+/// count of messages landed; every row reads back, the trunk compacted on the workers, and the
+/// store opened again stands at its last checkpoint.
+#[test]
+fn a_shard_that_may_wait_runs_its_maintenance_on_workers() {
+    std::thread::spawn(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.store");
+        mantle_engine::store::permit_blocking();
+        let at = path.clone();
+        shard()
+            .block_on(async move {
+                let mut db = ShardDb::create(file(&at), CONFIG, CONFIG.page_size, TRUNK).unwrap();
+                let again = at.clone();
+                db.set_workers_within(move || opened(&again, false), 2)
+                    .unwrap();
+                for i in 0..ROWS {
+                    let (k, v) = row(i, 1);
+                    db.put(&k, &v).unwrap();
+                    if i % 7 == 0 {
+                        db.checkpoint(i + 1).unwrap();
+                    }
+                }
+                db.checkpoint(ROWS).unwrap();
+                let (_, trunk, _) = db.stats();
+                assert!(
+                    trunk.pivot_compactions + trunk.leaf_compactions > 0,
+                    "{trunk:?}"
+                );
+                let (seats, _) = db.workers().unwrap();
+                assert!((1..=2).contains(&seats), "{seats} seats");
+                let first: Vec<_> = (0..ROWS).map(|i| row(i, 1)).collect();
+                assert_eq!(every_row(&mut db), first);
+            })
+            .unwrap();
+        let reopened = shard()
+            .block_on(async move {
+                let (mut db, applied) = ShardDb::open(
+                    opened(&path, false).unwrap(),
+                    CONFIG,
+                    CONFIG.page_size,
+                    TRUNK,
+                )
+                .unwrap();
+                (applied, every_row(&mut db).len() as u64)
+            })
+            .unwrap();
+        assert_eq!(reopened, (ROWS, ROWS));
     })
     .join()
     .unwrap();

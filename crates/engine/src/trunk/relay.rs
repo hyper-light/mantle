@@ -278,7 +278,13 @@ pub(crate) fn spawn<F: BlockFile + Send + 'static>(
                 op: "make a relay's channel back",
                 detail: error.to_string(),
             })?;
-        let back = std::mem::replace(&mut seat.back, relay_back);
+        let back = std::mem::replace(
+            &mut seat.back,
+            BackChannel {
+                tx: relay_back,
+                signal: Arc::default(),
+            },
+        );
         let thread = |name: String, f: Box<dyn FnOnce() + Send>| {
             std::thread::Builder::new()
                 .name(name)

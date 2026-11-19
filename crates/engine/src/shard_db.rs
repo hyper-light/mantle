@@ -1310,7 +1310,21 @@ impl<F: BlockFile> ShardDb<F> {
     /// cannot be made (`Pool::new`).
     pub fn set_workers(
         &mut self,
+        open: impl FnMut() -> Result<F, Error> + Send + 'static,
+    ) -> Result<(), Error>
+    where
+        F: Send + 'static,
+    {
+        self.set_workers_within(open, Pool::cores())
+    }
+
+    /// [`Self::set_workers`] with at most `most` workers, at least one: the bound an owner that
+    /// counts its workers' threads and memory states (a node, docs/design/node.md §1.4), within
+    /// the cores the OS reports less this thread.
+    pub fn set_workers_within(
+        &mut self,
         mut open: impl FnMut() -> Result<F, Error> + Send + 'static,
+        most: usize,
     ) -> Result<(), Error>
     where
         F: Send + 'static,
@@ -1323,7 +1337,7 @@ impl<F: BlockFile> ShardDb<F> {
         let per_worker = self
             .store
             .write_reservation_for(self.worker_attach.as_ref().map(|(_, n)| *n))?;
-        let mut most = Pool::cores();
+        let mut most = most.clamp(1, Pool::cores());
         if let Some(memory) = self.memory {
             let (cache, _, records) = self.memory_held();
             let used = self
@@ -5182,9 +5196,25 @@ impl<F: BlockFile> ShardDb<F> {
         let t = if self.timed { Some(now) } else { None };
         let mut stalled = false;
         if self.packing.is_some() && !self.hand_off_sorted()? {
-            // No worker free for it, or one the shard packs: built here, its branch after the
-            // older ones'.
-            self.finish_packing()?;
+            // No worker free for it: the shard waits for one to free rather than write the
+            // branch on its own thread, which a node's shard shares with its transport
+            // (docs/design/node.md §1.2), each wait taking one worker's message. It builds the
+            // branch here, after the older ones', only once no job is out to free a seat, a
+            // worker waits for extents, or no worker may sort it.
+            while self.packing.as_ref().is_some_and(|p| p.sort.is_some()) {
+                let Some(pool) = self.trunk.pool_mut() else {
+                    break;
+                };
+                if pool.needs_wanted() > 0 || !pool.wait_any(&mut self.store)? {
+                    break;
+                }
+                if self.hand_off_sorted()? {
+                    break;
+                }
+            }
+            if self.packing.is_some() {
+                self.finish_packing()?;
+            }
             stalled = true;
         }
         // Whatever froze them (this rotation, or a put's share that fed one whole), no more stay

@@ -26,6 +26,7 @@
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -233,6 +234,63 @@ pub(crate) enum Message {
 /// for every worker, so no send can wait on a shard that waits on that worker.
 const MESSAGES_A_WORKER: usize = 2;
 
+/// The messages the workers sent on the channel back, counted as each lands there
+/// ([`BackChannel`]), for an owner whose thread runs a hyper-rt shard: hyper-rt's channel refuses
+/// a blocking take on a shard's thread (`ChannelReceiver::blocking_recv`), and an owner that
+/// states its shard may wait on the device (`store::permit_blocking`, a node's ranges) waits on
+/// this count instead ([`Pool::wait_message`]). Its one waiter is the pool's owner, so a `Condvar`
+/// wakes it alone (docs/design/node.md §1.3).
+#[derive(Debug, Default)]
+struct Signal {
+    sent: Mutex<u64>,
+    moved: Condvar,
+}
+
+impl Signal {
+    /// One more message landed. Wrapping: only the count's change is read.
+    fn note(&self) {
+        // A poisoned count is left as it is: the owner's wait on it reports the poison.
+        if let Ok(mut sent) = self.sent.lock() {
+            *sent = sent.wrapping_add(1);
+        }
+        self.moved.notify_one();
+    }
+
+    /// The count now; none once a holder of the count unwound.
+    fn seen(&self) -> Option<u64> {
+        self.sent.lock().ok().map(|sent| *sent)
+    }
+
+    /// Waits until the count is past `seen`: the count then.
+    fn wait_past(&self, seen: u64) -> Option<u64> {
+        let sent = self.sent.lock().ok()?;
+        self.moved
+            .wait_while(sent, |sent| *sent == seen)
+            .ok()
+            .map(|sent| *sent)
+    }
+}
+
+/// A worker's channel back to its pool, each message counted in the pool's [`Signal`] once it is
+/// in the channel.
+#[derive(Clone, Debug)]
+struct BackChannel {
+    tx: Sender<Message>,
+    signal: Arc<Signal>,
+}
+
+impl BackChannel {
+    /// Sends `message`, then counts it; refused once the pool's end is gone.
+    fn blocking_send(&self, message: Message) -> Result<(), Error> {
+        let sent = self
+            .tx
+            .blocking_send(message)
+            .map_err(|_| gone("send a worker's message"));
+        self.signal.note();
+        sent
+    }
+}
+
 /// A worker's ends of its channels: its jobs, its grants' top-ups, and the shard's one channel
 /// back, which holds [`MESSAGES_A_WORKER`] for each worker.
 #[derive(Debug)]
@@ -240,7 +298,7 @@ pub struct Seat {
     pub id: usize,
     jobs: Receiver<Box<Job>>,
     more: Receiver<Result<TopUp, Error>>,
-    back: Sender<Message>,
+    back: BackChannel,
     /// The device's issuer and the batches the worker may have out on it, when the shard has
     /// one: its store's writes then go to the device while the worker builds on.
     attach: Option<(Attacher, usize)>,
@@ -373,7 +431,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
     retire(store, &back, id);
 }
 
-fn retire<F: BlockFile>(store: Store<F>, back: &Sender<Message>, id: usize) {
+fn retire<F: BlockFile>(store: Store<F>, back: &BackChannel, id: usize) {
     // Raw Drop is unacknowledged cleanup. Explicit terminal retirement must report
     // the worker attachment's lifecycle error before its return sender reaches EOF.
     // Normal close has consumed Done; after unwind a bounded sender waits for its slot.
@@ -566,6 +624,8 @@ pub struct Pool {
     /// its workers' messages; plain threads send and take on it as on a std channel.
     back: Option<Sender<Message>>,
     messages: ChannelReceiver<Message>,
+    /// The messages sent on `back`, for a wait on a shard's thread ([`Signal`]).
+    signal: Arc<Signal>,
     /// Jobs back for an owner other than the one taking: at most every job the owners have out
     /// (one node's compactions, the memtables' packings), since a worker freed here can take its
     /// next job before its owner takes this one.
@@ -647,6 +707,7 @@ impl Pool {
             workers: Vec::new(),
             back: Some(back),
             messages,
+            signal: Arc::default(),
             undelivered: VecDeque::new(),
             needs: VecDeque::new(),
             growing: None,
@@ -1240,7 +1301,10 @@ impl Pool {
         // Each channel holds what one worker can have waiting: one job, one top-up.
         let (jobs, job_rx) = sync_channel(1);
         let (more, more_rx) = sync_channel(1);
-        let back = self.back.clone().ok_or(gone("start a worker"))?;
+        let back = BackChannel {
+            tx: self.back.clone().ok_or(gone("start a worker"))?,
+            signal: Arc::clone(&self.signal),
+        };
         let seat = Seat {
             id: at,
             jobs: job_rx,
@@ -1309,14 +1373,14 @@ impl Pool {
             Ok(Some(m)) => m,
             Ok(None) if wait => {
                 let t = Instant::now();
-                let m = match self.messages.blocking_recv() {
-                    Ok(message) => message,
-                    Err(_) if self.closing && self.back.is_none() => {
+                let m = match self.wait_message() {
+                    Some(message) => message,
+                    None if self.closing && self.back.is_none() => {
                         self.closed = true;
                         self.waiting = false;
                         return Ok(false);
                     }
-                    Err(_) => return Err(gone("take a worker's message")),
+                    None => return Err(gone("take a worker's message")),
                 };
                 let waited = ns(Instant::now().saturating_duration_since(t));
                 self.waited_ns = self.waited_ns.saturating_add(waited);
@@ -1331,6 +1395,29 @@ impl Pool {
             Err(_) => return Err(gone("take a worker's message")),
         };
         self.accept(store, message)
+    }
+
+    /// Waits for the workers' next message: parked on the channel on a plain thread, and on a
+    /// shard's thread whose owner states it may wait (`store::permit_blocking`), where hyper-rt's
+    /// channel refuses a blocking take, on the count of messages landed ([`Signal`]). Each message
+    /// lands before it is counted, so one landing after the count is read is taken by the next
+    /// look or moves the count past it: each pass ends on a message or on one more counted, never
+    /// on a clock. None when the channel is closed, the shard's owner did not state it, or the
+    /// count's lock was poisoned.
+    fn wait_message(&mut self) -> Option<Message> {
+        if hyper_rt::registry::current_shard().is_none() {
+            return self.messages.blocking_recv().ok();
+        }
+        if !crate::store::blocking_permitted() {
+            return None;
+        }
+        let mut seen = self.signal.seen()?;
+        loop {
+            if let Some(message) = self.messages.try_recv().ok()? {
+                return Some(message);
+            }
+            seen = self.signal.wait_past(seen)?;
+        }
     }
 
     pub(crate) fn accept<F: BlockFile>(

@@ -108,7 +108,10 @@ MID_DEADLINE=${MID_DEADLINE:-2400}
 LEAN_DEADLINE=${LEAN_DEADLINE:-900}
 TAIL_DEADLINE=${TAIL_DEADLINE:-7200}
 QUIC_DEADLINE=${QUIC_DEADLINE:-600}
-PORT=39500
+# A case's port, and on the box its eight CPUs' first: another runner beside this one on the same
+# batch takes a port and eight CPUs of its own, claiming each case it runs by writing its status
+# first ("claimed CLAIM"), which every other runner then leaves to it.
+PORT=${PORT:-39500}
 KEY=AKIAIOSFODNN7EXAMPLE
 SECRET='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
 # A case needs a cell's three volumes and its objects: never started with less free.
@@ -227,7 +230,9 @@ plan() {
 # The CPUs a case's processes take, and how many busy loops share them.
 cpus_of() {
   case $MACHINE:$1 in
-    box:cpu1) echo 8 ;; box:cpu2) echo 8-9 ;; box:*) echo 8-15 ;;
+    box:cpu1) echo "${BOX_CPU0:-8}" ;;
+    box:cpu2) echo "${BOX_CPU0:-8}-$((${BOX_CPU0:-8} + 1))" ;;
+    box:*) echo "${BOX_CPU0:-8}-$((${BOX_CPU0:-8} + 7))" ;;
     vm:cpu1) echo 0 ;; vm:cpu2) echo 0-1 ;; vm:*) echo "0-$(($(vm_cpus) - 1))" ;;
     *) echo all ;;
   esac
@@ -465,7 +470,7 @@ run_case() {
     *) echo "no case $1" >&2; return 1 ;;
   esac
   [[ $name =~ ^(box|mac|vm)_[a-z0-9]+_[A-Za-z0-9-]+_r[0-9]+$ ]] || { echo "a case's name: $name" >&2; return 1; }
-  [ -e "$RAW/$name.status" ] && return 0
+  if [ -e "$RAW/$name.status" ] && ! grep -qx "claimed ${CLAIM:-none}" "$RAW/$name.status"; then return 0; fi
   if [ "$kind" = excluded ]; then
     echo "excluded 0 $note" > "$RAW/$name.status"
     return 0

@@ -187,6 +187,53 @@ pub struct NodeSettings<E> {
     pub issuer: Option<crate::enroll::Issuer>,
 }
 
+impl<E> NodeSettings<E> {
+    /// What the node states of itself for its transport's bounds as it opens ([`Node::open_on`]):
+    /// the nodes it may keep, its pinned nodes and seeds or every member but itself of a cell
+    /// whose members come and go (membership.md §9), which its ranges' messages go to, and the
+    /// gateways it pins; its gateway's native clients and the operations they draw on; its ranges,
+    /// their appends in flight and the lanes its shards give them; its volumes' transfers and its
+    /// chunk asks; its budget and its ranges' message bounds. `derive` gives a node the least
+    /// transport its statement holds (`bounds::least_transport`), the floor its limits take.
+    pub fn stated(&self) -> Result<Stated, NodeError> {
+        let messages = message_bounds(&self.ranges, self.chunk_bytes)?;
+        let inflight = self
+            .ranges
+            .iter()
+            .map(|h| h.range.settings.max_inflight_msgs)
+            .max()
+            .unwrap_or(0);
+        let pinned_nodes = self
+            .peers
+            .iter()
+            .filter(|p| p.role == Role::Node)
+            .count()
+            .saturating_add(self.seeds.len());
+        let node_peers = usize::try_from(self.max_nodes)
+            .map_err(|_| NodeError::Bounds("the cell's nodes".into()))?
+            .saturating_sub(1)
+            .max(pinned_nodes);
+        let others = self.peers.iter().filter(|p| p.role != Role::Node).count();
+        Ok(Stated {
+            peers: node_peers
+                .checked_add(others)
+                .ok_or_else(|| NodeError::Bounds("the peers".into()))?,
+            // A range's messages go to the cell's other nodes alone (`Node::send`).
+            replicas: node_peers,
+            clients: self.gateway.as_ref().map_or(0, |g| g.clients),
+            pool: self.gateway.as_ref().map_or(0, |g| g.objects),
+            ranges: self.ranges.len(),
+            inflight,
+            lanes: lanes(self.shards, self.ranges.len()),
+            transfers: self.storage.transfers(),
+            asked: self.chunk_asks,
+            transport_bytes: self.transport_bytes,
+            messages,
+            max_head: MAX_HEAD,
+        })
+    }
+}
+
 /// The wall clock a node stamps each entry it proposes with, nanoseconds since the Unix epoch: the
 /// entry's time, which every command in it takes as the leader's time from when the entry was
 /// proposed (`mantle_meta::wire::Entry::at_ns`).
@@ -1305,54 +1352,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
         let layout = Layout::new(&settings.dir);
         let run = layout.raise_run().map_err(at(Step::Storage))?;
-        let messages =
-            message_bounds(&settings.ranges, settings.chunk_bytes).map_err(at(Step::Budgets))?;
-        classes::state_bounds(messages)
+        let stated = settings.stated().map_err(at(Step::Budgets))?;
+        classes::state_bounds(stated.messages)
             .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
         // A pair for each peer a hosted range's configuration names ([`liveness_pairs`]), read
         // before the ranges are taken to open their replicas.
         let range_pairs = liveness_pairs(&settings.ranges).map_err(at(Step::Budgets))?;
-        let inflight = settings
-            .ranges
-            .iter()
-            .map(|h| h.range.settings.max_inflight_msgs)
-            .max()
-            .unwrap_or(0);
-        let clients = settings.gateway.as_ref().map_or(0, |g| g.clients);
-        // The nodes it may keep: its pinned nodes and seeds, or every member but itself of a cell
-        // whose members come and go (membership.md §9), and the gateways it pins.
-        let pinned_nodes = settings
-            .peers
-            .iter()
-            .filter(|p| p.role == Role::Node)
-            .count()
-            .saturating_add(settings.seeds.len());
-        let node_peers = usize::try_from(settings.max_nodes)
-            .map_err(|_| at(Step::Budgets)(NodeError::Bounds("the cell's nodes".into())))?
-            .saturating_sub(1)
-            .max(pinned_nodes);
-        let others = settings
-            .peers
-            .iter()
-            .filter(|p| p.role != Role::Node)
-            .count();
-        let stated = Stated {
-            peers: node_peers
-                .checked_add(others)
-                .ok_or_else(|| at(Step::Budgets)(NodeError::Bounds("the peers".into())))?,
-            // A range's messages go to the cell's other nodes alone (`Node::send`).
-            replicas: node_peers,
-            clients,
-            pool: settings.gateway.as_ref().map_or(0, |g| g.objects),
-            ranges: settings.ranges.len(),
-            inflight,
-            lanes: lanes(settings.shards, settings.ranges.len()),
-            transfers: settings.storage.transfers(),
-            asked: settings.chunk_asks,
-            transport_bytes: settings.transport_bytes,
-            messages,
-            max_head: MAX_HEAD,
-        };
+        // The nodes it may keep, and the native clients it admits.
+        let (node_peers, clients) = (stated.replicas, stated.clients);
         let limits = bounds::limits(&stated)
             .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
         let lane_window = limits.lane_window;

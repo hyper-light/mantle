@@ -760,7 +760,7 @@ impl Sim {
         member.armed = false;
         member.bound = None;
         let addresses = Vec::new();
-        let settings = NodeSettings {
+        let mut settings = NodeSettings {
             id,
             dir: member.dir.path().to_path_buf(),
             quic: "127.0.0.1:0".parse().unwrap(),
@@ -778,10 +778,8 @@ impl Sim {
                 .collect(),
             shards: std::num::NonZeroUsize::MIN,
             log: self.log,
-            transport_bytes: u64::try_from(
-                self.pki.peers(id).len() * 4 * hyper_transport::RECEIVE_CHUNK,
-            )
-            .unwrap(),
+            // The budget a node derives, from these settings' statement (below).
+            transport_bytes: 0,
             // A node started again draws afresh, as a process started again would.
             seed: Some(derived(
                 self.seed ^ (self.starts << 32),
@@ -805,6 +803,10 @@ impl Sim {
             seeds: Vec::new(),
             issuer: None,
         };
+        // The budget a node's configuration derives (`derive`'s transport class): the least its
+        // statement holds, each window at QUIC's initial window beside the messages' room, each
+        // connection's reserve and state and the receive ring at its most, and no receive chunk.
+        settings.transport_bytes = bounds::least_transport(&settings.stated().unwrap()).unwrap();
         self.starts += 1;
         let shard = member.shard;
         let tell = self.tell.clone();

@@ -78,13 +78,16 @@ fn at_rest(seed: u64) -> alloc::Counts {
 /// proofs' tail, no longer raises the floor, and the ten seconds ask 4,042 liveness writes where
 /// they asked 4,011, 31 more heartbeats' proofs, and count 540 allocations more, reallocations 0
 /// both. The rule changes no allocation site: what moved is when the stream sends and asks its
-/// writes, and the work that schedule gives. 95,768 since the transport budget's sizing holds the
-/// connections' state apart (`bounds::connections_state`): the cell's nodes state their budgets by
-/// hand, five peers' four receive chunks each (1,310,540 bytes), whose windows' ceiling the state
-/// takes from 74,550 bytes to 64,870 on macOS, below a chunk's 65,527, so a node holds no receive
-/// chunk where it held one a peer and copies each datagram into a buffer of its own: 126 more
-/// allocations, reallocations 0 both. On Linux the receive ring held apart (`bounds::ring_growth`)
-/// had already left them none.
+/// writes, and the work that schedule gives. 95,768 since the cell's nodes hold the budget a node
+/// derives (`derive`'s transport class), the least their statement holds (`NodeSettings::stated`,
+/// `bounds::least_transport`; 517,485 bytes on this Mac), where they had stated four receive
+/// chunks for each of their five peers by hand (1,310,540): at the floor a window's ceiling is
+/// QUIC's initial window, 12,000 bytes, below a chunk's 65,527, so a node holds no receive chunk,
+/// as no node at its floor does, and copies each datagram into a buffer of its own: 126 more
+/// allocations than the hand-stated chunk a peer gave, reallocations 0 both. The floor's windows
+/// are the same on every host, the receive ring and the connections' state held apart before them
+/// (`bounds::ring_growth`, `bounds::connections_state`); with those held apart, the hand-stated
+/// budget had held no chunk on Linux since the ring was, nor here since the state was.
 #[test]
 fn a_cell_at_rest_turns_without_remaking_what_a_turn_keeps() {
     let counts = at_rest(1);
@@ -162,18 +165,20 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// arrives, where the reply's was reserved at its own head's length as it was given, and the
 /// budget's spare buffers go round in another order: one allocation and 322 bytes more,
 /// reallocations 2,050 both. On Linux 33,545, derived as before and not yet counted there.
-/// 35,255 since the budget's sizing holds the connections' state apart
-/// (`bounds::connections_state`): the nodes' hand-stated budgets no longer hold a receive chunk a
-/// peer (the cell at rest's count), and each datagram the clients' run carries to a node is copied
-/// into a buffer of its own: 1,761 allocations and 5,483,027 bytes more, reallocations 2,046. On
-/// Linux 35,306, derived as before and not yet counted there; its ring had already left the nodes no
-/// chunk.
+/// 35,075 since the cell's nodes hold the budget a node derives, its floor (the cell at rest's
+/// count), where they held a receive chunk a peer of a budget stated by hand: each datagram the
+/// clients' run carries to a node is copied into a buffer of its own, and no window grows past
+/// QUIC's initial window: 1,581 allocations and 1,764,056 bytes more (17,562,009), reallocations
+/// 2,051. With the state held apart, the hand-stated budget's windows of 64,870 bytes had held no
+/// chunk either, and its run counted 35,255, carrying 7,021 datagrams where the floor's windows
+/// carry 6,873. On Linux 35,126, this Mac's and the 51 its sockets' batched headers add, derived
+/// and not yet counted there: the floor's windows are this Mac's.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        35_306
+        35_126
     } else {
-        35_255
+        35_075
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

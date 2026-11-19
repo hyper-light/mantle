@@ -1,8 +1,6 @@
 # The known call-graph cycles in mantle's built code (CLAUDE.md §10), as scripts/check-recursion.py
 # names them: each cycle's functions of mantle's, sorted and joined by ` | `, one cycle a line. The
 # list only shrinks: rewrite a cycle as flat work and take it off here.
-<mantle_engine::codec::zstd::decoder::Decoder>::step
-<mantle_engine::codec::zstd::decoder::Execution>::copy_from_dictionary
 <mantle_gateway::repair::Repairer>::read_more | <mantle_gateway::repair::Repairer>::rebuild
 <mantle_s3::json::Reader>::array | <mantle_s3::json::Reader>::object | <mantle_s3::json::Reader>::value
 <mantle_s3::json::Value>::write

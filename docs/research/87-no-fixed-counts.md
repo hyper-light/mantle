@@ -359,6 +359,50 @@ caches were wants, with them beside the data's, and in this order):
 The third step takes what the operations past the served took before: CI's granted node runs a
 stock client's ten operations where it ran 720, and a founder measured 4 deep ten where it ran 35.
 
+**Rule B for the caches, and every operation's windows at a chunk (2026-11-19, built).** A
+cache's share, however proportioned, takes bytes from the operations past those served: on the
+16 GiB host the third step left one operation where 13,765 ran (above). The order built since
+(the coordinator's decisions of 2026-11-19) is D for what bounds or carries the operations and B
+for the caches: (1) the capacity wants, as above; (2) the operations served; (3) the transport's
+growth for their connections, each share from QUIC's initial window to a receive chunk, whole
+while what remains holds it; (4) every operation more that what remains holds, each costing its
+client's windows at a receive chunk (`bounds::chunked_transport` at the operations, said as
+`transport_bytes`), so every operation's datagrams are cut from a chunk, not copied into a buffer
+of their own (hyper-transport's `receive`). Where (3) is short of whole the operations are those
+served and the transport's part raises each share's window past the initial one by it over the
+shares. The need counts (1) and (2), unchanged (14,005,933,370 bytes for the ladder founder on
+96 GiB at 36ad012b and now). No cache takes a share: `engine.cache_bytes` is each cache's want,
+the most it holds. The caches borrow, rule B's way, the bytes admission holds for the operations
+(`gateway.objects_bytes`) that no running operation is charged: each engine's cache on the node's
+shard holds its part of them, in proportion to the engines' wants (each the same, so the same
+part), at most its want (`admit::cache_part`), and gives it back at once, in the same turn on the
+shard where admission runs, before admission charges an operation bytes it holds
+(`node::host::lend`; `Cache::shrink`, its limit lowered and one bounded trim). Once a turn the
+caches grow back to their parts of what the turn left idle, keeping their pages (`Cache::grow`),
+resizing only where a part moved by a page. So at every moment the running operations' charges
+and the caches' bytes are within the operations' bytes, no operation waits on a cache, and idle
+bytes serve reads from memory. A range on another shard (`range_shards = spread`) borrows
+nothing, its cache not on the node's shard; a node that hosts no objects has no operations'
+memory, so its caches hold nothing. Derived (`derive::tests`, macOS aarch64; at 36ad012b, each
+operation's windows at QUIC's initial window, and now):
+
+| host | operations | the transport past its floor |
+|---|---|---|
+| 96 GiB, 32 cores, a 32 GiB volume, S3 | 71,522; 58,965 | 3,480,191 bytes; 9,469,140,408, its want |
+| 16 GiB, an 8 GiB volume | 13,764; 10,414 | 1,070,828 bytes; 1,672,772,277, its want |
+| CI's 7 GiB, a founder 4 deep | 31; 27 | 4,818,726 bytes; 5,620,335, its want |
+| CI's 7 GiB, a founder 64 or 256 deep | 10; 10 | none in each: what remains holds no growth |
+| CI's 7 GiB, a granted node | 714; 545 | 4,818,726 bytes; 88,801,293, its want |
+
+Counted: over random admissions, ends, reads and turns, three engines opened as the node opens
+them hold their charges and caches within the operations' bytes at every step; a cache an
+operation's charge emptied reads 100 pages for 100 gets of one row, and grown back once the
+operation ended none (`derive::tests::the_caches_borrow_the_operations_idle_bytes_and_give_them_back_before_they_are_charged`).
+The simulated cell of `tests/turn_allocs.rs` at a chunk each share counts 33,116 allocations and
+16,163,710 bytes against 34,319 and 17,557,473 at its floor (macOS aarch64). What a cache's
+borrowing gives a workload, its hits against the operations' room as the load moves, is
+measured in §4's matrix, not yet run.
+
 ## 5. What remains unknown
 
 - Whether `N*` learned from mixed sizes holds for the large ones. Each operation holds at most the

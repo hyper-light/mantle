@@ -270,11 +270,14 @@ measures the second, and derives the rest by these rules:
   resident metadata, whole while what remains holds them all, and when it holds less each the same
   part of its want, so the indexes and the engines fill together (`derive::shares`; the owner's
   choice of 2026-10-31); (2) the operations the node serves at least (`derive::served`: one at the
-  most one is charged, and with an S3 endpoint one stock client's parts); (3) the performance
-  wants, each engine's page cache and the transport's growth past its floor, sharing what remains
-  past (1) and (2) in proportion to their wants; (4) as many operations more as what remains past
-  those holds. The node's need (`memory.need`) counts (1) and (2) alone, so a node given its need
-  starts with every capacity want whole, and the performance wants take what a larger allowance
+  most one is charged, and with an S3 endpoint one stock client's parts); (3) the transport's
+  growth past its floor for the connections those operations open, each share from QUIC's
+  initial window to a receive chunk, whole while what remains holds it; (4) every operation more
+  that what remains past those holds, each costing its client's windows at a receive chunk, so
+  each operation's windows hold a chunk and its datagrams land without a copy. No page cache
+  takes a share: each engine's borrows the operations' idle bytes (below). The node's need
+  (`memory.need`) counts (1) and (2) alone, so a node given its need starts with every capacity
+  want whole, and the transport's growth and more operations take what a larger allowance
   leaves. The capacity wants: a
   volume's index a fragment at each of its blocks (`derive::index_wants`), and an engine the
   extents its rows take for the cell's blocks when each node's volumes hold what this node's do, an
@@ -288,27 +291,43 @@ measures the second, and derives the rest by these rules:
   rows, 89,208 millionths of an extent's bytes, and its allocator's own (`derive::engine_wants_for`,
   `shard_db::MEASURED_METADATA_PPM`, the owner's choice of 2026-10-23 over its statement for any
   keys, which holds a twentieth of the rows); an engine as many extents as its share holds
-  (`derive::engine_within`). Each engine's page cache is a performance want: every page of those
-  same extents, at the store's page size,
-  since the store's bytes an object are its file's length at its most, its pages as filled and
-  compaction's room counted, and the cache keeps live pages alone
-  (`derive::engine_cache_wants_for`); its share is `engine.cache_bytes`, as many verified pages as
-  it holds (`ShardDb::set_cache`, given as each range's engine is created or opened,
-  `process::engine`), at most its store's pages. With no cache every page a get or a one-row lookup
-  needed was a `pread` on the node's busy shard: 100 repeated gets of 1,100 Name-sized rows read 100
-  pages and 100 lookups 100, and none with the derived cache
-  (`derive::tests::a_range_opened_as_the_node_opens_it_reads_its_pages_from_its_derived_cache`). Its
-  want is the largest, about 11 times an engine's metadata's: at an object a 4 KiB block on each
-  node, five engines' caches want 2.2 times their volumes' bytes. Taken as a capacity want beside
-  the index and the metadata (24f78978), it pulled them below their wants on a host holding less
-  (a 16 GiB host with one 8 GiB volume: the index 469 MB of its 738 MB; a membership founder on
-  CI's 7 GiB macOS runner a fifth of its index's and metadata's wants) and raised `memory.need`
-  from 5.87 GB to 25.2 GB there. In rule D's order the 16 GiB host holds its index's 738 MB and
-  each engine's metadata's 346 MB whole, its one operation, and each cache 2.27 GB of its 3.86 GB
-  want, the transport the same part of its growth; 64 GiB holds every want whole and 39,723
-  operations past them; a ladder founder's 32 GiB volume on a 96 GiB host of 32 cores holds each
-  cache whole at 15.4 GB and the transport's growth whole, and 8,183 operations past them
-  (`derive::tests`). The transport's growth is its want past its floor
+  (`derive::engine_within`). Each engine's page cache wants every page of those same extents, at
+  the store's page size, since the store's bytes an object are its file's length at its most, its
+  pages as filled and compaction's room counted, and the cache keeps live pages alone
+  (`derive::engine_cache_wants_for`); its want, at most its store's pages, is `engine.cache_bytes`,
+  the most it holds, and no share of the split: it borrows the operations' bytes no running
+  operation holds (rule B for the caches, research/87 §4; `admit::cache_part`, `host::lend`).
+  Admission holds `gateway.objects_bytes` for the running operations' charges (§2.8); the bytes
+  none is charged are idle, and each range's engine on the node's shard holds its part of them,
+  in proportion to the engines' wants, each the same `engine.cache_bytes`, so the same part, at
+  most its want. Before admission charges an operation bytes the caches hold (an operation
+  admitted, a get's or a copy's window widened once its version is read, a copy's put, a
+  rebuild of the cell's repair), the caches shrink at once to their parts of what stays idle,
+  in the same turn on the node's shard where both run: no operation waits on a cache, and the
+  operations' charges and the caches' bytes are within `gateway.objects_bytes` at every moment.
+  A cache shrinks in one bounded trim (`Cache::shrink`): its limit lowered, its pages past it
+  freed by S3-FIFO's rule, each within its queue steps, and the chunks past the limit given back
+  with the pages they hold, so its memory is within its part too; the pages dropped are counted.
+  Once a turn the caches grow back to their parts of what the turn left idle, keeping their pages
+  (`Cache::grow`), so operations that end and begin within a turn move no cache, and a part that
+  moves by less than a page resizes none (`Engine::lend_cache`). A range on another shard
+  (`range_shards = spread`) borrows nothing, its cache not on the node's shard, and a node that
+  hosts no objects has no operations' memory to lend, so its caches hold nothing. With no cache
+  every page a get or a one-row lookup needed was a `pread` on the node's busy shard: 100 repeated
+  gets of 1,100 Name-sized rows read 100 pages and 100 lookups 100, and none with the derived cache
+  (`derive::tests::a_range_opened_as_the_node_opens_it_reads_its_pages_from_its_derived_cache`);
+  over random admissions, ends, reads and turns the charges and the caches' bytes stay within the
+  operations' bytes, and a cache an operation's charge emptied reads 100 pages for 100 gets, grown
+  back once it ended none
+  (`derive::tests::the_caches_borrow_the_operations_idle_bytes_and_give_them_back_before_they_are_charged`).
+  Its want is the largest, about 11 times an engine's metadata's: at an object a 4 KiB block on
+  each node, five engines' caches want 2.2 times their volumes' bytes. Taken as a capacity want
+  beside the index and the metadata (24f78978), it pulled them below their wants on a host holding
+  less (a 16 GiB host with one 8 GiB volume: the index 469 MB of its 738 MB; a membership founder
+  on CI's 7 GiB macOS runner a fifth of its index's and metadata's wants) and raised
+  `memory.need` from 5.87 GB to 25.2 GB there; given a share before the operations past those
+  served (f1db262e), the 16 GiB host ran one operation where it ran 13,765. Borrowing, it costs
+  none. The transport's growth is its want past its floor
   (`bounds::chunked_transport`, said as `transport.want`): each share at a receive chunk, 65,527
   bytes, where its floor's share is QUIC's initial window, 12,000, below a chunk, so a node at its
   floor holds no receive chunk and copies each datagram it receives into a buffer of its own. With
@@ -317,11 +336,17 @@ measures the second, and derives the rest by these rules:
   `QuicFlowController::MaybeIncreaseMaxWindowSize`; RFC 9000 §4.2 lets a receiver raise its
   limits as data is consumed; §3.3), and each peer's pool holds a chunk for its window's unread
   data, so a datagram is cut from a chunk: the simulated cell of `tests/turn_allocs.rs`, serving
-  the same writes and reads, asked 33,116 allocations and 16,163,710 bytes of the allocator at a
-  chunk each share against 34,319 and 17,557,473 at its floor. Its want is counted for the
-  connections the operations it serves open, its peers' and their clients'; its part of it is a
-  window between the two, each share past the initial window by that part of a chunk's growth
-  (`bounds::transport_at`), and each operation past those adds its client's windows at it. What no
+  the same writes and reads at the budget a node derives, asks fewer allocations and bytes of the
+  allocator at a chunk each share than at its floor: 33,116 allocations and 16,163,710 bytes
+  against 34,319 and 17,557,473 on macOS aarch64, the datagrams it carries cut from chunks, not
+  copied. Every operation's windows hold a chunk, its client's connections' and its pool's, so
+  each operation more costs them: a ladder founder's 32 GiB volume on a 96 GiB host of 32 cores runs 58,965 operations where
+  71,522 ran at QUIC's initial window (36ad012b), the 16 GiB host 10,414 where 13,764, and a
+  founder on CI's 7 GiB runner measuring four deep 27 where 31, the transport 9.47 GB and
+  1.67 GB past its floor on the first two (`derive::tests`). Where what remains past the capacity
+  wants and the operations served holds less than their connections' growth, the operations are
+  those served, and each share's window is past the initial one by the part over the shares
+  (`bounds::limits`): CI's founder measuring 64 or 256 deep runs ten at the floor. What no
   want takes goes to the
   engines' metadata, each up to what its share of the node directory's device holds: an empty
   object, a delete marker and an upload in progress make rows that no volume bounds. An engine had
@@ -580,9 +605,9 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry with the shell's bytes, its groups (the ranges and the liveness stream's), a checkpoint's cadence and what a group holds uncommitted past it of one `Ready` each (`mantle_range::ready_held`: as many entries as its bytes make of the least entry a range proposes, 13 bytes, and the term's empty first one, and its bytes with each entry's 5-byte shell), a cache of one largest entry a group, and a file holding every group's retention at once beside the least file the log runs in: a `Ready` goes in greedy parts of a frame's room, any two in a row more than a room, each a segment at most (`derive::log`). Before, entries were counted at the shell's 5 bytes, 2.6 times too many, and the file was the least, which one group's retention filled: a write past it is refused `Full`. Its memory: each group's slots, a deque doubled past its retained entries at hyper-log's 56 bytes a slot, its handle's unapplied entries and its cache, one group's slots again while they grow, and ten segments of the log's own buffers (`derive::log_bytes`; `tests/log_memory.rs`: every group at its retention, 112.6 MB at the peak of a 225.9 MB bound) |
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
-| `engine.cache_bytes` | derived | each range's engine's page cache, as many verified pages as its bytes hold (`ShardDb::set_cache`, given as `process::engine` creates or opens the range's engine): a performance want under rule D's order, sharing what remains past the capacity wants and the operations the node serves with the transport's growth in proportion to their wants, its want every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`, `derive::shares`), at most its store's pages |
+| `engine.cache_bytes` | derived | the most each range's engine's page cache holds, its want: every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`), at most its store's pages. No share of the split: each engine opens with no cache (`process::engine`) and borrows its part of the operations' bytes no running operation holds, giving it back at once before one is charged it (`admit::cache_part`, `host::lend`, `Engine::lend_cache`; rule B for the caches, research/87 §4) |
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
-| `transport_bytes` | derived | the transport's floor (`transport.floor`): what it holds besides QUIC's windows, the connections' state at the most connections it holds (`bounds::connections_state`) and the receive ring's growth at its most (`bounds::ring_growth`) among it, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`); and past it the part of its want (`transport.want`, each share at a receive chunk, `bounds::chunked_transport`) that rule D's third step gives it, in proportion with the engines' page caches past the capacity wants and the operations the node serves, each share's window past the initial window by that part of a chunk's growth (`bounds::transport_at`) |
+| `transport_bytes` | derived | the transport's floor (`transport.floor`): what it holds besides QUIC's windows, the connections' state at the most connections it holds (`bounds::connections_state`) and the receive ring's growth at its most (`bounds::ring_growth`) among it, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`); and past it its want whole (`transport.want`, each share at a receive chunk, `bounds::chunked_transport`) where what remains past the capacity wants and the operations the node serves holds those operations' connections at a chunk, every operation more costing its client's windows at a chunk; short of it, the operations are those served and its budget is its floor and what remains, each share's window past the initial window by it over the shares (`bounds::limits`) |
 | `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
 | `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor, the least a put or a get holds and still moves (§2.6's `⌈R·T/B⌉` at its least), a put and a get each holding the window the node learns of its own puts and gets, and a copy its put's that of the node's puts and its get's as many blocks as that put drains while one is read, where the operations' bytes hold it (§2.8, `crate::window`); the operations' bytes, what the memory holds past every class's floor and the indexes' and engines' wants (`gateway.objects_bytes`; research/87 §4 rule D), each operation charged what it holds at its own size (`derive::Charges`), and a ceiling of as many operations as those bytes hold at the least one holds (`gateway.objects`), within which the host admits as many as it learns its knee is (§2.8, `crate::admit`); the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals, and its file's write beside its blocks' (`put::most_commands`; gateway.md §2.2); one read each; and the node's enlistment (`derive::asks`). The memory an operation holds at its most: the larger of a put and a get of the schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
 | `memory.native` | derived | the most one native PUT or GET holds above the node's idle at `gateway.window`, the bound a body crossing the client, the host and the transport is held to (lean-doors step 5): the most an operation is charged (`derive::Charges::most`: its window of blocks at the largest block, `put::most_bytes` or `get::most_bytes`; a put's chunks copied to send for each block going down, one piece of its body, hyper-transport's `RECEIVE_CHUNK`, and its record of each block it wrote until its file names them, at the largest body a PUT or a part carries, `MAX_UPLOAD`, 5 GiB (`put::most_records`); a get's block taken), what one more operation adds beside its charge to the transport, the ranges, the listener and the runtime (the derivation's difference of the node at two operations and at one), and the host's records of it, its job and its boxed put or get (`node::record_bytes`) (`derive::native`). A put or a get admitted at a window it learned holds that window's blocks instead (`Charges::write`, `Charges::read`), at most `gateway.objects_bytes`; a get is admitted at the floor's window and takes the bytes for the window it learned once its version is read, before it holds those blocks; a copy holds its get's and its put's at once (`Charges::copy`), admitted at the floor's and fitted the same way once its source's version is read. A put's records (`mantle_gateway::put`'s `recorded` and `due`) grow with its body by design, a block's entry in each of two std B-trees: at most 212 bytes a block, each tree's node over the least entries every node but its root holds (`put::records_bytes`), and 1,056 for the roots; 138,008 at 5 GiB in blocks of one copy's 8,325,104 bytes, 646 of them. A put is charged its own body's (`put::records_for`, in `Charges::write`), so a node admits no more puts than it holds records for. Counted on macOS aarch64, about 146 bytes a block (`object_path.rs`'s `a_put_and_a_get_many_windows_long_hold_their_windows_bytes`, which holds each block more to the 212) |
@@ -2302,8 +2327,10 @@ window and doubles whenever its reader consumed a whole window within two round 
 growth reserved from the budget first, so it is `min(BDP, ceiling)` (hyper-transport's `credit`,
 after Chromium QUIC's `QuicFlowController::MaybeIncreaseMaxWindowSize`; RFC 9000 §4.1–4.2). It is
 a performance want in rule D's order (§1.4): after the capacity wants and the operations the
-node serves, beside the engines' page caches in proportion to their wants, for the connections
-those operations open; each operation past them adds its client's windows at the transport's.
+node serves, whole for the connections those operations open while what remains holds it; then
+each operation more costs its client's windows at a chunk, so every operation's windows hold a
+chunk and its datagrams land without a copy, at fewer operations for it (10,414 where 13,764 at
+the initial window on a 16 GiB host).
 Windows past a chunk at a path's bandwidth-delay product wait on the transport: its ceiling is
 fixed when the endpoint is made (`Limits::window_ceiling`), before any round trip is measured, so
 a ceiling past a chunk would be a guess at the path, and a share past the one the budget funds

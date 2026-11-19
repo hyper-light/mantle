@@ -335,6 +335,14 @@ impl Lanes {
             let Some((number, ask)) = self.waiting.pop_front() else {
                 break;
             };
+            // DIAGNOSTIC (repro/trace-2): a held ask asked of the node.
+            #[cfg(feature = "diag-trace")]
+            crate::diag_trace::ev2(
+                0,
+                crate::diag_trace::L_ASKED,
+                number,
+                crate::diag_trace::n(self.shard),
+            );
             self.ask(node, number, ask)?;
         }
         let mut at = 0;
@@ -370,6 +378,14 @@ impl Lanes {
                 if self.waiting.is_empty() && node.room(&ask) {
                     self.ask(node, number, ask)?;
                 } else {
+                    // DIAGNOSTIC (repro/trace-2): held by the node's task for want of its room.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev2(
+                        0,
+                        crate::diag_trace::L_WAIT,
+                        number,
+                        crate::diag_trace::n(self.shard),
+                    );
                     self.waiting.push_back((number, ask));
                 }
             }
@@ -539,6 +555,9 @@ impl Served {
 impl Serve for Served {
     fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
         if !self.room(&ask) {
+            // DIAGNOSTIC (repro/trace-2): refused for room, the shard holding as many as it keeps.
+            #[cfg(feature = "diag-trace")]
+            super::host::diag_asked(super::host::diag_ask_kind(&ask), &Err(NodeError::Asks));
             return Err(NodeError::Asks);
         }
         let number = self.next;
@@ -550,6 +569,9 @@ impl Serve for Served {
         };
         let held = self.held.of(Kind::pending(pending));
         *held = held.saturating_add(1);
+        // DIAGNOSTIC (repro/trace-2): the job's ask, numbered on its shard.
+        #[cfg(feature = "diag-trace")]
+        super::host::diag_asked(super::host::diag_ask_kind(&ask), &Ok(pending));
         self.gave.push(Out::Ask(number, ask));
         Ok(pending)
     }

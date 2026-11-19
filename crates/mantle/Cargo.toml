@@ -61,6 +61,13 @@ base64.workspace = true
 # with its process's allocations and `mantle bench doors` counts its own: a diagnostic, off by
 # default and never in a timed build, which allocates through the system allocator.
 count-allocs = []
+# DIAGNOSTIC, branch repro/trace-2 only, each off by default: `diag` is `mantle bench doors`' steady
+# windows (MANTLE_DIAG_STEADY), the command run around each bounded window (MANTLE_DIAG_HOOK) and
+# the `diag window` lines naming the window each server closed; `diag-trace` the stall trace
+# (`mantle_node::diag_trace`, MANTLE_DIAG_TRACE). diag-doors' `diag-stacks` is not carried: its
+# recorder reads hyper-measure's `alloc::is_set_aside`, a change to vendor/.
+diag = []
+diag-trace = ["diag", "mantle-node/diag-trace"]
 
 [dev-dependencies]
 # The real-process test of `mantle node` (tests/node.rs): the client's transport, the range's

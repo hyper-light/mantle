@@ -113,6 +113,9 @@ pub(crate) struct Parked {
     window: usize,
     deadline_ns: Option<u64>,
     until_ns: u64,
+    /// DIAGNOSTIC (repro/trace-2): the stall trace's id, given as it arrived.
+    #[cfg(feature = "diag-trace")]
+    diag: u64,
 }
 
 /// What the host waits on for an operation: a command, a read, or a chunk it asked.
@@ -167,6 +170,21 @@ pub(crate) struct Handover {
     charge: u64,
     window: usize,
     driven: Option<usize>,
+    /// DIAGNOSTIC (repro/trace-2): the stall trace's id.
+    #[cfg(feature = "diag-trace")]
+    diag: Diag,
+}
+
+/// DIAGNOSTIC (repro/trace-2): a job's stall trace id, and its put's window as last stamped
+/// (`Host::diag_window`).
+#[cfg(feature = "diag-trace")]
+#[derive(Default)]
+pub(crate) struct Diag {
+    id: u64,
+    window: [u64; 8],
+    /// Its last `J_HELD`'s values and time: stamped again where they changed or a sample's gap
+    /// passed (`diag_trace::SAMPLE_NS`), as a held job is held at every turn.
+    held: (u64, u64, u64),
 }
 
 /// An object operation the host runs: the door it came in by, its asker, and where it is.
@@ -201,6 +219,9 @@ pub(crate) struct Job {
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
+    /// DIAGNOSTIC (repro/trace-2): the stall trace's id, and its put's window as last stamped.
+    #[cfg(feature = "diag-trace")]
+    diag: Diag,
 }
 
 impl Job {
@@ -424,7 +445,18 @@ impl Host {
             charge,
             window,
             driven,
+            #[cfg(feature = "diag-trace")]
+            diag,
         } = *handed;
+        // DIAGNOSTIC (repro/trace-2): handed with its fields read to the shard it was placed on,
+        // or run where the node's task runs.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev2(
+            diag.id,
+            crate::diag_trace::J_HANDED,
+            driven.map_or(u64::MAX, crate::diag_trace::n),
+            u64::from(exchange.is_some()),
+        );
         let label = Some(labels::host(&op));
         self.jobs.push(Job {
             door: Door::Native(exchange, half),
@@ -438,6 +470,8 @@ impl Host {
             window,
             driven,
             label,
+            #[cfg(feature = "diag-trace")]
+            diag,
         });
     }
 
@@ -464,6 +498,11 @@ impl Host {
                 charge: job.charge,
                 window: job.window,
                 driven: job.driven,
+                #[cfg(feature = "diag-trace")]
+                diag: Diag {
+                    id: job.diag.id,
+                    ..Diag::default()
+                },
             }),
             exchange,
         ))
@@ -878,6 +917,8 @@ fn native_door() -> Option<(Native, Replies)> {
             drain: Drain::default(),
             room: None,
             driving: None,
+            #[cfg(feature = "diag-trace")]
+            diag: (0, 0),
         },
     ))
 }
@@ -1062,6 +1103,10 @@ pub(crate) struct Replies {
     /// writes it whole, or lets go of the reply, so the job gives its next or ends; none where the
     /// node's task runs the job, which it steps in its own turn.
     driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+    /// DIAGNOSTIC (repro/trace-2): the stall trace's id of the request it replies to, and when its
+    /// asker was last told its work is held, which is sampled (`diag_trace::SAMPLE_NS`).
+    #[cfg(feature = "diag-trace")]
+    diag: (u64, u64),
 }
 
 /// What a native get's client took of a piece the node's task held whole, timed from when the
@@ -1252,6 +1297,12 @@ impl Replies {
             .swap(false, std::sync::atomic::Ordering::Acquire)
         {
             to.working();
+            // DIAGNOSTIC (repro/trace-2): the job's asker told its work is held; sampled.
+            #[cfg(feature = "diag-trace")]
+            if now >= self.diag.1.saturating_add(crate::diag_trace::SAMPLE_NS) {
+                self.diag.1 = now;
+                crate::diag_trace::ev(self.diag.0, crate::diag_trace::N_VOUCHED, 0);
+            }
         }
         let mut whole = false;
         // The answer held, the channel's one, and the end behind it.
@@ -1372,6 +1423,12 @@ impl Replies {
         if now < bound {
             self.room = Some(bound);
             to.working();
+            // DIAGNOSTIC (repro/trace-2): the asker told its reply waits for room; sampled.
+            #[cfg(feature = "diag-trace")]
+            if now >= self.diag.1.saturating_add(crate::diag_trace::SAMPLE_NS) {
+                self.diag.1 = now;
+                crate::diag_trace::ev(self.diag.0, crate::diag_trace::N_VOUCHED, 1);
+            }
             return Wrote::Room;
         }
         self.room = None;
@@ -1440,6 +1497,10 @@ pub(crate) struct Feeding {
     /// of its moved, told as a piece or the end is given or the feeding is let go, so the job takes
     /// it; its door's (`Replies::driving`).
     driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+    /// DIAGNOSTIC (repro/trace-2): the stall trace's id, the body's bytes read off its exchange and
+    /// those given to its job.
+    #[cfg(feature = "diag-trace")]
+    diag: (u64, u64, u64),
 }
 
 /// What became of a body the node's task fed at a turn.
@@ -1537,12 +1598,53 @@ impl Feeding {
             self.dropping = true;
             return Fed::Moved;
         }
+        // DIAGNOSTIC (repro/trace-2): a piece's bytes, or the end's trailer's.
+        #[cfg(feature = "diag-trace")]
+        let (bytes, end) = match &piece {
+            Piece::Bytes(bytes, _) => (crate::diag_trace::n(bytes.len()), None),
+            Piece::End(trailer) => (
+                0,
+                Some(
+                    trailer
+                        .as_ref()
+                        .map_or(0, |t| crate::diag_trace::n(t.bytes.len())),
+                ),
+            ),
+            Piece::Refused(_) => (0, Some(u64::MAX)),
+        };
         match self.pieces.try_send(piece) {
             Ok(()) => {
+                // DIAGNOSTIC (repro/trace-2): given to the job.
+                #[cfg(feature = "diag-trace")]
+                {
+                    self.diag.2 = self.diag.2.saturating_add(bytes);
+                    match end {
+                        None => crate::diag_trace::ev2(
+                            self.diag.0,
+                            crate::diag_trace::N_FED,
+                            bytes,
+                            self.diag.2,
+                        ),
+                        Some(trailer) => crate::diag_trace::ev2(
+                            self.diag.0,
+                            crate::diag_trace::N_FED_END,
+                            self.diag.2,
+                            trailer,
+                        ),
+                    }
+                }
                 self.wake_job();
                 Fed::Moved
             }
             Err(SyncError::Full(piece)) => {
+                // DIAGNOSTIC (repro/trace-2): held, the job's channel full.
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev2(
+                    self.diag.0,
+                    crate::diag_trace::N_FED_HELD,
+                    bytes,
+                    self.diag.2,
+                );
                 self.held = Some(piece);
                 Fed::Still
             }
@@ -1631,6 +1733,8 @@ fn feed(
         empty: length == 0 && width == 0,
         dropping: false,
         driving,
+        #[cfg(feature = "diag-trace")]
+        diag: (0, 0, 0),
     }
 }
 
@@ -2727,6 +2831,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Ok(head) => sized(self.gateway.as_deref(), &self.windows, Moves::of_head(head)),
             Err(_) => (0, 0),
         };
+        // DIAGNOSTIC (repro/trace-2): the request arrived, before it is parked or started; its id
+        // rides with it while parked.
+        #[cfg(feature = "diag-trace")]
+        let diag = crate::diag_trace::id();
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev2(
+            diag,
+            crate::diag_trace::N_ARRIVED,
+            crate::diag_trace::n(self.host.jobs.len()),
+            crate::diag_trace::n(self.parked.len()),
+        );
         let parks = head.is_ok() && self.gateway.is_some() && !self.stopping();
         // Asked even behind parked requests: one the limit turns away tells it its clients ask
         // more than it admits.
@@ -2741,6 +2856,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 window,
                 deadline_ns,
                 until_ns: deadline_ns.unwrap_or_else(|| now.saturating_add(patience)),
+                #[cfg(feature = "diag-trace")]
+                diag,
             });
             return;
         }
@@ -2759,6 +2876,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             head,
             (deadline_ns, now, charge, window),
             slowed,
+            #[cfg(feature = "diag-trace")]
+            diag,
         );
     }
 
@@ -2780,9 +2899,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 for waiting in parked.iter() {
                     driver.endpoint().working(waiting.exchange);
                 }
+                // DIAGNOSTIC (repro/trace-2): each parked request vouched for, by its place.
+                #[cfg(feature = "diag-trace")]
+                for (place, waiting) in parked.iter().enumerate() {
+                    crate::diag_trace::ev2(
+                        waiting.diag,
+                        crate::diag_trace::N_PARKED_HELD,
+                        crate::diag_trace::n(parked.len()),
+                        crate::diag_trace::n(place),
+                    );
+                }
                 return;
             }
             self.parked.pop_front();
+            // DIAGNOSTIC (repro/trace-2): taken from where it waited, the parked, into a job, as the
+            // S3 door's request is taken from the door (`take_local`).
+            #[cfg(feature = "diag-trace")]
+            crate::diag_trace::ev(
+                first.diag,
+                crate::diag_trace::J_TAKEN,
+                crate::diag_trace::n(self.host.jobs.len()),
+            );
             let head = first.head.ok_or(ObjectError::Fields(0));
             let slowed = if !over {
                 None
@@ -2797,6 +2934,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 head,
                 (first.deadline_ns, now, first.charge, first.window),
                 slowed,
+                #[cfg(feature = "diag-trace")]
+                first.diag,
             );
         }
     }
@@ -2829,6 +2968,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         head: Result<Head, ObjectError>,
         (deadline_ns, now, charge, window): (Option<u64>, u64, u64, usize),
         slowed: Option<door::Slowed>,
+        #[cfg(feature = "diag-trace")] diag: u64,
     ) {
         // A client's operations act for the account its certificate names; one whose
         // connections have all gone since asking is no longer known, and nothing is taken.
@@ -2879,6 +3019,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if admitted_ns.is_some() {
             self.charge_admitted(charge);
         }
+        // DIAGNOSTIC (repro/trace-2): the reply's half knows its request.
+        #[cfg(feature = "diag-trace")]
+        let replies = {
+            let mut replies = replies;
+            replies.diag = (diag, 0);
+            replies
+        };
         self.replies.push((exchange, replies));
         self.host.jobs.push(Job {
             door: Door::Native(Some(exchange), native),
@@ -2892,6 +3039,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             window,
             driven,
             label: None,
+            #[cfg(feature = "diag-trace")]
+            diag: Diag {
+                id: diag,
+                ..Diag::default()
+            },
         });
     }
 
@@ -2904,7 +3056,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             denied,
             body,
             reply,
+            #[cfg(feature = "diag-trace")]
+            diag,
         } = request;
+        // DIAGNOSTIC (repro/trace-2): taken from the door into a job.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(
+            diag,
+            crate::diag_trace::J_TAKEN,
+            crate::diag_trace::n(self.host.jobs.len()),
+        );
         let now = hyper_rt::futures::now_ns();
         let mut admitted_ns = None;
         let (charge, window) = charged(self.gateway.as_deref(), &self.windows, &op);
@@ -2953,6 +3114,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // The S3 door's operations are driven where the node's task runs (node.md §2.9).
             driven: None,
             label,
+            #[cfg(feature = "diag-trace")]
+            diag: Diag {
+                id: diag,
+                ..Diag::default()
+            },
         });
     }
 
@@ -3101,6 +3267,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         let op = head.op(fields);
+        // DIAGNOSTIC (repro/trace-2): a native request's fields decoded into its operation.
+        #[cfg(feature = "diag-trace")]
+        if let Ok(op) = op.as_ref() {
+            crate::diag_trace::ev(job.diag.id, crate::diag_trace::N_DECODED, 0);
+            crate::diag_trace::op_key(job.diag.id, op);
+        }
         let admitted = job.charge;
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
         // A copy holds a get's window and a put's at once (`charged`), this job admitted at its
@@ -3177,6 +3349,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     let handed = std::sync::Arc::clone(&native.handed);
                     self.feeding
                         .push((exchange, feed(body, pieces, handed, driving)));
+                    // DIAGNOSTIC (repro/trace-2): the feeding knows its request.
+                    #[cfg(feature = "diag-trace")]
+                    if let Some((_, feeding)) = self.feeding.last_mut() {
+                        feeding.diag.0 = job.diag.id;
+                    }
                 }
                 None => job.work = Work::Draining(Box::new(Reply::slowed(door::Slowed::Door))),
             }
@@ -3413,6 +3590,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             if over {
                 let (exchange, mut replies) = self.replies.swap_remove(at);
+                // DIAGNOSTIC (repro/trace-2): the native reply over: written whole, refused, or
+                // its exchange gone.
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev(replies.diag.0, crate::diag_trace::J_END, 0);
                 for (_, feeding) in self.feeding.extract_if(.., |(fed, _)| *fed == exchange) {
                     replies.body = Some(feeding.let_go());
                 }
@@ -3505,6 +3686,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Fed::Over => {
                     self.fed = true;
                     let (exchange, feeding) = self.feeding.swap_remove(at);
+                    // DIAGNOSTIC (repro/trace-2): the feeding let go.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev2(
+                        feeding.diag.0,
+                        crate::diag_trace::N_FED_OVER,
+                        feeding.diag.2,
+                        u64::from(feeding.job_let_go()),
+                    );
                     let sender = feeding.let_go();
                     if let Some((_, replies)) = self
                         .replies
@@ -3573,6 +3762,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // go of the last piece and its client has sent more, whatever other traffic holds of
             // the endpoint's budget.
             let got = super::read_piece(endpoint, exchange, piece);
+            // DIAGNOSTIC (repro/trace-2): a piece read off the exchange.
+            #[cfg(feature = "diag-trace")]
+            if let Ok(read) = got
+                && read > 0
+            {
+                feeding.diag.1 = feeding.diag.1.saturating_add(crate::diag_trace::n(read));
+                crate::diag_trace::ev2(
+                    feeding.diag.0,
+                    crate::diag_trace::N_READ,
+                    crate::diag_trace::n(read),
+                    feeding.diag.1,
+                );
+            }
             let given = match got {
                 Ok(0) => Ok(Fed::Still),
                 Ok(_) => feeding.give(piece, moved),
@@ -3824,8 +4026,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 /// The node's task serves the host it lends out (node.md §2.9 step 6d): each of the host's asks
 /// by the node's own functions, as the host's steps called them when they were the node's.
 impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
+    #[cfg(not(feature = "diag-trace"))]
     fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
         Node::ask(self, ask)
+    }
+
+    /// DIAGNOSTIC (repro/trace-2): the ask of the job under way on this thread, kept or refused
+    /// for room.
+    #[cfg(feature = "diag-trace")]
+    fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+        let kind = diag_ask_kind(&ask);
+        let asked = Node::ask(self, ask);
+        diag_asked(kind, &asked);
+        asked
     }
 
     fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
@@ -3976,8 +4189,23 @@ impl Host {
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
         let waiting = self.jobs.iter().any(Job::waits_for_room);
         let due = waiting && now >= self.room_offered_ns.saturating_add(beat);
+        // DIAGNOSTIC (repro/trace-2): room freed this turn, on this host's shard.
+        #[cfg(feature = "diag-trace")]
+        if freed {
+            crate::diag_trace::ev2(
+                0,
+                crate::diag_trace::N_ROOM_FREED,
+                crate::diag_trace::n(self.jobs.iter().filter(|j| j.waits_for_room()).count()),
+                crate::diag_trace::n(self.jobs.len()),
+            );
+        }
         if freed || due {
-            self.offer_room(node, now)?;
+            self.offer_room(
+                node,
+                now,
+                #[cfg(feature = "diag-trace")]
+                (u64::from(freed) | u64::from(due) << 1),
+            )?;
         }
         if freed || due || !waiting {
             self.room_offered_ns = now;
@@ -4189,7 +4417,12 @@ impl Host {
             .jobs
             .get(at)
             .map_or((None, 0), |job| (job.label, job.pending.len()));
+        // DIAGNOSTIC (repro/trace-2): the job under way on this thread, which its asks stamp.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::set_current(self.jobs.get(at).map_or(0, |job| job.diag.id));
         let over = self.step_job(node, at)?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::set_current(0);
         if let Some(Job {
             door: Door::Native(_, native),
             ..
@@ -4219,8 +4452,18 @@ impl Host {
                 charge,
                 driven,
                 pending,
+                #[cfg(feature = "diag-trace")]
+                diag,
                 ..
             } = self.jobs.swap_remove(at);
+            // DIAGNOSTIC (repro/trace-2): the job over and gone.
+            #[cfg(feature = "diag-trace")]
+            crate::diag_trace::ev2(
+                diag.id,
+                crate::diag_trace::J_OVER,
+                crate::diag_trace::n(pending.len()),
+                0,
+            );
             let half = match door {
                 Door::Native(_, native) => {
                     native
@@ -4242,13 +4485,37 @@ impl Host {
     /// Asks again each chunk a put's or a get's driver holds for want of room, its volume's or the
     /// transport's, of the same volume; a driver that fails doing so ends its job as its failed
     /// answers do. A job past its client's patience is offered none: `bound_jobs` ends it.
-    fn offer_room<N: Serve>(&mut self, node: &mut N, now: u64) -> Result<(), NodeError> {
+    fn offer_room<N: Serve>(
+        &mut self,
+        node: &mut N,
+        now: u64,
+        #[cfg(feature = "diag-trace")] why: u64,
+    ) -> Result<(), NodeError> {
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get_mut(at) else {
                 continue;
             };
             if job.bounded(now) != Bounded::Held {
                 continue;
+            }
+            // DIAGNOSTIC (repro/trace-2): room offered to a job a chunk of whose waits for it.
+            #[cfg(feature = "diag-trace")]
+            if job.waits_for_room() {
+                let (put, get) = match &job.work {
+                    Work::Put(p) => (p.put.as_ref().is_some_and(Put::waits_for_room), false),
+                    Work::Get(g) => (false, g.get.as_ref().is_some_and(Get::waits_for_room)),
+                    Work::Copy(c) => (
+                        c.put.as_ref().is_some_and(Put::waits_for_room),
+                        c.get.as_ref().is_some_and(Get::waits_for_room),
+                    ),
+                    _ => (false, false),
+                };
+                crate::diag_trace::ev2(
+                    job.diag.id,
+                    crate::diag_trace::J_ROOM_OFFER,
+                    why,
+                    u64::from(put) | u64::from(get) << 1,
+                );
             }
             let (put, get) = match &mut job.work {
                 Work::Put(putting) => (putting.put.as_mut(), None),
@@ -4296,6 +4563,26 @@ impl Host {
                 Bounded::Held => {
                     if let Door::Native(_, native) = &job.door {
                         native.held();
+                    }
+                    // DIAGNOSTIC (repro/trace-2): the job held, its asker to be told so; sampled.
+                    #[cfg(feature = "diag-trace")]
+                    if let Some(job) = self.jobs.get_mut(at) {
+                        let (asks, room) = (
+                            crate::diag_trace::n(job.pending.len()),
+                            u64::from(job.waits_for_room()),
+                        );
+                        let (was_asks, was_room, at_ns) = job.diag.held;
+                        if (asks, room) != (was_asks, was_room)
+                            || now >= at_ns.saturating_add(crate::diag_trace::SAMPLE_NS)
+                        {
+                            job.diag.held = (asks, room, now);
+                            crate::diag_trace::ev2(
+                                job.diag.id,
+                                crate::diag_trace::J_HELD,
+                                asks,
+                                room,
+                            );
+                        }
                     }
                 }
                 // A chunk read waiting for room is the node's own wait, which no transport ends:
@@ -4353,9 +4640,22 @@ impl Host {
         }
         // Taken out while the node gives each its outcome, and given back with those still out.
         let mut pending = std::mem::take(&mut job.pending);
+        #[cfg(feature = "diag-trace")]
+        let diag = job.diag.id;
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
         pending.retain(|(asked, request)| match node.outcome(*asked) {
             Some(outcome) => {
+                // DIAGNOSTIC (repro/trace-2): an ask of the job's answered, a chunk's by its
+                // outcome's class.
+                #[cfg(feature = "diag-trace")]
+                {
+                    let (kind, number) = diag_kind(asked);
+                    crate::diag_trace::ev2(diag, crate::diag_trace::J_DONE, kind, number);
+                    if let Outcome::Chunk(chunk) = &outcome {
+                        let (class, detail) = diag_chunk(chunk);
+                        crate::diag_trace::ev2(diag, crate::diag_trace::J_CHUNK, class, detail);
+                    }
+                }
                 answered.push((*request, outcome));
                 false
             }
@@ -4364,9 +4664,14 @@ impl Host {
         if let Some(job) = self.jobs.get_mut(at) {
             job.pending = pending;
         }
+        // DIAGNOSTIC (repro/trace-2): the job under way on this thread, which its asks stamp.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::set_current(diag);
         for (request, outcome) in answered {
             self.answer_job(node, at, request, outcome, now)?;
         }
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::set_current(0);
         Ok(())
     }
 
@@ -5119,7 +5424,44 @@ impl Host {
                 break;
             }
         }
+        #[cfg(feature = "diag-trace")]
+        self.diag_window(at);
         Ok(false)
+    }
+
+    /// DIAGNOSTIC (repro/trace-2): a put's window as it waits after its turn, stamped where it
+    /// changed since the last: blocks going down and chunk asks out, a full block waiting and its
+    /// phase, chunks waiting for room and requests held for the node's room, requests asked and
+    /// ready.
+    #[cfg(feature = "diag-trace")]
+    fn diag_window(&mut self, at: usize) {
+        use crate::diag_trace::{J_WINDOW, J_WINDOW_ASKED, J_WINDOW_ROOM, J_WINDOW_WAIT, ev2, n};
+        let Some(job) = self.jobs.get_mut(at) else {
+            return;
+        };
+        let Work::Put(putting) = &job.work else {
+            return;
+        };
+        let Some(put) = putting.put.as_ref() else {
+            return;
+        };
+        let [going, waiting, roomless, asked, ready, phase] = put.diag_window();
+        let chunks = n(job
+            .pending
+            .iter()
+            .filter(|(pending, _)| matches!(pending, Pending::Chunk(_)))
+            .count());
+        let held = n(putting.waiting.len());
+        let window = [going, chunks, waiting, phase, roomless, held, asked, ready];
+        if window == job.diag.window {
+            return;
+        }
+        job.diag.window = window;
+        let id = job.diag.id;
+        ev2(id, J_WINDOW, going, chunks);
+        ev2(id, J_WINDOW_WAIT, waiting, phase);
+        ev2(id, J_WINDOW_ROOM, roomless, held);
+        ev2(id, J_WINDOW_ASKED, asked, ready);
     }
 
     /// Reads a put's body into its driver as far as the driver takes it, from its door's channel
@@ -5254,6 +5596,15 @@ impl Host {
                 })
             }
             put::Request::Block(_) | put::Request::File(_) | put::Request::Name(_) => {
+                // DIAGNOSTIC (repro/trace-2): a command not asked, the node holding as many as it
+                // keeps.
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev2(
+                    crate::diag_trace::current(),
+                    crate::diag_trace::J_ASK_ROOM,
+                    0,
+                    1,
+                );
                 Err(NodeError::Asks)
             }
         };
@@ -5416,6 +5767,8 @@ impl Host {
     /// job is over.
     fn send_held<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<Option<bool>, NodeError> {
         let bound_ns = self.jobs.get(at).map_or(0, Job::bound_ns);
+        #[cfg(feature = "diag-trace")]
+        let diag = self.jobs.get(at).map_or(0, |job| job.diag.id);
         let Some(Job {
             work: Work::Get(getting),
             door,
@@ -5443,6 +5796,10 @@ impl Host {
         let Some(reply) = getting.held.take() else {
             return Ok(None);
         };
+        // DIAGNOSTIC (repro/trace-2): a get's reply head goes, now that its driver has the range's
+        // first bytes.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::J_REPLY, 1);
         // The reply goes first, its bytes after it as the driver gives them.
         let sent = match door {
             Door::Local(local) => local.offer(door::Answer::Head(reply)),
@@ -6086,7 +6443,18 @@ impl Host {
                     };
                     node.ask(JobAsk::Read(g, query))
                 }),
-            complete::Request::File(_) | complete::Request::Name(_) => Err(NodeError::Asks),
+            complete::Request::File(_) | complete::Request::Name(_) => {
+                // DIAGNOSTIC (repro/trace-2): a command not asked, the node holding as many as it
+                // keeps.
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev2(
+                    crate::diag_trace::current(),
+                    crate::diag_trace::J_ASK_ROOM,
+                    0,
+                    1,
+                );
+                Err(NodeError::Asks)
+            }
         };
         match asked {
             Ok(pending) => {
@@ -7020,6 +7388,9 @@ impl Host {
             return Ok(false);
         };
         let (bound_ns, admitted) = (job.bound_ns(), job.admitted_ns.is_some());
+        // DIAGNOSTIC (repro/trace-2): a drained job's reply goes, a head or a slowing.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(job.diag.id, crate::diag_trace::J_REPLY, 0);
         match &mut job.door {
             // A put's body the node's task gives from the exchange is let go of, so the node's
             // task reads and drops the rest (`Node::feed_body`); the reply goes after it, the body
@@ -7111,6 +7482,14 @@ fn take_body(
             putting.taken = putting
                 .taken
                 .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+            // DIAGNOSTIC (repro/trace-2): what the put took of what it left of the last piece.
+            #[cfg(feature = "diag-trace")]
+            crate::diag_trace::ev2(
+                crate::diag_trace::current(),
+                crate::diag_trace::J_TOOK,
+                crate::diag_trace::n(took),
+                putting.taken,
+            );
             putting.carry.drain(..took.min(putting.carry.len()));
             if !putting.carry.is_empty() {
                 return Ok(());
@@ -7146,6 +7525,15 @@ fn take_body(
                 putting.taken = putting
                     .taken
                     .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                // DIAGNOSTIC (repro/trace-2): a piece taken off the channel into the put: what
+                // the put took of it, the body's bytes it took so far.
+                #[cfg(feature = "diag-trace")]
+                crate::diag_trace::ev2(
+                    crate::diag_trace::current(),
+                    crate::diag_trace::J_TOOK,
+                    crate::diag_trace::n(took),
+                    putting.taken,
+                );
                 if let Some(rest) = bytes.get(took..) {
                     putting.carry.extend_from_slice(rest);
                 }
@@ -8006,6 +8394,108 @@ fn get_answer(outcome: Outcome) -> get::Answer {
     }
 }
 
+/// DIAGNOSTIC (repro/trace-2): an ask's kind for the stall trace (0 a command, 1 a read, 2 a
+/// chunk), and its number.
+#[cfg(feature = "diag-trace")]
+fn diag_kind(pending: &Pending) -> (u64, u64) {
+    match pending {
+        Pending::Command(number) => (0, *number),
+        Pending::Read(number) => (1, *number),
+        Pending::Chunk(number) => (2, *number),
+    }
+}
+
+/// DIAGNOSTIC (repro/trace-2): a job's ask's kind, as [`diag_kind`] numbers it.
+#[cfg(feature = "diag-trace")]
+pub(super) fn diag_ask_kind(ask: &JobAsk) -> u64 {
+    match ask {
+        JobAsk::Command(..) => 0,
+        JobAsk::Read(..) => 1,
+        JobAsk::Put { .. } | JobAsk::Get { .. } => 2,
+    }
+}
+
+/// DIAGNOSTIC (repro/trace-2): an ask of the job under way on this thread, kept (`J_ASK`: its
+/// kind, its number) or refused for room (`J_ASK_ROOM`: its kind, 0); none outside a job's turn,
+/// as a driving shard's asks the node's task asks for it.
+#[cfg(feature = "diag-trace")]
+pub(super) fn diag_asked(kind: u64, asked: &Result<Pending, NodeError>) {
+    let id = crate::diag_trace::current();
+    if id == 0 {
+        return;
+    }
+    match asked {
+        Ok(pending) => {
+            let (_, number) = diag_kind(pending);
+            crate::diag_trace::ev2(id, crate::diag_trace::J_ASK, kind, number);
+        }
+        Err(NodeError::Asks) => crate::diag_trace::ev2(id, crate::diag_trace::J_ASK_ROOM, kind, 0),
+        Err(_) => {}
+    }
+}
+
+/// DIAGNOSTIC (repro/trace-2): a chunk ask's outcome for the stall trace: its class ([`taken`]: 0
+/// stored, 1 room, 2 refused, 3 full, 4 failed), and what said so: 0 stored, 1 a get's bytes, 10 +
+/// the volume's status and 100 + the transport's refusal, each in the order [`taken`] lists them.
+#[cfg(feature = "diag-trace")]
+fn diag_chunk(outcome: &ChunkOutcome) -> (u64, u64) {
+    let class = match taken(outcome) {
+        Taken::Stored => 0,
+        Taken::Room => 1,
+        Taken::Refused => 2,
+        Taken::Full => 3,
+        Taken::Failed => 4,
+    };
+    let detail = match outcome {
+        ChunkOutcome::Stored => 0,
+        ChunkOutcome::Read(_) => 1,
+        ChunkOutcome::Refused(status) => match status {
+            chunk::Status::Stored => 10,
+            chunk::Status::Busy => 11,
+            chunk::Status::Full => 12,
+            chunk::Status::Fenced => 13,
+            chunk::Status::Closed => 14,
+            chunk::Status::NoVolume => 15,
+            chunk::Status::Checksum => 16,
+            chunk::Status::TooLarge => 17,
+            chunk::Status::Corrupt => 18,
+            chunk::Status::Exists => 19,
+            chunk::Status::Malformed => 20,
+            chunk::Status::Failed => 21,
+            chunk::Status::Read => 22,
+            chunk::Status::NotFound => 23,
+            chunk::Status::Range => 24,
+        },
+        ChunkOutcome::Lost(refusal) => match refusal {
+            Refusal::Budget => 100,
+            Refusal::Exchanges => 101,
+            Refusal::LaneFull => 102,
+            Refusal::Lanes => 103,
+            Refusal::Events => 104,
+            Refusal::ReceiveBuffer => 105,
+            Refusal::Pending => 106,
+            Refusal::Identities => 107,
+            Refusal::Connections => 108,
+            Refusal::Busy => 109,
+            Refusal::Unsent => 110,
+            Refusal::Stalled => 111,
+            Refusal::Identity => 112,
+            Refusal::NotConnected => 113,
+            Refusal::Closed => 114,
+            Refusal::UnknownExchange => 115,
+            Refusal::Corrupt => 116,
+            Refusal::Quic => 117,
+            Refusal::Unknown => 118,
+            Refusal::Kind => 119,
+            Refusal::FrameBound => 120,
+            Refusal::Order => 121,
+            Refusal::Exhausted => 122,
+            Refusal::Configuration => 123,
+        },
+    };
+    (class, detail)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -8666,6 +9156,8 @@ pub(super) mod tests {
             charge: 0,
             window: 1,
             driven: None,
+            #[cfg(feature = "diag-trace")]
+            diag: Diag::default(),
             label: None,
         };
         assert!(job.held());
@@ -10193,6 +10685,8 @@ pub(super) mod tests {
             charge,
             window: 1,
             driven: None,
+            #[cfg(feature = "diag-trace")]
+            diag: Diag::default(),
             label: None,
         };
         (job, body_in, answers)
@@ -10881,6 +11375,8 @@ pub(super) mod tests {
             window: 1,
             driven: Some(1),
             label: None,
+            #[cfg(feature = "diag-trace")]
+            diag: Diag::default(),
         };
         (job, replies)
     }
@@ -11084,6 +11580,8 @@ pub(super) mod tests {
             charge,
             window: 1,
             driven: Some(1),
+            #[cfg(feature = "diag-trace")]
+            diag: Diag::default(),
         })
     }
 

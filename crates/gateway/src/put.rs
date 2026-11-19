@@ -726,6 +726,34 @@ impl Put {
         self.outcome.as_ref()
     }
 
+    /// DIAGNOSTIC (repro/trace-2): its window as the stall trace stamps it: the blocks going down,
+    /// whether a full block waits for a place among them, the chunks waiting for room, the requests
+    /// asked and unanswered, those ready and not yet polled, and its phase (0 body, 1 ended, 2
+    /// closing, 3 file, 4 name; 5 over).
+    #[cfg(feature = "diag-trace")]
+    pub fn diag_window(&self) -> [u64; 6] {
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let phase = if self.outcome.is_some() {
+            5
+        } else {
+            match self.phase {
+                Phase::Body => 0,
+                Phase::Ended => 1,
+                Phase::Closing => 2,
+                Phase::File => 3,
+                Phase::Name => 4,
+            }
+        };
+        [
+            count(self.going.len()),
+            u64::from(self.waiting.is_some()),
+            count(self.roomless.len()),
+            count(self.asked.len()),
+            count(self.ready.len()),
+            phase,
+        ]
+    }
+
     /// Runs a step; one that fails ends the PUT with its error, and what the PUT wrote is left
     /// to the sweeps (docs/design/gateway.md §2).
     fn guard<T>(

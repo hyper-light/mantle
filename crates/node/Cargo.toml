@@ -63,6 +63,13 @@ rustix.workspace = true
 # buffers, which the S3 listener's accept waits out (src/listener/mod.rs).
 windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
 
+[features]
+# DIAGNOSTIC, branch repro/trace-2 only: the stall trace (`diag_trace`), stamped on
+# CLOCK_MONOTONIC through rustix, so Unix only; on at run time where MANTLE_DIAG_TRACE names a
+# directory. Off by default: the default build compiles none of it. A put's window is read through
+# the gateway's own diagnostic (`Put::diag_window`).
+diag-trace = ["mantle-gateway/diag-trace"]
+
 [dev-dependencies]
 # The simulated device a simulated node's log runs on (tests/sim.rs).
 hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }

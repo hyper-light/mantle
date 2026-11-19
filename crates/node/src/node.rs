@@ -2594,6 +2594,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Err(NodeError::Task);
         }
         self.wait().await?;
+        // DIAGNOSTIC (repro/trace-2): the turn's start, the end of each of its phases and its end,
+        // each turn its id, its start and end with the thread's CPU time.
+        #[cfg(feature = "diag-trace")]
+        let diag = crate::diag_trace::id();
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(
+            diag,
+            crate::diag_trace::T_BEGIN,
+            if diag > 0 {
+                crate::diag_trace::cpu()
+            } else {
+                0
+            },
+        );
         self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
         self.take_inbox();
@@ -2602,6 +2616,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.liveness.poll(now, &mut self.asked);
         }
         self.act_on_liveness()?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 1);
         while let Some(event) = self.driver.endpoint().poll_event() {
             self.events.push(event);
         }
@@ -2612,7 +2628,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.on_event(event, now)?;
         }
         self.events = events;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 2);
         self.take_stored().await?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 3);
         self.take_shards(now)?;
         self.vouch_held(now);
         self.dial(now);
@@ -2621,25 +2641,53 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.schedule_due(now);
         self.drive(now)?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 4);
         self.take_door();
         self.take_parked();
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 5);
         self.step_host()?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 6);
         self.hand_off();
         self.serve_driving()?;
+        // DIAGNOSTIC (repro/trace-2): phases 9 to 11 are the calls 6 and 7 hold now: the driving
+        // shards served, the bodies fed, the replies written.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 9);
         self.feed_bodies();
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 10);
         self.write_replies()?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 11);
         self.observe_presence()?;
         self.step_repair()?;
         // What the turn's operations and repairs left idle, lent to the caches once a turn.
         self.lend_caches(0, true);
         self.step_asks(now)?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 7);
         self.step_reads(now)?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(diag, crate::diag_trace::T_PHASE, 8);
         self.step_replacements();
         self.step_members()?;
         self.step_enrollments(now)?;
         self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(
+            diag,
+            crate::diag_trace::T_END,
+            if diag > 0 {
+                crate::diag_trace::cpu()
+            } else {
+                0
+            },
+        );
         Ok(())
     }
 

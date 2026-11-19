@@ -127,6 +127,9 @@ struct Connection {
     admitted: Admitted,
     /// The client's address, which a principal's policy may name (`aws:SourceIp`).
     peer: Option<std::net::IpAddr>,
+    /// DIAGNOSTIC (diag-doors): the stall trace's id of the request under way.
+    #[cfg(feature = "diag-trace")]
+    diag: u64,
 }
 
 /// Serves `io`'s requests until the connection ends, then gives its descriptor back and its slot,
@@ -151,6 +154,8 @@ pub(super) async fn serve(
         door,
         admitted,
         peer,
+        #[cfg(feature = "diag-trace")]
+        diag: 0,
     };
     let ended = connection.requests().await;
     connection.end(ended).await;
@@ -237,6 +242,12 @@ impl Connection {
                     }
                 }
             };
+            // DIAGNOSTIC (diag-doors): a request's head read, its id fresh.
+            #[cfg(feature = "diag-trace")]
+            {
+                self.diag = crate::diag_trace::id();
+                crate::diag_trace::ev(self.diag, crate::diag_trace::H_HEAD, 0);
+            }
             // The head is kept apart, so the body after it can be read on.
             octets.clear();
             octets.extend_from_slice(self.input.unread().get(..head.len()).unwrap_or_default());
@@ -342,6 +353,9 @@ impl Connection {
             principal,
             plan,
         } = asked;
+        // DIAGNOSTIC (diag-doors): routed, signed and judged.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(self.diag, crate::diag_trace::H_AUTH, 0);
         let query = Query::parse(parts.query);
         let echo = Echo {
             route: &route,
@@ -542,12 +556,16 @@ impl Connection {
                 .refuse(&slow(&self.door), resource, ids, (version, head), unread)
                 .await;
         };
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::op_key(self.diag, &op);
         let request = door::Request {
             op,
             principal,
             denied,
             body: taken,
             reply: answers,
+            #[cfg(feature = "diag-trace")]
+            diag: self.diag,
         };
         // A door at its bound refuses before any of the body is read (node.md §4.5).
         if self.door.submit(request).is_err() {
@@ -555,6 +573,9 @@ impl Connection {
                 .refuse(&slow(&self.door), resource, ids, (version, head), unread)
                 .await;
         }
+        // DIAGNOSTIC (diag-doors): handed to the host through the door.
+        #[cfg(feature = "diag-trace")]
+        crate::diag_trace::ev(self.diag, crate::diag_trace::H_SUBMIT, 0);
         let mut body = body;
         let mut refused: Option<Refused> = None;
         loop {
@@ -566,10 +587,17 @@ impl Connection {
                     let Some((upload, _)) = body.take() else {
                         continue;
                     };
+                    // DIAGNOSTIC (diag-doors): the host wants the body.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_READY, 0);
                     if continues && self.io.write(write::CONTINUE).await.is_err() {
                         return Err(());
                     }
-                    match self.stream(framing, upload, &pieces).await {
+                    let streamed = self.stream(framing, upload, &pieces).await;
+                    // DIAGNOSTIC (diag-doors): the body handed on, or stopped.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_BODY_SENT, 0);
+                    match streamed {
                         Ok(()) => unread = false,
                         Err(Stopped::Refused(why)) => refused = Some(why),
                         // The host ended the job: its reply follows, and the body's rest is unread.
@@ -578,6 +606,9 @@ impl Connection {
                     }
                 }
                 Ok(Answer::Head(reply)) => {
+                    // DIAGNOSTIC (diag-doors): the host's reply came.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_REPLY, 0);
                     if let Some(why) = refused {
                         // The listener refused the body as it came: its answer, not the host's.
                         return self
@@ -598,15 +629,26 @@ impl Connection {
                             ..
                         } = response;
                         self.head(status, fields, version, unread, length)?;
+                        // DIAGNOSTIC (diag-doors): H_RESPONDED is stamped in `object`, as the head
+                        // goes with the first bytes.
                         self.object(&mut replies, length).await?;
                     } else {
                         self.respond(response, version, unread).await?;
+                        // DIAGNOSTIC (diag-doors): the response written.
+                        #[cfg(feature = "diag-trace")]
+                        crate::diag_trace::ev(self.diag, crate::diag_trace::H_RESPONDED, 0);
                     }
+                    // DIAGNOSTIC (diag-doors): the request done.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_END, 0);
                     return Ok(!unread);
                 }
                 // The host slowed it in place of a head: its cause, unless the listener refused
                 // the body first.
                 Ok(Answer::Slowed(cause)) => {
+                    // DIAGNOSTIC (diag-doors): the host's reply came, a slowing in place of a head.
+                    #[cfg(feature = "diag-trace")]
+                    crate::diag_trace::ev(self.diag, crate::diag_trace::H_REPLY, 0);
                     let why = refused.unwrap_or_else(|| respond::slowed(self.door.slowed(cause)));
                     return self
                         .refuse(&why, resource, ids, (version, head), unread)
@@ -674,6 +716,11 @@ impl Connection {
                         .write_pair(head_bytes, &bytes)
                         .await
                         .map_err(|_| ())?;
+                    // DIAGNOSTIC (diag-doors): the response's head written, with these bytes.
+                    #[cfg(feature = "diag-trace")]
+                    if head {
+                        crate::diag_trace::ev(self.diag, crate::diag_trace::H_RESPONDED, 0);
+                    }
                     head = false;
                     if let Some(full) = drained.full {
                         let ns = u64::try_from(full.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -688,6 +735,9 @@ impl Connection {
                     // An empty object's head goes alone.
                     if head {
                         self.io.write(&self.output).await.map_err(|_| ())?;
+                        // DIAGNOSTIC (diag-doors): the response's head written, alone.
+                        #[cfg(feature = "diag-trace")]
+                        crate::diag_trace::ev(self.diag, crate::diag_trace::H_RESPONDED, 0);
                     }
                     return Ok(());
                 }

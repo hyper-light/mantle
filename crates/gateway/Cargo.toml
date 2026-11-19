@@ -19,6 +19,11 @@ mantle-meta = { path = "../meta" }
 mantle-s3 = { path = "../s3" }
 thiserror.workspace = true
 
+[features]
+# DIAGNOSTIC, mantle's branch repro/trace-2 only: `Put::diag_window`, which mantle-node's stall
+# trace reads. Off by default.
+diag-trace = []
+
 [dev-dependencies]
 # A GET's allocations and bytes, counted by its allocator (tests/object_path.rs).
 hyper-measure = { path = "../../vendor/hyper-measure" }

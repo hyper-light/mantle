@@ -4563,6 +4563,24 @@ impl<F: BlockFile> ShardDb<F> {
         self.idle_step_with(keys, false)
     }
 
+    /// [`Self::idle_step`] for a shard that serves requests between its steps, as a node's turn
+    /// does (docs/design/node.md §2.9), waiting for nothing: what the workers finished is taken
+    /// and what is due handed out, and a job still out leaves its work owed rather than be waited
+    /// for, so the step lasts its `keys`. The work is the runtime's idle slice's (`idle_owed`): an
+    /// active memtable's runs merge only once scans paid for it. Returns the work done and whether
+    /// such work is still owed; none while a checkpoint holds the trunk.
+    pub fn idle_step_now(&mut self, keys: u64) -> Result<(u64, bool), Error> {
+        if !self.idle_owed() {
+            return Ok((0, false));
+        }
+        self.trunk.clear_io_wait();
+        let done = self.idle_step_with(keys, true)?;
+        let f = &mut self.flush_stats;
+        f.idle_slices = f.idle_slices.saturating_add(1);
+        f.idle_units = f.idle_units.saturating_add(done);
+        Ok((done, self.idle_owed()))
+    }
+
     /// A range task's turn: what the workers sent back since its last turn is taken, a growth
     /// back or booked once due and packed branches retired, their needs answered, and the shares
     /// of the work owed that the turn's puts wrote paid, once a turn rather than at every put

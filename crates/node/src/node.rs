@@ -82,6 +82,7 @@ mod repair;
 mod shard;
 mod spread;
 mod stop;
+mod upkeep;
 use answers::Answers;
 pub use host::GatewaySettings;
 pub(crate) use host::record_bytes;
@@ -1283,6 +1284,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The replacements that ended while this node led, since the last call
     /// ([`Node::take_replaced`]).
     replaced: Vec<(u128, Replacement)>,
+    /// Its ranges' engines' maintenance in the time its turns leave ([`upkeep`]).
+    upkeep: upkeep::Upkeep,
     snapshots_sent: u64,
     snapshots_taken: u64,
     /// Each range's timing before a measure, to tell which moved.
@@ -1790,6 +1793,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             frame: Vec::new(),
             applied: Vec::new(),
             replaced: Vec::new(),
+            upkeep: upkeep::Upkeep::default(),
             snapshots_sent: 0,
             snapshots_taken: 0,
             timings: Vec::new(),
@@ -2775,6 +2779,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Err(NodeError::Task);
         }
         self.wait().await?;
+        let began = std::time::Instant::now();
         self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
         self.take_inbox();
@@ -2821,6 +2826,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;
+        // Last, once the turn's reads, writes and messages are out: its ranges' engines'
+        // maintenance, a turn's budget of it (`upkeep`).
+        self.upkeep_ranges(began)?;
         Ok(())
     }
 
@@ -2937,6 +2945,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// (`Liveness::on_wait`).
     async fn wait(&mut self) -> Result<(), NodeError> {
         if self.owner.has_work() || self.answered().await? {
+            return Ok(());
+        }
+        // A range's engine owes maintenance: the turn comes again at once, after the shard's other
+        // tasks had theirs (`upkeep`).
+        if self.upkeep.owed() {
+            hyper_rt::futures::yield_now().await;
             return Ok(());
         }
         let now = hyper_rt::futures::now_ns();

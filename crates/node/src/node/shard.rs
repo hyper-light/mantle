@@ -1177,6 +1177,8 @@ struct Shard<E: Engine, S: LogStore> {
     compact: bool,
     /// Where the node's shard asked its ranges' engines back ([`In::Release`]).
     release: Option<OneshotSender<Vec<(u128, E)>>>,
+    /// Its ranges' engines' maintenance in the time its turns leave (`node::upkeep`).
+    upkeep: super::upkeep::Upkeep,
 }
 
 impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
@@ -1611,6 +1613,29 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
         }
     }
 
+    /// A turn's maintenance of the shard's ranges' engines, once what the turn gave is handed on,
+    /// after `own_ns` of the turn's own work (`node::upkeep`).
+    fn upkeep(&mut self, own_ns: u64) -> Result<(), NodeError> {
+        let Self {
+            upkeep,
+            ranges,
+            owner,
+            ..
+        } = self;
+        upkeep.turn(own_ns, ranges.len(), |at, units| {
+            let Some(kept) = ranges.get(at) else {
+                return Ok((0, false));
+            };
+            match owner.get_mut(kept.handle) {
+                Some(replica) => {
+                    super::upkeep::step(kept.group, replica.machine_mut().engine_mut(), units)
+                }
+                None => Ok((0, false)),
+            }
+        })?;
+        Ok(())
+    }
+
     /// When the shard's task wakes though nothing arrives: its earliest deadline, at most the idle
     /// timeout away, as every wait of the node's is bounded.
     fn sleep_ns(&self, now: u64) -> u64 {
@@ -1666,9 +1691,11 @@ async fn run<E: Engine + 'static, S: LogStore>(
         waker,
         compact: false,
         release: None,
+        upkeep: super::upkeep::Upkeep::default(),
     };
     let mut arrived = None;
     loop {
+        let began = std::time::Instant::now();
         let mut stopped = arrived.take().and_then(|sent| shard.take(sent).err());
         for _ in 0..capacity {
             if stopped.is_some() {
@@ -1694,6 +1721,8 @@ async fn run<E: Engine + 'static, S: LogStore>(
                 .map(|()| shard.replace())
                 .err();
         }
+        // The turn's own work, not its wait for the lane's room below.
+        let own_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         for out in shard.gave.drain(..) {
             if given.send(out).await.is_err() {
                 return;
@@ -1703,9 +1732,14 @@ async fn run<E: Engine + 'static, S: LogStore>(
             let _ = given.send(Out::Stopped(error)).await;
             return;
         }
-        // With work still queued the task yields once, so the shard's other tasks run between
-        // its turns, and turns again.
-        if shard.owner.has_work() || shard.answered() {
+        // Last, its ranges' engines' maintenance, a turn's budget of it.
+        if let Err(error) = shard.upkeep(own_ns) {
+            let _ = given.send(Out::Stopped(error)).await;
+            return;
+        }
+        // With work still queued or maintenance owed the task yields once, so the shard's other
+        // tasks run between its turns, and turns again.
+        if shard.owner.has_work() || shard.answered() || shard.upkeep.owed() {
             hyper_rt::futures::yield_now().await;
             continue;
         }

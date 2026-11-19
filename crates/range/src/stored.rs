@@ -251,6 +251,19 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
             .map(|e| e as &(dyn std::error::Error + 'static))
     }
 
+    /// The engine's idle step that waits for nothing (`ShardDb::idle_step_now`), in SILK's order:
+    /// the packing first, then the trunk's work and its workers' results, then the consolidations
+    /// seeks paid for, then the cache's. A puts-only or reads-only range otherwise paid it only at
+    /// its next put or checkpoint. One that failed fences the engine, as a failed apply does.
+    fn upkeep(&mut self, budget: u64) -> Result<(u64, bool), EngineError> {
+        if self.fault.is_some() {
+            return Err(EngineError::Fenced);
+        }
+        self.db
+            .idle_step_now(budget)
+            .map_err(|e| fenced(&mut self.fault, e))
+    }
+
     fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
         self.clear(&[], None)?;
         for (k, v) in &rows {

@@ -461,8 +461,10 @@ impl Door {
 /// the two share beside it ([`Handed`]). The job touches nothing of the node's but these: the bytes
 /// it moves it counts here, which the host's step takes as a value (`Host::turn_job`).
 pub(crate) struct Native {
-    /// A put's body, once its fields named one.
-    body: Option<Pieces>,
+    /// A put's body, once its fields named one, on the channel made with its door and kept with
+    /// it ([`Doors`]): its sender is the node's task's half's ([`Replies`]), lent to the put's
+    /// feeding while the node's task reads the body ([`Feeding`]).
+    body: Pieces,
     reply: Sender<Told>,
     /// Answers the reply's channel had no room for, sent before any other, in order. A piece is
     /// given only once the last is written whole, so these are at most the reply's end behind its
@@ -523,13 +525,19 @@ struct Opening {
 /// And whether the node's task let go of the reply, its exchange ended or refused, so a job waiting
 /// for what it gave to be written ends; and whether the job let go of its door, so the node's task
 /// writes nothing past what it gave: a door kept for the next request ([`Doors`]) closes neither
-/// end of its channel, which once said both.
+/// end of its channels, which once said both. And of a put's body, what its channel's ends'
+/// drops said: whether the job let go of it (`dropped`), so the node's task reads and drops the
+/// rest, and whether the node's task let go of it (`cut`), so the job, finding nothing more given,
+/// knows its body did not come whole, the word read before the channel so a piece given before it
+/// is taken first.
 #[derive(Default)]
 struct Handed {
     unwritten: std::sync::atomic::AtomicUsize,
     held: std::sync::atomic::AtomicBool,
     gone: std::sync::atomic::AtomicBool,
     ended: std::sync::atomic::AtomicBool,
+    dropped: std::sync::atomic::AtomicBool,
+    cut: std::sync::atomic::AtomicBool,
 }
 
 impl Native {
@@ -651,13 +659,17 @@ fn give_native(
 }
 
 /// A native exchange's door, made as the host takes its request: the job's ends, and the node's
-/// task's ([`Replies`]); none where the reply's channel cannot be made.
+/// task's ([`Replies`]); none where its reply's channel or its body's cannot be made.
 fn native_door() -> Option<(Native, Replies)> {
     let (reply, told) = hyper_rt::sync::channel(door::Replying::FIRST_ANSWERS).ok()?;
+    let (body, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).ok()?;
     let handed = std::sync::Arc::new(Handed::default());
     Some((
         Native {
-            body: None,
+            body: Pieces {
+                pieces,
+                ended: None,
+            },
             reply,
             pending: VecDeque::new(),
             handed: std::sync::Arc::clone(&handed),
@@ -665,6 +677,7 @@ fn native_door() -> Option<(Native, Replies)> {
         },
         Replies {
             told,
+            body: Some(body),
             handed,
             drained: None,
             head: None,
@@ -767,27 +780,20 @@ impl Doors {
     }
 
     /// A door both of whose halves are back, kept for the next request where fewer than `most`
-    /// are: what its job gave that the node's task never took dropped, at most the channel's
-    /// answers, and its halves as a new door's.
+    /// are: what its job gave that the node's task never took dropped, and what the node's task
+    /// gave of a body that its job never took, at most each channel's room, and its halves as a
+    /// new door's. One whose body's sender is not back, which a feeding let go of gives back
+    /// first, is let go.
     fn keep(&mut self, mut native: Box<Native>, mut replies: Replies) {
-        if self.kept.len() >= self.most {
+        if self.kept.len() >= self.most || replies.body.is_none() {
             return;
         }
-        let mut empty = false;
-        for _ in 0..=door::Replying::FIRST_ANSWERS {
-            match replies.told.try_recv() {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    empty = true;
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
-        if !empty {
+        if !emptied(&mut replies.told, door::Replying::FIRST_ANSWERS)
+            || !emptied(&mut native.body.pieces, door::Depth::FIRST)
+        {
             return;
         }
-        native.body = None;
+        native.body.ended = None;
         native.pending.clear();
         native.moved = 0;
         replies.drained = None;
@@ -798,11 +804,30 @@ impl Doors {
         handed
             .unwritten
             .store(0, std::sync::atomic::Ordering::Release);
-        for word in [&handed.held, &handed.gone, &handed.ended] {
+        for word in [
+            &handed.held,
+            &handed.gone,
+            &handed.ended,
+            &handed.dropped,
+            &handed.cut,
+        ] {
             word.store(false, std::sync::atomic::Ordering::Release);
         }
         self.kept.push((native, replies));
     }
+}
+
+/// Whether a kept door's channel is emptied of what was given and never taken, at most `room`:
+/// none where the channel is closed, its other end gone.
+fn emptied<T>(channel: &mut ChannelReceiver<T>, room: usize) -> bool {
+    for _ in 0..=room {
+        match channel.try_recv() {
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// A native job's reply as the node's task writes it to the exchange (node.md §2.9 step 6c), the
@@ -817,6 +842,9 @@ impl Doors {
 /// the client, whose stream's flow control it is, holds both.
 pub(crate) struct Replies {
     told: ChannelReceiver<Told>,
+    /// A put's body's sender, kept with its door, none while the put's feeding holds it
+    /// ([`Feeding`]).
+    body: Option<Sender<Piece>>,
     handed: std::sync::Arc<Handed>,
     /// A reply taken that waits for the request's body to be read whole, or for room in the
     /// endpoint's budget for its head.
@@ -1117,7 +1145,12 @@ struct Local {
 /// (`Bytes`) and that is reused once the job let it go: a piece is copied no more than when its job
 /// read it, and in storage reused from piece to piece.
 pub(crate) struct Feeding {
+    /// The body's sender, lent by the put's door ([`Replies`]) and given back as the feeding is let
+    /// go ([`Feeding::let_go`]), so no channel is made a put.
     pieces: Sender<Piece>,
+    /// What the put's door's halves share: whether its job let go of its body, and where the
+    /// feeding is let go, that the node's task did.
+    handed: std::sync::Arc<Handed>,
     /// The storage the piece in flight is a view of, made at the first piece, and the bytes it was
     /// made to hold: what was left of the object then, at most a piece.
     storage: Option<(BytesMut, usize)>,
@@ -1225,6 +1258,11 @@ impl Feeding {
     /// Gives `piece` to the job, or holds it where the channel has no room; a job that let go of
     /// its body has the rest dropped.
     fn send(&mut self, piece: Piece) -> Fed {
+        if self.job_let_go() {
+            self.held = None;
+            self.dropping = true;
+            return Fed::Moved;
+        }
         match self.pieces.try_send(piece) {
             Ok(()) => Fed::Moved,
             Err(SyncError::Full(piece)) => {
@@ -1236,6 +1274,24 @@ impl Feeding {
                 Fed::Moved
             }
         }
+    }
+
+    /// Whether the put's job let go of its body, or of its door: the rest is read and dropped, a
+    /// piece it never took holding the storage until its door is kept, emptied ([`Doors::keep`]).
+    fn job_let_go(&self) -> bool {
+        [&self.handed.dropped, &self.handed.ended]
+            .into_iter()
+            .any(|word| word.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// The feeding let go, its body given whole or dropped, or its exchange gone: its door's body
+    /// sender given back, and its job told the node's task let go of the body (`Handed::cut`),
+    /// which a job that took the body's end never reads.
+    fn let_go(self) -> Sender<Piece> {
+        self.handed
+            .cut
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.pieces
     }
 
     /// Gives what the channel had no room for, first: whether it went, and whether it was the end.
@@ -1250,16 +1306,15 @@ impl Feeding {
 }
 
 /// A native put, its fields read and nothing past them, given its body by the node's task (node.md
-/// §2.9 step 6c): from its first byte on a channel of one piece, the least that moves a body
-/// (`door::Depth::FIRST`), from the feeding, which the node's task keeps, to the pieces, which the
-/// put's job takes, the trailer's value past the object's bytes the feeding's. The reply its job
-/// ends with instead: `SlowDown` where the channel cannot be made, as the S3 listener answers one.
-fn feed(putting: &Putting) -> Result<(Feeding, Pieces), Box<Reply>> {
+/// §2.9 step 6c): from its first byte on its door's channel of one piece, the least that moves a
+/// body (`door::Depth::FIRST`), `pieces` the sender its door lent and `handed` what its door's
+/// halves share, from the feeding, which the node's task keeps, to its door's receiver, which the
+/// put's job takes from, the trailer's value past the object's bytes the feeding's.
+fn feed(putting: &Putting, pieces: Sender<Piece>, handed: std::sync::Arc<Handed>) -> Feeding {
     let width = putting.trailing.map_or(0, checksum::Algorithm::width);
-    let (pieces, taken) = hyper_rt::sync::channel(door::Depth::FIRST)
-        .map_err(|_| Box::new(Reply::slowed(door::Slowed::Door)))?;
-    let feeding = Feeding {
+    Feeding {
         pieces,
+        handed,
         storage: None,
         held: None,
         left: putting.length,
@@ -1267,14 +1322,7 @@ fn feed(putting: &Putting) -> Result<(Feeding, Pieces), Box<Reply>> {
         trailer: Vec::new(),
         empty: putting.length == 0 && width == 0,
         dropping: false,
-    };
-    Ok((
-        feeding,
-        Pieces {
-            pieces: taken,
-            ended: None,
-        },
-    ))
+    }
 }
 
 /// The bytes of a native body's piece: the transport's receive chunk (`PIECE`).
@@ -2633,13 +2681,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 work(op, block)
             }
         };
-        if let (Work::Put(putting), Door::Native(_, native)) = (&job.work, &mut job.door) {
-            match feed(putting) {
-                Ok((feeding, pieces)) => {
-                    native.body = Some(pieces);
-                    self.feeding.push((exchange, feeding));
+        // The put's body comes on its door's channel, its sender lent to the feeding: one whose door
+        // lent it already, which no put's does, is answered as one whose channel cannot be made.
+        if let (Work::Put(putting), Door::Native(_, native)) = (&job.work, &job.door) {
+            let lent = self
+                .replies
+                .iter_mut()
+                .find(|(replied, _)| *replied == exchange)
+                .and_then(|(_, replies)| replies.body.take());
+            match lent {
+                Some(pieces) => {
+                    let handed = std::sync::Arc::clone(&native.handed);
+                    self.feeding.push((exchange, feed(putting, pieces, handed)));
                 }
-                Err(reply) => job.work = Work::Draining(reply),
+                None => job.work = Work::Draining(Box::new(Reply::slowed(door::Slowed::Door))),
             }
         }
         Ok(false)
@@ -2770,7 +2825,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             };
             if over {
-                let (_, replies) = self.replies.swap_remove(at);
+                let (exchange, mut replies) = self.replies.swap_remove(at);
+                for (_, feeding) in self.feeding.extract_if(.., |(fed, _)| *fed == exchange) {
+                    replies.body = Some(feeding.let_go());
+                }
                 self.host.doors.give_replies(replies);
             } else {
                 at = at.saturating_add(1);
@@ -2853,7 +2911,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 Fed::Over => {
                     self.fed = true;
-                    self.feeding.swap_remove(at);
+                    let (exchange, feeding) = self.feeding.swap_remove(at);
+                    let sender = feeding.let_go();
+                    if let Some((_, replies)) = self
+                        .replies
+                        .iter_mut()
+                        .find(|(replied, _)| *replied == exchange)
+                    {
+                        replies.body = Some(sender);
+                    }
                 }
             }
         }
@@ -2885,6 +2951,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some(Fed::Still | Fed::Room) => return fed,
                 Some(Fed::Over) => return Fed::Over,
                 Some(Fed::Moved) => fed = Fed::Moved,
+            }
+            if feeding.job_let_go() {
+                feeding.held = None;
+                feeding.dropping = true;
             }
             if feeding.dropping {
                 break;
@@ -3015,9 +3085,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } = self;
         let now = hyper_rt::futures::now_ns();
         parked.retain(|p| p.exchange != exchange);
-        feeding.retain(|(fed, _)| *fed != exchange);
-        // Each door's halves given back, kept for the next request.
-        for (_, lost) in replies.extract_if(.., |(replied, _)| *replied == exchange) {
+        // An exchange's one feeding, its body's sender given back with its door's half.
+        let mut lent = feeding
+            .iter()
+            .position(|(fed, _)| *fed == exchange)
+            .map(|at| feeding.swap_remove(at).1.let_go());
+        // Each door's halves given back, kept for the next request, its body's sender with it.
+        for (_, mut lost) in replies.extract_if(.., |(replied, _)| *replied == exchange) {
+            if let Some(sender) = lent.take() {
+                lost.body = Some(sender);
+            }
             host.doors.give_replies(lost);
         }
         let Host { jobs, doors, .. } = host;
@@ -4367,17 +4444,21 @@ impl Host {
                         return self.fail_job(node, at, Status::IncompleteBody);
                     }
                 }
-                take_body(&mut local.body, putting, moved, |paced| node.took(paced))
+                take_body(&mut local.body, None, putting, moved, |paced| {
+                    node.took(paced)
+                })
             }
             // A native put's pieces come as its exchange delivers them, at no connection's pace,
             // and their bytes are counted in its door. Its fields are read before its put is made,
             // which takes its body.
             Door::Native(_, native) => {
-                let Native { body, moved, .. } = &mut **native;
-                match body.as_mut() {
-                    Some(body) => take_body(body, putting, moved, |_| {}),
-                    None => Ok(()),
-                }
+                let Native {
+                    body,
+                    moved,
+                    handed,
+                    ..
+                } = &mut **native;
+                take_body(body, Some(&handed.cut), putting, moved, |_| {})
             }
         };
         match fed {
@@ -6195,7 +6276,10 @@ impl Host {
             // cause as it goes, as the listener counts the S3 door's. A reply no message holds, a
             // field past its bound, refuses its exchange, so its asker hears it at once.
             Door::Native(_, native) => {
-                native.body = None;
+                native
+                    .handed
+                    .dropped
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let told = match reply.encode() {
                     Ok((head, fields)) => Told::Reply(Box::new(Opening {
                         head,
@@ -6257,9 +6341,12 @@ impl Host {
 /// piece's bytes counted `moved` and its pacing told `took`; and the body's end taken only once
 /// the door gave it, its door having checked what the body's framing, signature and checksum
 /// say, its trailer's checksum then the one the end is checked against. The status the job ends
-/// with where the body does not hold.
+/// with where the body does not hold: `IncompleteBody` where its door is gone before its end, its
+/// channel closed, or a native door's node's task let go of it (`cut`, `Handed::cut`), read before
+/// the channel so a piece given before it is taken first.
 fn take_body(
     body: &mut Pieces,
+    cut: Option<&std::sync::atomic::AtomicBool>,
     putting: &mut Putting,
     moved: &mut u64,
     mut took: impl FnMut(door::Paced),
@@ -6300,6 +6387,7 @@ fn take_body(
         if putting.length == u64::MAX || !put.wants_body() {
             return Ok(());
         }
+        let cut = cut.is_some_and(|cut| cut.load(std::sync::atomic::Ordering::Acquire));
         match body.pieces.try_recv() {
             Ok(Some(Piece::Bytes(bytes, paced))) => {
                 // The piece's time from its send to this turn: a sample of the body's depth.
@@ -6316,8 +6404,9 @@ fn take_body(
             }
             Ok(Some(Piece::End(trailer))) => body.ended = Some(trailer),
             Ok(Some(Piece::Refused(status))) => return Err(status),
-            Ok(None) => return Ok(()),
             // The door is gone with the body unfinished.
+            Ok(None) if cut => return Err(Status::IncompleteBody),
+            Ok(None) => return Ok(()),
             Err(_) => return Err(Status::IncompleteBody),
         }
     }
@@ -7499,6 +7588,20 @@ mod tests {
         (object, trailer)
     }
 
+    /// A native put's feeding over a channel and words of its own, and the job's end of the
+    /// channel: as a door lends them, its body's sender and what its halves share.
+    fn fed(putting: &Putting) -> (Feeding, Pieces) {
+        let (sender, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
+        let handed = std::sync::Arc::new(Handed::default());
+        (
+            feed(putting, sender, handed),
+            Pieces {
+                pieces,
+                ended: None,
+            },
+        )
+    }
+
     /// The node's task's half of a stream (`Node::feed_body`) over `stream`, the bytes its
     /// exchange delivers after the fields, as far as the put's job takes them, the job's turn
     /// (`take_body`) between each of the node's: each read is of a piece at most, and only once
@@ -7519,7 +7622,7 @@ mod tests {
                 feeding.give(read, &mut moved)?;
                 *stream = rest;
             }
-            take_body(pieces, putting, &mut moved, |_| {})?;
+            take_body(pieces, None, putting, &mut moved, |_| {})?;
             if putting.length == u64::MAX {
                 return Ok(true);
             }
@@ -7536,7 +7639,7 @@ mod tests {
         let (object, trailer) = native_body(3 * piece_len() + 1_000);
         let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
         let mut putting = native_put(object.len() as u64);
-        let (mut feeding, mut pieces) = feed(&putting).unwrap();
+        let (mut feeding, mut pieces) = fed(&putting);
         let mut stream = &past[..];
         assert_eq!(
             feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
@@ -7555,7 +7658,7 @@ mod tests {
         let (object, trailer) = native_body(10);
         let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
         let mut putting = native_put(10);
-        let (mut feeding, mut pieces) = feed(&putting).unwrap();
+        let (mut feeding, mut pieces) = fed(&putting);
         let mut stream = &past[..];
         assert_eq!(
             feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
@@ -7568,7 +7671,7 @@ mod tests {
         trailer[0] ^= 1;
         let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
         let mut putting = native_put(object.len() as u64);
-        let (mut feeding, mut pieces) = feed(&putting).unwrap();
+        let (mut feeding, mut pieces) = fed(&putting);
         let mut stream = &past[..];
         assert_eq!(
             feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
@@ -7587,7 +7690,7 @@ mod tests {
     fn a_full_channel_holds_the_streams_bytes() {
         let (object, _) = native_body(4 * piece_len());
         let putting = native_put(object.len() as u64);
-        let (mut feeding, mut pieces) = feed(&putting).unwrap();
+        let (mut feeding, mut pieces) = fed(&putting);
         let mut moved = 0;
         assert!(feeding.free());
         assert_eq!(
@@ -7636,12 +7739,12 @@ mod tests {
         assert!(feeding.free());
         // A body shorter than a piece is given in storage of its size.
         let putting = native_put(6);
-        let (mut feeding, _pieces) = feed(&putting).unwrap();
+        let (mut feeding, _pieces) = fed(&putting);
         assert_eq!(feeding.give(&[2; 6], &mut moved), Ok(Fed::Moved));
         assert_eq!(feeding.storage.as_ref().map(|(_, made)| *made), Some(6));
         // An end the channel has no room for is held, and given once the job takes the piece.
         let putting = native_put(1);
-        let (mut feeding, mut pieces) = feed(&putting).unwrap();
+        let (mut feeding, mut pieces) = fed(&putting);
         assert_eq!(feeding.give(&[7, 1, 2, 3, 4], &mut moved), Ok(Fed::Moved));
         assert!(feeding.read_whole());
         assert_eq!(feeding.end(), Fed::Still);
@@ -7666,32 +7769,32 @@ mod tests {
         let (object, _) = native_body(2 * piece_len());
         // The exchange failed mid-body: the node's task tells the job.
         let mut putting = native_put(object.len() as u64);
-        let (feeding, mut pieces) = feed(&putting).unwrap();
+        let (feeding, mut pieces) = fed(&putting);
         feeding
             .pieces
             .try_send(Piece::Refused(Status::IncompleteBody))
             .unwrap();
         let mut moved = 0;
         assert_eq!(
-            take_body(&mut pieces, &mut putting, &mut moved, |_| {}),
+            take_body(&mut pieces, None, &mut putting, &mut moved, |_| {}),
             Err(Status::IncompleteBody)
         );
         // The exchange lost and its feeding let go with it, the body unfinished.
         let mut putting = native_put(object.len() as u64);
-        let (mut feeding, mut pieces) = feed(&putting).unwrap();
+        let (mut feeding, mut pieces) = fed(&putting);
         assert_eq!(
             feeding.give(&object[..piece_len()], &mut moved),
             Ok(Fed::Moved)
         );
         drop(feeding);
         assert_eq!(
-            take_body(&mut pieces, &mut putting, &mut moved, |_| {}),
+            take_body(&mut pieces, None, &mut putting, &mut moved, |_| {}),
             Err(Status::IncompleteBody)
         );
         assert_eq!(putting.taken, piece_len() as u64);
         // The job let go of its body: the next piece read finds it gone, and the rest is dropped.
         let putting = native_put(object.len() as u64);
-        let (mut feeding, pieces) = feed(&putting).unwrap();
+        let (mut feeding, pieces) = fed(&putting);
         drop(pieces);
         assert!(feeding.free());
         assert_eq!(
@@ -7729,7 +7832,7 @@ mod tests {
         // The node's task's half: each piece copied into the feeding's storage and handed over;
         // the job copies it into its driver and lets it go.
         let putting = native_put(object.len() as u64);
-        let (mut feeding, mut pieces) = feed(&putting).unwrap();
+        let (mut feeding, mut pieces) = fed(&putting);
         let mut moved = 0;
         let mut now = |read: &[u8], driver: &mut Vec<u8>| {
             assert!(feeding.free());
@@ -8330,6 +8433,139 @@ mod tests {
         }
         assert_eq!(doors.kept.len(), 2);
         assert!(doors.waiting.is_empty());
+    }
+
+    /// One native put's door as the host and the node's task use it for its body: taken as the
+    /// request is, its body's sender lent to the put's feeding, which gives `pieces` pieces of
+    /// `piece` and the body's end, each taken by the job from its door, then let go, its sender
+    /// given back; the job's end given and written; and both halves given back. What its halves
+    /// share, which tells the door.
+    fn door_put(
+        doors: &mut Doors,
+        putting: &Putting,
+        piece: &[u8],
+        pieces: usize,
+    ) -> *const Handed {
+        let (mut native, mut replies) = doors.take().unwrap();
+        let sender = replies.body.take().unwrap();
+        let mut feeding = feed(putting, sender, std::sync::Arc::clone(&native.handed));
+        let mut moved = 0;
+        for _ in 0..pieces {
+            assert!(feeding.free());
+            assert_eq!(feeding.give(piece, &mut moved), Ok(Fed::Moved));
+            assert!(matches!(
+                native.body.pieces.try_recv(),
+                Ok(Some(Piece::Bytes(..)))
+            ));
+        }
+        assert_eq!(feeding.end(), Fed::Over);
+        assert!(matches!(
+            native.body.pieces.try_recv(),
+            Ok(Some(Piece::End(_)))
+        ));
+        replies.body = Some(feeding.let_go());
+        assert_eq!(native.offer(Told::End), Sent::Taken);
+        let mut seen = Seen::default();
+        let (mut slowed, handed) = (
+            [0; door::Slowed::ALL.len()],
+            std::sync::Arc::as_ptr(&native.handed),
+        );
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        doors.give_native(native);
+        doors.give_replies(replies);
+        handed
+    }
+
+    /// A native put's body channel is its door's, kept with it for the next request (node.md §2.9
+    /// step 6e): where each put made its own, a put past the first asks the allocator for nothing
+    /// for its channels, its body's pieces and end given and taken through the door kept, the
+    /// feeding's storage made and shared once a put and reused piece to piece as before. What the channel's
+    /// ends' drops said is two words: a job that let go of its body has the rest dropped by its
+    /// feeding, and a feeding let go tells its job the body did not come whole once it took the
+    /// piece given before.
+    #[test]
+    fn a_native_puts_body_channel_is_kept_with_its_door_and_allocates_nothing() {
+        const PUTS: usize = 64;
+        let mut putting = native_put(0);
+        putting.trailing = None;
+        let mut doors = Doors::new(1);
+        let first = door_put(&mut doors, &putting, &[], 0);
+        hyper_measure::alloc::begin();
+        let mut same = 0;
+        for _ in 0..PUTS {
+            same += usize::from(door_put(&mut doors, &putting, &[], 0) == first);
+        }
+        let kept = hyper_measure::alloc::end();
+        assert_eq!((kept.allocations, kept.reallocations), (0, 0));
+        assert_eq!(same, PUTS, "each put took the one door kept");
+        // With a body: what the feeding's storage asks, as before, and nothing for the channels:
+        // made at its first piece, and shared as that piece is split from it (`BytesMut::split`
+        // promotes a storage made whole to one its views share), each piece past it a view.
+        let mut putting = native_put(4 * piece_len() as u64);
+        putting.trailing = None;
+        let piece = vec![7; piece_len()];
+        hyper_measure::alloc::begin();
+        for _ in 0..PUTS {
+            assert_eq!(door_put(&mut doors, &putting, &piece, 4), first);
+        }
+        let bodied = hyper_measure::alloc::end();
+        assert_eq!(
+            (bodied.allocations, bodied.reallocations),
+            (2 * PUTS as u64, 0),
+            "a storage a put, and its sharing"
+        );
+
+        // The job let go of its body: its feeding drops the rest.
+        let (native, mut replies) = doors.take().unwrap();
+        let mut feeding = feed(
+            &putting,
+            replies.body.take().unwrap(),
+            std::sync::Arc::clone(&native.handed),
+        );
+        native
+            .handed
+            .dropped
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut moved = 0;
+        assert_eq!(feeding.give(&piece, &mut moved), Ok(Fed::Moved));
+        assert!(feeding.dropping);
+        replies.body = Some(feeding.let_go());
+        doors.give_native(native);
+        doors.give_replies(replies);
+
+        // The node's task let go of the body before its end: the job takes the piece given before
+        // it, then hears its body did not come whole.
+        let (mut native, mut replies) = doors.take().unwrap();
+        assert!(
+            !native.handed.cut.load(std::sync::atomic::Ordering::Acquire),
+            "a kept door's words are cleared"
+        );
+        let mut feeding = feed(
+            &putting,
+            replies.body.take().unwrap(),
+            std::sync::Arc::clone(&native.handed),
+        );
+        assert_eq!(feeding.give(&piece, &mut moved), Ok(Fed::Moved));
+        replies.body = Some(feeding.let_go());
+        let mut taking = native_put(4 * piece_len() as u64);
+        taking.trailing = None;
+        let Native {
+            body,
+            handed,
+            moved: took,
+            ..
+        } = &mut *native;
+        assert_eq!(
+            take_body(body, Some(&handed.cut), &mut taking, took, |_| {}),
+            Err(Status::IncompleteBody)
+        );
+        assert_eq!(taking.taken, piece_len() as u64, "the piece given before");
+        doors.give_native(native);
+        doors.give_replies(replies);
+        assert_eq!(doors.kept.len(), 1);
     }
 
     fn refused(work: &Work) -> Option<Status> {
@@ -8975,17 +9211,10 @@ mod tests {
         let mut host = Host::new(2, Some(std::sync::Arc::new(scheming_gateway())));
         let mut putting = native_put(0);
         putting.trailing = None;
-        let (mut put, mut put_replies) = handed_job(Work::Put(putting), now, 7);
-        let (body, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
+        let (put, mut put_replies) = handed_job(Work::Put(putting), now, 7);
         let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        let body = put_replies.body.as_ref().unwrap();
         assert!(body.try_send(Piece::End(Some(crc))).is_ok());
-        let Door::Native(None, native) = &mut put.door else {
-            panic!("a handed request's door names no exchange");
-        };
-        native.body = Some(Pieces {
-            pieces,
-            ended: None,
-        });
         let get = work(
             Op::Get {
                 bucket: "b".into(),
@@ -9041,7 +9270,6 @@ mod tests {
         host.doors.give_replies(put_replies);
         host.doors.give_replies(get_replies);
         assert_eq!((host.doors.kept.len(), host.doors.waiting.len()), (2, 0));
-        drop(body);
     }
 
     /// A job's end carries its native door's half to whoever serves its host (node.md §2.9 step

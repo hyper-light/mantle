@@ -55,4 +55,4 @@ pub use owner::{Full, Handle, Owner};
 pub use replica::{
     Cause, Disk, Driven, OpenError, Output, Replica, ReplicaError, Settings, Writes,
 };
-pub use store::{Entries, EntryRef, Fault, Health, LogStore, Point, StoreView, Write};
+pub use store::{Entries, EntryRef, Fault, Health, LogStore, Point, Reason, StoreView, Write};

@@ -175,9 +175,12 @@ pub enum Fault {
     Failed(&'static str),
     /// The write failed as [`Fault::Failed`] does, for a reason the store stated with it: what
     /// failed, then the store's own words for why (mantle: vendor/UPSTREAM.md, a log's refusal
-    /// named).
-    #[error("the write failed: {0}: {1}")]
-    FailedFor(&'static str, &'static str),
+    /// named). Boxed, as only a write on its way to a fence states one: inline, its two words
+    /// widened every fault by 16 bytes, and each write a replica keeps out holds a fault in its
+    /// state, so a member opened 64 bytes larger at hyper-log's depth of three (mantle's
+    /// `tests/range_memory.rs`).
+    #[error("the write failed: {0}")]
+    FailedFor(Box<Reason>),
 }
 
 impl Fault {
@@ -185,6 +188,27 @@ impl Fault {
     /// owner met what the store held it for.
     pub fn changed_nothing(&self) -> bool {
         matches!(self, Self::Room(_) | Self::Behind | Self::Held)
+    }
+
+    /// The write failed on `what`, for the store's reason `why` ([`Fault::FailedFor`]).
+    pub fn failed_for(what: &'static str, why: &'static str) -> Self {
+        Self::FailedFor(Box::new(Reason { what, why }))
+    }
+}
+
+/// What failed of a write the store stated a reason for, and the store's own words for why
+/// ([`Fault::FailedFor`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reason {
+    /// What failed.
+    pub what: &'static str,
+    /// The store's own words for why.
+    pub why: &'static str,
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.what, self.why)
     }
 }
 

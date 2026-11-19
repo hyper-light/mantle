@@ -3687,7 +3687,6 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let message = self.message(class, kind, header, body)?;
         let mut out = Outgoing::nothing();
         out.state = Out::Head;
-        out.message = Some(message);
         out.left = body.unwrap_or(0);
         out.has_body = body.is_some();
         let exchange = Exchange {
@@ -3723,7 +3722,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             vouch: false,
             vouched: None,
         };
-        let id = self.exchanges.insert(exchange)?;
+        // mantle: the message's room is given back when the table refuses the exchange
+        // (vendor/UPSTREAM.md). Held by the exchange as it was offered, it went with the refused
+        // value, never given back: each open refused `Exchanges` kept its prefix's and head's bytes
+        // for good, and a node asking again while its table was full filled its budget with them,
+        // refusing every open, reply head and lane frame after (mantle's new voter's reads).
+        let id = match self.exchanges.insert(exchange) {
+            Ok(id) => id,
+            Err(refusal) => {
+                self.budget.release(message);
+                return Err(refusal);
+            }
+        };
+        match self.exchanges.get_mut(id) {
+            Some(exchange) => exchange.out.message = Some(message),
+            None => self.budget.release(message),
+        }
         self.exchanges.place(id, conn.exchanges.len());
         conn.exchanges.push(id);
         let held = self.held(conn);

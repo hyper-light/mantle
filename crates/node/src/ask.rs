@@ -85,6 +85,12 @@ pub(crate) struct ReadOut {
     /// member refusing or taking it. Past its range's budget, judged while it is not out on an
     /// exchange, it ends (node.md §5.4).
     pub leaderless_since: Option<u64>,
+    /// When it was first asked of a node since that node or another last answered it, any reply
+    /// at all: a leader its member trusts that answers nothing, its opens refused or its
+    /// exchanges ended unanswered, is judged by it as a leader that serves nothing
+    /// (`Node::unanswered_end`), which `leaderless_since` alone never does, its member's trust
+    /// stopping that clock.
+    pub unanswered_since: Option<u64>,
     /// The patience the members it asked last stated in a redirect, 0 for none.
     pub stated_patience_ns: u64,
 }

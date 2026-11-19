@@ -27,7 +27,7 @@ use hyper_rt::coop::Class;
 use hyper_rt::runtime::{Runtime, RuntimeConfig, WakeTracking};
 use mantle_node::derive::{self, ShardShape};
 use mantle_node::listener::{Listener, Settings};
-use mantle_node::process::RangeShards;
+use mantle_node::process::{NativeShards, RangeShards};
 
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
@@ -260,14 +260,21 @@ fn the_floor_holds_the_nodes_runtime_at_every_shape() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Once, for what a process makes at its first runtime and keeps.
-    let warm = derive::shard_shape(Some(1), 2, RangeShards::First).unwrap();
+    let warm = derive::shard_shape(Some(1), 2, (RangeShards::First, NativeShards::First)).unwrap();
     started(&config(1, &warm, 1));
     for shards in [1u16, 2, 4, 10] {
         for listening in [None, Some(1), Some(10), Some(256)] {
             for peers in [2, 8] {
                 for ring in [1, 16, 1024] {
-                    for ranges in [RangeShards::First, RangeShards::Spread] {
-                        let shape = derive::shard_shape(listening, peers, ranges).unwrap();
+                    for (ranges, native) in [
+                        (RangeShards::First, NativeShards::First),
+                        (RangeShards::Spread, NativeShards::First),
+                        (RangeShards::First, NativeShards::Spread),
+                        (RangeShards::Spread, NativeShards::Spread),
+                    ] {
+                        // The driving tasks are Normal: their shards' queues make no class more.
+                        let shape =
+                            derive::shard_shape(listening, peers, (ranges, native)).unwrap();
                         let runtime = config(shards, &shape, ring);
                         // Spread, a range on each shard past the first, the most that run ranges.
                         let ranging = match ranges {
@@ -294,12 +301,14 @@ fn the_floor_holds_the_nodes_runtime_at_every_shape() {
                         .unwrap();
                         eprintln!(
                             "{shards} shards, {listening:?} served, {peers} peers, {ring} \
-                             entries, ranges {ranges:?}: held {held} of {stated}"
+                             entries, ranges {ranges:?}, native {native:?}: held {held} of \
+                             {stated}"
                         );
                         assert!(
                             held <= stated,
                             "{shards} shards, {listening:?} served, {peers} peers, {ring} \
-                             entries, ranges {ranges:?}: held {held}, past {stated}"
+                             entries, ranges {ranges:?}, native {native:?}: held {held}, past \
+                             {stated}"
                         );
                     }
                 }

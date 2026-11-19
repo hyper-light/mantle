@@ -1890,7 +1890,8 @@ pub enum Slowed {
     /// Past the connections the S3 listener serves at once.
     Connections,
     /// The S3 listener's door held as many requests as it keeps, the node was gone, or its
-    /// channels for the request could not be made.
+    /// channels for the request could not be made; or a native put's body's channel could not be
+    /// made.
     Door,
     /// The node held as many key lookups as its door holds requests.
     Lookups,

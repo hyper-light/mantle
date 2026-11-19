@@ -71,6 +71,8 @@ use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object;
 
 mod answers;
+mod drivers;
+mod driving;
 mod enrollments;
 mod host;
 mod members;
@@ -120,6 +122,33 @@ pub fn shard_lanes_bytes(capacity: usize) -> Option<u64> {
     let room = std::mem::size_of::<(u64, u64)>();
     let each = into.checked_add(out)?.checked_add(room.checked_mul(2)?)?;
     u64::try_from(capacity.checked_mul(each)?).ok()
+}
+
+/// What a driving shard's lanes and the vectors beside them hold (node.md §2.9 step 6f,
+/// `node::driving`): for each of the `requests` the lanes take at once, a ring place and a room
+/// place in and out; for each of the `slots` asks the node holds at once, the answers' ring and
+/// room places, the node's side's held and asked asks, and the shard's side's given, answered and
+/// abandoned ones; and the shard's word that a door moved. Derived from the sizes, at the types a
+/// process runs.
+pub fn driving_lanes_bytes(requests: usize, slots: usize) -> Option<u64> {
+    use std::mem::size_of;
+    let room = size_of::<(u64, u64)>();
+    let request = size_of::<driving::In>()
+        .checked_add(size_of::<driving::Out>())?
+        .checked_add(room.checked_mul(2)?)?;
+    let slot = size_of::<(u64, host::Outcome)>()
+        .checked_add(room)?
+        .checked_add(size_of::<(u64, host::JobAsk)>())?
+        .checked_add(size_of::<(u64, host::Pending)>())?
+        .checked_add(size_of::<driving::Out>())?
+        .checked_add(size_of::<(host::Pending, host::Outcome)>())?
+        .checked_add(size_of::<host::Pending>())?;
+    let word = size_of::<hyper_rt::sync::Notify>().checked_add(size_of::<[usize; 2]>())?;
+    let bytes = requests
+        .checked_mul(request)?
+        .checked_add(slots.checked_mul(slot)?)?
+        .checked_add(word)?;
+    u64::try_from(bytes).ok()
 }
 
 /// The log's id: the node's.
@@ -853,25 +882,41 @@ struct Commanded {
     commands: Vec<(u64, u64, Option<Answer>)>,
 }
 
-/// The piece a body is read in: the transport's own receive chunk.
-const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
+/// The piece a body is read in: the transport's own receive chunk. The node's task holds one of its
+/// own outside the transport's budget (`Node::piece`), which the memory floor counts in the
+/// transport's class (`derive::Class::Transport`, node.md §1.4).
+pub(crate) const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
 /// Reads the next bytes of `exchange`'s body, at most a piece, into `piece`, empty: how many. The
-/// piece is the operation's own, the one its admission charged it for (`derive::Charges`, node.md
-/// §2.8), its buffer kept from read to read: hyper-transport reads a body into any reservation its
-/// owner's accountant granted, mantle's admission among them (its `budget` module). A piece of the
-/// endpoint's budget, which every connection's windows, receive chunks, heads and frames share,
-/// could be refused while an operation's body waited on no ask of its own: it was then neither
-/// read nor vouched for, and the budget freeing woke nothing, so its client gave it up a period
-/// later (`Lost(Stalled)`, tests/put_body.rs).
+/// piece is the reader's own, never the endpoint's budget's, its buffer kept from read to read: a
+/// put's, whose admission charged it a piece (`derive::Charges`, node.md §2.8), or the node's
+/// task's, which reads every native body a piece at a time (`Node::piece`): hyper-transport reads a
+/// body into any reservation its owner's accountant granted, mantle's admission among them (its
+/// `budget` module). A piece of the endpoint's budget, which every connection's windows, receive
+/// chunks, heads and frames share, could be refused while an operation's body waited on no ask of
+/// its own: it was then neither read nor vouched for, and the budget freeing woke nothing, so its
+/// client gave it up a period later (`Lost(Stalled)`, tests/put_body.rs).
 pub fn read_piece(
     endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
     exchange: ExchangeId,
     piece: &mut Vec<u8>,
 ) -> Result<usize, Refusal> {
+    read_at_most(endpoint, exchange, piece, hyper_transport::RECEIVE_CHUNK)
+}
+
+/// Reads the next bytes of `exchange`'s body, at most `most`, into `piece`, empty: how many
+/// ([`read_piece`]); a piece made larger than `most` once is kept so.
+fn read_at_most(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    piece: &mut Vec<u8>,
+    most: usize,
+) -> Result<usize, Refusal> {
     let mut buffer = std::mem::take(piece);
-    buffer.reserve_exact(hyper_transport::RECEIVE_CHUNK);
-    let mut into = hyper_transport::Reservation::new(PIECE, buffer);
+    buffer.clear();
+    buffer.reserve_exact(most);
+    let granted = u64::try_from(most).unwrap_or(u64::MAX);
+    let mut into = hyper_transport::Reservation::new(granted, buffer);
     let got = endpoint.read_body(exchange, &mut into);
     *piece = into.into_buffer();
     got
@@ -1103,9 +1148,6 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     stored: Vec<Done>,
     /// Whether a volume answered a put or a get since the host last offered its jobs room.
     room_freed: bool,
-    /// When, on the shard's clock, the host last offered its puts room, or last had none waiting
-    /// for it: a put whose chunk waits for room is offered it again a beat after (`step_host`).
-    room_offered_ns: u64,
     /// The chunk puts and gets this node asked of its peers and not yet answered; at most
     /// `chunk_asks` of them.
     chunks_out: Vec<ChunkOut>,
@@ -1137,8 +1179,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     wall: Wall,
     /// The gateway host's settings, and the object operations it runs: as many at once as it has
     /// learned its knee is (`crate::admit`), at most `GatewaySettings::objects`, the ceiling its
-    /// memory was split for.
-    gateway: Option<GatewaySettings>,
+    /// memory was split for. Shared with the host (`host::Host`), which its jobs run by.
+    gateway: Option<std::sync::Arc<GatewaySettings>>,
     admission: Option<crate::admit::Admission>,
     /// The stream pool the native clients draw from, as last sized: the admission's limit.
     pooled: usize,
@@ -1150,7 +1192,39 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// What the node measured of its puts' and its gets' blocks and bodies, the windows each
     /// holds (`crate::window`).
     windows: crate::window::Windows,
-    jobs: Vec<host::Job>,
+    /// The object operations the node's task runs, and what they hold (node.md §2.9 step 6d).
+    host: host::Host,
+    /// The lanes of each shard past the first that drives native requests (node.md §2.9 step 6e,
+    /// `node::driving`), one a shard, in shard order: none where the node drives every request
+    /// on its first (`Node::spread_native`).
+    driving: Vec<driving::Lanes>,
+    /// The volume table's applied index the driving shards were last told.
+    driving_table: Option<u64>,
+    /// The exchange's half of each native put's body, read from its exchange for its job (node.md
+    /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's.
+    feeding: Vec<(ExchangeId, host::Feeding)>,
+    /// The piece the node's task reads native bodies into, a piece at a time (`read_piece`): a
+    /// put's fields past their first read, its body's pieces before each is copied into its
+    /// feeding's storage, the piece its admission charged it for, and what is left of an admitted
+    /// job's body after its reply; made once, at most a piece (`PIECE`), never the endpoint's
+    /// budget's, which other traffic may hold past a client's patience.
+    piece: Vec<u8>,
+    /// Whether a body moved at the last turn's feeding (`Node::feed_bodies`): the next turn is due
+    /// at once, for its job to take what it was given.
+    fed: bool,
+    /// The exchange's half of each native reply, written to its exchange from its job's channel
+    /// (node.md §2.9 step 6c, `host::Replies`): one a native request the host took, each ended
+    /// with its exchange or once its reply is written whole, so at most the exchanges the
+    /// transport holds at once, and given back to the host's doors as it ends (6d, `host::Doors`).
+    replies: Vec<(ExchangeId, host::Replies)>,
+    /// Whether a reply's rounds ran out at the last turn's writing (`Node::write_replies`) with its
+    /// exchange taking more: the next turn is due at once, for its job to give the next piece.
+    replied: bool,
+    /// The native requests the host admitted running on each of the node's shards, the count the
+    /// rule places each on (node.md §2.9 step 6, `node::drivers`): over the first and each shard
+    /// a driving task runs on (`Node::spread_native`), and over the first alone where none does, so each
+    /// is placed on the first, where the node's task runs it.
+    drivers: drivers::Drivers,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
     abandoned: Vec<host::Pending>,
@@ -1180,8 +1254,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     dial_only: Option<Tls>,
     /// The volume table as this node's member of the root range last held it (`host::Table`).
     table: Option<host::Table>,
-    /// Bytes of exchanges' bodies this node has read and written: its transfers' progress
-    /// ([`Node::moved`]).
+    /// Bytes of exchanges' bodies this node's task has read and written: its transfers' progress,
+    /// summed with its host's jobs' ([`Node::moved`]).
     moved: u64,
     /// The native requests this node answered `SlowDown`, a count for each cause in
     /// `door::Slowed::ALL`'s order ([`Node::slowed`]).
@@ -1507,6 +1581,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
         }
+        // The gateway's settings, shared by the node and the host it lends out for each turn: one
+        // `Arc` made here, never per turn (node.md §2.9 step 6d).
+        let gateway = settings.gateway.take().map(std::sync::Arc::new);
         let mut node = Self {
             id: settings.id,
             log,
@@ -1555,7 +1632,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             storage: std::mem::take(&mut settings.storage),
             stored: Vec::new(),
             room_freed: false,
-            room_offered_ns: 0,
             chunks_out: Vec::new(),
             chunk_asks: settings.chunk_asks,
             next_chunk: 0,
@@ -1572,22 +1648,35 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_read_ask: 0,
             reads_done: Vec::new(),
             wall: settings.wall,
-            admission: settings.gateway.as_ref().map(|g| {
+            admission: gateway.as_ref().map(|g| {
                 crate::admit::Admission::new(
                     g.objects,
                     g.objects_bytes,
                     hyper_rt::futures::now_ns(),
                 )
             }),
-            pooled: settings
-                .gateway
+            pooled: gateway
                 .as_ref()
                 .map_or(0, |g| if g.clients > 0 { g.objects } else { 0 }),
-            gateway: settings.gateway.take(),
+            // A door kept for each operation the host runs at most, as the memory floor counts
+            // one an operation (`host::record_bytes`), and never past the exchanges the transport
+            // holds, each door out being one's.
+            host: host::Host::new(
+                exchanges.min(gateway.as_ref().map_or(0, |g| g.objects)),
+                gateway.clone(),
+            ),
+            driving: Vec::new(),
+            driving_table: None,
+            gateway,
             parked: VecDeque::new(),
             parked_most: exchanges,
             windows: crate::window::Windows::default(),
-            jobs: Vec::new(),
+            feeding: Vec::new(),
+            piece: Vec::new(),
+            fed: false,
+            replies: Vec::new(),
+            replied: false,
+            drivers: drivers::Drivers::over(NonZeroUsize::MIN),
             abandoned: Vec::new(),
             repair: None,
             seeing: Vec::new(),
@@ -1719,6 +1808,44 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .ok_or(NodeError::ShardEnded(shard))?;
             self.spread_to(*holder, shard)?;
         }
+        Ok(())
+    }
+
+    /// Drives the node's native requests over the shards past its first (node.md §2.9 step 6f):
+    /// starts a driving shard's task on each, shard `i` numbered from the node's first being the
+    /// runtime shard `holders[i - 1]` names, as [`Node::spread`] numbers them, its lanes kept for
+    /// the node's turn (`node::driving`): its asks held to the node's bounds, the ranges' groups,
+    /// the wall clock, the gateway's settings shared with the node's host, and the requests its
+    /// lane takes at once, the exchanges the transport admits (`parked_most`). The rule's count is
+    /// made over the first and those shards (`node::drivers`), so each request the host admits
+    /// from then on is placed by it. Called before the node's first turn, so none was placed
+    /// before. A node that hosts no objects starts none. Refused, typed, where a shard takes no
+    /// task (`Lanes::start`), or its number passes a `usize`'s.
+    pub fn spread_native(&mut self, holders: &[hyper_rt::SlotHolder]) -> Result<(), NodeError> {
+        let Some(gateway) = self.gateway.as_ref() else {
+            return Ok(());
+        };
+        for (at, holder) in holders.iter().enumerate() {
+            let shard = at
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Bounds("a driving shard's number".into()))?;
+            let start = driving::Start {
+                command_asks: self.command_asks,
+                read_asks: self.read_asks,
+                chunk_asks: self.chunk_asks,
+                groups: self.ranges.iter().map(|k| (k.layer, k.group)).collect(),
+                ranges: self.ranges.len(),
+                wall: self.wall,
+                gateway: std::sync::Arc::clone(gateway),
+                requests: self.parked_most,
+            };
+            self.driving
+                .push(driving::Lanes::start(*holder, shard, start)?);
+        }
+        let shards = NonZeroUsize::MIN
+            .checked_add(self.driving.len())
+            .ok_or_else(|| NodeError::Bounds("the node's driving shards".into()))?;
+        self.drivers = drivers::Drivers::over(shards);
         Ok(())
     }
 
@@ -2301,9 +2428,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Bytes of exchanges' bodies the node has read and written since it opened: what its
-    /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written).
+    /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written),
+    /// its own task's, its host's jobs' (node.md §2.9 step 6d) and each driving shard's jobs', as
+    /// each last said (6f).
     pub fn moved(&self) -> u64 {
-        self.moved
+        self.driving.iter().map(driving::Lanes::moved).fold(
+            self.moved.saturating_add(self.host.moved()),
+            u64::saturating_add,
+        )
     }
 
     /// The requests this node answered `SlowDown` since it opened, on either door, a count for
@@ -2486,6 +2618,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.take_door();
         self.take_parked();
         self.step_host()?;
+        self.hand_off();
+        self.serve_driving()?;
+        self.feed_bodies();
+        self.write_replies()?;
         self.observe_presence()?;
         self.step_repair()?;
         // What the turn's operations and repairs left idle, lent to the caches once a turn.
@@ -2532,7 +2668,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         loop {
-            let (gateway, learned) = (self.gateway.as_ref(), &self.windows);
+            let (gateway, learned) = (self.gateway.as_deref(), &self.windows);
             // A key a connection asks before its operation takes no slot of the host's: it is
             // read at once, the lookups held to the door's bound (`host::take_lookup`).
             let charge = match self
@@ -2726,6 +2862,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let arrived = poll_fn(|context| {
                 let mut arrived = false;
                 for lanes in shards.iter_mut() {
+                    arrived |= lanes.arrived(context);
+                }
+                Poll::Ready(arrived)
+            })
+            .await;
+            if arrived {
+                return Ok(true);
+            }
+        }
+        // What a driving shard's host gave, or its end (node.md §2.9 step 6e).
+        if !self.driving.is_empty() {
+            let driving = &mut self.driving;
+            let arrived = poll_fn(|context| {
+                let mut arrived = false;
+                for lanes in driving.iter_mut() {
                     arrived |= lanes.arrived(context);
                 }
                 Poll::Ready(arrived)
@@ -3087,8 +3238,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.read_exchange(exchange)
             }
-            // A job's body is read, and its bytes written, at the host's turn.
-            Event::BodyReady { exchange } if self.job_on(exchange).is_some() => Ok(()),
+            // A job's body is read, and its reply written, at the host's turn.
+            Event::BodyReady { exchange } if self.hosts(exchange) => Ok(()),
             Event::BodyReady { exchange } => self.read_exchange(exchange),
             Event::Reply { exchange, body } => {
                 if self.chunks_out.iter().any(|c| c.exchange == exchange) {
@@ -3135,7 +3286,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.keep_pool();
                 Ok(())
             }
-            Event::Writable { exchange } if self.job_on(exchange).is_some() => Ok(()),
+            Event::Writable { exchange } if self.hosts(exchange) => Ok(()),
             Event::Writable { exchange } => {
                 self.write_exchange(exchange);
                 Ok(())
@@ -3606,7 +3757,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .find(|c| c.exchange == exchange)
                 .map(|c| c.asked)
         {
-            host::chunk_moved(&mut self.jobs, asked);
+            self.host.chunk_moved(asked);
+            for lanes in &self.driving {
+                lanes.tell_moved(asked);
+            }
         }
         match then {
             Some(Then::Snapshot { .. }) if failed.is_some() => self.snapshot_done(exchange, false),
@@ -3711,7 +3865,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if len > 0
                 && let Some(asked) = asked
             {
-                host::chunk_moved(&mut self.jobs, asked);
+                self.host.chunk_moved(asked);
+                for lanes in &self.driving {
+                    lanes.tell_moved(asked);
+                }
             }
             if matches!(receiving.what, Arriving::ChunkPut { .. }) {
                 self.chunks_received = self.chunks_received.saturating_add(len);
@@ -5631,6 +5788,33 @@ mod tests {
         moves::<hyper_durable::Replica<Store, Machine, Unbounded>>();
         moves::<Owner<Store, Machine, Unbounded>>();
         shared::<Log<DeviceFile>>();
+    }
+
+    /// What step 6 hands between the endpoint's shard and a shard that drives native requests
+    /// (node.md §2.9) may cross threads: a request's operation, and its door's request, pieces and
+    /// answers as the S3 listener hands them over now; a job's asks, each one value (6b), of a
+    /// range's command or read or a chunk's bytes and key, and their outcomes; and the volume table
+    /// its puts are placed by. The gateway's settings, keys among them, may be shared by every
+    /// shard's host.
+    #[test]
+    fn a_native_requests_work_may_cross_to_the_shard_that_drives_it() {
+        fn moves<T: Send>() {}
+        fn shared<T: Sync>() {}
+        moves::<object::Op>();
+        moves::<crate::door::Request>();
+        moves::<crate::door::Piece>();
+        moves::<crate::door::Answer>();
+        moves::<host::JobAsk>();
+        moves::<Command>();
+        moves::<Query>();
+        moves::<Bytes>();
+        moves::<ChunkKey>();
+        moves::<CommandOutcome>();
+        moves::<ReadOutcome>();
+        moves::<ChunkOutcome>();
+        moves::<host::Table>();
+        moves::<GatewaySettings>();
+        shared::<GatewaySettings>();
     }
 
     #[test]

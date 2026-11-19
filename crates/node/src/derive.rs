@@ -33,7 +33,9 @@ use mantle_range::{ConfState, Range, Settings};
 
 use crate::ask::ENTRIES_OUT;
 use crate::node::Hosted;
-use crate::process::{Enlisting, GatewayConfig, PeerLine, ProcessConfig, RangeShards, S3Stated};
+use crate::process::{
+    Enlisting, GatewayConfig, NativeShards, PeerLine, ProcessConfig, RangeShards, S3Stated,
+};
 use crate::storage::VolumeSettings;
 use mantle_protocol::classes::Role;
 
@@ -1426,19 +1428,22 @@ pub struct ShardShape {
 }
 
 /// The shape of each of the node's shards with `peers` peers, with an S3 listener serving
-/// `listening` connections where it has one, and its ranges placed as `ranges` states
-/// ([`ShardShape`]).
+/// `listening` connections where it has one, its ranges placed and its native requests driven as
+/// `ranges` and `native` state ([`ShardShape`]).
 pub fn shard_shape(
     listening: Option<u64>,
     peers: usize,
-    ranges: RangeShards,
+    (ranges, native): (RangeShards, NativeShards),
 ) -> Option<ShardShape> {
     let connections = match listening {
         Some(served) => usize::try_from(crate::listener::tasks(served)).ok()?,
         None => 0,
     };
-    // Whether the shards past the first run ranges (node.md §2.9).
-    let ranging = usize::from(ranges == RangeShards::Spread);
+    // Whether the shards past the first run ranges (node.md §2.9), and whether they drive native
+    // requests (step 6f): each a task, the launcher that spawns it holding its own slot while it
+    // spawns (`node::shard::Lanes::start`, `node::driving::Lanes::start`), and the task's wait.
+    let ranging = usize::from(ranges == RangeShards::Spread)
+        .checked_add(usize::from(native == NativeShards::Spread))?;
     // The first shard: the node's task, the launcher that spawns it, and each connection, which
     // falls back to it where the shard it was handed to refuses it. Each past it: the listener's
     // taker of the connections it is handed, and each of them; and where it runs ranges, their
@@ -1526,7 +1531,8 @@ pub enum Class {
     /// The node's shared log ([`log_bytes`]).
     Log,
     /// The transport beside its budget, its plane and its liveness stream
-    /// ([`transport_bytes_beside`], [`plane_bytes`], [`liveness_bytes`]).
+    /// ([`transport_bytes_beside`], [`plane_bytes`], [`liveness_bytes`]), and the piece the node's
+    /// task reads native bodies into outside the budget (`node::PIECE`).
     Transport,
     /// The runtime's shards, each sized for the first's role, and the S3 listener's lanes to the
     /// shards past the first ([`runtime_bytes`]).
@@ -1859,6 +1865,9 @@ pub struct Stated {
     pub s3: Option<S3Stated>,
     /// The shards the node places its ranges over, where its operator states them (node.md §2.9).
     pub range_shards: Option<RangeShards>,
+    /// The shards the node drives its native requests on, where its operator states them (node.md
+    /// §2.9 step 6f).
+    pub native_shards: Option<NativeShards>,
 }
 
 /// Where a value comes from (node.md §1.4's table).
@@ -2182,6 +2191,11 @@ pub fn derive(
         Some(shards) => (shards, Kind::Stated),
         None => (RangeShards::First, Kind::Cited),
     };
+    // The shards it drives its native requests on, which its runtime's shards are sized for too.
+    let (native_shards, native_shards_why) = match stated.native_shards {
+        Some(shards) => (shards, Kind::Stated),
+        None => (NativeShards::First, Kind::Cited),
+    };
     // What `objects` operations at once hold beside their charges, the volumes moving `transfers`
     // at once: their asks, the transport's bounds with a native client each beside the pinned
     // peers (node.md §3.6) drawing its exchanges from a pool of as many, each share of its windows
@@ -2262,13 +2276,29 @@ pub fn derive(
         let lanes = crate::node::shard_lanes_bytes(limits.exchanges)
             .and_then(|pair| u64::try_from(far).ok()?.checked_mul(pair))
             .ok_or(overflow("the ranges' shards' lanes"))?;
+        // Where the node drives its native requests past the first (node.md §2.9 step 6f), each
+        // shard past it runs a driving task with its three lanes, each holding the exchanges the
+        // transport admits at once, the answers' the asks the node holds at once.
+        let driving = match native_shards {
+            NativeShards::Spread if hosts => measured.cores.saturating_sub(1),
+            NativeShards::Spread | NativeShards::First => 0,
+        };
+        let slots = asked
+            .chunks
+            .checked_add(asked.commands)
+            .and_then(|asks| asks.checked_add(asked.reads))
+            .ok_or(overflow("the driving shards' asks"))?;
+        let lanes = crate::node::driving_lanes_bytes(limits.exchanges, slots)
+            .and_then(|each| u64::try_from(driving).ok()?.checked_mul(each))
+            .and_then(|driving| driving.checked_add(lanes))
+            .ok_or(overflow("the driving shards' lanes"))?;
         // Where the node spreads its ranges, each of those shards runs their task Critical
         // (`node::shard::Lanes::start`); none past the first runs one where it does not.
         let ranging = match range_shards {
             RangeShards::First => 0,
             RangeShards::Spread => far,
         };
-        let runtime = shard_shape(listening, stated.peers.len(), range_shards)
+        let runtime = shard_shape(listening, stated.peers.len(), (range_shards, native_shards))
             .and_then(|shape| {
                 runtime_bytes(measured.cores, &shape, measured.ring, listening, ranging)
             })
@@ -2323,6 +2353,9 @@ pub fn derive(
                     .transport_bytes
                     .checked_add(held.beside)
                     .and_then(|bytes| bytes.checked_add(held.listener))
+                    // The node's task's one piece it reads every native body into, outside the
+                    // transport's budget (`Node::piece`, `node::PIECE`), made once at most a piece.
+                    .and_then(|bytes| bytes.checked_add(crate::node::PIECE))
                     .ok_or(overflow("the transport's memory"))?,
             ),
             (Class::Runtime, held.runtime),
@@ -2697,6 +2730,14 @@ pub fn derive(
          (lean-doors ec7519e1) measured placement over its shards slower than r28 (54fda898) with \
          every range on the first (node.md §2.9)",
     );
+    said.add(
+        "native_shards",
+        native_shards,
+        native_shards_why,
+        "the shards the node drives its native requests on: as stated, or its first alone, as every \
+         ladder before step 6f measured it, until a ladder measures them spread (node.md §2.9 step \
+         6f)",
+    );
     let gateway_config = hosts.then(|| GatewayConfig {
         keys: stated.keys.clone(),
         handover_ns: gateway.handover_ns,
@@ -2743,6 +2784,7 @@ pub fn derive(
             enlist: stated.enlist,
             gateway: gateway_config,
             range_shards,
+            native_shards,
         },
         bases: said.0,
     })
@@ -3394,7 +3436,8 @@ fn say_floor(
                 Class::Log => "the node's shared log (derive::log_bytes)",
                 Class::Transport => {
                     "the transport's budget and what it holds beside it, its plane and its \
-                     liveness stream (derive::transport_bytes_beside), and the S3 listener's \
+                     liveness stream (derive::transport_bytes_beside), the node's task's piece \
+                     it reads native bodies into (node::PIECE), and the S3 listener's \
                      connections, as many as the operations, each at its measured bytes and \
                      its sessions' slots (listener::CONNECTION_BYTES, listener::SESSION_BYTES)"
                 }
@@ -3874,7 +3917,7 @@ mod tests {
     #[test]
     fn the_runtime_holds_each_shard_at_the_firsts_shape_and_a_lane_past_the_first() {
         assert_eq!(
-            shard_shape(None, 4, RangeShards::First),
+            shard_shape(None, 4, (RangeShards::First, NativeShards::First)),
             Some(ShardShape {
                 tasks: 2,
                 timers: 3,
@@ -3882,7 +3925,7 @@ mod tests {
             })
         );
         // 256 served and 10 answered refused.
-        let shape = shard_shape(Some(256), 4, RangeShards::First).unwrap();
+        let shape = shard_shape(Some(256), 4, (RangeShards::First, NativeShards::First)).unwrap();
         assert_eq!(
             shape,
             ShardShape {
@@ -3909,7 +3952,7 @@ mod tests {
             Some(RUNTIME_BYTES + 10 * shard + critical + 9 * lane)
         );
         // No listener, no lane.
-        let alone = shard_shape(None, 4, RangeShards::First).unwrap();
+        let alone = shard_shape(None, 4, (RangeShards::First, NativeShards::First)).unwrap();
         assert_eq!(
             runtime_bytes(10, &alone, 16, None, 0),
             Some(
@@ -3934,7 +3977,7 @@ mod tests {
     #[test]
     fn a_shard_that_runs_ranges_holds_their_launcher_and_the_classes_their_critical_task_makes() {
         // 256 served and 10 answered refused, the taker, the ranges' task and its launcher.
-        let shape = shard_shape(Some(256), 4, RangeShards::Spread).unwrap();
+        let shape = shard_shape(Some(256), 4, (RangeShards::Spread, NativeShards::First)).unwrap();
         assert_eq!(
             shape,
             ShardShape {
@@ -3945,8 +3988,8 @@ mod tests {
         );
         // No listener: the first's two, the node's task and its launcher, as the ranges' two.
         assert_eq!(
-            shard_shape(None, 4, RangeShards::Spread),
-            shard_shape(None, 4, RangeShards::First)
+            shard_shape(None, 4, (RangeShards::Spread, NativeShards::First)),
+            shard_shape(None, 4, (RangeShards::First, NativeShards::First))
         );
         let shard = SHARD_BYTES
             + 269 * SHARD_TASK_BYTES
@@ -3969,6 +4012,28 @@ mod tests {
         assert_eq!(runtime_bytes(10, &shape, 16, Some(256), usize::MAX), None);
     }
 
+    /// A shard past the first that drives native requests (node.md §2.9 step 6f) holds its driving
+    /// task and the launcher that spawns it, holding its own slot while it spawns, and the task's
+    /// timer, beside its ranges' where they are spread too; its lanes hold the exchanges the
+    /// transport admits at once each way and the node's asks back.
+    #[test]
+    fn a_shard_that_drives_native_requests_holds_their_task_and_its_launcher() {
+        // 256 served and 10 answered refused, the taker, and the driving task and its launcher.
+        let driving = shard_shape(Some(256), 4, (RangeShards::First, NativeShards::Spread));
+        let ranging = shard_shape(Some(256), 4, (RangeShards::Spread, NativeShards::First));
+        assert_eq!(driving, ranging);
+        let both = shard_shape(Some(256), 4, (RangeShards::Spread, NativeShards::Spread)).unwrap();
+        assert_eq!((both.tasks, both.timers), (271, 269));
+        // No listener: past the first, two tasks and their launchers, the first's two less.
+        let alone = shard_shape(None, 4, (RangeShards::Spread, NativeShards::Spread)).unwrap();
+        assert_eq!((alone.tasks, alone.timers), (4, crate::process::TIMERS));
+        // Each lane's room, two lanes of exchanges and one of answers, at least a value each.
+        let lanes = crate::node::driving_lanes_bytes(8, 3).unwrap();
+        assert!(lanes > crate::node::driving_lanes_bytes(4, 3).unwrap());
+        assert!(lanes > crate::node::driving_lanes_bytes(8, 2).unwrap());
+        assert_eq!(crate::node::driving_lanes_bytes(usize::MAX, 3), None);
+    }
+
     /// The runtime grows by the same bytes with each S3 connection, at every count, shard and
     /// placement of the ranges: the operations' count charges each operation the difference from
     /// one to two (`derive`), so a step past it is a floor the count passes. Charged at its power
@@ -3985,7 +4050,8 @@ mod tests {
                         RangeShards::Spread => shards - 1,
                     };
                     let at = |served: u64| {
-                        let shape = shard_shape(Some(served), peers, ranges).unwrap();
+                        let shape = shard_shape(Some(served), peers, (ranges, NativeShards::First))
+                            .unwrap();
                         runtime_bytes(shards, &shape, 16, Some(served), ranging).unwrap()
                     };
                     let each = at(2) - at(1);
@@ -4200,7 +4266,9 @@ mod tests {
     /// each operation's client's among them, at a receive chunk, so each datagram is cut from a
     /// chunk, not copied. Each operation so costs its client's windows at a chunk: 58,965
     /// operations where 71,522 at QUIC's initial window (36ad012b), 9.47 GB past the transport's
-    /// floor; the need is 36ad012b's, which holds the capacity wants and the operations served.
+    /// floor; the need is 36ad012b's, which holds the capacity wants and the operations served,
+    /// and the piece the node's task reads every native body into, which step 6 counts in the
+    /// transport's floor (`node::PIECE`, node.md §2.9 step 6c).
     #[test]
     fn a_node_with_memory_to_spare_gives_every_operations_windows_a_receive_chunk() {
         let mut founder = Stated {
@@ -4229,7 +4297,10 @@ mod tests {
         assert_eq!(bytes - floor, want);
         let operations = said_bytes(&derived, "gateway.objects");
         assert!((58_000..60_000).contains(&operations), "{operations}");
-        assert_eq!(said_bytes(&derived, "memory.need"), NEED_96_GIB);
+        assert_eq!(
+            said_bytes(&derived, "memory.need"),
+            NEED_96_GIB + crate::node::PIECE
+        );
     }
 
     /// The need of a ladder founder on 96 GiB and 32 cores at 36ad012b, rule D's order before
@@ -5047,6 +5118,7 @@ mod tests {
             target: None,
             s3: None,
             range_shards: None,
+            native_shards: None,
         }
     }
 
@@ -5149,6 +5221,7 @@ mod tests {
         );
         assert_eq!(read.enlist, config.enlist);
         assert_eq!(read.range_shards, config.range_shards);
+        assert_eq!(read.native_shards, config.native_shards);
         let (read, config) = (read.gateway.unwrap(), config.gateway.as_ref().unwrap());
         assert_eq!(read.keys, config.keys);
         assert_eq!(

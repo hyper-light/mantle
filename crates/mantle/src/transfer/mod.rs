@@ -24,7 +24,7 @@ use std::time::Instant;
 use hyper_rt::runtime::LocalRuntime;
 use mantle_client::{Client, Settings};
 use mantle_disk::histogram::Histogram;
-use mantle_node::process::RangeShards;
+use mantle_node::process::{NativeShards, RangeShards};
 use mantle_protocol::classes::Bounds;
 use mantle_protocol::object::{Op, Status};
 
@@ -553,7 +553,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
             None => {
                 let (volume_bytes, why) = options.volume.bytes(&dir)?;
                 writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
-                let mut cell = Cell::make(&dir, volume_bytes, RangeShards::First)?;
+                let shards = (RangeShards::First, NativeShards::First);
+                let mut cell = Cell::make(&dir, volume_bytes, shards)?;
                 let mut natives = Natives::new(&cell, &dir, messages)?;
                 let (tallies, oracle) = small(
                     &cell,
@@ -669,7 +670,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
             None => {
                 let (volume_bytes, why) = options.volume.bytes(&dir)?;
                 writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
-                let mut cell = Cell::make(&dir, volume_bytes, RangeShards::First)?;
+                let shards = (RangeShards::First, NativeShards::First);
+                let mut cell = Cell::make(&dir, volume_bytes, shards)?;
                 let mut natives = Natives::new(&cell, &dir, messages)?;
                 let (done, oracle, budget) = large::large(
                     &cell,

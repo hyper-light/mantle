@@ -718,6 +718,11 @@ enum BenchCommand {
         /// every range on its first shard, or spread, over the shards past it (node.md §2.9).
         #[arg(long, default_value = "first")]
         range_shards: mantle_node::process::RangeShards,
+        /// The shards each server of the cell drives its native requests on, its `native_shards`:
+        /// first, every request on its first shard, or spread, over the shards past it, apart from
+        /// where its ranges go (node.md §2.9 step 6f).
+        #[arg(long, default_value = "first")]
+        native_shards: mantle_node::process::NativeShards,
     },
 }
 
@@ -1418,6 +1423,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         kinds,
         relay,
         range_shards,
+        native_shards,
     } = command
     else {
         return Err("not mantle bench doors".to_owned());
@@ -1475,6 +1481,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         kinds,
         relay,
         range_shards,
+        native_shards,
     })
 }
 
@@ -1570,6 +1577,33 @@ mod tests {
         );
         assert_eq!(shards(&["--range-shards", "first"]), Ok(RangeShards::First));
         assert!(shards(&["--range-shards", "every"]).is_err());
+    }
+
+    /// `mantle bench doors --native-shards` states the shards each server drives its native
+    /// requests on, apart from its ranges', `first` where not given, and refuses another word
+    /// (node.md §2.9 step 6f).
+    #[test]
+    fn bench_doors_states_the_shards_its_servers_native_requests_take() {
+        use clap::Parser;
+        use mantle_node::process::{NativeShards, RangeShards};
+        let shards = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["mantle", "bench", "doors", "run"].iter().chain(args))
+                .map_err(|e| e.to_string())?;
+            let Command::Bench { command } = cli.command else {
+                return Err("not mantle bench".to_owned());
+            };
+            doors_options(command).map(|options| (options.range_shards, options.native_shards))
+        };
+        assert_eq!(shards(&[]), Ok((RangeShards::First, NativeShards::First)));
+        assert_eq!(
+            shards(&["--native-shards", "spread"]),
+            Ok((RangeShards::First, NativeShards::Spread))
+        );
+        assert_eq!(
+            shards(&["--range-shards", "spread", "--native-shards", "first"]),
+            Ok((RangeShards::Spread, NativeShards::First))
+        );
+        assert!(shards(&["--native-shards", "every"]).is_err());
     }
 
     /// A machines file's founders come before the flags', and a cell's statement made in both is

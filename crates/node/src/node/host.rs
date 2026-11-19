@@ -12,14 +12,16 @@
 //! preconditions and range are judged by `mantle_s3::conditional` and `mantle_s3::range`, a
 //! write's at the Name range's commit (05 §2).
 //!
-//! A put's body is read from its exchange only as fast as the driver takes it, a piece at a time,
-//! and a get's bytes are taken from its driver only as fast as the exchange takes them, so what an
-//! operation holds is its driver's window of blocks and one piece. The operations the host runs at
-//! once are bounded (`GatewaySettings::objects`); one past them is answered `SlowDown`.
+//! A put's body comes on a bounded channel as its door gives it, a native exchange's by the node's
+//! task (node.md §2.9 step 6c), only as fast as the driver takes it, a piece at a time, and a reply
+//! goes on a bounded channel its door writes from, a native exchange's by the node's task, a get's
+//! bytes taken from its driver only as fast as the door takes them, so what an operation holds is
+//! its driver's window of blocks and a piece or two. The operations the host runs at once
+//! are bounded (`GatewaySettings::objects`); one past them is answered `SlowDown`.
 
 use std::collections::VecDeque;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use hyper_rt::compute;
 use hyper_rt::slow::Label;
 use hyper_rt::sync::{ChannelReceiver, OneshotReceiver, Sender, SyncError};
@@ -121,6 +123,52 @@ pub(crate) enum Pending {
     Chunk(ChunkAsk),
 }
 
+/// What a job asks of the node, one value a lane between shards can carry (node.md §2.9 step
+/// 6b), which [`Node::ask`] serves: a range's command or read, asked as a gateway asks one, until
+/// the range answers or its budget passes without a leader (`Wait::Request`); or a chunk's put or
+/// get on a volume, of the node the volume table names as holding it.
+pub(crate) enum JobAsk {
+    /// A command of the range of the group.
+    Command(u128, Command),
+    /// A read of the range of the group.
+    Read(u128, Query),
+    /// `key`'s whole chunk, `bytes`, with the CRC-32C its writer computed, put on `volume`, which
+    /// `at` holds, within the job's `remaining_ns`.
+    Put {
+        at: PeerId,
+        volume: u128,
+        key: mantle_chunk::ChunkKey,
+        bytes: Bytes,
+        crc32c: u32,
+        remaining_ns: u64,
+    },
+    /// `len` bytes from `offset` of `key`'s chunk on `volume`, which `at` holds, within the job's
+    /// `remaining_ns`.
+    Get {
+        at: PeerId,
+        volume: u128,
+        key: mantle_chunk::ChunkKey,
+        span: (u64, u64),
+        remaining_ns: u64,
+    },
+}
+
+/// A native request handed to a driving shard with its fields read (node.md §2.9 step 6e): its
+/// operation, not its work, which the shard makes ([`Host::take_handed`]), as a job's drivers need
+/// not cross (step 6's check); its door's job half, its asker's principal, its Open's block, its
+/// client's deadline, its admission's time, charge and window, and the shard it was placed on.
+pub(crate) struct Handover {
+    half: Box<Native>,
+    principal: String,
+    op: Op,
+    block: Option<u64>,
+    deadline_ns: Option<u64>,
+    admitted_ns: Option<u64>,
+    charge: u64,
+    window: usize,
+    driven: Option<usize>,
+}
+
 /// An object operation the host runs: the door it came in by, its asker, and where it is.
 pub(crate) struct Job {
     door: Door,
@@ -146,15 +194,13 @@ pub(crate) struct Job {
     /// (`reading`), and charged for them. A copy's get and put hold their own, fitted once its
     /// source's version is read (`copy_windows`), and this is the floor's.
     window: usize,
+    /// The shard, numbered from the node's first, its native request was placed on and is counted
+    /// on until it ends (`node::drivers`); none for one not placed: the S3 door's, or one answered
+    /// at once.
+    driven: Option<usize>,
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
-    /// Whether its reply waits for room in the endpoint's budget, which refused the piece the
-    /// request's body before it drains through (its head never waits, `node::reply_head`): offered
-    /// again at each turn, the job held meanwhile, vouched for and due at each beat within its
-    /// client's patience (research/77 D1, D2), and past it its exchange refused `Budget`, which
-    /// its asker hears at once (`Node::wait_to_reply`). A job never ends without its reply.
-    room_to_reply: bool,
 }
 
 impl Job {
@@ -206,8 +252,8 @@ impl Job {
     /// and whose patience passed is vouched for no more and needs no beat; a get still reading
     /// its version must wake at the bound even through the local S3 door. A put or a get whose
     /// chunk waits for room is due at the beat on either door: no answer of its own comes to turn
-    /// the node when a peer's volume frees room, so the node offers it room again then
-    /// (`Node::step_host`).
+    /// the node when a peer's volume frees room, so the host offers it room again then
+    /// (`Host::step`).
     fn due_ns(&self, now: u64, beat: u64) -> Option<u64> {
         if self.bounded(now) == Bounded::Unvouched {
             return None;
@@ -215,7 +261,7 @@ impl Job {
         let bound = self.bound_ns();
         Some(match self.door {
             Door::Local(_) if !self.waits_for_room() => bound,
-            Door::Exchange(_) | Door::Local(_) => bound.min(now.saturating_add(beat)),
+            Door::Native(..) | Door::Local(_) => bound.min(now.saturating_add(beat)),
         })
     }
 
@@ -233,16 +279,261 @@ impl Job {
     fn working(&self) -> bool {
         !matches!(
             self.work,
-            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_)
+            Work::Fields(..) | Work::Handing(_) | Work::Draining(_) | Work::Answering(_)
         )
     }
 }
 
+/// The object operations a task runs (node.md §2.9 step 6d): its jobs and what they hold, the
+/// bytes their work moved, the native doors kept for its next requests ([`Doors`]), and the
+/// gateway's settings its jobs run by, shared with the node. Its steps are served by the node
+/// through one interface ([`Serve`]), which lends it out for each turn: the node keeps admission,
+/// parking and the windows it learned, one authority for its bottleneck (§2.5), the asks and their
+/// outcomes, and the exchanges, each request's fields read and its reply written by its own task.
+/// A host taken for a lend leaves its default in its place, which holds nothing and allocates
+/// nothing (`Vec::new`).
+#[derive(Default)]
+pub(crate) struct Host {
+    jobs: Vec<Job>,
+    /// Bytes of its jobs' bodies taken and of their replies given, as each job counted them since
+    /// the host was made: summed with the node's own where `Node::moved` is read.
+    moved: u64,
+    doors: Doors,
+    /// The gateway's settings, one `Arc` made with the node and shared with it, none where the
+    /// node hosts no objects.
+    gateway: Option<std::sync::Arc<GatewaySettings>>,
+    /// When, on the shard's clock, the host last offered its jobs room, or last had none waiting
+    /// for it: a put or a get whose chunk waits for room is offered it again a beat after
+    /// (`Host::step`).
+    room_offered_ns: u64,
+}
+
+/// What the host asks of whoever lends it a turn, the node's task now and a driving shard's task
+/// at 6e (node.md §2.9 step 6d): each ask of a job and its outcome (6b), the volume table and the
+/// ranges' groups, whether the node holds room for a command, the wall clock, a local door's
+/// pacing, the put and get windows' samples, the windows learned and room for a job's charge to
+/// grow, and each job's end with its charge, its shard and the asks it let go. A native job's fields are read by the node's task (`read_fields`) until 6f
+/// reads them before the job is made.
+pub(crate) trait Serve {
+    /// Asks what a job asks: what it waits on, whose outcome [`Serve::outcome`] gives. Refused
+    /// `NodeError::Asks` where the node holds as many of its kind as it keeps, which the job asks
+    /// again at its next turn.
+    fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError>;
+    /// The outcome of what a job asked, once answered, taken.
+    fn outcome(&mut self, pending: Pending) -> Option<Outcome>;
+    /// Whether what a job asked is answered, its outcome not yet taken: the host's next turn is
+    /// due at once ([`Host::due`]).
+    fn answered(&self, pending: Pending) -> bool;
+    /// Asks a job let go of, their job ended or replied before they were answered: each outcome
+    /// dropped as it comes, as one no job takes would hold one of the node's asks for good.
+    fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>);
+    /// The volume table puts are placed by, as the node last read it.
+    fn table(&mut self) -> Result<&Table, NodeError>;
+    /// The group of the range of `layer` the node hosts.
+    fn group_of(&self, layer: Layer) -> Option<u128>;
+    /// The ranges the node hosts, which a bucket's coordinator bounds its reads by.
+    fn ranges(&self) -> usize;
+    /// Whether the node holds room for one more command (`command_asks`).
+    fn command_room(&self) -> bool;
+    /// Whether the node holds room for one more ask of `ask`'s kind (`command_asks`, `read_asks`,
+    /// `chunk_asks`), checked before the ask's value is given up: a driving shard's ask the node
+    /// has no room for is held by the node's task, not answered `Asks` (node.md §2.9 step 6e).
+    fn room(&self, ask: &JobAsk) -> bool;
+    /// The commands the node holds at once (`command_asks`), which a DeleteObjects shares.
+    fn command_asks(&self) -> usize;
+    /// The wall clock's time, which a put's and a completion's records carry.
+    fn wall_ns(&self) -> u64;
+    /// Whether room at a volume or in the transport toward it was freed since the last turn, so
+    /// each chunk a put or a get holds for want of it is asked again (research/77 D2).
+    fn freed(&mut self) -> bool;
+    /// Bytes the node's task moved since it was made, a native job's fields among them.
+    fn moved(&self) -> u64;
+    /// A native job's fields read from its exchange, a piece at a time, and once whole the work
+    /// they name; whether it is over.
+    fn read_fields(&mut self, job: &mut Job) -> Result<bool, NodeError>;
+    /// A piece of an S3 body taken as `paced` says: a sample of the S3 door's depth.
+    fn took(&mut self, paced: door::Paced);
+    /// A put's blocks recorded in `ns`: a sample of the put window (`Window::took`).
+    fn committed(&mut self, ns: u64);
+    /// A put's body of `bytes` came in `ns`: a sample of the put window (`Window::paced`).
+    fn filled(&mut self, bytes: u64, ns: u64);
+    /// A get's block read in `ns`, from its row asked to its plaintext opened: a sample of the get
+    /// window (`Window::took`).
+    fn read(&mut self, ns: u64);
+    /// What the node learned of its puts' and its gets' blocks and bodies, the windows each holds
+    /// (`crate::window`), which a get's and a copy's are fitted to once their sizes are known.
+    fn windows(&self) -> crate::window::Windows;
+    /// Whether the operations' bytes hold `more` past a running job's charge beside the others'
+    /// (`admit::Admission::holds`).
+    fn holds(&self, more: u64) -> bool;
+    /// A running job's charge moved as its windows were fitted: `more` bytes taken past it, which
+    /// [`Serve::holds`] said the operations' bytes hold, the caches giving back first what of them
+    /// they hold (`Node::charge_more`), and `less` given back.
+    fn recharge(&mut self, more: u64, less: u64);
+    /// A job ended: admitted at `admitted_ns` and charged `charge`, placed on shard `driven`,
+    /// with what it still waited on let go, and its native door's half (`half`), told already
+    /// that its job let go: what the host keeps of it, back. The node's task holds a native door's
+    /// other half, so its host keeps the half, in its doors for the next request; a driving
+    /// shard's host keeps none, the half riding the job's end to the node's task (node.md §2.9
+    /// step 6e), as a half its host kept would wait there with no bound for a half it never sees.
+    fn job_ended(
+        &mut self,
+        admitted_ns: Option<u64>,
+        charge: u64,
+        driven: Option<usize>,
+        asks: impl IntoIterator<Item = Pending>,
+        half: Option<Box<Native>>,
+    ) -> Option<Box<Native>>;
+}
+
+impl Host {
+    /// A host with no jobs, keeping at most `doors` native doors for its next requests: one an
+    /// operation it runs at once, within the exchanges the transport holds; its jobs run by
+    /// `gateway`.
+    pub(super) fn new(doors: usize, gateway: Option<std::sync::Arc<GatewaySettings>>) -> Self {
+        Self {
+            jobs: Vec::new(),
+            moved: 0,
+            doors: Doors::new(doors),
+            gateway,
+            room_offered_ns: 0,
+        }
+    }
+
+    /// Bytes its jobs moved since it was made.
+    pub(super) fn moved(&self) -> u64 {
+        self.moved
+    }
+
+    /// Whether it runs no job.
+    pub(super) fn idle(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    /// Takes a native request handed with its fields read: its job made here, its work made from
+    /// its operation (node.md §2.9 step 6e), its door naming `exchange` where the node's task runs
+    /// it and none on a driving shard.
+    pub(super) fn take_handed(&mut self, handed: Box<Handover>, exchange: Option<ExchangeId>) {
+        let Handover {
+            half,
+            principal,
+            op,
+            block,
+            deadline_ns,
+            admitted_ns,
+            charge,
+            window,
+            driven,
+        } = *handed;
+        let label = Some(labels::host(&op));
+        self.jobs.push(Job {
+            door: Door::Native(exchange, half),
+            principal,
+            work: work(op, block),
+            pending: Vec::new(),
+            deadline_ns,
+            moved_ns: hyper_rt::futures::now_ns(),
+            admitted_ns,
+            charge,
+            window,
+            driven,
+            label,
+        });
+    }
+
+    /// A native job whose fields were read for a driving shard (`Work::Handing`), taken out to be
+    /// handed there: its request and its exchange.
+    fn handing(&mut self) -> Option<(Box<Handover>, Option<ExchangeId>)> {
+        let at = self
+            .jobs
+            .iter()
+            .position(|job| matches!(job.work, Work::Handing(_)))?;
+        let job = self.jobs.swap_remove(at);
+        let (Door::Native(exchange, half), Work::Handing(handing)) = (job.door, job.work) else {
+            return None;
+        };
+        let (op, block) = *handing;
+        Some((
+            Box::new(Handover {
+                half,
+                principal: job.principal,
+                op,
+                block,
+                deadline_ns: job.deadline_ns,
+                admitted_ns: job.admitted_ns,
+                charge: job.charge,
+                window: job.window,
+                driven: job.driven,
+            }),
+            exchange,
+        ))
+    }
+
+    /// When, on the shard's clock, the host next needs a turn of whoever serves it, by its own
+    /// jobs alone (node.md §2.9 step 6e), so a driving shard's task waits on its host and nothing
+    /// of the node's: at once where what a job asked is answered (`Serve::answered`), as an answer
+    /// that came after the host's step in a turn waits on no event; else a put's renewal coming
+    /// due, or the beat or bound of a job whose work is held. Each operation at work is ended at
+    /// its client's patience, and one whose asks are held says so each beat, a probe timeout, the
+    /// transport's notes' beat of a third of the serve period (research/77 D2).
+    pub(super) fn due<N: Serve>(&self, node: &N) -> Option<u64> {
+        let shard = hyper_rt::futures::now_ns();
+        if self
+            .jobs
+            .iter()
+            .flat_map(|job| job.pending.iter())
+            .any(|(pending, _)| node.answered(*pending))
+        {
+            return Some(shard);
+        }
+        let wall = node.wall_ns();
+        let renewal = self
+            .jobs
+            .iter()
+            .filter_map(|job| match &job.work {
+                Work::Put(putting) => putting.put.as_ref()?.due_ns(),
+                Work::Copy(copying) => copying.put.as_ref()?.due_ns(),
+                _ => None,
+            })
+            .min()
+            .map(|due| shard.saturating_add(due.saturating_sub(wall)));
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let bound = self
+            .jobs
+            .iter()
+            .filter(|job| job.working() && job.held())
+            .filter_map(|job| job.due_ns(shard, beat))
+            .min();
+        [renewal, bound].into_iter().flatten().min()
+    }
+
+    /// The job waiting on chunk ask `ask`, its work moved now: a piece of the chunk it reads came,
+    /// or one of the chunk it sends went (research/77 D2).
+    pub(super) fn chunk_moved(&mut self, ask: u64) {
+        let now = hyper_rt::futures::now_ns();
+        if let Some(job) = self.jobs.iter_mut().find(|job| {
+            job.pending
+                .iter()
+                .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask))
+        }) {
+            job.moved_ns = now;
+        }
+    }
+}
+
 /// What the host keeps of one native put or get beside its charge, by design: its job, and the
-/// work it boxes, a put's or a get's whichever is larger, its driver inline in it
-/// (`derive::native`).
+/// work it boxes, a put's or a get's whichever is larger, its driver inline in it; its reply's
+/// door, the job's end and the node's task's, and what the two share; and a door kept for a next
+/// request, the host keeping at most one an operation (`Doors`, at most `objects`) (node.md §2.9
+/// step 6d; `derive::native`).
 pub(crate) fn record_bytes() -> Option<usize> {
-    size_of::<Job>().checked_add(size_of::<Putting>().max(size_of::<Getting>()))
+    let door = size_of::<Native>().checked_add(size_of::<Handed>())?;
+    size_of::<Job>()
+        .checked_add(size_of::<Putting>().max(size_of::<Getting>()))?
+        .checked_add(door)?
+        .checked_add(size_of::<(ExchangeId, Replies)>())?
+        .checked_add(door)?
+        .checked_add(size_of::<(Box<Native>, Replies)>())
 }
 
 /// What a held job's bound makes of it at a turn (research/77 D2).
@@ -258,25 +549,1050 @@ enum Bounded {
 
 /// Where a job's operation came in: its body is read and its reply written there.
 enum Door {
-    /// A native exchange, the operation's fields at its body's start (`mantle_protocol::object`).
-    Exchange(ExchangeId),
+    /// A native exchange (`mantle_protocol::object`), the operation's fields at its body's start,
+    /// read from it at the job's turns; then a put's body given by the node's task ([`Feeding`]) and
+    /// the reply written by the node's task ([`Replies`]), each from a bounded channel, as the S3
+    /// listener gives a local door's body and writes its reply (node.md §2.9 step 6c). The exchange
+    /// is the node's task's alone, none where the request was handed with its fields read (§2.9
+    /// step 6e): only hyper-transport makes an `ExchangeId`, and the job needs none, its body and
+    /// reply going through its door.
+    Native(Option<ExchangeId>, Box<Native>),
     /// The S3 listener's, in-process (`crate::door`).
     Local(Box<Local>),
+}
+
+impl Door {
+    /// The native exchange the operation came in on, which its reply is written to; none for the
+    /// S3 listener's, or for a request handed with its fields read.
+    fn exchange(&self) -> Option<ExchangeId> {
+        match self {
+            Self::Native(exchange, _) => *exchange,
+            Self::Local(_) => None,
+        }
+    }
+}
+
+/// A native job's ends of its exchange's channels (node.md §2.9 step 6c): a put's body as the
+/// node's task gives it, and its reply as the job gives it, which the node's task writes, with what
+/// the two share beside it ([`Handed`]). The job touches nothing of the node's but these: the bytes
+/// it moves it counts here, which the host's step takes as a value (`Host::turn_job`).
+pub(crate) struct Native {
+    /// A put's body, once its fields named one, on the channel made with its door and kept with
+    /// it ([`Doors`]): its sender is the node's task's half's ([`Replies`]), lent to the put's
+    /// feeding while the node's task reads the body ([`Feeding`]).
+    body: Pieces,
+    reply: Sender<Told>,
+    /// Answers the reply's channel had no room for, sent before any other, in order. A piece is
+    /// given only once the last is written whole, so these are at most the reply's end behind its
+    /// last piece.
+    pending: VecDeque<Told>,
+    handed: std::sync::Arc<Handed>,
+    /// Bytes of its body taken and of its reply given since the host's step last took them.
+    moved: u64,
+    /// The node's task's waker while the job runs on a driving shard (node.md §2.9 step 6f),
+    /// woken as the job gives its door anything the node's task acts on: an answer to write, its
+    /// work held, its body let go of, or a piece of its body taken, the next to be read. None
+    /// where the node's task runs the job, which steps it in its own turn. A hyper-rt waker is a
+    /// word its clone copies, so holding it costs nothing.
+    node: Option<std::task::Waker>,
+}
+
+/// What a native job tells the node's task to write to its exchange, in order, as an S3 job tells
+/// its connection (`door::Answer`): its reply's head and the fields that open its body, then a
+/// get's pieces and its end.
+enum Told {
+    /// A reply with no bytes past its fields, written once the request's body is read whole and
+    /// dropped, so the exchange ends whole (`Arriving::Redirect`'s reason), and the exchange ended
+    /// once its fields are written.
+    Reply(Box<Opening>),
+    /// A get's reply, held until its driver had the range's first bytes: its head now, its pieces
+    /// to follow.
+    Head(Box<Opening>),
+    /// A get's bytes, in order, as its driver gave them.
+    Bytes(Bytes),
+    /// Every byte given and written: the exchange ends.
+    End,
+    /// The exchange is refused for the cause it carries: a get's driver failed past its head, so
+    /// the exchange ends unfinished, which its asker hears as the exchange refused, not as bytes it
+    /// could take for the object's; or a reply no message holds, a field past its bound, which its
+    /// asker hears at once rather than a period's silence.
+    Failed(Refusal),
+}
+
+/// A reply's head and the fields that open its body (`Reply::encode`), the job's work; the bytes of
+/// the body past the fields, a get's range and none for any other reply, which the head's body
+/// length counts (`Endpoint::reply`); and the cause of a `SlowDown`, which the node counts as the
+/// reply goes, as the listener counts the S3 door's.
+struct Opening {
+    head: Vec<u8>,
+    fields: Bytes,
+    body: u64,
+    slowed: Option<door::Slowed>,
+    /// When, on the shard's clock, its job's client stops waiting, as the job's bound stood when it
+    /// gave the reply (`Job::bound_ns`): a reply whose piece its request's body drains through
+    /// waits for room in the endpoint's budget is held until then, and past it its exchange is
+    /// refused `Budget` (`Replies::wait_for_room`). Its head never waits: it fills the room the
+    /// endpoint took with its request's head (`node::reply_head`).
+    bound_ns: u64,
+    /// Whether its job was admitted, charged a piece of its body: what is left of the body is read
+    /// into the node's task's piece rather than the endpoint's (`Node::drop_body`).
+    admitted: bool,
+}
+
+/// What a native job and the node's task share of its reply beside its channel, each an atomic that
+/// needs no lock, as the S3 door's connections tell the host what they wrote (`door::Learned`): the
+/// fields and pieces the job gave that the node's task has yet to write whole, past which the job
+/// gives none, so a get holds one piece taken from its driver, as it held one while its job wrote
+/// its exchange (`derive::Charges`: "a get's block taken and written out"); and whether its work is
+/// held, which the node's task tells the exchange's asker (`Endpoint::working`, research/77 D1).
+/// And whether the node's task let go of the reply, its exchange ended or refused, so a job waiting
+/// for what it gave to be written ends; and whether the job let go of its door, so the node's task
+/// writes nothing past what it gave: a door kept for the next request ([`Doors`]) closes neither
+/// end of its channels, which once said both. And of a put's body, what its channel's ends'
+/// drops said: whether the job let go of it (`dropped`), so the node's task reads and drops the
+/// rest, and whether the node's task let go of it (`cut`), so the job, finding nothing more given,
+/// knows its body did not come whole, the word read before the channel so a piece given before it
+/// is taken first.
+#[derive(Default)]
+struct Handed {
+    unwritten: std::sync::atomic::AtomicUsize,
+    held: std::sync::atomic::AtomicBool,
+    gone: std::sync::atomic::AtomicBool,
+    ended: std::sync::atomic::AtomicBool,
+    dropped: std::sync::atomic::AtomicBool,
+    cut: std::sync::atomic::AtomicBool,
+}
+
+impl Native {
+    /// Sends what waits, in order: whether the door takes more now; `Gone` once the node's task let
+    /// go of the reply, whose channel's receiving end may be kept for the next request ([`Doors`]).
+    fn flush(&mut self) -> Sent {
+        if self.gone() {
+            return Sent::Gone;
+        }
+        let waiting = self.pending.len();
+        let sent = flush(&self.reply, &mut self.pending);
+        if self.pending.len() < waiting {
+            self.wake_node();
+        }
+        sent
+    }
+
+    /// Sends `told` after what waits, or holds it behind them.
+    fn offer(&mut self, told: Told) -> Sent {
+        self.pending.push_back(told);
+        self.flush()
+    }
+
+    /// Gives fields or a piece the node's task writes: counted unwritten until it is written whole.
+    fn give(&mut self, told: Told) -> Sent {
+        self.handed
+            .unwritten
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.offer(told)
+    }
+
+    /// Whether every field and piece it gave is written whole, and nothing waits: the next may be
+    /// taken from its driver.
+    fn written(&self) -> bool {
+        self.pending.is_empty()
+            && self
+                .handed
+                .unwritten
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+    }
+
+    /// Whether the node's task let go of its reply: nothing it gives will be written.
+    fn gone(&self) -> bool {
+        self.handed.gone.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Says its work is held: the node's task vouches for it at its next write, woken where it
+    /// runs on a driving shard only where the node's task took the last word, as it vouches once
+    /// for each it takes.
+    fn held(&self) {
+        if !self
+            .handed
+            .held
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.wake_node();
+        }
+    }
+
+    /// Lets go of its body: the node's task reads and drops the rest.
+    fn drop_body(&self) {
+        self.handed
+            .dropped
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_node();
+    }
+
+    /// Turns the node's task where the job runs on a driving shard, after what it gave its door.
+    fn wake_node(&self) {
+        if let Some(node) = &self.node {
+            node.wake_by_ref();
+        }
+    }
+}
+
+/// What a get's door takes its bytes from: its driver (`Get`), or a test's.
+trait Source {
+    /// The next of its bytes, in order, once ready.
+    fn take(&mut self) -> Option<Bytes>;
+    /// Whether it ended whole, once it ended.
+    fn ended(&self) -> Option<bool>;
+}
+
+impl Source for Get {
+    fn take(&mut self) -> Option<Bytes> {
+        Get::take(self)
+    }
+
+    fn ended(&self) -> Option<bool> {
+        self.outcome().map(Result::is_ok)
+    }
+}
+
+/// What became of a native get's turn at its door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gave {
+    /// It waits: for the node's task to write what it gave, or for its driver.
+    Waits,
+    /// Its end is given, or its door is gone.
+    Over,
+    /// Its end waits for room on the channel.
+    Ending,
+}
+
+/// A native get's bytes given to its door from `source`, `written` of its `total` given so far: a
+/// piece only once the node's task wrote the last whole (`Native::written`), so the get holds one
+/// piece past its driver's window, as when its job wrote its exchange, and the node's task asks for
+/// the next within its turn while the exchange takes more (`Node::write_replies`); then its end, or
+/// its failure past its head, once every piece ready was given.
+fn give_native(
+    native: &mut Native,
+    source: &mut impl Source,
+    written: &mut u64,
+    total: u64,
+) -> Gave {
+    match native.flush() {
+        Sent::Taken if native.gone() => return Gave::Over,
+        Sent::Taken => {}
+        Sent::Held => return Gave::Waits,
+        Sent::Gone => return Gave::Over,
+    }
+    if !native.written() {
+        return Gave::Waits;
+    }
+    if let Some(bytes) = source.take() {
+        let took = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        *written = written.saturating_add(took);
+        native.moved = native.moved.saturating_add(took);
+        return match native.give(Told::Bytes(bytes)) {
+            Sent::Gone => Gave::Over,
+            Sent::Taken | Sent::Held => Gave::Waits,
+        };
+    }
+    let last = match source.ended() {
+        Some(true) if *written >= total => Told::End,
+        // The driver failed past the reply's head: the exchange ends unfinished.
+        Some(false) => Told::Failed(Refusal::Closed),
+        _ => return Gave::Waits,
+    };
+    match native.offer(last) {
+        Sent::Held => Gave::Ending,
+        Sent::Taken | Sent::Gone => Gave::Over,
+    }
+}
+
+/// A native exchange's door, made as the host takes its request: the job's ends, and the node's
+/// task's ([`Replies`]); none where its reply's channel or its body's cannot be made.
+fn native_door() -> Option<(Native, Replies)> {
+    let (reply, told) = hyper_rt::sync::channel(door::Replying::FIRST_ANSWERS).ok()?;
+    let (body, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).ok()?;
+    let handed = std::sync::Arc::new(Handed::default());
+    Some((
+        Native {
+            body: Pieces {
+                pieces,
+                ended: None,
+            },
+            reply,
+            pending: VecDeque::new(),
+            handed: std::sync::Arc::clone(&handed),
+            moved: 0,
+            node: None,
+        },
+        Replies {
+            told,
+            body: Some(body),
+            handed,
+            drained: None,
+            out: None,
+            drain: Drain::default(),
+            room: None,
+            driving: None,
+        },
+    ))
+}
+
+/// The native doors the host keeps for its next requests (node.md §2.9 step 6d), so a request takes
+/// its reply's channel, and what its job and the node's task share beside it ([`Handed`]), from
+/// those kept rather than from the allocator. A door's two halves are each given back as it is let
+/// go: the job's ([`Native`]) as its job ends, the node's task's ([`Replies`]) once its reply is
+/// written whole or refused, or its exchange ended; and a door both of whose halves are back is
+/// emptied of what its job gave and the node's task never took, its shared words cleared, and kept.
+/// A half given back first waits for the other, which is then still out, a job's or a reply the
+/// node's task writes, each of a request the node holds. Bound: the doors kept, at most `most`,
+/// the operations the host runs at once (`GatewaySettings::objects`), one an operation, as the
+/// memory floor counts them (`record_bytes`), and never past the exchanges the transport holds at
+/// once (the node's `parked_most`), as each door out is of an exchange the node holds; one given
+/// back past them is let go.
+#[derive(Default)]
+struct Doors {
+    kept: Vec<(Box<Native>, Replies)>,
+    /// Halves given back whose door's other half is still out.
+    waiting: Vec<Half>,
+    most: usize,
+}
+
+/// A door's half given back.
+enum Half {
+    Native(Box<Native>),
+    Replies(Replies),
+}
+
+impl Half {
+    /// What its door's two halves share, which tells the door.
+    fn handed(&self) -> &std::sync::Arc<Handed> {
+        match self {
+            Self::Native(native) => &native.handed,
+            Self::Replies(replies) => &replies.handed,
+        }
+    }
+}
+
+impl Doors {
+    /// Doors for a host that keeps at most `most` of them.
+    fn new(most: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            waiting: Vec::new(),
+            most,
+        }
+    }
+
+    /// A door for a request: one kept, or one made; none where its channel cannot be made.
+    fn take(&mut self) -> Option<(Box<Native>, Replies)> {
+        if let Some(door) = self.kept.pop() {
+            return Some(door);
+        }
+        let (native, replies) = native_door()?;
+        Some((Box::new(native), replies))
+    }
+
+    /// A job's half of its door, the job ended: the node's task writes nothing past what it gave.
+    fn give_native(&mut self, native: Box<Native>) {
+        native
+            .handed
+            .ended
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.give(Half::Native(native));
+    }
+
+    /// The node's task's half of a door, its reply written whole or refused, or its exchange
+    /// ended: its job gives nothing more.
+    fn give_replies(&mut self, replies: Replies) {
+        replies
+            .handed
+            .gone
+            .store(true, std::sync::atomic::Ordering::Release);
+        replies.wake_job();
+        self.give(Half::Replies(replies));
+    }
+
+    /// A half given back: its door kept once the other half is back too, else held for it.
+    fn give(&mut self, half: Half) {
+        let other = self
+            .waiting
+            .iter()
+            .position(|waiting| std::sync::Arc::ptr_eq(waiting.handed(), half.handed()));
+        let Some(at) = other else {
+            self.waiting.push(half);
+            return;
+        };
+        match (half, self.waiting.swap_remove(at)) {
+            (Half::Native(native), Half::Replies(replies))
+            | (Half::Replies(replies), Half::Native(native)) => self.keep(native, replies),
+            // A door has one half of each: two of one are none of a door's, and go.
+            _ => {}
+        }
+    }
+
+    /// A door both of whose halves are back, kept for the next request where fewer than `most`
+    /// are: what its job gave that the node's task never took dropped, and what the node's task
+    /// gave of a body that its job never took, at most each channel's room, and its halves as a
+    /// new door's. One whose body's sender is not back, which a feeding let go of gives back
+    /// first, is let go.
+    fn keep(&mut self, mut native: Box<Native>, mut replies: Replies) {
+        if self.kept.len() >= self.most || replies.body.is_none() {
+            return;
+        }
+        if !emptied(&mut replies.told, door::Replying::FIRST_ANSWERS)
+            || !emptied(&mut native.body.pieces, door::Depth::FIRST)
+        {
+            return;
+        }
+        native.body.ended = None;
+        native.pending.clear();
+        native.moved = 0;
+        native.node = None;
+        replies.drained = None;
+        replies.out = None;
+        replies.drain = Drain::default();
+        replies.room = None;
+        replies.driving = None;
+        let handed = &native.handed;
+        handed
+            .unwritten
+            .store(0, std::sync::atomic::Ordering::Release);
+        for word in [
+            &handed.held,
+            &handed.gone,
+            &handed.ended,
+            &handed.dropped,
+            &handed.cut,
+        ] {
+            word.store(false, std::sync::atomic::Ordering::Release);
+        }
+        self.kept.push((native, replies));
+    }
+}
+
+/// Whether a kept door's channel is emptied of what was given and never taken, at most `room`:
+/// none where the channel is closed, its other end gone.
+fn emptied<T>(channel: &mut ChannelReceiver<T>, room: usize) -> bool {
+    for _ in 0..=room {
+        match channel.try_recv() {
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// A native job's reply as the node's task writes it to the exchange (node.md §2.9 step 6c), the
+/// exchange's half of what the S3 listener does for a local door's reply: each answer taken from
+/// the job's channel in order and written, a reply's head with its body's length
+/// (`Endpoint::reply`), then its fields and a get's pieces as the job gave them
+/// (`Endpoint::write_body_bytes`, no copy), then its end; a reply with no bytes past its fields
+/// written once the request's body is read whole, after its feeding (`Node::feed_body`); and the
+/// job's word that its work is held passed to the exchange's asker. The channel holds one
+/// answer, the least that moves a reply (`door::Replying::FIRST_ANSWERS`), and the job gives a
+/// piece only once the last is written whole ([`Handed`]), so a full exchange holds the job, and
+/// the client, whose stream's flow control it is, holds both.
+pub(crate) struct Replies {
+    told: ChannelReceiver<Told>,
+    /// A put's body's sender, kept with its door, none while the put's feeding holds it
+    /// ([`Feeding`]).
+    body: Option<Sender<Piece>>,
+    handed: std::sync::Arc<Handed>,
+    /// A reply taken that waits for the request's body to be read whole, or for room in the
+    /// endpoint's budget for the piece that body drains through.
+    drained: Option<Box<Opening>>,
+    /// Bytes taken and not yet written whole, and what follows once they are.
+    out: Option<(Bytes, After)>,
+    /// What a get's client took of the piece being written once its room was full ([`Drain`]).
+    drain: Drain,
+    /// While the piece its request's body drains through waits for room in the endpoint's budget,
+    /// its client's patience (`Opening::bound_ns`): offered again at each turn, since the budget
+    /// freeing turns no node (`Endpoint::release` retries only the transport's lossless frames),
+    /// its exchange vouched for meanwhile, and the node's turn due at each beat (research/77 D1,
+    /// D2; `Node::host_due`); past it, its exchange refused `Budget`.
+    room: Option<u64>,
+    /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
+    /// of its moved (`driving::Lanes::doors`), told as the node's task takes what the job gave or
+    /// writes it whole, or lets go of the reply, so the job gives its next or ends; none where the
+    /// node's task runs the job, which it steps in its own turn.
+    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+}
+
+/// What a native get's client took of a piece the node's task held whole, timed from when the
+/// client's room for it was full, so its client's pace with no window holding it back
+/// (`crate::window`): a piece its room took at once says only that the room was there. The room is
+/// the stream's flow-control window, smaller than a block, so each block's writing waits on its
+/// client. On the S3 door the reply's channel holds whole blocks, so the connection times the same
+/// of its socket as it writes each (`listener::io::Drained`), and the node takes it from the door
+/// (`door::Doorway::drained`).
+#[derive(Debug, Clone, Copy, Default)]
+struct Drain {
+    /// When, on the shard's clock, the client's room was full; none while it was not.
+    held_ns: Option<u64>,
+    /// The bytes it took since.
+    bytes: u64,
+    /// The last piece's pace once it was written whole, its bytes and their nanoseconds, for the
+    /// node's task to take (`Replies::take_paced`).
+    paced: Option<(u64, u64)>,
+}
+
+impl Drain {
+    /// `took` bytes of the piece written at `now`, the last of them where `whole`: counted while
+    /// its client's room was full, which it was from now where it took less than the rest; and
+    /// once whole, what its client took since its room was full kept as its pace.
+    fn wrote(&mut self, took: u64, whole: bool, now: u64) {
+        if self.held_ns.is_some() {
+            self.bytes = self.bytes.saturating_add(took);
+        }
+        if !whole {
+            self.held_ns.get_or_insert(now);
+            return;
+        }
+        if let Some(held) = self.held_ns.take() {
+            self.paced = Some((self.bytes, now.saturating_sub(held)));
+        }
+        self.bytes = 0;
+    }
+}
+
+/// What follows bytes of a reply written whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum After {
+    /// A get's fields, before its pieces.
+    Fields,
+    /// A get's piece, which its job counted moved as it gave it.
+    Piece,
+    /// A reply's fields, its last bytes: the exchange ends.
+    End,
+}
+
+/// What became of a native reply the node's task wrote at a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrote {
+    /// Nothing more now: the exchange takes no more, or the job gave nothing more.
+    Still,
+    /// Everything given is written whole and the exchange takes more: its job may give the next.
+    More,
+    /// A reply waits for the request's body, read whole and dropped.
+    Draining,
+    /// A reply waits for room in the endpoint's budget, its exchange vouched for.
+    Room,
+    /// The exchange ended, or was refused, or its job let go with nothing more to write.
+    Over,
+}
+
+/// The exchange a native reply is written to: the node's endpoint, or a test's.
+trait Exchange {
+    /// Answers with `head` and a body of `body` bytes: what became of the head (`node::Replied`).
+    fn reply(&mut self, head: &[u8], body: u64) -> super::Replied;
+    /// Writes `bytes` as they are, kept by reference: how many it took, none where it is gone.
+    fn write(&mut self, bytes: &Bytes) -> Option<usize>;
+    fn end(&mut self);
+    /// Ends it unfinished, refused for `refusal`.
+    fn refuse(&mut self, refusal: Refusal);
+    /// Tells its asker the work for it is held.
+    fn working(&mut self);
+}
+
+/// A native exchange on the node's endpoint.
+struct Toward<'a> {
+    endpoint: &'a mut hyper_transport::Endpoint<
+        mantle_protocol::classes::NodeClasses,
+        hyper_transport::Fixed,
+        crate::directory::Peers,
+    >,
+    exchange: ExchangeId,
+}
+
+impl Exchange for Toward<'_> {
+    fn reply(&mut self, head: &[u8], body: u64) -> super::Replied {
+        super::reply_head(self.endpoint, self.exchange, head, Some(body))
+    }
+
+    fn write(&mut self, bytes: &Bytes) -> Option<usize> {
+        self.endpoint.write_body_bytes(self.exchange, bytes).ok()
+    }
+
+    fn end(&mut self) {
+        self.endpoint.end(self.exchange);
+    }
+
+    fn refuse(&mut self, refusal: Refusal) {
+        self.endpoint.refuse_exchange(self.exchange, refusal);
+    }
+
+    fn working(&mut self) {
+        self.endpoint.working(self.exchange);
+    }
+}
+
+impl Drop for Replies {
+    /// Tells the job its reply is let go of, so one waiting for what it gave to be written ends.
+    fn drop(&mut self) {
+        self.handed
+            .gone
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_job();
+    }
+}
+
+impl Replies {
+    /// Whether a reply waits for the request's body.
+    fn draining(&self) -> bool {
+        self.drained.is_some()
+    }
+
+    /// Whether the reply waiting for the request's body is of a job admitted, charged a piece of
+    /// its body (`Opening::admitted`).
+    fn admitted(&self) -> bool {
+        self.drained
+            .as_ref()
+            .is_some_and(|opening| opening.admitted)
+    }
+
+    /// When, on the shard's clock, the node's next turn is due for a reply that waits for room in
+    /// the endpoint's budget: at its next beat, at most its client's patience (`room`).
+    pub(super) fn room_due_ns(&self, now: u64, beat: u64) -> Option<u64> {
+        self.room.map(|bound| bound.min(now.saturating_add(beat)))
+    }
+
+    /// Wakes the driving shard its job runs on, where one does and the job has not ended: its door
+    /// moved.
+    fn wake_job(&self) {
+        if let Some(driving) = &self.driving
+            && !self.handed.ended.load(std::sync::atomic::Ordering::Acquire)
+        {
+            driving.notify_one();
+        }
+    }
+
+    /// Writes what the job gave, as [`Replies::write_told`] does, and wakes the driving shard its
+    /// job runs on where an answer was taken or written whole: the job gives the next only then.
+    fn write(
+        &mut self,
+        to: &mut impl Exchange,
+        body_read: bool,
+        now: u64,
+        moved: &mut u64,
+        slowed: &mut [u64],
+    ) -> Wrote {
+        let mut took = false;
+        let wrote = self.write_told(to, (body_read, now), moved, slowed, &mut took);
+        if took {
+            self.wake_job();
+        }
+        wrote
+    }
+
+    /// Writes what the job gave, in order, as far as `to` takes it, the request's body read whole
+    /// where `body_read`: the fields' bytes counted `moved`, and a `SlowDown` counted in `slowed`
+    /// for its cause as it goes. Each pass writes an answer whole or ends, and the job gives the
+    /// next only once the last is written whole, so a pass takes at most the channel's one answer
+    /// and the end behind it. A head never waits for room: it fills the room the endpoint took
+    /// with its request's head (`node::reply_head`). A get's piece is timed at `now` where its
+    /// client's room was full ([`Drain`]). Whether an answer was taken from the job's channel or
+    /// written whole it says in `took`.
+    fn write_told(
+        &mut self,
+        to: &mut impl Exchange,
+        (body_read, now): (bool, u64),
+        moved: &mut u64,
+        slowed: &mut [u64],
+        took: &mut bool,
+    ) -> Wrote {
+        if self
+            .handed
+            .held
+            .swap(false, std::sync::atomic::Ordering::Acquire)
+        {
+            to.working();
+        }
+        let mut whole = false;
+        // The answer held, the channel's one, and the end behind it.
+        for _ in 0..door::Replying::FIRST_ANSWERS.saturating_add(2) {
+            if let Some(opening) = self.drained.take() {
+                if !body_read {
+                    self.drained = Some(opening);
+                    return Wrote::Draining;
+                }
+                let length = u64::try_from(opening.fields.len()).unwrap_or(u64::MAX);
+                if to.reply(&opening.head, length) == super::Replied::Ended {
+                    return Wrote::Over;
+                }
+                self.room = None;
+                if let Some(count) = opening
+                    .slowed
+                    .and_then(|cause| slowed.get_mut(cause.index()))
+                {
+                    *count = count.saturating_add(1);
+                }
+                self.out = Some((opening.fields, After::End));
+            }
+            if let Some((bytes, then)) = self.out.take() {
+                if !bytes.is_empty() {
+                    let Some(took) = to.write(&bytes) else {
+                        to.refuse(Refusal::Closed);
+                        return Wrote::Over;
+                    };
+                    let took_bytes = u64::try_from(took).unwrap_or(u64::MAX);
+                    if then != After::Piece {
+                        *moved = moved.saturating_add(took_bytes);
+                    }
+                    if took < bytes.len() {
+                        if then == After::Piece {
+                            self.drain.wrote(took_bytes, false, now);
+                        }
+                        self.out = Some((bytes.slice(took..), then));
+                        return Wrote::Still;
+                    }
+                    if then == After::Piece {
+                        self.drain.wrote(took_bytes, true, now);
+                    }
+                }
+                if then == After::End {
+                    to.end();
+                    return Wrote::Over;
+                }
+                self.handed
+                    .unwritten
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                whole = true;
+                *took = true;
+            }
+            // Read before the channel, so what the job gave before it let go is taken first.
+            let ended = self.handed.ended.load(std::sync::atomic::Ordering::Acquire);
+            let told = self.told.try_recv();
+            *took |= matches!(told, Ok(Some(_)));
+            match told {
+                Ok(Some(Told::Reply(opening))) => self.drained = Some(opening),
+                Ok(Some(Told::Head(opening))) => {
+                    if let Some(wrote) = self.open(to, *opening) {
+                        return wrote;
+                    }
+                }
+                Ok(Some(Told::Bytes(bytes))) => self.out = Some((bytes, After::Piece)),
+                Ok(Some(Told::End)) => {
+                    to.end();
+                    return Wrote::Over;
+                }
+                Ok(Some(Told::Failed(refusal))) => {
+                    to.refuse(refusal);
+                    return Wrote::Over;
+                }
+                // The job let go with nothing more to write: the exchange is left as it left it,
+                // its door given back ([`Doors`]) or dropped.
+                Ok(None) if ended => return Wrote::Over,
+                Ok(None) if whole => return Wrote::More,
+                Ok(None) => return Wrote::Still,
+                Err(_) => return Wrote::Over,
+            }
+        }
+        Wrote::Still
+    }
+
+    /// A get's head given, its fields to follow and its range's bytes past them, which the head's
+    /// length counts: none where it went, else its exchange is over.
+    fn open(&mut self, to: &mut impl Exchange, opening: Opening) -> Option<Wrote> {
+        let length = u64::try_from(opening.fields.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(opening.body);
+        match to.reply(&opening.head, length) {
+            super::Replied::Sent => {
+                self.out = Some((opening.fields, After::Fields));
+                None
+            }
+            super::Replied::Ended => Some(Wrote::Over),
+        }
+    }
+
+    /// The pace of the last of a get's pieces its client took once its room was full, its bytes
+    /// and their nanoseconds, taken once ([`Drain`]).
+    fn take_paced(&mut self) -> Option<(u64, u64)> {
+        self.drain.paced.take()
+    }
+
+    /// The reply held, the piece its request's body drains through refused for room in the
+    /// endpoint's budget: within its client's patience it waits, its exchange vouched for
+    /// (`Endpoint::working`) and offered again at the next turn, due at each beat; past it, its
+    /// exchange is refused `Budget`, which needs no room and its asker hears at once, as it hears a
+    /// request whose head the budget refused. A reply never ends with its exchange open and its
+    /// asker waiting on nothing, which its client gave up a period later (`Lost(Stalled)`,
+    /// tests/put_body.rs).
+    fn wait_for_room(&mut self, to: &mut impl Exchange, now: u64) -> Wrote {
+        let bound = self
+            .drained
+            .as_ref()
+            .map_or(now, |opening| opening.bound_ns);
+        if now < bound {
+            self.room = Some(bound);
+            to.working();
+            return Wrote::Room;
+        }
+        self.room = None;
+        to.refuse(Refusal::Budget);
+        Wrote::Over
+    }
+}
+
+/// A request's body as its door gives it: its pieces on a bounded channel, and its end once it
+/// came, with the checksum its trailer carried.
+struct Pieces {
+    pieces: ChannelReceiver<Piece>,
+    ended: Option<Option<checksum::Checksum>>,
 }
 
 /// A local door's ends: the request's body as the listener sends it, and the reply as the host
 /// writes it.
 struct Local {
-    body: ChannelReceiver<Piece>,
+    body: Pieces,
     reply: Sender<door::Answer>,
-    /// The body's end once it came, with the checksum its trailer carried.
-    ended: Option<Option<checksum::Checksum>>,
     /// Answers the reply's channel had no room for, sent before any other, in order. A stream's
     /// next piece is taken only once these are sent, so they are at most one piece of bytes and
     /// the few answers around it.
     pending: VecDeque<door::Answer>,
     /// Whether the listener was told the put wants its body.
     ready: bool,
+}
+
+/// A native put's body as the node's task reads it from its exchange for the put's job (node.md
+/// §2.9 step 6c), the exchange's half of what the S3 listener does for a local door: each piece
+/// the transport delivers given on the job's channel as an S3 connection gives one
+/// (`door::Piece`), the object's bytes apart from the trailer's value past them, and the body's
+/// end once the transport verified the body whole, the trailer's checksum with it. A piece is read
+/// only once the job let go of the last, so the channel holds one piece and the exchange's stream
+/// the rest: while the job's driver takes nothing, nothing is read, and the stream's flow control
+/// holds the client, as it did while the job read its own exchange.
+///
+/// Each piece is read into the node's task's piece (`Node::piece`, never the endpoint's budget,
+/// which other traffic may hold past the client's patience) and copied once from it into storage
+/// of the feeding's own, the piece the put's admission charged it for, that the piece is a view of
+/// (`Bytes`) and that is reused once the job let it go: a piece is copied no more than when its job
+/// read it, and in storage reused from piece to piece.
+pub(crate) struct Feeding {
+    /// The body's sender, lent by the put's door ([`Replies`]) and given back as the feeding is let
+    /// go ([`Feeding::let_go`]), so no channel is made a put.
+    pieces: Sender<Piece>,
+    /// What the put's door's halves share: whether its job let go of its body, and where the
+    /// feeding is let go, that the node's task did.
+    handed: std::sync::Arc<Handed>,
+    /// The storage the piece in flight is a view of, made at the first piece, and the bytes it was
+    /// made to hold: what was left of the object then, at most a piece.
+    storage: Option<(BytesMut, usize)>,
+    /// A piece or end the channel had no room for, given before anything more is read.
+    held: Option<Piece>,
+    /// The object's bytes still to come, the trailer's algorithm, and its value read so far.
+    left: u64,
+    trailing: Option<checksum::Algorithm>,
+    trailer: Vec<u8>,
+    /// Whether the put's body is empty, its end given with no read of the exchange, as the job
+    /// ended it when it read its exchange.
+    empty: bool,
+    /// Whether the job let go of the body: the rest is read and dropped, so its exchange ends whole
+    /// for its reply.
+    dropping: bool,
+    /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
+    /// of its moved, told as a piece or the end is given or the feeding is let go, so the job takes
+    /// it; its door's (`Replies::driving`).
+    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+}
+
+/// What became of a body the node's task fed at a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fed {
+    /// Nothing moved: the job holds the last piece, or no bytes arrived.
+    Still,
+    /// A body answered at once waits for room in the endpoint's budget for the piece it drains
+    /// through (`Node::drop_body`).
+    Room,
+    /// A piece or the end given, or bytes read and dropped: the job's next turn is due at once.
+    Moved,
+    /// The body is ended, given or dropped whole, or its exchange failed.
+    Over,
+}
+
+impl Feeding {
+    /// The bytes `read` from the exchange, after the fields: the object's given to the job as a
+    /// piece, which counts them moved as it takes them, and the trailer's value past them kept for
+    /// the end, counted moved here. Refused `Malformed` where they pass the trailer's width, which
+    /// the transport's length of the body rules out (`Head::decode`).
+    fn give(&mut self, read: &[u8], moved: &mut u64) -> Result<Fed, Status> {
+        let next = self.next_piece();
+        let object = next.min(read.len());
+        let (bytes, trailer) = read.split_at_checked(object).ok_or(Status::Failed)?;
+        let width = self.trailing.map_or(0, checksum::Algorithm::width);
+        if self.trailer.len().saturating_add(trailer.len()) > width {
+            return Err(Status::Malformed);
+        }
+        self.trailer.extend_from_slice(trailer);
+        *moved = moved.saturating_add(u64::try_from(trailer.len()).unwrap_or(u64::MAX));
+        self.left = self
+            .left
+            .saturating_sub(u64::try_from(object).unwrap_or(u64::MAX));
+        if bytes.is_empty() {
+            return Ok(Fed::Still);
+        }
+        let (storage, _) = self
+            .storage
+            .get_or_insert_with(|| (BytesMut::with_capacity(next), next));
+        storage.extend_from_slice(bytes);
+        let piece = Piece::Bytes(
+            storage.split().freeze(),
+            door::Paced {
+                sent: std::time::Instant::now(),
+                delivered_ns: None,
+            },
+        );
+        Ok(self.send(piece))
+    }
+
+    /// The object's bytes the next piece may hold: what is left of them, at most a piece. The
+    /// storage is made this large at the first piece, so a body whose last bytes come apart from
+    /// its fields' read holds no more than they.
+    fn next_piece(&self) -> usize {
+        usize::try_from(self.left)
+            .unwrap_or(usize::MAX)
+            .min(piece_len())
+    }
+
+    /// Whether the job let go of the last piece, so the next may be read into its storage: none
+    /// made yet, or reclaimed whole, every view of it dropped. Whole, not only the room the next
+    /// piece needs, which a short piece leaves past it while the job still holds it.
+    fn free(&mut self) -> bool {
+        self.held.is_none()
+            && self
+                .storage
+                .as_mut()
+                .is_none_or(|(storage, made)| storage.try_reclaim(*made))
+    }
+
+    /// Whether the object's bytes and the trailer's value are all read.
+    fn read_whole(&self) -> bool {
+        self.left == 0 && self.trailer.len() == self.trailing.map_or(0, checksum::Algorithm::width)
+    }
+
+    /// The body's end, its trailer's checksum with it: `Over` once given, or once the job let go
+    /// of a body the transport already verified whole; held where the channel has no room.
+    fn end(&mut self) -> Fed {
+        let trailer = self.trailing.map(|algorithm| checksum::Checksum {
+            algorithm,
+            bytes: std::mem::take(&mut self.trailer),
+        });
+        match self.send(Piece::End(trailer)) {
+            Fed::Still | Fed::Room => Fed::Still,
+            Fed::Moved | Fed::Over => Fed::Over,
+        }
+    }
+
+    /// Gives `piece` to the job, or holds it where the channel has no room; a job that let go of
+    /// its body has the rest dropped.
+    fn send(&mut self, piece: Piece) -> Fed {
+        if self.job_let_go() {
+            self.held = None;
+            self.dropping = true;
+            return Fed::Moved;
+        }
+        match self.pieces.try_send(piece) {
+            Ok(()) => {
+                self.wake_job();
+                Fed::Moved
+            }
+            Err(SyncError::Full(piece)) => {
+                self.held = Some(piece);
+                Fed::Still
+            }
+            Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => {
+                self.dropping = true;
+                Fed::Moved
+            }
+        }
+    }
+
+    /// Whether the put's job let go of its body, or of its door: the rest is read and dropped, a
+    /// piece it never took holding the storage until its door is kept, emptied ([`Doors::keep`]).
+    fn job_let_go(&self) -> bool {
+        [&self.handed.dropped, &self.handed.ended]
+            .into_iter()
+            .any(|word| word.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// The feeding let go, its body given whole or dropped, or its exchange gone: its door's body
+    /// sender given back, and its job told the node's task let go of the body (`Handed::cut`),
+    /// which a job that took the body's end never reads.
+    fn let_go(self) -> Sender<Piece> {
+        self.handed
+            .cut
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_job();
+        self.pieces
+    }
+
+    /// Wakes the driving shard its job runs on, where one does: its body moved.
+    fn wake_job(&self) {
+        if let Some(driving) = &self.driving {
+            driving.notify_one();
+        }
+    }
+
+    /// Gives what the channel had no room for, first: whether it went, and whether it was the end.
+    fn send_held(&mut self) -> Option<Fed> {
+        let held = self.held.take()?;
+        let end = matches!(held, Piece::End(_));
+        Some(match self.send(held) {
+            Fed::Moved if end && !self.dropping => Fed::Over,
+            fed => fed,
+        })
+    }
+}
+
+/// The body a native put's operation names, its object's length and its trailer's algorithm, which
+/// its feeding reads (`feed`): a put's, a part's or a run's, the operations whose work is a put.
+fn body_of(op: &Op) -> Option<(u64, Option<checksum::Algorithm>)> {
+    match op {
+        Op::Put {
+            length, trailing, ..
+        }
+        | Op::UploadPart {
+            length, trailing, ..
+        }
+        | Op::Append {
+            length, trailing, ..
+        } => Some((*length, *trailing)),
+        _ => None,
+    }
+}
+
+/// A native put, its fields read and nothing past them, given its body by the node's task (node.md
+/// §2.9 step 6c): of its object's length and its trailer's algorithm, from its first byte on its
+/// door's channel of one piece, the least that moves a body (`door::Depth::FIRST`), `pieces` the
+/// sender its door lent and `handed` what its door's halves share, from the feeding, which the node's task keeps, to its door's receiver, which the
+/// put's job takes from, the trailer's value past the object's bytes the feeding's; `driving` the
+/// word of the driving shard its job runs on, none where the node's task runs it.
+fn feed(
+    (length, trailing): (u64, Option<checksum::Algorithm>),
+    pieces: Sender<Piece>,
+    handed: std::sync::Arc<Handed>,
+    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+) -> Feeding {
+    let width = trailing.map_or(0, checksum::Algorithm::width);
+    Feeding {
+        pieces,
+        handed,
+        storage: None,
+        held: None,
+        left: length,
+        trailing,
+        trailer: Vec::new(),
+        empty: length == 0 && width == 0,
+        dropping: false,
+        driving,
+    }
+}
+
+/// The bytes of a native body's piece: the transport's receive chunk (`PIECE`).
+fn piece_len() -> usize {
+    usize::try_from(PIECE).unwrap_or(usize::MAX)
 }
 
 /// What became of an answer sent on a local door.
@@ -289,20 +1605,25 @@ enum Sent {
     Gone,
 }
 
+/// Sends what waits on `reply`, in order: whether it takes more now.
+fn flush<T>(reply: &Sender<T>, pending: &mut VecDeque<T>) -> Sent {
+    while let Some(answer) = pending.pop_front() {
+        match reply.try_send(answer) {
+            Ok(()) => {}
+            Err(SyncError::Full(answer)) => {
+                pending.push_front(answer);
+                return Sent::Held;
+            }
+            Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => return Sent::Gone,
+        }
+    }
+    Sent::Taken
+}
+
 impl Local {
     /// Sends what waits, in order: whether the door takes more now.
     fn flush(&mut self) -> Sent {
-        while let Some(answer) = self.pending.pop_front() {
-            match self.reply.try_send(answer) {
-                Ok(()) => {}
-                Err(SyncError::Full(answer)) => {
-                    self.pending.push_front(answer);
-                    return Sent::Held;
-                }
-                Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => return Sent::Gone,
-            }
-        }
-        Sent::Taken
+        flush(&self.reply, &mut self.pending)
     }
 
     /// Sends `answer` after what waits, or holds it behind them.
@@ -315,13 +1636,16 @@ impl Local {
 enum Work {
     /// The request's fields being read from its body's start: the head, the fields so far.
     Fields(Head, Vec<u8>),
-    /// A request refused or done: what is left of its body read and dropped, then the reply, so
-    /// the exchange ends whole (`Arriving::Redirect`'s reason). Boxed: a reply is many times any
-    /// other job's state.
+    /// A native request's fields read, its operation and its Open's block to be handed to the
+    /// driving shard it was placed on (node.md §2.9 step 6e), which makes its work there: taken
+    /// out by the node's task after the host's step (`Node::hand_off`).
+    Handing(Box<(Op, Option<u64>)>),
+    /// A request refused or done: its reply, which goes once what is left of its body is read and
+    /// dropped, so the exchange ends whole (`Arriving::Redirect`'s reason). Boxed: a reply is many
+    /// times any other job's state.
     Draining(Box<Reply>),
-    /// A reply's head sent: the fields that open its body, and how much of them is written.
-    Replying(Vec<u8>, usize),
-    /// A local operation's last answers going out, in order: its reply and its end, or its end.
+    /// An operation's last answers going out, in order: a local one's its reply and its end, or
+    /// its end; a native one's wait in its door.
     Answering(VecDeque<door::Answer>),
     /// CreateBucket or DeleteBucket, through the bucket's coordinator.
     Bucket(Box<Coordinating>),
@@ -532,15 +1856,12 @@ struct Putting {
     /// What the body's end is checked against: its `Content-MD5` and checksum (05 §3.2).
     expected: Expected,
     /// The algorithm of the checksum a trailer brings with the body's end: aws-chunked's through
-    /// the listener's door, or the value past a native put's bytes (`object::Op::Put`).
+    /// the listener's door, or the value past a native put's bytes (`object::Op::Put`), which the
+    /// node's task reads ([`Feeding`]).
     trailing: Option<checksum::Algorithm>,
-    /// A native put's trailer read so far, at most its algorithm's width.
-    trailer: Vec<u8>,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
-    /// Body bytes read and not yet taken by the driver, in the piece of its body its admission
-    /// charged it for, which a native put's body is read into (`read_piece`); and the body's bytes
-    /// taken so far.
+    /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
     carry: Vec<u8>,
     taken: u64,
     /// The driver's requests not yet asked: the node held as many asks as it keeps.
@@ -574,29 +1895,10 @@ struct Getting {
     /// cannot be read before any byte goes is answered with a typed refusal rather than a reply
     /// begun and cut (docs/design/repair.md §6); none once sent.
     held: Option<Box<Reply>>,
-    /// Plaintext taken from the driver and not yet written to the exchange.
-    out: Option<(Bytes, usize)>,
-    /// Bytes of the reply's body written so far, and the body's length.
+    /// Bytes of the range given to the door so far, and the range's length.
     written: u64,
     total: u64,
     waiting: VecDeque<(u64, get::Request)>,
-    /// What its client took of the block being written once its room was full.
-    drain: Drain,
-}
-
-/// What a native get's client took of a block the host held whole, timed from when the client's
-/// room for it was full, so its client's pace with no window holding it back (`crate::window`): a
-/// block its room took at once says only that the room was there. The room is the stream's
-/// flow-control window, smaller than a block, so each block's writing waits on its client. On the
-/// S3 door the reply's channel holds whole blocks, so the connection times the same of its socket
-/// as it writes each (`listener::io::Drained`), and the node takes it from the door
-/// (`door::Doorway::drained`).
-#[derive(Debug, Clone, Copy, Default)]
-struct Drain {
-    /// When, on the shard's clock, the client's room was full; none while it was not.
-    held_ns: Option<u64>,
-    /// The bytes it took since.
-    bytes: u64,
 }
 
 /// An operation whose bucket's row is read first, for the incarnation, versioning and owner its
@@ -743,6 +2045,23 @@ impl Table {
     /// The root range's applied index the table was read at.
     pub(super) fn applied(&self) -> u64 {
         self.applied
+    }
+
+    /// A settled copy for a driving shard (node.md §2.9 step 6e): its volumes and the scheme new
+    /// blocks take now, no choice running, as the node's task alone asks the durability model.
+    pub(super) fn settled(&self) -> Self {
+        Self {
+            applied: self.applied,
+            placed: self.placed.clone(),
+            facts: self.facts.clone(),
+            standing: self.standing.clone(),
+            scheming: Scheming {
+                now: self.scheming.now,
+                domains_at: self.scheming.domains_at,
+                settled: true,
+                choosing: None,
+            },
+        }
     }
 
     /// The scheme new blocks take now: none where no candidate fits the domains, and refused
@@ -1211,14 +2530,13 @@ fn reading(
 fn copy_windows(
     gateway: &GatewaySettings,
     learned: &crate::window::Windows,
-    room: Option<&crate::admit::Admission>,
+    holds: impl Fn(u64) -> bool,
     length: u64,
     charge: u64,
 ) -> (usize, usize, u64) {
     let charges = &gateway.charges;
     let fits = |bytes: u64| {
-        let more = bytes.saturating_sub(charge);
-        if room.is_none_or(|room| room.holds(more)) {
+        if holds(bytes.saturating_sub(charge)) {
             bytes
         } else {
             u64::MAX
@@ -1291,6 +2609,58 @@ fn facts(status: Status, order: u64, version: &Version) -> Reply {
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
+    /// Asks what a job asks (node.md §2.9 step 6b): what it waits on, whose outcome
+    /// [`Node::outcome`] gives. Refused `NodeError::Asks` where the node holds as many of its kind
+    /// as it keeps (`command_asks`, `read_asks`, `chunk_asks`), which the job asks again at its
+    /// next turn.
+    pub(super) fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+        match ask {
+            JobAsk::Command(group, command) => self
+                .command(group, command, u64::MAX, Wait::Request)
+                .map(Pending::Command),
+            JobAsk::Read(group, query) => self
+                .read(group, query, u64::MAX, Wait::Request)
+                .map(Pending::Read),
+            JobAsk::Put {
+                at,
+                volume,
+                key,
+                bytes,
+                crc32c,
+                remaining_ns,
+            } => self
+                .put_chunk(at, volume, key, bytes, (crc32c, remaining_ns))
+                .map(Pending::Chunk),
+            JobAsk::Get {
+                at,
+                volume,
+                key,
+                span,
+                remaining_ns,
+            } => self
+                .get_chunk(at, volume, key, span, remaining_ns)
+                .map(Pending::Chunk),
+        }
+    }
+
+    /// The outcome of what a job asked, once answered, taken.
+    fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
+        match pending {
+            Pending::Command(ask) => take_done(&mut self.commands_done, ask).map(Outcome::Command),
+            Pending::Read(ask) => take_done(&mut self.reads_done, ask).map(Outcome::Read),
+            Pending::Chunk(ask) => take_done(&mut self.chunks_done, ask).map(Outcome::Chunk),
+        }
+    }
+
+    /// Whether what a job asked is answered, its outcome not yet taken.
+    fn has_outcome(&self, pending: Pending) -> bool {
+        match pending {
+            Pending::Command(ask) => self.commands_done.iter().any(|(a, _)| *a == ask),
+            Pending::Read(ask) => self.reads_done.iter().any(|(a, _)| *a == ask),
+            Pending::Chunk(ask) => self.chunks_done.iter().any(|(a, _)| *a == ask),
+        }
+    }
+
     /// An object's request arrived on `exchange` from `peer`, its body `body` bytes: a job that
     /// reads its fields first; parked, its body unread, where the host has no room for it now or
     /// requests parked before it wait (`take_parked`), as the S3 listener's door holds a request
@@ -1310,7 +2680,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             });
         // What it holds at its own size, its body's length known from its head.
         let (charge, window) = match &head {
-            Ok(head) => sized(self.gateway.as_ref(), &self.windows, Moves::of_head(head)),
+            Ok(head) => sized(self.gateway.as_deref(), &self.windows, Moves::of_head(head)),
             Err(_) => (0, 0),
         };
         let parks = head.is_ok() && self.gateway.is_some() && !self.stopping();
@@ -1424,25 +2794,50 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .refuse_exchange(exchange, Refusal::Identity);
             return;
         };
+        // Its reply goes on a channel the node's task writes from (node.md §2.9 step 6c), a door
+        // the host kept from a request before it, or one made (6d): one that cannot be made leaves
+        // nothing to reply on, so the exchange is refused, as an owner past what it holds refuses
+        // one, which its asker asks again after.
+        let Some((native, replies)) = self.host.doors.take() else {
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::Budget);
+            return;
+        };
         let mut admitted_ns = None;
-        let work = match (head, self.gateway.as_ref(), slowed) {
+        let mut driven = None;
+        let work = match (head, self.gateway.as_deref(), slowed) {
             (_, None, _) => Work::Draining(Box::new(Reply::status(Status::Failed))),
             (Err(_), Some(_), _) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7), and one with no room for it
             // answers it at once: its client asks another, or again.
             (Ok(_), Some(_), Some(cause)) => Work::Draining(Box::new(Reply::slowed(cause))),
-            (Ok(head), Some(_), None) => {
-                admitted_ns = Some(now);
-                let fields = usize::try_from(head.fields()).unwrap_or(0);
-                Work::Fields(head, Vec::with_capacity(fields))
-            }
+            // Placed on the shard the rule picks, and counted there until its job ends (node.md
+            // §2.9 step 6). A count past a `usize`'s, which no host's jobs reach, each placed
+            // request being one of them, places nothing: the request is one the host cannot run.
+            // A shard past the first is one a driving task runs on whose shard the watchdog does
+            // not see held past its limit (`driving::Lanes::takes`), the lanes in shard order.
+            (Ok(head), Some(_), None) => match self.drivers.place(|shard| {
+                self.driving
+                    .get(shard.wrapping_sub(1))
+                    .is_some_and(|lanes| lanes.shard() == shard && lanes.takes())
+            }) {
+                Some(shard) => {
+                    admitted_ns = Some(now);
+                    driven = Some(shard);
+                    let fields = usize::try_from(head.fields()).unwrap_or(0);
+                    Work::Fields(head, Vec::with_capacity(fields))
+                }
+                None => Work::Draining(Box::new(Reply::status(Status::Failed))),
+            },
         };
         let charge = if admitted_ns.is_some() { charge } else { 0 };
         if admitted_ns.is_some() {
             self.charge_admitted(charge);
         }
-        self.jobs.push(Job {
-            door: Door::Exchange(exchange),
+        self.replies.push((exchange, replies));
+        self.host.jobs.push(Job {
+            door: Door::Native(Some(exchange), native),
             principal,
             work,
             pending: Vec::new(),
@@ -1451,8 +2846,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            driven,
             label: None,
-            room_to_reply: false,
         });
     }
 
@@ -1468,12 +2863,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } = request;
         let now = hyper_rt::futures::now_ns();
         let mut admitted_ns = None;
-        let (charge, window) = charged(self.gateway.as_ref(), &self.windows, &op);
+        let (charge, window) = charged(self.gateway.as_deref(), &self.windows, &op);
         let label = Some(labels::host(&op));
         // The door holds a request while the host has no room (`take_door`): one taken here past
         // the limit is a stopping node's.
         let room = self.gateway.is_some() && !self.stopping() && self.admits(charge);
-        let work = match self.gateway.as_ref() {
+        let work = match self.gateway.as_deref() {
             None => Work::Draining(Box::new(Reply::status(Status::Failed))),
             // Taken past the limit, the door holds no request while the host has no room: a
             // stopping node's (`take_door`).
@@ -1492,11 +2887,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if admitted_ns.is_some() {
             self.charge_admitted(charge);
         }
-        self.jobs.push(Job {
+        self.host.jobs.push(Job {
             door: Door::Local(Box::new(Local {
-                body,
+                body: Pieces {
+                    pieces: body,
+                    ended: None,
+                },
                 reply,
-                ended: None,
                 pending: VecDeque::new(),
                 ready: false,
             })),
@@ -1509,8 +2906,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            // The S3 door's operations are driven where the node's task runs (node.md §2.9).
+            driven: None,
             label,
-            room_to_reply: false,
         });
     }
 
@@ -1594,7 +2992,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             _ => return failed,
         };
         let (row, held) = *signer;
-        let key = self.gateway.as_ref().and_then(|g| {
+        let key = self.gateway.as_deref().and_then(|g| {
             g.keys
                 .iter()
                 .find(|(generation, _)| *generation == row.generation)
@@ -1613,225 +3011,47 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// An operator's request at its turn: its one command or read of the root range asked, once;
-    /// a key's id and secret drawn and the secret wrapped under the root key's current generation
-    /// first, once, so a turn without room asks the same key again.
-    fn step_admin(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(Job {
-            work: Work::Admin(admin),
-            pending,
-            ..
-        }) = self.jobs.get(at)
-        else {
-            return Ok(true);
-        };
-        if !pending.is_empty() || admin.asked {
-            return Ok(false);
-        }
-        if let Admin::Key {
-            principal,
-            rotating,
-        } = &admin.asking
-        {
-            let made = self.issue(principal, *rotating);
-            let Some(Job {
-                work: Work::Admin(admin),
-                ..
-            }) = self.jobs.get_mut(at)
-            else {
-                return Ok(true);
-            };
-            match made {
-                Ok((command, issued)) => {
-                    admin.asking = Admin::Command(Box::new(command));
-                    admin.issued = Some(issued);
-                }
-                Err(status) => {
-                    self.fail_job(at, status)?;
-                    return self.drain_job(at);
-                }
-            }
-        }
-        let Some(group) = self.group_of(Layer::Root) else {
-            self.fail_job(at, Status::Failed)?;
-            return self.drain_job(at);
-        };
-        let asking = match self.jobs.get(at) {
-            Some(Job {
-                work: Work::Admin(admin),
-                ..
-            }) => match &admin.asking {
-                Admin::Command(command) => Ok(Command::Root(command.as_ref().clone())),
-                Admin::Read { query, .. } => Err(query.clone()),
-                Admin::Key { .. } => return Ok(false),
-            },
-            _ => return Ok(true),
-        };
-        let asked = match asking {
-            Ok(command) => self
-                .command(group, command, u64::MAX, Wait::Request)
-                .map(Pending::Command),
-            Err(query) => self
-                .read(group, query, u64::MAX, Wait::Request)
-                .map(Pending::Read),
-        };
-        match asked {
-            Ok(pending) => {
-                if let Some(Job {
-                    work: Work::Admin(admin),
-                    pending: held,
-                    ..
-                }) = self.jobs.get_mut(at)
-                {
-                    held.push((pending, None));
-                    admin.asked = true;
-                }
-                Ok(false)
-            }
-            // Asked again at the next turn, as every ask the node has no room for is.
-            Err(NodeError::Asks) => Ok(false),
-            Err(_) => {
-                self.fail_job(at, Status::Failed)?;
-                self.drain_job(at)
-            }
-        }
-    }
-
-    /// A key for `principal`: its id and secret drawn from the OS, and the command that makes it,
-    /// its secret wrapped under the root key's current generation, the last the node holds
-    /// (encryption.md §2); with the key, to reply once the root range made it.
-    fn issue(
-        &self,
-        principal: &str,
-        rotating: bool,
-    ) -> Result<(root::Command, (String, mantle_s3::account::Secret)), Status> {
-        let (generation, key) = self
-            .gateway
-            .as_ref()
-            .and_then(|g| g.keys.last())
-            .ok_or(Status::Failed)?;
-        let id = mantle_s3::account::draw_id().map_err(|_| Status::Failed)?;
-        let secret = mantle_s3::account::draw_secret().map_err(|_| Status::Failed)?;
-        let wrapped = mantle_s3::seal::wrap_secret(&secret, key).map_err(|_| Status::Failed)?;
-        let command = root::Command::Principal(principal::Command::Key(principal::NewKey {
-            principal: principal.to_owned(),
-            id: id.clone(),
-            generation: *generation,
-            wrapped,
-            rotating,
-            at_ns: 0,
-        }));
-        Ok((command, (id, secret)))
-    }
-
-    /// An operator's request answered by the root range: its reply, IAM's error codes for its
-    /// refusals (research/91 §2), a key made with its id and secret, and a page of principals.
-    fn admin_answered(&mut self, at: usize, outcome: Outcome) -> Result<(), NodeError> {
-        let one = matches!(
-            self.jobs.get(at),
-            Some(Job {
-                work: Work::Admin(admin),
-                ..
-            }) if matches!(admin.asking, Admin::Read { one: true, .. })
-        );
-        let reply = match outcome {
-            Outcome::Command(CommandOutcome::Answered(Answer::Root(root::Outcome::Principal(
-                made,
-            )))) => match made {
-                principal::Outcome::Made
-                | principal::Outcome::Set
-                | principal::Outcome::Removed => Reply::status(Status::Done),
-                principal::Outcome::KeyMade { replacing } => {
-                    let issued = match self.jobs.get_mut(at) {
-                        Some(Job {
-                            work: Work::Admin(admin),
-                            ..
-                        }) => admin.issued.take(),
-                        _ => None,
-                    };
-                    match issued {
-                        Some((id, secret)) => Reply {
-                            listing: Some(Listing::Issued(Box::new(Issued {
-                                id,
-                                secret,
-                                replacing,
-                            }))),
-                            ..Reply::status(Status::Done)
-                        },
-                        None => Reply::status(Status::Failed),
-                    }
-                }
-                principal::Outcome::Taken => Reply::status(Status::EntityAlreadyExists),
-                principal::Outcome::Full => Reply::status(Status::LimitExceeded),
-                principal::Outcome::Unknown => Reply::status(Status::NoSuchEntity),
-                principal::Outcome::Held => Reply::status(Status::DeleteConflict),
-                principal::Outcome::Unrotatable => Reply::status(Status::NothingToRotate),
-                principal::Outcome::Invalid => Reply::status(Status::InvalidArgument),
-            },
-            Outcome::Read(ReadOutcome::Read(read)) => match *read {
-                Read::Principals(page) if one && page.principals.is_empty() => {
-                    Reply::status(Status::NoSuchEntity)
-                }
-                Read::Principals(page) => Reply {
-                    listing: Some(Listing::Principals(page)),
-                    ..Reply::status(Status::Done)
-                },
-                _ => Reply::status(Status::Failed),
-            },
-            _ => Reply::status(Status::Failed),
-        };
-        self.reply_job(at, reply)
-    }
-
-    /// A job's fields read from its body's start; once whole, the work they name.
+    /// A job's fields read from its body's start; once whole, the work they name
+    /// (`Serve::read_fields`).
     ///
-    /// They are read into the job's own memory, never a piece of the endpoint's budget, which
-    /// other traffic may hold past its client's patience (`read_piece`): into their buffer, made
-    /// at their length as the job was admitted, while none of them has come, and else into a piece
-    /// of what is left of them, at most the piece its admission charged it for. Nothing past them
-    /// is read: a put reads its body into its own piece.
-    fn read_fields(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
+    /// They are read into memory of the job's or the node's task's own, never a piece of the
+    /// endpoint's budget, which other traffic may hold past its client's patience (`read_piece`):
+    /// into their buffer, made at their length as the job was admitted, while none of them has
+    /// come, and else into the node's task's piece (`Node::piece`) as much as is left of them.
+    /// Nothing past them is read: a put's body is read by its feeding ([`Feeding`]).
+    fn read_fields(&mut self, job: &mut Job) -> Result<bool, NodeError> {
+        // A local operation comes typed, never as fields to read, as a native one handed with its
+        // fields read does.
+        let Door::Native(Some(exchange), _) = &job.door else {
             return Ok(true);
         };
-        // A local operation comes typed, never as fields to read.
-        let Door::Exchange(exchange) = job.door else {
-            return Ok(true);
-        };
+        let exchange = *exchange;
         let Work::Fields(head, fields) = &mut job.work else {
             return Ok(false);
         };
         let wanted = usize::try_from(head.fields()).unwrap_or(usize::MAX);
         let endpoint = self.driver.endpoint();
         while fields.len() < wanted {
-            let first = fields.is_empty();
-            let room = if first {
-                wanted
+            let left = wanted.saturating_sub(fields.len());
+            let got = if fields.is_empty() {
+                super::read_at_most(endpoint, exchange, fields, left)
             } else {
-                wanted
-                    .saturating_sub(fields.len())
-                    .min(hyper_transport::RECEIVE_CHUNK)
+                let got = super::read_at_most(
+                    endpoint,
+                    exchange,
+                    &mut self.piece,
+                    left.min(hyper_transport::RECEIVE_CHUNK),
+                );
+                fields.extend_from_slice(&self.piece);
+                got
             };
-            let buffer = if first {
-                std::mem::take(fields)
-            } else {
-                Vec::with_capacity(room)
-            };
-            let mut piece =
-                hyper_transport::Reservation::new(u64::try_from(room).unwrap_or(u64::MAX), buffer);
-            let got = endpoint.read_body(exchange, &mut piece);
-            let read = piece.into_buffer();
-            self.moved = self
-                .moved
-                .saturating_add(u64::try_from(read.len()).unwrap_or(u64::MAX));
-            if first {
-                *fields = read;
-            } else {
-                fields.extend_from_slice(&read);
-            }
             match got {
                 Ok(0) if fields.len() < wanted => return Ok(false),
-                Ok(_) => {}
+                Ok(read) => {
+                    self.moved = self
+                        .moved
+                        .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                }
                 // Its asker is gone.
                 Err(_) => return Ok(true),
             }
@@ -1847,7 +3067,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .ok()
             .filter(|op| matches!(op, Op::Copy(_) | Op::CopyPart(_)))
             .map_or(0, |op| {
-                charged(self.gateway.as_ref(), &self.windows, op)
+                charged(self.gateway.as_deref(), &self.windows, op)
                     .0
                     .saturating_sub(admitted)
             });
@@ -1858,23 +3078,64 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .is_some_and(|admission| !admission.holds(more));
         // The bytes past its charge, taken where it runs: the caches give back first what of
         // them they hold.
-        let taking =
-            more > 0 && !crowded && op.is_ok() && self.admission.is_some() && at < self.jobs.len();
+        let taking = more > 0 && !crowded && op.is_ok() && self.admission.is_some();
         if taking {
             self.charge_more(more);
         }
-        if let Some(job) = self.jobs.get_mut(at) {
-            job.work = match op {
-                Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
-                Ok(_) if crowded => Work::Draining(Box::new(Reply::slowed(door::Slowed::Crowded))),
-                Ok(op) => {
-                    if taking {
-                        job.charge = job.charge.saturating_add(more);
-                    }
-                    job.label = Some(labels::host(&op));
+        // A request placed on a shard a driving task runs on is handed there with its operation
+        // (node.md §2.9 step 6e), the shard making its work; its door carries that shard's word
+        // and the node's task's waker, each side waking the other as it moves the door (6f).
+        let driving = job.driven.and_then(|shard| {
+            self.driving
+                .iter()
+                .find(|lanes| lanes.shard() == shard)
+                .map(super::driving::Lanes::doors)
+        });
+        job.work = match op {
+            Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
+            Ok(_) if crowded => Work::Draining(Box::new(Reply::slowed(door::Slowed::Crowded))),
+            Ok(op) => {
+                if taking {
+                    job.charge = job.charge.saturating_add(more);
+                }
+                job.label = Some(labels::host(&op));
+                if driving.is_some() {
+                    Work::Handing(Box::new((op, block)))
+                } else {
                     work(op, block)
                 }
-            };
+            }
+        };
+        // The put's body comes on its door's channel, its sender lent to the feeding: one whose door
+        // lent it already, which no put's does, is answered as one whose channel cannot be made.
+        let (body, handing) = match &job.work {
+            Work::Put(putting) => (Some((putting.length, putting.trailing)), false),
+            Work::Handing(handing) => (body_of(&handing.0), true),
+            _ => (None, false),
+        };
+        let Door::Native(_, native) = &mut job.door else {
+            return Ok(false);
+        };
+        let mut replies = self
+            .replies
+            .iter_mut()
+            .find(|(replied, _)| *replied == exchange)
+            .map(|(_, replies)| replies);
+        if handing && let Some(replies) = replies.as_mut() {
+            native.node = Some(self.waker.clone());
+            replies.driving = driving;
+        }
+        if let Some(body) = body {
+            let lent =
+                replies.and_then(|replies| Some((replies.body.take()?, replies.driving.clone())));
+            match lent {
+                Some((pieces, driving)) => {
+                    let handed = std::sync::Arc::clone(&native.handed);
+                    self.feeding
+                        .push((exchange, feed(body, pieces, handed, driving)));
+                }
+                None => job.work = Work::Draining(Box::new(Reply::slowed(door::Slowed::Door))),
+            }
         }
         Ok(false)
     }
@@ -1940,36 +3201,714 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .ok_or(NodeError::Bounds("no volume table".into()))?;
         table
             .scheming
-            .settle(self.gateway.as_ref(), &table.standing);
+            .settle(self.gateway.as_deref(), &table.standing);
         Ok(table)
     }
 
-    /// The host at a turn: each operation's answers taken, its next requests asked, its body read
-    /// and its bytes written as far as they go, and each one done answered.
-    ///
-    /// The node's task is labelled, as the turn ends, with the operation whose step held it
-    /// longest, none where it stepped none (`crate::labels`): a long poll of the task is counted
-    /// under the operation that cost it most.
+    /// The host at a turn, lent out for its step ([`Host::step`]) after the answers to asks whose
+    /// jobs ended are dropped and the S3 door's key lookups stepped.
     pub(super) fn step_host(&mut self) -> Result<(), NodeError> {
         self.drop_abandoned();
         self.step_lookups();
+        self.lend(|host, node| host.step(node))
+    }
+
+    /// Each native request whose fields were read for a driving shard handed there (node.md §2.9
+    /// step 6e), with its operation, its door's job half and its admission; one its lane refuses
+    /// for room, or whose shard holds no lane, made into work here and run on the first shard.
+    /// The node's task keeps its exchange: its body's feeding and its reply's half.
+    pub(super) fn hand_off(&mut self) {
+        // A request is made `Handing` only where a lane is held for its shard.
+        if self.driving.is_empty() {
+            return;
+        }
+        while let Some((request, exchange)) = self.host.handing() {
+            let lanes = self
+                .driving
+                .iter()
+                .find(|lanes| Some(lanes.shard()) == request.driven);
+            let refused = match lanes {
+                Some(lanes) => lanes.hand(request),
+                None => Some(request),
+            };
+            // Run here: counted on the first shard, which runs it, until its job ends; its door
+            // wakes no shard, as the node's task steps its job in its turn.
+            if let Some(mut request) = refused {
+                if let Some(from) = request.driven
+                    && self.drivers.moved(from, 0).is_some()
+                {
+                    request.driven = Some(0);
+                }
+                request.half.node = None;
+                let door = self
+                    .replies
+                    .iter_mut()
+                    .filter(|(replied, _)| Some(*replied) == exchange)
+                    .map(|(_, replies)| &mut replies.driving);
+                let fed = self
+                    .feeding
+                    .iter_mut()
+                    .filter(|(fed, _)| Some(*fed) == exchange)
+                    .map(|(_, feeding)| &mut feeding.driving);
+                for driving in door.chain(fed) {
+                    *driving = None;
+                }
+                self.host.take_handed(request, exchange);
+            }
+        }
+    }
+
+    /// Each driving shard's lanes at the node's turn (node.md §2.9 step 6e), served by the node as
+    /// its own host is: each ask asked, held while the node has no room, each answer sent, each
+    /// job's end told and its door's half kept in the host's doors, and the volume table, where the
+    /// node read a newer one, told. A shard whose task ended stops the node.
+    pub(super) fn serve_driving(&mut self) -> Result<(), NodeError> {
+        if self.driving.is_empty() {
+            return Ok(());
+        }
+        // Read again where its root range applied past it, as the node's own host reads it at
+        // each put it places: a driving shard's puts are placed by the table the node last read,
+        // which the node's own host may not read while the driving shards run its puts. One the
+        // node cannot read leaves the shards the last told.
+        let applied = self.table().ok().map(Table::applied);
+        let told = applied.filter(|applied| Some(*applied) != self.driving_table);
+        let mut driving = std::mem::take(&mut self.driving);
+        let mut host = std::mem::take(&mut self.host);
+        let mut served = Ok(());
+        for lanes in &mut driving {
+            if told.is_some()
+                && let Some(table) = self.table.as_ref()
+            {
+                lanes.tell_table(Box::new(table.settled()));
+            }
+            served = lanes.serve(self, |half| host.doors.give_native(half));
+            if served.is_err() {
+                break;
+            }
+        }
+        if told.is_some() {
+            self.driving_table = told;
+        }
+        self.host = host;
+        self.driving = driving;
+        served
+    }
+
+    /// The host lent out to `step`, served by the node through [`Serve`], and taken back
+    /// (node.md §2.9 step 6d): `std::mem::take` leaves the default host in its place, which holds
+    /// nothing and allocates nothing, and the host is put back whatever the step came to.
+    fn lend<T>(&mut self, step: impl FnOnce(&mut Host, &mut Self) -> T) -> T {
+        let mut host = std::mem::take(&mut self.host);
+        let stepped = step(&mut host, self);
+        self.host = host;
+        stepped
+    }
+
+    /// The node's task's half of each native reply (node.md §2.9 step 6c): what its job gave
+    /// written to its exchange as far as the exchange takes it, after the host's step and the
+    /// bodies' feeding at each turn ([`Replies`]). A get's job gives a piece only once the last is
+    /// written whole, so where one is and the exchange takes more, its job gives the next within
+    /// the turn: as many of its pieces go in a turn as the exchange takes, as when its job wrote
+    /// them, at most a window's (`GatewaySettings::window`, the blocks its driver holds read at
+    /// once) and the end past them. One whose rounds ran out makes the next turn due at once. One
+    /// over, ended, refused or let go, is let go.
+    pub(super) fn write_replies(&mut self) -> Result<(), NodeError> {
+        self.replied = false;
+        let rounds = self
+            .gateway
+            .as_ref()
+            .map_or(0, |gateway| gateway.window)
+            .saturating_add(2);
+        let mut at = 0;
+        while at < self.replies.len() {
+            let mut left = rounds;
+            let over = loop {
+                match self.write_reply(at) {
+                    Wrote::Over => break true,
+                    Wrote::Still | Wrote::Draining | Wrote::Room => break false,
+                    Wrote::More => {
+                        left = left.saturating_sub(1);
+                        if left == 0 {
+                            self.replied = true;
+                            break false;
+                        }
+                        let exchange = self.replies.get(at).map(|(exchange, _)| *exchange);
+                        let job =
+                            self.host.jobs.iter().position(|job| {
+                                exchange.is_some() && job.door.exchange() == exchange
+                            });
+                        // A job that ended gave all it will: the next write finds its channel
+                        // ended.
+                        if let Some(job) = job {
+                            self.lend(|host, node| host.turn_job(node, job, &mut None))?;
+                        }
+                    }
+                }
+            };
+            if over {
+                let (exchange, mut replies) = self.replies.swap_remove(at);
+                for (_, feeding) in self.feeding.extract_if(.., |(fed, _)| *fed == exchange) {
+                    replies.body = Some(feeding.let_go());
+                }
+                self.host.doors.give_replies(replies);
+            } else {
+                at = at.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// One native reply written as far as its exchange takes it: a reply with no bytes past its
+    /// fields once the request's body is read whole and dropped, after its feeding, as `drain_job`
+    /// wrote one; what else its job gave as it comes.
+    fn write_reply(&mut self, at: usize) -> Wrote {
+        let Some(exchange) = self.replies.get(at).map(|(exchange, _)| *exchange) else {
+            return Wrote::Over;
+        };
+        let now = hyper_rt::futures::now_ns();
+        let mut body_read = false;
+        // A reply taken, then its body read: the second pass writes it.
+        for _ in 0..2 {
+            let mut room = false;
+            let draining = self
+                .replies
+                .get(at)
+                .filter(|(_, replies)| replies.draining())
+                .map(|(_, replies)| replies.admitted());
+            if let Some(admitted) = draining {
+                // A body the node's task reads for the job is read and dropped there.
+                if self.feeding.iter().any(|(fed, _)| *fed == exchange) {
+                    return Wrote::Still;
+                }
+                match self.drop_body(exchange, admitted) {
+                    Fed::Still => return Wrote::Still,
+                    Fed::Room => room = true,
+                    // Its asker is gone: nothing to answer.
+                    Fed::Moved | Fed::Over if !self.driver.endpoint().body_complete(exchange) => {
+                        return Wrote::Over;
+                    }
+                    Fed::Moved | Fed::Over => body_read = true,
+                }
+            }
+            let Self {
+                replies,
+                driver,
+                moved,
+                slowed,
+                windows,
+                ..
+            } = self;
+            let Some((_, replies)) = replies.get_mut(at) else {
+                return Wrote::Over;
+            };
+            let mut toward = Toward {
+                endpoint: driver.endpoint(),
+                exchange,
+            };
+            if room {
+                return replies.wait_for_room(&mut toward, now);
+            }
+            let wrote = replies.write(&mut toward, body_read, now, moved, slowed);
+            // What a get's client took of a piece once its room was full: its pace, for the
+            // windows the node's next gets hold (`crate::window`).
+            if let Some((bytes, ns)) = replies.take_paced() {
+                windows.get.paced(bytes, ns);
+            }
+            match wrote {
+                Wrote::Draining => {}
+                wrote => return wrote,
+            }
+        }
+        Wrote::Draining
+    }
+
+    /// The exchange's half of each native put's body (node.md §2.9 step 6c): read from its exchange
+    /// and given to its job as far as the job takes it, after the host's step in which the job took
+    /// what it was given ([`Feeding`]). One that moved makes the node's next turn due at once
+    /// (`host_due`), so its job takes what it was given; one ended, given or dropped whole or its
+    /// exchange failed, is let go.
+    pub(super) fn feed_bodies(&mut self) {
+        self.fed = false;
+        let mut at = 0;
+        while at < self.feeding.len() {
+            match self.feed_body(at) {
+                Fed::Still | Fed::Room => at = at.saturating_add(1),
+                Fed::Moved => {
+                    self.fed = true;
+                    at = at.saturating_add(1);
+                }
+                Fed::Over => {
+                    self.fed = true;
+                    let (exchange, feeding) = self.feeding.swap_remove(at);
+                    let sender = feeding.let_go();
+                    if let Some((_, replies)) = self
+                        .replies
+                        .iter_mut()
+                        .find(|(replied, _)| *replied == exchange)
+                    {
+                        replies.body = Some(sender);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One native put's body read from its exchange as far as its job takes it: a piece at a time
+    /// while the job let go of the last, the object's bytes given and the trailer's value kept,
+    /// then the body's end once the transport verified it whole, its trailer's checksum with it.
+    /// A job that let go of its body has the rest read and dropped, so the exchange ends whole for
+    /// its reply, as the job drained it when it read its exchange; an exchange that fails tells the
+    /// job its body did not come whole (`IncompleteBody`), as the job heard it then.
+    fn feed_body(&mut self, at: usize) -> Fed {
+        let Self {
+            feeding,
+            driver,
+            moved,
+            piece,
+            ..
+        } = self;
+        let Some((exchange, feeding)) = feeding.get_mut(at) else {
+            return Fed::Over;
+        };
+        let exchange = *exchange;
+        let endpoint = driver.endpoint();
+        let mut fed = Fed::Still;
+        loop {
+            match feeding.send_held() {
+                None => {}
+                Some(Fed::Still | Fed::Room) => return fed,
+                Some(Fed::Over) => return Fed::Over,
+                Some(Fed::Moved) => fed = Fed::Moved,
+            }
+            if feeding.job_let_go() {
+                feeding.held = None;
+                feeding.dropping = true;
+            }
+            if feeding.dropping {
+                break;
+            }
+            if feeding.read_whole() {
+                if !feeding.empty && !endpoint.body_complete(exchange) {
+                    // The body's checksum, after its last byte.
+                    let mut empty = hyper_transport::Reservation::default();
+                    let _ = endpoint.read_body(exchange, &mut empty);
+                    if !endpoint.body_complete(exchange) {
+                        return fed;
+                    }
+                }
+                match feeding.end() {
+                    Fed::Still => return fed,
+                    _ => return Fed::Over,
+                }
+            }
+            if !feeding.free() {
+                return fed;
+            }
+            // Into the node's task's piece, then the feeding's storage: read whenever the job let
+            // go of the last piece and its client has sent more, whatever other traffic holds of
+            // the endpoint's budget.
+            let got = super::read_piece(endpoint, exchange, piece);
+            let given = match got {
+                Ok(0) => Ok(Fed::Still),
+                Ok(_) => feeding.give(piece, moved),
+                Err(_) => Err(Status::IncompleteBody),
+            };
+            match (got, given) {
+                (Ok(0), _) => return fed,
+                (_, Ok(Fed::Still)) => {}
+                (_, Ok(_)) => fed = Fed::Moved,
+                // The exchange failed: its job hears its body did not come whole, and ends with
+                // the exchange.
+                (Err(_), Err(status)) => {
+                    let _ = feeding.pieces.try_send(Piece::Refused(status));
+                    return Fed::Over;
+                }
+                // Bytes past the trailer's value, which the transport's length of the body rules
+                // out: refused as the job refused them, the rest dropped for its reply.
+                (Ok(_), Err(status)) => {
+                    feeding.send(Piece::Refused(status));
+                    feeding.dropping = true;
+                    fed = Fed::Moved;
+                }
+            }
+        }
+        match self.drop_body(exchange, true) {
+            Fed::Still | Fed::Room => fed,
+            dropped => dropped,
+        }
+    }
+
+    /// What is left of a body its job let go of, read and dropped as it arrives, so its exchange
+    /// ends whole for the job's reply (`drain_job`): `Over` once the transport verified it whole,
+    /// or the exchange is gone. A body read whole, as a put's that ended is, needs no piece. One
+    /// its job was admitted for (`own`) is read into the node's task's piece (`Node::piece`); one
+    /// answered at once holds no charge, and reads through the endpoint's one piece for its
+    /// owner's reads (`bounds::messages`), which waits for room while other reads hold it (`Room`).
+    fn drop_body(&mut self, exchange: ExchangeId, own: bool) -> Fed {
+        let endpoint = self.driver.endpoint();
+        while !endpoint.body_complete(exchange) {
+            let got = if own {
+                super::read_piece(endpoint, exchange, &mut self.piece)
+            } else {
+                let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                    return Fed::Room;
+                };
+                let got = endpoint.read_body(exchange, &mut piece);
+                endpoint.release(piece);
+                got
+            };
+            match got {
+                Ok(0) => break,
+                Ok(read) => {
+                    self.moved = self
+                        .moved
+                        .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                }
+                Err(_) => return Fed::Over,
+            }
+        }
+        if !endpoint.body_complete(exchange) && endpoint.head(exchange).is_some() {
+            let mut empty = hyper_transport::Reservation::default();
+            let _ = endpoint.read_body(exchange, &mut empty);
+        }
+        if endpoint.body_complete(exchange) || endpoint.head(exchange).is_none() {
+            Fed::Over
+        } else {
+            Fed::Still
+        }
+    }
+
+    /// The outcomes of asks whose job ended before they came, dropped as they come: an outcome no
+    /// job takes would hold one of the node's asks for good.
+    fn drop_abandoned(&mut self) {
+        if self.abandoned.is_empty() {
+            return;
+        }
+        let mut abandoned = std::mem::take(&mut self.abandoned);
+        abandoned.retain(|pending| self.outcome(*pending).is_none());
+        self.abandoned = abandoned;
+    }
+
+    /// Whether the host holds `exchange`, for an event on it: a job's, or a reply its node's task
+    /// writes.
+    pub(super) fn hosts(&self, exchange: ExchangeId) -> bool {
+        self.host
+            .jobs
+            .iter()
+            .any(|j| j.door.exchange() == Some(exchange))
+            || self.replies.iter().any(|(e, _)| *e == exchange)
+    }
+
+    /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
+    pub(super) fn job_lost(&mut self, exchange: ExchangeId) {
+        let Self {
+            host,
+            abandoned,
+            admission,
+            drivers,
+            parked,
+            feeding,
+            replies,
+            ..
+        } = self;
+        let now = hyper_rt::futures::now_ns();
+        parked.retain(|p| p.exchange != exchange);
+        // An exchange's one feeding, its body's sender given back with its door's half.
+        let mut lent = feeding
+            .iter()
+            .position(|(fed, _)| *fed == exchange)
+            .map(|at| feeding.swap_remove(at).1.let_go());
+        // Each door's halves given back, kept for the next request, its body's sender with it.
+        for (_, mut lost) in replies.extract_if(.., |(replied, _)| *replied == exchange) {
+            if let Some(sender) = lent.take() {
+                lost.body = Some(sender);
+            }
+            host.doors.give_replies(lost);
+        }
+        let Host { jobs, doors, .. } = host;
+        for j in jobs.extract_if(.., |j| j.door.exchange() == Some(exchange)) {
+            abandoned.extend(j.pending.into_iter().map(|(pending, _)| pending));
+            if let Some(shard) = j.driven {
+                drivers.ended(shard);
+            }
+            if let (Some(at), Some(admission)) = (j.admitted_ns, admission.as_mut()) {
+                admission.completed(now.saturating_sub(at), now, j.charge);
+            }
+            if let Door::Native(_, native) = j.door {
+                doors.give_native(native);
+            }
+        }
+    }
+
+    /// The operations the host admits at once now, as it learned its knee (`crate::admit`): none
+    /// for a node that hosts no objects.
+    pub fn admitting(&self) -> Option<usize> {
+        self.admission.as_ref().map(crate::admit::Admission::limit)
+    }
+
+    /// Whether the host admits one more operation holding `charge` bytes beside those it runs
+    /// (`crate::admit`). One the learned limit turns away tells the limit its clients ask more
+    /// than it admits; one whose bytes the operations' memory does not hold says nothing of it.
+    pub(super) fn admits(&mut self, charge: u64) -> bool {
+        let Some(admission) = self.admission.as_mut() else {
+            return true;
+        };
+        match admission.admits(charge) {
+            Ok(()) => true,
+            Err(crate::admit::Held::Limit) => {
+                admission.turned_away();
+                false
+            }
+            Err(crate::admit::Held::Bytes) => false,
+        }
+    }
+
+    /// The ranges' page caches on the node's shard lent their parts of the operations' idle
+    /// bytes once `more` are charged ([`lend`]), growing where `grow`; none for a node that hosts
+    /// no objects, which has no operations' memory to lend.
+    pub(super) fn lend_caches(&mut self, more: u64, grow: bool) {
+        let Self {
+            gateway,
+            admission,
+            ranges,
+            owner,
+            ..
+        } = self;
+        if let (Some(gateway), Some(admission)) = (gateway.as_deref(), admission.as_mut()) {
+            lend(gateway.cache_bytes, admission, ranges, owner, more, grow);
+        }
+    }
+
+    /// An operation admitted, charged `charge` bytes: the caches give back first what of them
+    /// they hold.
+    fn charge_admitted(&mut self, charge: u64) {
+        self.lend_caches(charge, false);
+        if let Some(admission) = self.admission.as_mut() {
+            admission.admitted(charge);
+        }
+    }
+
+    /// A running operation takes `more` bytes past its charge, or the cell's repair takes them
+    /// for a rebuild: the caches give back first what of them they hold.
+    pub(super) fn charge_more(&mut self, more: u64) {
+        self.lend_caches(more, false);
+        if let Some(admission) = self.admission.as_mut() {
+            admission.took(more);
+        }
+    }
+
+    /// An operation the host admitted at `admitted_ns`, charged `charge` bytes, ended: the limit
+    /// learns its latency, and its bytes are free.
+    fn ended(&mut self, admitted_ns: Option<u64>, charge: u64) {
+        let now = hyper_rt::futures::now_ns();
+        if let (Some(at), Some(admission)) = (admitted_ns, self.admission.as_mut()) {
+            admission.completed(now.saturating_sub(at), now, charge);
+        }
+        self.keep_pool();
+    }
+
+    /// The native clients' stream pool sized to the limit the admission learned, where it moved:
+    /// the exchanges they may open past those they keep are the operations the host runs
+    /// (Breakwater's credit, hyper-transport's `pool`).
+    pub(super) fn keep_pool(&mut self) {
+        let Some(limit) = self.admission.as_ref().map(crate::admit::Admission::limit) else {
+            return;
+        };
+        if self.pooled == 0 || self.pooled == limit {
+            return;
+        }
+        let streams = u32::try_from(limit).unwrap_or(u32::MAX);
+        if self.driver.endpoint().set_stream_pool(streams).is_ok() {
+            self.pooled = limit;
+        }
+    }
+
+    /// When the node's task next needs a turn for its host and the exchanges it keeps for it: its
+    /// host's own wait ([`Host::due`]: its jobs' answered asks, its puts' renewals and its held
+    /// jobs' beats and bounds), beside what the node's task waits on itself (node.md §2.9 step
+    /// 6e): at once where an ask of a job that ended is answered, its outcome to drop, a lookup is
+    /// answered, a body was fed at the last turn (its job takes what it was given), or a reply's
+    /// exchange took more than its rounds gave (its job gives the next); and a reply that waits for
+    /// the piece its request's body drains through, room in the endpoint's budget, at its next
+    /// beat, which the beat's turn asks the budget for again, since the budget freeing turns no
+    /// node.
+    pub(super) fn host_due(&self) -> Option<u64> {
+        let shard = hyper_rt::futures::now_ns();
+        let looked_up = self
+            .lookups
+            .iter()
+            .filter_map(|l| l.ask)
+            .any(|ask| self.reads_done.iter().any(|(a, _)| *a == ask));
+        let dropped = self
+            .abandoned
+            .iter()
+            .any(|pending| self.has_outcome(*pending));
+        if self.fed || self.replied || looked_up || dropped {
+            return Some(shard);
+        }
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let room = self
+            .replies
+            .iter()
+            .filter_map(|(_, replies)| replies.room_due_ns(shard, beat))
+            .min();
+        [self.host.due(self), room].into_iter().flatten().min()
+    }
+}
+
+/// The node's task serves the host it lends out (node.md §2.9 step 6d): each of the host's asks
+/// by the node's own functions, as the host's steps called them when they were the node's.
+impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
+    fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+        Node::ask(self, ask)
+    }
+
+    fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
+        Node::outcome(self, pending)
+    }
+
+    fn answered(&self, pending: Pending) -> bool {
+        self.has_outcome(pending)
+    }
+
+    fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
+        self.abandoned.extend(asks);
+    }
+
+    fn table(&mut self) -> Result<&Table, NodeError> {
+        Node::table(self)
+    }
+
+    fn group_of(&self, layer: Layer) -> Option<u128> {
+        Node::group_of(self, layer)
+    }
+
+    fn ranges(&self) -> usize {
+        self.ranges.len()
+    }
+
+    fn command_room(&self) -> bool {
+        Node::command_room(self)
+    }
+
+    fn room(&self, ask: &JobAsk) -> bool {
+        match ask {
+            JobAsk::Command(..) => Node::command_room(self),
+            JobAsk::Read(..) => {
+                self.reads_out.len().saturating_add(self.reads_done.len()) < self.read_asks
+            }
+            JobAsk::Put { at, .. } | JobAsk::Get { at, .. } => {
+                *at == self.id || self.chunks_out.len() < self.chunk_asks
+            }
+        }
+    }
+
+    fn command_asks(&self) -> usize {
+        self.command_asks
+    }
+
+    fn wall_ns(&self) -> u64 {
+        self.wall.now_ns()
+    }
+
+    /// A chunk answered otherwise than for want of room frees room at its volume and in the
+    /// transport toward it, as a volume's put answered does at the volume: each chunk refused for
+    /// want of room is asked again then (research/77 D2), and not at its own refusal, which would
+    /// ask it again each turn while the room stays taken.
+    fn freed(&mut self) -> bool {
+        let freed = std::mem::take(&mut self.room_freed)
+            || self
+                .chunks_done
+                .iter()
+                .any(|(_, outcome)| taken(outcome) != Taken::Room);
+        // A driving shard's puts and gets wait on the same room (node.md §2.9 step 6e).
+        if freed {
+            for lanes in &mut self.driving {
+                lanes.tell_freed();
+            }
+        }
+        freed
+    }
+
+    fn moved(&self) -> u64 {
+        self.moved
+    }
+
+    fn read_fields(&mut self, job: &mut Job) -> Result<bool, NodeError> {
+        Node::read_fields(self, job)
+    }
+
+    fn took(&mut self, paced: door::Paced) {
+        if let Some(doorway) = self.doorway.as_mut() {
+            doorway.took(paced);
+        }
+    }
+
+    fn committed(&mut self, ns: u64) {
+        self.windows.put.took(ns);
+    }
+
+    fn filled(&mut self, bytes: u64, ns: u64) {
+        self.windows.put.paced(bytes, ns);
+    }
+
+    fn read(&mut self, ns: u64) {
+        self.windows.get.took(ns);
+    }
+
+    fn windows(&self) -> crate::window::Windows {
+        self.windows
+    }
+
+    fn holds(&self, more: u64) -> bool {
+        self.admission
+            .as_ref()
+            .is_none_or(|admission| admission.holds(more))
+    }
+
+    fn recharge(&mut self, more: u64, less: u64) {
+        self.charge_more(more);
+        if less > 0
+            && let Some(admission) = self.admission.as_mut()
+        {
+            admission.gave(less);
+        }
+    }
+
+    fn job_ended(
+        &mut self,
+        admitted_ns: Option<u64>,
+        charge: u64,
+        driven: Option<usize>,
+        asks: impl IntoIterator<Item = Pending>,
+        half: Option<Box<Native>>,
+    ) -> Option<Box<Native>> {
+        self.ended(admitted_ns, charge);
+        if let Some(shard) = driven {
+            self.drivers.ended(shard);
+        }
+        self.abandoned.extend(asks);
+        half
+    }
+}
+
+impl Host {
+    /// The host at a turn: each operation's answers taken, its next requests asked, its body read
+    /// and its bytes written as far as they go, and each one done answered, served by `node`.
+    ///
+    /// The task is labelled, as the turn ends, with the operation whose step held it longest, none
+    /// where it stepped none (`crate::labels`): a long poll of the task is counted under the
+    /// operation that cost it most.
+    pub(super) fn step<N: Serve>(&mut self, node: &mut N) -> Result<(), NodeError> {
         if self.jobs.is_empty() {
             labels::set(None);
             return Ok(());
         }
         // Every operation's answers taken before any asks again, so each asks with the room
         // that every answer taken this turn gave back.
-        // A chunk answered otherwise than for want of room frees room at its volume and in the
-        // transport toward it, as a volume's put answered does at the volume: each chunk refused
-        // for want of room is asked again then (research/77 D2), and not at its own refusal,
-        // which would ask it again each turn while the room stays taken.
-        let freed = std::mem::take(&mut self.room_freed)
-            || self
-                .chunks_done
-                .iter()
-                .any(|(_, outcome)| taken(outcome) != Taken::Room);
+        let freed = node.freed();
         for at in 0..self.jobs.len() {
-            self.take_answers(at)?;
+            self.take_answers(node, at)?;
         }
         // A chunk refused for room at a peer's volume hears nothing when that volume frees room
         // (its queue held by others' writes or by its cleaner, as a filling volume's is), and with
@@ -1981,40 +3920,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let waiting = self.jobs.iter().any(Job::waits_for_room);
         let due = waiting && now >= self.room_offered_ns.saturating_add(beat);
         if freed || due {
-            self.offer_room()?;
+            self.offer_room(node)?;
         }
         if freed || due || !waiting {
             self.room_offered_ns = now;
         }
-        self.bound_jobs()?;
+        self.bound_jobs(node)?;
         // The step that held the turn longest, and its operation's label.
         let mut slowest: Option<(u64, &'static Label)> = None;
         let mut at = 0;
         while at < self.jobs.len() {
-            // Bytes of its own body read or of its reply written are its work moving, as its
-            // asks answered are.
-            let before = self.moved;
-            let label = self.jobs.get(at).and_then(|job| job.label);
-            let began = hyper_rt::futures::now_ns();
-            let over = self.step_job(at)?;
-            let held = hyper_rt::futures::now_ns().saturating_sub(began);
-            if let Some(label) = label
-                && slowest.is_none_or(|(most, _)| held >= most)
-            {
-                slowest = Some((held, label));
-            }
-            if self.moved != before
-                && let Some(job) = self.jobs.get_mut(at)
-            {
-                job.moved_ns = hyper_rt::futures::now_ns();
-            }
-            if over {
-                // What it still waits on is let go: an ended get's chunks still out, say.
-                let job = self.jobs.swap_remove(at);
-                self.ended(job.admitted_ns, job.charge);
-                self.abandoned
-                    .extend(job.pending.into_iter().map(|(pending, _)| pending));
-            } else {
+            if !self.turn_job(node, at, &mut slowest)? {
                 at = at.saturating_add(1);
             }
         }
@@ -2022,10 +3938,252 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
+    /// A native job's fields, read through `node` (`Serve::read_fields`); whether it is over.
+    fn read_fields<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        let Some(job) = self.jobs.get_mut(at) else {
+            return Ok(true);
+        };
+        node.read_fields(job)
+    }
+
+    /// An operator's request at its turn: its one command or read of the root range asked, once;
+    /// a key's id and secret drawn and the secret wrapped under the root key's current generation
+    /// first, once, so a turn without room asks the same key again.
+    fn step_admin<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        let Some(Job {
+            work: Work::Admin(admin),
+            pending,
+            ..
+        }) = self.jobs.get(at)
+        else {
+            return Ok(true);
+        };
+        if !pending.is_empty() || admin.asked {
+            return Ok(false);
+        }
+        if let Admin::Key {
+            principal,
+            rotating,
+        } = &admin.asking
+        {
+            let made = self.issue(principal, *rotating);
+            let Some(Job {
+                work: Work::Admin(admin),
+                ..
+            }) = self.jobs.get_mut(at)
+            else {
+                return Ok(true);
+            };
+            match made {
+                Ok((command, issued)) => {
+                    admin.asking = Admin::Command(Box::new(command));
+                    admin.issued = Some(issued);
+                }
+                Err(status) => {
+                    self.fail_job(node, at, status)?;
+                    return self.drain_job(at);
+                }
+            }
+        }
+        let Some(group) = node.group_of(Layer::Root) else {
+            self.fail_job(node, at, Status::Failed)?;
+            return self.drain_job(at);
+        };
+        let asking = match self.jobs.get(at) {
+            Some(Job {
+                work: Work::Admin(admin),
+                ..
+            }) => match &admin.asking {
+                Admin::Command(command) => Ok(Command::Root(command.as_ref().clone())),
+                Admin::Read { query, .. } => Err(query.clone()),
+                Admin::Key { .. } => return Ok(false),
+            },
+            _ => return Ok(true),
+        };
+        let asked = match asking {
+            Ok(command) => node.ask(JobAsk::Command(group, command)),
+            Err(query) => node.ask(JobAsk::Read(group, query)),
+        };
+        match asked {
+            Ok(pending) => {
+                if let Some(Job {
+                    work: Work::Admin(admin),
+                    pending: held,
+                    ..
+                }) = self.jobs.get_mut(at)
+                {
+                    held.push((pending, None));
+                    admin.asked = true;
+                }
+                Ok(false)
+            }
+            // Asked again at the next turn, as every ask the node has no room for is.
+            Err(NodeError::Asks) => Ok(false),
+            Err(_) => {
+                self.fail_job(node, at, Status::Failed)?;
+                self.drain_job(at)
+            }
+        }
+    }
+
+    /// A key for `principal`: its id and secret drawn from the OS, and the command that makes it,
+    /// its secret wrapped under the root key's current generation, the last the node holds
+    /// (encryption.md §2); with the key, to reply once the root range made it.
+    fn issue(
+        &self,
+        principal: &str,
+        rotating: bool,
+    ) -> Result<(root::Command, (String, mantle_s3::account::Secret)), Status> {
+        let (generation, key) = self
+            .gateway
+            .as_deref()
+            .and_then(|g| g.keys.last())
+            .ok_or(Status::Failed)?;
+        let id = mantle_s3::account::draw_id().map_err(|_| Status::Failed)?;
+        let secret = mantle_s3::account::draw_secret().map_err(|_| Status::Failed)?;
+        let wrapped = mantle_s3::seal::wrap_secret(&secret, key).map_err(|_| Status::Failed)?;
+        let command = root::Command::Principal(principal::Command::Key(principal::NewKey {
+            principal: principal.to_owned(),
+            id: id.clone(),
+            generation: *generation,
+            wrapped,
+            rotating,
+            at_ns: 0,
+        }));
+        Ok((command, (id, secret)))
+    }
+
+    /// An operator's request answered by the root range: its reply, IAM's error codes for its
+    /// refusals (research/91 §2), a key made with its id and secret, and a page of principals.
+    fn admin_answered<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        outcome: Outcome,
+    ) -> Result<(), NodeError> {
+        let one = matches!(
+            self.jobs.get(at),
+            Some(Job {
+                work: Work::Admin(admin),
+                ..
+            }) if matches!(admin.asking, Admin::Read { one: true, .. })
+        );
+        let reply = match outcome {
+            Outcome::Command(CommandOutcome::Answered(Answer::Root(root::Outcome::Principal(
+                made,
+            )))) => match made {
+                principal::Outcome::Made
+                | principal::Outcome::Set
+                | principal::Outcome::Removed => Reply::status(Status::Done),
+                principal::Outcome::KeyMade { replacing } => {
+                    let issued = match self.jobs.get_mut(at) {
+                        Some(Job {
+                            work: Work::Admin(admin),
+                            ..
+                        }) => admin.issued.take(),
+                        _ => None,
+                    };
+                    match issued {
+                        Some((id, secret)) => Reply {
+                            listing: Some(Listing::Issued(Box::new(Issued {
+                                id,
+                                secret,
+                                replacing,
+                            }))),
+                            ..Reply::status(Status::Done)
+                        },
+                        None => Reply::status(Status::Failed),
+                    }
+                }
+                principal::Outcome::Taken => Reply::status(Status::EntityAlreadyExists),
+                principal::Outcome::Full => Reply::status(Status::LimitExceeded),
+                principal::Outcome::Unknown => Reply::status(Status::NoSuchEntity),
+                principal::Outcome::Held => Reply::status(Status::DeleteConflict),
+                principal::Outcome::Unrotatable => Reply::status(Status::NothingToRotate),
+                principal::Outcome::Invalid => Reply::status(Status::InvalidArgument),
+            },
+            Outcome::Read(ReadOutcome::Read(read)) => match *read {
+                Read::Principals(page) if one && page.principals.is_empty() => {
+                    Reply::status(Status::NoSuchEntity)
+                }
+                Read::Principals(page) => Reply {
+                    listing: Some(Listing::Principals(page)),
+                    ..Reply::status(Status::Done)
+                },
+                _ => Reply::status(Status::Failed),
+            },
+            _ => Reply::status(Status::Failed),
+        };
+        self.reply_job(node, at, reply)
+    }
+
+    /// Job `at`'s step at a turn, the longest step's time and label kept in `slowest`; whether it
+    /// is over, and so let go. Bytes of its own body taken or of its reply given are its work
+    /// moving, as its asks answered are: a native job counts them in its door, taken here as a
+    /// value into the node's count (node.md §2.9 step 6c).
+    fn turn_job<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        slowest: &mut Option<(u64, &'static Label)>,
+    ) -> Result<bool, NodeError> {
+        let before = (node.moved(), self.moved);
+        let label = self.jobs.get(at).and_then(|job| job.label);
+        let began = hyper_rt::futures::now_ns();
+        let over = self.step_job(node, at)?;
+        let held = hyper_rt::futures::now_ns().saturating_sub(began);
+        if let Some(label) = label
+            && slowest.is_none_or(|(most, _)| held >= most)
+        {
+            *slowest = Some((held, label));
+        }
+        if let Some(Job {
+            door: Door::Native(_, native),
+            ..
+        }) = self.jobs.get_mut(at)
+        {
+            self.moved = self.moved.saturating_add(std::mem::take(&mut native.moved));
+        }
+        if (node.moved(), self.moved) != before
+            && let Some(job) = self.jobs.get_mut(at)
+        {
+            job.moved_ns = hyper_rt::futures::now_ns();
+        }
+        if over {
+            // What it still waits on is let go: an ended get's chunks still out, say; and its
+            // door's half goes with its end, told first that its job let go, so the node's task
+            // writes nothing past what it gave wherever the half is kept: here, once its reply's
+            // half is back too, where the node's task holds that half (`Serve::job_ended`).
+            let Job {
+                door,
+                admitted_ns,
+                charge,
+                driven,
+                pending,
+                ..
+            } = self.jobs.swap_remove(at);
+            let half = match door {
+                Door::Native(_, native) => {
+                    native
+                        .handed
+                        .ended
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    Some(native)
+                }
+                Door::Local(_) => None,
+            };
+            let asks = pending.into_iter().map(|(pending, _)| pending);
+            if let Some(native) = node.job_ended(admitted_ns, charge, driven, asks, half) {
+                self.doors.give_native(native);
+            }
+        }
+        Ok(over)
+    }
+
     /// Asks again each chunk a put's or a get's driver holds for want of room, its volume's or the
     /// transport's, of the same volume; a driver that fails doing so ends its job as its failed
     /// answers do. A job past its client's patience is offered none: `bound_jobs` ends it.
-    fn offer_room(&mut self) -> Result<(), NodeError> {
+    fn offer_room<N: Serve>(&mut self, node: &mut N) -> Result<(), NodeError> {
         let now = hyper_rt::futures::now_ns();
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get_mut(at) else {
@@ -2050,7 +4208,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 && put.room().is_err()
                 && put.outcome().is_none()
             {
-                self.fail_job(at, Status::Failed)?;
+                self.fail_job(node, at, Status::Failed)?;
             }
         }
         Ok(())
@@ -2061,33 +4219,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// client's patience (research/77 D2): one past it is answered `SlowDown` and lets go of what
     /// it asked, its client gone or going; one within it tells its asker its work is held. A get
     /// replied before its body: its asks, chunk reads, are given up by its transport once their
-    /// peers say nothing, and it ends unfinished as a get does. An operation waiting on its client,
-    /// for its body or room to write its reply, is the transport's to judge. One whose reply waits
-    /// for the piece its request's body drains through, room in the endpoint's budget, is held by
-    /// the node, and vouched for within its client's patience; past it, its turn refuses its
-    /// exchange (`wait_to_reply`).
-    fn bound_jobs(&mut self) -> Result<(), NodeError> {
+    /// peers say nothing, and it ends unfinished as a get does; one whose chunk read waits for room
+    /// is the node's own wait, which no transport ends, and its driver ends `Patience`. An
+    /// operation waiting on its client, for its body or room to write its reply, is the
+    /// transport's to judge.
+    fn bound_jobs<N: Serve>(&mut self, node: &mut N) -> Result<(), NodeError> {
         let now = hyper_rt::futures::now_ns();
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get(at) else {
                 continue;
             };
-            if job.room_to_reply {
-                if job.bounded(now) == Bounded::Held
-                    && let Door::Exchange(exchange) = job.door
-                {
-                    self.driver.endpoint().working(exchange);
-                }
-                continue;
-            }
             if !job.working() || !job.held() {
                 continue;
             }
             match job.bounded(now) {
-                Bounded::SlowDown => self.slow_job(at, door::Slowed::Patience)?,
+                Bounded::SlowDown => self.slow_job(node, at, door::Slowed::Patience)?,
+                // The job says so on its door, and the node's task tells its exchange's asker
+                // (`Replies::write`).
                 Bounded::Held => {
-                    if let Door::Exchange(exchange) = job.door {
-                        self.driver.endpoint().working(exchange);
+                    if let Door::Native(_, native) = &job.door {
+                        native.held();
                     }
                 }
                 // A chunk read waiting for room is the node's own wait, which no transport ends:
@@ -2105,61 +4256,59 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// One operation's turn; whether it is over.
-    fn step_job(&mut self, at: usize) -> Result<bool, NodeError> {
+    fn step_job<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get(at) else {
             return Ok(true);
         };
         match job.work {
-            Work::Fields(..) => self.read_fields(at),
+            Work::Fields(..) => self.read_fields(node, at),
+            // Taken out after the host's step, by the node's task that reads its fields.
+            Work::Handing(_) => Ok(false),
             Work::Draining(_) => self.drain_job(at),
-            Work::Replying(..) => self.write_fields(at),
-            Work::Answering(_) => self.answer_local(at),
-            Work::Bucket(_) => self.step_bucket(at),
-            Work::Put(_) => self.step_put(at),
-            Work::Get(_) => self.step_get(at),
-            Work::Command(_) => self.step_command(at),
-            Work::Complete(_) => self.step_complete(at),
-            Work::Read(_) => self.step_single(at),
-            Work::Deletes(_) => self.step_deletes(at),
-            Work::Copy(_) => self.step_copy(at),
-            Work::Admin(_) => self.step_admin(at),
+            Work::Answering(_) => self.answer_door(at),
+            Work::Bucket(_) => self.step_bucket(node, at),
+            Work::Put(_) => self.step_put(node, at),
+            Work::Get(_) => self.step_get(node, at),
+            Work::Command(_) => self.step_command(node, at),
+            Work::Complete(_) => self.step_complete(node, at),
+            Work::Read(_) => self.step_single(node, at),
+            Work::Deletes(_) => self.step_deletes(node, at),
+            Work::Copy(_) => self.step_copy(node, at),
+            Work::Admin(_) => self.step_admin(node, at),
         }
     }
 
     /// The outcomes of what job `at` asked, taken from the node's answers and given to it.
-    fn take_answers(&mut self, at: usize) -> Result<(), NodeError> {
+    fn take_answers<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<(), NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
         if job.pending.is_empty() {
             return Ok(());
         }
+        // Taken out while the node gives each its outcome, and given back with those still out.
+        let mut pending = std::mem::take(&mut job.pending);
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
-        job.pending.retain(|(pending, request)| {
-            let outcome = match pending {
-                Pending::Command(ask) => {
-                    take_done(&mut self.commands_done, *ask).map(Outcome::Command)
-                }
-                Pending::Read(ask) => take_done(&mut self.reads_done, *ask).map(Outcome::Read),
-                Pending::Chunk(ask) => take_done(&mut self.chunks_done, *ask).map(Outcome::Chunk),
-            };
-            match outcome {
-                Some(outcome) => {
-                    answered.push((*request, outcome));
-                    false
-                }
-                None => true,
+        pending.retain(|(asked, request)| match node.outcome(*asked) {
+            Some(outcome) => {
+                answered.push((*request, outcome));
+                false
             }
+            None => true,
         });
+        if let Some(job) = self.jobs.get_mut(at) {
+            job.pending = pending;
+        }
         for (request, outcome) in answered {
-            self.answer_job(at, request, outcome)?;
+            self.answer_job(node, at, request, outcome)?;
         }
         Ok(())
     }
 
     /// Gives job `at` an outcome of what it asked.
-    fn answer_job(
+    fn answer_job<N: Serve>(
         &mut self,
+        node: &mut N,
         at: usize,
         request: Option<u64>,
         outcome: Outcome,
@@ -2172,7 +4321,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Outcome::Read(ReadOutcome::Deadline) | Outcome::Command(CommandOutcome::Deadline)
         );
         if leaderless && self.jobs.get(at).is_some_and(Job::working) {
-            return self.slow_job(at, door::Slowed::Leaderless);
+            return self.slow_job(node, at, door::Slowed::Leaderless);
         }
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
@@ -2181,7 +4330,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         job.answered(&outcome, moved);
         let principal = job.principal.clone();
         match &mut job.work {
-            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_) => {}
+            Work::Fields(..) | Work::Handing(_) | Work::Draining(_) | Work::Answering(_) => {}
             // A native upload opened: its ID, and its progress, every run but the last as long
             // as the plan made it.
             Work::Command(commanding) if matches!(commanding.then, Then::Open { .. }) => {
@@ -2189,7 +4338,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Ok(());
                 };
                 return match outcome {
-                    Outcome::Read(ReadOutcome::Read(read)) => self.command_read(at, *read),
+                    Outcome::Read(ReadOutcome::Read(read)) => self.command_read(node, at, *read),
                     Outcome::Command(CommandOutcome::Answered(Answer::Name(
                         name::Outcome::Created { upload },
                     ))) => {
@@ -2204,12 +4353,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             })),
                             ..Reply::status(Status::Done)
                         };
-                        self.reply_job(at, reply)
+                        self.reply_job(node, at, reply)
                     }
                     Outcome::Command(CommandOutcome::Answered(Answer::Name(refused))) => {
-                        self.fail_job(at, name_status(&refused))
+                        self.fail_job(node, at, name_status(&refused))
                     }
-                    _ => self.fail_job(at, Status::Failed),
+                    _ => self.fail_job(node, at, Status::Failed),
                 };
             }
             Work::Bucket(coordinating) => {
@@ -2223,13 +4372,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         };
                         coordinating.owned = status.is_none();
                         return match status {
-                            Some(status) => self.fail_job(at, status),
+                            Some(status) => self.fail_job(node, at, status),
                             None => Ok(()),
                         };
                     }
                     Outcome::Command(CommandOutcome::Answered(Answer::Bucket(o))) => {
                         if coordinating.coordinator.is_none() {
-                            return self.begun(at, o);
+                            return self.begun(node, at, o);
                         }
                         coordinator::Answer::Bucket(o)
                     }
@@ -2239,22 +4388,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Outcome::Read(ReadOutcome::Read(read)) => match *read {
                         Read::Gate(gate) => coordinator::Answer::Gate(gate),
                         Read::Probe(probe) => coordinator::Answer::Probe(probe),
-                        _ => return self.fail_job(at, Status::Failed),
+                        _ => return self.fail_job(node, at, Status::Failed),
                     },
-                    _ => return self.fail_job(at, Status::Failed),
+                    _ => return self.fail_job(node, at, Status::Failed),
                 };
                 let Some(c) = coordinating.coordinator.as_mut() else {
-                    return self.fail_job(at, Status::Failed);
+                    return self.fail_job(node, at, Status::Failed);
                 };
                 if c.answer(answer).is_err() {
-                    return self.fail_job(at, Status::Failed);
+                    return self.fail_job(node, at, Status::Failed);
                 }
             }
             Work::Put(putting) => match (request, outcome) {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
-                    return self.bucket_read(at, *read);
+                    return self.bucket_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(at, Status::Failed),
+                (None, _) => return self.fail_job(node, at, Status::Failed),
                 (Some(id), outcome) => {
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn replies: a precondition or a lock the Name range judged, say.
@@ -2265,9 +4414,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             },
             Work::Get(getting) => match (request, outcome) {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
-                    return self.current_read(at, *read);
+                    return self.current_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(at, Status::Failed),
+                (None, _) => return self.fail_job(node, at, Status::Failed),
                 (Some(id), outcome) => {
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn ends the exchange on. A block it read is timed for the window the
@@ -2276,14 +4425,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         get.tick(moved);
                         let _ = get.answer(id, get_answer(outcome));
                         if let Some(ns) = get.take_read() {
-                            self.windows.get.took(ns);
+                            node.read(ns);
                         }
                     }
                 }
             },
             Work::Command(_) => {
                 return match outcome {
-                    Outcome::Read(ReadOutcome::Read(read)) => self.command_read(at, *read),
+                    Outcome::Read(ReadOutcome::Read(read)) => self.command_read(node, at, *read),
                     Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => {
                         let reply = match o {
                             name::Outcome::Deleted { marker, version } => Reply {
@@ -2298,7 +4447,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             name::Outcome::Aborted => Reply::status(Status::Done),
                             refused => Reply::status(name_status(&refused)),
                         };
-                        self.reply_job(at, reply)
+                        self.reply_job(node, at, reply)
                     }
                     Outcome::Command(CommandOutcome::Answered(Answer::Bucket(o))) => {
                         let status = match o {
@@ -2308,21 +4457,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             bucket::Outcome::OperationAborted => Status::OperationAborted,
                             _ => Status::Failed,
                         };
-                        self.fail_job(at, status)
+                        self.fail_job(node, at, status)
                     }
-                    _ => self.fail_job(at, Status::Failed),
+                    _ => self.fail_job(node, at, Status::Failed),
                 };
             }
             Work::Complete(completing) => match (request, outcome) {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
-                    return self.complete_read(at, *read);
+                    return self.complete_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(at, Status::Failed),
+                (None, _) => return self.fail_job(node, at, Status::Failed),
                 (Some(id), outcome) => {
                     // A read or command refused, or answered with another kind: `500`, which
                     // clients retry; never the 404 an upload not found would be.
                     let Some(answer) = complete_answer(outcome) else {
-                        return self.fail_job(at, Status::Failed);
+                        return self.fail_job(node, at, Status::Failed);
                     };
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn replies.
@@ -2333,22 +4482,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             },
             Work::Read(_) => {
                 return match outcome {
-                    Outcome::Read(ReadOutcome::Read(read)) => self.single_read(at, *read),
-                    _ => self.fail_job(at, Status::Failed),
+                    Outcome::Read(ReadOutcome::Read(read)) => self.single_read(node, at, *read),
+                    _ => self.fail_job(node, at, Status::Failed),
                 };
             }
             Work::Deletes(deleting) => match (request, outcome) {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
-                    return self.deletes_read(at, *read);
+                    return self.deletes_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(at, Status::Failed),
+                (None, _) => return self.fail_job(node, at, Status::Failed),
                 (Some(index), outcome) => {
                     let index = usize::try_from(index).unwrap_or(usize::MAX);
                     deleting.out = deleting.out.saturating_sub(1);
                     let (Some(target), Some(slot)) =
                         (deleting.objects.get(index), deleting.results.get_mut(index))
                     else {
-                        return self.fail_job(at, Status::Failed);
+                        return self.fail_job(node, at, Status::Failed);
                     };
                     *slot = Some(match outcome {
                         Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => {
@@ -2367,9 +4516,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             },
             Work::Copy(copying) => match (request, outcome) {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
-                    return self.copy_read(at, *read);
+                    return self.copy_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(at, Status::Failed),
+                (None, _) => return self.fail_job(node, at, Status::Failed),
                 (Some(tag), outcome) => match untagged(tag) {
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn replies. A block its get read is timed as a get's is, for the windows
@@ -2379,7 +4528,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             get.tick(moved);
                             let _ = get.answer(id, get_answer(outcome));
                             if let Some(ns) = get.take_read() {
-                                self.windows.get.took(ns);
+                                node.read(ns);
                             }
                         }
                     }
@@ -2390,14 +4539,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 },
             },
-            Work::Admin(_) => return self.admin_answered(at, outcome),
+            Work::Admin(_) => return self.admin_answered(node, at, outcome),
         }
         Ok(())
     }
 
     /// A bucket's create or delete answered by the Bucket range's first command: its
     /// coordinator, or the reply it gets.
-    fn begun(&mut self, at: usize, outcome: bucket::Outcome) -> Result<(), NodeError> {
+    fn begun<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        outcome: bucket::Outcome,
+    ) -> Result<(), NodeError> {
         let status = match outcome {
             bucket::Outcome::Creating { .. } | bucket::Outcome::Deleting { .. } => None,
             bucket::Outcome::AlreadyOwnedByYou => Some(Status::BucketAlreadyOwnedByYou),
@@ -2408,14 +4562,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             _ => Some(Status::Failed),
         };
         if let Some(status) = status {
-            return self.fail_job(at, status);
+            return self.fail_job(node, at, status);
         }
-        let Some(gateway) = self.gateway.as_ref() else {
-            return self.fail_job(at, Status::Failed);
+        let Some(gateway) = self.gateway.as_deref() else {
+            return self.fail_job(node, at, Status::Failed);
         };
         let bounds = coordinator::Bounds {
             budget: gateway.scan_rows,
-            ranges: self.ranges.len(),
+            ranges: node.ranges(),
         };
         let Some(Job {
             work: Work::Bucket(coordinating),
@@ -2429,15 +4583,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 coordinating.coordinator = Some(c);
                 Ok(())
             }
-            _ => self.fail_job(at, Status::Failed),
+            _ => self.fail_job(node, at, Status::Failed),
         }
     }
 
     /// A bucket's create or delete at a turn: a delete's bucket row read first, its owner checked;
     /// then its first command; then its coordinator's next request, one at a time; once the
     /// coordinator is done, its answer.
-    fn step_bucket(&mut self, at: usize) -> Result<bool, NodeError> {
-        let quota = self.gateway.as_ref().map_or(0, |g| g.bucket_quota);
+    fn step_bucket<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        let quota = self.gateway.as_deref().map_or(0, |g| g.bucket_quota);
         let Some(job) = self.jobs.get(at) else {
             return Ok(true);
         };
@@ -2477,43 +4631,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             },
         };
         let (Some(bucket_group), Some(name_group)) =
-            (self.group_of(Layer::Bucket), self.group_of(Layer::Name))
+            (node.group_of(Layer::Bucket), node.group_of(Layer::Name))
         else {
-            self.fail_job(at, Status::Failed)?;
+            self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
         };
         let asked = match next {
             Next::Done(status) => {
-                self.fail_job(at, status)?;
+                self.fail_job(node, at, status)?;
                 return self.drain_job(at);
             }
-            Next::Owner => self
-                .read(
-                    bucket_group,
-                    Query::Bucket { bucket },
-                    u64::MAX,
-                    Wait::Request,
-                )
-                .map(Pending::Read),
-            Next::Request(coordinator::Request::Bucket(command)) => self
-                .command(
-                    bucket_group,
-                    Command::Bucket(command),
-                    u64::MAX,
-                    Wait::Request,
-                )
-                .map(Pending::Command),
-            Next::Request(coordinator::Request::Name { command, .. }) => self
-                .command(name_group, Command::Name(command), u64::MAX, Wait::Request)
-                .map(Pending::Command),
-            Next::Request(coordinator::Request::Gate { generation, .. }) => self
-                .read(
-                    name_group,
-                    Query::Gate { bucket, generation },
-                    u64::MAX,
-                    Wait::Request,
-                )
-                .map(Pending::Read),
+            Next::Owner => node.ask(JobAsk::Read(bucket_group, Query::Bucket { bucket })),
+            Next::Request(coordinator::Request::Bucket(command)) => {
+                node.ask(JobAsk::Command(bucket_group, Command::Bucket(command)))
+            }
+            Next::Request(coordinator::Request::Name { command, .. }) => {
+                node.ask(JobAsk::Command(name_group, Command::Name(command)))
+            }
+            Next::Request(coordinator::Request::Gate { generation, .. }) => {
+                node.ask(JobAsk::Read(name_group, Query::Gate { bucket, generation }))
+            }
             Next::Request(coordinator::Request::Probe {
                 generation,
                 from,
@@ -2526,8 +4663,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     from,
                     budget: u32::try_from(budget).unwrap_or(u32::MAX),
                 };
-                self.read(name_group, query, u64::MAX, Wait::Request)
-                    .map(Pending::Read)
+                node.ask(JobAsk::Read(name_group, query))
             }
             // The cell's one Name range is the directory.
             Next::Request(coordinator::Request::Directory) => {
@@ -2539,18 +4675,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     && c.answer(coordinator::Answer::Directory(directory()))
                         .is_err()
                 {
-                    self.fail_job(at, Status::Failed)?;
+                    self.fail_job(node, at, Status::Failed)?;
                 }
                 return Ok(false);
             }
         };
-        self.asked(at, asked, None)
+        self.asked(node, at, asked, None)
     }
 
     /// What job `at` asked, kept to wait on; the asking's failure ends the job. An ask the node
     /// has no room for is asked again at the next turn.
-    fn asked(
+    fn asked<N: Serve>(
         &mut self,
+        node: &mut N,
         at: usize,
         asked: Result<Pending, NodeError>,
         request: Option<u64>,
@@ -2564,7 +4701,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Err(NodeError::Asks) => Ok(false),
             Err(_) => {
-                self.fail_job(at, Status::Failed)?;
+                self.fail_job(node, at, Status::Failed)?;
                 self.drain_job(at)
             }
         }
@@ -2572,16 +4709,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// A put's bucket row, read: its driver made over it, or the reply `NoSuchBucket`. A native
     /// upload's run asks its upload's row next, which it is checked against (`run_read`).
-    fn bucket_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn bucket_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let read = match read {
-            Read::Upload(upload) => return self.run_read(at, upload),
+            Read::Upload(upload) => return self.run_read(node, at, upload),
             read => read,
         };
         let Read::Bucket(Some(row)) = read else {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         };
         if row.state != BucketState::Active {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         }
         if let Some(Job {
             work: Work::Put(putting),
@@ -2599,13 +4741,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     .map(|(upload, _)| upload.clone())
                     .unwrap_or_default(),
             };
-            let Some(group) = self.group_of(Layer::Name) else {
-                return self.fail_job(at, Status::Failed);
+            let Some(group) = node.group_of(Layer::Name) else {
+                return self.fail_job(node, at, Status::Failed);
             };
-            let asked = self
-                .read(group, query, u64::MAX, Wait::Request)
-                .map(Pending::Read);
-            return self.asked(at, asked, None).map(|_| ());
+            let asked = node.ask(JobAsk::Read(group, query));
+            return self.asked(node, at, asked, None).map(|_| ());
         }
         let default = row.lock.and_then(|lock| lock.default);
         let Some(Job {
@@ -2655,14 +4795,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 deadline_ns: 0,
             }),
         };
-        self.start_put(at, commit)
+        self.start_put(node, at, commit)
     }
 
     /// A native upload's run, its upload's row read (gateway.md §2.1): begun at the offset the
     /// row holds, as long as the plan's runs or, the last, no longer, numbered the next; or the
     /// reply it earns, one at any other offset or after the last run `Offset`, naming the
     /// upload's.
-    fn run_read(&mut self, at: usize, upload: Option<Upload>) -> Result<(), NodeError> {
+    fn run_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        upload: Option<Upload>,
+    ) -> Result<(), NodeError> {
         let Some(Job {
             work: Work::Put(putting),
             ..
@@ -2671,11 +4816,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let Some(upload) = upload else {
-            return self.fail_job(at, Status::NoSuchUpload);
+            return self.fail_job(node, at, Status::NoSuchUpload);
         };
         // An upload CreateMultipartUpload made takes its client's parts, never runs.
         let (Some(runs), Some(appending)) = (upload.runs, putting.run.as_mut()) else {
-            return self.fail_job(at, Status::InvalidRequest);
+            return self.fail_job(node, at, Status::InvalidRequest);
         };
         appending.runs = Some(runs);
         if runs.ended || appending.offset != runs.offset {
@@ -2683,15 +4828,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 progress: Some(Box::new(progress(&runs, None))),
                 ..Reply::status(Status::Offset)
             };
-            return self.reply_job(at, reply);
+            return self.reply_job(node, at, reply);
         }
         let (offset, last) = (appending.offset, appending.last);
         let Some(incarnation) = appending.incarnation else {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         };
         // The run's checksum is in the algorithm its object is held to at its end.
         if putting.trailing.map(Algorithm::code) != upload.checksum.map(|(code, _)| code) {
-            return self.fail_job(at, Status::InvalidRequest);
+            return self.fail_job(node, at, Status::InvalidRequest);
         }
         let end = offset.checked_add(putting.length);
         let planned = match end {
@@ -2710,7 +4855,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let (true, Some(number), Some((upload_id, numbered))) =
             (planned, number, putting.part.as_mut())
         else {
-            return self.fail_job(at, Status::InvalidArgument);
+            return self.fail_job(node, at, Status::InvalidArgument);
         };
         *numbered = number;
         let commit = Commit::Run {
@@ -2734,22 +4879,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .length
                 .is_none_or(|length| length > mantle_s3::body::MAX_UPLOAD),
         };
-        self.start_put(at, commit)
+        self.start_put(node, at, commit)
     }
 
     /// A put's driver, made over `commit`: its file's ID and data key drawn, under the root key's
     /// current generation, and its blocks laid out by the scheme new blocks take; or the reply
     /// its failure earns.
-    fn start_put(&mut self, at: usize, commit: Commit) -> Result<(), NodeError> {
-        let Ok(Some(scheme)) = self.table().and_then(Table::scheme) else {
-            return self.fail_job(at, Status::Failed);
+    fn start_put<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        commit: Commit,
+    ) -> Result<(), NodeError> {
+        let Ok(Some(scheme)) = node.table().and_then(Table::scheme) else {
+            return self.fail_job(node, at, Status::Failed);
         };
-        let now = self.wall.now_ns();
-        let Some(gateway) = self.gateway.as_ref() else {
-            return self.fail_job(at, Status::Failed);
+        let now = node.wall_ns();
+        let Some(gateway) = self.gateway.as_deref() else {
+            return self.fail_job(node, at, Status::Failed);
         };
         let Some((generation, root)) = gateway.keys.last() else {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         };
         let holding = Holding {
             handover_ns: gateway.handover_ns,
@@ -2771,7 +4921,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some((keys, Layout::new(scheme).ok()?))
         })();
         let Some((keys, layout)) = made else {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         };
         let Some(Job {
             work: Work::Put(putting),
@@ -2795,14 +4945,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 putting.put = Some(put);
                 Ok(())
             }
-            Err(error) => self.reply_job(at, put_failed(&error)),
+            Err(error) => self.reply_job(node, at, put_failed(&error)),
         }
     }
 
     /// A put's turn: its bucket's row read first; then its body read as far as the driver takes
     /// it, its driver's time moved and its requests asked; once its outcome is known, its answer.
-    fn step_put(&mut self, at: usize) -> Result<bool, NodeError> {
-        let wall = self.wall.now_ns();
+    fn step_put<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        let wall = node.wall_ns();
         let state = {
             let Some(Job {
                 work: Work::Put(putting),
@@ -2843,10 +4993,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     // What its blocks took to be recorded and its body to come, for the windows the
                     // node's next puts hold (`crate::window`).
                     if let Some(ns) = put.take_committed() {
-                        self.windows.put.took(ns);
+                        node.committed(ns);
                     }
                     if let Some((bytes, ns)) = put.take_filled() {
-                        self.windows.put.paced(bytes, ns);
+                        node.filled(bytes, ns);
                     }
                     match over {
                         Some(reply) => Step::Over(Box::new(reply)),
@@ -2867,18 +5017,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return self.drain_job(at);
             }
             Step::Ask(bucket) => {
-                let Some(group) = self.group_of(Layer::Bucket) else {
-                    self.fail_job(at, Status::Failed)?;
+                let Some(group) = node.group_of(Layer::Bucket) else {
+                    self.fail_job(node, at, Status::Failed)?;
                     return self.drain_job(at);
                 };
-                let asked = self
-                    .read(group, Query::Bucket { bucket }, u64::MAX, Wait::Request)
-                    .map(Pending::Read);
-                return self.asked(at, asked, None);
+                let asked = node.ask(JobAsk::Read(group, Query::Bucket { bucket }));
+                return self.asked(node, at, asked, None);
             }
             Step::Go => {}
         }
-        self.feed_put(at)?;
+        self.feed_put(node, at)?;
         // The driver's requests, each asked of what serves it.
         loop {
             let Some(job) = self.jobs.get_mut(at) else {
@@ -2895,7 +5043,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 break;
             };
             // Not asked: the node holds as many asks as it keeps. It waits, in its place.
-            if let Some(request) = self.ask_put(at, id, request)? {
+            if let Some(request) = self.ask_put(node, at, id, request)? {
                 if let Some(Job {
                     work: Work::Put(putting),
                     ..
@@ -2909,205 +5057,85 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(false)
     }
 
-    /// Reads a put's body into its driver as far as the driver takes it: what it left of the
-    /// last piece first, then a piece at a time; at the body's end, the body ended, its digests
-    /// checked against what the request said before anything commits.
-    fn feed_put(&mut self, at: usize) -> Result<(), NodeError> {
-        if self
-            .jobs
-            .get(at)
-            .is_some_and(|j| matches!(j.door, Door::Local(_)))
-        {
-            return self.feed_local_put(at);
-        }
-        let Some(job) = self.jobs.get_mut(at) else {
-            return Ok(());
-        };
-        let Door::Exchange(exchange) = job.door else {
+    /// Reads a put's body into its driver as far as the driver takes it, from its door's channel
+    /// ([`take_body`]): a local door's as the S3 listener gives it, the listener told once the
+    /// driver first wants a byte, so a client that waits for `100 Continue` sends none before every
+    /// check that could refuse it passed, and each piece a sample of the body's depth
+    /// (`door::Depth`); a native exchange's as the node's task gives it ([`Feeding`]). A job whose
+    /// body does not hold ends with the status that says why.
+    fn feed_put<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<(), NodeError> {
+        let Self { jobs, moved, .. } = self;
+        let Some(job) = jobs.get_mut(at) else {
             return Ok(());
         };
         let Work::Put(putting) = &mut job.work else {
             return Ok(());
         };
-        let Some(put) = putting.put.as_mut() else {
+        let Some(put) = putting.put.as_ref() else {
             return Ok(());
         };
-        let endpoint = self.driver.endpoint();
-        // A trailer's value follows the object's bytes: the driver is fed those alone.
-        let width = putting.trailing.map_or(0, |a| a.width());
-        loop {
-            let left = usize::try_from(putting.length.saturating_sub(putting.taken))
-                .unwrap_or(usize::MAX)
-                .min(putting.carry.len());
-            if left > 0 {
-                if !put.wants_body() {
-                    return Ok(());
-                }
-                let took = match putting.carry.get(..left).map(|bytes| put.feed(bytes)) {
-                    Some(Ok(took)) => took,
-                    _ => return self.fail_job(at, Status::Failed),
-                };
-                putting.taken = putting
-                    .taken
-                    .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                putting.carry.drain(..took.min(putting.carry.len()));
-                if took < left {
-                    return Ok(());
-                }
-            }
-            if putting.taken >= putting.length && !putting.carry.is_empty() {
-                // Past the object's bytes, the trailer's; the transport holds the body to the
-                // length its head stated, the trailer's width within it.
-                if putting.trailer.len().saturating_add(putting.carry.len()) > width {
-                    return self.fail_job(at, Status::Malformed);
-                }
-                putting.trailer.append(&mut putting.carry);
-            }
-            if putting.taken >= putting.length && putting.trailer.len() == width {
-                if endpoint.body_complete(exchange) || (putting.length == 0 && width == 0) {
-                    if let Some(algorithm) = putting.trailing {
-                        putting.expected.checksum = Some(checksum::Checksum {
-                            algorithm,
-                            bytes: std::mem::take(&mut putting.trailer),
-                        });
+        let fed = match &mut job.door {
+            Door::Local(local) => {
+                if !local.ready && put.wants_body() {
+                    local.ready = true;
+                    if local.offer(door::Answer::Ready) == Sent::Gone {
+                        return self.fail_job(node, at, Status::IncompleteBody);
                     }
-                    if put.end(&putting.expected).is_err() && put.outcome().is_none() {
-                        return self.fail_job(at, Status::Failed);
-                    }
-                    // Ended once: nothing more is read, and the outcome answers it.
-                    putting.length = u64::MAX;
-                } else {
-                    // The body's checksum, after its last byte.
-                    let mut empty = hyper_transport::Reservation::default();
-                    let _ = endpoint.read_body(exchange, &mut empty);
                 }
-                return Ok(());
+                take_body(&mut local.body, None, putting, moved, |paced| {
+                    node.took(paced)
+                })
             }
-            if putting.taken < putting.length && !put.wants_body() {
-                return Ok(());
+            // A native put's pieces come as its exchange delivers them, at no connection's pace,
+            // and their bytes are counted in its door. Its fields are read before its put is made,
+            // which takes its body.
+            // A piece taken frees the storage the node's task reads the next into, so a job on a
+            // driving shard turns it.
+            Door::Native(_, native) => {
+                let Native {
+                    body,
+                    moved,
+                    handed,
+                    node,
+                    ..
+                } = &mut **native;
+                take_body(body, Some(&handed.cut), putting, moved, |_| {
+                    if let Some(node) = node {
+                        node.wake_by_ref();
+                    }
+                })
             }
-            // Into the put's own piece, emptied above: read whenever its driver wants bytes and
-            // its client has sent them, whatever other traffic holds of the endpoint's budget.
-            let got = super::read_piece(endpoint, exchange, &mut putting.carry);
-            self.moved = self
-                .moved
-                .saturating_add(u64::try_from(putting.carry.len()).unwrap_or(u64::MAX));
-            match got {
-                Ok(0) if putting.carry.is_empty() => return Ok(()),
-                Ok(_) => {}
-                Err(_) => return self.fail_job(at, Status::IncompleteBody),
-            }
-        }
-    }
-
-    /// A put's body from a local door (`crate::door`): the listener told once the driver first
-    /// wants a byte, so a client that waits for `100 Continue` sends none before every check
-    /// that could refuse it passed; each piece fed to the driver as it wants it, only what it did
-    /// not take kept; and the body's end taken only once the listener checked its signature and
-    /// its digest, its trailer's checksum then the one the end is checked against.
-    fn feed_local_put(&mut self, at: usize) -> Result<(), NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
-            return Ok(());
         };
-        let (Door::Local(local), Work::Put(putting)) = (&mut job.door, &mut job.work) else {
-            return Ok(());
-        };
-        let Some(put) = putting.put.as_mut() else {
-            return Ok(());
-        };
-        if !local.ready && put.wants_body() {
-            local.ready = true;
-            if local.offer(door::Answer::Ready) == Sent::Gone {
-                return self.fail_job(at, Status::IncompleteBody);
-            }
-        }
-        loop {
-            if !putting.carry.is_empty() {
-                if !put.wants_body() {
-                    return Ok(());
-                }
-                let took = match put.feed(&putting.carry) {
-                    Ok(took) => took,
-                    Err(_) => return self.fail_job(at, Status::Failed),
-                };
-                putting.taken = putting
-                    .taken
-                    .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                putting.carry.drain(..took.min(putting.carry.len()));
-                if !putting.carry.is_empty() {
-                    return Ok(());
-                }
-            }
-            if let Some(trailer) = local.ended.take() {
-                // The listener framed the body at its stated length: an end before or past it is
-                // a body that does not hold.
-                if putting.taken != putting.length {
-                    return self.fail_job(at, Status::IncompleteBody);
-                }
-                if let Some(checksum) = trailer {
-                    putting.expected.checksum = Some(checksum);
-                }
-                if put.end(&putting.expected).is_err() && put.outcome().is_none() {
-                    return self.fail_job(at, Status::Failed);
-                }
-                // Ended once: nothing more is read, and the outcome answers it.
-                putting.length = u64::MAX;
-                return Ok(());
-            }
-            if putting.length == u64::MAX || !put.wants_body() {
-                return Ok(());
-            }
-            match local.body.try_recv() {
-                Ok(Some(Piece::Bytes(bytes, paced))) => {
-                    // The piece's time from its send to this turn: a sample of the body's depth.
-                    if let Some(doorway) = self.doorway.as_mut() {
-                        doorway.took(paced);
-                    }
-                    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                    self.moved = self.moved.saturating_add(len);
-                    let took = match put.feed(&bytes) {
-                        Ok(took) => took,
-                        Err(_) => return self.fail_job(at, Status::Failed),
-                    };
-                    putting.taken = putting
-                        .taken
-                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                    if let Some(rest) = bytes.get(took..) {
-                        putting.carry.extend_from_slice(rest);
-                    }
-                }
-                Ok(Some(Piece::End(trailer))) => local.ended = Some(trailer),
-                Ok(Some(Piece::Refused(status))) => return self.fail_job(at, status),
-                Ok(None) => return Ok(()),
-                // The connection is gone with the body unfinished.
-                Err(_) => return self.fail_job(at, Status::IncompleteBody),
-            }
+        match fed {
+            Ok(()) => Ok(()),
+            Err(status) => self.fail_job(node, at, status),
         }
     }
 
     /// Asks a put's driver's request of what serves it; the request back when the node holds as
     /// many asks as it keeps.
-    fn ask_put(
+    fn ask_put<N: Serve>(
         &mut self,
+        node: &mut N,
         at: usize,
         id: u64,
         request: put::Request,
     ) -> Result<Option<put::Request>, NodeError> {
         let Some(kept) = self.kept_id(at, Driver::Put, id) else {
-            self.fail_job(at, Status::Failed)?;
+            self.fail_job(node, at, Status::Failed)?;
             return Ok(None);
         };
         // A command goes to its range as the driver made it, moved, once the node has room
         // for it; without room it waits whole for the next turn.
         let request = match request {
-            put::Request::Block(command) if self.command_room() => {
-                return self.ask_command(at, kept, Layer::Block, Command::Block(command));
+            put::Request::Block(command) if node.command_room() => {
+                return self.ask_command(node, at, kept, Layer::Block, Command::Block(command));
             }
-            put::Request::File(command) if self.command_room() => {
-                return self.ask_command(at, kept, Layer::File, Command::File(command));
+            put::Request::File(command) if node.command_room() => {
+                return self.ask_command(node, at, kept, Layer::File, Command::File(command));
             }
-            put::Request::Name(command) if self.command_room() => {
-                return self.ask_command(at, kept, Layer::Name, Command::Name(command));
+            put::Request::Name(command) if node.command_room() => {
+                return self.ask_command(node, at, kept, Layer::Name, Command::Name(command));
             }
             request => request,
         };
@@ -3115,12 +5143,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             put::Request::Place { block, .. } => {
                 // Only volumes that take chunks now, their nodes seen, weighted by measured
                 // availability (docs/design/repair.md §5).
-                let now = self.wall.now_ns();
-                let Ok(volumes) = self
+                let now = node.wall_ns();
+                let Ok(volumes) = node
                     .table()
                     .map(|t| place::offer(*block, &t.facts, &[], false, now))
                 else {
-                    self.fail_job(at, Status::Failed)?;
+                    self.fail_job(node, at, Status::Failed)?;
                     return Ok(None);
                 };
                 // Refused, the driver ends with that outcome, which its next turn replies.
@@ -3135,11 +5163,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 bytes,
                 crc,
             } => {
-                let Ok(node) = self.table().map(|t| t.node_of(*volume)) else {
-                    self.fail_job(at, Status::Failed)?;
+                let Ok(holder) = node.table().map(|t| t.node_of(*volume)) else {
+                    self.fail_job(node, at, Status::Failed)?;
                     return Ok(None);
                 };
-                let Some(node) = node else {
+                let Some(holder) = holder else {
                     // A volume the table no longer holds refuses it: the next is asked.
                     if let Some(put) = self.put_of(at) {
                         let _ = put.answer(id, put::Answer::Refused { full: false });
@@ -3149,8 +5177,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 let remaining = self.remaining_of(at);
                 // The replicas' one copy of the bytes, shared (a count, not a copy): each
                 // replica's put writes or sends from it.
-                self.put_chunk(node, *volume, *key, bytes.clone(), (*crc, remaining))
-                    .map(Pending::Chunk)
+                node.ask(JobAsk::Put {
+                    at: holder,
+                    volume: *volume,
+                    key: *key,
+                    bytes: bytes.clone(),
+                    crc32c: *crc,
+                    remaining_ns: remaining,
+                })
             }
             put::Request::Block(_) | put::Request::File(_) | put::Request::Name(_) => {
                 Err(NodeError::Asks)
@@ -3165,7 +5199,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Err(NodeError::Asks) => Ok(Some(request)),
             Err(_) => {
-                self.fail_job(at, Status::Failed)?;
+                self.fail_job(node, at, Status::Failed)?;
                 Ok(None)
             }
         }
@@ -3173,26 +5207,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Asks `command` of `layer`'s range for request `id` of job `at`, the node having room for
     /// it; a refusal fails the job.
-    fn ask_command<R>(
+    fn ask_command<R, N: Serve>(
         &mut self,
+        node: &mut N,
         at: usize,
         id: u64,
         layer: Layer,
         command: Command,
     ) -> Result<Option<R>, NodeError> {
-        let asked = self
+        let asked = node
             .group_of(layer)
             .ok_or(NodeError::Bounds(
                 "no range of the command's layer here".into(),
             ))
-            .and_then(|g| self.command(g, command, u64::MAX, Wait::Request));
+            .and_then(|g| node.ask(JobAsk::Command(g, command)));
         match asked {
-            Ok(ask) => {
+            Ok(pending) => {
                 if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((Pending::Command(ask), Some(id)));
+                    job.pending.push((pending, Some(id)));
                 }
             }
-            Err(_) => self.fail_job(at, Status::Failed)?,
+            Err(_) => self.fail_job(node, at, Status::Failed)?,
         }
         Ok(None)
     }
@@ -3200,24 +5235,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// A get's or head's current version, read: its preconditions judged and its range resolved
     /// against it (05 §2.4, §12); then a head's facts replied, or a get's driver made over the
     /// range and the reply's head sent.
-    fn current_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn current_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let (order, version) = match read {
-            Read::NoBucket => return self.fail_job(at, Status::NoSuchBucket),
-            Read::Current(None) => return self.fail_job(at, Status::NoSuchKey),
+            Read::NoBucket => return self.fail_job(node, at, Status::NoSuchBucket),
+            Read::Current(None) => return self.fail_job(node, at, Status::NoSuchKey),
             Read::Current(Some(found)) => found,
-            Read::Version(None) => return self.fail_job(at, Status::NoSuchVersion),
+            Read::Version(None) => return self.fail_job(node, at, Status::NoSuchVersion),
             // A named version that is a delete marker: "the response returns a `405 Method Not
             // Allowed` error and the `Last-Modified: timestamp` response header" (research/89
             // §2.1), the marker's facts with it.
             Read::Version(Some((order, marker))) if marker.marker => {
                 let reply = facts(Status::MethodNotAllowed, order, &marker);
-                return self.reply_job(at, reply);
+                return self.reply_job(node, at, reply);
             }
             Read::Version(Some(found)) => found,
-            _ => return self.fail_job(at, Status::Failed),
+            _ => return self.fail_job(node, at, Status::Failed),
         };
-        let Some(gateway) = self.gateway.as_ref() else {
-            return self.fail_job(at, Status::Failed);
+        let Some(gateway) = self.gateway.as_deref() else {
+            return self.fail_job(node, at, Status::Failed);
         };
         let keyring = RootKeys {
             keys: gateway
@@ -3255,7 +5295,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if reply.status == Status::PreconditionFailed {
                 reply = Reply::status(Status::PreconditionFailed);
             }
-            return self.reply_job(at, reply);
+            return self.reply_job(node, at, reply);
         }
         let size = version.size;
         let served = match range::span(getting.headers.range.as_deref(), size) {
@@ -3269,22 +5309,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     size,
                     ..Reply::status(Status::InvalidRange)
                 };
-                return self.reply_job(at, refused);
+                return self.reply_job(node, at, refused);
             }
         };
         if getting.head {
-            return self.reply_job(at, reply);
+            return self.reply_job(node, at, reply);
         }
         let length = served.end.saturating_sub(served.start);
         // One GET returns at most S3's single GET; an object past it is read in ranges (05 §4.1).
         if length > mantle_s3::body::MAX_GET {
-            return self.fail_job(at, Status::EntityTooLarge);
+            return self.fail_job(node, at, Status::EntityTooLarge);
         }
         // Its window, now its range's length is known: the one learned, as wide as its blocks and
         // the operations' bytes beside the others' hold, the bytes past its admitted charge taken.
-        let admission = self.admission.as_ref();
-        let held = reading(gateway, &self.windows.get, length, *charge, |more| {
-            admission.is_none_or(|admission| admission.holds(more))
+        let learned = node.windows();
+        let held = reading(gateway, &learned.get, length, *charge, |more| {
+            node.holds(more)
         });
         let more = gateway.charges.read(held).saturating_sub(*charge);
         match Get::new(version.file, size, served, Box::new(keyring), held) {
@@ -3292,14 +5332,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 get.tick(hyper_rt::futures::now_ns());
                 getting.get = Some(get);
             }
-            Err(_) => return self.fail_job(at, Status::Failed),
+            Err(_) => return self.fail_job(node, at, Status::Failed),
         }
         // The reply waits for the range's first bytes (`write_get`).
         getting.total = length;
         getting.held = Some(Box::new(reply));
         *window = held;
         *charge = charge.saturating_add(more);
-        self.charge_more(more);
+        node.recharge(more, 0);
         Ok(())
     }
 
@@ -3307,10 +5347,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// and natively its fields opening the body, ahead of the range's bytes. A driver that failed
     /// before is answered with the refusal its failure is (`get_status`), no byte sent. Whether the
     /// job is over.
-    fn send_held(&mut self, at: usize) -> Result<Option<bool>, NodeError> {
+    fn send_held<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<Option<bool>, NodeError> {
+        let bound_ns = self.jobs.get(at).map_or(0, Job::bound_ns);
         let Some(Job {
             work: Work::Get(getting),
             door,
+            admitted_ns,
             ..
         }) = self.jobs.get_mut(at)
         else {
@@ -3325,7 +5367,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(Err(e)) = get.outcome() {
             let failed = get_failed(e);
             getting.held = None;
-            self.reply_job(at, failed)?;
+            self.reply_job(node, at, failed)?;
             return Ok(Some(false));
         }
         if !get.ready() && get.outcome().is_none() {
@@ -3334,42 +5376,39 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(reply) = getting.held.take() else {
             return Ok(None);
         };
-        let length = getting.total;
-        let exchange = match door {
-            Door::Exchange(exchange) => *exchange,
-            // The reply goes first, its bytes after it as the driver gives them.
-            Door::Local(local) => {
-                if local.offer(door::Answer::Head(reply)) == Sent::Gone {
-                    self.fail_job(at, Status::Failed)?;
+        // The reply goes first, its bytes after it as the driver gives them.
+        let sent = match door {
+            Door::Local(local) => local.offer(door::Answer::Head(reply)),
+            // Natively its fields open the body, ahead of the range's bytes, which the head's
+            // length counts as the node's task writes it.
+            Door::Native(_, native) => {
+                let Ok((head, fields)) = reply.encode() else {
+                    self.fail_job(node, at, Status::Failed)?;
                     return Ok(Some(false));
-                }
-                return Ok(None);
+                };
+                native.give(Told::Head(Box::new(Opening {
+                    head,
+                    fields: Bytes::from(fields),
+                    body: getting.total,
+                    slowed: None,
+                    bound_ns,
+                    admitted: admitted_ns.is_some(),
+                })))
             }
         };
-        let Ok((head, fields)) = reply.encode() else {
-            self.fail_job(at, Status::Failed)?;
+        if sent == Sent::Gone {
+            // Its asker is gone: the job ends with its exchange.
+            self.fail_job(node, at, Status::Failed)?;
             return Ok(Some(false));
-        };
-        // The fields open the body, ahead of the range's bytes.
-        let total = u64::try_from(fields.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(length);
-        match super::reply_head(self.driver.endpoint(), exchange, &head, Some(total)) {
-            super::Replied::Sent => {
-                getting.total = total;
-                getting.out = Some((Bytes::from(fields), 0));
-                Ok(None)
-            }
-            // Its asker is gone, or told why: the job ends with its exchange.
-            super::Replied::Ended => Ok(Some(true)),
         }
+        Ok(None)
     }
 
     /// A get's or head's turn: its current version read first; then a get's driver's requests
     /// asked and its bytes written as far as the exchange takes them; once every byte is written,
     /// its end.
-    fn step_get(&mut self, at: usize) -> Result<bool, NodeError> {
-        let name = self.group_of(Layer::Name);
+    fn step_get<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        let name = node.group_of(Layer::Name);
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
@@ -3392,15 +5431,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 },
             };
             let Some(group) = name else {
-                self.fail_job(at, Status::Failed)?;
+                self.fail_job(node, at, Status::Failed)?;
                 return self.drain_job(at);
             };
-            let asked = self
-                .read(group, query, u64::MAX, Wait::Request)
-                .map(Pending::Read);
-            return self.asked(at, asked, None);
+            let asked = node.ask(JobAsk::Read(group, query));
+            return self.asked(node, at, asked, None);
         }
-        if self.write_get(at)? {
+        if self.write_get(node, at)? {
             return Ok(true);
         }
         loop {
@@ -3417,7 +5454,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some((id, request)) = next else {
                 break;
             };
-            if let Some(request) = self.ask_get(at, id, request)? {
+            if let Some(request) = self.ask_get(node, at, id, request)? {
                 if let Some(Job {
                     work: Work::Get(getting),
                     ..
@@ -3431,11 +5468,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(false)
     }
 
-    /// Writes a get's bytes as far as its exchange takes them, taking more from the driver as the
-    /// last is written; whether the get is over: every byte written, or its driver or exchange
-    /// failed, which ends the exchange unfinished.
-    fn write_get(&mut self, at: usize) -> Result<bool, NodeError> {
-        if let Some(over) = self.send_held(at)? {
+    /// Gives a get's bytes to its door as far as it takes them, taking more from the driver as the
+    /// last is taken, then its end; whether the get is over: every byte given and its end, or its
+    /// driver failed, which ends the exchange unfinished, or its door is gone.
+    fn write_get<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        if let Some(over) = self.send_held(node, at)? {
             return Ok(over);
         }
         let Some(job) = self.jobs.get_mut(at) else {
@@ -3447,11 +5484,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(get) = getting.get.as_mut() else {
             return Ok(false);
         };
-        let now = hyper_rt::futures::now_ns();
         // Blocks it begins from here are timed from now (`Get::take_read`).
-        get.tick(now);
-        let exchange = match &mut job.door {
-            Door::Exchange(exchange) => *exchange,
+        get.tick(hyper_rt::futures::now_ns());
+        match &mut job.door {
+            // Its client's pace is the node's task's to time as it writes the exchange
+            // (`Replies`, `Drain`).
+            Door::Native(_, native) => {
+                match give_native(native, get, &mut getting.written, getting.total) {
+                    Gave::Waits => Ok(false),
+                    Gave::Over => Ok(true),
+                    Gave::Ending => {
+                        // The last answer waits for room: the job sends it before it ends.
+                        job.work = Work::Answering(VecDeque::new());
+                        Ok(false)
+                    }
+                }
+            }
             Door::Local(local) => {
                 // Every piece this turn sends carries the turn, the one held from the last turn's
                 // among them: the node learns the reply's depth from the time between turns its
@@ -3464,7 +5512,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 // A piece is taken from the driver only once the last is sent, so the channel holds
                 // what the client has yet to read and the driver the rest of its window. Its
-                // client's pace is the connection's to time (`Drain`).
+                // client's pace is the connection's to time (`listener::io::Drained`).
                 loop {
                     match local.flush() {
                         Sent::Taken => {}
@@ -3492,84 +5540,28 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     job.work = Work::Answering(VecDeque::new());
                     return Ok(false);
                 }
-                return Ok(true);
-            }
-        };
-        let endpoint = self.driver.endpoint();
-        loop {
-            if getting.out.is_none() {
-                getting.out = get.take().map(|bytes| (bytes, 0));
-            }
-            let Some((bytes, written)) = getting.out.as_mut() else {
-                break;
-            };
-            let Some(rest) = bytes.get(*written..) else {
-                getting.out = None;
-                continue;
-            };
-            if rest.is_empty() {
-                // Written whole: what its client took since its room was full is its pace
-                // (`Drain`).
-                if let Some(held) = getting.drain.held_ns {
-                    let ns = now.saturating_sub(held);
-                    self.windows.get.paced(getting.drain.bytes, ns);
-                }
-                getting.drain = Drain::default();
-                getting.out = None;
-                continue;
-            }
-            match endpoint.write_body(exchange, rest) {
-                Ok(0) => {
-                    getting.drain.held_ns.get_or_insert(now);
-                    return Ok(false);
-                }
-                Ok(took) => {
-                    let took_bytes = u64::try_from(took).unwrap_or(u64::MAX);
-                    *written = written.saturating_add(took);
-                    getting.written = getting.written.saturating_add(took_bytes);
-                    self.moved = self.moved.saturating_add(took_bytes);
-                    if getting.drain.held_ns.is_some() {
-                        getting.drain.bytes = getting.drain.bytes.saturating_add(took_bytes);
-                    }
-                }
-                Err(_) => {
-                    endpoint.refuse_exchange(exchange, Refusal::Closed);
-                    return Ok(true);
-                }
-            }
-        }
-        match get.outcome() {
-            Some(Ok(())) if getting.written >= getting.total => {
-                endpoint.end(exchange);
                 Ok(true)
             }
-            // The driver failed past the reply's head: the exchange ends unfinished, which its
-            // asker hears as the exchange refused, not as bytes it could take for the object's.
-            Some(Err(_)) => {
-                endpoint.refuse_exchange(exchange, Refusal::Closed);
-                Ok(true)
-            }
-            _ => Ok(false),
         }
     }
 
     /// Asks a get's driver's request of what serves it; the request back when the node holds as
     /// many asks as it keeps.
-    fn ask_get(
+    fn ask_get<N: Serve>(
         &mut self,
+        node: &mut N,
         at: usize,
         id: u64,
         request: get::Request,
     ) -> Result<Option<get::Request>, NodeError> {
         let asked = match &request {
-            get::Request::Header { file } => self
+            get::Request::Header { file } => node
                 .group_of(Layer::File)
                 .ok_or(NodeError::Bounds("no File range here".into()))
-                .and_then(|g| self.read(g, Query::Header { file: *file }, u64::MAX, Wait::Request))
-                .map(Pending::Read),
+                .and_then(|g| node.ask(JobAsk::Read(g, Query::Header { file: *file }))),
             get::Request::Extents { file, offset, max } => {
                 let max = u32::try_from(*max).unwrap_or(u32::MAX);
-                self.group_of(Layer::File)
+                node.group_of(Layer::File)
                     .ok_or(NodeError::Bounds("no File range here".into()))
                     .and_then(|g| {
                         let query = Query::Extents {
@@ -3577,26 +5569,24 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             offset: *offset,
                             max,
                         };
-                        self.read(g, query, u64::MAX, Wait::Request)
+                        node.ask(JobAsk::Read(g, query))
                     })
-                    .map(Pending::Read)
             }
-            get::Request::Block { block } => self
+            get::Request::Block { block } => node
                 .group_of(Layer::Block)
                 .ok_or(NodeError::Bounds("no Block range here".into()))
-                .and_then(|g| self.read(g, Query::Block { block: *block }, u64::MAX, Wait::Request))
-                .map(Pending::Read),
+                .and_then(|g| node.ask(JobAsk::Read(g, Query::Block { block: *block }))),
             get::Request::Chunk {
                 volume,
                 key,
                 offset,
                 len,
             } => {
-                let Ok(node) = self.table().map(|t| t.node_of(*volume)) else {
-                    self.fail_job(at, Status::Failed)?;
+                let Ok(holder) = node.table().map(|t| t.node_of(*volume)) else {
+                    self.fail_job(node, at, Status::Failed)?;
                     return Ok(None);
                 };
-                let Some(node) = node else {
+                let Some(holder) = holder else {
                     // A volume the table no longer holds: another copy is read, or the driver
                     // ends with its outcome.
                     if let Some(get) = self.get_of(at) {
@@ -3605,12 +5595,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Ok(None);
                 };
                 let remaining = self.remaining_of(at);
-                self.get_chunk(node, *volume, *key, (*offset, *len), remaining)
-                    .map(Pending::Chunk)
+                node.ask(JobAsk::Get {
+                    at: holder,
+                    volume: *volume,
+                    key: *key,
+                    span: (*offset, *len),
+                    remaining_ns: remaining,
+                })
             }
         };
         let Some(kept) = self.kept_id(at, Driver::Get, id) else {
-            self.fail_job(at, Status::Failed)?;
+            self.fail_job(node, at, Status::Failed)?;
             return Ok(None);
         };
         match asked {
@@ -3622,7 +5617,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Err(NodeError::Asks) => Ok(Some(request)),
             Err(_) => {
-                self.fail_job(at, Status::Failed)?;
+                self.fail_job(node, at, Status::Failed)?;
                 Ok(None)
             }
         }
@@ -3657,7 +5652,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// A commanding operation's turn: its bucket's row read first, then its command; the
     /// command's answer replies (`answer_job`).
-    fn step_command(&mut self, at: usize) -> Result<bool, NodeError> {
+    fn step_command<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
         let Some(Job {
             work: Work::Command(commanding),
             pending,
@@ -3669,33 +5664,36 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !pending.is_empty() || commanding.asked {
             return Ok(false);
         }
-        let Some(group) = self.group_of(Layer::Bucket) else {
-            self.fail_job(at, Status::Failed)?;
+        let Some(group) = node.group_of(Layer::Bucket) else {
+            self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
         };
         let query = Query::Bucket {
             bucket: commanding.bucket.clone(),
         };
-        let asked = self
-            .read(group, query, u64::MAX, Wait::Request)
-            .map(Pending::Read);
-        self.asked(at, asked, None)
+        let asked = node.ask(JobAsk::Read(group, query));
+        self.asked(node, at, asked, None)
     }
 
     /// A commanding operation's bucket row, read: its command asked, a delete's under the
     /// bucket's incarnation and versioning (05 §7.3), a versioning change by the bucket's owner;
     /// or the reply `NoSuchBucket` or `AccessDenied`.
-    fn command_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn command_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let Read::Bucket(Some(row)) = read else {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         };
         if row.state != BucketState::Active {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         }
         let (Some(bucket_group), Some(name_group)) =
-            (self.group_of(Layer::Bucket), self.group_of(Layer::Name))
+            (node.group_of(Layer::Bucket), node.group_of(Layer::Name))
         else {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         };
         let Some(Job {
             work: Work::Command(commanding),
@@ -3726,7 +5724,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             ),
             // S3 lets no other principal change a bucket's versioning unless a policy grants it.
             Then::Versioning(_) if row.owner != *principal => {
-                return self.fail_job(at, Status::AccessDenied);
+                return self.fail_job(node, at, Status::AccessDenied);
             }
             Then::Versioning(versioning) => (
                 bucket_group,
@@ -3774,7 +5772,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         .and_then(|state| <[u8; 16]>::try_from(state.chaining()).ok());
                     match begun {
                         Some(chaining) => Some(RunMd5::Running(chaining)),
-                        None => return self.fail_job(at, Status::Failed),
+                        None => return self.fail_job(node, at, Status::Failed),
                     }
                 } else {
                     None
@@ -3817,15 +5815,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             ),
         };
         commanding.asked = true;
-        let asked = self
-            .command(group, command, u64::MAX, Wait::Request)
-            .map(Pending::Command);
-        self.asked(at, asked, None).map(|_| ())
+        let asked = node.ask(JobAsk::Command(group, command));
+        self.asked(node, at, asked, None).map(|_| ())
     }
 
     /// A completion's turn: its bucket's row read first; then its driver's requests asked; once
     /// its outcome is known, its answer.
-    fn step_complete(&mut self, at: usize) -> Result<bool, NodeError> {
+    fn step_complete<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
         let Some(Job {
             work: Work::Complete(completing),
             pending,
@@ -3841,14 +5837,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let query = Query::Bucket {
                 bucket: completing.bucket.clone(),
             };
-            let Some(group) = self.group_of(Layer::Bucket) else {
-                self.fail_job(at, Status::Failed)?;
+            let Some(group) = node.group_of(Layer::Bucket) else {
+                self.fail_job(node, at, Status::Failed)?;
                 return self.drain_job(at);
             };
-            let asked = self
-                .read(group, query, u64::MAX, Wait::Request)
-                .map(Pending::Read);
-            return self.asked(at, asked, None);
+            let asked = node.ask(JobAsk::Read(group, query));
+            return self.asked(node, at, asked, None);
         };
         if let Some(outcome) = completion.outcome() {
             let reply = match outcome {
@@ -3861,7 +5855,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 },
                 Err(error) => Reply::status(complete_status(error)),
             };
-            self.reply_job(at, reply)?;
+            self.reply_job(node, at, reply)?;
             return self.drain_job(at);
         }
         loop {
@@ -3878,7 +5872,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some((id, request)) = next else {
                 break;
             };
-            if let Some(request) = self.ask_complete(at, id, request)? {
+            if let Some(request) = self.ask_complete(node, at, id, request)? {
                 if let Some(Job {
                     work: Work::Complete(completing),
                     ..
@@ -3894,20 +5888,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// A completion's bucket row, read: its driver made over it, or the reply `NoSuchBucket` or
     /// the refusal its parts' list earns before anything is asked (05 §4.4).
-    fn complete_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn complete_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let Read::Bucket(Some(row)) = read else {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         };
         if row.state != BucketState::Active {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         }
-        let Some(handover_ns) = self.gateway.as_ref().map(|g| g.handover_ns) else {
-            return self.fail_job(at, Status::Failed);
+        let Some(handover_ns) = self.gateway.as_deref().map(|g| g.handover_ns) else {
+            return self.fail_job(node, at, Status::Failed);
         };
-        let now = self.wall.now_ns();
+        let now = node.wall_ns();
         let mut file = [0u8; 16];
         if getrandom::fill(&mut file).is_err() {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         }
         let Some(Job {
             work: Work::Complete(completing),
@@ -3958,15 +5957,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Err(error) => {
                 let status = complete_status(&error);
-                self.fail_job(at, status)
+                self.fail_job(node, at, status)
             }
         }
     }
 
     /// Asks a completion's driver's request of what serves it; the request back when the node
     /// holds as many asks as it keeps.
-    fn ask_complete(
+    fn ask_complete<N: Serve>(
         &mut self,
+        node: &mut N,
         at: usize,
         id: u64,
         request: complete::Request,
@@ -3986,16 +5986,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // A completion's commands, its list of parts among them, go to their ranges moved, as
         // a put's do (`ask_put`).
         let request = match request {
-            complete::Request::File(command) if self.command_room() => {
-                return self.ask_command(at, id, Layer::File, Command::File(command));
+            complete::Request::File(command) if node.command_room() => {
+                return self.ask_command(node, at, id, Layer::File, Command::File(command));
             }
-            complete::Request::Name(command) if self.command_room() => {
-                return self.ask_command(at, id, Layer::Name, Command::Name(command));
+            complete::Request::Name(command) if node.command_room() => {
+                return self.ask_command(node, at, id, Layer::Name, Command::Name(command));
             }
             request => request,
         };
         let asked = match &request {
-            complete::Request::Upload => self
+            complete::Request::Upload => node
                 .group_of(Layer::Name)
                 .ok_or(NodeError::Bounds("no Name range here".into()))
                 .and_then(|g| {
@@ -4004,10 +6004,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         key,
                         upload,
                     };
-                    self.read(g, query, u64::MAX, Wait::Request)
-                })
-                .map(Pending::Read),
-            complete::Request::Parts { after, max } => self
+                    node.ask(JobAsk::Read(g, query))
+                }),
+            complete::Request::Parts { after, max } => node
                 .group_of(Layer::Name)
                 .ok_or(NodeError::Bounds("no Name range here".into()))
                 .and_then(|g| {
@@ -4018,9 +6017,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         after: *after,
                         max: u32::try_from(*max).unwrap_or(u32::MAX),
                     };
-                    self.read(g, query, u64::MAX, Wait::Request)
-                })
-                .map(Pending::Read),
+                    node.ask(JobAsk::Read(g, query))
+                }),
             complete::Request::File(_) | complete::Request::Name(_) => Err(NodeError::Asks),
         };
         match asked {
@@ -4032,7 +6030,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Err(NodeError::Asks) => Ok(Some(request)),
             Err(_) => {
-                self.fail_job(at, Status::Failed)?;
+                self.fail_job(node, at, Status::Failed)?;
                 Ok(None)
             }
         }
@@ -4042,11 +6040,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// delete asked in the order named, at most an operation's share of the node's commands out
     /// at once (`crate::derive::asks`); once every one is answered, the results, the failures
     /// alone where it is quiet.
-    fn step_deletes(&mut self, at: usize) -> Result<bool, NodeError> {
-        let objects = self.gateway.as_ref().map_or(1, |g| g.objects).max(1);
+    fn step_deletes<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        let objects = self.gateway.as_deref().map_or(1, |g| g.objects).max(1);
         // An operation's share of the commands the node holds, past its own enlistment's one.
-        let share = self
-            .command_asks
+        let share = node
+            .command_asks()
             .saturating_sub(1)
             .checked_div(objects)
             .unwrap_or(1)
@@ -4066,17 +6064,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let query = Query::Bucket {
                 bucket: deleting.bucket.clone(),
             };
-            let Some(group) = self.group_of(Layer::Bucket) else {
-                self.fail_job(at, Status::Failed)?;
+            let Some(group) = node.group_of(Layer::Bucket) else {
+                self.fail_job(node, at, Status::Failed)?;
                 return self.drain_job(at);
             };
-            let asked = self
-                .read(group, query, u64::MAX, Wait::Request)
-                .map(Pending::Read);
-            return self.asked(at, asked, None);
+            let asked = node.ask(JobAsk::Read(group, query));
+            return self.asked(node, at, asked, None);
         };
-        let Some(group) = self.group_of(Layer::Name) else {
-            self.fail_job(at, Status::Failed)?;
+        let Some(group) = node.group_of(Layer::Name) else {
+            self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
         };
         let principal = self.jobs.get(at).map(|j| j.principal.clone());
@@ -4138,18 +6134,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 bypass: false,
                 owner: principal.clone().unwrap_or_default(),
             })));
-            match self.command(group, command, u64::MAX, Wait::Request) {
-                Ok(ask) => {
+            match node.ask(JobAsk::Command(group, command)) {
+                Ok(asked) => {
                     if let Some(Job {
                         work: Work::Deletes(deleting),
                         pending,
                         ..
                     }) = self.jobs.get_mut(at)
                     {
-                        pending.push((
-                            Pending::Command(ask),
-                            Some(u64::try_from(index).unwrap_or(u64::MAX)),
-                        ));
+                        pending.push((asked, Some(u64::try_from(index).unwrap_or(u64::MAX))));
                         deleting.out = deleting.out.saturating_add(1);
                         deleting.next = index.saturating_add(1);
                     }
@@ -4157,7 +6150,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 // The node holds as many commands as it keeps: the rest are asked at a later turn.
                 Err(NodeError::Asks) => break,
                 Err(_) => {
-                    self.fail_job(at, Status::Failed)?;
+                    self.fail_job(node, at, Status::Failed)?;
                     return self.drain_job(at);
                 }
             }
@@ -4184,18 +6177,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             listing: Some(Listing::Deleted(results)),
             ..Reply::status(Status::Done)
         };
-        self.reply_job(at, reply)?;
+        self.reply_job(node, at, reply)?;
         self.drain_job(at)
     }
 
     /// A DeleteObjects' bucket row, read: the incarnation and versioning its deletes are made
     /// under, or the reply `NoSuchBucket`.
-    fn deletes_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn deletes_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let Read::Bucket(Some(row)) = read else {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         };
         if row.state != BucketState::Active {
-            return self.fail_job(at, Status::NoSuchBucket);
+            return self.fail_job(node, at, Status::NoSuchBucket);
         }
         if let Some(Job {
             work: Work::Deletes(deleting),
@@ -4211,8 +6209,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// UploadPartCopy's upload's row next, then the source's version; then its drivers, the
     /// get's plaintext fed to the put as the put takes it, each one's requests asked; once the
     /// put commits, its reply, a null version's time read from its mark first.
-    fn step_copy(&mut self, at: usize) -> Result<bool, NodeError> {
-        let wall = self.wall.now_ns();
+    fn step_copy<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        let wall = node.wall_ns();
         let Some(Job {
             work: Work::Copy(copying),
             pending,
@@ -4264,20 +6262,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if !pending.is_empty() {
                 return Ok(false);
             }
-            let Some(group) = self.group_of(layer) else {
-                self.fail_job(at, Status::Failed)?;
+            let Some(group) = node.group_of(layer) else {
+                self.fail_job(node, at, Status::Failed)?;
                 return self.drain_job(at);
             };
-            let asked = self
-                .read(group, query, u64::MAX, Wait::Request)
-                .map(Pending::Read);
-            return self.asked(at, asked, None);
+            let asked = node.ask(JobAsk::Read(group, query));
+            return self.asked(node, at, asked, None);
         }
         // What its put's blocks took to be recorded, for the windows the node's next puts and
         // copies hold (`crate::window`). Its put's body comes at its get's pace, not a client's,
         // so how fast that filled is no client's pace, and is not taken (`Put::take_filled`).
         if let Some(ns) = copying.put.as_mut().and_then(Put::take_committed) {
-            self.windows.put.took(ns);
+            node.committed(ns);
         }
         // Blocks its get begins from here are timed from now (`Get::take_read`).
         if let Some(get) = copying.get.as_mut() {
@@ -4300,7 +6296,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         match over {
             Some(Err(failed)) => {
-                self.reply_job(at, failed)?;
+                self.reply_job(node, at, failed)?;
                 return self.drain_job(at);
             }
             Some(Ok(stored)) => {
@@ -4321,7 +6317,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 };
                 let reply = reply.unwrap_or_else(|| Reply::status(Status::Failed));
-                self.reply_job(at, reply)?;
+                self.reply_job(node, at, reply)?;
                 return self.drain_job(at);
             }
             None => {}
@@ -4330,7 +6326,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             && put.tick(wall).is_err()
             && put.outcome().is_none()
         {
-            self.fail_job(at, Status::Failed)?;
+            self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
         }
         self.feed_copy(at);
@@ -4352,7 +6348,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         let Some((id, request)) = next else {
                             break;
                         };
-                        if let Some(request) = self.ask_get(at, id, request)? {
+                        if let Some(request) = self.ask_get(node, at, id, request)? {
                             if let Some(Job {
                                 work: Work::Copy(copying),
                                 ..
@@ -4371,7 +6367,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         let Some((id, request)) = next else {
                             break;
                         };
-                        if let Some(request) = self.ask_put(at, id, request)? {
+                        if let Some(request) = self.ask_put(node, at, id, request)? {
                             if let Some(Job {
                                 work: Work::Copy(copying),
                                 ..
@@ -4433,7 +6429,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// What a copy read: its destination bucket's row, an UploadPartCopy's upload's, its
     /// source's version, or a null version's mark.
-    fn copy_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn copy_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let Some(Job {
             work: Work::Copy(copying),
             ..
@@ -4452,7 +6453,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(())
             }
             (CopyStage::Bucket, _) | (CopyStage::Upload, Read::NoBucket) => {
-                self.fail_job(at, Status::NoSuchBucket)
+                self.fail_job(node, at, Status::NoSuchBucket)
             }
             (CopyStage::Upload, Read::Upload(Some(upload))) if upload.runs.is_none() => {
                 copying.upload = Some(upload);
@@ -4460,9 +6461,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(())
             }
             // A native upload's parts are its runs, which no copy makes.
-            (CopyStage::Upload, Read::Upload(Some(_))) => self.fail_job(at, Status::InvalidRequest),
-            (CopyStage::Upload, Read::Upload(None)) => self.fail_job(at, Status::NoSuchUpload),
-            (CopyStage::Source, read) => self.copy_source_read(at, read),
+            (CopyStage::Upload, Read::Upload(Some(_))) => {
+                self.fail_job(node, at, Status::InvalidRequest)
+            }
+            (CopyStage::Upload, Read::Upload(None)) => {
+                self.fail_job(node, at, Status::NoSuchUpload)
+            }
+            (CopyStage::Source, read) => self.copy_source_read(node, at, read),
             (
                 CopyStage::Mark,
                 Read::Mark(Some(record::Mark {
@@ -4474,9 +6479,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Some(stored) => copied(stored, !order, &copying.source_version),
                     None => Reply::status(Status::Failed),
                 };
-                self.reply_job(at, reply)
+                self.reply_job(node, at, reply)
             }
-            _ => self.fail_job(at, Status::Failed),
+            _ => self.fail_job(node, at, Status::Failed),
         }
     }
 
@@ -4484,32 +6489,37 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// what may be copied and how much, then the copy's drivers made, a get of the source's span
     /// and a put of the destination's object or part, its metadata the source's or the request's
     /// by the directive (research/89 §3.2).
-    fn copy_source_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn copy_source_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let (order, version) = match read {
-            Read::NoBucket => return self.fail_job(at, Status::NoSuchBucket),
-            Read::Current(None) => return self.fail_job(at, Status::NoSuchKey),
+            Read::NoBucket => return self.fail_job(node, at, Status::NoSuchBucket),
+            Read::Current(None) => return self.fail_job(node, at, Status::NoSuchKey),
             // "If the current version is a delete marker, Amazon S3 behaves as if the object was
             // deleted" (research/89 §3.1).
             Read::Current(Some((_, current))) if current.marker => {
-                return self.fail_job(at, Status::NoSuchKey);
+                return self.fail_job(node, at, Status::NoSuchKey);
             }
             Read::Current(Some(found)) => found,
-            Read::Version(None) => return self.fail_job(at, Status::NoSuchVersion),
+            Read::Version(None) => return self.fail_job(node, at, Status::NoSuchVersion),
             Read::Version(Some((_, named))) if named.marker => {
-                return self.fail_job(at, Status::CopyMarker);
+                return self.fail_job(node, at, Status::CopyMarker);
             }
             Read::Version(Some(found)) => found,
-            _ => return self.fail_job(at, Status::Failed),
+            _ => return self.fail_job(node, at, Status::Failed),
         };
-        let now = self.wall.now_ns();
-        let Ok(Some(scheme)) = self.table().and_then(Table::scheme) else {
-            return self.fail_job(at, Status::Failed);
+        let now = node.wall_ns();
+        let Ok(Some(scheme)) = node.table().and_then(Table::scheme) else {
+            return self.fail_job(node, at, Status::Failed);
         };
-        let Some(gateway) = self.gateway.as_ref() else {
-            return self.fail_job(at, Status::Failed);
+        let Some(gateway) = self.gateway.as_deref() else {
+            return self.fail_job(node, at, Status::Failed);
         };
         let Some((generation, root)) = gateway.keys.last() else {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         };
         let keyring = RootKeys {
             keys: gateway
@@ -4534,7 +6544,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some((keys, Layout::new(scheme).ok()?))
         })();
         let Some((keys, layout)) = made else {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         };
         let Some(Job {
             work: Work::Copy(copying),
@@ -4552,9 +6562,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         match conditional::copy_source(&copying.conditions.conditions(), &current) {
             conditional::Outcome::Proceed => {}
-            conditional::Outcome::NotFound => return self.fail_job(at, Status::NoSuchKey),
+            conditional::Outcome::NotFound => return self.fail_job(node, at, Status::NoSuchKey),
             conditional::Outcome::Failed | conditional::Outcome::NotModified => {
-                return self.fail_job(at, Status::PreconditionFailed);
+                return self.fail_job(node, at, Status::PreconditionFailed);
             }
         }
         let size = version.size;
@@ -4568,32 +6578,34 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     && named.is_none()
                     && copying.directive == Directive::Copy
                 {
-                    return self.fail_job(at, Status::CopyToItself);
+                    return self.fail_job(node, at, Status::CopyToItself);
                 }
                 if size > mantle_s3::body::MAX_UPLOAD {
-                    return self.fail_job(at, Status::CopySourceTooLarge);
+                    return self.fail_job(node, at, Status::CopySourceTooLarge);
                 }
                 0..size
             }
             Some(_) => match copying.conditions.range.as_deref() {
                 None if size > name::MAX_PART => {
-                    return self.fail_job(at, Status::CopySourceTooLarge);
+                    return self.fail_job(node, at, Status::CopySourceTooLarge);
                 }
                 None => 0..size,
                 Some(text) => match range::copy_range(text, size) {
                     Err(CopyRangeError::Malformed) => {
-                        return self.fail_job(at, Status::InvalidCopyRange);
+                        return self.fail_job(node, at, Status::InvalidCopyRange);
                     }
-                    Err(CopyRangeError::Outside) => return self.fail_job(at, Status::InvalidRange),
+                    Err(CopyRangeError::Outside) => {
+                        return self.fail_job(node, at, Status::InvalidRange);
+                    }
                     // "You can copy a range only if the source object is greater than 5 MB"
                     // (research/89 §4.1).
                     Ok(_) if size <= mantle_s3::body::MIN_PART => {
-                        return self.fail_job(at, Status::CopyRangeSource);
+                        return self.fail_job(node, at, Status::CopyRangeSource);
                     }
                     Ok((first, last)) => {
                         let end = last.saturating_add(1);
                         if end.saturating_sub(first) > name::MAX_PART {
-                            return self.fail_job(at, Status::EntityTooLarge);
+                            return self.fail_job(node, at, Status::EntityTooLarge);
                         }
                         first..end
                     }
@@ -4645,7 +6657,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             },
         };
         let Some(row) = copying.row.as_ref() else {
-            return self.fail_job(at, Status::Failed);
+            return self.fail_job(node, at, Status::Failed);
         };
         let commit = match &copying.part {
             Some((upload, number)) => Commit::Part(name::PutPart {
@@ -4699,26 +6711,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // many blocks as that put drains while one is read, each as wide as the operations' bytes
         // beside the others' hold; the bytes past its admitted charge taken, those its span does
         // not need given back.
-        let (reads, writes, held) = copy_windows(
-            gateway,
-            &self.windows,
-            self.admission.as_ref(),
-            length,
-            *charge,
-        );
-        if let Some(admission) = self.admission.as_mut() {
-            let more = held.saturating_sub(*charge);
-            lend(
-                gateway.cache_bytes,
-                admission,
-                &mut self.ranges,
-                &mut self.owner,
-                more,
-                false,
-            );
-            admission.took(more);
-            admission.gave(charge.saturating_sub(held));
-        }
+        let learned = node.windows();
+        let (reads, writes, held) =
+            copy_windows(gateway, &learned, |more| node.holds(more), length, *charge);
+        node.recharge(held.saturating_sub(*charge), charge.saturating_sub(held));
         *charge = held;
         let holding = Holding {
             handover_ns: gateway.handover_ns,
@@ -4734,13 +6730,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 copying.stage = CopyStage::Run;
                 Ok(())
             }
-            (_, Err(error)) => self.reply_job(at, put_failed(&error)),
-            (Err(_), _) => self.fail_job(at, Status::Failed),
+            (_, Err(error)) => self.reply_job(node, at, put_failed(&error)),
+            (Err(_), _) => self.fail_job(node, at, Status::Failed),
         }
     }
 
     /// An operation one read answers, at its turn: its read asked once.
-    fn step_single(&mut self, at: usize) -> Result<bool, NodeError> {
+    fn step_single<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get(at) else {
             return Ok(true);
         };
@@ -4803,18 +6799,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 },
             ),
         };
-        let Some(group) = self.group_of(layer) else {
-            self.fail_job(at, Status::Failed)?;
+        let Some(group) = node.group_of(layer) else {
+            self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
         };
-        let asked = self
-            .read(group, query, u64::MAX, Wait::Request)
-            .map(Pending::Read);
-        self.asked(at, asked, None)
+        let asked = node.ask(JobAsk::Read(group, query));
+        self.asked(node, at, asked, None)
     }
 
     /// The answer of an operation one read answers: its reply.
-    fn single_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
+    fn single_read<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        read: Read,
+    ) -> Result<(), NodeError> {
         let Some(job) = self.jobs.get(at) else {
             return Ok(());
         };
@@ -4889,16 +6888,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             (_, Read::Upload(None)) => Reply::status(Status::NoSuchUpload),
             _ => Reply::status(Status::Failed),
         };
-        self.reply_job(at, reply)
+        self.reply_job(node, at, reply)
     }
 
     /// Ends job `at` with `reply`: what it waits on is let go, and its body, if any is left, read
     /// to its end and dropped before the reply goes.
-    fn reply_job(&mut self, at: usize, reply: Reply) -> Result<(), NodeError> {
+    fn reply_job<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        reply: Reply,
+    ) -> Result<(), NodeError> {
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = Work::Draining(Box::new(reply));
-            self.abandoned
-                .extend(job.pending.drain(..).map(|(pending, _)| pending));
+            node.abandon(job.pending.drain(..).map(|(pending, _)| pending));
         }
         Ok(())
     }
@@ -4913,319 +6916,97 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match self.jobs.get(at).map(|job| &job.work) {
             None => Ok(true),
             Some(Work::Draining(_)) => self.drain_job(at),
-            Some(Work::Answering(_)) => self.answer_local(at),
+            Some(Work::Answering(_)) => self.answer_door(at),
             Some(_) => Ok(false),
         }
     }
 
     /// Ends job `at` with `status` alone.
-    fn fail_job(&mut self, at: usize, status: Status) -> Result<(), NodeError> {
-        self.reply_job(at, Reply::status(status))
+    fn fail_job<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        status: Status,
+    ) -> Result<(), NodeError> {
+        self.reply_job(node, at, Reply::status(status))
     }
 
     /// Ends job `at` `SlowDown` for `cause`, which its reply names on either door.
-    fn slow_job(&mut self, at: usize, cause: door::Slowed) -> Result<(), NodeError> {
-        self.reply_job(at, Reply::slowed(cause))
+    fn slow_job<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        cause: door::Slowed,
+    ) -> Result<(), NodeError> {
+        self.reply_job(node, at, Reply::slowed(cause))
     }
 
-    /// The outcomes of asks whose job ended before they came, dropped as they come: an outcome no
-    /// job takes would hold one of the node's asks for good.
-    fn drop_abandoned(&mut self) {
-        if self.abandoned.is_empty() {
-            return;
-        }
-        let Self {
-            abandoned,
-            commands_done,
-            reads_done,
-            chunks_done,
-            ..
-        } = self;
-        abandoned.retain(|pending| {
-            let gone = match pending {
-                Pending::Command(ask) => take_done(commands_done, *ask).is_some(),
-                Pending::Read(ask) => take_done(reads_done, *ask).is_some(),
-                Pending::Chunk(ask) => take_done(chunks_done, *ask).is_some(),
-            };
-            !gone
-        });
-    }
-
-    /// A draining job's turn: its body read to its end and dropped, then its reply; whether it is
-    /// over.
+    /// A draining job's turn: its reply given to its door, which goes once what is left of its
+    /// body is read and dropped; whether it is over: the reply given, or its door gone.
     fn drain_job(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let exchange = match job.door {
-            Door::Exchange(exchange) => exchange,
+        let Work::Draining(reply) =
+            std::mem::replace(&mut job.work, Work::Answering(VecDeque::new()))
+        else {
+            return Ok(false);
+        };
+        let (bound_ns, admitted) = (job.bound_ns(), job.admitted_ns.is_some());
+        match &mut job.door {
+            // A put's body the node's task gives from the exchange is let go of, so the node's
+            // task reads and drops the rest (`Node::feed_body`); the reply goes after it, the body
+            // whole (`Node::write_reply`). A native request answered `SlowDown` is counted for its
+            // cause as it goes, as the listener counts the S3 door's. A reply no message holds, a
+            // field past its bound, refuses its exchange, so its asker hears it at once.
+            Door::Native(_, native) => {
+                native.drop_body();
+                let told = match reply.encode() {
+                    Ok((head, fields)) => Told::Reply(Box::new(Opening {
+                        head,
+                        fields: Bytes::from(fields),
+                        body: 0,
+                        slowed: reply.slowed,
+                        bound_ns,
+                        admitted,
+                    })),
+                    Err(_) => Told::Failed(Refusal::FrameBound),
+                };
+                Ok(native.offer(told) != Sent::Held)
+            }
             // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
             // and its end go now.
             Door::Local(_) => {
-                let Work::Draining(reply) =
-                    std::mem::replace(&mut job.work, Work::Answering(VecDeque::new()))
-                else {
-                    return Ok(false);
-                };
                 // A reply slowed for a cause says it (`door::Slowed`); any other, its head.
                 let head = match reply.slowed {
                     Some(cause) => door::Answer::Slowed(cause),
                     None => door::Answer::Head(reply),
                 };
                 job.work = Work::Answering(VecDeque::from([head, door::Answer::End]));
-                return self.answer_local(at);
-            }
-        };
-        // Whether it still waits for room is this turn's to say.
-        job.room_to_reply = false;
-        let Work::Draining(reply) = &job.work else {
-            return Ok(false);
-        };
-        let endpoint = self.driver.endpoint();
-        // A body read whole, as a put's that ended is, needs no piece: its reply goes now. One
-        // admitted drains into a piece of its own, which its admission charged it for
-        // (`read_piece`); one answered at once holds no charge, and reads through the endpoint's
-        // one piece for its owner's reads (`bounds::messages`), which waits for room while other
-        // reads hold it (`wait_to_reply`).
-        let mut own = job.admitted_ns.map(|_| Vec::new());
-        while !endpoint.body_complete(exchange) {
-            let got = match own.as_mut() {
-                Some(piece) => {
-                    piece.clear();
-                    super::read_piece(endpoint, exchange, piece)
-                }
-                None => {
-                    let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                        return self.wait_to_reply(at, exchange);
-                    };
-                    let got = endpoint.read_body(exchange, &mut piece);
-                    endpoint.release(piece);
-                    got
-                }
-            };
-            match got {
-                Ok(0) => break,
-                Ok(read) => {
-                    self.moved = self
-                        .moved
-                        .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-                }
-                // Its asker is gone: nothing to answer.
-                Err(_) => return Ok(true),
+                self.answer_door(at)
             }
         }
-        if !endpoint.body_complete(exchange) && endpoint.head(exchange).is_some() {
-            let mut empty = hyper_transport::Reservation::default();
-            let _ = endpoint.read_body(exchange, &mut empty);
-            if !endpoint.body_complete(exchange) {
-                return Ok(false);
-            }
-        }
-        // A reply no message holds, a field past its bound, is refused as its exchange's end: its
-        // asker hears it at once rather than a period's silence.
-        let Ok((head, fields)) = reply.encode() else {
-            endpoint.refuse_exchange(exchange, Refusal::FrameBound);
-            return Ok(true);
-        };
-        let slowed = reply.slowed;
-        let length = u64::try_from(fields.len()).unwrap_or(u64::MAX);
-        if super::reply_head(endpoint, exchange, &head, Some(length)) == super::Replied::Ended {
-            return Ok(true);
-        }
-        // A native request answered `SlowDown`, counted for its cause as it goes: the node says
-        // the counts in its lines, as the listener counts the S3 door's.
-        if let Some(count) = slowed.and_then(|cause| self.slowed.get_mut(cause.index())) {
-            *count = count.saturating_add(1);
-        }
-        if let Some(job) = self.jobs.get_mut(at) {
-            job.work = Work::Replying(fields, 0);
-        }
-        self.write_fields(at)
     }
 
-    /// Job `at`'s reply on `exchange` waits for room in the endpoint's budget, which refused the
-    /// piece its request's body drains through before the reply (its head never waits: it fills
-    /// the room taken with its request's head, `node::reply_head`); whether it is over. Within its
-    /// client's patience it is held: vouched for and due at each beat (`bound_jobs`, `host_due`),
-    /// and offered again at each turn, since nothing tells the node when the budget frees (its
-    /// `release` retries only the transport's lossless frames). Past it, its exchange is refused
-    /// `Budget`, which needs no room and its asker hears at once, as it hears a request whose
-    /// head the budget refused: a job never ends with its exchange open and its asker waiting on
-    /// nothing, which its client gave up a period later (`Lost(Stalled)`).
-    fn wait_to_reply(&mut self, at: usize, exchange: ExchangeId) -> Result<bool, NodeError> {
-        let now = hyper_rt::futures::now_ns();
+    /// A job's last answers sent as far as its door's channel takes them; whether it is over:
+    /// every one sent, or the door gone.
+    fn answer_door(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        if job.bounded(now) == Bounded::Held {
-            job.room_to_reply = true;
-            return Ok(false);
-        }
-        self.driver
-            .endpoint()
-            .refuse_exchange(exchange, Refusal::Budget);
-        Ok(true)
-    }
-
-    /// A reply's fields written as far as its exchange takes them; once all are, the exchange
-    /// ends.
-    fn write_fields(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Work::Answering(answers) = &mut job.work else {
             return Ok(true);
         };
-        let Door::Exchange(exchange) = job.door else {
-            return Ok(true);
-        };
-        let Work::Replying(fields, written) = &mut job.work else {
-            return Ok(false);
-        };
-        let endpoint = self.driver.endpoint();
-        while let Some(rest) = fields.get(*written..)
-            && !rest.is_empty()
-        {
-            match endpoint.write_body(exchange, rest) {
-                Ok(0) => return Ok(false),
-                Ok(took) => {
-                    *written = written.saturating_add(took);
-                    self.moved = self
-                        .moved
-                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                }
-                Err(_) => return Ok(true),
+        let sent = match &mut job.door {
+            Door::Local(local) => {
+                local.pending.extend(answers.drain(..));
+                local.flush()
             }
-        }
-        endpoint.end(exchange);
-        Ok(true)
-    }
-
-    /// A local job's last answers sent as far as its channel takes them; whether it is over: every
-    /// one sent, or the connection gone.
-    fn answer_local(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
-            return Ok(true);
+            Door::Native(_, native) => native.flush(),
         };
-        let (Door::Local(local), Work::Answering(answers)) = (&mut job.door, &mut job.work) else {
-            return Ok(true);
-        };
-        local.pending.extend(answers.drain(..));
-        Ok(local.flush() != Sent::Held)
+        Ok(sent != Sent::Held)
     }
 
-    /// The jobs whose exchange is `exchange`, for an event on it.
-    pub(super) fn job_on(&self, exchange: ExchangeId) -> Option<usize> {
-        self.jobs
-            .iter()
-            .position(|j| matches!(j.door, Door::Exchange(e) if e == exchange))
-    }
-
-    /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
-    pub(super) fn job_lost(&mut self, exchange: ExchangeId) {
-        let Self {
-            jobs,
-            abandoned,
-            admission,
-            ..
-        } = self;
-        let now = hyper_rt::futures::now_ns();
-        self.parked.retain(|p| p.exchange != exchange);
-        jobs.retain_mut(|j| {
-            if !matches!(j.door, Door::Exchange(e) if e == exchange) {
-                return true;
-            }
-            abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));
-            if let (Some(at), Some(admission)) = (j.admitted_ns, admission.as_mut()) {
-                admission.completed(now.saturating_sub(at), now, j.charge);
-            }
-            false
-        });
-    }
-
-    /// The operations the host admits at once now, as it learned its knee (`crate::admit`): none
-    /// for a node that hosts no objects.
-    pub fn admitting(&self) -> Option<usize> {
-        self.admission.as_ref().map(crate::admit::Admission::limit)
-    }
-
-    /// Whether the host admits one more operation holding `charge` bytes beside those it runs
-    /// (`crate::admit`). One the learned limit turns away tells the limit its clients ask more
-    /// than it admits; one whose bytes the operations' memory does not hold says nothing of it.
-    pub(super) fn admits(&mut self, charge: u64) -> bool {
-        let Some(admission) = self.admission.as_mut() else {
-            return true;
-        };
-        match admission.admits(charge) {
-            Ok(()) => true,
-            Err(crate::admit::Held::Limit) => {
-                admission.turned_away();
-                false
-            }
-            Err(crate::admit::Held::Bytes) => false,
-        }
-    }
-
-    /// The ranges' page caches on the node's shard lent their parts of the operations' idle
-    /// bytes once `more` are charged ([`lend`]), growing where `grow`; none for a node that hosts
-    /// no objects, which has no operations' memory to lend.
-    pub(super) fn lend_caches(&mut self, more: u64, grow: bool) {
-        let Self {
-            gateway,
-            admission,
-            ranges,
-            owner,
-            ..
-        } = self;
-        if let (Some(gateway), Some(admission)) = (gateway.as_ref(), admission.as_mut()) {
-            lend(gateway.cache_bytes, admission, ranges, owner, more, grow);
-        }
-    }
-
-    /// An operation admitted, charged `charge` bytes: the caches give back first what of them
-    /// they hold.
-    fn charge_admitted(&mut self, charge: u64) {
-        self.lend_caches(charge, false);
-        if let Some(admission) = self.admission.as_mut() {
-            admission.admitted(charge);
-        }
-    }
-
-    /// A running operation takes `more` bytes past its charge, or the cell's repair takes them
-    /// for a rebuild: the caches give back first what of them they hold.
-    pub(super) fn charge_more(&mut self, more: u64) {
-        self.lend_caches(more, false);
-        if let Some(admission) = self.admission.as_mut() {
-            admission.took(more);
-        }
-    }
-
-    /// An operation the host admitted at `admitted_ns`, charged `charge` bytes, ended: the limit
-    /// learns its latency, and its bytes are free.
-    fn ended(&mut self, admitted_ns: Option<u64>, charge: u64) {
-        let now = hyper_rt::futures::now_ns();
-        if let (Some(at), Some(admission)) = (admitted_ns, self.admission.as_mut()) {
-            admission.completed(now.saturating_sub(at), now, charge);
-        }
-        self.keep_pool();
-    }
-
-    /// The native clients' stream pool sized to the limit the admission learned, where it moved:
-    /// the exchanges they may open past those they keep are the operations the host runs
-    /// (Breakwater's credit, hyper-transport's `pool`).
-    pub(super) fn keep_pool(&mut self) {
-        let Some(limit) = self.admission.as_ref().map(crate::admit::Admission::limit) else {
-            return;
-        };
-        if self.pooled == 0 || self.pooled == limit {
-            return;
-        }
-        let streams = u32::try_from(limit).unwrap_or(u32::MAX);
-        if self.driver.endpoint().set_stream_pool(streams).is_ok() {
-            self.pooled = limit;
-        }
-    }
-
-    /// When the host next needs a turn: at once when what an operation, or one ended, asked is
-    /// answered, as one answered after the host's step in a turn (a read this node's own member
-    /// answers) waits on no event; else a put's renewal coming due.
     /// What job `at`'s client will still wait, in nanoseconds, for an ask of the job's own
     /// (research/77 D2): at least one, as a time that has passed is none to wait on.
     fn remaining_of(&self, at: usize) -> u64 {
@@ -5234,51 +7015,81 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .get(at)
             .map_or(1, |job| job.bound_ns().saturating_sub(now).max(1))
     }
+}
 
-    pub(super) fn host_due(&self) -> Option<u64> {
-        let shard = hyper_rt::futures::now_ns();
-        let answered = |pending: &Pending| match pending {
-            Pending::Command(ask) => self.commands_done.iter().any(|(a, _)| a == ask),
-            Pending::Read(ask) => self.reads_done.iter().any(|(a, _)| a == ask),
-            Pending::Chunk(ask) => self.chunks_done.iter().any(|(a, _)| a == ask),
-        };
-        let mut pending = self
-            .jobs
-            .iter()
-            .flat_map(|j| j.pending.iter().map(|(p, _)| p))
-            .chain(&self.abandoned);
-        let looked_up = self
-            .lookups
-            .iter()
-            .filter_map(|l| l.ask)
-            .any(|ask| self.reads_done.iter().any(|(a, _)| *a == ask));
-        if looked_up || pending.any(answered) {
-            return Some(shard);
+/// A put's body from its door's channel, fed to its driver as it wants it: what it did not take
+/// of the last piece first, then each piece as it comes, only what it did not take kept, each
+/// piece's bytes counted `moved` and its pacing told `took`; and the body's end taken only once
+/// the door gave it, its door having checked what the body's framing, signature and checksum
+/// say, its trailer's checksum then the one the end is checked against. The status the job ends
+/// with where the body does not hold: `IncompleteBody` where its door is gone before its end, its
+/// channel closed, or a native door's node's task let go of it (`cut`, `Handed::cut`), read before
+/// the channel so a piece given before it is taken first.
+fn take_body(
+    body: &mut Pieces,
+    cut: Option<&std::sync::atomic::AtomicBool>,
+    putting: &mut Putting,
+    moved: &mut u64,
+    mut took: impl FnMut(door::Paced),
+) -> Result<(), Status> {
+    let Some(put) = putting.put.as_mut() else {
+        return Ok(());
+    };
+    loop {
+        if !putting.carry.is_empty() {
+            if !put.wants_body() {
+                return Ok(());
+            }
+            let took = put.feed(&putting.carry).map_err(|_| Status::Failed)?;
+            putting.taken = putting
+                .taken
+                .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+            putting.carry.drain(..took.min(putting.carry.len()));
+            if !putting.carry.is_empty() {
+                return Ok(());
+            }
         }
-        let wall = self.wall.now_ns();
-        let renewal = self
-            .jobs
-            .iter()
-            .filter_map(|j| match &j.work {
-                Work::Put(putting) => putting.put.as_ref()?.due_ns(),
-                Work::Copy(copying) => copying.put.as_ref()?.due_ns(),
-                _ => None,
-            })
-            .min()
-            .map(|due| shard.saturating_add(due.saturating_sub(wall)));
-        // Each operation at work is ended at its client's patience, and one whose asks are held
-        // says so each beat, a probe timeout, the transport's notes' beat of a third of the serve
-        // period (research/77 D2); so is one whose reply waits for the piece its request's body
-        // drains through, which the beat's turn asks the budget for again, since the budget
-        // freeing turns no node.
-        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
-        let bound = self
-            .jobs
-            .iter()
-            .filter(|j| (j.working() && j.held()) || j.room_to_reply)
-            .filter_map(|j| j.due_ns(shard, beat))
-            .min();
-        [renewal, bound].into_iter().flatten().min()
+        if let Some(trailer) = body.ended.take() {
+            // The door framed the body at its stated length: an end before or past it is a body
+            // that does not hold.
+            if putting.taken != putting.length {
+                return Err(Status::IncompleteBody);
+            }
+            if let Some(checksum) = trailer {
+                putting.expected.checksum = Some(checksum);
+            }
+            if put.end(&putting.expected).is_err() && put.outcome().is_none() {
+                return Err(Status::Failed);
+            }
+            // Ended once: nothing more is read, and the outcome answers it.
+            putting.length = u64::MAX;
+            return Ok(());
+        }
+        if putting.length == u64::MAX || !put.wants_body() {
+            return Ok(());
+        }
+        let cut = cut.is_some_and(|cut| cut.load(std::sync::atomic::Ordering::Acquire));
+        match body.pieces.try_recv() {
+            Ok(Some(Piece::Bytes(bytes, paced))) => {
+                // The piece's time from its send to this turn: a sample of the body's depth.
+                took(paced);
+                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                *moved = moved.saturating_add(len);
+                let took = put.feed(&bytes).map_err(|_| Status::Failed)?;
+                putting.taken = putting
+                    .taken
+                    .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                if let Some(rest) = bytes.get(took..) {
+                    putting.carry.extend_from_slice(rest);
+                }
+            }
+            Ok(Some(Piece::End(trailer))) => body.ended = Some(trailer),
+            Ok(Some(Piece::Refused(status))) => return Err(status),
+            // The door is gone with the body unfinished.
+            Ok(None) if cut => return Err(Status::IncompleteBody),
+            Ok(None) => return Ok(()),
+            Err(_) => return Err(Status::IncompleteBody),
+        }
     }
 }
 
@@ -5359,7 +7170,6 @@ fn work(op: Op, block: Option<u64>) -> Work {
             },
             expected: Expected { md5, checksum },
             trailing,
-            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry: Vec::new(),
@@ -5458,7 +7268,6 @@ fn work(op: Op, block: Option<u64>) -> Work {
             preconditions: Preconditions::default(),
             expected: Expected { md5, checksum },
             trailing,
-            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry: Vec::new(),
@@ -5562,7 +7371,6 @@ fn work(op: Op, block: Option<u64>) -> Work {
             preconditions: Preconditions::default(),
             expected: Expected::default(),
             trailing,
-            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry: Vec::new(),
@@ -5880,11 +7688,9 @@ fn getting(
         head,
         get: None,
         held: None,
-        out: None,
         written: 0,
         total: 0,
         waiting: VecDeque::new(),
-        drain: Drain::default(),
     }))
 }
 
@@ -5951,23 +7757,10 @@ fn get_failed(error: &GetError) -> Reply {
 }
 
 /// What a job's ask came to.
-enum Outcome {
+pub(crate) enum Outcome {
     Command(CommandOutcome),
     Read(ReadOutcome),
     Chunk(ChunkOutcome),
-}
-
-/// The job of `jobs` waiting on chunk ask `ask`, its work moved now: a piece of the chunk it
-/// reads came, or one of the chunk it sends went (research/77 D2).
-pub(super) fn chunk_moved(jobs: &mut [Job], ask: u64) {
-    let now = hyper_rt::futures::now_ns();
-    if let Some(job) = jobs.iter_mut().find(|job| {
-        job.pending
-            .iter()
-            .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask))
-    }) {
-        job.moved_ns = now;
-    }
 }
 
 /// A put's driver's answer for what its request came to.
@@ -6147,7 +7940,7 @@ fn get_answer(outcome: Outcome) -> get::Answer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// A gateway of the rates and target `mantle init`'s cells state (crates/mantle/tests/support).
@@ -6660,7 +8453,7 @@ mod tests {
                        learned: &crate::window::Windows,
                        room: &mut crate::admit::Admission,
                        length: u64| {
-            let fitted = copy_windows(gateway, learned, Some(&*room), length, admitted);
+            let fitted = copy_windows(gateway, learned, |more| room.holds(more), length, admitted);
             room.took(fitted.2.saturating_sub(admitted));
             room.gave(admitted.saturating_sub(fitted.2));
             fitted
@@ -6740,9 +8533,11 @@ mod tests {
         let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
         let mut job = Job {
             door: Door::Local(Box::new(Local {
-                body,
+                body: Pieces {
+                    pieces: body,
+                    ended: None,
+                },
                 reply,
-                ended: None,
                 pending: VecDeque::new(),
                 ready: false,
             })),
@@ -6754,8 +8549,8 @@ mod tests {
             admitted_ns: Some(1),
             charge: 0,
             window: 1,
+            driven: None,
             label: None,
-            room_to_reply: false,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);
@@ -6785,6 +8580,1447 @@ mod tests {
         assert_eq!(job.bounded(patience + 1), Bounded::Held);
         job.deadline_ns = Some(patience + 1);
         assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
+    }
+
+    /// A native put's work as its fields name it, nothing read past them, and a driver made over a
+    /// body of `length` bytes whose trailer is a CRC-32C (`Op::Put`'s `trailing`), which its end is
+    /// checked against.
+    fn native_put(length: u64) -> Box<Putting> {
+        let op = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+            trailing: Some(Algorithm::Crc32c),
+            metadata: Vec::new(),
+        };
+        let Work::Put(mut putting) = work(op, None) else {
+            panic!("a put's work");
+        };
+        let root = WrappingKey::generate().unwrap();
+        let data = DataKey::generate().unwrap();
+        let keys = Keys {
+            file: 1,
+            wrapped: WrappedKey {
+                by: Wrapper::Root(1),
+                bytes: data.wrap(&root).unwrap(),
+            },
+            data,
+        };
+        let commit = Commit::Object(name::Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: 0,
+            ordered_ns: None,
+            version: Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".into(),
+                headers: Vec::new(),
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            },
+            default: None,
+            id: 1,
+            deadline_ns: u64::MAX,
+        });
+        let body = put::Body {
+            length,
+            checksum: Some(Algorithm::Crc32c),
+            content_md5: false,
+        };
+        let layout = Layout::new(durability::Scheme::Copies(3)).unwrap();
+        let holding = Holding {
+            handover_ns: 1,
+            window: 1,
+        };
+        putting.put =
+            Some(Put::new(commit, body, keys, layout, holding, Box::new(Random), 0).unwrap());
+        putting
+    }
+
+    /// A body past a native put's fields: `length` bytes of the object, then its CRC-32C, the
+    /// trailer's value.
+    fn native_body(length: usize) -> (Vec<u8>, Vec<u8>) {
+        let object: Vec<u8> = (0..length)
+            .map(|i| u8::try_from((i * 7 + i / 251) % 256).unwrap())
+            .collect();
+        let trailer = checksum::checksum(Algorithm::Crc32c, &object)
+            .unwrap()
+            .bytes;
+        (object, trailer)
+    }
+
+    /// A native put's feeding over a channel and words of its own, and the job's end of the
+    /// channel: as a door lends them, its body's sender and what its halves share.
+    fn fed(putting: &Putting) -> (Feeding, Pieces) {
+        let (sender, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
+        let handed = std::sync::Arc::new(Handed::default());
+        (
+            feed((putting.length, putting.trailing), sender, handed, None),
+            Pieces {
+                pieces,
+                ended: None,
+            },
+        )
+    }
+
+    /// The node's task's half of a stream (`Node::feed_body`) over `stream`, the bytes its
+    /// exchange delivers after the fields, as far as the put's job takes them, the job's turn
+    /// (`take_body`) between each of the node's: each read is of a piece at most, and only once
+    /// the job let go of the last. Whether the body ended.
+    fn feed_and_take(
+        feeding: &mut Feeding,
+        pieces: &mut Pieces,
+        putting: &mut Putting,
+        stream: &mut &[u8],
+    ) -> Result<bool, Status> {
+        let mut moved = 0;
+        for _ in 0..stream.len() / piece_len() + 8 {
+            if feeding.send_held() == Some(Fed::Still) {
+            } else if feeding.read_whole() {
+                assert_eq!(feeding.end(), Fed::Over);
+            } else if feeding.free() {
+                let (read, rest) = stream.split_at(stream.len().min(piece_len()));
+                feeding.give(read, &mut moved)?;
+                *stream = rest;
+            }
+            take_body(pieces, None, putting, &mut moved, |_| {})?;
+            if putting.length == u64::MAX {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// A native put's body, read past its fields by the node's task and given on its job's channel
+    /// a piece at a time, reaches its driver in order and whole: each piece from the body's first
+    /// byte, the trailer's value carried by the end, against which the driver's CRC-32C of the
+    /// bytes it took holds. A trailer that does not hold is the driver's refusal.
+    #[test]
+    fn a_native_bodys_pieces_reach_its_put_in_order_and_whole() {
+        let (object, trailer) = native_body(3 * piece_len() + 1_000);
+        let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let mut putting = native_put(object.len() as u64);
+        let (mut feeding, mut pieces) = fed(&putting);
+        let mut stream = &past[..];
+        assert_eq!(
+            feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
+            Ok(true)
+        );
+        assert!(stream.is_empty());
+        let put = putting.put.as_ref().unwrap();
+        assert!(put.outcome().is_none(), "{:?}", put.outcome());
+        assert_eq!(
+            putting.expected.checksum.as_ref().map(|c| c.bytes.clone()),
+            Some(trailer.clone())
+        );
+
+        // The object's bytes and the trailer's value in one read: the bytes given as a piece, the
+        // trailer's value kept for the end.
+        let (object, trailer) = native_body(10);
+        let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let mut putting = native_put(10);
+        let (mut feeding, mut pieces) = fed(&putting);
+        let mut stream = &past[..];
+        assert_eq!(
+            feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
+            Ok(true)
+        );
+        assert!(putting.put.as_ref().unwrap().outcome().is_none());
+
+        // A trailer that does not hold the bytes: the driver refuses the body.
+        let (object, mut trailer) = native_body(piece_len() + 5);
+        trailer[0] ^= 1;
+        let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let mut putting = native_put(object.len() as u64);
+        let (mut feeding, mut pieces) = fed(&putting);
+        let mut stream = &past[..];
+        assert_eq!(
+            feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
+            Ok(true)
+        );
+        assert!(matches!(
+            putting.put.as_ref().unwrap().outcome(),
+            Some(Err(PutError::BadChecksum))
+        ));
+    }
+
+    /// While a native put's job takes nothing, the node's task reads nothing more of its stream:
+    /// one piece on the channel, and the next read only once the job let go of it, in the same
+    /// storage, so nothing the body holds grows and the stream's flow control holds the client.
+    #[test]
+    fn a_full_channel_holds_the_streams_bytes() {
+        let (object, _) = native_body(4 * piece_len());
+        let putting = native_put(object.len() as u64);
+        let (mut feeding, mut pieces) = fed(&putting);
+        let mut moved = 0;
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        // The job holds the piece on its channel: nothing more is read.
+        assert!(!feeding.free());
+        assert!(!feeding.free());
+        let Ok(Some(Piece::Bytes(first, _))) = pieces.pieces.try_recv() else {
+            panic!("the first piece");
+        };
+        assert_eq!(&first[..], &object[..piece_len()]);
+        // Taken but not let go: still nothing.
+        assert!(!feeding.free());
+        let storage = first.as_ptr();
+        drop(first);
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(&object[piece_len()..2 * piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        let Ok(Some(Piece::Bytes(second, _))) = pieces.pieces.try_recv() else {
+            panic!("the second piece");
+        };
+        assert_eq!(&second[..], &object[piece_len()..2 * piece_len()]);
+        assert_eq!(second.as_ptr(), storage, "the piece's storage is reused");
+        assert_eq!(feeding.left, 2 * piece_len() as u64);
+        // A short piece leaves room in the storage past it, which is not read into while the job
+        // holds the piece.
+        drop(second);
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(
+                &object[2 * piece_len()..2 * piece_len() + 1_000],
+                &mut moved
+            ),
+            Ok(Fed::Moved)
+        );
+        assert!(!feeding.free());
+        let Ok(Some(Piece::Bytes(short, _))) = pieces.pieces.try_recv() else {
+            panic!("the short piece");
+        };
+        assert!(!feeding.free());
+        drop(short);
+        assert!(feeding.free());
+        // A body shorter than a piece is given in storage of its size.
+        let putting = native_put(6);
+        let (mut feeding, _pieces) = fed(&putting);
+        assert_eq!(feeding.give(&[2; 6], &mut moved), Ok(Fed::Moved));
+        assert_eq!(feeding.storage.as_ref().map(|(_, made)| *made), Some(6));
+        // An end the channel has no room for is held, and given once the job takes the piece.
+        let putting = native_put(1);
+        let (mut feeding, mut pieces) = fed(&putting);
+        assert_eq!(feeding.give(&[7, 1, 2, 3, 4], &mut moved), Ok(Fed::Moved));
+        assert!(feeding.read_whole());
+        assert_eq!(feeding.end(), Fed::Still);
+        assert_eq!(feeding.send_held(), Some(Fed::Still));
+        assert!(matches!(
+            pieces.pieces.try_recv(),
+            Ok(Some(Piece::Bytes(..)))
+        ));
+        assert_eq!(feeding.send_held(), Some(Fed::Over));
+        assert!(matches!(
+            pieces.pieces.try_recv(),
+            Ok(Some(Piece::End(Some(_))))
+        ));
+    }
+
+    /// A native put's stream that stops or is reset ends its job as it did when the job read the
+    /// stream: refused `IncompleteBody`, told on its channel or by its channel's end, the node's
+    /// task gone with the exchange (`Node::job_lost`). A job that lets go of its body has the rest
+    /// read and dropped by the node's task, nothing more given.
+    #[test]
+    fn a_stopped_or_reset_stream_ends_its_put_as_before() {
+        let (object, _) = native_body(2 * piece_len());
+        // The exchange failed mid-body: the node's task tells the job.
+        let mut putting = native_put(object.len() as u64);
+        let (feeding, mut pieces) = fed(&putting);
+        feeding
+            .pieces
+            .try_send(Piece::Refused(Status::IncompleteBody))
+            .unwrap();
+        let mut moved = 0;
+        assert_eq!(
+            take_body(&mut pieces, None, &mut putting, &mut moved, |_| {}),
+            Err(Status::IncompleteBody)
+        );
+        // The exchange lost and its feeding let go with it, the body unfinished.
+        let mut putting = native_put(object.len() as u64);
+        let (mut feeding, mut pieces) = fed(&putting);
+        assert_eq!(
+            feeding.give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        drop(feeding);
+        assert_eq!(
+            take_body(&mut pieces, None, &mut putting, &mut moved, |_| {}),
+            Err(Status::IncompleteBody)
+        );
+        assert_eq!(putting.taken, piece_len() as u64);
+        // The job let go of its body: the next piece read finds it gone, and the rest is dropped.
+        let putting = native_put(object.len() as u64);
+        let (mut feeding, pieces) = fed(&putting);
+        drop(pieces);
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        assert!(feeding.dropping);
+    }
+
+    /// What a native body's piece asks of the allocator on its way to the job, against what the
+    /// job's own read of its exchange asked (research/71, step 5): none past the first piece's
+    /// storage either way. A read was copied once into the bytes the job carried and once into its
+    /// driver; now it is copied once into the feeding's storage, which the job's piece is a view
+    /// of, and once into its driver, so a piece is copied no more than it was.
+    #[test]
+    fn a_native_bodys_piece_is_copied_and_allocated_no_more_than_the_jobs_own_read() {
+        const PIECES: usize = 64;
+        let (object, _) = native_body(PIECES * piece_len());
+        let mut driver = Vec::with_capacity(piece_len());
+        // The job's own read of its exchange: each piece copied into its carry, then into its
+        // driver, the carry drained of what the driver took.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut was = |read: &[u8], driver: &mut Vec<u8>| {
+            carry.extend_from_slice(read);
+            driver.clear();
+            driver.extend_from_slice(&carry);
+            carry.drain(..);
+        };
+        was(&object[..piece_len()], &mut driver);
+        hyper_measure::alloc::begin();
+        for read in object.chunks(piece_len()).skip(1) {
+            was(read, &mut driver);
+        }
+        let before = hyper_measure::alloc::end();
+        // The node's task's half: each piece copied into the feeding's storage and handed over;
+        // the job copies it into its driver and lets it go.
+        let putting = native_put(object.len() as u64);
+        let (mut feeding, mut pieces) = fed(&putting);
+        let mut moved = 0;
+        let mut now = |read: &[u8], driver: &mut Vec<u8>| {
+            assert!(feeding.free());
+            assert_eq!(feeding.give(read, &mut moved), Ok(Fed::Moved));
+            let Ok(Some(Piece::Bytes(piece, _))) = pieces.pieces.try_recv() else {
+                panic!("a piece");
+            };
+            driver.clear();
+            driver.extend_from_slice(&piece);
+            piece.as_ptr()
+        };
+        // The first piece makes the storage, and the view that shares it: what the counter sees.
+        hyper_measure::alloc::begin();
+        let storage = now(&object[..piece_len()], &mut driver);
+        let first = hyper_measure::alloc::end();
+        assert!(first.allocations > 0, "{first:?}");
+        hyper_measure::alloc::begin();
+        let mut views = 0;
+        for read in object.chunks(piece_len()).skip(1) {
+            views += usize::from(now(read, &mut driver) == storage);
+        }
+        let after = hyper_measure::alloc::end();
+        assert_eq!(views, PIECES - 1, "each piece is a view of the one storage");
+        assert_eq!(
+            (before.allocations, before.reallocations),
+            (after.allocations, after.reallocations)
+        );
+        assert_eq!((after.allocations, after.reallocations), (0, 0));
+    }
+
+    /// A native exchange as a test sees it: the head and body length it was answered with, the
+    /// bytes written to it and where each write's bytes lay, its end or refusal, and its asker told
+    /// the work is held; taking `credit` bytes of body a turn, as its stream's flow control would.
+    #[derive(Default)]
+    struct Seen {
+        answered: Option<(Vec<u8>, u64)>,
+        body: Vec<u8>,
+        writes: Vec<*const u8>,
+        ended: bool,
+        refused: bool,
+        refusal: Option<Refusal>,
+        working: usize,
+        credit: usize,
+        gone: bool,
+    }
+
+    impl Exchange for Seen {
+        fn reply(&mut self, head: &[u8], body: u64) -> crate::node::Replied {
+            assert!(self.answered.is_none(), "answered twice");
+            self.answered = Some((head.to_vec(), body));
+            if self.gone {
+                crate::node::Replied::Ended
+            } else {
+                crate::node::Replied::Sent
+            }
+        }
+
+        fn write(&mut self, bytes: &Bytes) -> Option<usize> {
+            if self.gone {
+                return None;
+            }
+            assert!(self.answered.is_some(), "a body before its head");
+            let took = bytes.len().min(self.credit);
+            self.credit -= took;
+            self.body.extend_from_slice(&bytes[..took]);
+            self.writes.push(bytes.as_ptr());
+            Some(took)
+        }
+
+        fn end(&mut self) {
+            self.ended = true;
+        }
+
+        fn refuse(&mut self, refusal: Refusal) {
+            self.refused = true;
+            self.refusal = Some(refusal);
+        }
+
+        fn working(&mut self) {
+            self.working += 1;
+        }
+    }
+
+    /// A get's driver as a test gives it: its pieces, in order, then whether it ended whole.
+    struct Pieced {
+        pieces: VecDeque<Bytes>,
+        whole: Option<bool>,
+    }
+
+    impl Source for Pieced {
+        fn take(&mut self) -> Option<Bytes> {
+            self.pieces.pop_front()
+        }
+
+        fn ended(&self) -> Option<bool> {
+            if self.pieces.is_empty() {
+                self.whole
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The pieces of a get of `count` pieces of `len` bytes each, each its own storage.
+    fn pieces(count: usize, len: usize) -> VecDeque<Bytes> {
+        (0..count)
+            .map(|p| {
+                Bytes::from(
+                    (0..len)
+                        .map(|i| u8::try_from((p * 31 + i * 7) % 251).unwrap())
+                        .collect::<Vec<u8>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// A native get's reply opened with `fields`, its range `total` bytes, given as `send_held`
+    /// gives it.
+    fn open_get(native: &mut Native, fields: &[u8], total: u64) {
+        let opening = Opening {
+            head: b"head".to_vec(),
+            fields: Bytes::copy_from_slice(fields),
+            body: total,
+            slowed: None,
+            bound_ns: u64::MAX,
+            admitted: true,
+        };
+        assert_eq!(native.give(Told::Head(Box::new(opening))), Sent::Taken);
+    }
+
+    /// A node's turn for a native get, as `Node::step_host` and `Node::write_replies` run one: the
+    /// job's step, then the node's task's write, the job giving the next piece within the turn
+    /// while the exchange takes more, at most `rounds` times. The job's turn's end and whether the
+    /// reply is over.
+    fn get_turn(
+        native: &mut Native,
+        replies: &mut Replies,
+        source: &mut Pieced,
+        (written, total): (&mut u64, u64),
+        seen: &mut Seen,
+        rounds: usize,
+    ) -> (Gave, bool) {
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut gave = give_native(native, source, written, total);
+        for _ in 0..rounds {
+            match replies.write(seen, false, 0, &mut moved, &mut slowed) {
+                Wrote::Over => return (gave, true),
+                Wrote::Still | Wrote::Draining | Wrote::Room => return (gave, false),
+                Wrote::More => gave = give_native(native, source, written, total),
+            }
+        }
+        (gave, false)
+    }
+
+    /// A native get's reply, given by its job on its channel and written by the node's task, reaches
+    /// its exchange whole and in order: its head with the body's length, fields and range both, its
+    /// fields, each piece, then its end; as many pieces a turn as the exchange takes, as when its job
+    /// wrote its exchange. A reply with no bytes past its fields waits for the request's body, then
+    /// goes whole and ends the exchange, a `SlowDown` counted for its cause.
+    #[test]
+    fn a_native_gets_reply_reaches_its_exchange_whole_and_in_order() {
+        let fields = b"the reply's fields";
+        let given = pieces(5, 3 * piece_len() + 17);
+        let total: u64 = given.iter().map(|p| p.len() as u64).sum();
+        let expected: Vec<u8> = fields
+            .iter()
+            .copied()
+            .chain(given.iter().flat_map(|p| p.iter().copied()))
+            .collect();
+        // An exchange that takes 5,000 bytes a turn: the reply goes in as many turns as that takes.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, fields, total);
+        let mut seen = Seen::default();
+        let mut written = 0;
+        let mut turns = 0;
+        loop {
+            turns += 1;
+            seen.credit = 5_000;
+            let (_, over) = get_turn(
+                &mut native,
+                &mut replies,
+                &mut source,
+                (&mut written, total),
+                &mut seen,
+                given.len() + 2,
+            );
+            if over {
+                break;
+            }
+            assert!(turns < 1_000);
+        }
+        assert_eq!(
+            seen.answered,
+            Some((b"head".to_vec(), fields.len() as u64 + total))
+        );
+        assert_eq!(seen.body, expected);
+        assert!(seen.ended && !seen.refused);
+        assert_eq!(turns, expected.len().div_ceil(5_000));
+        assert_eq!(native.moved, total, "the job counts the range's bytes");
+        // An exchange that takes everything: the whole reply in one turn, its end with it.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, fields, total);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut written = 0;
+        let (gave, over) = get_turn(
+            &mut native,
+            &mut replies,
+            &mut source,
+            (&mut written, total),
+            &mut seen,
+            given.len() + 2,
+        );
+        assert_eq!((gave, over), (Gave::Over, true));
+        assert_eq!(seen.body, expected);
+        assert!(seen.ended);
+        // A driver that fails past the head: the exchange ends unfinished.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: pieces(1, 10),
+            whole: Some(false),
+        };
+        open_get(&mut native, fields, 100);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (_, over) = get_turn(
+            &mut native,
+            &mut replies,
+            &mut source,
+            (&mut 0, 100),
+            &mut seen,
+            4,
+        );
+        assert!(over && seen.refused && !seen.ended);
+        assert_eq!(seen.body.len(), fields.len() + 10);
+        // A `SlowDown` waits for the request's body, then goes whole, counted for its cause.
+        let (mut native, mut replies) = native_door().unwrap();
+        let (head, reply_fields) = Reply::slowed(door::Slowed::Queued).encode().unwrap();
+        let opening = Opening {
+            head: head.clone(),
+            fields: Bytes::from(reply_fields.clone()),
+            body: 0,
+            slowed: Some(door::Slowed::Queued),
+            bound_ns: u64::MAX,
+            admitted: true,
+        };
+        assert_eq!(native.offer(Told::Reply(Box::new(opening))), Sent::Taken);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Draining
+        );
+        assert!(seen.answered.is_none());
+        assert_eq!(
+            replies.write(&mut seen, true, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert_eq!(seen.answered, Some((head, reply_fields.len() as u64)));
+        assert_eq!(seen.body, reply_fields);
+        assert!(seen.ended);
+        assert_eq!(moved, reply_fields.len() as u64);
+        assert_eq!(slowed[door::Slowed::Queued.index()], 1);
+    }
+
+    /// A reply's channel holds one answer: while the node's task has not written what its job gave,
+    /// the job takes nothing more from its driver, and an answer past the channel's room waits in
+    /// its door, in order, until the node's task took the one before; nothing grows.
+    #[test]
+    fn a_full_reply_channel_holds_the_job() {
+        let (mut native, mut replies) = native_door().unwrap();
+        let given = pieces(3, piece_len());
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, b"fields", 3 * piece_len() as u64);
+        // Its fields not yet written: the job takes no piece.
+        let mut written = 0;
+        let total = 3 * piece_len() as u64;
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(source.pieces.len(), 3);
+        // An exchange that takes nothing: the fields wait in the node's task, the job holds.
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                give_native(&mut native, &mut source, &mut written, total),
+                Gave::Waits
+            );
+        }
+        assert_eq!(source.pieces.len(), 3);
+        assert!(native.pending.is_empty());
+        // Room for the fields and half a piece: one piece taken, and no other while it is unwritten.
+        seen.credit = b"fields".len() + piece_len() / 2;
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(source.pieces.len(), 2);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(source.pieces.len(), 2);
+        // An answer past the channel's one waits in the door, in order, and goes once the node's
+        // task took the one before.
+        let (mut native, mut replies) = native_door().unwrap();
+        assert_eq!(
+            native.offer(Told::Bytes(Bytes::from_static(b"a"))),
+            Sent::Taken
+        );
+        assert_eq!(native.offer(Told::End), Sent::Held);
+        assert_eq!(native.pending.len(), 1);
+        assert_eq!(native.flush(), Sent::Held);
+        assert!(matches!(replies.told.try_recv(), Ok(Some(Told::Bytes(_)))));
+        assert_eq!(native.flush(), Sent::Taken);
+        assert!(matches!(replies.told.try_recv(), Ok(Some(Told::End))));
+    }
+
+    /// A job whose work is held says so on its door, and the node's task tells its exchange's asker
+    /// at its next write, once for each time the job said it (research/77 D1).
+    #[test]
+    fn a_held_job_is_vouched_for_through_the_nodes_task() {
+        let (native, mut replies) = native_door().unwrap();
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(seen.working, 0);
+        native.held();
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(seen.working, 1);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(seen.working, 1, "said once, vouched once");
+        native.held();
+        native.held();
+        replies.write(&mut seen, false, 0, &mut moved, &mut slowed);
+        assert_eq!(seen.working, 2);
+    }
+
+    /// A stopped stream ends the job and its reply: an exchange gone as its reply is written is
+    /// refused and let go by the node's task, and a job whose exchange's half was let go (refused,
+    /// or ended unanswered, `Node::job_lost`) finds its door gone and ends. A job that let go with
+    /// nothing given leaves its exchange's half nothing to write.
+    #[test]
+    fn a_stopped_stream_ends_the_job_and_its_reply() {
+        let given = pieces(2, piece_len());
+        // The exchange is gone as a piece is written.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, b"fields", 2 * piece_len() as u64);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut written = 0;
+        let total = 2 * piece_len() as u64;
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        seen.gone = true;
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.refused && !seen.ended);
+        // The node's task lets go of it: the job's next answer finds its door gone.
+        drop(replies);
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Over
+        );
+        // An exchange gone before its head is written.
+        let (mut native, mut replies) = native_door().unwrap();
+        open_get(&mut native, b"fields", 1);
+        let mut seen = Seen {
+            gone: true,
+            ..Seen::default()
+        };
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        // A job that let go with nothing more given: nothing to write.
+        let (native, mut replies) = native_door().unwrap();
+        drop(native);
+        let mut seen = Seen::default();
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.answered.is_none() && !seen.ended && !seen.refused);
+    }
+
+    /// A native get's pieces reach its exchange as its driver gave them, each write's bytes the
+    /// piece's own storage (`Endpoint::write_body_bytes` keeps them by reference): no piece is
+    /// copied on its way, where the job's own write copied each into QUIC's buffer
+    /// (`Endpoint::write_body`); and past the first piece the way asks the allocator for nothing.
+    #[test]
+    fn a_native_replys_pieces_reach_the_exchange_uncopied() {
+        const PIECES: usize = 64;
+        let given = pieces(PIECES, piece_len());
+        let storage: Vec<*const u8> = given.iter().map(|p| p.as_ptr()).collect();
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given,
+            whole: Some(true),
+        };
+        let total = (PIECES * piece_len()) as u64;
+        open_get(&mut native, b"", total);
+        let mut seen = Seen {
+            body: Vec::with_capacity(PIECES * piece_len()),
+            writes: Vec::with_capacity(PIECES + 1),
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut written = 0;
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        // The first piece: what the channel and the door's queue set up once.
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        hyper_measure::alloc::begin();
+        for _ in 1..PIECES {
+            assert_eq!(
+                give_native(&mut native, &mut source, &mut written, total),
+                Gave::Waits
+            );
+            assert_eq!(
+                replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+                Wrote::More
+            );
+        }
+        let counts = hyper_measure::alloc::end();
+        assert_eq!((counts.allocations, counts.reallocations), (0, 0));
+        assert_eq!(
+            seen.writes, storage,
+            "each write is the piece's own storage"
+        );
+        assert_eq!(seen.body.len(), PIECES * piece_len());
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Over
+        );
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.ended);
+    }
+
+    /// One native request's door as the host and the node's task use it: taken as the request is,
+    /// its job's end given and written, and both halves given back, the job's or the reply's first.
+    /// What its two halves share, which tells the door.
+    fn door_request(doors: &mut Doors, job_first: bool) -> *const Handed {
+        let (mut native, mut replies) = doors.take().unwrap();
+        assert!(!native.gone() && native.written());
+        assert_eq!(native.offer(Told::End), Sent::Taken);
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.ended && seen.working == 0);
+        let handed = std::sync::Arc::as_ptr(&native.handed);
+        if job_first {
+            doors.give_native(native);
+            doors.give_replies(replies);
+        } else {
+            doors.give_replies(replies);
+            doors.give_native(native);
+        }
+        handed
+    }
+
+    /// A native request's door is the one a request before it let go of (node.md §2.9 step 6d):
+    /// where each request made its own, its reply's channel and what its two halves share asking
+    /// the allocator each time, a request past the first asks it for nothing, whichever half comes
+    /// back first. A door given back with an answer its job gave that the node's task never took is
+    /// emptied, and its words cleared, so the next request's job is not told its reply is gone, nor
+    /// the node's task that its job ended. The host keeps no more doors than it holds exchanges.
+    #[test]
+    fn a_native_requests_door_is_kept_for_the_next_and_allocates_nothing() {
+        const REQUESTS: usize = 64;
+        hyper_measure::alloc::begin();
+        let made = native_door().unwrap();
+        let each = hyper_measure::alloc::end();
+        drop(made);
+        assert!(each.allocations > 0, "{each:?}");
+        let mut doors = Doors::new(2);
+        let first = door_request(&mut doors, true);
+        hyper_measure::alloc::begin();
+        let mut same = 0;
+        for request in 0..REQUESTS {
+            same += usize::from(door_request(&mut doors, request % 2 == 0) == first);
+        }
+        let kept = hyper_measure::alloc::end();
+        assert_eq!((kept.allocations, kept.reallocations), (0, 0));
+        assert_eq!(same, REQUESTS, "each request took the one door kept");
+        // A job that gave past the node's task's letting go: its answer dropped with the door's
+        // words, its next request's door as new.
+        let (mut native, replies) = doors.take().unwrap();
+        assert_eq!(
+            native.give(Told::Bytes(Bytes::from_static(b"never written"))),
+            Sent::Taken
+        );
+        native.held();
+        doors.give_replies(replies);
+        assert!(native.gone());
+        assert_eq!(native.offer(Told::End), Sent::Gone);
+        doors.give_native(native);
+        let (mut native, mut replies) = doors.take().unwrap();
+        assert!(!native.gone() && native.written() && native.pending.is_empty());
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert!(seen.answered.is_none() && seen.body.is_empty() && seen.working == 0);
+        assert_eq!(native.offer(Told::End), Sent::Taken);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.ended);
+        doors.give_native(native);
+        doors.give_replies(replies);
+        // Three out at once, the host holding two exchanges' doors: the third back is let go.
+        let out: Vec<_> = (0..3).map(|_| doors.take().unwrap()).collect();
+        for (native, replies) in out {
+            doors.give_native(native);
+            doors.give_replies(replies);
+        }
+        assert_eq!(doors.kept.len(), 2);
+        assert!(doors.waiting.is_empty());
+    }
+
+    /// One native put's door as the host and the node's task use it for its body: taken as the
+    /// request is, its body's sender lent to the put's feeding, which gives `pieces` pieces of
+    /// `piece` and the body's end, each taken by the job from its door, then let go, its sender
+    /// given back; the job's end given and written; and both halves given back. What its halves
+    /// share, which tells the door.
+    fn door_put(
+        doors: &mut Doors,
+        putting: &Putting,
+        piece: &[u8],
+        pieces: usize,
+    ) -> *const Handed {
+        let (mut native, mut replies) = doors.take().unwrap();
+        let sender = replies.body.take().unwrap();
+        let mut feeding = feed(
+            (putting.length, putting.trailing),
+            sender,
+            std::sync::Arc::clone(&native.handed),
+            None,
+        );
+        let mut moved = 0;
+        for _ in 0..pieces {
+            assert!(feeding.free());
+            assert_eq!(feeding.give(piece, &mut moved), Ok(Fed::Moved));
+            assert!(matches!(
+                native.body.pieces.try_recv(),
+                Ok(Some(Piece::Bytes(..)))
+            ));
+        }
+        assert_eq!(feeding.end(), Fed::Over);
+        assert!(matches!(
+            native.body.pieces.try_recv(),
+            Ok(Some(Piece::End(_)))
+        ));
+        replies.body = Some(feeding.let_go());
+        assert_eq!(native.offer(Told::End), Sent::Taken);
+        let mut seen = Seen::default();
+        let (mut slowed, handed) = (
+            [0; door::Slowed::ALL.len()],
+            std::sync::Arc::as_ptr(&native.handed),
+        );
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        doors.give_native(native);
+        doors.give_replies(replies);
+        handed
+    }
+
+    /// A native put's body channel is its door's, kept with it for the next request (node.md §2.9
+    /// step 6e): where each put made its own, a put past the first asks the allocator for nothing
+    /// for its channels, its body's pieces and end given and taken through the door kept, the
+    /// feeding's storage made and shared once a put and reused piece to piece as before. What the channel's
+    /// ends' drops said is two words: a job that let go of its body has the rest dropped by its
+    /// feeding, and a feeding let go tells its job the body did not come whole once it took the
+    /// piece given before.
+    #[test]
+    fn a_native_puts_body_channel_is_kept_with_its_door_and_allocates_nothing() {
+        const PUTS: usize = 64;
+        let mut putting = native_put(0);
+        putting.trailing = None;
+        let mut doors = Doors::new(1);
+        let first = door_put(&mut doors, &putting, &[], 0);
+        hyper_measure::alloc::begin();
+        let mut same = 0;
+        for _ in 0..PUTS {
+            same += usize::from(door_put(&mut doors, &putting, &[], 0) == first);
+        }
+        let kept = hyper_measure::alloc::end();
+        assert_eq!((kept.allocations, kept.reallocations), (0, 0));
+        assert_eq!(same, PUTS, "each put took the one door kept");
+        // With a body: what the feeding's storage asks, as before, and nothing for the channels:
+        // made at its first piece, and shared as that piece is split from it (`BytesMut::split`
+        // promotes a storage made whole to one its views share), each piece past it a view.
+        let mut putting = native_put(4 * piece_len() as u64);
+        putting.trailing = None;
+        let piece = vec![7; piece_len()];
+        hyper_measure::alloc::begin();
+        for _ in 0..PUTS {
+            assert_eq!(door_put(&mut doors, &putting, &piece, 4), first);
+        }
+        let bodied = hyper_measure::alloc::end();
+        assert_eq!(
+            (bodied.allocations, bodied.reallocations),
+            (2 * PUTS as u64, 0),
+            "a storage a put, and its sharing"
+        );
+
+        // The job let go of its body: its feeding drops the rest.
+        let (native, mut replies) = doors.take().unwrap();
+        let mut feeding = feed(
+            (putting.length, putting.trailing),
+            replies.body.take().unwrap(),
+            std::sync::Arc::clone(&native.handed),
+            None,
+        );
+        native
+            .handed
+            .dropped
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut moved = 0;
+        assert_eq!(feeding.give(&piece, &mut moved), Ok(Fed::Moved));
+        assert!(feeding.dropping);
+        replies.body = Some(feeding.let_go());
+        doors.give_native(native);
+        doors.give_replies(replies);
+
+        // The node's task let go of the body before its end: the job takes the piece given before
+        // it, then hears its body did not come whole.
+        let (mut native, mut replies) = doors.take().unwrap();
+        assert!(
+            !native.handed.cut.load(std::sync::atomic::Ordering::Acquire),
+            "a kept door's words are cleared"
+        );
+        let mut feeding = feed(
+            (putting.length, putting.trailing),
+            replies.body.take().unwrap(),
+            std::sync::Arc::clone(&native.handed),
+            None,
+        );
+        assert_eq!(feeding.give(&piece, &mut moved), Ok(Fed::Moved));
+        replies.body = Some(feeding.let_go());
+        let mut taking = native_put(4 * piece_len() as u64);
+        taking.trailing = None;
+        let Native {
+            body,
+            handed,
+            moved: took,
+            ..
+        } = &mut *native;
+        assert_eq!(
+            take_body(body, Some(&handed.cut), &mut taking, took, |_| {}),
+            Err(Status::IncompleteBody)
+        );
+        assert_eq!(taking.taken, piece_len() as u64, "the piece given before");
+        doors.give_native(native);
+        doors.give_replies(replies);
+        assert_eq!(doors.kept.len(), 1);
+    }
+
+    fn refused(work: &Work) -> Option<Status> {
+        match work {
+            Work::Draining(reply) => Some(reply.status),
+            _ => None,
+        }
+    }
+
+    /// What a request's head alone refuses, before anything is read or written: a part declared
+    /// past S3's 5 GiB, an object past a single PUT's, and a checksum type its algorithm does not
+    /// have (05 §3.3, §4.1).
+    #[test]
+    fn a_request_past_s3s_bounds_is_refused_before_anything_is_read() {
+        let part = |length| Op::UploadPart {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload: "0123456789ABC".into(),
+            number: 1,
+            id: 1,
+            length,
+            checksum: None,
+            md5: None,
+            trailing: None,
+        };
+        assert_eq!(
+            refused(&work(part(name::MAX_PART + 1), None)),
+            Some(Status::EntityTooLarge)
+        );
+        assert_eq!(refused(&work(part(name::MAX_PART), None)), None);
+        let put = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: mantle_s3::body::MAX_UPLOAD + 1,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+            trailing: None,
+            metadata: Vec::new(),
+        };
+        assert_eq!(refused(&work(put, None)), Some(Status::EntityTooLarge));
+        // A checksum in the fields and a trailer's both.
+        let twice = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: 1,
+            headers: Headers::default(),
+            checksum: Some(checksum::Checksum {
+                algorithm: checksum::Algorithm::Crc32,
+                bytes: vec![0; 4],
+            }),
+            md5: None,
+            trailing: Some(checksum::Algorithm::Crc32),
+            metadata: Vec::new(),
+        };
+        assert_eq!(refused(&work(twice, None)), Some(Status::InvalidRequest));
+        let create = |algorithm, full| Op::CreateUpload {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            checksum: Some((algorithm, full)),
+            metadata: Vec::new(),
+        };
+        for (algorithm, full, ok) in [
+            (Algorithm::Crc64Nvme, true, true),
+            (Algorithm::Crc64Nvme, false, false),
+            (Algorithm::Sha256, true, false),
+            (Algorithm::Sha256, false, true),
+            (Algorithm::Crc32c, true, true),
+            (Algorithm::Crc32c, false, true),
+        ] {
+            let status = refused(&work(create(algorithm, full), None));
+            assert_eq!(
+                status,
+                if ok {
+                    None
+                } else {
+                    Some(Status::InvalidRequest)
+                },
+                "{algorithm:?} full {full}"
+            );
+        }
+    }
+
+    /// What research/89 adds is refused from its request alone, before anything is read: a
+    /// version ID mantle never makes (InvalidArgument), metadata past S3's 2 KB
+    /// (MetadataTooLarge) or that no HTTP field carries, a part copy's number past 10,000.
+    #[test]
+    fn what_a_version_metadata_or_a_copy_names_is_refused_before_anything_is_read() {
+        let get = |version: &str| Op::Get {
+            bucket: "b".into(),
+            key: "k".into(),
+            headers: Headers::default(),
+            version: Some(version.into()),
+        };
+        for named in ["null", "0123456789ABC"] {
+            assert_eq!(refused(&work(get(named), None)), None, "{named}");
+        }
+        for invalid in ["", "nul", "0123456789AB", "0123456789ABCD", "0123456789ABU"] {
+            assert_eq!(
+                refused(&work(get(invalid), None)),
+                Some(Status::InvalidVersion),
+                "{invalid:?}"
+            );
+        }
+        let delete = Op::Delete {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            headers: Headers::default(),
+            version: Some("not one".into()),
+        };
+        assert_eq!(refused(&work(delete, None)), Some(Status::InvalidVersion));
+        let put = |metadata: Metadata| Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: 1,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+            trailing: None,
+            metadata,
+        };
+        let at = vec![(
+            "x-amz-meta-k".to_owned(),
+            "v".repeat(mantle_s3::metadata::MAX_USER - 1),
+        )];
+        assert_eq!(refused(&work(put(at), None)), None);
+        let past = vec![(
+            "x-amz-meta-k".to_owned(),
+            "v".repeat(mantle_s3::metadata::MAX_USER),
+        )];
+        assert_eq!(
+            refused(&work(put(past), None)),
+            Some(Status::MetadataTooLarge)
+        );
+        let control = vec![("x-amz-meta-k".to_owned(), "a\nb".to_owned())];
+        assert_eq!(
+            refused(&work(put(control), None)),
+            Some(Status::InvalidArgument)
+        );
+        let source = mantle_s3::copy::Source {
+            bucket: "b".into(),
+            key: "k".into(),
+            version: None,
+        };
+        let part = Op::CopyPart(Box::new(object::CopyPart {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload: "0123456789ABC".into(),
+            number: name::MAX_PART_NUMBER + 1,
+            id: 1,
+            source: source.clone(),
+            conditions: Headers::default(),
+        }));
+        assert_eq!(refused(&work(part, None)), Some(Status::InvalidArgument));
+        let copy = Op::Copy(Box::new(object::Copy {
+            bucket: "b".into(),
+            key: "k2".into(),
+            id: 1,
+            source: mantle_s3::copy::Source {
+                version: Some("bad".into()),
+                ..source
+            },
+            conditions: Headers::default(),
+            headers: Headers::default(),
+            directive: Directive::Copy,
+            metadata: Vec::new(),
+            checksum: None,
+        }));
+        assert_eq!(refused(&work(copy, None)), Some(Status::InvalidVersion));
+    }
+
+    /// A node as a test serves the host it lends out (`Serve`, node.md §2.9 step 6d): each ask
+    /// answered by `answer` and its outcome given at the host's next turn, and each job's end kept,
+    /// with how many asks it let go. It holds no volume table, and reads no fields: its jobs come
+    /// typed through the S3 door.
+    pub(crate) struct Stub {
+        answer: fn(&JobAsk) -> Outcome,
+        answers: Vec<(Pending, Outcome)>,
+        pub(crate) asked: u64,
+        /// Whether it says it has no room for any ask (`Serve::room`).
+        pub(crate) no_room: bool,
+        ended: Vec<(Option<u64>, u64, Option<usize>, usize)>,
+        abandoned: usize,
+        /// Whether it takes each ended job's door half, as a driving shard's lanes take it to the
+        /// node's task, rather than giving it back for the host to keep, as the node does; and
+        /// the last it took.
+        takes_halves: bool,
+        half: Option<Box<Native>>,
+    }
+
+    impl Serve for Stub {
+        fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+            let pending = match &ask {
+                JobAsk::Command(..) => Pending::Command(self.asked),
+                JobAsk::Read(..) => Pending::Read(self.asked),
+                JobAsk::Put { .. } | JobAsk::Get { .. } => Pending::Chunk(self.asked),
+            };
+            self.asked += 1;
+            self.answers.push((pending, (self.answer)(&ask)));
+            Ok(pending)
+        }
+
+        fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
+            let at = self.answers.iter().position(|(p, _)| *p == pending)?;
+            Some(self.answers.swap_remove(at).1)
+        }
+
+        fn answered(&self, pending: Pending) -> bool {
+            self.answers.iter().any(|(p, _)| *p == pending)
+        }
+
+        fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
+            self.abandoned += asks.into_iter().count();
+        }
+
+        fn table(&mut self) -> Result<&Table, NodeError> {
+            Err(NodeError::Bounds("a stub holds no volume table".into()))
+        }
+
+        fn group_of(&self, _: Layer) -> Option<u128> {
+            Some(1)
+        }
+
+        fn ranges(&self) -> usize {
+            1
+        }
+
+        fn command_room(&self) -> bool {
+            true
+        }
+
+        fn room(&self, _: &JobAsk) -> bool {
+            !self.no_room
+        }
+
+        fn command_asks(&self) -> usize {
+            1
+        }
+
+        fn wall_ns(&self) -> u64 {
+            0
+        }
+
+        fn freed(&mut self) -> bool {
+            false
+        }
+
+        fn moved(&self) -> u64 {
+            0
+        }
+
+        fn read_fields(&mut self, _: &mut Job) -> Result<bool, NodeError> {
+            panic!("a local door's work comes typed")
+        }
+
+        fn took(&mut self, _: door::Paced) {}
+
+        fn committed(&mut self, _: u64) {}
+
+        fn filled(&mut self, _: u64, _: u64) {}
+
+        fn read(&mut self, _: u64) {}
+
+        fn windows(&self) -> crate::window::Windows {
+            crate::window::Windows::default()
+        }
+
+        fn holds(&self, _: u64) -> bool {
+            true
+        }
+
+        fn recharge(&mut self, _: u64, _: u64) {}
+
+        fn job_ended(
+            &mut self,
+            admitted_ns: Option<u64>,
+            charge: u64,
+            driven: Option<usize>,
+            asks: impl IntoIterator<Item = Pending>,
+            half: Option<Box<Native>>,
+        ) -> Option<Box<Native>> {
+            self.ended
+                .push((admitted_ns, charge, driven, asks.into_iter().count()));
+            if !self.takes_halves {
+                return half;
+            }
+            self.half = half;
+            None
+        }
+    }
+
+    impl Stub {
+        /// A stub that answers each chunk ask `Stored`, its answers' room made for 4 at once.
+        pub(crate) fn chunks() -> Self {
+            Self {
+                answer: |_| Outcome::Chunk(ChunkOutcome::Stored),
+                answers: Vec::with_capacity(4),
+                asked: 0,
+                no_room: false,
+                ended: Vec::with_capacity(4),
+                abandoned: 0,
+                takes_halves: false,
+                half: None,
+            }
+        }
+    }
+
+    impl Table {
+        /// A table of no volumes read at `applied`, whose blocks take three copies.
+        pub(crate) fn empty(applied: u64) -> Self {
+            Self {
+                applied,
+                placed: Vec::new(),
+                facts: Vec::new(),
+                standing: Vec::new(),
+                scheming: Scheming {
+                    now: Ok(Some(durability::Scheme::Copies(3))),
+                    domains_at: applied,
+                    settled: true,
+                    choosing: None,
+                },
+            }
+        }
+    }
+
+    /// An object's version of no bytes, as its Name range holds it.
+    fn empty_version() -> Version {
+        Version {
+            marker: false,
+            null: false,
+            modified_ns: 0,
+            etag: "\"e\"".into(),
+            size: 0,
+            checksum: None,
+            file: None,
+            owner: "o".into(),
+            headers: Vec::new(),
+            retention: None,
+            legal_hold: None,
+            listing: None,
+        }
+    }
+
+    /// A job of `work` through the S3 door, admitted at `now` and charged `charge`: its door's
+    /// body's sender and its reply's receiver beside it.
+    fn local_job(
+        work: Work,
+        now: u64,
+        charge: u64,
+    ) -> (Job, Sender<Piece>, ChannelReceiver<door::Answer>) {
+        let (body_in, pieces) = hyper_rt::sync::channel(2).unwrap();
+        let (reply, answers) = hyper_rt::sync::channel(4).unwrap();
+        let job = Job {
+            door: Door::Local(Box::new(Local {
+                body: Pieces {
+                    pieces,
+                    ended: None,
+                },
+                reply,
+                pending: VecDeque::new(),
+                ready: false,
+            })),
+            principal: "o".into(),
+            work,
+            pending: Vec::new(),
+            deadline_ns: None,
+            moved_ns: now,
+            admitted_ns: Some(now),
+            charge,
+            window: 1,
+            driven: None,
+            label: None,
+        };
+        (job, body_in, answers)
     }
 
     /// A one-byte put of three copies, `offered` volumes offered its block (`0..offered`), and its
@@ -6857,43 +10093,10 @@ mod tests {
 
     /// An S3 put's job, its driver `put`, its work last moved at 1.
     fn put_job(put: Put) -> Job {
-        let (_body, body) = hyper_rt::sync::channel(1).unwrap();
-        let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
-        Job {
-            door: Door::Local(Box::new(Local {
-                body,
-                reply,
-                ended: None,
-                pending: VecDeque::new(),
-                ready: false,
-            })),
-            principal: "client".into(),
-            work: Work::Put(Box::new(Putting {
-                bucket: "b".into(),
-                key: "k".into(),
-                part: None,
-                id: 1,
-                length: 1,
-                preconditions: Preconditions::default(),
-                expected: Expected::default(),
-                trailing: None,
-                trailer: Vec::new(),
-                put: Some(put),
-                carry: Vec::new(),
-                taken: 1,
-                waiting: VecDeque::new(),
-                run: None,
-                metadata: Vec::new(),
-            })),
-            pending: Vec::new(),
-            deadline_ns: None,
-            moved_ns: 1,
-            admitted_ns: Some(1),
-            charge: 0,
-            window: 1,
-            label: None,
-            room_to_reply: false,
-        }
+        let mut putting = native_put(1);
+        putting.put = Some(put);
+        putting.taken = 1;
+        local_job(Work::Put(putting), 1, 0).0
     }
 
     /// An S3 put whose chunks every volume refused for want of room is due at its beat, as a
@@ -7217,27 +10420,8 @@ mod tests {
         let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
         let (mut get, id, _) = get_of_copies();
         get.answer(id, get::Answer::Busy).unwrap();
-        let (_body, body) = hyper_rt::sync::channel(1).unwrap();
-        let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
-        let mut job = Job {
-            door: Door::Local(Box::new(Local {
-                body,
-                reply,
-                ended: None,
-                pending: VecDeque::new(),
-                ready: false,
-            })),
-            principal: "client".into(),
-            work: getting("b".into(), "k".into(), Headers::default(), None, false),
-            pending: Vec::new(),
-            deadline_ns: None,
-            moved_ns: 1,
-            admitted_ns: Some(1),
-            charge: 0,
-            window: 1,
-            label: None,
-            room_to_reply: false,
-        };
+        let work = getting("b".into(), "k".into(), Headers::default(), None, false);
+        let (mut job, _body, _answers) = local_job(work, 1, 0);
         let Work::Get(getting) = &mut job.work else {
             panic!("the job is a get");
         };
@@ -7272,177 +10456,1039 @@ mod tests {
         assert!(!job.waits_for_room() && !job.held());
     }
 
-    fn refused(work: &Work) -> Option<Status> {
-        match work {
-            Work::Draining(reply) => Some(reply.status),
-            _ => None,
+    /// A native reply's head goes at its first offer, as it fills the room the endpoint took with
+    /// its request's head (`node::reply_head`), a get's as a status's. What still waits for room is
+    /// the piece its request's body drains through (`Node::drop_body`'s `Room`): the reply is held
+    /// and vouched for within its client's patience, its node's turn due at the beat, and goes
+    /// whole once the body is read; past its patience its exchange is refused `Budget`, which its
+    /// asker hears at once. Taken as the reply's end, as the job's drain once took it, its exchange
+    /// stayed open with nothing more to come, and its client gave it up a period later
+    /// (`Lost(Stalled)`, tests/put_body.rs).
+    #[test]
+    fn a_reply_whose_body_waits_for_room_is_held_then_goes_or_is_refused() {
+        let (head, fields) = Reply::status(Status::Done).encode().unwrap();
+        let opening = |bound_ns| Opening {
+            head: head.clone(),
+            fields: Bytes::from(fields.clone()),
+            body: 0,
+            slowed: None,
+            bound_ns,
+            admitted: false,
+        };
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let (mut native, mut replies) = native_door().unwrap();
+        assert_eq!(
+            native.offer(Told::Reply(Box::new(opening(100)))),
+            Sent::Taken
+        );
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        assert_eq!(
+            replies.write(&mut seen, false, 5, &mut moved, &mut slowed),
+            Wrote::Draining
+        );
+        // The piece its body drains through refused for room (`Node::write_reply`).
+        for (turn, now) in [10, 20].into_iter().enumerate() {
+            assert_eq!(replies.wait_for_room(&mut seen, now), Wrote::Room);
+            assert_eq!(seen.working, turn + 1, "vouched for at each turn it waits");
+            assert_eq!(
+                replies.room_due_ns(now, 7),
+                Some(now + 7),
+                "due at its beat"
+            );
+            assert_eq!(
+                replies.room_due_ns(99, 7),
+                Some(100),
+                "at most its patience"
+            );
+        }
+        assert_eq!(
+            replies.write(&mut seen, true, 30, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert_eq!(seen.answered, Some((head.clone(), fields.len() as u64)));
+        assert_eq!(seen.body, fields);
+        assert!(seen.ended && !seen.refused);
+        assert_eq!(replies.room_due_ns(30, 7), None);
+
+        // Past its patience: refused `Budget`, nothing written.
+        let (mut native, mut replies) = native_door().unwrap();
+        assert_eq!(
+            native.offer(Told::Reply(Box::new(opening(100)))),
+            Sent::Taken
+        );
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        assert_eq!(
+            replies.write(&mut seen, false, 50, &mut moved, &mut slowed),
+            Wrote::Draining
+        );
+        assert_eq!(replies.wait_for_room(&mut seen, 50), Wrote::Room);
+        assert_eq!(replies.wait_for_room(&mut seen, 100), Wrote::Over);
+        assert_eq!(seen.refusal, Some(Refusal::Budget));
+        assert!(seen.answered.is_none() && !seen.ended);
+
+        // A get's head goes at its first offer, its fields after it, and nothing waits.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut get = opening(100);
+        get.body = 3;
+        assert_eq!(native.give(Told::Head(Box::new(get))), Sent::Taken);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        assert_eq!(
+            replies.write(&mut seen, false, 10, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        assert_eq!(seen.answered, Some((head.clone(), fields.len() as u64 + 3)));
+        assert_eq!(seen.body, fields);
+        assert_eq!(replies.room_due_ns(10, 7), None);
+
+        // A reply no message holds refuses its exchange, so its asker hears it at once.
+        let (mut native, mut replies) = native_door().unwrap();
+        assert_eq!(native.offer(Told::Failed(Refusal::FrameBound)), Sent::Taken);
+        let mut seen = Seen::default();
+        assert_eq!(
+            replies.write(&mut seen, true, 0, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert_eq!(seen.refusal, Some(Refusal::FrameBound));
+    }
+
+    /// A get's piece its client's room took only in part is timed from then: once written whole,
+    /// what its client took since its room was full, over the time since, is its pace for the
+    /// windows the node's next gets hold (`Drain`, `crate::window`); a piece its room took at once
+    /// says nothing, as no window held it back.
+    #[test]
+    fn a_native_gets_client_is_paced_from_when_its_room_was_full() {
+        let (head, fields) = Reply::status(Status::Done).encode().unwrap();
+        let opening = Opening {
+            head,
+            fields: Bytes::from(fields),
+            body: 10,
+            slowed: None,
+            bound_ns: 100,
+            admitted: true,
+        };
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        assert_eq!(native.give(Told::Head(Box::new(opening))), Sent::Taken);
+        assert_eq!(
+            replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        // Taken at once: no pace.
+        assert_eq!(
+            native.give(Told::Bytes(Bytes::from(vec![1; 4]))),
+            Sent::Taken
+        );
+        assert_eq!(
+            replies.write(&mut seen, false, 1, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        assert_eq!(replies.take_paced(), None);
+        // Its room full after 2 of 6 bytes at 10 ns, then a byte at 20 and the last 3 at 40: 4
+        // bytes in 30 ns.
+        seen.credit = 2;
+        assert_eq!(
+            native.give(Told::Bytes(Bytes::from(vec![2; 6]))),
+            Sent::Taken
+        );
+        for (credit, now) in [(2, 10), (1, 20)] {
+            seen.credit = credit;
+            assert_eq!(
+                replies.write(&mut seen, false, now, &mut moved, &mut slowed),
+                Wrote::Still
+            );
+            assert_eq!(replies.take_paced(), None);
+        }
+        seen.credit = 3;
+        assert_eq!(
+            replies.write(&mut seen, false, 40, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        assert_eq!(replies.take_paced(), Some((4, 30)));
+        assert_eq!(replies.take_paced(), None);
+    }
+
+    /// Every answer a door's reply channel holds, in order.
+    fn answered(answers: &mut ChannelReceiver<door::Answer>) -> Vec<door::Answer> {
+        let mut taken = Vec::new();
+        while let Ok(Some(answer)) = answers.try_recv() {
+            taken.push(answer);
+        }
+        taken
+    }
+
+    /// A host driven only through its interface (node.md §2.9 step 6d), by a stub of the node that
+    /// answers each ask at the host's next turn, steps a put and a get to their ends: the put of an
+    /// empty object takes its body's end from its door, asks its Name range to commit it, and is
+    /// answered `Done` with the version the range wrote; the get reads its current version, an
+    /// empty one, makes its driver over it and is answered `Done` with no bytes; and each job's end
+    /// is told with its admission's charge, its shard and no ask let go.
+    #[test]
+    fn a_host_driven_only_through_its_interface_steps_a_put_and_a_get_to_their_ends() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(2, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut putting = native_put(0);
+        putting.trailing = None;
+        let (mut put, body, mut put_answers) = local_job(Work::Put(putting), now, 7);
+        put.driven = Some(1);
+        // The put's body as the S3 door ends it: whole, its trailer's checksum the empty body's.
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        assert!(body.try_send(Piece::End(Some(crc))).is_ok());
+        let get = work(
+            Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+            None,
+        );
+        // Admitted at what a get is, the floor's window read (`sized`): its version read, its
+        // window holds no more (`reading`).
+        let read = scheming_gateway().charges.read(1);
+        let (get, _, mut get_answers) = local_job(get, now, read);
+        host.jobs.push(put);
+        host.jobs.push(get);
+        let mut stub = put_and_get_stub();
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 8, "the jobs never ended");
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(stub.asked, 2, "the put's commit and the get's read");
+        assert!(stub.answers.is_empty() && stub.abandoned == 0);
+        stub.ended.sort();
+        assert_eq!(
+            stub.ended,
+            vec![(Some(now), 7, Some(1), 0), (Some(now), read, None, 0)]
+        );
+        let put_answers = answered(&mut put_answers);
+        assert!(
+            matches!(put_answers.as_slice(), [door::Answer::Ready, door::Answer::Head(reply), door::Answer::End]
+                if reply.status == Status::Done && reply.version == "v" && reply.size == 0),
+            "{put_answers:?}"
+        );
+        let get_answers = answered(&mut get_answers);
+        assert!(
+            matches!(get_answers.as_slice(), [door::Answer::Head(reply), door::Answer::End]
+                if reply.status == Status::Done && reply.size == 0),
+            "{get_answers:?}"
+        );
+    }
+
+    /// A native request's job of `work`, handed with its fields read, so its door names no
+    /// exchange (node.md §2.9 step 6e), admitted at `now`, charged `charge` and placed on shard 1;
+    /// the node's task's half of its door beside it.
+    fn handed_job(work: Work, now: u64, charge: u64) -> (Job, Replies) {
+        let (native, replies) = native_door().unwrap();
+        let job = Job {
+            door: Door::Native(None, Box::new(native)),
+            principal: "o".into(),
+            work,
+            pending: Vec::new(),
+            deadline_ns: None,
+            moved_ns: now,
+            admitted_ns: Some(now),
+            charge,
+            window: 1,
+            driven: Some(1),
+            label: None,
+        };
+        (job, replies)
+    }
+
+    /// The reply an exchange was written: its head's, and the fields past it.
+    fn reply_seen(seen: &Seen) -> Reply {
+        let (head, _) = seen.answered.as_ref().unwrap();
+        let head = object::ReplyHead::decode(head).unwrap();
+        let fields = usize::try_from(head.fields()).unwrap();
+        head.reply(&seen.body[..fields]).unwrap()
+    }
+
+    /// A stub that answers a put's commit of its Name range and a get's read of its current
+    /// version, an empty one.
+    fn put_and_get_stub() -> Stub {
+        Stub {
+            answer: |ask| match ask {
+                JobAsk::Command(_, Command::Name(_)) => {
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                        version: "v".into(),
+                    })))
+                }
+                JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Current(Some((1, empty_version())))),
+                )),
+                _ => panic!("an ask neither job makes"),
+            },
+            answers: Vec::new(),
+            asked: 0,
+            no_room: false,
+            ended: Vec::new(),
+            abandoned: 0,
+            takes_halves: false,
+            half: None,
         }
     }
 
-    /// What a request's head alone refuses, before anything is read or written: a part declared
-    /// past S3's 5 GiB, an object past a single PUT's, and a checksum type its algorithm does not
-    /// have (05 §3.3, §4.1).
+    /// A native request handed with its fields read names no exchange (node.md §2.9 step 6e): only
+    /// hyper-transport makes one, and the job needs none. Driven only through `Serve`, its put
+    /// takes its body's end from its door and is answered `Done` with the version written, and its
+    /// get is answered `Done` with no bytes, each reply written by the node's task's half of its
+    /// door as the exchange takes it; each job's half given back as it ends, and each door kept
+    /// once its reply's half is given back too.
     #[test]
-    fn a_request_past_s3s_bounds_is_refused_before_anything_is_read() {
-        let part = |length| Op::UploadPart {
-            bucket: "b".into(),
-            key: "k".into(),
-            upload: "0123456789ABC".into(),
-            number: 1,
-            id: 1,
-            length,
-            checksum: None,
-            md5: None,
-            trailing: None,
-        };
-        assert_eq!(
-            refused(&work(part(name::MAX_PART + 1), None)),
-            Some(Status::EntityTooLarge)
+    fn a_native_request_handed_with_its_fields_read_needs_no_exchange() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(2, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut putting = native_put(0);
+        putting.trailing = None;
+        let (put, mut put_replies) = handed_job(Work::Put(putting), now, 7);
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        let body = put_replies.body.as_ref().unwrap();
+        assert!(body.try_send(Piece::End(Some(crc))).is_ok());
+        let get = work(
+            Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+            None,
         );
-        assert_eq!(refused(&work(part(name::MAX_PART), None)), None);
+        let read = scheming_gateway().charges.read(1);
+        let (get, mut get_replies) = handed_job(get, now, read);
+        assert!(put.door.exchange().is_none() && get.door.exchange().is_none());
+        host.jobs.push(put);
+        host.jobs.push(get);
+        let mut stub = put_and_get_stub();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut put_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut get_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (mut put_over, mut get_over) = (false, false);
+        let mut turns = 0;
+        while !(host.idle() && put_over && get_over) {
+            turns += 1;
+            assert!(turns <= 8, "the jobs never ended");
+            host.step(&mut stub).unwrap();
+            put_over = put_over
+                || put_replies.write(&mut put_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            get_over = get_over
+                || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+        }
+        assert_eq!(stub.asked, 2, "the put's commit and the get's read");
+        stub.ended.sort();
+        assert_eq!(
+            stub.ended,
+            vec![(Some(now), 7, Some(1), 0), (Some(now), read, Some(1), 0)]
+        );
+        let put_reply = reply_seen(&put_seen);
+        assert_eq!(
+            (put_reply.status, put_reply.version.as_str()),
+            (Status::Done, "v")
+        );
+        let get_reply = reply_seen(&get_seen);
+        assert_eq!((get_reply.status, get_reply.size), (Status::Done, 0));
+        assert!(put_seen.ended && get_seen.ended && !put_seen.refused && !get_seen.refused);
+        // Each job's half came back as it ended; each door is kept once its reply's half is.
+        assert_eq!((host.doors.kept.len(), host.doors.waiting.len()), (0, 2));
+        host.doors.give_replies(put_replies);
+        host.doors.give_replies(get_replies);
+        assert_eq!((host.doors.kept.len(), host.doors.waiting.len()), (2, 0));
+    }
+
+    /// A job's end carries its native door's half to whoever serves its host (node.md §2.9 step
+    /// 6e), told first that its job let go: the node gives it back, and its host keeps it for the
+    /// next request once its reply's half is back too; a driving shard's lanes take it to the
+    /// node's task, which holds the other half, so that host keeps no door, and the node's task's
+    /// doors keep it whole.
+    #[test]
+    fn a_jobs_end_carries_its_doors_half_to_whoever_serves_its_host() {
+        for takes_halves in [false, true] {
+            let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+            let done = Work::Draining(Box::new(Reply::status(Status::Done)));
+            let (job, replies) = handed_job(done, 0, 0);
+            host.jobs.push(job);
+            let mut stub = put_and_get_stub();
+            stub.takes_halves = takes_halves;
+            host.step(&mut stub).unwrap();
+            assert!(host.idle() && stub.ended.len() == 1);
+            assert!(
+                replies
+                    .handed
+                    .ended
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "told its job let go before its half went"
+            );
+            let mut doors = if takes_halves {
+                assert!(host.doors.waiting.is_empty() && host.doors.kept.is_empty());
+                let mut doors = Doors::new(1);
+                doors.give_native(stub.half.take().unwrap());
+                doors
+            } else {
+                assert!(stub.half.is_none());
+                std::mem::take(&mut host.doors)
+            };
+            assert_eq!(doors.waiting.len(), 1);
+            doors.give_replies(replies);
+            assert_eq!((doors.kept.len(), doors.waiting.len()), (1, 0));
+        }
+    }
+
+    /// A runtime of two shards, each with `tasks` task slots (as the shards' tests start theirs).
+    pub(crate) fn two_shards(tasks: usize) -> hyper_rt::runtime::Runtime {
+        hyper_rt::runtime::Runtime::start(&hyper_rt::runtime::RuntimeConfig {
+            shards: 2,
+            tasks_per_shard: tasks,
+            timers_per_shard: 1,
+            interests_per_shard: hyper_rt::runtime::interests_for(tasks),
+            ring_entries: 1,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: 1,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: usize::try_from(hyper_rt::machine::facts::Facts::query().page.base)
+                .unwrap(),
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        })
+        .unwrap()
+    }
+
+    /// A bucket's row, active and owned by the asker of a handed request.
+    fn bucket_row() -> Bucket {
+        Bucket {
+            owner: "o".into(),
+            created_ns: 0,
+            location: String::new(),
+            versioning: Versioning::Unversioned,
+            state: BucketState::Active,
+            attempt: 0,
+            progress_ns: 0,
+            lock: None,
+        }
+    }
+
+    /// A native request handed to a driving shard with its fields read: its operation and its
+    /// door's job half, admitted now, charged `charge` and placed on shard 1.
+    fn handover(half: Box<Native>, op: Op, charge: u64, now: u64) -> Box<Handover> {
+        Box::new(Handover {
+            half,
+            principal: "o".into(),
+            op,
+            block: None,
+            deadline_ns: None,
+            admitted_ns: Some(now),
+            charge,
+            window: 1,
+            driven: Some(1),
+        })
+    }
+
+    /// A host on a driving shard, the second of a two-shard runtime, driven over its lanes by the
+    /// stub node on the test's thread (node.md §2.9 step 6e), takes a put and a get handed with
+    /// their operations to their ends: the shard makes their work, its asks cross to the stub and
+    /// their answers back in the lane's slots, the put takes its body's end from its door and is
+    /// answered `Done` with the version written, the get is answered `Done` with no bytes, each
+    /// reply written by the test as the node's task writes it; each job's end is told with its
+    /// charge and its shard, its door's half riding it back, so the shard's host keeps no door
+    /// and the test's doors keep both. A request past the lane's room is given back.
+    #[test]
+    fn a_driving_shards_host_takes_a_put_and_a_get_to_their_ends_over_its_lanes() {
+        let rt = two_shards(4);
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        let gateway = std::sync::Arc::new(gateway);
+        let start = super::super::driving::Start {
+            command_asks: 2,
+            read_asks: 2,
+            chunk_asks: 2,
+            groups: vec![(Layer::Bucket, 1), (Layer::Name, 2)],
+            ranges: 2,
+            wall: super::super::Wall::From(0),
+            gateway,
+            requests: 3,
+        };
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let mut lanes = super::super::driving::Lanes::start(holder, 1, start).unwrap();
+        lanes.tell_table(Box::new(Table::empty(1)));
+        let mut doors = Doors::new(2);
+        let now = hyper_rt::futures::now_ns();
+        let (put_half, mut put_replies) = doors.take().unwrap();
+        let (get_half, mut get_replies) = doors.take().unwrap();
+        // The put's body as the node's task gives it: empty, whole.
+        let body = put_replies.body.as_ref().unwrap();
+        assert!(body.try_send(Piece::End(None)).is_ok());
         let put = Op::Put {
             bucket: "b".into(),
             key: "k".into(),
             id: 1,
-            length: mantle_s3::body::MAX_UPLOAD + 1,
+            length: 0,
             headers: Headers::default(),
             checksum: None,
             md5: None,
             trailing: None,
             metadata: Vec::new(),
         };
-        assert_eq!(refused(&work(put, None)), Some(Status::EntityTooLarge));
-        // A checksum in the fields and a trailer's both.
-        let twice = Op::Put {
+        let get = Op::Get {
             bucket: "b".into(),
             key: "k".into(),
-            id: 1,
-            length: 1,
             headers: Headers::default(),
-            checksum: Some(checksum::Checksum {
-                algorithm: checksum::Algorithm::Crc32,
-                bytes: vec![0; 4],
-            }),
-            md5: None,
-            trailing: Some(checksum::Algorithm::Crc32),
-            metadata: Vec::new(),
+            version: None,
         };
-        assert_eq!(refused(&work(twice, None)), Some(Status::InvalidRequest));
-        let create = |algorithm, full| Op::CreateUpload {
+        let read = scheming_gateway().charges.read(1);
+        assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
+        assert!(lanes.hand(handover(get_half, get, read, now)).is_none());
+        let mut stub = Stub {
+            answer: |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Command(_, Command::Name(_)) => {
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                        version: "v".into(),
+                    })))
+                }
+                JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Current(Some((1, empty_version())))),
+                )),
+                _ => panic!("an ask neither job makes"),
+            },
+            ..Stub::chunks()
+        };
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut put_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut get_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (mut put_over, mut get_over) = (false, false);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(put_over && get_over && stub.ended.len() == 2) {
+            assert!(std::time::Instant::now() < until, "the jobs never ended");
+            lanes
+                .serve(&mut stub, |half| doors.give_native(half))
+                .unwrap();
+            let now = hyper_rt::futures::now_ns();
+            put_over = put_over
+                || put_replies.write(&mut put_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            get_over = get_over
+                || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            std::thread::yield_now();
+        }
+        stub.ended.sort();
+        assert_eq!(
+            stub.ended,
+            vec![(Some(now), 7, Some(1), 0), (Some(now), read, Some(1), 0)]
+        );
+        let put_reply = reply_seen(&put_seen);
+        assert_eq!(
+            (put_reply.status, put_reply.version.as_str()),
+            (Status::Done, "v")
+        );
+        let get_reply = reply_seen(&get_seen);
+        assert_eq!((get_reply.status, get_reply.size), (Status::Done, 0));
+        // Each job's half rode its end back: the test's doors keep both doors once the replies'
+        // halves are back too.
+        assert_eq!(doors.waiting.len(), 2);
+        doors.give_replies(put_replies);
+        doors.give_replies(get_replies);
+        assert_eq!((doors.kept.len(), doors.waiting.len()), (2, 0));
+        rt.shutdown().unwrap();
+
+        // A request past the lane's room is given back, to run on the first shard.
+        let (lanes, _ends) = super::super::driving::tests::unstarted(holder, 1, 3);
+        let (half, _) = doors.take().unwrap();
+        let op = || Op::Get {
             bucket: "b".into(),
             key: "k".into(),
-            id: 1,
-            checksum: Some((algorithm, full)),
-            metadata: Vec::new(),
+            headers: Headers::default(),
+            version: None,
         };
-        for (algorithm, full, ok) in [
-            (Algorithm::Crc64Nvme, true, true),
-            (Algorithm::Crc64Nvme, false, false),
-            (Algorithm::Sha256, true, false),
-            (Algorithm::Sha256, false, true),
-            (Algorithm::Crc32c, true, true),
-            (Algorithm::Crc32c, false, true),
-        ] {
-            let status = refused(&work(create(algorithm, full), None));
-            assert_eq!(
-                status,
-                if ok {
-                    None
-                } else {
-                    Some(Status::InvalidRequest)
-                },
-                "{algorithm:?} full {full}"
-            );
+        assert!(lanes.hand(handover(half, op(), 0, now)).is_none());
+        let (half, _) = doors.take().unwrap();
+        let given_back = lanes.hand(handover(half, op(), 0, now));
+        assert!(given_back.is_some_and(|request| request.driven == Some(1)));
+    }
+
+    /// A cell in memory as a test serves a driving shard's asks (node.md §2.9 step 6f): Block and
+    /// File ranges that apply their commands to models as their engines would, volumes that keep
+    /// each chunk whose CRC-32C holds, a Name range that keeps the version a put commits, and the
+    /// reads of each, so a put's bytes read back through a get.
+    struct Cell {
+        blocks: mantle_meta::engine::Model,
+        files: mantle_meta::engine::Model,
+        applied: u64,
+        chunks: std::collections::BTreeMap<(u128, mantle_chunk::ChunkKey), Bytes>,
+        version: Option<Version>,
+        answers: Vec<(Pending, Outcome)>,
+        asked: u64,
+        ended: usize,
+    }
+
+    impl Cell {
+        fn new() -> Self {
+            Self {
+                blocks: mantle_meta::engine::Model::default(),
+                files: mantle_meta::engine::Model::default(),
+                applied: 0,
+                chunks: std::collections::BTreeMap::new(),
+                version: None,
+                answers: Vec::new(),
+                asked: 0,
+                ended: 0,
+            }
+        }
+
+        /// What the cell answers `ask`, as its ranges and volumes would.
+        fn answer(&mut self, ask: JobAsk) -> Outcome {
+            self.applied += 1;
+            let read = |read: Read| Outcome::Read(ReadOutcome::Read(Box::new(read)));
+            let answered = |answer: Answer| Outcome::Command(CommandOutcome::Answered(answer));
+            match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => read(Read::Bucket(Some(bucket_row()))),
+                JobAsk::Read(_, Query::Current { .. }) => {
+                    read(Read::Current(self.version.clone().map(|v| (1, v))))
+                }
+                JobAsk::Read(_, Query::Header { file }) => read(Read::Header(
+                    mantle_meta::file::header(&mut self.files, file).unwrap(),
+                )),
+                JobAsk::Read(_, Query::Extents { file, offset, max }) => read(Read::Extents(
+                    mantle_meta::file::extents(
+                        &mut self.files,
+                        file,
+                        offset,
+                        usize::try_from(max).unwrap(),
+                    )
+                    .unwrap(),
+                )),
+                JobAsk::Read(_, Query::Block { block }) => read(Read::Block(
+                    mantle_meta::block::read(&mut self.blocks, block).unwrap(),
+                )),
+                JobAsk::Command(_, Command::Block(command)) => answered(Answer::Block(
+                    mantle_meta::block::apply(&mut self.blocks, self.applied, &command).unwrap(),
+                )),
+                JobAsk::Command(_, Command::File(command)) => answered(Answer::File(
+                    mantle_meta::file::apply(&mut self.files, self.applied, &command).unwrap(),
+                )),
+                JobAsk::Command(_, Command::Name(command)) => {
+                    let name::Command::Put(put) = *command else {
+                        panic!("a put's commit");
+                    };
+                    self.version = Some(put.version);
+                    answered(Answer::Name(name::Outcome::Put {
+                        version: "v".into(),
+                    }))
+                }
+                JobAsk::Put {
+                    volume,
+                    key,
+                    bytes,
+                    crc32c,
+                    ..
+                } => {
+                    assert_eq!(mantle_crc::crc32c(&bytes), crc32c);
+                    self.chunks.insert((volume, key), bytes);
+                    Outcome::Chunk(ChunkOutcome::Stored)
+                }
+                JobAsk::Get {
+                    volume,
+                    key,
+                    span: (offset, len),
+                    ..
+                } => {
+                    let chunk = &self.chunks[&(volume, key)];
+                    let span =
+                        usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap();
+                    Outcome::Chunk(ChunkOutcome::Read(chunk[span].to_vec()))
+                }
+                _ => panic!("an ask neither job makes"),
+            }
         }
     }
 
-    /// What research/89 adds is refused from its request alone, before anything is read: a
-    /// version ID mantle never makes (InvalidArgument), metadata past S3's 2 KB
-    /// (MetadataTooLarge) or that no HTTP field carries, a part copy's number past 10,000.
+    impl Serve for Cell {
+        fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+            let pending = match &ask {
+                JobAsk::Command(..) => Pending::Command(self.asked),
+                JobAsk::Read(..) => Pending::Read(self.asked),
+                JobAsk::Put { .. } | JobAsk::Get { .. } => Pending::Chunk(self.asked),
+            };
+            self.asked += 1;
+            let outcome = self.answer(ask);
+            self.answers.push((pending, outcome));
+            Ok(pending)
+        }
+
+        fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
+            let at = self.answers.iter().position(|(p, _)| *p == pending)?;
+            Some(self.answers.swap_remove(at).1)
+        }
+
+        fn answered(&self, pending: Pending) -> bool {
+            self.answers.iter().any(|(p, _)| *p == pending)
+        }
+
+        fn abandon(&mut self, _: impl IntoIterator<Item = Pending>) {}
+
+        fn table(&mut self) -> Result<&Table, NodeError> {
+            Err(NodeError::Bounds("the shard holds its own table".into()))
+        }
+
+        fn group_of(&self, _: Layer) -> Option<u128> {
+            Some(1)
+        }
+
+        fn ranges(&self) -> usize {
+            4
+        }
+
+        fn command_room(&self) -> bool {
+            true
+        }
+
+        fn room(&self, _: &JobAsk) -> bool {
+            true
+        }
+
+        fn command_asks(&self) -> usize {
+            4
+        }
+
+        fn wall_ns(&self) -> u64 {
+            0
+        }
+
+        fn freed(&mut self) -> bool {
+            false
+        }
+
+        fn moved(&self) -> u64 {
+            0
+        }
+
+        fn read_fields(&mut self, _: &mut Job) -> Result<bool, NodeError> {
+            panic!("a request is handed with its fields read")
+        }
+
+        fn took(&mut self, _: door::Paced) {}
+
+        fn committed(&mut self, _: u64) {}
+
+        fn filled(&mut self, _: u64, _: u64) {}
+
+        fn read(&mut self, _: u64) {}
+
+        fn windows(&self) -> crate::window::Windows {
+            crate::window::Windows::default()
+        }
+
+        fn holds(&self, _: u64) -> bool {
+            true
+        }
+
+        fn recharge(&mut self, _: u64, _: u64) {}
+
+        fn job_ended(
+            &mut self,
+            _: Option<u64>,
+            _: u64,
+            _: Option<usize>,
+            _: impl IntoIterator<Item = Pending>,
+            half: Option<Box<Native>>,
+        ) -> Option<Box<Native>> {
+            self.ended += 1;
+            half
+        }
+    }
+
+    impl Table {
+        /// A table of three volumes in three domains, their nodes seen, read at `applied`, whose
+        /// blocks take three copies.
+        fn volumes(applied: u64) -> Self {
+            let facts: Vec<root::Fact> = placed_in(&["a", "b", "c"])
+                .into_iter()
+                .map(|placed| root::Fact {
+                    placed,
+                    standing: mantle_meta::record::VolumeStanding::Active,
+                    presence: mantle_meta::record::Presence {
+                        present: true,
+                        ..mantle_meta::record::Presence::default()
+                    },
+                })
+                .collect();
+            Self {
+                placed: facts.iter().map(|f| f.placed.clone()).collect(),
+                standing: facts.iter().map(|f| f.placed.clone()).collect(),
+                facts,
+                ..Self::empty(applied)
+            }
+        }
+    }
+
+    /// A put of a body of many pieces and a get of its bytes in many pieces, each handed to a
+    /// driving shard, the second of a two-shard runtime, and driven over its lanes by a cell in
+    /// memory on the test's thread, which stands in for the node's task (node.md §2.9 step 6f):
+    /// the test gives the put's body a piece at a time as the node's task feeds it, each only once
+    /// the job let go of the last, and writes each reply as the node's task writes it, a get's
+    /// piece taken only once the last is written whole. The shard's task waits on its lanes and
+    /// its own deadlines, so each piece given or written wakes it through the door: the put is
+    /// answered `Done` and the get `Done` with the object's bytes exact.
     #[test]
-    fn what_a_version_metadata_or_a_copy_names_is_refused_before_anything_is_read() {
-        let get = |version: &str| Op::Get {
-            bucket: "b".into(),
-            key: "k".into(),
-            headers: Headers::default(),
-            version: Some(version.into()),
+    fn a_driving_shards_jobs_are_woken_by_their_doors() {
+        let rt = two_shards(4);
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        // Held far past the test, so no block's hold lapses under it.
+        gateway.handover_ns = 600_000_000_000;
+        let start = super::super::driving::Start {
+            command_asks: 4,
+            read_asks: 4,
+            chunk_asks: 4,
+            groups: vec![
+                (Layer::Bucket, 1),
+                (Layer::Name, 2),
+                (Layer::File, 3),
+                (Layer::Block, 4),
+            ],
+            ranges: 4,
+            wall: super::super::Wall::From(0),
+            gateway: std::sync::Arc::new(gateway),
+            requests: 3,
         };
-        for named in ["null", "0123456789ABC"] {
-            assert_eq!(refused(&work(get(named), None)), None, "{named}");
-        }
-        for invalid in ["", "nul", "0123456789AB", "0123456789ABCD", "0123456789ABU"] {
-            assert_eq!(
-                refused(&work(get(invalid), None)),
-                Some(Status::InvalidVersion),
-                "{invalid:?}"
-            );
-        }
-        let delete = Op::Delete {
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let mut lanes = super::super::driving::Lanes::start(holder, 1, start).unwrap();
+        lanes.tell_table(Box::new(Table::volumes(1)));
+        let mut doors = Doors::new(2);
+        let now = hyper_rt::futures::now_ns();
+        // Two blocks and part of a third: a body of many pieces, read back a block at a time.
+        let segments = Layout::new(durability::Scheme::Copies(3))
+            .unwrap()
+            .segments_per_block();
+        let block = usize::try_from(segments).unwrap() * mantle_s3::seal::SEGMENT;
+        let (object, trailer) = native_body(2 * block + piece_len() / 2);
+        let stream: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let put = Op::Put {
             bucket: "b".into(),
             key: "k".into(),
             id: 1,
-            headers: Headers::default(),
-            version: Some("not one".into()),
-        };
-        assert_eq!(refused(&work(delete, None)), Some(Status::InvalidVersion));
-        let put = |metadata: Metadata| Op::Put {
-            bucket: "b".into(),
-            key: "k".into(),
-            id: 1,
-            length: 1,
+            length: object.len() as u64,
             headers: Headers::default(),
             checksum: None,
             md5: None,
-            trailing: None,
-            metadata,
-        };
-        let at = vec![(
-            "x-amz-meta-k".to_owned(),
-            "v".repeat(mantle_s3::metadata::MAX_USER - 1),
-        )];
-        assert_eq!(refused(&work(put(at), None)), None);
-        let past = vec![(
-            "x-amz-meta-k".to_owned(),
-            "v".repeat(mantle_s3::metadata::MAX_USER),
-        )];
-        assert_eq!(
-            refused(&work(put(past), None)),
-            Some(Status::MetadataTooLarge)
-        );
-        let control = vec![("x-amz-meta-k".to_owned(), "a\nb".to_owned())];
-        assert_eq!(
-            refused(&work(put(control), None)),
-            Some(Status::InvalidArgument)
-        );
-        let source = mantle_s3::copy::Source {
-            bucket: "b".into(),
-            key: "k".into(),
-            version: None,
-        };
-        let part = Op::CopyPart(Box::new(object::CopyPart {
-            bucket: "b".into(),
-            key: "k".into(),
-            upload: "0123456789ABC".into(),
-            number: name::MAX_PART_NUMBER + 1,
-            id: 1,
-            source: source.clone(),
-            conditions: Headers::default(),
-        }));
-        assert_eq!(refused(&work(part, None)), Some(Status::InvalidArgument));
-        let copy = Op::Copy(Box::new(object::Copy {
-            bucket: "b".into(),
-            key: "k2".into(),
-            id: 1,
-            source: mantle_s3::copy::Source {
-                version: Some("bad".into()),
-                ..source
-            },
-            conditions: Headers::default(),
-            headers: Headers::default(),
-            directive: Directive::Copy,
+            trailing: Some(Algorithm::Crc32c),
             metadata: Vec::new(),
-            checksum: None,
-        }));
-        assert_eq!(refused(&work(copy, None)), Some(Status::InvalidVersion));
+        };
+        // The put's body as the node's task feeds it, from the sender its door lends, its door
+        // carrying the shard's word as `Node::read_fields` gives it.
+        let (put_half, mut put_replies) = doors.take().unwrap();
+        put_replies.driving = Some(lanes.doors());
+        let pieces = put_replies.body.take().unwrap();
+        let handed = std::sync::Arc::clone(&put_replies.handed);
+        let driving = put_replies.driving.clone();
+        let mut feeding = Some(feed(body_of(&put).unwrap(), pieces, handed, driving));
+        assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
+        let mut cell = Cell::new();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut put_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut get_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut rest = &stream[..];
+        let mut get_replies = None;
+        let (mut put_over, mut get_over) = (false, false);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !(put_over && get_over && cell.ended == 2) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the jobs never ended: put {put_over}, get {get_over}, {} ended",
+                cell.ended
+            );
+            lanes
+                .serve(&mut cell, |half| doors.give_native(half))
+                .unwrap();
+            // The body a piece at a time, each read only once the job let go of the last.
+            if let Some(fed) = feeding.as_mut() {
+                let over = match fed.send_held() {
+                    Some(Fed::Over) => true,
+                    Some(Fed::Still) => false,
+                    _ if fed.read_whole() => fed.end() == Fed::Over,
+                    _ if fed.free() => {
+                        let (read, left) = rest.split_at(rest.len().min(piece_len()));
+                        fed.give(read, &mut moved).unwrap();
+                        rest = left;
+                        false
+                    }
+                    _ => false,
+                };
+                if over {
+                    put_replies.body = feeding.take().map(Feeding::let_go);
+                }
+            }
+            let now = hyper_rt::futures::now_ns();
+            let body_read = feeding.is_none();
+            put_over = put_over
+                || put_replies.write(&mut put_seen, body_read, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            // The get, once the put is answered, of the bytes it wrote.
+            if put_over && get_replies.is_none() {
+                let (get_half, mut replies) = doors.take().unwrap();
+                replies.driving = Some(lanes.doors());
+                let get = Op::Get {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    headers: Headers::default(),
+                    version: None,
+                };
+                let read = scheming_gateway().charges.read(1);
+                assert!(lanes.hand(handover(get_half, get, read, now)).is_none());
+                get_replies = Some(replies);
+            }
+            if let Some(replies) = get_replies.as_mut() {
+                get_over = get_over
+                    || replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                        == Wrote::Over;
+            }
+            std::thread::yield_now();
+        }
+        // The shard's jobs' bytes, the put's body taken and the get's given, reach the node's
+        // side of the lanes, summed into the node's count (`Node::moved`).
+        while lanes.moved() != 2 * object.len() as u64 {
+            assert!(
+                std::time::Instant::now() < until,
+                "the shard's count never came: {}",
+                lanes.moved()
+            );
+            lanes
+                .serve(&mut cell, |half| doors.give_native(half))
+                .unwrap();
+            std::thread::yield_now();
+        }
+        let put_reply = reply_seen(&put_seen);
+        assert_eq!(
+            (put_reply.status, put_reply.size),
+            (Status::Done, object.len() as u64)
+        );
+        let get_reply = reply_seen(&get_seen);
+        assert_eq!(
+            (get_reply.status, get_reply.size),
+            (Status::Done, object.len() as u64)
+        );
+        let (head, _) = get_seen.answered.as_ref().unwrap();
+        let fields = object::ReplyHead::decode(head).unwrap().fields();
+        let fields = usize::try_from(fields).unwrap();
+        assert!(
+            get_seen.body[fields..] == object[..],
+            "the object's bytes exact"
+        );
+        assert_eq!(
+            get_seen.writes.len(),
+            4,
+            "the get's fields, then its three blocks"
+        );
+        rt.shutdown().unwrap();
+    }
+
+    /// A host's wait is its own jobs' alone (node.md §2.9 step 6e), so a driving shard's task can
+    /// wait on its host: none while it runs no job; a job whose ask is out is due at its client's
+    /// patience, an S3 door's get holding no beat; and at once once whoever serves it holds the
+    /// ask's answer, untaken.
+    #[test]
+    fn a_hosts_wait_is_its_own_jobs_alone() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut stub = Stub {
+            answer: |_| panic!("nothing is asked"),
+            answers: Vec::new(),
+            asked: 0,
+            no_room: false,
+            ended: Vec::new(),
+            abandoned: 0,
+            takes_halves: false,
+            half: None,
+        };
+        assert_eq!(host.due(&stub), None, "no job, no wait");
+        let get = work(
+            Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+            None,
+        );
+        let (mut job, _body, _answers) = local_job(get, now, 0);
+        job.pending.push((Pending::Read(0), None));
+        let patience = job.bound_ns();
+        host.jobs.push(job);
+        assert_eq!(host.due(&stub), Some(patience), "held to its patience");
+        stub.answers.push((
+            Pending::Read(0),
+            Outcome::Read(ReadOutcome::Read(Box::new(Read::Current(None)))),
+        ));
+        let due = host.due(&stub).unwrap();
+        assert!(
+            (now..patience).contains(&due),
+            "due at once once answered: {due}"
+        );
+    }
+
+    /// The node lends its host out for each turn (`Node::lend`) and takes it back: the host taken
+    /// leaves its default in its place, which asks the allocator for nothing, and the host given
+    /// back keeps its jobs, its doors and its gateway's settings.
+    #[test]
+    fn a_hosts_lend_asks_the_allocator_for_nothing() {
+        let gateway = std::sync::Arc::new(scheming_gateway());
+        let mut held = Host::new(2, Some(std::sync::Arc::clone(&gateway)));
+        let (native, replies) = held.doors.take().unwrap();
+        held.doors.keep(native, replies);
+        let (job, _, _) = local_job(Work::Draining(Box::new(Reply::status(Status::Done))), 0, 0);
+        held.jobs.push(job);
+        hyper_measure::alloc::begin();
+        let mut lent = std::mem::take(&mut held);
+        assert!(held.idle() && held.gateway.is_none());
+        lent.moved = 1;
+        held = lent;
+        let counts = hyper_measure::alloc::end();
+        assert_eq!((counts.allocations, counts.reallocations), (0, 0));
+        assert_eq!(
+            (held.jobs.len(), held.doors.kept.len(), held.moved),
+            (1, 1, 1)
+        );
+        assert!(
+            held.gateway
+                .is_some_and(|g| std::sync::Arc::ptr_eq(&g, &gateway))
+        );
     }
 }

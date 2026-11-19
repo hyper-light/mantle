@@ -1500,10 +1500,12 @@ becomes:
   length, which its head states before its fields are read: its first segment and first block,
   the largest of its own, each chunk of a block copied to send, and a piece of its body, under
   the scheme that holds the most of it (`put::bytes_for`); the driver reserves its segment at the
-  same length. That piece is the one its body is read into: the host reads a native put's body,
-  and an admitted operation's fields and what it drains of a body, into memory of the
-  operation's own that its charge holds (`node::read_piece`), never a piece of the transport's
-  budget, which every connection's windows, receive chunks, heads and frames share (§3.3). A body
+  same length. That piece is the one its body is read into: the node's task reads a native put's
+  body, and an admitted operation's fields and what it drains of a body, into memory of the
+  operation's own that its charge holds (`node::read_piece`; a put's feeding's storage, which each
+  piece is copied into from the one piece the node's task reads with, `Node::piece`, §2.9 step
+  6c), never a piece of the transport's budget, which every connection's windows, receive chunks,
+  heads and frames share (§3.3). A body
   read a piece of that budget at a time waited, while other traffic held it, on no ask of its own:
   the host held nothing of it, so vouched for nothing, and the budget freeing woke nothing; its
   client, judging the exchange once a period, gave it up (the node suite's 20 MiB put
@@ -1696,6 +1698,7 @@ the node already states, and each refusal typed (CLAUDE.md §2):
 | Log updates | a range's shard, to the log's owner | hyper-log's bounded owner channel | `LogError::Busy`: the range waits for room (§2.2's stall) |
 | Native requests | the endpoint, to a driving shard | the exchanges the transport admits (§2.8's pool) | parked, then `SlowDown` at the client's deadline (§2.8) |
 | Chunk puts and gets | a driving shard, to the endpoint | `chunk_asks` | refused, as `Node::put_chunk` refuses now |
+| A native reply | a job, to the endpoint's shard | one answer, the least that moves a reply (`door::Replying::FIRST_ANSWERS`), a get's piece given only once the last is written whole (6c) | held in the job's door, its client held by its stream's flow control |
 
 A shard that ends takes its ranges with it, which nothing else holds, so the node stops and its
 next start recovers them from the log (§1.7), as it stops for a lost task now.
@@ -1716,7 +1719,75 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
 4. The command and read lanes, and their answers.
 5. The rule over the runtime's shards, which places the ranges, and `lanes_per_peer` (§3.2) the
    shards that run ranges, at most the ranges the node hosts.
-6. Native requests driven past the first shard.
+6. Native requests driven past the first shard, in seven parts, each an hour's work, unit-tested
+   and merged before the next. With one shard, or none past the first that `NodeSettings::shards`
+   names (`range_shards = first`), every request stays on the first shard, as now.
+   - *6a, the rule and its count* (`node::drivers`; `host::start_object`, `Node::step_host`,
+     `Node::job_lost`): a native request the host admits is placed on the shard past the first
+     with the fewest requests running, the first of those tied, as an S3 connection is placed
+     (`listener::shards::least`), and counted there until its job ends; over the one shard the
+     node's task drives every request on, so each is placed on the first, where it runs.
+   - *6b, a job's asks as values* (`host::ask_put`, `ask_get`, `ask_command`, `asked`,
+     `take_answers`, `drop_abandoned`, `host_due`; `Node::command`, `Node::read`,
+     `Node::put_chunk`, `Node::get_chunk`): each ask a job makes of the node, a range's command or
+     read or a chunk's put or get on a volume, the volume's node named by the node's table, is one
+     value served by one function of the node's, refused `NodeError::Asks` past `command_asks`,
+     `read_asks` or `chunk_asks` as now and asked again at the job's next turn, so a lane can carry
+     it. Every job still on the first shard.
+   - *6c, the native door as the S3 door's* (`host::read_fields`, `feed_put`, `write_fields`,
+     `drain_job`, `send_held`, `write_get`; `Door`, `Local`; `crate::door`): a native request's
+     fields are read on the first shard, then its operation is run by a job whose body comes on a
+     bounded channel the node's task fills from the exchange, at the depth a body's pieces need
+     (`door::Depth`), and whose answers the node's task writes to the exchange from a channel at the
+     depth a reply needs (`door::Replying`), as an S3 connection does for its job (`Door::Local`).
+     The node's task keeps the exchange: its vouching (`Endpoint::working`) and its end
+     (`Node::job_lost`). What the node's task does for the exchange is the exchange's half of what
+     the job does now: a body's pieces read as `feed_put` reads them and given as an S3 connection
+     gives them (`door::Piece`, its end carrying the trailer's checksum), and a reply's head, fields
+     and bytes written as `write_fields` and `write_get` write them. So it may land as two: the
+     body, then the reply.
+   - *6d, a host of its own* (`host::Job` and the host's `impl Node`; `Node`'s `jobs`, `abandoned`,
+     `gateway`, `moved`, `slowed`): the jobs and what they hold move from `Node` into a `host::Host`
+     that the node's task holds and steps, its asks (6b) served by the node, its doors (6c) channels
+     and its puts placed by the volume table the node last read (`Node::table`, `host::Table`), so a
+     shard past the first can hold one. Admission, parking and the put window stay the node's, one
+     authority for its bottleneck (§2.5), told of each job's end and each put's samples of its
+     blocks (`Window::committed`, `Window::filled`); the bytes moved and the `SlowDown`s by cause
+     are each host's, summed where `Node::moved` and `Node::slowed` are read. The largest part,
+     which may land as two: the state, then the steps.
+   - *6e, a driving shard's task and its lanes* (a module beside `node::shard`, made as
+     `shard::Lanes` is): a task on a shard past the first holding a `Host`, started through that
+     shard's control queue as the listener's takers are, Normal as the S3 connections beside it.
+     Into it, each request handed, its operation and its door's ends, at most the exchanges the
+     transport admits at once (`parked_most`), each request handed holding one; and each volume
+     table the node reads, the latest superseding the rest, as a far root range's rows reach the
+     node (`Out::Rows`). Out of it, its jobs' asks, the host holding each kind to the node's bound
+     for it (`command_asks`, `read_asks`, `chunk_asks`) and refusing one past it `Asks`, asked again
+     at the job's next turn, each with a slot for its answer made as it is asked
+     (`hyper_rt::sync::oneshot`), so the answer cannot be refused; the node's task answers `Asks` in
+     the slot of one it has no room for now, its other asks holding the room (the table above). And
+     each job's end with its put's samples, the host's counts, and each held job's beat, by which
+     the node's task tells its exchange's asker its work is held (`Endpoint::working`, research/77
+     D1). Production starts none. Tested on a two-shard runtime: a request handed is driven there,
+     its asks served by the node's task, its end given back; a full lane refuses, typed; a shard
+     whose task ended stops the node, `NodeError::ShardEnded`.
+   - *6f, requests placed by the rule* (`host::start_object`, `Node::spread`, `process::serve`,
+     `derive::shard_shape`, `node::shard_lanes_bytes`): each native request admitted, its fields
+     read, is handed to the shard 6a's rule picks among those `NodeSettings::shards` names past the
+     first, passing over one hyper-rt's watchdog sees held past its limit (`Lane::takes`); one a
+     lane refuses runs on the first shard, its place in the count moved there. `process::serve`
+     starts each driving shard's task; `derive::shard_shape` and the memory floor count it and its
+     lanes. Tested: requests spread by the count, and one a lane refuses runs on the first, counted
+     there. No node test runs the object host (each opens its nodes with no gateway), so the native
+     suite (`crates/mantle/tests/native.rs`) run under `range_shards = spread` is the end-to-end
+     test, and the ladder the measure.
+   - *6g, a far range's commands from the driving shard* (`shard::In::Propose`, `shard::Refusal`,
+     `Node::propose_asked`, `Asking`): a command or read of a range this node leads on a shard
+     past the first goes from the driving shard to that range's shard on its command lane, its
+     answer in a slot of the asker's (the table above); a range a peer leads, or one on the first
+     shard, still through the node's task and its transport. How the node's session with a range
+     (`Asking`, §6.6) is kept once its commands come from several shards is the first thing 6g
+     settles.
 7. In hyper-raft: hyper-log's frames in flight past one, sized to the device's measured knee.
 8. In hyper-raft: connection IDs that name their shard, and datagrams routed by them.
 
@@ -2030,6 +2101,575 @@ range, and neither changes. Tested: the task is spawned Critical and what it spa
 (`tests/shard_memory.rs`). What it buys in commit latency under S3 load is the `spread` ladder's
 to measure.
 
+*As built (2026-11-18), step 6's first part: the rule and its count* (6a,
+`crates/node/src/node/drivers.rs`). `Drivers` holds the native requests running on each of the
+node's shards, numbered from its first, and places each request the host admits, taken at once or
+from those parked (`host::start_object`), by the rule of 6a: the shard past the first running the
+fewest, the first of those tied, and the first where it is the only shard, as
+`listener::shards::least` places an S3 connection. The job keeps the shard it was placed on
+(`Job::driven`) and gives its place back as it ends: at the turn it is over (`Node::step_host`),
+or as its exchange ends unanswered (`Node::job_lost`). A request answered at once (refused,
+malformed or slowed) and an S3 door's operation are placed nowhere. The node holds it over the one
+shard its task drives every request on (`NonZeroUsize::MIN`), so each request is placed on the
+first, where it runs, until 6f places them over the shards `NodeSettings::shards` names, passing
+over one hyper-rt's watchdog sees held past its limit, as the listener's lanes do
+(`Lane::takes`). Bound: an entry a shard, and each count at most the host's jobs, each request
+placed being one; a count past a `usize`'s places nothing, and the request is answered `Failed`,
+one the host cannot run. Tested (`node::drivers`): a node of one shard drives every request on
+it; a request goes to the shard past the first running the fewest, the first of those tied, never
+the first while another exists; one that ended gives its place back to the rule; every shard past
+the first stays within one request of every other, from one shard to nine and one request to
+forty; an end where none runs counts nothing; and a count past a `usize`'s is refused, nothing
+placed. The host places and gives back inside a `Node`, which no unit test builds; the native
+suite (`crates/mantle/tests/native.rs`) runs both end to end.
+
+*As built (2026-11-18), step 6's check: what a driving shard is handed may cross threads.* What
+6b to 6f hand between the endpoint's shard and a shard that drives native requests is `Send`: a
+request's operation (`object::Op`), and its door's request, pieces and answers (`door::Request`,
+`Piece`, `Answer`), as the S3 listener already hands them across; a job's asks, a range's command
+(`wire::Command`) or read (`read::Query`) and a chunk's bytes (`Bytes`) and key (`ChunkKey`); their
+outcomes (`CommandOutcome`, `ReadOutcome`, `ChunkOutcome`); and the volume table puts are placed by
+(`host::Table`). The gateway's settings, its root keys among them (`GatewaySettings`), are `Sync`
+too, so every shard's host may share one;
+`node::tests::a_native_requests_work_may_cross_to_the_shard_that_drives_it` holds this at compile
+time. A job's drivers (`Put`, `Get`, the bucket's `Coordinator`) need not cross: a request is
+handed over once its fields are read, before its work is made (6c, 6f), so they are made on the
+shard that drives them. So step 6 needs no change in hyper-raft for what crosses.
+
+*As built (2026-11-18), step 6's second part: a job's asks as values* (6b,
+`crates/node/src/node/host.rs`). Each ask a job makes of the node is one value, `host::JobAsk`:
+a range's command or read, its group and its command or query, asked as a gateway asks one, until
+the range answers or its budget passes without a leader (`Wait::Request`), as every job asked
+before; or a chunk's put or get on a volume, of the node the volume table names as holding it,
+within the job's patience. `Node::ask` serves it by `Node::command`, `Node::read`,
+`Node::put_chunk` or `Node::get_chunk`, as the job called them, and says what the job waits on
+(`Pending`); `Node::outcome` takes that outcome once answered, which `take_answers` gives the job
+and `drop_abandoned` drops for a job that ended, and `Node::has_outcome` says whether it came
+(`host_due`). The bounds are as they were: each kind held to the node's (`command_asks`,
+`read_asks`, `chunk_asks`), one past it refused `NodeError::Asks` and asked again at the job's
+next turn. The S3 door's key lookups (`host::step_lookups`) are no job's asks and keep the node's
+read. Every job is still driven on the first shard. Tested: the host's and the node's unit tests
+pass over it unchanged, as nothing a job asks or is answered changed, which no test can show red;
+`node::tests::a_native_requests_work_may_cross_to_the_shard_that_drives_it` holds the value
+`Send`, so a lane may carry it (6e).
+
+*As built (2026-11-18), step 6's third part, its first half: a native put's body as the S3 door's*
+(6c, `crates/node/src/node/host.rs`). A native request's fields are read by the node's task as
+before (`read_fields`); once they name a put (`Op::Put`, `UploadPart`, `Append`), its job's door
+becomes `Door::Fed`: the job takes its body from a bounded channel (`host::Pieces`) as an S3 job
+takes the listener's, through one function both doors' puts are fed by (`take_body`, which
+replaced `feed_put`'s read of the exchange and `feed_local_put`), and the node's task keeps the
+exchange's half (`host::Feeding`, `Node::feed_bodies`, after the host's step at each turn): it reads
+each piece the transport delivers as `feed_put` read it, gives the object's bytes as
+`door::Piece::Bytes`, keeps the trailer's value past them, and gives `Piece::End` carrying the
+trailer's checksum once the transport verified the body whole (`body_complete`), as an S3
+connection gives a body's end; the bytes read with the fields stay the job's carry, the trailer's
+among them the feeding's. Bounds: the channel holds one piece, the least that moves a body
+(`door::Depth::FIRST`), and a piece is read only once the job let go of the last, so while the
+job's driver takes nothing, nothing is read and the stream's flow control holds the client, as when
+the job read its exchange; an end the channel has no room for is held, one, and given once the job
+takes the last piece; one feeding a native put, each one of the host's jobs. Copies: a piece is
+copied once out of the transport's reservation, into storage of the feeding's own (`BytesMut`)
+that the piece the job takes is a view of (`Bytes`), where the job copied it into the bytes it
+carried; then once into the driver, as before. The storage is made at the first piece as large as
+what is left of the object, at most a piece, and reused once the job let the piece go, reclaimed
+whole (`try_reclaim`), so no piece allocates past the first, as no piece did; what a put asks
+once more is its channel and the job's end of it in its door. The transport gives no
+owned bytes of a body: `Endpoint::read_body` copies QUIC's chunks into its owner's reservation, so
+handing QUIC's own chunks over, a copy fewer, is a change to hyper-transport, not made here. What
+the job did is kept: a job that lets go of its body, refused or done before its end, drops its
+channel, the node's task reads and drops the rest, and the job's reply goes once the body is read
+whole (`drain_job`); an exchange that fails tells the job `IncompleteBody` on its channel, and its
+end (`Node::job_lost`) lets both go; the job's vouching, its patience and its `SlowDown`s are as
+they were, and its reply is still written to the exchange by the job. A feeding that moved makes
+the node's next turn due at once (`host_due`), so the job takes what it was given there: a native
+put's body moves a piece a turn, where its job read as many as its driver took in one, the S3
+door's pace at its first depth. Tested (`node::host`): a body's pieces reach the driver in order and
+whole, its CRC-32C trailer holding, and a trailer that does not hold is refused (`BadChecksum`); a
+full channel holds the stream's bytes, the next piece read only once the job let go of the last,
+into the same storage, and an end held behind it given once it is taken; a stopped or reset stream
+ends the job `IncompleteBody`, and a job that let go has the rest dropped; and 63 pieces past the
+first ask the allocator for nothing, as the job's own read of them asked nothing (0 and 0
+allocations, 0 and 0 reallocations), each a view of the one storage. No node test runs the object
+host (each opens its nodes with no gateway), so the native suite (`crates/mantle/tests/native.rs`)
+is the end-to-end test, and the ladder its measure. Left then, 6c's second half: the reply, the
+drain and the exchange's end (below).
+
+*As built (2026-11-18), step 6's third part, its second half: a native reply as the S3 door's*
+(6c, `crates/node/src/node/host.rs`). Every native request the host takes gets its door as it is
+taken (`host::native_door`, in `start_object`): the job's ends (`host::Native`) and the node's
+task's (`host::Replies`, held in `Node::replies`). The job gives its reply on a bounded channel as
+an S3 job gives its connection `door::Answer`s (`host::Told`): a reply with no bytes past its fields
+(`Told::Reply`, every refusal and every operation's end but a get's), its head and fields encoded
+by the job (`Reply::encode`) with its `SlowDown`'s cause; a get's held reply (`Told::Head`, from
+`send_held`), its head carrying the range's length (`getting.total`); a get's pieces as its driver
+gave them (`Told::Bytes`); and its end (`End`, or `Failed` past its head). The node's task writes
+them, after the host's step and the bodies' feeding at each turn (`Node::write_replies`): a
+`Told::Reply` once the body's feeding ended and the rest of the body is read whole and dropped
+(`drop_body`), as `drain_job` read it, then `Endpoint::reply` with the fields' length, the
+`SlowDown` counted for its cause as it goes, the fields, and the exchange's end; a get's head with
+the fields' length and the range's, then its fields and each piece by `Endpoint::write_body_bytes`,
+kept by QUIC by reference, then `end` or, for `Failed`, the exchange refused. `drain_job`,
+`write_get` and `send_held` give to the door and write nothing; `write_fields` and `Work::Replying`
+are gone. Vouching goes the same way: a held job says so on its door (`Native::held`), and the node's
+task tells the exchange's asker at its next write (`Endpoint::working`). The bytes a native job moves
+(its body's pieces taken, its range's pieces given) it counts in its door, and the host's step takes
+them as a value into `Node::moved` (`Node::turn_job`), so a native job touches nothing of the node's
+but its door; the fields the node's task writes and the body it drops it counts itself. The S3
+door's depth is sampled only by S3 jobs, which run on the node's task (§4.1), as before.
+
+Bounds. The channel holds one answer, the least that moves a reply (`door::Replying::FIRST_ANSWERS`),
+and a job gives its fields or a piece only once the node's task wrote the last whole: the two share
+the count of what is given and unwritten (`host::Handed`, atomics, as `door::Learned` is shared with
+the S3 connections), so a get holds one piece taken from its driver past its window, the one
+`derive::Charges` counts ("a get's block taken and written out"), as when its job wrote its
+exchange; a deeper channel at the learned reply depth would hold pieces past that charge. An answer
+the channel has no room for waits in the job's door (`Native::pending`), at most its end behind its
+last piece, so a full exchange holds the job, and the client, whose stream's flow control it is,
+holds both: nothing grows. `Node::replies` holds one a native request the host took, each let go
+with its exchange (`job_lost`), or once its reply is written whole or refused, so at most the
+exchanges the transport holds; one the node's task lets go tells its job (`Handed`'s `gone`), which
+ends. The node's stop waits for every reply written as for every job ended (`step_stop`). A job's
+reply channel that cannot be made refuses its exchange `Budget`.
+
+Copies. None added: a get's piece reaches `write_body_bytes` as its driver gave it, where the job's
+own write copied it into QUIC's buffer (`write_body`), so a piece is copied once fewer; a reply's
+fields are moved into `Bytes`, not copied.
+
+Pace. A get's pieces do not go one a turn: a piece is given only once the last is written whole, so
+where one is written whole and its exchange takes more, the node's task asks the job for the next
+within the same turn (`Wrote::More`, `Node::write_replies`), as many as the exchange takes, at most
+a window's (`GatewaySettings::window`, the pieces the driver holds read at once) and its fields and
+end past them, a turn whose rounds ran out making the next due at once (`Node::replied`, `host_due`).
+So a large get takes the turns its job's own writes took: each turn writes what its driver has ready
+as far as the stream's credit goes, the stream's window at most (`stream_window_ceiling`, about
+2.3 MB), and its end in the turn its last byte is written. A reply with no bytes past its fields goes
+in the turn its job ends, as `drain_job` wrote it; the job now ends as it gives it, as an S3 job ends
+as its answers are taken, the drain and the write the node's task's.
+
+Tested (`node::host`): a native get's reply reaches its exchange whole and in order, its head's
+length the fields' and the range's, in the turns its exchange's credit takes (5,000 bytes a turn: the
+reply's bytes over 5,000), and in one turn where the exchange takes everything; a driver failing past
+the head refuses the exchange; a `SlowDown` waits for the request's body, then goes whole, counted
+for its cause; a full reply channel holds the job, which takes no piece from its driver while one is
+unwritten, and an answer past the channel's room waits in its door in order; a held job is vouched
+for through the node's task, once each time it says so; a stopped stream refuses the exchange and
+ends the job, and a job that let go leaves nothing to write; and 63 pieces past the first reach the
+exchange each in its own storage, asking the allocator for nothing (0 allocations, 0 reallocations).
+The host and node unit tests pass unchanged. No node test runs the object host, so the native suite
+(`crates/mantle/tests/native.rs`) is the end-to-end test, and the ladder its measure.
+
+What 6d needs first: the host's step (`step_host`, `turn_job`) and its jobs move into `host::Host`
+with their own counts (`moved`, `slowed` by cause, both now applied as values), its asks served by
+the node as 6b made them; `Node::write_replies`' ask for a get's next piece becomes the node's task
+stepping the host's reply step for one job, and `read_fields`, still a job's step that reads its
+exchange, becomes the node's task's before the job is made (6f), as `drop_body` already is.
+
+*As built (2026-11-18), step 6's fourth part, its first half: the host's state, and its doors kept*
+(6d, `crates/node/src/node/host.rs`). The jobs the node's task runs, the bytes their work moves and
+the doors of native requests are a `host::Host` the node's task holds (`Node::host`). `Node::moved`
+sums the node's task's count (fields read, bodies dropped, a trailer's value, a reply's fields
+written, chunks sent and received) and the host's (a body's pieces taken and a get's given, on
+either door). The `SlowDown`s by cause stay the node's: since 6c its task counts each as it writes
+the reply that carries its cause (`Opening::slowed`), and it writes every native reply wherever its
+job runs, the S3 door's counted by its listener. Admission, parking, the put window, the rule's
+count, the key lookups and the asks' outcomes stay the node's, `abandoned` among them, which repair
+shares; the node's step of the host (`step_host`, `turn_job`) still reads each job's end and tells
+admission and the rule, until the steps move (the second half, below).
+
+The doors kept (`host::Doors`). A native request's door, its reply's channel and what its two
+halves share (`Handed`), was made as the request was taken and dropped as it ended, even for one
+refused at once: 5 allocations (2,792 bytes) for the channel and what its halves share, a sixth
+boxing the job's half (`Native`) and a seventh at its first answer, its queue of held answers. Now
+the host keeps them: a request takes a door kept, one made only where none is; each half is given
+back as it is let go, the job's as its job ends (`turn_job`, `job_lost`), the node's task's once its
+reply is written whole or refused or its exchange ended (`write_replies`, `job_lost`); and a door
+both of whose halves are back is emptied of what its job gave that the node's task never took, its
+words cleared, and kept with its storage, its queue's among it. A kept door closes neither end of
+its channel, so its words say what the ends' drops said: `Handed::gone`, the node's task let go,
+which the job's `flush` reads before it sends; and `Handed::ended`, the job let go, read before the
+channel, so the node's task's write, finding the channel empty, ends the reply rather than waiting
+on it. A half dropped still closes its end, as before. Bound: the doors kept are at most the
+exchanges the transport holds at once (`parked_most`), as each door out is of an exchange the node
+holds, one given back past them let go; a half given back first waits for its other, then still out
+in a job or a reply of a request the node holds. A put's body channel (`host::Pieces`, `Feeding`) is
+still made for each put: kept the same way, its ends' drops would become the door's words too, in
+the body's code (`take_body`, `Feeding::send`), which upload-stall changes now.
+
+Tested (`node::host`): past its first request, 64 requests each take the one door kept, whichever
+half comes back first, the job's end given and written through it, and ask the allocator for nothing
+(0 allocations, 0 reallocations), where making a door asks it 5 times; a door given back with an
+answer the node's task never took is emptied, its next request's job not told its reply is gone nor
+its node's task that its job ended; and a host holding two exchanges keeps two doors, the third
+given back let go. The host and node unit tests pass unchanged.
+
+What the second half needs: the steps move into `impl Host`, each served by the node through one
+interface a shard's task can drive later (its asks, their outcomes, the volume table, the ranges'
+groups, the wall clock, a local door's pacing, the put window's samples and each job's end, its
+admission's charge, its shard and its asks let go); the node's step of the host takes the host out
+of `Node` for its turn (`std::mem::take`, allocating nothing) and hands it back; `write_replies`' ask
+for a get's next piece steps one job of the host; and a job's fields (`Work::Fields`, `read_fields`)
+are read by the node's task, served as one of those asks until 6f reads them before the job is made.
+
+*As built (2026-11-18), step 6's fourth part, its second half: the steps* (6d,
+`crates/node/src/node/host.rs`). The job steps (`Host::step`, `turn_job` and every job's step:
+its asks, its answers, its reply given to its door and its end) are `impl Host`'s, each generic
+over one interface, `host::Serve`, which the node implements and a test's stub implements too: a
+job's ask and its outcome (`ask`, `outcome`, as 6b made them), the asks a job let go (`abandon`),
+the volume table (`table`), the ranges' groups and their count (`group_of`, `ranges`), the room
+and bound for commands (`command_room`, `command_asks`), the wall clock (`wall_ns`), whether room
+at a volume or in the transport was freed (`freed`), the node's own count of bytes moved
+(`moved`), a native job's fields read from its exchange (`read_fields`, the node's task's until 6f
+reads them before the job is made), the S3 door's pacing samples (`took`), the put window's
+samples (`committed`, `filled`), and each job's end with its admission's charge, its shard and the
+asks it let go (`job_ended`), by which the admission learns its latency, the stream pool is sized
+again and the rule's count is given back. The node's task lends the host out for its step
+(`Node::lend`): `std::mem::take` leaves the default host in its place, which holds nothing and
+allocates nothing, and the host is put back whatever the step came to, an error among them; the
+node drops the outcomes of asks whose jobs ended and steps the S3 door's key lookups first, as
+before. `write_replies`' ask for a get's next piece steps that one job through the same lend. The
+gateway's settings are one `Arc` made with the node and shared with its host, not made per turn.
+The node keeps admission, parking, the put window, the rule's count, the key lookups, the asks'
+outcomes and `abandoned`, which repair shares, each exchange's fields read, body fed and reply
+written, and `host_due`, `hosts` and `job_lost`, which read the host between its turns.
+
+The doors kept (6d's first half) are at most one an operation the host runs at once
+(`GatewaySettings::objects`), within the exchanges the transport holds (`parked_most`), and the
+memory floor's records of a native operation (`host::record_bytes`, `derive::native`) count one
+door kept beside the operation's own: its place in the host's keep, its job's half boxed and what
+its halves share. A put's body channel (`host::Pieces`, `Feeding`) is still made for each put:
+pooling it changes `take_body` and `Feeding::send`, which upload-stall's body reading rewrites
+(`43357e2d`, a body read into the piece its admission charged); it is pooled once that merge lands
+(below).
+
+Tested (`node::host`): the host and node unit tests pass unchanged; a host driven only through
+`Serve`, by a stub that answers each ask at the host's next turn, steps a put and a get to their
+ends: the put of an empty object takes its body's end from its door, asks its Name range to commit
+it and is answered `Done` with the version written, the get reads its current version, an empty
+one, makes its driver over it and is answered `Done`, and each job's end is told with its charge,
+its shard and no ask let go; and the lend asks the allocator for nothing (0 allocations, 0
+reallocations), the host given back with its jobs, its doors and its gateway. The stub drives the
+S3 door's jobs, whose steps are a native job's: a native door's exchange (`ExchangeId`) is made
+only inside hyper-transport.
+
+What 6e needs first: the host's wait split from the node's (`Node::host_due` reads the host's
+answered asks, its puts' renewals and its held jobs' bounds beside the node's lookups, feedings and
+replies), so a shard's task waits on its host's alone; and a `Serve` of the driving shard's over
+its lanes, each ask sent with its slot (`hyper_rt::sync::oneshot`) and its outcome taken from it,
+the host holding each kind to the node's bound for it, the latest volume table handed in held for
+`table`, the ranges' groups handed with the task's start (a range's layer and group do not change
+in a process), `read_fields` refused (a request is handed with its fields read, 6f), `took` none
+(the S3 door's jobs stay on the first shard), and `freed`, `committed`, `filled` and `job_ended`
+each a lane message, as is a chunk's piece moving a job's work (`Host::chunk_moved`), which the
+node's task sees on its transport.
+
+*As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
+The node's task reads every native body, so it reads them as upload-stall's job did, never into a
+piece of the endpoint's budget: a job's fields straight into their buffer, made at their length as
+it was admitted, and nothing past them, so a put's body comes whole through its feeding and its
+work carries none (`work` takes no carry); each of its pieces read into the one piece the node's
+task reads with (`Node::piece`, made once, at most a piece) and copied once into the feeding's
+storage, the piece the put's admission charged it for, as 6c copied it out of the budget's piece;
+and what is left of a body after its reply drained into that piece where its job was admitted, a
+body already whole reading nothing, and through the endpoint's one piece for its owner's reads
+where it was answered at once, charged nothing (`Node::drop_body`, `Opening::admitted`). The node's
+task writes every native reply (6c), so a reply the budget has no room for waits there
+(`Replies::wait_for_room`), the job having ended as it gave a reply with no bytes past its fields:
+its head, or the piece a body answered at once drains through, refused `Budget`, it is held,
+offered again at each turn and its exchange vouched for, the node's turn due at each beat
+(`Replies::room_due_ns`, `host_due`) within its client's patience as its job's bound stood when it
+gave the reply (`Opening::bound_ns`), and past it its exchange is refused `Budget`; a get's head
+waits the same way, its job taking no piece meanwhile, as none is written; a reply no message
+holds refuses its exchange `FrameBound` (`Told::Failed`, which carries its refusal). A put whose
+chunk waits for room is offered it again at each beat on either door by the host's own step
+(`Host::step`, `Host::room_offered_ns`), so a driving shard's host offers its own. Tested
+(`node::host`): a reply whose head the budget refuses waits, vouched for at each turn and due at
+its beat, then goes whole, or past its patience is refused `Budget`, a get's head the same, and a
+reply no message holds is refused `FrameBound`; an S3 put waiting for room is due at its beat;
+tests/put_body.rs, red then green on upload-stall, passes over the merged code.
+
+*As built (2026-11-18), step 6's fifth part, its first piece: a host's own wait, and the node's
+piece in its floor* (6e, `crates/node/src/node/host.rs`, `crates/node/src/derive.rs`). The host's
+wait is its own jobs' alone (`Host::due`): at once where whoever serves it holds the answer of
+one of its jobs' asks, untaken (`Serve::answered`, the node's `has_outcome`), as an answer that
+came after the host's step in a turn waits on no event; else its puts' renewals, and the beat or
+bound of each job whose work is held. `Node::host_due` keeps beside it what the node's task waits
+on itself: an ended job's answered ask, its outcome to drop (`abandoned`), a lookup answered, a
+body fed at the last turn, a reply whose rounds ran out, and a reply waiting for room in the
+endpoint's budget (`Replies::room_due_ns`). So a driving shard's task can wait on its host and
+nothing of the node's. The piece the node's task reads every native body into (`Node::piece`,
+`node::PIECE`, one a node, made once, at most a piece, outside the transport's budget) is counted
+in the floor's transport class (`derive::Class::Transport`, §1.4). Tested (`node::host`): a host
+running no job waits on nothing; a job whose ask is out is due at its client's patience; and once
+the ask's answer is held, at once. The host, node and derive unit tests and tests/put_body.rs
+pass.
+
+What 6e needed still, as worked out: the lanes, in `node::driving` beside `node::shard`, and the
+body's channel kept with its door. Built since (below): a native door's exchange optional, a job's
+end carrying its door's half, the body's channel kept with its door, and the lanes.
+
+- *The answer slots, pooled.* `hyper_rt::sync::oneshot` boxes the block its ends share and makes
+  its ring at each one made (`ring::Shared::new`, `Ring::new`), so a slot made as it is asked
+  allocates per ask. A lane of answers from the node's task to the driving
+  shard, made once and holding `command_asks + read_asks + chunk_asks` values, is a pool of those
+  slots: the shard's host holds each kind to the node's bound for it, each ask holding its place
+  from its send until its answer is taken (an abandoned ask's until its answer comes and is
+  dropped), so the node's task never finds the lane full and an answer cannot be refused, and the
+  steady state allocates nothing past what the ask's own value holds.
+- *An ask the node has no room for is held by the node's task, not answered `Asks`.* Answered
+  `Asks` in its slot, the shard would ask it again with nothing to wait on but the next answer, a
+  loop between the two tasks for as long as the room stays taken; and the job cannot take it back,
+  its driver's request having become the ask. The node's task holds it, in order, at most the
+  asks the shard's host holds (its count), and asks it at each turn while it has room
+  (`Node::command_room`, the read and chunk bounds checked as `Node::read` and
+  `Node::put_chunk` check them, before the ask's value is given up). An ask `Node::ask` refuses
+  otherwise is answered its kind's refusal (`CommandOutcome::Refused`, `ReadOutcome::Refused`,
+  `ChunkOutcome::Lost`), which the job ends `Failed` on as it does now.
+- *The node's side of the lanes is generic over `Serve`*: each ask taken from the lane served by
+  `Serve::ask`, each held ask's outcome sent once `Serve::outcome` gives it, and each job's end and
+  put sample told through `Serve::job_ended`, `committed` and `filled`; so a unit test serves a
+  two-shard runtime's driving task from the test's thread with the stub (`Stub`), as no unit test
+  builds a `Node`, and the node serves it in 6f by lending its host as it does now.
+- *A job's end carries its door's half back.* A driving shard's host keeps no doors: its job's
+  half (`Native`) would wait in its `Doors` for a `Replies` half the node's task keeps, and that
+  wait has no bound there. So `Serve::job_ended` takes the job's half and gives back what the host
+  keeps: the node's own, the half, kept in its doors as now; the lanes', none, the half riding the
+  job's end to the node's task, which gives it to its doors.
+- *A request handed carries its operation, not its work* (its door's job half, its principal, its
+  `Op`, its Open's block, its deadline, its admission and its shard), and the shard makes the work
+  (`work`), as a job's drivers need not cross (step 6's check). Its door's exchange is the node's
+  task's alone: `ExchangeId` is made only inside hyper-transport, so a test cannot make a request
+  that names one, and the shard needs none (`Door::Native`'s exchange becomes optional).
+- *The rest of `Serve` over the lanes*: the volume table the node last read handed in, a settled
+  copy (its scheme chosen on the node's task), the latest superseding one the lane had no room for;
+  the ranges' groups, their count, the ask bounds and the node's wall clock (`Wall`, `Copy`) handed
+  at the task's start; `read_fields` refused, typed; `took` nothing; `freed` a flag the node's
+  task tells, held while the lane is full; a chunk's move (`Host::chunk_moved`) told by the number
+  the shard gave its ask, dropped where the lane is full, its next piece telling it again.
+- *Production starts none, and compiles every piece*: with no `#[allow(dead_code)]`, the task's
+  start is reached through the node's turn and a list of driving lanes production leaves empty
+  until 6f fills it.
+- *The put's body channel kept with its door.* The receiver stays in the job's half (`Native`)
+  and the sender in the node's task's (`Replies`), the body's feeding (`Feeding`) holding no
+  sender of its own: what the ends' drops said becomes two words in `Handed`, the job let go of
+  its body (the feeding reads and drops the rest, where its send found the channel closed) and the
+  node's task let go of it before its end (the job's body is `IncompleteBody`, where its take found
+  the channel closed, read before the channel so a piece given before it is taken first); and
+  `Doors::keep` empties the body's channel as it empties the reply's. Shown by the door's
+  allocation count over 64 puts, as the reply's is (0 allocations).
+
+*As built (2026-11-18), step 6's fifth part, its second piece: a handed request needs no exchange*
+(6e, `crates/node/src/node/host.rs`). `Door::Native` holds an `Option<ExchangeId>`: the node's task
+names the exchange of each request it reads the fields of, and a request handed with its fields
+read names none, as only hyper-transport makes an `ExchangeId` and the job needs none, its body and
+reply going through its door. The node's lookups by exchange (`hosts`, `job_lost`, the reply's job
+in `write_replies`) find no handed job, and a handed job reads no fields, as a local one reads none.
+Tested (`node::host`): a native put and get handed with no exchange, driven only through `Serve`
+by the stub, take the put's body's end from its door and give each reply to the node's task's half
+of the door, which writes it whole (`Done`, the version written; `Done`, no bytes); each job's half
+comes back as it ends, and each door is kept once its reply's half is given back.
+
+*As built (2026-11-18), its third piece: a job's end carries its door's half* (6e,
+`crates/node/src/node/host.rs`). `Serve::job_ended` takes the ended job's native half (`Native`),
+told first that its job let go (`Handed::ended`), so the node's task writes nothing past what it
+gave wherever the half is kept, and gives back what the host keeps: the node gives the half back,
+kept in its host's doors as before; a driving shard's lanes will take it to the node's task, which
+holds the door's other half, so a driving shard's host keeps no doors and no half waits there for
+one it never sees. Tested (`node::host`): given back, the host keeps the half and the door once its
+reply's half is back; taken, as the lanes will take it, the host keeps nothing, and the node's
+task's doors keep the door whole once both halves are back.
+
+*As built (2026-11-18), its fourth piece: a put's body channel kept with its door* (6e,
+`crates/node/src/node/host.rs`). The body's channel is made with the door (`native_door`) and kept
+with it: its receiver in the job's half (`Native::body`), its sender in the node's task's
+(`Replies::body`), lent to the put's feeding while the node's task reads the body (`read_fields`,
+`feed`) and given back as the feeding is let go (`Feeding::let_go`): at its end, its exchange's
+failure or its job's drop (`feed_bodies`), its exchange's end (`job_lost`), or its reply's end
+(`write_replies`), always before its door's half goes back, so no feeding outlives the door it
+reads for. What the channel's ends' drops said is two words in `Handed`: the job let go of its
+body (`dropped`, set by `drain_job`, or of its door, `ended`), so the feeding reads and drops the
+rest, and does so at its next turn rather than waiting for a piece the job never takes to free its
+storage; and the node's task let go of it (`cut`, set as the feeding is let go), which the job
+reads before the channel (`take_body`), so a piece given before it is taken first and the body is
+then `IncompleteBody`; a job that took the body's end reads neither. `Doors::keep` empties the
+body's channel as it empties the reply's, clears both words, and keeps no door whose body sender is
+not back. A put whose door has lent its sender already, which none has, is answered `SlowDown`, as
+one whose channel could not be made was. Bound: one piece in the channel (`door::Depth::FIRST`), as
+before, and a door's two channels at most one a door kept (`Doors`). Copies: none changed.
+Allocations: a door made asks the allocator for its body's channel beside its reply's, once; past
+it a put asks nothing for its channels. Tested (`node::host`): 64 puts past the first take the one
+door kept and ask the allocator for nothing (0 allocations, 0 reallocations); with a body of four
+pieces each, only the feeding's storage, made and shared once a put as before (`BytesMut::split`
+promotes the storage to one its views share: 2 allocations a put, 0 reallocations); a job that let
+go has the rest dropped; a feeding let go tells its job its body did not come whole once it took
+the piece given before; a kept door's words are cleared. The host and node unit tests and
+tests/put_body.rs pass.
+
+*As built (2026-11-19), its fifth piece: a driving shard's task and its lanes* (6e,
+`crates/node/src/node/driving.rs`, `host.rs`, `node.rs`). A driving shard's task holds a `Host`
+that keeps no doors (`Host::new(0, ..)`), started through that shard's control queue by a launcher
+that makes the task there, as its jobs' drivers need not cross, and spawns it Normal, as the S3
+connections beside it run (`driving::Lanes::start`). Its lanes, each a hyper-rt channel made once:
+
+| Lane | From, to | Bound | At the bound |
+|---|---|---|---|
+| Requests, tables, room freed, chunks moved (`In`) | the node's task, to the shard | the exchanges the transport admits at once (`parked_most`) | a request given back to run on the first shard (`Lanes::hand`); the volume table held, the latest superseding it; room freed held as a flag; a chunk's move dropped, its next piece telling it again |
+| Asks, job ends, put samples (`Out`) | the shard, to the node's task | `parked_most`, the most the node's task takes in a turn | the shard waits for room, as a range's shard does |
+| Answers | the node's task, to the shard | `command_asks + read_asks + chunk_asks` | never full: the shard's host holds each kind to its bound (`Asks` past it, asked again at the job's next turn), each ask holding its place from its ask until its answer is taken, an abandoned one's until its answer comes and is dropped |
+
+The answers lane is the pool of answer slots: an ask is numbered by the shard (`Out::Ask`) and its
+answer comes back under its number, so an ask allocates nothing past its own value, where a
+`oneshot` an ask would make its block and ring each time. The node's side is generic over `Serve`
+(`Lanes::serve`): each ask asked where the node has room (`Serve::room`, checked before the ask's
+value is given up, as `Node::command`, `read` and `put_chunk` check theirs), held in order where it
+has none rather than answered `Asks`, which the shard would ask again with nothing to wait on, and
+answered its kind's refusal where the node refuses it otherwise; each answer the node holds sent;
+each job's end told (`Serve::job_ended`, no ask let go, the node holding the shard's asks until
+their answers come), its door's half given to the node's host's doors; and the put window's
+samples told. The shard's `Serve` (`driving::Served`): asks numbered and held to the node's bounds,
+outcomes taken from the answers come, the latest volume table handed in (`Table::settled`, a copy
+with the scheme chosen now and no choice running), the ranges' groups, their count, the ask bounds
+and the wall clock handed at its start (`driving::Start`), `read_fields` refused (a request is handed
+with its fields read), `took` nothing, `moved` none of its own, and `job_ended` the job's half
+riding its end. The task waits for the first of a request, an answer and its host's own due
+(`Host::due`); the node's task wakes on what a driving shard gave or its end (`Lanes::arrived`), and
+one whose task ended stops the node (`NodeError::ShardEnded`).
+
+A handed request carries its operation, not its work (`host::Handover`: its door's job half, its
+principal, its `Op`, its Open's block, its deadline, its admission's time, charge and window, and
+its shard), and the shard makes its work (`Host::take_handed`). The node hands one where a lane is
+held for the shard its request was placed on: its fields read, its operation is held as handing
+(`Work::Handing`), its put's feeding set up from the operation's length and trailer (`body_of`),
+and after the host's step it is handed (`Node::hand_off`), its exchange's feeding and reply kept by
+the node's task; one its lane refuses is made into work and runs on the first shard. Production
+starts none and compiles every piece: `Node::spread` starts driving tasks from a list it leaves
+empty until 6f (`Node::start_driving`), and with no lane held the node's turn skips the hand-off and
+the lanes' turn. Tested: a host on the second shard of a two-shard runtime, driven over its lanes by
+the stub node on the test's thread, takes a put and a get handed with their operations to their
+ends (the put's bucket read, its commit asked and answered `Done` with the version written; the get
+answered `Done`, no bytes), each job's end told with its charge and its shard and its half riding
+it back, the test's doors keeping both doors; a request past the lane's room is given back
+(`node::host`); each lane's bound holds as stated, an abandoned ask's place held until its answer
+comes, an ask the node has no room for held and asked once it has, the table held and superseded,
+room freed held, a chunk's move dropped, a shard whose task ended refused `ShardEnded`; and an ask
+and its answer cross the lanes asking the allocator for nothing, on either side (64 asks: 0
+allocations, 0 reallocations) (`node::driving`).
+
+What 6f needs first, beside placing requests by the rule: a driving shard's host is woken by its
+doors. Its task waits on its lanes and its host's due alone, so a put's body piece the node's task
+gives, or a get's piece it writes whole, wakes nothing there: a put awaiting its body or a get
+awaiting its last piece's write has no due and would wait until something else woke the shard (the
+test's put took its body's end at its first step, and its get had no bytes). A waker its door's
+halves share (`Handed`), woken by the node's task as it gives a piece or writes one whole, closes
+it. And the host's count of bytes moved (`Host::moved`) reaching the node's sum (`Node::moved`);
+and a refused request's place in the rule's count moved to the first shard.
+
+*As built (2026-11-19), step 6's sixth part, its first piece: a driving shard woken by its doors*
+(6f, `crates/node/src/node/driving.rs`, `host.rs`). A handed job's body and reply go through its
+door's channels, which neither task waits on, so each wakes the other as it moves the door. The
+node's task tells the shard's word (`driving::Lanes::doors`, hyper-rt's `sync::Notify`, made once
+with the lanes), which the shard's task waits on beside its lanes and its host's due, as it gives a
+piece, the end or a refusal of a put's body (`Feeding::send`), lets go of the body
+(`Feeding::let_go`), takes an answer from the job's reply channel or writes one whole
+(`Replies::write`), or lets go of the reply (`Doors::give_replies`, `Replies`' drop); the door's
+half the node's task keeps (`Replies::driving`, lent to the feeding) carries the word while its job
+runs on that shard, set as its fields are read for the hand-off (`Node::read_fields`) and taken off
+where the lane refuses it. The job wakes the node's task's waker, which its own half carries while
+it runs there (`Native::node`), as it gives its door an answer (`Native::flush`), takes a piece of
+its body, the next then readable (`feed_put`), says its work is held where the node's task took its
+last word (`Native::held`: it vouches once a word, and a held job says so at each of its shard's
+steps), or lets go of its body (`Native::drop_body`), as an S3 connection on another shard wakes it
+after each piece it sends (`door::Submitter::wake`). Why a `Notify` and not a lane message: hyper-rt's `Notify` is an atomic
+waker with a permit (one waiter registered in its cell, woken by `notify_one`, a notification with
+no waiter kept for the next wait), so no wake is lost and none takes a place in a lane; a message
+the lane had no room for would be dropped, and a full lane's older messages order nothing after
+what the door moved. One word a shard, not one a door, as one task steps every job of its shard at
+each of its turns; the job's half wakes the node's waker itself, a word its clone copies (hyper-rt's
+wakers count nothing), where the node's task's turn is its own. Neither allocates per wake: the
+word is made once a shard and each door's half holds a count of it (`Arc`), set and cleared with
+the door. Bound: a notification is one bit, kept until the next wait. Tested (`node::host`): a put
+of a body of 2.5 blocks, given a piece at a time, and a get of its bytes, each handed to the second
+shard of a two-shard runtime and served over its lanes by a cell in memory on the test's thread
+(Block and File ranges over models, volumes checking each chunk's CRC-32C, the Name range keeping
+the version the put commits), reach `Done`, the put's size and the get's bytes exact, given in
+three pieces after its fields; before the wake they hung (no job ended in 20 s).
+
+*As built (2026-11-19), its second piece: a driving shard's bytes in the node's count* (6f,
+`crates/node/src/node/driving.rs`, `Node::moved`). After each step in which its jobs moved bytes
+(their bodies' pieces taken, their replies' given: `Host::moved`), a driving shard's task says the
+total since it started on its out lane (`Out::Moved`), as it says the put window's samples, one
+message a step at most; the node's side keeps the latest (`Lanes::moved`) and `Node::moved` sums
+each shard's with its own task's and its host's. Tested: the lane's count reaches the node's side,
+the latest superseding (`node::driving`), and the put and get handed above, once ended, are
+counted there whole, the put's body taken and the get's bytes given, twice the object (`node::host`).
+
+*As built (2026-11-19), its third piece: a refused request counted where it runs* (6f,
+`Drivers::moved`, `Node::hand_off`). A request whose lane gives it back (its lane full, or its
+shard's task gone) runs on the first shard, so its place in the rule's count moves there and its
+job's shard says the first (`Handover::driven`), its end giving that place back; the shard it was
+placed on counts one fewer, so the rule places the next there. A move past the drivers' shards, or
+a count past a `usize`'s, moves nothing, and the place stays where it was. Tested
+(`node::drivers`): a request moved from the second shard to the first is counted on the first, the
+next placed on the second, the end given back to the first, and a move past the shards refused.
+
+*As built (2026-11-19), its fourth piece: native requests placed by the rule* (6f,
+`Node::spread_native`, `Drivers::place`, `driving::Lanes::takes`, `process::NativeShards`,
+`derive::shard_shape`, `node::driving_lanes_bytes`). Where its operator states `native_shards =
+spread`, `process::serve` starts a driving shard's task on each runtime shard past the first that
+takes tasks (`others`, numbered as `Node::spread` numbers the ranges' shards), before the node's
+first turn, and the rule's count is made over the first and those shards; each native request the
+host admits is placed on the one running the fewest of those whose shard the watchdog does not see
+held past its limit (`Lane::takes`' test, `hyper_rt::watch::stalls`), the first of those tied, and
+on the first where none takes one; a refused hand-off runs on the first, counted there (above). The
+node's task reads the volume table again at each turn it serves the driving shards, where its root
+range applied past it (`Node::table`), and tells them the newer, as its own host may place none of
+the puts that would have read it. Why a setting of its own, `native_shards = first | spread`
+(`first` where unstated, said as a basis by `mantle serve`, taken by both `mantle serve`'s file and
+`mantle node`'s), and not `range_shards = spread`: ladder r40 measured spreading the ranges slower
+than keeping them on the first shard (above), so tied to it native placement could be measured only
+with the ranges spread, its effect not told from theirs; apart, a ladder measures each on and off,
+`mantle bench doors --native-shards first|spread` stating it in each founder's file beside
+`--range-shards` (`transfer::Cell::make`), its `doors run` line saying both. Sizing:
+`derive::shard_shape` counts on each shard past the first, where native requests are spread, the
+driving task and the launcher that spawns it, holding its own slot while it spawns, and the task's
+timer, beside the ranges' where they are spread too; the floor counts each driving shard's lanes and
+the vectors beside them, derived from their types' sizes (`node::driving_lanes_bytes`: two lanes of
+the exchanges the transport admits at once, the answers' lane and both sides' asks at the node's
+asks, and the shard's word), for each shard past the first where the node hosts objects. Tested:
+the rule passes over a shard that takes none now and fills it first once it takes again, and with
+none taking places on the first (`node::drivers`); a driving shard takes requests while its shard
+runs and none once it is gone (`node::driving`); the key reads `first` and `spread` apart from
+`range_shards` and refuses another word (`process::tests`), and reads back from the bases
+(`derive::tests`); the shape holds a driving shard's task, launcher and timer beside the ranges'
+(`derive::tests`); the floor holds the runtime at every shape with native requests spread or not
+(`tests/shard_memory.rs`); and `mantle bench doors --native-shards` parses apart from
+`--range-shards` (`mantle`'s CLI tests). Open: each driving shard holds a settled copy of the volume
+table, which grows with the cell's volumes and is not yet in the floor; and the native suite under
+`native_shards = spread` is the end-to-end test, and the ladder over `native_shards` the measure.
+
+*As merged with perf-10k (2026-11-19): the learned windows, the room classes and the caches' loans in
+step 6's shape* (`host::Serve`, `driving::Served`, `host::Replies`). The node keeps the windows it
+learned of its puts and its gets (`crate::window::Windows`, §2.8) as it kept the put window: the
+host tells it each sample through `Serve` (`committed`, `filled`, and `read`, a get's block from its
+row asked to its plaintext opened), and a native get's client pace is timed by the node's task, which
+writes the get's pieces (`Replies`' `Drain`, from when its client's room for a piece was full until
+the piece is written whole), as the S3 door's connection times its socket. A get's window is widened
+and a copy's windows fitted once their sizes are read, through `Serve`: `windows`, `holds` (whether
+the operations' bytes hold the bytes past the job's charge beside the others') and `recharge` (the
+bytes past its charge taken, the caches giving back first what of them they hold, `host::lend`, and
+those its span does not need given back). Admission is the node's task's alone (§2.5), which a
+driving shard cannot ask within its step, so a job there takes no bytes past what it was admitted at
+(`Served::holds`): its get holds the floor's window, and its copy the windows its admitted charge
+holds, fitted to the windows the shard learned of its own jobs; what its span does not need, and
+its samples, go to the node over the shard's lane (`Out::Recharged`, `Out::Read`). Each chunk
+outcome is classed as perf-10k classes it (`host::taken`): a put's or a get's chunk refused for room
+is asked again of the same volume, offered room at each beat by whichever host runs it, a driving
+shard's told as room frees (`In::Freed`), and its refusal moves none of its job's work. A reply's
+head never waits for room (§3.3): what waits is the piece a refusal's body drains through
+(`Replies::wait_for_room`). Open: a get or a copy on a driving shard widens no window past its
+admission until the shard can take bytes of the node's admission, which `native_shards = spread`'s
+ladder measures against.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate
@@ -2312,10 +2952,13 @@ asker hears at once; the reply fills that room, and the exchange's end gives it 
 ends (hyper-transport's `Core::admit_prefix`, `Core::reply`, vendor/UPSTREAM.md). The messages'
 bytes already count every exchange's head both ways (`bounds::messages`), so the room needs no
 memory past what the sizing states. What still waits for room is the piece a refusal's body
-drains through before its reply, the endpoint's one piece for its owner's reads: the job is held as
-one whose ask is out is, vouched for and asking again at each beat within its client's patience,
-and past that patience its exchange is refused `Budget`, which needs no room and its asker hears
-at once (`host`'s `wait_to_reply`, research/77 D1, D2). A job never ends with its exchange open.
+drains through before its reply, the endpoint's one piece for its owner's reads: the reply is held
+by the node's task, which writes every native reply (§2.9 step 6c, `host::Replies`), as a job
+whose ask is out is held: vouched for and asking again at each turn, the node's turn due at each
+beat, within its client's patience as its job's bound stood when it gave the reply, and past that
+patience its exchange is refused `Budget`, which needs no room and its asker hears at once
+(`Replies::wait_for_room`, research/77 D1, D2); a reply no message holds, a field past its bound,
+refuses its exchange `FrameBound`. A job never ends with its exchange open.
 
 Past its floor the transport is given its want where memory allows (2026-11-19). At the floor
 each share is QUIC's initial window, 12,000 bytes (RFC 9002 §7.2), below a receive chunk's 65,527,
@@ -2558,7 +3201,7 @@ less than a datagram moved, or after the peer had the whole request and a period
    refused so is asked of the same copy again, a read changing nothing, never taken for a copy
    lost, and a get whose reply began and whose read still waits at its client's patience ends
    unfinished there, as no transport ends that wait (`Get::out_of_patience`); and at each
-   beat it waits, at most once a beat (`Node::step_host`), on either door:
+   beat it waits, at most once a beat (`host::Host::step`), on either door:
    a peer's volume whose queue other writes or its cleaner hold, as a filling volume's is, tells
    the asker nothing when it frees room, and with no other chunk of the node out nothing asked it
    again before the client's patience. The S3 door's put, due only at that patience, then sat

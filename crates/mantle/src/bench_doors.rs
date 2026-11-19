@@ -92,7 +92,7 @@ use mantle_client::{Client, Native, Rewind, Settings, Sink, Source, TRAILER, Wir
 use mantle_disk::histogram::Histogram;
 use mantle_disk::rounds::{self, Judgment, Policy};
 use mantle_http::write::Length;
-use mantle_node::process::RangeShards;
+use mantle_node::process::{NativeShards, RangeShards};
 use mantle_protocol::object::{Headers, List, Listing, Op, Reply, Slowed, Status};
 use mantle_s3::checksum::{self, Algorithm, Hasher};
 use mantle_s3::list::Resume;
@@ -267,6 +267,9 @@ pub struct Options {
     pub relay: bool,
     /// The shards each server of the cell places its ranges over (`range_shards`, node.md §2.9).
     pub range_shards: RangeShards,
+    /// The shards each server of the cell drives its native requests on (`native_shards`, node.md
+    /// §2.9 step 6f).
+    pub native_shards: NativeShards,
 }
 
 /// An S3 server this program did not start (`--endpoint`): the HTTP door's phases, controls and
@@ -3791,10 +3794,12 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     let counting = alloc::installed();
     writeln!(
         out,
-        "doors run seed {} condition {} range_shards {} load {} clients {} ops {} counting {}",
+        "doors run seed {} condition {} range_shards {} native_shards {} load {} clients {} ops {} \
+         counting {}",
         options.seed,
         options.condition,
         options.range_shards,
+        options.native_shards,
         match options.load {
             Load::Open(rate) => format!("open:{rate}"),
             Load::Closed => "closed".to_owned(),
@@ -3824,8 +3829,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             (None, vec![endpoint.at], signer)
         }
         None => {
-            let mut cell =
-                Cell::make(&options.dir, options.volume, options.range_shards).map_err(failed)?;
+            let shards = (options.range_shards, options.native_shards);
+            let mut cell = Cell::make(&options.dir, options.volume, shards).map_err(failed)?;
             // Every range led before the first phase, so no phase measures the cell's first
             // elections.
             cell.led().map_err(failed)?;

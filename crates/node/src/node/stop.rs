@@ -91,7 +91,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(());
         };
         let next = match stopping {
-            Stopping::Objects if self.jobs.is_empty() => Stopping::Handing(self.hand_over()?),
+            // Every operation ended and every native reply written (`host::Replies`).
+            Stopping::Objects if self.host.idle() && self.replies.is_empty() => {
+                Stopping::Handing(self.hand_over()?)
+            }
             Stopping::Handing(out) => {
                 let out = self.handing(out)?;
                 if out.is_empty() {

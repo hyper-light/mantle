@@ -526,6 +526,42 @@ pub struct ProcessConfig {
     pub gateway: Option<GatewayConfig>,
     /// The shards the node places its ranges over (`range_shards`, node.md §2.9).
     pub range_shards: RangeShards,
+    /// The shards the node drives its native requests on (`native_shards`, node.md §2.9 step 6f).
+    pub native_shards: NativeShards,
+}
+
+/// The shards a node drives its native requests on (`native_shards`, node.md §2.9 step 6f): a mode
+/// its operator states apart from where its ranges go, `first` where unstated, so a ladder measures
+/// native placement on and off under either placement of the ranges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeShards {
+    /// Every native request driven by the node's task on its first shard.
+    #[default]
+    First,
+    /// Each native request the host admits driven on the shard past the first running the fewest,
+    /// by a task of its own there (`node::drivers`, `node::driving`).
+    Spread,
+}
+
+impl std::str::FromStr for NativeShards {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "first" => Ok(Self::First),
+            "spread" => Ok(Self::Spread),
+            other => Err(format!("{other} is not first or spread")),
+        }
+    }
+}
+
+impl std::fmt::Display for NativeShards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::First => "first",
+            Self::Spread => "spread",
+        })
+    }
 }
 
 /// The shards a node places its ranges over (`range_shards`, node.md §2.9): a mode its operator
@@ -679,6 +715,7 @@ pub const KEYS: &[&str] = &[
     "command_asks",
     "read_asks",
     "range_shards",
+    "native_shards",
     "domain",
     "root.max_nodes",
     "root.max_volumes",
@@ -737,6 +774,7 @@ pub const STATED_KEYS: &[&str] = &[
     "durability.repair_rate",
     "stop_ms",
     "range_shards",
+    "native_shards",
     "s3",
     "s3.region",
     "s3.certificate",
@@ -1188,6 +1226,7 @@ impl ProcessConfig {
             enlist: enlisting(&lines)?,
             gateway: gateway(&lines)?,
             range_shards: lines.maybe("range_shards")?.unwrap_or_default(),
+            native_shards: lines.maybe("native_shards")?.unwrap_or_default(),
         };
         if !config.rules.admit_sessions() {
             return Err(ProcessError::Value(
@@ -2244,6 +2283,7 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         repair,
         s3: s3_stated(&lines)?,
         range_shards: lines.maybe("range_shards")?,
+        native_shards: lines.maybe("native_shards")?,
     })
 }
 
@@ -2520,13 +2560,19 @@ fn shards(facts: &hyper_rt::machine::facts::Facts) -> usize {
 /// as each falls back to the first shard where the shard it was handed to refuses it, and a socket
 /// for the listener and each of those connections. Another shard holds at most its taker of
 /// handed connections and each connection, and where the node spreads its ranges
-/// (`range_shards`), their task, the launcher that spawns it Critical and the task's timer.
+/// (`range_shards`), their task, the launcher that spawns it Critical and the task's timer, and
+/// where it spreads its native requests (`native_shards`), their driving task, the launcher that
+/// spawns it and the task's timer.
 fn runtime(config: &ProcessConfig, listening: Option<u64>) -> Result<RuntimeConfig, ProcessError> {
     let calibration = calibration(&config.dir, config.probe_budget)?;
     let constants = constants(&calibration)?;
     // The shape the node's floor counts each shard at (`derive::runtime_bytes`).
-    let shape = crate::derive::shard_shape(listening, config.peers.len(), config.range_shards)
-        .ok_or_else(|| ProcessError::Runtime("the node's shards' tasks".into()))?;
+    let shape = crate::derive::shard_shape(
+        listening,
+        config.peers.len(),
+        (config.range_shards, config.native_shards),
+    )
+    .ok_or_else(|| ProcessError::Runtime("the node's shards' tasks".into()))?;
     let mut runtime =
         RuntimeConfig::from_calibration(&calibration, &constants, shape.tasks, shape.timers);
     runtime.shards = u16::try_from(shards(&calibration.facts))
@@ -2711,6 +2757,13 @@ async fn serve(
     // (node.md §2.9); a refusal stops the start, typed, as nothing would drive those ranges.
     node.spread(&others)
         .map_err(|e| step(Step::Network)(ProcessError::Node(e)))?;
+    // The node's native requests driven over the shards past the first, as its operator states
+    // (`native_shards`, node.md §2.9 step 6f), apart from where its ranges go: a ladder measures
+    // each placement on and off. A shard that takes no task stops the start, typed.
+    if config.native_shards == NativeShards::Spread {
+        node.spread_native(&others)
+            .map_err(|e| step(Step::Network)(ProcessError::Node(e)))?;
+    }
     let run = layout
         .run()
         .map_err(kept)?
@@ -4784,6 +4837,41 @@ mod tests {
             Err(ProcessError::Value("range_shards", _))
         ));
         assert_eq!(RangeShards::default(), RangeShards::First);
+    }
+
+    /// `native_shards` is a mode its operator states apart from `range_shards`, `first` or
+    /// `spread`, unstated where the file names it not, and any other word refused naming the key
+    /// (node.md §2.9 step 6f).
+    #[test]
+    fn the_shards_a_nodes_native_requests_take_are_first_or_spread() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let base = "id = 1\ndir = .\nquic = 127.0.0.1:0\nplane = 127.0.0.1:0\nauthority = a.der\n\
+                    certificate = n.der\nkey = n.key\nvoters = 1\nrange = 1 root\n";
+        std::fs::write(&config, base).unwrap();
+        assert_eq!(read_stated(&config).unwrap().native_shards, None);
+        for (word, shards) in [
+            ("first", NativeShards::First),
+            ("spread", NativeShards::Spread),
+        ] {
+            std::fs::write(
+                &config,
+                format!("{base}range_shards = first\nnative_shards = {word}\n"),
+            )
+            .unwrap();
+            let stated = read_stated(&config).unwrap();
+            assert_eq!(
+                (stated.range_shards, stated.native_shards),
+                (Some(RangeShards::First), Some(shards))
+            );
+            assert_eq!(shards.to_string(), word);
+        }
+        std::fs::write(&config, format!("{base}native_shards = every\n")).unwrap();
+        assert!(matches!(
+            read_stated(&config),
+            Err(ProcessError::Value("native_shards", _))
+        ));
+        assert_eq!(NativeShards::default(), NativeShards::First);
     }
 
     /// A stated volume's directory may hold a space, its size after the last; a relative one is

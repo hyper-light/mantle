@@ -801,8 +801,10 @@ struct Commanded {
     commands: Vec<(u64, u64, Option<Answer>)>,
 }
 
-/// The piece a body is read in: the transport's own receive chunk.
-const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
+/// The piece a body is read in: the transport's own receive chunk. The node's task holds one of its
+/// own outside the transport's budget (`Node::piece`), which the memory floor counts in the
+/// transport's class (`derive::Class::Transport`, node.md §1.4).
+pub(crate) const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
 /// Reads the next bytes of `exchange`'s body, at most a piece, into `piece`, empty: how many. The
 /// piece is the reader's own, never the endpoint's budget's, its buffer kept from read to read: a

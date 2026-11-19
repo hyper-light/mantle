@@ -1454,7 +1454,8 @@ pub enum Class {
     /// The node's shared log ([`log_bytes`]).
     Log,
     /// The transport beside its budget, its plane and its liveness stream
-    /// ([`transport_bytes_beside`], [`plane_bytes`], [`liveness_bytes`]).
+    /// ([`transport_bytes_beside`], [`plane_bytes`], [`liveness_bytes`]), and the piece the node's
+    /// task reads native bodies into outside the budget (`node::PIECE`).
     Transport,
     /// The runtime's shards, each sized for the first's role, and the S3 listener's lanes to the
     /// shards past the first ([`runtime_bytes`]).
@@ -2236,6 +2237,9 @@ pub fn derive(
                     .transport_bytes
                     .checked_add(held.beside)
                     .and_then(|bytes| bytes.checked_add(held.listener))
+                    // The node's task's one piece it reads every native body into, outside the
+                    // transport's budget (`Node::piece`, `node::PIECE`), made once at most a piece.
+                    .and_then(|bytes| bytes.checked_add(crate::node::PIECE))
                     .ok_or(overflow("the transport's memory"))?,
             ),
             (Class::Runtime, held.runtime),
@@ -3202,7 +3206,8 @@ fn say_floor(
                 Class::Log => "the node's shared log (derive::log_bytes)",
                 Class::Transport => {
                     "the transport's budget and what it holds beside it, its plane and its \
-                     liveness stream (derive::transport_bytes_beside), and the S3 listener's \
+                     liveness stream (derive::transport_bytes_beside), the node's task's piece \
+                     it reads native bodies into (node::PIECE), and the S3 listener's \
                      connections, as many as the operations, each at its measured bytes and \
                      its sessions' slots (listener::CONNECTION_BYTES, listener::SESSION_BYTES)"
                 }

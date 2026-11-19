@@ -281,6 +281,9 @@ pub(crate) trait Serve {
     fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError>;
     /// The outcome of what a job asked, once answered, taken.
     fn outcome(&mut self, pending: Pending) -> Option<Outcome>;
+    /// Whether what a job asked is answered, its outcome not yet taken: the host's next turn is
+    /// due at once ([`Host::due`]).
+    fn answered(&self, pending: Pending) -> bool;
     /// Asks a job let go of, their job ended or replied before they were answered: each outcome
     /// dropped as it comes, as one no job takes would hold one of the node's asks for good.
     fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>);
@@ -343,6 +346,44 @@ impl Host {
     /// Whether it runs no job.
     pub(super) fn idle(&self) -> bool {
         self.jobs.is_empty()
+    }
+
+    /// When, on the shard's clock, the host next needs a turn of whoever serves it, by its own
+    /// jobs alone (node.md §2.9 step 6e), so a driving shard's task waits on its host and nothing
+    /// of the node's: at once where what a job asked is answered (`Serve::answered`), as an answer
+    /// that came after the host's step in a turn waits on no event; else a put's renewal coming
+    /// due, or the beat or bound of a job whose work is held. Each operation at work is ended at
+    /// its client's patience, and one whose asks are held says so each beat, a probe timeout, the
+    /// transport's notes' beat of a third of the serve period (research/77 D2).
+    pub(super) fn due<N: Serve>(&self, node: &N) -> Option<u64> {
+        let shard = hyper_rt::futures::now_ns();
+        if self
+            .jobs
+            .iter()
+            .flat_map(|job| job.pending.iter())
+            .any(|(pending, _)| node.answered(*pending))
+        {
+            return Some(shard);
+        }
+        let wall = node.wall_ns();
+        let renewal = self
+            .jobs
+            .iter()
+            .filter_map(|job| match &job.work {
+                Work::Put(putting) => putting.put.as_ref()?.due_ns(),
+                Work::Copy(copying) => copying.put.as_ref()?.due_ns(),
+                _ => None,
+            })
+            .min()
+            .map(|due| shard.saturating_add(due.saturating_sub(wall)));
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let bound = self
+            .jobs
+            .iter()
+            .filter(|job| job.working() && job.held())
+            .filter_map(|job| job.due_ns(shard, beat))
+            .min();
+        [renewal, bound].into_iter().flatten().min()
     }
 
     /// The job waiting on chunk ask `ask`, its work moved now: a piece of the chunk it reads came,
@@ -3034,58 +3075,35 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// When the host next needs a turn: at once when what an operation, or one ended, asked is
-    /// answered, as one answered after the host's step in a turn (a read this node's own member
-    /// answers) waits on no event; else a put's renewal coming due.
+    /// When the node's task next needs a turn for its host and the exchanges it keeps for it: its
+    /// host's own wait ([`Host::due`]: its jobs' answered asks, its puts' renewals and its held
+    /// jobs' beats and bounds), beside what the node's task waits on itself (node.md §2.9 step
+    /// 6e): at once where an ask of a job that ended is answered, its outcome to drop, a lookup is
+    /// answered, a body was fed at the last turn (its job takes what it was given), or a reply's
+    /// exchange took more than its rounds gave (its job gives the next); and a reply that waits for
+    /// room in the endpoint's budget at its next beat, which the beat's turn offers its head
+    /// again, since the budget freeing turns no node.
     pub(super) fn host_due(&self) -> Option<u64> {
         let shard = hyper_rt::futures::now_ns();
-        let answered = |pending: &Pending| self.has_outcome(*pending);
-        let mut pending = self
-            .host
-            .jobs
-            .iter()
-            .flat_map(|j| j.pending.iter().map(|(p, _)| p))
-            .chain(&self.abandoned);
         let looked_up = self
             .lookups
             .iter()
             .filter_map(|l| l.ask)
             .any(|ask| self.reads_done.iter().any(|(a, _)| *a == ask));
-        // A body the node's task fed at the last turn: its job takes what it was given; and a
-        // reply whose exchange took more than its rounds gave: its job gives the next.
-        if self.fed || self.replied || looked_up || pending.any(answered) {
+        let dropped = self
+            .abandoned
+            .iter()
+            .any(|pending| self.has_outcome(*pending));
+        if self.fed || self.replied || looked_up || dropped {
             return Some(shard);
         }
-        let wall = self.wall.now_ns();
-        let renewal = self
-            .host
-            .jobs
-            .iter()
-            .filter_map(|j| match &j.work {
-                Work::Put(putting) => putting.put.as_ref()?.due_ns(),
-                Work::Copy(copying) => copying.put.as_ref()?.due_ns(),
-                _ => None,
-            })
-            .min()
-            .map(|due| shard.saturating_add(due.saturating_sub(wall)));
-        // Each operation at work is ended at its client's patience, and one whose asks are held
-        // says so each beat, a probe timeout, the transport's notes' beat of a third of the serve
-        // period (research/77 D2); so is a reply that waits for room, which the beat's turn offers
-        // its head again, since the budget freeing turns no node.
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
-        let bound = self
-            .host
-            .jobs
-            .iter()
-            .filter(|j| j.working() && j.held())
-            .filter_map(|j| j.due_ns(shard, beat))
-            .min();
         let room = self
             .replies
             .iter()
             .filter_map(|(_, replies)| replies.room_due_ns(shard, beat))
             .min();
-        [renewal, bound, room].into_iter().flatten().min()
+        [self.host.due(self), room].into_iter().flatten().min()
     }
 }
 
@@ -3098,6 +3116,10 @@ impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
 
     fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
         Node::outcome(self, pending)
+    }
+
+    fn answered(&self, pending: Pending) -> bool {
+        self.has_outcome(pending)
     }
 
     fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
@@ -8491,6 +8513,10 @@ mod tests {
             Some(self.answers.swap_remove(at).1)
         }
 
+        fn answered(&self, pending: Pending) -> bool {
+            self.answers.iter().any(|(p, _)| *p == pending)
+        }
+
         fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
             self.abandoned += asks.into_iter().count();
         }
@@ -8861,6 +8887,47 @@ mod tests {
             matches!(get_answers.as_slice(), [door::Answer::Head(reply), door::Answer::End]
                 if reply.status == Status::Done && reply.size == 0),
             "{get_answers:?}"
+        );
+    }
+
+    /// A host's wait is its own jobs' alone (node.md §2.9 step 6e), so a driving shard's task can
+    /// wait on its host: none while it runs no job; a job whose ask is out is due at its client's
+    /// patience, an S3 door's get holding no beat; and at once once whoever serves it holds the
+    /// ask's answer, untaken.
+    #[test]
+    fn a_hosts_wait_is_its_own_jobs_alone() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut stub = Stub {
+            answer: |_| panic!("nothing is asked"),
+            answers: Vec::new(),
+            asked: 0,
+            ended: Vec::new(),
+            abandoned: 0,
+        };
+        assert_eq!(host.due(&stub), None, "no job, no wait");
+        let get = work(
+            Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+            None,
+        );
+        let (mut job, _body, _answers) = local_job(get, now, 0);
+        job.pending.push((Pending::Read(0), None));
+        let patience = job.bound_ns();
+        host.jobs.push(job);
+        assert_eq!(host.due(&stub), Some(patience), "held to its patience");
+        stub.answers.push((
+            Pending::Read(0),
+            Outcome::Read(ReadOutcome::Read(Box::new(Read::Current(None)))),
+        ));
+        let due = host.due(&stub).unwrap();
+        assert!(
+            (now..patience).contains(&due),
+            "due at once once answered: {due}"
         );
     }
 

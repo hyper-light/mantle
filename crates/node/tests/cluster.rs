@@ -411,6 +411,8 @@ struct Pki {
     nodes: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
     /// By client id: the certificate and the key.
     clients: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
+    /// Every node's log: [`log_config`], unless a test states its own.
+    log: LogConfig,
 }
 
 impl Pki {
@@ -444,6 +446,7 @@ impl Pki {
             voters,
             nodes,
             clients,
+            log: log_config(),
         }
     }
 
@@ -515,7 +518,7 @@ impl Pki {
             addresses: Vec::new(),
             ranges: vec![hosted(self.voters, engine)],
             shards: NonZeroUsize::MIN,
-            log: log_config(),
+            log: self.log,
             // The budget a node derives, once its settings are whole ([`run`]).
             transport_bytes: 0,
             seed: None,
@@ -1255,6 +1258,13 @@ impl Cell {
         Self::start_bounded(engines, network, voters, spares, volume, BTreeMap::new())
     }
 
+    /// `start`, every node's log `log`.
+    fn start_logged(engines: Engines, log: LogConfig) -> Self {
+        let mut pki = Pki::new(NODES, NODES);
+        pki.log = log;
+        Self::start_issued(engines, Network::Direct, pki, None, BTreeMap::new())
+    }
+
     /// `start_spared`, the nodes `chunk_bytes` names told those chunk bounds.
     fn start_bounded(
         engines: Engines,
@@ -1264,12 +1274,24 @@ impl Cell {
         volume: Option<VolumeSettings>,
         chunk_bytes: BTreeMap<u64, u64>,
     ) -> Self {
-        let nodes = voters + spares;
+        let pki = Pki::new(voters, voters + spares);
+        Self::start_issued(engines, network, pki, volume, chunk_bytes)
+    }
+
+    /// The cell `pki` names, its founding voters started on `network`.
+    fn start_issued(
+        engines: Engines,
+        network: Network,
+        pki: Pki,
+        volume: Option<VolumeSettings>,
+        chunk_bytes: BTreeMap<u64, u64>,
+    ) -> Self {
+        let (voters, nodes) = (pki.voters, u64::try_from(pki.nodes.len()).unwrap());
         let (tell, reports) = mpsc::channel();
         let mut cell = Cell {
             nodes,
             engines,
-            pki: Pki::new(voters, nodes),
+            pki,
             dirs: (1..=nodes)
                 .map(|id| (id, tempfile::tempdir().unwrap()))
                 .collect(),
@@ -1886,6 +1908,82 @@ fn catch_up_by_snapshot(engines: Engines) {
     }
 }
 
+/// The entries a follower stopped for falls behind by in `catch_up_from_the_log`: past what the
+/// leader's handle keeps in memory (the log's `group_cache`, 4 KiB, some tens of registrations), so
+/// its catch-up is read from the leader's log file a run at a time, and short of the entries the
+/// group retains ([`retaining_log`]), so it needs no snapshot.
+const BEHIND: u64 = 768;
+
+/// [`log_config`], each group retaining its `group_entries` whatever their bytes, up to a quarter
+/// of the file's room, while it keeps 4 KiB of them in memory: a follower behind by most of them is
+/// caught up from the file.
+fn retaining_log() -> LogConfig {
+    let log = log_config();
+    LogConfig {
+        group_bytes: log.segment_bytes * u64::from(log.max_segments) / 4,
+        ..log
+    }
+}
+
+/// A follower stopped while the leader wrote `BEHIND` entries catches up from the leader's log
+/// file (hyper-durable's `LogStore::catch_up`): each run the store reads wakes the node, which
+/// drives the range at once, so its pages go out at the path's and the device's pace, never a
+/// timer's. Measured from the follower's first entry past where it stopped to its last, with the
+/// leader's Raft sends in that time.
+fn catch_up_from_the_log(engines: Engines) {
+    let mut cell = Cell::start_logged(engines, retaining_log());
+    let leader = cell.leader();
+    let follower = (1..=cell.nodes).rev().find(|id| *id != leader).unwrap();
+    let (stopped_at, _) = cell.write(1);
+    cell.applied_everywhere(1);
+    cell.stop(follower);
+    let mut last = 0;
+    for serial in 2..=BEHIND + 1 {
+        last = cell.write(serial).0;
+    }
+    let before = cell.watch.status[&leader].sends;
+    cell.restart(follower);
+    let began = std::cell::Cell::new(None);
+    let restarted = Instant::now();
+    cell.watch.until(&cell.reports, |w| {
+        let applied = w.status.get(&follower).map_or(0, |s| s.applied);
+        if applied > stopped_at && began.get().is_none() {
+            let writes = w.status[&follower].writes.entries;
+            began.set(Some((
+                Instant::now(),
+                applied,
+                w.status[&leader].sends,
+                writes,
+            )));
+        }
+        if applied >= last { Some(()) } else { None }
+    });
+    let ended = Instant::now();
+    let (began_at, first, sends, writes) = began.get().unwrap();
+    let after = cell.watch.status[&leader].sends;
+    let follower_status = cell.watch.status[&follower];
+    let written = follower_status.writes.entries - writes;
+    eprintln!(
+        "catch-up of {} entries ({stopped_at} to {last}): {:?} from the first entry past the \
+         stop ({first}) to the last, {:?} from the restart; the leader's lane frames {} and \
+         plane messages {} in the catch-up, {} and {} since the restart; the follower's writes \
+         of entries {written}, {:?} each",
+        last - stopped_at,
+        ended - began_at,
+        ended - restarted,
+        after.lane - sends.lane,
+        after.plane - sends.plane,
+        after.lane - before.lane,
+        after.plane - before.plane,
+        (ended - began_at) / u32::try_from(written.max(1)).unwrap(),
+    );
+    assert_eq!(
+        follower_status.snapshots_taken, 0,
+        "the follower caught up from the log, not a snapshot"
+    );
+    cell.close();
+}
+
 /// A node's own commands (`Node::command`) and reads (`Node::read`): the gate asked by the leader
 /// of its own member, puts asked by a follower of the leader over QUIC, and more puts with the
 /// leader stopped while they are out, which go to the next leader with their serials the same.
@@ -2124,6 +2222,11 @@ fn a_follower_stopped_while_the_range_compacted_catches_up_by_a_snapshot() {
 #[test]
 fn a_follower_stopped_while_the_range_compacted_catches_up_by_a_snapshot_on_mantles_engine() {
     catch_up_by_snapshot(Engines::Mantle);
+}
+
+#[test]
+fn a_follower_stopped_while_the_range_wrote_catches_up_from_the_leaders_log_at_its_reads_pace() {
+    catch_up_from_the_log(Engines::Model);
 }
 
 #[test]

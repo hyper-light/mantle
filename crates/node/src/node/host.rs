@@ -49,6 +49,7 @@ use mantle_s3::copy::Directive;
 use mantle_s3::range::{self, CopyRangeError, Span};
 use mantle_s3::seal::{DataKey, WrappingKey};
 
+use super::keyed::Key;
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, shard, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome, Wait};
 use crate::chunk;
@@ -1754,6 +1755,129 @@ impl Replies {
         to.refuse(Refusal::Budget);
         Wrote::Over
     }
+}
+
+/// The node's task's halves of the native replies in flight (`Node::replies`), each found by its
+/// exchange in one probe (`keyed::Keyed`), and each one's due while it waits for room in the
+/// endpoint's budget (`Replies::room_due_ns`) a key in a heap by its slot, as the host keeps its
+/// jobs' (`Earliest`): the node's wait (`Node::host_due`) reads the earliest in one step, where it
+/// walked every reply. A reply's due is its own state's alone, the beat a constant, and a reply
+/// changes only through [`Writes::change`] and [`Writes::change_at`], each keying it again after,
+/// so every key is its reply's due: none is ever stale. Bound: one key a reply. Its exchanges'
+/// type a parameter only so a test counts it with a stand-in for `ExchangeId`, which only the
+/// transport makes.
+pub(super) struct Writes<K = ExchangeId>
+where
+    (K, Replies): Key<Of = K>,
+{
+    replies: super::keyed::Keyed<(K, Replies)>,
+    due: Earliest,
+}
+
+impl<K> Default for Writes<K>
+where
+    (K, Replies): Key<Of = K>,
+{
+    /// None, which allocates nothing (`Keyed::default`, `Earliest::default`).
+    fn default() -> Self {
+        Self {
+            replies: super::keyed::Keyed::default(),
+            due: Earliest::default(),
+        }
+    }
+}
+
+impl<K> Writes<K>
+where
+    (K, Replies): Key<Of = K>,
+{
+    pub(super) fn len(&self) -> usize {
+        self.replies.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.replies.is_empty()
+    }
+
+    pub(super) fn contains(&self, exchange: K) -> bool {
+        self.replies.contains(exchange)
+    }
+
+    /// The reply at slot `at`, as [`super::keyed::Keyed::at`].
+    pub(super) fn at(&self, at: usize) -> Option<&(K, Replies)> {
+        self.replies.at(at)
+    }
+
+    /// The earliest due of the replies waiting for room, on the shard's clock.
+    pub(super) fn first(&self) -> Option<u64> {
+        self.due.first()
+    }
+
+    /// Holds `reply`, last, keyed by its due. One already held on its exchange, which no caller
+    /// pushes (each holds its own), is replaced in its slot and given back.
+    pub(super) fn push(&mut self, reply: (K, Replies)) -> Option<(K, Replies)> {
+        let (exchange, due) = (reply.key(), reply.1.room_due_ns(room_beat()));
+        let displaced = self.replies.push(reply);
+        let at = match displaced {
+            None => {
+                self.due.grow();
+                self.replies.len().checked_sub(1)
+            }
+            Some(_) => self.replies.slot(exchange),
+        };
+        if let Some(at) = at {
+            self.due.set(at, due);
+        }
+        #[cfg(test)]
+        self.audit();
+        displaced
+    }
+
+    /// The reply on `exchange` changed by `change`, and keyed again by its due.
+    pub(super) fn change<R>(
+        &mut self,
+        exchange: K,
+        change: impl FnOnce(&mut Replies) -> R,
+    ) -> Option<R> {
+        let at = self.replies.slot(exchange)?;
+        self.change_at(at, change)
+    }
+
+    /// The reply at slot `at` changed by `change`, and keyed again by its due.
+    pub(super) fn change_at<R>(
+        &mut self,
+        at: usize,
+        change: impl FnOnce(&mut Replies) -> R,
+    ) -> Option<R> {
+        let (_, replies) = self.replies.at_mut(at)?;
+        let changed = change(replies);
+        let due = replies.room_due_ns(room_beat());
+        self.due.set(at, due);
+        #[cfg(test)]
+        self.audit();
+        Some(changed)
+    }
+
+    /// The reply at slot `at` taken out, the last moved into its slot, its key with it.
+    pub(super) fn take(&mut self, at: usize) -> Option<(K, Replies)> {
+        let reply = self.replies.take(at)?;
+        self.due.swap_remove(at);
+        #[cfg(test)]
+        self.audit();
+        Some(reply)
+    }
+
+    /// The reply on `exchange` taken out, as [`Writes::take`].
+    pub(super) fn remove(&mut self, exchange: K) -> Option<(K, Replies)> {
+        let at = self.replies.slot(exchange)?;
+        self.take(at)
+    }
+}
+
+/// The beat a reply waiting for room is vouched for by, half of it apart (`vouch_every`): the
+/// probe timeout before any sample (`bounds::initial_pto`, RFC 9002 §6.2.1), a constant.
+fn room_beat() -> u64 {
+    u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// A request's body as its door gives it: its pieces on a bounded channel, and its end once it
@@ -3584,15 +3708,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Door::Native(_, native) = &mut job.door else {
             return Ok(false);
         };
-        let mut replies = self.replies.get_mut(exchange).map(|(_, replies)| replies);
-        if handing && let Some(replies) = replies.as_mut() {
+        let lends = body.is_some();
+        let held = self.replies.change(exchange, |replies| {
+            if handing {
+                replies.driving = driving;
+            }
+            if !lends {
+                return None;
+            }
+            Some((replies.body.take()?, replies.driving.clone()))
+        });
+        if handing && held.is_some() {
             native.node = Some(self.waker.clone());
-            replies.driving = driving;
         }
         if let Some(body) = body {
-            let lent =
-                replies.and_then(|replies| Some((replies.body.take()?, replies.driving.clone())));
-            match lent {
+            match held.flatten() {
                 Some((pieces, driving)) => {
                     let handed = std::sync::Arc::clone(&native.handed);
                     self.feeding
@@ -3714,14 +3844,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     request.driven = Some(0);
                 }
                 request.half.node = None;
-                let door = exchange
-                    .and_then(|exchange| self.replies.get_mut(exchange))
-                    .map(|(_, replies)| &mut replies.driving);
-                let fed = exchange
-                    .and_then(|exchange| self.feeding.get_mut(exchange))
-                    .map(|(_, feeding)| &mut feeding.driving);
-                for driving in door.into_iter().chain(fed) {
-                    *driving = None;
+                if let Some(exchange) = exchange {
+                    self.replies
+                        .change(exchange, |replies| replies.driving = None);
+                    if let Some((_, feeding)) = self.feeding.get_mut(exchange) {
+                        feeding.driving = None;
+                    }
                 }
                 self.host.take_handed(request, exchange);
             }
@@ -3883,26 +4011,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 windows,
                 ..
             } = self;
-            let Some((_, replies)) = replies.at_mut(at) else {
-                return Wrote::Over;
-            };
             let mut toward = Toward {
                 endpoint: driver.endpoint(),
                 exchange,
             };
-            if room {
-                let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
-                return replies.wait_for_room(&mut toward, now, beat);
-            }
-            let wrote = replies.write(&mut toward, body_read, now, moved, slowed);
-            // What a get's client took of a piece once its room was full: its pace, for the
-            // windows the node's next gets hold (`crate::window`).
-            if let Some((bytes, ns)) = replies.take_paced() {
-                windows.get.paced(bytes, ns);
-            }
+            let wrote = replies.change_at(at, |replies| {
+                if room {
+                    return replies.wait_for_room(&mut toward, now, room_beat());
+                }
+                let wrote = replies.write(&mut toward, body_read, now, moved, slowed);
+                // What a get's client took of a piece once its room was full: its pace, for the
+                // windows the node's next gets hold (`crate::window`).
+                if let Some((bytes, ns)) = replies.take_paced() {
+                    windows.get.paced(bytes, ns);
+                }
+                wrote
+            });
             match wrote {
-                Wrote::Draining => {}
-                wrote => return wrote,
+                None => return Wrote::Over,
+                Some(wrote) if room => return wrote,
+                Some(Wrote::Draining) => {}
+                Some(wrote) => return wrote,
             }
         }
         Wrote::Draining
@@ -3929,9 +4058,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         break;
                     };
                     let sender = feeding.let_go();
-                    if let Some((_, replies)) = self.replies.get_mut(exchange) {
-                        replies.body = Some(sender);
-                    }
+                    self.replies
+                        .change(exchange, |replies| replies.body = Some(sender));
                 }
             }
         }
@@ -4237,13 +4365,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.fed || self.replied || looked_up || dropped {
             return Some(shard);
         }
-        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
-        let room = self
-            .replies
-            .iter()
-            .filter_map(|(_, replies)| replies.room_due_ns(beat))
-            .min();
-        [self.host.due(self), room].into_iter().flatten().min()
+        // The earliest reply waiting for room, its heap's first (`Writes`).
+        [self.host.due(self), self.replies.first()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 
@@ -8481,20 +8607,8 @@ pub(super) mod tests {
                 "an exchange's slot no job holds"
             );
             assert_eq!(self.asks.len(), asks, "an ask's slot no job waits on");
-            for (keys, of) in [(&self.beats, "beat"), (&self.renewals, "renewal")] {
-                assert_eq!(keys.place.len(), self.jobs.len(), "a {of}'s place a job");
-                for (place, (key, at)) in keys.heap.iter().enumerate() {
-                    assert_eq!(keys.place[*at], Some(place), "job {at}'s {of}'s place");
-                    if let Some(parent) = place.checked_sub(1).map(|p| p / 2) {
-                        assert!(keys.heap[parent].0 <= *key, "{of}s out of order at {place}");
-                    }
-                }
-                assert_eq!(
-                    keys.place.iter().flatten().count(),
-                    keys.heap.len(),
-                    "a {of} a job keyed"
-                );
-            }
+            self.beats.audit(self.jobs.len(), "beat");
+            self.renewals.audit(self.jobs.len(), "renewal");
         }
 
         /// The oracle as a step ends at `now`, every job turned in it: [`Host::audit`], and each
@@ -8529,6 +8643,50 @@ pub(super) mod tests {
         fn key(&self, at: usize) -> Option<u64> {
             let place = self.place.get(at).copied().flatten()?;
             self.heap.get(place).map(|(key, _)| *key)
+        }
+
+        /// The oracle's recount of the keys of `slots` slots, each an `of`: each slot's place
+        /// naming its entry, no key less than its parent's, and an entry a slot keyed.
+        fn audit(&self, slots: usize, of: &str) {
+            assert_eq!(self.place.len(), slots, "a {of}'s place a slot");
+            for (place, (key, at)) in self.heap.iter().enumerate() {
+                assert_eq!(self.place[*at], Some(place), "slot {at}'s {of}'s place");
+                if let Some(parent) = place.checked_sub(1).map(|p| p / 2) {
+                    assert!(self.heap[parent].0 <= *key, "{of}s out of order at {place}");
+                }
+            }
+            assert_eq!(
+                self.place.iter().flatten().count(),
+                self.heap.len(),
+                "a {of} a slot keyed"
+            );
+        }
+    }
+
+    impl<K> Writes<K>
+    where
+        (K, Replies): Key<Of = K>,
+    {
+        /// The oracle, after each change: its slots exact (`Keyed::audit`), its heap's places and
+        /// order ([`Earliest::audit`]), each reply's key its due, and the first the earliest a
+        /// full recount finds.
+        pub(super) fn audit(&self) {
+            self.replies.audit();
+            self.due.audit(self.replies.len(), "due");
+            let beat = room_beat();
+            for (at, (_, replies)) in self.replies.iter().enumerate() {
+                assert_eq!(
+                    self.due.key(at),
+                    replies.room_due_ns(beat),
+                    "reply {at}'s due"
+                );
+            }
+            let earliest = self
+                .replies
+                .iter()
+                .filter_map(|(_, replies)| replies.room_due_ns(beat))
+                .min();
+            assert_eq!(self.due.first(), earliest);
         }
     }
 
@@ -13067,6 +13225,67 @@ pub(super) mod tests {
             }
         }
         (visited, due)
+    }
+
+    /// The node's wait (`Node::host_due`) reads the earliest due of the native replies waiting for
+    /// room in the endpoint's budget first of their heap (`Writes::first`): 2,048 replies in
+    /// flight, every third waiting for room, each vouched for at its own time; then, a wait after
+    /// each, each waiting one's vouch moved half a beat on and then its room come as its reply is
+    /// written on, and every fifth of the others let go. Before, each wait walked every reply
+    /// (`room_due_ns` of each). The due each finds is the same.
+    #[test]
+    fn a_nodes_wait_reads_no_reply_waiting_for_room() {
+        const IN_FLIGHT: u64 = 2048;
+        let beat = room_beat();
+        let mut writes: Writes<u64> = Writes::default();
+        for exchange in 0..IN_FLIGHT {
+            let (_, replies) = native_door().unwrap();
+            assert!(writes.push((exchange, replies)).is_none());
+        }
+        for exchange in (0..IN_FLIGHT).filter(|exchange| exchange % 3 == 0) {
+            let vouched = (exchange * 7919) % (1 << 30);
+            writes.change(exchange, |replies| replies.room = Some((1 << 40, vouched)));
+        }
+        COMPARED_KEYS.with(|compared| compared.set(0));
+        let (mut waits, mut scanned, mut visited) = (0, 0, 0);
+        let mut wait = |writes: &Writes<u64>| {
+            let by_scan = writes
+                .replies
+                .iter()
+                .filter_map(|(_, replies)| replies.room_due_ns(beat))
+                .min();
+            scanned += writes.len();
+            assert_eq!(writes.first(), by_scan);
+            visited += COMPARED_KEYS.with(|compared| compared.replace(0));
+            waits += 1;
+        };
+        wait(&writes);
+        let mut compared = 0;
+        for exchange in 0..IN_FLIGHT {
+            if exchange % 3 == 0 {
+                writes.change(exchange, |replies| {
+                    if let Some((_, vouched)) = replies.room.as_mut() {
+                        *vouched += vouch_every(beat);
+                    }
+                });
+                compared += COMPARED_KEYS.with(|compared| compared.replace(0));
+                wait(&writes);
+                writes.change(exchange, |replies| replies.room = None);
+            } else if exchange % 5 == 1 {
+                assert!(writes.remove(exchange).is_some());
+            } else {
+                continue;
+            }
+            compared += COMPARED_KEYS.with(|compared| compared.replace(0));
+            wait(&writes);
+        }
+        println!(
+            "{IN_FLIGHT} replies in flight, a third waiting for room: {waits} waits read {visited} \
+             replies ({scanned} by the walk), the changes between them compared {compared} keys"
+        );
+        assert_eq!(visited, 0, "no reply read, no key compared");
+        assert!(scanned > waits * 1700);
+        assert_eq!(writes.first(), None, "no reply waits for room");
     }
 
     /// A host's wait reads none of its jobs (`Host::due`): with 2,048 held, each waiting on a read,

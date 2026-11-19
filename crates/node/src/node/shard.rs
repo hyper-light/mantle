@@ -2147,7 +2147,7 @@ mod tests {
         let range = one_member();
         let log = log_in(dir.path(), &range);
         let (mut lanes, _, _) = leading(&rt, &log, &range);
-        let mut commanded = super::super::keyed::KeyedOn::default();
+        let mut commanded = super::super::keyed::Waiting::default();
         commanded.push(super::super::Commanded {
             origin: super::super::CommandOrigin::Own(0),
             group: GROUP,
@@ -2420,7 +2420,7 @@ mod tests {
         let log = log_in(dir.path(), &range);
         let (mut shards, far) = follower(&rt, &log, &range);
         assert!(!far.seen.leading);
-        let mut commanded = super::super::keyed::KeyedOn::default();
+        let mut commanded = super::super::keyed::Waiting::default();
         commanded.push(Commanded {
             origin: CommandOrigin::Own(3),
             group: GROUP,
@@ -2970,7 +2970,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut commanded = super::super::keyed::KeyedOn::default();
+        let mut commanded = super::super::keyed::Waiting::default();
         commanded.push(Commanded {
             origin: CommandOrigin::Own(0),
             group: GROUP,

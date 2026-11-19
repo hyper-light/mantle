@@ -659,7 +659,13 @@ async fn run(
             Some(due) => {
                 match race2(lanes, hyper_rt::futures::sleep(due.saturating_sub(now))).await {
                     Either::First(woke) => Some(woke),
-                    Either::Second(_) => None,
+                    Either::Second(Ok(())) => None,
+                    // The shard's timer refused the wait: the host would miss its bounds, so the
+                    // task stops, as a range's shard's does.
+                    Either::Second(Err(error)) => {
+                        let _ = given.send(Out::Stopped(error.into())).await;
+                        return;
+                    }
                 }
             }
             None => Some(lanes.await),

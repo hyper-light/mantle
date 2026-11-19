@@ -187,6 +187,10 @@ impl<T: On> KeyedOn<T> {
         self.keyed.len()
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.keyed.is_empty()
+    }
+
     /// Its entries, in no order a caller may rely on, as [`Keyed::iter`].
     pub(super) fn iter(&self) -> std::slice::Iter<'_, T> {
         self.keyed.iter()
@@ -274,6 +278,20 @@ impl<T: On> KeyedOn<T> {
         let entry = self.keyed.take(at)?;
         self.let_go(&entry);
         Some(entry)
+    }
+
+    /// Keeps the entries `keep` holds to, each other taken out as [`KeyedOn::take`] takes one: a
+    /// walk of every entry, for what neither key finds (an entry this node asked itself, by its
+    /// own number). Each step removes an entry or passes one, so it ends within the entries' count.
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        let mut at = 0;
+        while let Some(entry) = self.keyed.at(at) {
+            if keep(entry) {
+                at = at.saturating_add(1);
+            } else {
+                self.take(at);
+            }
+        }
     }
 
     fn let_go(&mut self, entry: &T) {
@@ -676,5 +694,53 @@ pub(super) mod tests {
         assert_eq!(after[1], others.len(), "a probe a Refused");
         assert_eq!(after[2], 2 * out.len(), "two probes an answer");
         assert_eq!(reads.len(), 0);
+    }
+
+    /// `Event::Refused` lets go of what a peer asked this node's members on the exchange that
+    /// ended (`Node::commanded`, `Node::reading`), each found by its exchange in one probe
+    /// (`KeyedOn::on`): 1,024 commands and 1,024 reads peers asked on exchanges, and 64 of each
+    /// this node asked itself, which no exchange finds; a `Refused` on each of 2,048 exchanges
+    /// neither holds (a chunk's, a native request's), then on each command's and each read's.
+    /// Before, each `Refused` walked both lists whole (`retain`).
+    #[test]
+    fn a_refused_exchange_finds_its_command_and_read_with_no_scan() {
+        const ASKED: u64 = 1024;
+        const OWN: u64 = 64;
+        let (mut commanded, mut reading) = (KeyedOn::default(), KeyedOn::default());
+        for number in 0..ASKED + OWN {
+            let on = (number < ASKED).then(|| 10_000 + number);
+            commanded.push(Out(number, on));
+            reading.push(Out(number, on.map(|exchange| exchange + ASKED)));
+        }
+        let others: Vec<u64> = (100_000..100_000 + 2048).collect();
+        let (mut before, mut after) = ([0; 2], [0; 2]);
+        probes();
+        for &exchange in &others {
+            before[0] += commanded.len() + reading.len();
+            assert!(commanded.on(exchange).is_none() && reading.on(exchange).is_none());
+        }
+        after[0] = probes();
+        for exchange in 10_000..10_000 + ASKED {
+            before[1] += commanded.len() + reading.len();
+            let command = commanded.on(exchange).unwrap();
+            assert!(commanded.remove(command).is_some());
+            let read = reading.on(exchange + ASKED).unwrap();
+            assert!(reading.remove(read).is_some());
+        }
+        after[1] = probes();
+        println!(
+            "{ASKED} commands and {ASKED} reads asked by peers, {OWN} of each its own: Refused on \
+             {} other exchanges {} probes ({} visited by the walks), on each command's and read's \
+             {} ({})",
+            others.len(),
+            after[0],
+            before[0],
+            after[1],
+            before[1]
+        );
+        assert_eq!(after[0], 2 * others.len(), "two probes a Refused");
+        assert_eq!(after[1], 4 * usize::try_from(ASKED).unwrap(), "two a list");
+        let own = usize::try_from(OWN).unwrap();
+        assert_eq!((commanded.len(), reading.len()), (own, own));
     }
 }

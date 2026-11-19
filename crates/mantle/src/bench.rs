@@ -1260,9 +1260,44 @@ mod tests {
         );
     }
 
+    /// The span of the failure guard on the OS's count of the process's threads ([`released`]),
+    /// the native worker fixtures' (engine's `ranges_room.rs`): a passing run never goes this long
+    /// with a joined thread still counted and none leaving the count, and elapsed time never
+    /// counts as the fact.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// Waits until the OS counts no more of the process's threads than `baseline`: every thread
+    /// an earlier point started and joined has left its count. A join returns before the OS lets
+    /// go of its thread (`drive::Started::join`), and macOS went on counting joined threads past
+    /// the join's own wait, which gives up after as long again as they ran: the next point's count
+    /// took them for its own. The guard is on progress, not on the wait's length: a span of
+    /// [`WAIT`] with the count above `baseline` and at no new low fails, and the count reaches a
+    /// new low at most as often as it stands above `baseline`, so the wait ends.
+    fn released(baseline: usize) {
+        let mut lowest = usize::MAX;
+        let mut deadline = Instant::now() + WAIT;
+        loop {
+            let counted = drive::thread_count();
+            if counted <= baseline {
+                return;
+            }
+            if counted < lowest {
+                lowest = counted;
+                deadline = Instant::now() + WAIT;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the OS still counts {counted} threads, {baseline} before the first point, and \
+                 none left its count for {WAIT:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// Clients are records: puts at ten times a driver a core's clients add no threads, as
     /// the OS counts them, over one client a core, and open loop adds none over closed. Run in a
-    /// process of its own, so that no other test's threads are counted.
+    /// process of its own, so that no other test's threads are counted, and each point counted
+    /// once the OS counts no thread an earlier one joined ([`released`]).
     #[test]
     fn clients_cost_no_threads() {
         const ALONE: &str = "MANTLE_TEST_THREADS_ALONE";
@@ -1296,6 +1331,9 @@ mod tests {
         let issuer = Issuer::start_device(&path, 4).unwrap();
         let v = Volume::format(&issuer, file, size, config).unwrap();
         let cores = drive::drivers(usize::MAX);
+        // The issuer's and the volume's threads, none of them joined: nothing the OS lets go of
+        // later is counted here.
+        let baseline = drive::thread_count();
         let mut seen = Vec::new();
         for (point, (clients, rate)) in [
             (cores, None),
@@ -1305,6 +1343,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
+            released(baseline);
             let load = Load {
                 clients,
                 rate,

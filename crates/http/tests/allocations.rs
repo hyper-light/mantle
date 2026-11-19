@@ -209,3 +209,79 @@ fn a_response_head_is_written_with_no_allocation_of_its_own() {
     });
     assert_eq!(made, 0);
 }
+
+/// The allocations and the reallocations `f` makes on this thread, apart.
+fn counted<T>(f: impl FnOnce() -> T) -> (T, (u64, u64)) {
+    alloc::begin();
+    let out = f();
+    let counts = alloc::end();
+    (out, (counts.allocations, counts.reallocations))
+}
+
+/// A response's head is written around its field lines into the buffer its connection keeps from
+/// response to response, at its length (the listener's `conn::Connection::head`): a buffer smaller
+/// than the head is replaced by one made at it, one allocation, and one large enough is written in
+/// place, none; neither grows. A first head into an empty buffer, a shorter one, a longer one with
+/// every length's field at its longest, and a chunked one, each the bytes `write::head` writes for
+/// the same fields.
+#[test]
+fn a_response_head_is_written_at_its_length_in_its_reused_buffer() {
+    let etag: &[u8] = b"\"d41d8cd98f00b204e9800998ecf8427e\"";
+    let id: &[u8] = b"0123456789ABCDEF";
+    let date: &[u8] = b"Sun, 25 Oct 2026 12:00:00 GMT";
+    let key = vec![b'k'; 1024];
+    // Each head's status, reason, fields and length, and its allocations and reallocations.
+    type Head<'a> = (u16, &'a str, Vec<(&'a str, &'a [u8])>, Length, (u64, u64));
+    let heads: [Head<'_>; 4] = [
+        (
+            200,
+            "OK",
+            vec![
+                ("ETag", etag),
+                ("Last-Modified", date),
+                ("x-amz-request-id", id),
+            ],
+            Length::Known(1 << 20),
+            (1, 0),
+        ),
+        (
+            204,
+            "No Content",
+            vec![("x-amz-request-id", id)],
+            Length::None,
+            (0, 0),
+        ),
+        (
+            500,
+            "Internal Server Error",
+            vec![
+                ("x-amz-request-id", id),
+                ("x-amz-id-2", b"host"),
+                ("Date", date),
+                ("Location", &key),
+                ("Connection", b"close"),
+            ],
+            Length::Known(u64::MAX),
+            (1, 0),
+        ),
+        (200, "OK", Vec::new(), Length::Chunked, (0, 0)),
+    ];
+    let mut out = Vec::new();
+    for (status, reason, fields, length, expected) in heads {
+        let mut lines = Vec::new();
+        for (name, value) in &fields {
+            write::field(&mut lines, name, &[value]).unwrap();
+        }
+        let ((), made) = counted(|| {
+            write::head_lines(&mut out, Version::Http11, status, reason, &lines, length).unwrap()
+        });
+        println!("head {status} of {} bytes: {made:?}", out.len());
+        let mut whole = Vec::new();
+        write::head(&mut whole, Version::Http11, status, reason, &fields, length).unwrap();
+        assert_eq!(out, whole, "{status}");
+        assert_eq!(made, expected, "{status}");
+        if made.0 == 1 {
+            assert_eq!(out.capacity(), out.len(), "{status}");
+        }
+    }
+}

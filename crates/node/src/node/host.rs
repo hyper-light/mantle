@@ -147,6 +147,22 @@ pub(crate) enum JobAsk {
     },
 }
 
+/// A native request handed to a driving shard with its fields read (node.md §2.9 step 6e): its
+/// operation, not its work, which the shard makes ([`Host::take_handed`]), as a job's drivers need
+/// not cross (step 6's check); its door's job half, its asker's principal, its Open's block, its
+/// client's deadline, its admission's time, charge and window, and the shard it was placed on.
+pub(crate) struct Handover {
+    half: Box<Native>,
+    principal: String,
+    op: Op,
+    block: Option<u64>,
+    deadline_ns: Option<u64>,
+    admitted_ns: Option<u64>,
+    charge: u64,
+    window: usize,
+    driven: Option<usize>,
+}
+
 /// An object operation the host runs: the door it came in by, its asker, and where it is.
 pub(crate) struct Job {
     door: Door,
@@ -240,7 +256,7 @@ impl Job {
     fn working(&self) -> bool {
         !matches!(
             self.work,
-            Work::Fields(..) | Work::Draining(_) | Work::Answering(_)
+            Work::Fields(..) | Work::Handing(_) | Work::Draining(_) | Work::Answering(_)
         )
     }
 }
@@ -295,6 +311,10 @@ pub(crate) trait Serve {
     fn ranges(&self) -> usize;
     /// Whether the node holds room for one more command (`command_asks`).
     fn command_room(&self) -> bool;
+    /// Whether the node holds room for one more ask of `ask`'s kind (`command_asks`, `read_asks`,
+    /// `chunk_asks`), checked before the ask's value is given up: a driving shard's ask the node
+    /// has no room for is held by the node's task, not answered `Asks` (node.md §2.9 step 6e).
+    fn room(&self, ask: &JobAsk) -> bool;
     /// The commands the node holds at once (`command_asks`), which a DeleteObjects shares.
     fn command_asks(&self) -> usize;
     /// The wall clock's time, which a put's and a completion's records carry.
@@ -351,6 +371,65 @@ impl Host {
     /// Whether it runs no job.
     pub(super) fn idle(&self) -> bool {
         self.jobs.is_empty()
+    }
+
+    /// Takes a native request handed with its fields read: its job made here, its work made from
+    /// its operation (node.md §2.9 step 6e), its door naming `exchange` where the node's task runs
+    /// it and none on a driving shard.
+    pub(super) fn take_handed(&mut self, handed: Box<Handover>, exchange: Option<ExchangeId>) {
+        let Handover {
+            half,
+            principal,
+            op,
+            block,
+            deadline_ns,
+            admitted_ns,
+            charge,
+            window,
+            driven,
+        } = *handed;
+        let label = Some(labels::host(&op));
+        self.jobs.push(Job {
+            door: Door::Native(exchange, half),
+            principal,
+            work: work(op, block),
+            pending: Vec::new(),
+            deadline_ns,
+            moved_ns: hyper_rt::futures::now_ns(),
+            admitted_ns,
+            charge,
+            window,
+            driven,
+            label,
+        });
+    }
+
+    /// A native job whose fields were read for a driving shard (`Work::Handing`), taken out to be
+    /// handed there: its request and its exchange.
+    fn handing(&mut self) -> Option<(Box<Handover>, Option<ExchangeId>)> {
+        let at = self
+            .jobs
+            .iter()
+            .position(|job| matches!(job.work, Work::Handing(_)))?;
+        let job = self.jobs.swap_remove(at);
+        let (Door::Native(exchange, half), Work::Handing(handing)) = (job.door, job.work) else {
+            return None;
+        };
+        let (op, block) = *handing;
+        Some((
+            Box::new(Handover {
+                half,
+                principal: job.principal,
+                op,
+                block,
+                deadline_ns: job.deadline_ns,
+                admitted_ns: job.admitted_ns,
+                charge: job.charge,
+                window: job.window,
+                driven: job.driven,
+            }),
+            exchange,
+        ))
     }
 
     /// When, on the shard's clock, the host next needs a turn of whoever serves it, by its own
@@ -1305,22 +1384,43 @@ impl Feeding {
     }
 }
 
+/// The body a native put's operation names, its object's length and its trailer's algorithm, which
+/// its feeding reads (`feed`): a put's, a part's or a run's, the operations whose work is a put.
+fn body_of(op: &Op) -> Option<(u64, Option<checksum::Algorithm>)> {
+    match op {
+        Op::Put {
+            length, trailing, ..
+        }
+        | Op::UploadPart {
+            length, trailing, ..
+        }
+        | Op::Append {
+            length, trailing, ..
+        } => Some((*length, *trailing)),
+        _ => None,
+    }
+}
+
 /// A native put, its fields read and nothing past them, given its body by the node's task (node.md
-/// §2.9 step 6c): from its first byte on its door's channel of one piece, the least that moves a
-/// body (`door::Depth::FIRST`), `pieces` the sender its door lent and `handed` what its door's
-/// halves share, from the feeding, which the node's task keeps, to its door's receiver, which the
+/// §2.9 step 6c): of its object's length and its trailer's algorithm, from its first byte on its
+/// door's channel of one piece, the least that moves a body (`door::Depth::FIRST`), `pieces` the
+/// sender its door lent and `handed` what its door's halves share, from the feeding, which the node's task keeps, to its door's receiver, which the
 /// put's job takes from, the trailer's value past the object's bytes the feeding's.
-fn feed(putting: &Putting, pieces: Sender<Piece>, handed: std::sync::Arc<Handed>) -> Feeding {
-    let width = putting.trailing.map_or(0, checksum::Algorithm::width);
+fn feed(
+    (length, trailing): (u64, Option<checksum::Algorithm>),
+    pieces: Sender<Piece>,
+    handed: std::sync::Arc<Handed>,
+) -> Feeding {
+    let width = trailing.map_or(0, checksum::Algorithm::width);
     Feeding {
         pieces,
         handed,
         storage: None,
         held: None,
-        left: putting.length,
-        trailing: putting.trailing,
+        left: length,
+        trailing,
         trailer: Vec::new(),
-        empty: putting.length == 0 && width == 0,
+        empty: length == 0 && width == 0,
         dropping: false,
     }
 }
@@ -1371,6 +1471,10 @@ impl Local {
 enum Work {
     /// The request's fields being read from its body's start: the head, the fields so far.
     Fields(Head, Vec<u8>),
+    /// A native request's fields read, its operation and its Open's block to be handed to the
+    /// driving shard it was placed on (node.md §2.9 step 6e), which makes its work there: taken
+    /// out by the node's task after the host's step (`Node::hand_off`).
+    Handing(Box<(Op, Option<u64>)>),
     /// A request refused or done: its reply, which goes once what is left of its body is read and
     /// dropped, so the exchange ends whole (`Arriving::Redirect`'s reason). Boxed: a reply is many
     /// times any other job's state.
@@ -1785,6 +1889,23 @@ impl Table {
     /// The root range's applied index the table was read at.
     pub(super) fn applied(&self) -> u64 {
         self.applied
+    }
+
+    /// A settled copy for a driving shard (node.md §2.9 step 6e): its volumes and the scheme new
+    /// blocks take now, no choice running, as the node's task alone asks the durability model.
+    pub(super) fn settled(&self) -> Self {
+        Self {
+            applied: self.applied,
+            placed: self.placed.clone(),
+            facts: self.facts.clone(),
+            standing: self.standing.clone(),
+            scheming: Scheming {
+                now: self.scheming.now,
+                domains_at: self.scheming.domains_at,
+                settled: true,
+                choosing: None,
+            },
+        }
     }
 
     /// The scheme new blocks take now: none where no candidate fits the domains, and refused
@@ -2667,6 +2788,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .admission
                 .as_ref()
                 .is_some_and(|admission| !admission.holds(more));
+        // A request placed on a shard a driving task runs on is handed there with its operation
+        // (node.md §2.9 step 6e), the shard making its work; production holds no driving lanes
+        // until 6f, so every request is made into work here.
+        let driving = job
+            .driven
+            .is_some_and(|shard| self.driving.iter().any(|lanes| lanes.shard() == shard));
         job.work = match op {
             Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             Ok(_) if crowded => Work::Draining(Box::new(Reply::slowed(door::Slowed::Crowded))),
@@ -2678,12 +2805,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     job.charge = job.charge.saturating_add(more);
                 }
                 job.label = Some(labels::host(&op));
-                work(op, block)
+                if driving {
+                    Work::Handing(Box::new((op, block)))
+                } else {
+                    work(op, block)
+                }
             }
         };
         // The put's body comes on its door's channel, its sender lent to the feeding: one whose door
         // lent it already, which no put's does, is answered as one whose channel cannot be made.
-        if let (Work::Put(putting), Door::Native(_, native)) = (&job.work, &job.door) {
+        let body = match &job.work {
+            Work::Put(putting) => Some((putting.length, putting.trailing)),
+            Work::Handing(handing) => body_of(&handing.0),
+            _ => None,
+        };
+        if let (Some(body), Door::Native(_, native)) = (body, &job.door) {
             let lent = self
                 .replies
                 .iter_mut()
@@ -2692,7 +2828,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             match lent {
                 Some(pieces) => {
                     let handed = std::sync::Arc::clone(&native.handed);
-                    self.feeding.push((exchange, feed(putting, pieces, handed)));
+                    self.feeding.push((exchange, feed(body, pieces, handed)));
                 }
                 None => job.work = Work::Draining(Box::new(Reply::slowed(door::Slowed::Door))),
             }
@@ -2771,6 +2907,62 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.drop_abandoned();
         self.step_lookups();
         self.lend(|host, node| host.step(node))
+    }
+
+    /// Each native request whose fields were read for a driving shard handed there (node.md §2.9
+    /// step 6e), with its operation, its door's job half and its admission; one its lane refuses
+    /// for room, or whose shard holds no lane, made into work here and run on the first shard.
+    /// The node's task keeps its exchange: its body's feeding and its reply's half.
+    pub(super) fn hand_off(&mut self) {
+        // A request is made `Handing` only where a lane is held for its shard.
+        if self.driving.is_empty() {
+            return;
+        }
+        while let Some((request, exchange)) = self.host.handing() {
+            let lanes = self
+                .driving
+                .iter()
+                .find(|lanes| Some(lanes.shard()) == request.driven);
+            let refused = match lanes {
+                Some(lanes) => lanes.hand(request),
+                None => Some(request),
+            };
+            if let Some(request) = refused {
+                self.host.take_handed(request, exchange);
+            }
+        }
+    }
+
+    /// Each driving shard's lanes at the node's turn (node.md §2.9 step 6e), served by the node as
+    /// its own host is: each ask asked, held while the node has no room, each answer sent, each
+    /// job's end told and its door's half kept in the host's doors, and the volume table, where the
+    /// node read a newer one, told. A shard whose task ended stops the node.
+    pub(super) fn serve_driving(&mut self) -> Result<(), NodeError> {
+        if self.driving.is_empty() {
+            return Ok(());
+        }
+        let applied = self.table.as_ref().map(Table::applied);
+        let told = applied.filter(|applied| Some(*applied) != self.driving_table);
+        let mut driving = std::mem::take(&mut self.driving);
+        let mut host = std::mem::take(&mut self.host);
+        let mut served = Ok(());
+        for lanes in &mut driving {
+            if told.is_some()
+                && let Some(table) = self.table.as_ref()
+            {
+                lanes.tell_table(Box::new(table.settled()));
+            }
+            served = lanes.serve(self, |half| host.doors.give_native(half));
+            if served.is_err() {
+                break;
+            }
+        }
+        if told.is_some() {
+            self.driving_table = told;
+        }
+        self.host = host;
+        self.driving = driving;
+        served
     }
 
     /// The host lent out to `step`, served by the node through [`Serve`], and taken back
@@ -3228,6 +3420,18 @@ impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
         Node::command_room(self)
     }
 
+    fn room(&self, ask: &JobAsk) -> bool {
+        match ask {
+            JobAsk::Command(..) => Node::command_room(self),
+            JobAsk::Read(..) => {
+                self.reads_out.len().saturating_add(self.reads_done.len()) < self.read_asks
+            }
+            JobAsk::Put { at, .. } | JobAsk::Get { at, .. } => {
+                *at == self.id || self.chunks_out.len() < self.chunk_asks
+            }
+        }
+    }
+
     fn command_asks(&self) -> usize {
         self.command_asks
     }
@@ -3241,14 +3445,21 @@ impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
     /// want of room is asked again then (research/77 D2), and not at its own refusal, which would
     /// ask it again each turn while the room stays taken.
     fn freed(&mut self) -> bool {
-        std::mem::take(&mut self.room_freed)
+        let freed = std::mem::take(&mut self.room_freed)
             || self.chunks_done.iter().any(|(_, outcome)| {
                 !matches!(
                     outcome,
                     ChunkOutcome::Refused(chunk::Status::Busy)
                         | ChunkOutcome::Lost(Refusal::Budget)
                 )
-            })
+            });
+        // A driving shard's puts wait on the same room (node.md §2.9 step 6e).
+        if freed {
+            for lanes in &mut self.driving {
+                lanes.tell_freed();
+            }
+        }
+        freed
     }
 
     fn moved(&self) -> u64 {
@@ -3636,6 +3847,8 @@ impl Host {
         };
         match job.work {
             Work::Fields(..) => self.read_fields(node, at),
+            // Taken out after the host's step, by the node's task that reads its fields.
+            Work::Handing(_) => Ok(false),
             Work::Draining(_) => self.drain_job(at),
             Work::Answering(_) => self.answer_door(at),
             Work::Bucket(_) => self.step_bucket(node, at),
@@ -3702,7 +3915,7 @@ impl Host {
         job.moved_ns = hyper_rt::futures::now_ns();
         let principal = job.principal.clone();
         match &mut job.work {
-            Work::Fields(..) | Work::Draining(_) | Work::Answering(_) => {}
+            Work::Fields(..) | Work::Handing(_) | Work::Draining(_) | Work::Answering(_) => {}
             // A native upload opened: its ID, and its progress, every run but the last as long
             // as the plan made it.
             Work::Command(commanding) if matches!(commanding.then, Then::Open { .. }) => {
@@ -7139,7 +7352,7 @@ fn get_answer(outcome: Outcome) -> get::Answer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// A gateway of the rates and target `mantle init`'s cells state (crates/mantle/tests/support).
@@ -7594,7 +7807,7 @@ mod tests {
         let (sender, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
         let handed = std::sync::Arc::new(Handed::default());
         (
-            feed(putting, sender, handed),
+            feed((putting.length, putting.trailing), sender, handed),
             Pieces {
                 pieces,
                 ended: None,
@@ -8448,7 +8661,11 @@ mod tests {
     ) -> *const Handed {
         let (mut native, mut replies) = doors.take().unwrap();
         let sender = replies.body.take().unwrap();
-        let mut feeding = feed(putting, sender, std::sync::Arc::clone(&native.handed));
+        let mut feeding = feed(
+            (putting.length, putting.trailing),
+            sender,
+            std::sync::Arc::clone(&native.handed),
+        );
         let mut moved = 0;
         for _ in 0..pieces {
             assert!(feeding.free());
@@ -8521,7 +8738,7 @@ mod tests {
         // The job let go of its body: its feeding drops the rest.
         let (native, mut replies) = doors.take().unwrap();
         let mut feeding = feed(
-            &putting,
+            (putting.length, putting.trailing),
             replies.body.take().unwrap(),
             std::sync::Arc::clone(&native.handed),
         );
@@ -8544,7 +8761,7 @@ mod tests {
             "a kept door's words are cleared"
         );
         let mut feeding = feed(
-            &putting,
+            (putting.length, putting.trailing),
             replies.body.take().unwrap(),
             std::sync::Arc::clone(&native.handed),
         );
@@ -8749,10 +8966,12 @@ mod tests {
     /// answered by `answer` and its outcome given at the host's next turn, and each job's end kept,
     /// with how many asks it let go. It holds no volume table, and reads no fields: its jobs come
     /// typed through the S3 door.
-    struct Stub {
+    pub(crate) struct Stub {
         answer: fn(&JobAsk) -> Outcome,
         answers: Vec<(Pending, Outcome)>,
-        asked: u64,
+        pub(crate) asked: u64,
+        /// Whether it says it has no room for any ask (`Serve::room`).
+        pub(crate) no_room: bool,
         ended: Vec<(Option<u64>, u64, Option<usize>, usize)>,
         abandoned: usize,
         /// Whether it takes each ended job's door half, as a driving shard's lanes take it to the
@@ -8803,6 +9022,10 @@ mod tests {
             true
         }
 
+        fn room(&self, _: &JobAsk) -> bool {
+            !self.no_room
+        }
+
         fn command_asks(&self) -> usize {
             1
         }
@@ -8844,6 +9067,40 @@ mod tests {
             }
             self.half = half;
             None
+        }
+    }
+
+    impl Stub {
+        /// A stub that answers each chunk ask `Stored`, its answers' room made for 4 at once.
+        pub(crate) fn chunks() -> Self {
+            Self {
+                answer: |_| Outcome::Chunk(ChunkOutcome::Stored),
+                answers: Vec::with_capacity(4),
+                asked: 0,
+                no_room: false,
+                ended: Vec::with_capacity(4),
+                abandoned: 0,
+                takes_halves: false,
+                half: None,
+            }
+        }
+    }
+
+    impl Table {
+        /// A table of no volumes read at `applied`, whose blocks take three copies.
+        pub(crate) fn empty(applied: u64) -> Self {
+            Self {
+                applied,
+                placed: Vec::new(),
+                facts: Vec::new(),
+                standing: Vec::new(),
+                scheming: Scheming {
+                    now: Ok(Some(durability::Scheme::Copies(3))),
+                    domains_at: applied,
+                    settled: true,
+                    choosing: None,
+                },
+            }
         }
     }
 
@@ -9192,6 +9449,7 @@ mod tests {
             },
             answers: Vec::new(),
             asked: 0,
+            no_room: false,
             ended: Vec::new(),
             abandoned: 0,
             takes_halves: false,
@@ -9310,6 +9568,188 @@ mod tests {
         }
     }
 
+    /// A runtime of two shards, each with `tasks` task slots (as the shards' tests start theirs).
+    fn two_shards(tasks: usize) -> hyper_rt::runtime::Runtime {
+        hyper_rt::runtime::Runtime::start(&hyper_rt::runtime::RuntimeConfig {
+            shards: 2,
+            tasks_per_shard: tasks,
+            timers_per_shard: 1,
+            interests_per_shard: hyper_rt::runtime::interests_for(tasks),
+            ring_entries: 1,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: 1,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: usize::try_from(hyper_rt::machine::facts::Facts::query().page.base)
+                .unwrap(),
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        })
+        .unwrap()
+    }
+
+    /// A bucket's row, active and owned by the asker of a handed request.
+    fn bucket_row() -> Bucket {
+        Bucket {
+            owner: "o".into(),
+            created_ns: 0,
+            location: String::new(),
+            versioning: Versioning::Unversioned,
+            state: BucketState::Active,
+            attempt: 0,
+            progress_ns: 0,
+            lock: None,
+        }
+    }
+
+    /// A native request handed to a driving shard with its fields read: its operation and its
+    /// door's job half, admitted now, charged `charge` and placed on shard 1.
+    fn handover(half: Box<Native>, op: Op, charge: u64, now: u64) -> Box<Handover> {
+        Box::new(Handover {
+            half,
+            principal: "o".into(),
+            op,
+            block: None,
+            deadline_ns: None,
+            admitted_ns: Some(now),
+            charge,
+            window: 1,
+            driven: Some(1),
+        })
+    }
+
+    /// A host on a driving shard, the second of a two-shard runtime, driven over its lanes by the
+    /// stub node on the test's thread (node.md §2.9 step 6e), takes a put and a get handed with
+    /// their operations to their ends: the shard makes their work, its asks cross to the stub and
+    /// their answers back in the lane's slots, the put takes its body's end from its door and is
+    /// answered `Done` with the version written, the get is answered `Done` with no bytes, each
+    /// reply written by the test as the node's task writes it; each job's end is told with its
+    /// charge and its shard, its door's half riding it back, so the shard's host keeps no door
+    /// and the test's doors keep both. A request past the lane's room is given back.
+    #[test]
+    fn a_driving_shards_host_takes_a_put_and_a_get_to_their_ends_over_its_lanes() {
+        let rt = two_shards(4);
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        let gateway = std::sync::Arc::new(gateway);
+        let start = super::super::driving::Start {
+            command_asks: 2,
+            read_asks: 2,
+            chunk_asks: 2,
+            groups: vec![(Layer::Bucket, 1), (Layer::Name, 2)],
+            ranges: 2,
+            wall: super::super::Wall::From(0),
+            gateway,
+            requests: 3,
+        };
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let mut lanes = super::super::driving::Lanes::start(holder, 1, start).unwrap();
+        lanes.tell_table(Box::new(Table::empty(1)));
+        let mut doors = Doors::new(2);
+        let now = hyper_rt::futures::now_ns();
+        let (put_half, mut put_replies) = doors.take().unwrap();
+        let (get_half, mut get_replies) = doors.take().unwrap();
+        // The put's body as the node's task gives it: empty, whole.
+        let body = put_replies.body.as_ref().unwrap();
+        assert!(body.try_send(Piece::End(None)).is_ok());
+        let put = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: 0,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+            trailing: None,
+            metadata: Vec::new(),
+        };
+        let get = Op::Get {
+            bucket: "b".into(),
+            key: "k".into(),
+            headers: Headers::default(),
+            version: None,
+        };
+        assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
+        assert!(lanes.hand(handover(get_half, get, 5, now)).is_none());
+        let mut stub = Stub {
+            answer: |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Command(_, Command::Name(_)) => {
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                        version: "v".into(),
+                    })))
+                }
+                JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Current(Some((1, empty_version())))),
+                )),
+                _ => panic!("an ask neither job makes"),
+            },
+            ..Stub::chunks()
+        };
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut put_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut get_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (mut put_over, mut get_over) = (false, false);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(put_over && get_over && stub.ended.len() == 2) {
+            assert!(std::time::Instant::now() < until, "the jobs never ended");
+            lanes
+                .serve(&mut stub, |half| doors.give_native(half))
+                .unwrap();
+            let now = hyper_rt::futures::now_ns();
+            put_over = put_over
+                || put_replies.write(&mut put_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            get_over = get_over
+                || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            std::thread::yield_now();
+        }
+        stub.ended.sort();
+        assert_eq!(
+            stub.ended,
+            vec![(Some(now), 5, Some(1), 0), (Some(now), 7, Some(1), 0)]
+        );
+        let put_reply = reply_seen(&put_seen);
+        assert_eq!(
+            (put_reply.status, put_reply.version.as_str()),
+            (Status::Done, "v")
+        );
+        let get_reply = reply_seen(&get_seen);
+        assert_eq!((get_reply.status, get_reply.size), (Status::Done, 0));
+        // Each job's half rode its end back: the test's doors keep both doors once the replies'
+        // halves are back too.
+        assert_eq!(doors.waiting.len(), 2);
+        doors.give_replies(put_replies);
+        doors.give_replies(get_replies);
+        assert_eq!((doors.kept.len(), doors.waiting.len()), (2, 0));
+        rt.shutdown().unwrap();
+
+        // A request past the lane's room is given back, to run on the first shard.
+        let (lanes, _ends) = super::super::driving::tests::unstarted(1, 3);
+        let (half, _) = doors.take().unwrap();
+        let op = || Op::Get {
+            bucket: "b".into(),
+            key: "k".into(),
+            headers: Headers::default(),
+            version: None,
+        };
+        assert!(lanes.hand(handover(half, op(), 0, now)).is_none());
+        let (half, _) = doors.take().unwrap();
+        let given_back = lanes.hand(handover(half, op(), 0, now));
+        assert!(given_back.is_some_and(|request| request.driven == Some(1)));
+    }
+
     /// A host's wait is its own jobs' alone (node.md §2.9 step 6e), so a driving shard's task can
     /// wait on its host: none while it runs no job; a job whose ask is out is due at its client's
     /// patience, an S3 door's get holding no beat; and at once once whoever serves it holds the
@@ -9322,6 +9762,7 @@ mod tests {
             answer: |_| panic!("nothing is asked"),
             answers: Vec::new(),
             asked: 0,
+            no_room: false,
             ended: Vec::new(),
             abandoned: 0,
             takes_halves: false,

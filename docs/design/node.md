@@ -2295,7 +2295,7 @@ pass.
 
 What 6e needed still, as worked out: the lanes, in `node::driving` beside `node::shard`, and the
 body's channel kept with its door. Built since (below): a native door's exchange optional, a job's
-end carrying its door's half, and the body's channel kept with its door; the lanes are not.
+end carrying its door's half, the body's channel kept with its door, and the lanes.
 
 - *The answer slots, pooled.* `hyper_rt::sync::oneshot` boxes the block its ends share and makes
   its ring at each one made (`ring::Shared::new`, `Ring::new`), so a slot made as it is asked
@@ -2394,17 +2394,64 @@ go has the rest dropped; a feeding let go tells its job its body did not come wh
 the piece given before; a kept door's words are cleared. The host and node unit tests and
 tests/put_body.rs pass.
 
-What 6e needs still: the lanes (`node::driving`), as the list above works them out, and with them
-a handed request carrying its operation (`Op`) for the shard to make its work, and the task
-reachable from production. These three land as one: with no `#[allow(dead_code)]`, the request a
-lane carries, the function that makes its work on the shard and the task that takes it are
-reachable from production only through a node's turn that hands a request to a driving lane where
-one is held for its shard, which production leaves empty until 6f; so that hand-off, a request's
-fields read and its operation handed rather than made into work (`read_fields`), with a lane's
-refusal running it on the first shard, lands with the lanes. And the volume table handed in needs a
-settled copy of the node's (`Table` is not `Clone`; its scheme's choice may be pending on the pool,
-`Scheming`), and the host's count of bytes moved (`Host::moved`) a way to the node's sum
-(`Node::moved`), each a lane message or a shared word.
+*As built (2026-11-19), its fifth piece: a driving shard's task and its lanes* (6e,
+`crates/node/src/node/driving.rs`, `host.rs`, `node.rs`). A driving shard's task holds a `Host`
+that keeps no doors (`Host::new(0, ..)`), started through that shard's control queue by a launcher
+that makes the task there, as its jobs' drivers need not cross, and spawns it Normal, as the S3
+connections beside it run (`driving::Lanes::start`). Its lanes, each a hyper-rt channel made once:
+
+| Lane | From, to | Bound | At the bound |
+|---|---|---|---|
+| Requests, tables, room freed, chunks moved (`In`) | the node's task, to the shard | the exchanges the transport admits at once (`parked_most`) | a request given back to run on the first shard (`Lanes::hand`); the volume table held, the latest superseding it; room freed held as a flag; a chunk's move dropped, its next piece telling it again |
+| Asks, job ends, put samples (`Out`) | the shard, to the node's task | `parked_most`, the most the node's task takes in a turn | the shard waits for room, as a range's shard does |
+| Answers | the node's task, to the shard | `command_asks + read_asks + chunk_asks` | never full: the shard's host holds each kind to its bound (`Asks` past it, asked again at the job's next turn), each ask holding its place from its ask until its answer is taken, an abandoned one's until its answer comes and is dropped |
+
+The answers lane is the pool of answer slots: an ask is numbered by the shard (`Out::Ask`) and its
+answer comes back under its number, so an ask allocates nothing past its own value, where a
+`oneshot` an ask would make its block and ring each time. The node's side is generic over `Serve`
+(`Lanes::serve`): each ask asked where the node has room (`Serve::room`, checked before the ask's
+value is given up, as `Node::command`, `read` and `put_chunk` check theirs), held in order where it
+has none rather than answered `Asks`, which the shard would ask again with nothing to wait on, and
+answered its kind's refusal where the node refuses it otherwise; each answer the node holds sent;
+each job's end told (`Serve::job_ended`, no ask let go, the node holding the shard's asks until
+their answers come), its door's half given to the node's host's doors; and the put window's
+samples told. The shard's `Serve` (`driving::Served`): asks numbered and held to the node's bounds,
+outcomes taken from the answers come, the latest volume table handed in (`Table::settled`, a copy
+with the scheme chosen now and no choice running), the ranges' groups, their count, the ask bounds
+and the wall clock handed at its start (`driving::Start`), `read_fields` refused (a request is handed
+with its fields read), `took` nothing, `moved` none of its own, and `job_ended` the job's half
+riding its end. The task waits for the first of a request, an answer and its host's own due
+(`Host::due`); the node's task wakes on what a driving shard gave or its end (`Lanes::arrived`), and
+one whose task ended stops the node (`NodeError::ShardEnded`).
+
+A handed request carries its operation, not its work (`host::Handover`: its door's job half, its
+principal, its `Op`, its Open's block, its deadline, its admission's time, charge and window, and
+its shard), and the shard makes its work (`Host::take_handed`). The node hands one where a lane is
+held for the shard its request was placed on: its fields read, its operation is held as handing
+(`Work::Handing`), its put's feeding set up from the operation's length and trailer (`body_of`),
+and after the host's step it is handed (`Node::hand_off`), its exchange's feeding and reply kept by
+the node's task; one its lane refuses is made into work and runs on the first shard. Production
+starts none and compiles every piece: `Node::spread` starts driving tasks from a list it leaves
+empty until 6f (`Node::start_driving`), and with no lane held the node's turn skips the hand-off and
+the lanes' turn. Tested: a host on the second shard of a two-shard runtime, driven over its lanes by
+the stub node on the test's thread, takes a put and a get handed with their operations to their
+ends (the put's bucket read, its commit asked and answered `Done` with the version written; the get
+answered `Done`, no bytes), each job's end told with its charge and its shard and its half riding
+it back, the test's doors keeping both doors; a request past the lane's room is given back
+(`node::host`); each lane's bound holds as stated, an abandoned ask's place held until its answer
+comes, an ask the node has no room for held and asked once it has, the table held and superseded,
+room freed held, a chunk's move dropped, a shard whose task ended refused `ShardEnded`; and an ask
+and its answer cross the lanes asking the allocator for nothing, on either side (64 asks: 0
+allocations, 0 reallocations) (`node::driving`).
+
+What 6f needs first, beside placing requests by the rule: a driving shard's host is woken by its
+doors. Its task waits on its lanes and its host's due alone, so a put's body piece the node's task
+gives, or a get's piece it writes whole, wakes nothing there: a put awaiting its body or a get
+awaiting its last piece's write has no due and would wait until something else woke the shard (the
+test's put took its body's end at its first step, and its get had no bytes). A waker its door's
+halves share (`Handed`), woken by the node's task as it gives a piece or writes one whole, closes
+it. And the host's count of bytes moved (`Host::moved`) reaching the node's sum (`Node::moved`);
+and a refused request's place in the rule's count moved to the first shard.
 
 ## 3. Transport
 

@@ -72,6 +72,7 @@ use mantle_protocol::object;
 
 mod answers;
 mod drivers;
+mod driving;
 mod enrollments;
 mod host;
 mod members;
@@ -1117,6 +1118,11 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     put_window: crate::window::Window,
     /// The object operations the node's task runs, and what they hold (node.md §2.9 step 6d).
     host: host::Host,
+    /// The lanes of each shard past the first that drives native requests (node.md §2.9 step 6e,
+    /// `node::driving`), one a shard: none until 6f starts them (`Node::start_driving`).
+    driving: Vec<driving::Lanes>,
+    /// The volume table's applied index the driving shards were last told.
+    driving_table: Option<u64>,
     /// The exchange's half of each native put's body, read from its exchange for its job (node.md
     /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's.
     feeding: Vec<(ExchangeId, host::Feeding)>,
@@ -1620,6 +1626,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 exchanges.min(gateway.as_ref().map_or(0, |g| g.objects)),
                 gateway.clone(),
             ),
+            driving: Vec::new(),
+            driving_table: None,
             gateway,
             parked: VecDeque::new(),
             parked_most: exchanges,
@@ -1760,6 +1768,37 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .and_then(|at| holders.get(at))
                 .ok_or(NodeError::ShardEnded(shard))?;
             self.spread_to(*holder, shard)?;
+        }
+        // No shard drives native requests until 6f names them (node.md §2.9 step 6e).
+        self.start_driving(&[])
+    }
+
+    /// Starts a driving shard's task for each of `on`, the node's shard numbered from its first
+    /// and the holder of the runtime shard it runs on, its lanes kept for the node's turn (node.md
+    /// §2.9 step 6e, `node::driving`): its asks held to the node's bounds, the ranges' groups, the
+    /// wall clock, the gateway's settings shared with the node's host, and the requests its lane
+    /// takes at once, the exchanges the transport admits (`parked_most`). A node that hosts no
+    /// objects starts none. Refused, typed, where a shard takes no task (`Lanes::start`).
+    pub(crate) fn start_driving(
+        &mut self,
+        on: &[(usize, hyper_rt::SlotHolder)],
+    ) -> Result<(), NodeError> {
+        let Some(gateway) = self.gateway.as_ref() else {
+            return Ok(());
+        };
+        for (shard, holder) in on {
+            let start = driving::Start {
+                command_asks: self.command_asks,
+                read_asks: self.read_asks,
+                chunk_asks: self.chunk_asks,
+                groups: self.ranges.iter().map(|k| (k.layer, k.group)).collect(),
+                ranges: self.ranges.len(),
+                wall: self.wall,
+                gateway: std::sync::Arc::clone(gateway),
+                requests: self.parked_most,
+            };
+            self.driving
+                .push(driving::Lanes::start(*holder, *shard, start)?);
         }
         Ok(())
     }
@@ -2529,6 +2568,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.take_door();
         self.take_parked();
         self.step_host()?;
+        self.hand_off();
+        self.serve_driving()?;
         self.feed_bodies();
         self.write_replies()?;
         self.observe_presence()?;
@@ -2765,6 +2806,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let arrived = poll_fn(|context| {
                 let mut arrived = false;
                 for lanes in shards.iter_mut() {
+                    arrived |= lanes.arrived(context);
+                }
+                Poll::Ready(arrived)
+            })
+            .await;
+            if arrived {
+                return Ok(true);
+            }
+        }
+        // What a driving shard's host gave, or its end (node.md §2.9 step 6e).
+        if !self.driving.is_empty() {
+            let driving = &mut self.driving;
+            let arrived = poll_fn(|context| {
+                let mut arrived = false;
+                for lanes in driving.iter_mut() {
                     arrived |= lanes.arrived(context);
                 }
                 Poll::Ready(arrived)
@@ -3646,6 +3702,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .map(|c| c.asked)
         {
             self.host.chunk_moved(asked);
+            for lanes in &self.driving {
+                lanes.tell_moved(asked);
+            }
         }
         match then {
             Some(Then::Snapshot { .. }) if failed.is_some() => self.snapshot_done(exchange, false),
@@ -3751,6 +3810,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 && let Some(asked) = asked
             {
                 self.host.chunk_moved(asked);
+                for lanes in &self.driving {
+                    lanes.tell_moved(asked);
+                }
             }
             if matches!(receiving.what, Arriving::ChunkPut { .. }) {
                 self.chunks_received = self.chunks_received.saturating_add(len);

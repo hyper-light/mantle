@@ -2046,8 +2046,10 @@ the job read its exchange; an end the channel has no room for is held, one, and 
 takes the last piece; one feeding a native put, each one of the host's jobs. Copies: a piece is
 copied once out of the transport's reservation, into storage of the feeding's own (`BytesMut`)
 that the piece the job takes is a view of (`Bytes`), where the job copied it into the bytes it
-carried; then once into the driver, as before. The storage is reused once the job let the piece go
-(`try_reclaim`), so no piece allocates past the first, as no piece did. The transport gives no
+carried; then once into the driver, as before. The storage is made at the first piece as large as
+what is left of the object, at most a piece, and reused once the job let the piece go, reclaimed
+whole (`try_reclaim`), so no piece allocates past the first, as no piece did; what a put asks
+once more is its channel and the job's end of it in its door. The transport gives no
 owned bytes of a body: `Endpoint::read_body` copies QUIC's chunks into its owner's reservation, so
 handing QUIC's own chunks over, a copy fewer, is a change to hyper-transport, not made here. What
 the job did is kept: a job that lets go of its body, refused or done before its end, drops its

@@ -314,8 +314,9 @@ struct Local {
 /// storage reused from piece to piece, as the carried bytes were.
 pub(crate) struct Feeding {
     pieces: Sender<Piece>,
-    /// The storage the piece in flight is a view of, made at the first piece.
-    storage: Option<BytesMut>,
+    /// The storage the piece in flight is a view of, made at the first piece, and the bytes it was
+    /// made to hold: what was left of the object then, at most a piece.
+    storage: Option<(BytesMut, usize)>,
     /// A piece or end the channel had no room for, given before anything more is read.
     held: Option<Piece>,
     /// The object's bytes still to come, the trailer's algorithm, and its value read so far.
@@ -347,9 +348,8 @@ impl Feeding {
     /// the end, counted moved here. Refused `Malformed` where they pass the trailer's width, which
     /// the transport's length of the body rules out (`Head::decode`).
     fn give(&mut self, read: &[u8], moved: &mut u64) -> Result<Fed, Status> {
-        let object = usize::try_from(self.left)
-            .unwrap_or(usize::MAX)
-            .min(read.len());
+        let next = self.next_piece();
+        let object = next.min(read.len());
         let (bytes, trailer) = read.split_at_checked(object).ok_or(Status::Failed)?;
         let width = self.trailing.map_or(0, checksum::Algorithm::width);
         if self.trailer.len().saturating_add(trailer.len()) > width {
@@ -363,9 +363,9 @@ impl Feeding {
         if bytes.is_empty() {
             return Ok(Fed::Still);
         }
-        let storage = self
+        let (storage, _) = self
             .storage
-            .get_or_insert_with(|| BytesMut::with_capacity(piece_len()));
+            .get_or_insert_with(|| (BytesMut::with_capacity(next), next));
         storage.extend_from_slice(bytes);
         let piece = Piece::Bytes(
             storage.split().freeze(),
@@ -377,14 +377,24 @@ impl Feeding {
         Ok(self.send(piece))
     }
 
+    /// The object's bytes the next piece may hold: what is left of them, at most a piece. The
+    /// storage is made this large at the first piece, so a body whose last bytes come apart from
+    /// its fields' read holds no more than they.
+    fn next_piece(&self) -> usize {
+        usize::try_from(self.left)
+            .unwrap_or(usize::MAX)
+            .min(piece_len())
+    }
+
     /// Whether the job let go of the last piece, so the next may be read into its storage: none
-    /// made yet, or reclaimed whole, every view of it dropped.
+    /// made yet, or reclaimed whole, every view of it dropped. Whole, not only the room the next
+    /// piece needs, which a short piece leaves past it while the job still holds it.
     fn free(&mut self) -> bool {
         self.held.is_none()
             && self
                 .storage
                 .as_mut()
-                .is_none_or(|storage| storage.try_reclaim(piece_len()))
+                .is_none_or(|(storage, made)| storage.try_reclaim(*made))
     }
 
     /// Whether the object's bytes and the trailer's value are all read.
@@ -6538,6 +6548,29 @@ mod tests {
         assert_eq!(&second[..], &object[piece_len()..2 * piece_len()]);
         assert_eq!(second.as_ptr(), storage, "the piece's storage is reused");
         assert_eq!(feeding.left, 2 * piece_len() as u64);
+        // A short piece leaves room in the storage past it, which is not read into while the job
+        // holds the piece.
+        drop(second);
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(
+                &object[2 * piece_len()..2 * piece_len() + 1_000],
+                &mut moved
+            ),
+            Ok(Fed::Moved)
+        );
+        assert!(!feeding.free());
+        let Ok(Some(Piece::Bytes(short, _))) = pieces.pieces.try_recv() else {
+            panic!("the short piece");
+        };
+        assert!(!feeding.free());
+        drop(short);
+        assert!(feeding.free());
+        // Object bytes that come apart from the fields' read are given in storage of their size.
+        let mut putting = native_put(10, vec![1; 4]);
+        let (mut feeding, _pieces) = feed(&mut putting).unwrap();
+        assert_eq!(feeding.give(&[2; 6], &mut moved), Ok(Fed::Moved));
+        assert_eq!(feeding.storage.as_ref().map(|(_, made)| *made), Some(6));
         // An end the channel has no room for is held, and given once the job takes the piece.
         let mut putting = native_put(1, Vec::new());
         let (mut feeding, mut pieces) = feed(&mut putting).unwrap();

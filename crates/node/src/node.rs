@@ -66,7 +66,7 @@ use crate::frame;
 use crate::layout::Layout;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
-use keyed::{Key, Keyed, KeyedOn, On, Queued};
+use keyed::{Key, Keyed, KeyedOn, On, Queued, Waiting, Waits};
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object;
@@ -801,6 +801,28 @@ impl On for Commanded {
     }
 }
 
+/// And each of its commands, until answered, by its range's group and its session and serial,
+/// which the range's applied answer names (`answer_command`).
+impl Waits for Commanded {
+    type For = (u128, u64, u64);
+    type Part = (u64, u64, Option<Answer>);
+
+    fn parts(&self) -> &[Self::Part] {
+        &self.commands
+    }
+
+    fn parts_mut(&mut self) -> &mut [Self::Part] {
+        &mut self.commands
+    }
+
+    fn waits(&self, (session, serial, answer): &Self::Part) -> Option<(u128, u64, u64)> {
+        match answer {
+            None => Some((self.group, *session, *serial)),
+            Some(_) => None,
+        }
+    }
+}
+
 /// A read this node's member serves, found by its number (`Node::next_read`), which its replica
 /// gives back as the read's context.
 impl Key for Reading {
@@ -1247,9 +1269,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     receiving: Keyed<Receiving>,
     /// Commands proposed and not yet answered, and reads asked and not yet served: at most what
     /// the transport admits as exchanges. Each found by its own number, and a peer's by the
-    /// exchange it came on (`keyed::KeyedOn`), as its exchange ends, in one probe; each turn's
-    /// replies walk them all, in no order a reply depends on.
-    commanded: KeyedOn<Commanded>,
+    /// exchange it came on (`keyed::KeyedOn`), as its exchange ends, in one probe; each command
+    /// waiting by its group, session and serial (`keyed::Waiting`), as its range applies its
+    /// answer, in one probe; each turn's replies walk them all, in no order a reply depends on.
+    commanded: Waiting<Commanded>,
     reading: KeyedOn<Reading>,
     /// The id the next read's context carries.
     next_read: u64,
@@ -1777,7 +1800,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             lane_window,
             writing: Keyed::default(),
             receiving: Keyed::default(),
-            commanded: KeyedOn::default(),
+            commanded: Waiting::default(),
             reading: KeyedOn::default(),
             next_read: 0,
             next_ask: 0,
@@ -5845,30 +5868,22 @@ fn requested(seen: Option<shard::Seen>, group: u128, led: fn(u128) -> Arriving) 
 
 /// The command waiting on `group`'s entry proposed as `ask`, taken out to be answered: its range
 /// refused the entry (`shard::Out::Refused`). None where none waits on it any longer.
-fn refused_command(commanded: &mut KeyedOn<Commanded>, group: u128, ask: u64) -> Option<Commanded> {
+fn refused_command(commanded: &mut Waiting<Commanded>, group: u128, ask: u64) -> Option<Commanded> {
     if !commanded.get(ask).is_some_and(|c| c.group == group) {
         return None;
     }
     commanded.remove(ask)
 }
 
-/// An answer a range applied, given to the command waiting for it, if one is: the first whose
-/// command of that session and serial has no answer yet.
-fn answer_command(commanded: &mut KeyedOn<Commanded>, group: u128, applied: &Applied) {
-    let waiting = |(session, serial, answer): &(u64, u64, Option<Answer>)| {
-        *session == applied.session && *serial == applied.serial && answer.is_none()
-    };
-    let Some(ask) = commanded
-        .iter()
-        .find(|c| c.group == group && c.commands.iter().any(waiting))
-        .map(|c| c.ask)
-    else {
+/// An answer a range applied, given to the command waiting for it, if one is: of that group,
+/// session and serial with no answer yet, the one of the earliest ask, whose entry was proposed
+/// first, found in one probe of what the commands wait on (`Waiting::first`).
+fn answer_command(commanded: &mut Waiting<Commanded>, group: u128, applied: &Applied) {
+    let Some((ask, at)) = commanded.first((group, applied.session, applied.serial)) else {
         return;
     };
-    commanded.change(ask, |c| {
-        if let Some(slot) = c.commands.iter_mut().find(|command| waiting(command)) {
-            slot.2 = Some(applied.answer.clone());
-        }
+    commanded.change_part(ask, at, |command| {
+        command.2 = Some(applied.answer.clone());
     });
 }
 

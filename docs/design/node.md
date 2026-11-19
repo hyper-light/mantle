@@ -1594,7 +1594,63 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
 4. The command and read lanes, and their answers.
 5. The rule over the runtime's shards, which places the ranges, and `lanes_per_peer` (§3.2) the
    shards that run ranges, at most the ranges the node hosts.
-6. Native requests driven past the first shard.
+6. Native requests driven past the first shard, in seven parts, each an hour's work, unit-tested
+   and merged before the next. With one shard, or none past the first that `NodeSettings::shards`
+   names (`range_shards = first`), every request stays on the first shard, as now.
+   - *6a, the rule and its count* (`node::drivers`; `host::start_object`, `Node::step_host`,
+     `Node::job_lost`): a native request the host admits is placed on the shard past the first
+     with the fewest requests running, the first of those tied, as an S3 connection is placed
+     (`listener::shards::least`), and counted there until its job ends; over the one shard the
+     node's task drives every request on, so each is placed on the first, where it runs.
+   - *6b, a job's asks as values* (`host::ask_put`, `ask_get`, `ask_command`, `asked`,
+     `take_answers`, `drop_abandoned`, `host_due`; `Node::command`, `Node::read`,
+     `Node::put_chunk`, `Node::get_chunk`): each ask a job makes of the node, a range's command or
+     read or a chunk's put or get on a volume, the volume's node named by the node's table, is one
+     value served by one function of the node's, refused `NodeError::Asks` past `command_asks`,
+     `read_asks` or `chunk_asks` as now and asked again at the job's next turn, so a lane can carry
+     it. Every job still on the first shard.
+   - *6c, the native door as the S3 door's* (`host::read_fields`, `feed_put`, `write_fields`,
+     `drain_job`, `send_held`, `write_get`; `Door`, `Local`; `crate::door`): a native request's
+     fields are read on the first shard, then its operation is run by a job whose body comes on a
+     bounded channel the node's task fills from the exchange, at the depth a body's pieces need
+     (`door::Depth`), and whose answers the node's task writes to the exchange from a channel at the
+     depth a reply needs (`door::Replying`), as an S3 connection does for its job (`Door::Local`).
+     The node's task keeps the exchange: its vouching (`Endpoint::working`) and its end
+     (`Node::job_lost`).
+   - *6d, a host of its own* (`host::Job` and the host's `impl Node`; `Node`'s `jobs`,
+     `abandoned`, `gateway`, `table`, `moved`, `slowed`): the jobs and what they hold move from
+     `Node` into a `host::Host` that the node's task holds and steps, its asks (6b) served by the
+     node and its doors (6c) channels, so a shard past the first can hold one. Admission, parking
+     and the put window stay the node's, one authority for its bottleneck (§2.5), told of each
+     job's end. The largest part, which may land as two: the state, then the steps.
+   - *6e, a driving shard's task and its lanes* (a module beside `node::shard`, made as
+     `shard::Lanes` is): a task on a shard past the first holding a `Host`, started through that
+     shard's control queue as the listener's takers are, Normal as the S3 connections beside it.
+     Into it, each request handed, its operation and its door's ends, at most the exchanges the
+     transport admits at once (`parked_most`), each request handed holding one. Out of it, its
+     jobs' asks, the host holding each kind to the node's bound for it (`command_asks`,
+     `read_asks`, `chunk_asks`) and refusing one past it `Asks`, asked again at the job's next
+     turn, each with a slot for its answer made as it is asked (`hyper_rt::sync::oneshot`), so the
+     answer cannot be refused; the node's task answers `Asks` in the slot of one it has no room for
+     now, its other asks holding the room (the table above). And each job's end. Production starts
+     none. Tested on a two-shard runtime: a request handed is driven there, its asks served by the
+     node's task, its end given back; a full lane refuses, typed; a shard whose task ended stops
+     the node, `NodeError::ShardEnded`.
+   - *6f, requests placed by the rule* (`host::start_object`, `Node::spread`, `process::serve`,
+     `derive::shard_shape`, `node::shard_lanes_bytes`): each native request admitted, its fields
+     read, is handed to the shard 6a's rule picks among those `NodeSettings::shards` names past the
+     first, passing over one hyper-rt's watchdog sees held past its limit (`Lane::takes`); one a
+     lane refuses runs on the first shard. `process::serve` starts each driving shard's task;
+     `derive::shard_shape` and the memory floor count it and its lanes. Tested: requests spread by
+     the count, one a lane refuses runs on the first, and the cluster suite over two shards serves
+     its PUTs and GETs so.
+   - *6g, a far range's commands from the driving shard* (`shard::In::Propose`, `shard::Refusal`,
+     `Node::propose_asked`, `Asking`): a command or read of a range this node leads on a shard
+     past the first goes from the driving shard to that range's shard on its command lane, its
+     answer in a slot of the asker's (the table above); a range a peer leads, or one on the first
+     shard, still through the node's task and its transport. How the node's session with a range
+     (`Asking`, §6.6) is kept once its commands come from several shards is the first thing 6g
+     settles.
 7. In hyper-raft: hyper-log's frames in flight past one, sized to the device's measured knee.
 8. In hyper-raft: connection IDs that name their shard, and datagrams routed by them.
 

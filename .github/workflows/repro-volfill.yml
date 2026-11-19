@@ -1,0 +1,41 @@
+name: repro-volfill
+# Bisect, all at once: crates/mantle/tests/serve.rs
+# `a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors` at perf-10k's merges since
+# c3e73e7d, to find the one whose HTTP PUT of o5 waits with no progress past the test's 600 s (CI gates
+# 44547229268 on 5fbd5059, linux-x86_64; reproduced on macOS aarch64).
+on:
+  push:
+    branches: ["repro/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  volfill:
+    strategy:
+      fail-fast: false
+      matrix:
+        sha: [c3e73e7d, 96d9d0b9, 24113426, a9ab2a16, 1254391d, 068ee7a1, 7b780a63, 05c14470, 279b7f3a, d220e170, c1589e30, 88a2bc1f, b3f016e3, 9ec351b7]
+    name: volumes fill at ${{ matrix.sha }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check out the commit
+        run: git checkout --detach ${{ matrix.sha }}
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build the serve suite
+        run: cargo test -p mantle --test serve --locked --no-run
+      - name: The volumes-fill test
+        run: |
+          start=$(date +%s)
+          if timeout 1800 cargo test -p mantle --test serve --locked a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors -- --exact > out.txt 2>&1; then
+            echo "PASSED at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
+          else
+            echo "FAILED at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
+            grep -m 5 -E "panicked at|not so" out.txt | cut -c1-300 || true
+          fi

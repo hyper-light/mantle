@@ -2489,7 +2489,8 @@ end carrying its door's half, the body's channel kept with its door, and the lan
   copy (its scheme chosen on the node's task), the latest superseding one the lane had no room for;
   the ranges' groups, their count, the ask bounds and the node's wall clock (`Wall`, `Copy`) handed
   at the task's start; `read_fields` refused, typed; `took` nothing; `freed` a flag the node's
-  task tells, held while the lane is full; a chunk's move (`Host::chunk_moved`) told by the number
+  task tells a shard a chunk of whose jobs it answered for want of room since it last told it,
+  held while the lane is full; a chunk's move (`Host::chunk_moved`) told by the number
   the shard gave its ask, dropped where the lane is full, its next piece telling it again.
 - *Production starts none, and compiles every piece*: with no `#[allow(dead_code)]`, the task's
   start is reached through the node's turn and a list of driving lanes production leaves empty
@@ -2558,7 +2559,7 @@ connections beside it run (`driving::Lanes::start`). Its lanes, each a hyper-rt 
 
 | Lane | From, to | Bound | At the bound |
 |---|---|---|---|
-| Requests, tables, room freed, chunks moved (`In`) | the node's task, to the shard | the exchanges the transport admits at once (`parked_most`) | a request given back to run on the first shard (`Lanes::hand`); the volume table held, the latest superseding it; room freed held as a flag; a chunk's move dropped, its next piece telling it again |
+| Requests, tables, room freed, chunks moved (`In`) | the node's task, to the shard | the exchanges the transport admits at once (`parked_most`) | a request given back to run on the first shard (`Lanes::hand`); the volume table held, the latest superseding it; room freed, told only to a shard a chunk of whose jobs was answered for want of room since it was last told, held as a flag; a chunk's move dropped, its next piece telling it again |
 | Asks, job ends, put samples (`Out`) | the shard, to the node's task | `parked_most`, the most the node's task takes in a turn | the shard waits for room, as a range's shard does |
 | Answers | the node's task, to the shard | `command_asks + read_asks + chunk_asks` | never full: the shard's host holds each kind to its bound (`Asks` past it, asked again at the job's next turn), each ask holding its place from its ask until its answer is taken, an abandoned one's until its answer comes and is dropped |
 
@@ -2709,7 +2710,19 @@ holds, fitted to the windows the shard learned of its own jobs; what its span do
 its samples, go to the node over the shard's lane (`Out::Recharged`, `Out::Read`). Each chunk
 outcome is classed as perf-10k classes it (`host::taken`): a put's or a get's chunk refused for room
 is asked again of the same volume, offered room at each beat by whichever host runs it, a driving
-shard's told as room frees (`In::Freed`), and its refusal moves none of its job's work. A reply's
+shard's told as room frees (`In::Freed`), and its refusal moves none of its job's work. Room freed
+is read once a turn (`Node::step_host`: a volume answered a put or a get, or a chunk was answered
+otherwise than for room), offered to the node's host's jobs at its step and told to a driving shard
+only where the node answered a chunk of its jobs for want of room since it last told it
+(`Lanes::tell_freed`), the one thing room freed moves there: told to every driving shard at each
+turn that freed room, as first built, each chunk the node answered, the S3 door's among them, woke
+every driving shard to step its host for nothing and park again. Measured on a three-shard runtime,
+two driving shards served by the test's thread, room freed at each of 64 turns and through 16 gets
+handed to the first (`host::tests::a_driving_shard_wakes_for_its_own_work_alone`, debug build on
+an Apple M5 Max): the shard handed nothing was polled 55 to 59 times, woken 53 to 57 times from the
+node's thread and parked 42 to 49 times, three runs, where now it is polled twice (its launcher and
+its task's first poll), woken never and parked twice; the shard handed the gets was polled 39 to 59
+times and now 40 to 46, about 2.7 wakes a get. A reply's
 head never waits for room (§3.3): what waits is the piece a refusal's body drains through
 (`Replies::wait_for_room`). Open: a get or a copy on a driving shard widens no window past its
 admission until the shard can take bytes of the node's admission, which `native_shards = spread`'s

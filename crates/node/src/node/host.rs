@@ -3210,6 +3210,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub(super) fn step_host(&mut self) -> Result<(), NodeError> {
         self.drop_abandoned();
         self.step_lookups();
+        // A chunk answered otherwise than for want of room frees room at its volume and in the
+        // transport toward it, as a volume's put or get answered does at the volume: read once a
+        // turn, for the host's jobs and the driving shards' (`serve_driving`).
+        self.room_freed |= self
+            .chunks_done
+            .iter()
+            .any(|(_, outcome)| taken(outcome) != Taken::Room);
         self.lend(|host, node| host.step(node))
     }
 
@@ -3263,6 +3270,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// job's end told and its door's half kept in the host's doors, and the volume table, where the
     /// node read a newer one, told. A shard whose task ended stops the node.
     pub(super) fn serve_driving(&mut self) -> Result<(), NodeError> {
+        // Room freed this turn is offered once: to the host's jobs at its step, to a driving
+        // shard's at this serve, and only to a shard a chunk of whose jobs waits for room
+        // (`Lanes::tell_freed`): told to every shard, each chunk answered woke every driving shard
+        // to move nothing, the S3 door's requests and other shards' among them.
+        let freed = std::mem::take(&mut self.room_freed);
         if self.driving.is_empty() {
             return Ok(());
         }
@@ -3280,6 +3292,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 && let Some(table) = self.table.as_ref()
             {
                 lanes.tell_table(Box::new(table.settled()));
+            }
+            if freed {
+                lanes.tell_freed();
             }
             served = lanes.serve(self, |half| host.doors.give_native(half));
             if served.is_err() {
@@ -3811,23 +3826,12 @@ impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
         self.wall.now_ns()
     }
 
-    /// A chunk answered otherwise than for want of room frees room at its volume and in the
-    /// transport toward it, as a volume's put answered does at the volume: each chunk refused for
-    /// want of room is asked again then (research/77 D2), and not at its own refusal, which would
-    /// ask it again each turn while the room stays taken.
+    /// Room freed since the last turn, as the turn's step read it (`Node::step_host`): each chunk
+    /// refused for want of room is asked again then (research/77 D2), and not at its own refusal,
+    /// which would ask it again each turn while the room stays taken. A driving shard's puts and
+    /// gets wait on the same room, told it at the same turn (`Node::serve_driving`).
     fn freed(&mut self) -> bool {
-        let freed = std::mem::take(&mut self.room_freed)
-            || self
-                .chunks_done
-                .iter()
-                .any(|(_, outcome)| taken(outcome) != Taken::Room);
-        // A driving shard's puts and gets wait on the same room (node.md §2.9 step 6e).
-        if freed {
-            for lanes in &mut self.driving {
-                lanes.tell_freed();
-            }
-        }
-        freed
+        self.room_freed
     }
 
     fn moved(&self) -> u64 {
@@ -9884,7 +9888,7 @@ pub(super) mod tests {
     /// with how many asks it let go. It holds no volume table, and reads no fields: its jobs come
     /// typed through the S3 door.
     pub(crate) struct Stub {
-        answer: fn(&JobAsk) -> Outcome,
+        pub(crate) answer: fn(&JobAsk) -> Outcome,
         answers: Vec<(Pending, Outcome)>,
         pub(crate) asked: u64,
         /// Whether it says it has no room for any ask (`Serve::room`).
@@ -10918,8 +10922,13 @@ pub(super) mod tests {
 
     /// A runtime of two shards, each with `tasks` task slots (as the shards' tests start theirs).
     pub(crate) fn two_shards(tasks: usize) -> hyper_rt::runtime::Runtime {
+        shards_of(2, tasks)
+    }
+
+    /// A runtime of `shards` shards, each holding `tasks` tasks.
+    pub(crate) fn shards_of(shards: u16, tasks: usize) -> hyper_rt::runtime::Runtime {
         hyper_rt::runtime::Runtime::start(&hyper_rt::runtime::RuntimeConfig {
-            shards: 2,
+            shards,
             tasks_per_shard: tasks,
             timers_per_shard: 1,
             interests_per_shard: hyper_rt::runtime::interests_for(tasks),
@@ -11110,6 +11119,118 @@ pub(super) mod tests {
         let (half, _) = doors.take().unwrap();
         let given_back = lanes.hand(handover(half, op(), 0, now));
         assert!(given_back.is_some_and(|request| request.driven == Some(1)));
+    }
+
+    /// A driving shard wakes for its own work alone (node.md §2.9 step 6e): two driving shards,
+    /// the second and third of a three-shard runtime, served by the test's thread as the node's
+    /// task serves them, room freed at every turn as each chunk the node's own requests asked frees
+    /// it, and gets handed to the first of the two alone. Neither shard is told room was freed,
+    /// none of its chunks waiting for it, so the shard handed nothing is polled only as its task
+    /// starts and takes the table, however many turns pass, and the one handed the gets only for
+    /// them. Told at every turn, as the node told it, each turn's word woke each shard, its task
+    /// stepping an empty host and parking again: each S3 request's chunk woke every driving shard.
+    #[test]
+    fn a_driving_shard_wakes_for_its_own_work_alone() {
+        const TURNS: usize = 64;
+        const GETS: usize = 16;
+        let rt = shards_of(3, 4);
+        let gateway = std::sync::Arc::new(scheming_gateway());
+        let start = || super::super::driving::Start {
+            command_asks: 2,
+            read_asks: 2,
+            chunk_asks: 2,
+            groups: vec![(Layer::Bucket, 1), (Layer::Name, 2)],
+            ranges: 2,
+            wall: super::super::Wall::From(0),
+            gateway: std::sync::Arc::clone(&gateway),
+            requests: 3,
+        };
+        let holder = |at: usize| rt.holder_of(rt.shard_ids()[at]).unwrap();
+        let mut lanes = [
+            super::super::driving::Lanes::start(holder(1), 1, start()).unwrap(),
+            super::super::driving::Lanes::start(holder(2), 2, start()).unwrap(),
+        ];
+        for lanes in &mut lanes {
+            lanes.tell_table(Box::new(Table::empty(1)));
+        }
+        let mut stub = Stub {
+            answer: |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Current(Some((1, empty_version())))),
+                )),
+                _ => panic!("an ask a get makes not"),
+            },
+            ..Stub::chunks()
+        };
+        let mut doors = Doors::new(2);
+        // A node's turn: room freed, as a chunk of its own requests answered frees it, and each
+        // driving shard's lanes served.
+        let turn =
+            |lanes: &mut [super::super::driving::Lanes; 2], stub: &mut Stub, doors: &mut Doors| {
+                for lanes in lanes.iter_mut() {
+                    lanes.tell_freed();
+                    lanes.serve(stub, |half| doors.give_native(half)).unwrap();
+                }
+            };
+        // Turns with nothing for either shard, each yielding the test's thread as the node's task
+        // waits between its turns.
+        for _ in 0..TURNS {
+            turn(&mut lanes, &mut stub, &mut doors);
+            std::thread::yield_now();
+        }
+        // Gets handed to the first shard alone, each driven to its end, room freed at each turn.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        for at in 0..GETS {
+            let (half, mut replies) = doors.take().unwrap();
+            replies.driving = Some(lanes[0].doors());
+            let get = Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            };
+            let now = hyper_rt::futures::now_ns();
+            let read = scheming_gateway().charges.read(1);
+            assert!(lanes[0].hand(handover(half, get, read, now)).is_none());
+            let mut seen = Seen {
+                credit: usize::MAX,
+                ..Seen::default()
+            };
+            let mut over = false;
+            while !(over && stub.ended.len() == at + 1) {
+                assert!(std::time::Instant::now() < until, "the get never ended");
+                turn(&mut lanes, &mut stub, &mut doors);
+                let now = hyper_rt::futures::now_ns();
+                over = over
+                    || replies.write(&mut seen, true, now, &mut moved, &mut slowed) == Wrote::Over;
+                std::thread::yield_now();
+            }
+            assert_eq!(reply_seen(&seen).status, Status::Done);
+            doors.give_replies(replies);
+        }
+        let counters = rt.shutdown().unwrap();
+        let (handed, idle) = (&counters[1], &counters[2]);
+        println!(
+            "{TURNS} turns, {GETS} gets: shard handed the gets polled {}, woken {} times from \
+             other threads, waited {}; shard handed nothing polled {}, woken {}, waited {}",
+            handed.polls,
+            handed.wakes_foreign,
+            handed.waits,
+            idle.polls,
+            idle.wakes_foreign,
+            idle.waits
+        );
+        // Its launcher, its task's first poll, and the table's word.
+        assert!(
+            idle.polls <= 3,
+            "a shard handed nothing is polled for nothing past its start: {} polls",
+            idle.polls
+        );
+        drop(lanes);
     }
 
     /// A cell in memory as a test serves a driving shard's asks (node.md §2.9 step 6f): Block and

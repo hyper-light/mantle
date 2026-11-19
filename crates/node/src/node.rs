@@ -1150,7 +1150,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     storage: Storage,
     /// The storage's puts and gets answered, taken each turn (kept for its allocation).
     stored: Vec<Done>,
-    /// Whether a volume answered a put or a get since the host last offered its jobs room.
+    /// Whether room was freed since the last turn, offered at this one: a volume answered a put or
+    /// a get, or a chunk was answered otherwise than for want of room (`Node::step_host`); taken
+    /// as the driving shards are served (`Node::serve_driving`).
     room_freed: bool,
     /// The chunk puts and gets this node asked of its peers and not yet answered; at most
     /// `chunk_asks` of them.

@@ -424,9 +424,17 @@ fn exchange_tables(streams: u32) -> u64 {
 /// hosts and two allocators (docs/benchmarks.md), which no constant says for a host it was not
 /// measured on.
 pub fn state_charge<C: Classes>(limits: &Limits) -> u64 {
+    state_charge_for::<C>(limits.streams_per_connection)
+}
+
+/// [`state_charge`] under limits whose connections each take `streams_per_connection` exchanges at
+/// once, the one bound it depends on: what an owner sizing its budget before its limits are whole
+/// (their windows cut from what the budget holds past everything else) counts each connection's
+/// state at. mantle: vendor/UPSTREAM.md.
+pub fn state_charge_for<C: Classes>(streams_per_connection: u32) -> u64 {
     u64::try_from(size_of::<Conn<C::Role>>())
         .unwrap_or(u64::MAX)
-        .saturating_add(exchange_tables(limits.streams_per_connection))
+        .saturating_add(exchange_tables(streams_per_connection))
 }
 
 /// What a connection of classes `C` is charged under `limits` as it is made before its endpoint has
@@ -1663,7 +1671,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     /// Answer the request on `exchange` with `header`, and a body of `body` bytes to follow
-    /// through [`Endpoint::write_body`].
+    /// through [`Endpoint::write_body`]. Its prefix and head fill the room the request's head was
+    /// taken with, so a reply within its class's bounds is never refused [`Refusal::Budget`].
     pub fn reply(
         &mut self,
         exchange: ExchangeId,
@@ -3321,7 +3330,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         Ok(true)
     }
 
-    /// Check a message's prefix against this side's bounds for its class, and reserve its head.
+    /// Check a message's prefix against this side's bounds for its class, and reserve its head; a
+    /// request's with the room its reply's prefix and head take at their longest
+    /// (`frame_grant(max_head)`), kept as the exchange's outgoing message until its reply fills it
+    /// ([`Core::reply`]), so a reply is never refused for want of room. Reserved as it was wanted,
+    /// a reply came after the budget had filled with other exchanges' bodies and windows, and its
+    /// owner, refused `Budget`, could leave the exchange open with its asker waiting on nothing
+    /// for a whole period (mantle's uploads given up `Lost(Stalled)`). Both or neither are taken,
+    /// and a request the budget cannot fund both for is refused `Budget` as it arrives, which its
+    /// asker hears at once; the exchange's end gives the room back however it ends
+    /// ([`Core::finish_exchange`]), once its head is written if it is answered ([`Core::flush`]).
     fn admit_prefix(
         &mut self,
         now: Instant,
@@ -3352,12 +3370,27 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             self.budget
                 .reserve(u64::from(prefix.head), Lane::Class(class))?
         };
-        let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
+        // mantle: a reply's room taken with its request's head (vendor/UPSTREAM.md).
+        let room = if exchange.opened {
+            None
+        } else {
+            let longest = crate::frame_grant(u64::from(self.limits.max_head));
+            match self.budget.reserve(longest, Lane::Class(class)) {
+                Ok(room) => Some(room),
+                Err(refusal) => {
+                    self.budget.release(head);
+                    return Err(refusal);
+                }
+            }
+        };
         exchange.class = Some(class);
         exchange.rank = C::rank(class);
         exchange.incoming.decoded = Some(prefix);
         exchange.incoming.head = Some(head);
         exchange.incoming.state = In::Head;
+        if room.is_some() {
+            exchange.out.message = room;
+        }
         let rank = exchange.rank;
         let (at, backlog) = (moved(conn, rank), self.backlog(conn, rank));
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
@@ -3648,20 +3681,33 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         header: &[u8],
         body: Option<u64>,
     ) -> Result<Reservation, Refusal> {
+        let prefix = self.prefix(class, kind, header, body)?;
+        let mut message = self.budget.reserve(
+            length(PREFIX_BYTES).saturating_add(length(header.len())),
+            Lane::Class(class),
+        )?;
+        message.fill(&prefix);
+        message.fill(header);
+        Ok(message)
+    }
+
+    /// The prefix of a message of `class` and `kind` carrying `header` and a body of `body` bytes,
+    /// checked against the class's bounds: within them, the message's prefix and head fit the
+    /// room a reply's take at their longest ([`Core::admit_prefix`]).
+    fn prefix(
+        &self,
+        class: C::Class,
+        kind: u16,
+        header: &[u8],
+        body: Option<u64>,
+    ) -> Result<[u8; PREFIX_BYTES], Refusal> {
         let head = length(header.len());
         if head > u64::from(self.limits.max_head)
             || head.saturating_add(body.unwrap_or(0)) > C::frame_bound(class)
         {
             return Err(Refusal::FrameBound);
         }
-        let prefix = Prefix::encode(kind, header, body)?;
-        let mut message = self.budget.reserve(
-            length(PREFIX_BYTES).saturating_add(head),
-            Lane::Class(class),
-        )?;
-        message.fill(&prefix);
-        message.fill(header);
-        Ok(message)
+        Prefix::encode(kind, header, body)
     }
 
     /// Whether `conn` already waits for as many streams for its asked exchanges as its peer grants
@@ -4005,11 +4051,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return Err(Refusal::Order);
         }
         let class = exchange.class.ok_or(Refusal::Order)?;
-        let message = self.message(class, 0, header, body)?;
+        let prefix = self.prefix(class, 0, header, body)?;
         let now = self.now;
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
+        // The room its request's head was taken with (`admit_prefix`), which the reply's prefix
+        // and head fit within their bounds: the reply asks the budget for nothing, so it is never
+        // refused for want of room. mantle: vendor/UPSTREAM.md.
+        let message = exchange.out.message.as_mut().ok_or(Refusal::Order)?;
+        message.fill(&prefix);
+        message.fill(header);
         exchange.out.state = Out::Head;
-        exchange.out.message = Some(message);
         exchange.out.left = body.unwrap_or(0);
         exchange.out.has_body = body.is_some();
         let held = self.held(conn);

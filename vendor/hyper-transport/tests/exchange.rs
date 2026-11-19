@@ -535,6 +535,165 @@ fn a_budget_that_cannot_fund_a_head_refuses_it() {
     assert_eq!(refused, Some((Refusal::Budget, true)));
 }
 
+/// What `node`'s budget holds for messages: all it charged, less its connections' windows and
+/// state, their coding and its receive pool's chunks.
+fn messages_held(node: &Node<Mantle>) -> u64 {
+    let stats = node.stats();
+    node.budget().used()
+        - stats.receive_granted
+        - stats.state.charged
+        - stats.fec_charged
+        - (stats.receive_chunks * hyper_transport::RECEIVE_CHUNK) as u64
+}
+
+/// Node 1 asks node 2 a get, whose head is `head`, and a body of `body` bytes, the first `sent` of
+/// them written: the exchange on both sides once node 2 has the request's head.
+fn asked_of_two(
+    net: &mut Net<Node<Mantle>, Node<Mantle>>,
+    head: &[u8],
+    body: Option<u64>,
+    sent: usize,
+) -> (ExchangeId, ExchangeId) {
+    let progress = Progress::new(PERIOD).unwrap();
+    let asked = net
+        .a
+        .open(net.now, 2, Kind::Get, head, body, progress)
+        .unwrap();
+    if sent > 0 {
+        assert_eq!(net.a.write_body(asked, &vec![3u8; sent]).unwrap(), sent);
+    }
+    let mut served = None;
+    net.until(TURNS, |net| {
+        let _ = events(&mut net.a);
+        for event in events(&mut net.b) {
+            if let Event::Request { exchange, .. } = event {
+                served = Some(exchange);
+            }
+        }
+        served.is_some()
+    });
+    (asked, served.expect("the request's head arrived"))
+}
+
+/// A peer's exchange takes the room its reply's prefix and head take at their longest with its
+/// request's head, so a reply its owner gives once other work has taken every byte of the budget
+/// is sent, its longest head and all. Reserved as the reply was given, it was refused `Budget`
+/// there, and an owner that took the refusal as the exchange's end left it open, its asker waiting
+/// on nothing for a whole period (mantle's uploads given up `Lost(Stalled)`).
+#[test]
+fn a_reply_given_once_the_budget_is_full_is_sent() {
+    let pair = Pair::new();
+    let budget = 1 << 20;
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), budget);
+    let (asked, served) = asked_of_two(&mut net, &[7, 1, 2, 3], None, 0);
+    // Every byte the budget has left, held by the owner's other work.
+    let rest = net.b.reserve_own(budget - net.b.budget().used()).unwrap();
+    assert_eq!(
+        net.b.reserve(Class::Request, 1).err(),
+        Some(Refusal::Budget),
+        "the budget is full"
+    );
+    let head = vec![9u8; limits().max_head as usize];
+    net.b.reply(served, &head, None).unwrap();
+    net.b.end(served);
+    let mut reply = None;
+    net.until(TURNS, |net| {
+        let _ = events(&mut net.b);
+        for event in events(&mut net.a) {
+            match event {
+                Event::Reply { exchange, body } if exchange == asked => reply = Some(body),
+                Event::Refused {
+                    exchange, refusal, ..
+                } if exchange == asked => panic!("the reply was refused: {refusal:?}"),
+                _ => {}
+            }
+        }
+        reply.is_some()
+    });
+    assert_eq!(reply, Some(None), "the reply came, a head alone");
+    assert_eq!(net.a.head(asked), Some(&head[..]));
+    net.a.end(asked);
+    net.b.release(rest);
+}
+
+/// How a peer's exchange ends, for [`each_end_gives_a_peers_exchange_its_reply_room_back`].
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// Its owner answers it, a head alone, and ends it.
+    Answered,
+    /// Its owner answers it with a body and writes the body whole.
+    AnsweredWithBody,
+    /// Its owner refuses it unanswered.
+    Refused,
+    /// Its owner ends it unanswered.
+    Ended,
+    /// Its asker gives it up with its request's body half sent: the request's stream reset.
+    Reset,
+    /// Its asker ends it with its request sent whole: the reply's stream stopped.
+    Stopped,
+    /// Their connection is lost.
+    Lost,
+}
+
+/// Every end of a peer's exchange gives back what it took as its request's head arrived, its
+/// head's room and its reply's: answered, its head and body written; refused or ended by its owner
+/// before any reply; given up by its asker, its request reset or its reply stopped; and with its
+/// connection. The budget holds for messages what it held before the request came, at each.
+#[test]
+fn each_end_gives_a_peers_exchange_its_reply_room_back() {
+    let head = [7u8, 1, 2, 3];
+    let room = hyper_transport::frame_grant(u64::from(limits().max_head));
+    for ending in [
+        Ending::Answered,
+        Ending::AnsweredWithBody,
+        Ending::Refused,
+        Ending::Ended,
+        Ending::Reset,
+        Ending::Stopped,
+        Ending::Lost,
+    ] {
+        let pair = Pair::new();
+        let mut net = connected::<Mantle, Mantle>(&pair, limits(), 64 << 20);
+        let before = messages_held(&net.b);
+        let (body, sent) = match ending {
+            Ending::Reset => (Some(4_000), 1_000),
+            _ => (None, 0),
+        };
+        let (asked, served) = asked_of_two(&mut net, &head, body, sent);
+        assert_eq!(
+            messages_held(&net.b),
+            before + head.len() as u64 + room,
+            "{ending:?}: the request's head and its reply's room are held as the head arrives"
+        );
+        match ending {
+            Ending::Answered => {
+                net.b.reply(served, b"ok", None).unwrap();
+                net.b.end(served);
+            }
+            Ending::AnsweredWithBody => {
+                net.b.reply(served, b"ok", Some(3)).unwrap();
+                assert_eq!(net.b.write_body(served, b"abc").unwrap(), 3);
+                net.b.end(served);
+            }
+            Ending::Refused => net.b.refuse_exchange(served, Refusal::Busy),
+            Ending::Ended => net.b.end(served),
+            Ending::Reset => net.a.refuse_exchange(asked, Refusal::Closed),
+            Ending::Stopped => net.a.end(asked),
+            Ending::Lost => net.a.disconnect(net.now, 2),
+        }
+        net.until(TURNS, |net| {
+            let _ = events(&mut net.a);
+            let _ = events(&mut net.b);
+            net.b.stats().exchanges == 0
+        });
+        assert_eq!(
+            messages_held(&net.b),
+            before,
+            "{ending:?}: everything the exchange took is given back"
+        );
+    }
+}
+
 /// An owner that refuses an exchange it was asked tells the asker why, typed in the stream's reset:
 /// focal holds a sender to its share of the ingress and refuses past it; read as `Closed`, the
 /// refusal said the connection failed, and the asker's pool closed a connection its every other

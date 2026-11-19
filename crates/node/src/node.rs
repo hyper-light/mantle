@@ -332,10 +332,13 @@ impl From<hyper_rt::RtError> for NodeError {
 }
 
 /// What a refused reply on one of the node's exchanges comes to. A refusal of the exchange alone
-/// (its asker gave up, its stream or connection closed, its progress or a budget ran out: the
-/// transport ended it, and its `Refused` event follows or came) concerns that one asker, never the
-/// node's ranges: the reply is dropped and the node goes on, and the client asks again. A reply out
-/// of order or past its class's bounds is the node's own fault, and stops it.
+/// (its asker gave up, its stream or connection closed, its progress ran out: the transport ended
+/// it, and its `Refused` event follows or came) concerns that one asker, never the node's ranges:
+/// the reply is dropped and the node goes on, and the client asks again. A reply is never refused
+/// for room: its head fills the room the endpoint took with its request's head (hyper-transport's
+/// `Core::admit_prefix`), where a head refused `Budget` was dropped here with its exchange open and
+/// its asker waiting a period on nothing. A reply out of order or past its class's bounds is the
+/// node's own fault, and stops it.
 fn exchange_ended(refusal: Refusal) -> Result<(), NodeError> {
     match refusal {
         Refusal::Order | Refusal::FrameBound => Err(NodeError::Transport(refusal)),
@@ -829,20 +832,17 @@ pub fn read_piece(
 pub enum Replied {
     /// It went; its body, if it has one, follows.
     Sent,
-    /// The endpoint's budget has no room for it now: the exchange stays open, untouched, for its
-    /// owner to offer the head again, the job held meanwhile (`host`'s `Job::room_to_reply`).
-    WaitsForRoom,
-    /// The exchange is over: its asker gone, or the head refused for a cause no wait mends, which
-    /// the exchange is refused with, so its asker hears it at once.
+    /// The exchange is over: its asker gone, or the head refused, which the exchange is refused
+    /// with, so its asker hears it at once.
     Ended,
 }
 
-/// Offers `head` as the reply on `exchange`, with a body of `body` bytes to follow. The endpoint
-/// takes the head's room from its budget (hyper-transport's `Core::message`), which every
-/// connection's windows, receive chunks, heads and frames share, and refuses it `Budget` while
-/// that is held: a reply refused so is not lost, it waits for room ([`Replied::WaitsForRoom`]).
-/// Taken as the exchange's end, a job ended with its exchange open and its asker waiting on
-/// nothing, and its client gave it up a period later (`Lost(Stalled)`, tests/put_body.rs).
+/// Offers `head` as the reply on `exchange`, with a body of `body` bytes to follow. The head fills
+/// the room the endpoint took with its request's head (hyper-transport's `Core::admit_prefix`),
+/// so it is never refused for room in the budget every connection's windows, receive chunks, heads
+/// and frames share: taken from that budget as the reply was given, a head refused `Budget` left a
+/// job ended with its exchange open and its asker waiting on nothing, and its client gave it up a
+/// period later (`Lost(Stalled)`, tests/put_body.rs). Any refusal ends the exchange with it.
 pub fn reply_head(
     endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
     exchange: ExchangeId,
@@ -851,7 +851,6 @@ pub fn reply_head(
 ) -> Replied {
     match endpoint.reply(exchange, head, body) {
         Ok(()) => Replied::Sent,
-        Err(Refusal::Budget) => Replied::WaitsForRoom,
         Err(refusal) => {
             endpoint.refuse_exchange(exchange, refusal);
             Replied::Ended

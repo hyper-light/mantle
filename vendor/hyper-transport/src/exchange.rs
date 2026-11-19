@@ -151,7 +151,9 @@ pub(crate) enum Out {
 #[derive(Debug)]
 pub(crate) struct Outgoing {
     pub(crate) state: Out,
-    /// The prefix and the head, contiguous.
+    /// The prefix and the head, contiguous. A peer's exchange holds it from its request's head on,
+    /// as the room its reply's prefix and head take at their longest, which the reply fills
+    /// (`Core::admit_prefix`, `Core::reply`); the exchange's end gives it back however it ends.
     pub(crate) message: Option<Reservation>,
     pub(crate) written: usize,
     /// The body still to write.

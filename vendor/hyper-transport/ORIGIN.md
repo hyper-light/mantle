@@ -117,6 +117,15 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
 - **Received datagrams are cut from a bounded, charged pool** (`receive.rs`): at most
   `receive_chunks` chunks of 65,527 bytes, each reserved from the budget; past them a datagram is
   copied into a buffer of its own (`unread_datagrams_pin_no_more_receive_chunks_than_the_bound`).
+- **A reply's room is taken with its request's head** (mantle, 2026-11-18; a local change of
+  mantle's snapshot, its vendor/UPSTREAM.md). A reply's prefix and head were reserved from the
+  budget as the reply was given, after other exchanges' bodies, windows and frames could have
+  filled it, and an owner that took the refusal as the exchange's end left it open, its asker
+  waiting a period on nothing (mantle's uploads given up `Lost(Stalled)`). A peer's exchange now
+  takes the room they take at their longest, `frame_grant(max_head)`, with its request's head, both
+  or neither; the reply fills it, and the exchange's end gives it back however it ends
+  (`a_reply_given_once_the_budget_is_full_is_sent`,
+  `each_end_gives_a_peers_exchange_its_reply_room_back`).
 - **This side's delays are not the peer's.** A period in which an exchange's own owner offered
   nothing the peer would take, or a more urgent class of this side took the credit, is held rather
   than judged (`Core::ours_to_move`; `an_owner_late_to_write_is_not_refused_by_its_own_side`).

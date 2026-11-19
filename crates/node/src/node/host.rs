@@ -145,11 +145,11 @@ pub(crate) struct Job {
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
-    /// Whether its reply waits for room in the endpoint's budget, which refused its head or the
-    /// piece the body before it drains through (`node::reply_head`): offered again at each turn,
-    /// the job held meanwhile, vouched for and due at each beat within its client's patience
-    /// (research/77 D1, D2), and past it its exchange refused `Budget`, which its asker hears at
-    /// once (`Node::wait_to_reply`). A job never ends without its reply.
+    /// Whether its reply waits for room in the endpoint's budget, which refused the piece the
+    /// request's body before it drains through (its head never waits, `node::reply_head`): offered
+    /// again at each turn, the job held meanwhile, vouched for and due at each beat within its
+    /// client's patience (research/77 D1, D2), and past it its exchange refused `Budget`, which
+    /// its asker hears at once (`Node::wait_to_reply`). A job never ends without its reply.
     room_to_reply: bool,
 }
 
@@ -2006,9 +2006,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// it asked, its client gone or going; one within it tells its asker its work is held. A get
     /// replied before its body: its asks, chunk reads, are given up by its transport once their
     /// peers say nothing, and it ends unfinished as a get does. An operation waiting on its client,
-    /// for its body or room to write its reply, is the transport's to judge. One whose reply's head
-    /// waits for room in the endpoint's budget is held by the node, and vouched for within its
-    /// client's patience; past it, its turn refuses its exchange (`wait_to_reply`).
+    /// for its body or room to write its reply, is the transport's to judge. One whose reply waits
+    /// for the piece its request's body drains through, room in the endpoint's budget, is held by
+    /// the node, and vouched for within its client's patience; past it, its turn refuses its
+    /// exchange (`wait_to_reply`).
     fn bound_jobs(&mut self) -> Result<(), NodeError> {
         let now = hyper_rt::futures::now_ns();
         for at in 0..self.jobs.len() {
@@ -3249,7 +3250,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Get(getting),
             door,
-            room_to_reply,
             ..
         }) = self.jobs.get_mut(at)
         else {
@@ -3297,13 +3297,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             super::Replied::Sent => {
                 getting.total = total;
                 getting.out = Some((Bytes::from(fields), 0));
-                *room_to_reply = false;
                 Ok(None)
-            }
-            // Held as it was, its head offered again at the job's next turn.
-            super::Replied::WaitsForRoom => {
-                getting.held = Some(reply);
-                self.wait_to_reply(at, exchange).map(Some)
             }
             // Its asker is gone, or told why: the job ends with its exchange.
             super::Replied::Ended => Ok(Some(true)),
@@ -4917,8 +4911,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // A body read whole, as a put's that ended is, needs no piece: its reply goes now. One
         // admitted drains into a piece of its own, which its admission charged it for
         // (`read_piece`); one answered at once holds no charge, and reads through the endpoint's
-        // one piece for its owner's reads (`bounds::messages`), which waits for room as its
-        // reply's head does.
+        // one piece for its owner's reads (`bounds::messages`), which waits for room while other
+        // reads hold it (`wait_to_reply`).
         let mut own = job.admitted_ns.map(|_| Vec::new());
         while !endpoint.body_complete(exchange) {
             let got = match own.as_mut() {
@@ -4961,10 +4955,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let slowed = reply.slowed;
         let length = u64::try_from(fields.len()).unwrap_or(u64::MAX);
-        match super::reply_head(endpoint, exchange, &head, Some(length)) {
-            super::Replied::Sent => {}
-            super::Replied::WaitsForRoom => return self.wait_to_reply(at, exchange),
-            super::Replied::Ended => return Ok(true),
+        if super::reply_head(endpoint, exchange, &head, Some(length)) == super::Replied::Ended {
+            return Ok(true);
         }
         // A native request answered `SlowDown`, counted for its cause as it goes: the node says
         // the counts in its lines, as the listener counts the S3 door's.
@@ -4977,10 +4969,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.write_fields(at)
     }
 
-    /// Job `at`'s reply on `exchange` waits for room in the endpoint's budget, which refused its
-    /// head or the piece its body drains through; whether it is over. Within its client's
-    /// patience it is held: vouched for and due at each beat (`bound_jobs`, `host_due`), and
-    /// offered again at each turn, since nothing tells the node when the budget frees (its
+    /// Job `at`'s reply on `exchange` waits for room in the endpoint's budget, which refused the
+    /// piece its request's body drains through before the reply (its head never waits: it fills
+    /// the room taken with its request's head, `node::reply_head`); whether it is over. Within its
+    /// client's patience it is held: vouched for and due at each beat (`bound_jobs`, `host_due`),
+    /// and offered again at each turn, since nothing tells the node when the budget frees (its
     /// `release` retries only the transport's lossless frames). Past it, its exchange is refused
     /// `Budget`, which needs no room and its asker hears at once, as it hears a request whose
     /// head the budget refused: a job never ends with its exchange open and its asker waiting on
@@ -5167,8 +5160,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|due| shard.saturating_add(due.saturating_sub(wall)));
         // Each operation at work is ended at its client's patience, and one whose asks are held
         // says so each beat, a probe timeout, the transport's notes' beat of a third of the serve
-        // period (research/77 D2); so is one whose reply waits for room, which the beat's turn
-        // offers its head again, since the budget freeing turns no node.
+        // period (research/77 D2); so is one whose reply waits for the piece its request's body
+        // drains through, which the beat's turn asks the budget for again, since the budget
+        // freeing turns no node.
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
         let bound = self
             .jobs

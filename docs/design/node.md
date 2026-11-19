@@ -2500,6 +2500,41 @@ a count past a `usize`'s, moves nothing, and the place stays where it was. Teste
 (`node::drivers`): a request moved from the second shard to the first is counted on the first, the
 next placed on the second, the end given back to the first, and a move past the shards refused.
 
+*As built (2026-11-19), its fourth piece: native requests placed by the rule* (6f,
+`Node::spread_native`, `Drivers::place`, `driving::Lanes::takes`, `process::NativeShards`,
+`derive::shard_shape`, `node::driving_lanes_bytes`). Where its operator states `native_shards =
+spread`, `process::serve` starts a driving shard's task on each runtime shard past the first that
+takes tasks (`others`, numbered as `Node::spread` numbers the ranges' shards), before the node's
+first turn, and the rule's count is made over the first and those shards; each native request the
+host admits is placed on the one running the fewest of those whose shard the watchdog does not see
+held past its limit (`Lane::takes`' test, `hyper_rt::watch::stalls`), the first of those tied, and
+on the first where none takes one; a refused hand-off runs on the first, counted there (above). The
+node's task reads the volume table again at each turn it serves the driving shards, where its root
+range applied past it (`Node::table`), and tells them the newer, as its own host may place none of
+the puts that would have read it. Why a setting of its own, `native_shards = first | spread`
+(`first` where unstated, said as a basis by `mantle serve`, taken by both `mantle serve`'s file and
+`mantle node`'s), and not `range_shards = spread`: ladder r40 measured spreading the ranges slower
+than keeping them on the first shard (above), so tied to it native placement could be measured only
+with the ranges spread, its effect not told from theirs; apart, a ladder measures each on and off,
+`mantle bench doors --native-shards first|spread` stating it in each founder's file beside
+`--range-shards` (`transfer::Cell::make`), its `doors run` line saying both. Sizing:
+`derive::shard_shape` counts on each shard past the first, where native requests are spread, the
+driving task and the launcher that spawns it, holding its own slot while it spawns, and the task's
+timer, beside the ranges' where they are spread too; the floor counts each driving shard's lanes and
+the vectors beside them, derived from their types' sizes (`node::driving_lanes_bytes`: two lanes of
+the exchanges the transport admits at once, the answers' lane and both sides' asks at the node's
+asks, and the shard's word), for each shard past the first where the node hosts objects. Tested:
+the rule passes over a shard that takes none now and fills it first once it takes again, and with
+none taking places on the first (`node::drivers`); a driving shard takes requests while its shard
+runs and none once it is gone (`node::driving`); the key reads `first` and `spread` apart from
+`range_shards` and refuses another word (`process::tests`), and reads back from the bases
+(`derive::tests`); the shape holds a driving shard's task, launcher and timer beside the ranges'
+(`derive::tests`); the floor holds the runtime at every shape with native requests spread or not
+(`tests/shard_memory.rs`); and `mantle bench doors --native-shards` parses apart from
+`--range-shards` (`mantle`'s CLI tests). Open: each driving shard holds a settled copy of the volume
+table, which grows with the cell's volumes and is not yet in the floor; and the native suite under
+`native_shards = spread` is the end-to-end test, and the ladder over `native_shards` the measure.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

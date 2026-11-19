@@ -18,7 +18,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Instant;
 
-use mantle_node::process::RangeShards;
+use mantle_node::process::{NativeShards, RangeShards};
 
 use super::place::Gateway;
 
@@ -392,12 +392,13 @@ pub struct Cell {
 
 impl Cell {
     /// A cell made in `dir`, which holds nothing yet, each founder's volume stated at
-    /// `volume_bytes` and the shards it places its ranges over at `range_shards` (node.md §2.9),
-    /// every founder started and enlisted.
+    /// `volume_bytes`, the shards it places its ranges over at `range_shards` (node.md §2.9) and
+    /// those it drives its native requests on at `native_shards` (step 6f), every founder started
+    /// and enlisted.
     pub fn make(
         dir: &Path,
         volume_bytes: u64,
-        range_shards: RangeShards,
+        (range_shards, native_shards): (RangeShards, NativeShards),
     ) -> Result<Self, CellError> {
         let exe = std::env::current_exe().map_err(io("this program's path"))?;
         let machines = dir.join("machines.conf");
@@ -463,11 +464,14 @@ impl Cell {
                 nodes.len()
             )));
         }
-        // Each founder's operator's statements, `mantle init`'s, and the shards its ranges take.
+        // Each founder's operator's statements, `mantle init`'s, and the shards its ranges and its
+        // native requests take.
         for node in &nodes {
             let config = node.dir.join("config");
             let mut text = std::fs::read_to_string(&config).map_err(io("a founder's config"))?;
-            text.push_str(&format!("range_shards = {range_shards}\n"));
+            text.push_str(&format!(
+                "range_shards = {range_shards}\nnative_shards = {native_shards}\n"
+            ));
             std::fs::write(&config, text).map_err(io("a founder's config"))?;
         }
         // Pinned before any founder starts: a founder reads its peers once, at its start.

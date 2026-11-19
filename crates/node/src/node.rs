@@ -124,6 +124,33 @@ pub fn shard_lanes_bytes(capacity: usize) -> Option<u64> {
     u64::try_from(capacity.checked_mul(each)?).ok()
 }
 
+/// What a driving shard's lanes and the vectors beside them hold (node.md §2.9 step 6f,
+/// `node::driving`): for each of the `requests` the lanes take at once, a ring place and a room
+/// place in and out; for each of the `slots` asks the node holds at once, the answers' ring and
+/// room places, the node's side's held and asked asks, and the shard's side's given, answered and
+/// abandoned ones; and the shard's word that a door moved. Derived from the sizes, at the types a
+/// process runs.
+pub fn driving_lanes_bytes(requests: usize, slots: usize) -> Option<u64> {
+    use std::mem::size_of;
+    let room = size_of::<(u64, u64)>();
+    let request = size_of::<driving::In>()
+        .checked_add(size_of::<driving::Out>())?
+        .checked_add(room.checked_mul(2)?)?;
+    let slot = size_of::<(u64, host::Outcome)>()
+        .checked_add(room)?
+        .checked_add(size_of::<(u64, host::JobAsk)>())?
+        .checked_add(size_of::<(u64, host::Pending)>())?
+        .checked_add(size_of::<driving::Out>())?
+        .checked_add(size_of::<(host::Pending, host::Outcome)>())?
+        .checked_add(size_of::<host::Pending>())?;
+    let word = size_of::<hyper_rt::sync::Notify>().checked_add(size_of::<[usize; 2]>())?;
+    let bytes = requests
+        .checked_mul(request)?
+        .checked_add(slots.checked_mul(slot)?)?
+        .checked_add(word)?;
+    u64::try_from(bytes).ok()
+}
+
 /// The log's id: the node's.
 fn log_id(node: u64) -> u128 {
     u128::from(node)
@@ -1119,7 +1146,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The object operations the node's task runs, and what they hold (node.md §2.9 step 6d).
     host: host::Host,
     /// The lanes of each shard past the first that drives native requests (node.md §2.9 step 6e,
-    /// `node::driving`), one a shard: none until 6f starts them (`Node::start_driving`).
+    /// `node::driving`), one a shard, in shard order: none where the node drives every request
+    /// on its first (`Node::spread_native`).
     driving: Vec<driving::Lanes>,
     /// The volume table's applied index the driving shards were last told.
     driving_table: Option<u64>,
@@ -1144,8 +1172,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// exchange taking more: the next turn is due at once, for its job to give the next piece.
     replied: bool,
     /// The native requests the host admitted running on each of the node's shards, the count the
-    /// rule places each on (node.md §2.9 step 6, `node::drivers`): over the one shard the node's
-    /// task drives every request on, so each is placed on the first, where it runs.
+    /// rule places each on (node.md §2.9 step 6, `node::drivers`): over the first and each shard
+    /// a driving task runs on (`Node::spread_native`), and over the first alone where none does, so each
+    /// is placed on the first, where the node's task runs it.
     drivers: drivers::Drivers,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
@@ -1769,24 +1798,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .ok_or(NodeError::ShardEnded(shard))?;
             self.spread_to(*holder, shard)?;
         }
-        // No shard drives native requests until 6f names them (node.md §2.9 step 6e).
-        self.start_driving(&[])
+        Ok(())
     }
 
-    /// Starts a driving shard's task for each of `on`, the node's shard numbered from its first
-    /// and the holder of the runtime shard it runs on, its lanes kept for the node's turn (node.md
-    /// §2.9 step 6e, `node::driving`): its asks held to the node's bounds, the ranges' groups, the
-    /// wall clock, the gateway's settings shared with the node's host, and the requests its lane
-    /// takes at once, the exchanges the transport admits (`parked_most`). A node that hosts no
-    /// objects starts none. Refused, typed, where a shard takes no task (`Lanes::start`).
-    pub(crate) fn start_driving(
-        &mut self,
-        on: &[(usize, hyper_rt::SlotHolder)],
-    ) -> Result<(), NodeError> {
+    /// Drives the node's native requests over the shards past its first (node.md §2.9 step 6f):
+    /// starts a driving shard's task on each, shard `i` numbered from the node's first being the
+    /// runtime shard `holders[i - 1]` names, as [`Node::spread`] numbers them, its lanes kept for
+    /// the node's turn (`node::driving`): its asks held to the node's bounds, the ranges' groups,
+    /// the wall clock, the gateway's settings shared with the node's host, and the requests its
+    /// lane takes at once, the exchanges the transport admits (`parked_most`). The rule's count is
+    /// made over the first and those shards (`node::drivers`), so each request the host admits
+    /// from then on is placed by it. Called before the node's first turn, so none was placed
+    /// before. A node that hosts no objects starts none. Refused, typed, where a shard takes no
+    /// task (`Lanes::start`), or its number passes a `usize`'s.
+    pub fn spread_native(&mut self, holders: &[hyper_rt::SlotHolder]) -> Result<(), NodeError> {
         let Some(gateway) = self.gateway.as_ref() else {
             return Ok(());
         };
-        for (shard, holder) in on {
+        for (at, holder) in holders.iter().enumerate() {
+            let shard = at
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Bounds("a driving shard's number".into()))?;
             let start = driving::Start {
                 command_asks: self.command_asks,
                 read_asks: self.read_asks,
@@ -1798,8 +1830,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 requests: self.parked_most,
             };
             self.driving
-                .push(driving::Lanes::start(*holder, *shard, start)?);
+                .push(driving::Lanes::start(*holder, shard, start)?);
         }
+        let shards = NonZeroUsize::MIN
+            .checked_add(self.driving.len())
+            .ok_or_else(|| NodeError::Bounds("the node's driving shards".into()))?;
+        self.drivers = drivers::Drivers::over(shards);
         Ok(())
     }
 

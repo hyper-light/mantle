@@ -124,6 +124,8 @@ impl Start {
 /// The node's task's ends of a driving shard's lanes.
 pub(crate) struct Lanes {
     shard: usize,
+    /// The runtime shard the task runs on, whose watchdog says whether it takes a request now.
+    holder: SlotHolder,
     into: Sender<In>,
     answers: Sender<(u64, Outcome)>,
     from: ChannelReceiver<Out>,
@@ -170,6 +172,7 @@ impl Lanes {
         })?;
         Ok(Self {
             shard,
+            holder,
             into,
             answers,
             from,
@@ -187,6 +190,13 @@ impl Lanes {
     /// The node's shard the lanes reach.
     pub(crate) fn shard(&self) -> usize {
         self.shard
+    }
+
+    /// Whether the shard takes a request now: neither gone, nor held in one poll past its limit as
+    /// hyper-rt's watchdog sees it, where a request handed to it would wait for the poll to end, as
+    /// the S3 listener's lanes judge theirs (`listener::shards::Lane::takes`).
+    pub(crate) fn takes(&self) -> bool {
+        hyper_rt::watch::stalls(self.holder).is_some_and(|stalls| !stalls.stalled)
     }
 
     /// The shard's word that a door of its jobs moved, which a handed request's door carries for
@@ -746,13 +756,15 @@ pub(super) mod tests {
         Sender<Out>,
     );
 
-    /// A driving shard's lanes whose task is not started, and the shard's ends of them.
-    pub(crate) fn unstarted(requests: usize, slots: usize) -> (Lanes, Ends) {
+    /// A driving shard's lanes to the shard `holder` names whose task is not started, and the
+    /// shard's ends of them.
+    pub(crate) fn unstarted(holder: SlotHolder, requests: usize, slots: usize) -> (Lanes, Ends) {
         let (into, taken) = channel(requests).unwrap();
         let (answers, answered) = channel(slots).unwrap();
         let (given, from) = channel(requests).unwrap();
         let lanes = Lanes {
             shard: 1,
+            holder,
             into,
             answers,
             from,
@@ -831,7 +843,9 @@ pub(super) mod tests {
         assert_eq!(shard.held, Kinds::default());
 
         // The node's side: an ask it has no room for is held, in order, then asked.
-        let (mut lanes, (taken, mut answered, given)) = unstarted(1, 2);
+        let rt = crate::node::host::tests::two_shards(4);
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let (mut lanes, (taken, mut answered, given)) = unstarted(holder, 1, 2);
         let mut stub = Stub::chunks();
         stub.no_room = true;
         assert!(given.try_send(Out::Ask(7, chunk_get())).is_ok());
@@ -884,6 +898,19 @@ pub(super) mod tests {
             Err(NodeError::ShardEnded(1))
         ));
         drop((taken, answered));
+        rt.shutdown().unwrap();
+    }
+
+    /// A driving shard takes a request while its shard runs, not held past the watchdog's limit,
+    /// and none once its shard is gone: the rule passes over it then (`Drivers::place`).
+    #[test]
+    fn a_driving_shard_takes_requests_while_its_shard_runs() {
+        let rt = crate::node::host::tests::two_shards(4);
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let (lanes, _ends) = unstarted(holder, 1, 1);
+        assert!(lanes.takes());
+        rt.shutdown().unwrap();
+        assert!(!lanes.takes(), "its shard is gone");
     }
 
     /// An ask and its answer cross the lanes asking the allocator for nothing past the ask's own
@@ -892,7 +919,9 @@ pub(super) mod tests {
     #[test]
     fn an_ask_over_the_lanes_allocates_nothing() {
         const ASKS: usize = 64;
-        let (mut lanes, (_taken, mut answered, given)) = unstarted(2, 3);
+        let rt = crate::node::host::tests::two_shards(4);
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let (mut lanes, (_taken, mut answered, given)) = unstarted(holder, 2, 3);
         let mut shard = served(1);
         let mut stub = Stub::chunks();
         let mut ask = |shard: &mut Served, lanes: &mut Lanes, stub: &mut Stub| {

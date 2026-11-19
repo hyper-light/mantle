@@ -2617,7 +2617,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // Placed on the shard the rule picks, and counted there until its job ends (node.md
             // §2.9 step 6). A count past a `usize`'s, which no host's jobs reach, each placed
             // request being one of them, places nothing: the request is one the host cannot run.
-            (Ok(head), Some(_), None) => match self.drivers.place() {
+            // A shard past the first is one a driving task runs on whose shard the watchdog does
+            // not see held past its limit (`driving::Lanes::takes`), the lanes in shard order.
+            (Ok(head), Some(_), None) => match self.drivers.place(|shard| {
+                self.driving
+                    .get(shard.wrapping_sub(1))
+                    .is_some_and(|lanes| lanes.shard() == shard && lanes.takes())
+            }) {
                 Some(shard) => {
                     admitted_ns = Some(now);
                     driven = Some(shard);
@@ -3063,7 +3069,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.driving.is_empty() {
             return Ok(());
         }
-        let applied = self.table.as_ref().map(Table::applied);
+        // Read again where its root range applied past it, as the node's own host reads it at
+        // each put it places: a driving shard's puts are placed by the table the node last read,
+        // which the node's own host may not read while the driving shards run its puts. One the
+        // node cannot read leaves the shards the last told.
+        let applied = self.table().ok().map(Table::applied);
         let told = applied.filter(|applied| Some(*applied) != self.driving_table);
         let mut driving = std::mem::take(&mut self.driving);
         let mut host = std::mem::take(&mut self.host);
@@ -9698,7 +9708,7 @@ pub(super) mod tests {
     }
 
     /// A runtime of two shards, each with `tasks` task slots (as the shards' tests start theirs).
-    fn two_shards(tasks: usize) -> hyper_rt::runtime::Runtime {
+    pub(crate) fn two_shards(tasks: usize) -> hyper_rt::runtime::Runtime {
         hyper_rt::runtime::Runtime::start(&hyper_rt::runtime::RuntimeConfig {
             shards: 2,
             tasks_per_shard: tasks,
@@ -9865,7 +9875,7 @@ pub(super) mod tests {
         rt.shutdown().unwrap();
 
         // A request past the lane's room is given back, to run on the first shard.
-        let (lanes, _ends) = super::super::driving::tests::unstarted(1, 3);
+        let (lanes, _ends) = super::super::driving::tests::unstarted(holder, 1, 3);
         let (half, _) = doors.take().unwrap();
         let op = || Op::Get {
             bucket: "b".into(),

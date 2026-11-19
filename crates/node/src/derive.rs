@@ -7205,6 +7205,50 @@ mod tests {
         ));
     }
 
+    /// A founder of the repair suite's cells as `mantle init` makes it (crates/mantle/tests/repair.rs
+    /// `founders`, five founders of two 256 MiB volumes each): S3 served, the five founding ranges,
+    /// the table's bounds five nodes and 40 volumes, its four fellow founders pinned and the four
+    /// test clients pinned as gateways.
+    fn repair_founder() -> Stated {
+        let mut s = Stated {
+            quic: "127.0.0.1:0".parse().unwrap(),
+            plane: "127.0.0.1:0".parse().unwrap(),
+            s3: s3(),
+            voters: vec![1, 2, 3, 4, 5],
+            enlist: Some(Enlisting {
+                root: 0x10,
+                domain: "rack-0".into(),
+                max_nodes: 5,
+                max_volumes: 40,
+            }),
+            ..stated(2)
+        };
+        for (_, bytes) in &mut s.volumes {
+            *bytes = VolumeBytes::Stated(256 << 20);
+        }
+        s.peers = (2..=5)
+            .map(|id| peer(id, Role::Node, "/node/identity/peers/p.der", None))
+            .chain((6..=9).map(|id| peer(id, Role::Gateway, "/node/identity/c.der", None)))
+            .collect();
+        s
+    }
+
+    /// CI's macOS arm64 runner, three cores and 7 GiB, as a node of the repair suite measures it:
+    /// its two volumes on the node directory's device, of queue 256, measured `depth` deep, and
+    /// `ring` control entries a shard.
+    fn repair_runner(depth: usize, ring: usize) -> Measured {
+        let mut measured = facts(2);
+        measured.cores = 3;
+        measured.ring = ring;
+        measured.memory = machine(7 << 30, None);
+        for v in &mut measured.volumes {
+            v.device.name = measured.meta.name.clone();
+            v.device.queue = Some(256);
+            v.profile.depth = depth;
+        }
+        measured
+    }
+
     /// A founder of the repair suite's cell written off and rejoined (crates/mantle/tests/repair.rs
     /// `a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks`): its
     /// configuration keeps the `peer` lines naming its four fellow founders, and its switch to its
@@ -7222,29 +7266,7 @@ mod tests {
     /// machine: it starts.
     #[test]
     fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
-        let founder = || {
-            let mut s = Stated {
-                quic: "127.0.0.1:0".parse().unwrap(),
-                plane: "127.0.0.1:0".parse().unwrap(),
-                s3: s3(),
-                voters: vec![1, 2, 3, 4, 5],
-                enlist: Some(Enlisting {
-                    root: 0x10,
-                    domain: "rack-0".into(),
-                    max_nodes: 5,
-                    max_volumes: 40,
-                }),
-                ..stated(2)
-            };
-            for (_, bytes) in &mut s.volumes {
-                *bytes = VolumeBytes::Stated(256 << 20);
-            }
-            s.peers = (2..=5)
-                .map(|id| peer(id, Role::Node, "/node/identity/peers/p.der", None))
-                .chain((6..=9).map(|id| peer(id, Role::Gateway, "/node/identity/c.der", None)))
-                .collect();
-            s
-        };
+        let founder = repair_founder;
         // Written off as node 1 and granted 11, its seeds the three members that kept running.
         let rejoined = || Stated {
             id: 11,
@@ -7271,18 +7293,7 @@ mod tests {
         for key in ["transport_bytes", "transport.floor", "memory.floor.log"] {
             assert_eq!(said_bytes(&r, key), said_bytes(&f, key), "{key}");
         }
-        let runner = || {
-            let mut measured = facts(2);
-            measured.cores = 3;
-            measured.ring = 64;
-            measured.memory = machine(7 << 30, None);
-            for v in &mut measured.volumes {
-                v.device.name = measured.meta.name.clone();
-                v.device.queue = Some(256);
-                v.profile.depth = 16;
-            }
-            measured
-        };
+        let runner = || repair_runner(16, 64);
         // The floor at one operation: a ceiling of a byte leaves the operations nothing past it.
         let one = |stated: Stated| match derive(
             Stated {
@@ -7361,5 +7372,55 @@ mod tests {
         }
         assert_eq!(twice.config.settings, alone.config.settings);
         assert_eq!(twice.config.rules, alone.config.rules);
+    }
+
+    /// A founder of the repair suite's cell on CI's 7 GiB macOS runner whose device measured 240
+    /// deep and its shards 436 control entries, as one did at its first start in gates run
+    /// 44596668868 (macos-aarch64, `Cell::made_partly`, repair.rs:809), is refused at its threads
+    /// at 7,831,251,011 bytes, CI's exactly. Every byte past its floor at 16 deep and 64 entries,
+    /// 7,289,300,291, is what its depth and its ring hold: the device's issuer carries each
+    /// transfer on a worker of its own where a pool carries them (macOS, Windows;
+    /// `Issuer::device_threads`), 224 more threads' 2 MiB stacks, 469,762,048 bytes; its two
+    /// volumes take 448 more transfers at once, whose exchanges the transport holds, 34,843,648,
+    /// and whose reads the ranges hold, 37,273,600; and three shards' rings 372 entries longer,
+    /// 71,424. Its floor grows 2,419,104 bytes a transfer, so on macOS and Windows a node of this
+    /// cell starts on 7 GiB where its device measures 109 deep or less, 1,915,805 bytes within it,
+    /// and is refused from 110. Where the kernel holds the transfers on the issuer's one thread
+    /// (Linux), its threads are 16 stacks at any depth and it starts at 240.
+    #[test]
+    fn a_repair_founder_measured_deep_on_cis_macos_runner_passes_it_at_its_threads() {
+        let refused =
+            |depth, ring| match derive(repair_founder(), &repair_runner(depth, ring), &mut fresh) {
+                Err(DeriveError::Memory {
+                    class: Class::Threads,
+                    floor,
+                    ..
+                }) => Some(floor),
+                Ok(_) => None,
+                Err(e) => panic!("{depth} deep, {ring} entries: {e}"),
+            };
+        let measured = refused(240, 436);
+        eprintln!("240 deep, 436 entries: refused at {measured:?}");
+        if cfg!(target_os = "linux") {
+            assert_eq!(measured, None);
+        } else {
+            assert_eq!(measured, Some(7_831_251_011));
+            assert_eq!(refused(109, 64), None);
+            assert_eq!(refused(110, 64), Some(7_516_696_067));
+            // The deepest that starts, and the floor at one operation it starts with.
+            let one = match derive(
+                Stated {
+                    ceiling: Some(1),
+                    ..repair_founder()
+                },
+                &repair_runner(109, 64),
+                &mut fresh,
+            ) {
+                Err(DeriveError::Memory { floor, .. }) => floor,
+                other => panic!("{:?}", other.err()),
+            };
+            assert_eq!(one, 7_514_276_963);
+            assert_eq!((7u64 << 30) - one, 1_915_805);
+        }
     }
 }

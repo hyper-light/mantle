@@ -158,8 +158,8 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
 /// wants ([`derive`], research/87 §4 rule D), and at most as many operations as those bytes hold at
 /// what one costs, as many as it learns its knee is within them;
 /// as many clients of the native protocol admitted at once, each with an operation it may run; S3's
-/// quota of buckets; one row each step of a bucket's attempt passes or removes, the least that
-/// moves it; HDFS's handover.
+/// quota of buckets; the rows each step of a bucket's attempt passes or removes that the largest
+/// entry's bytes hold ([`scan_rows`]); HDFS's handover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gateway {
     pub window: usize,
@@ -282,10 +282,22 @@ pub fn gateway(objects: usize, objects_bytes: u64) -> Result<Gateway, DeriveErro
         objects_bytes,
         clients: objects,
         bucket_quota: BUCKET_QUOTA,
-        scan_rows: 1,
+        scan_rows: scan_rows()?,
         handover_ns: u64::try_from(HANDOVER.as_nanos())
             .map_err(|_| DeriveError::Overflow("the handover"))?,
     })
+}
+
+/// The rows one step of a bucket's attempt passes or removes (`coordinator::Bounds`): as many as the
+/// largest entry a range takes (`wire::largest_entry_bytes`, `range.max_entry_bytes`) holds of what
+/// one row a collection removes writes (`wire::largest_collected_bytes`), so a collection's writes
+/// are within the bytes of the largest entry a range applies, and a probe passes as many a read. At
+/// least one, the least that moves an attempt.
+pub fn scan_rows() -> Result<u32, DeriveError> {
+    let entry = wire::largest_entry_bytes()?;
+    let row = wire::largest_collected_bytes()?;
+    let rows = entry.checked_div(row).unwrap_or(0).max(1);
+    u32::try_from(rows).map_err(|_| DeriveError::Overflow("a scan's rows"))
 }
 
 /// The schemes a node's blocks may take, its operations' charges are reckoned under: those
@@ -3098,8 +3110,9 @@ fn say_objects(
         "gateway.scan_rows",
         gateway.scan_rows,
         Kind::Derived,
-        "one row each step of a bucket's attempt passes or removes, the least that moves it, \
-         until deletion's throughput is measured",
+        "the rows each step of a bucket's attempt passes or removes: as many as the largest entry a \
+         range takes holds of what one row a collection removes writes, its key deleted and a \
+         part's file released (derive::scan_rows, wire::largest_collected_bytes)",
     );
     said.add(
         "gateway.handover_ns",
@@ -3984,6 +3997,21 @@ mod tests {
         let mixed = Charges::new(1, &[three, coded]).unwrap();
         assert!(mixed.of(Some(1)) >= charges.of(Some(1)));
         assert!(mixed.of(Some(1)) < mixed.most());
+    }
+
+    /// A step of a bucket's attempt passes or removes as many rows as the largest entry a range
+    /// takes holds of what one row a collection removes writes: more than one, and their writes
+    /// within that entry's bytes.
+    #[test]
+    fn a_buckets_step_passes_the_rows_the_largest_entry_holds() {
+        let rows = usize::try_from(scan_rows().unwrap()).unwrap();
+        let entry = wire::largest_entry_bytes().unwrap();
+        let row = wire::largest_collected_bytes().unwrap();
+        assert!(row > key::largest_bytes());
+        assert!(rows > 1, "{rows}");
+        assert!(rows * row <= entry);
+        assert!((rows + 1) * row > entry);
+        assert_eq!(gateway(1, 0).unwrap().scan_rows, scan_rows().unwrap());
     }
 
     /// A get is charged for its window under the scheme that holds the most of it: its driver's

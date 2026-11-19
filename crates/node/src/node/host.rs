@@ -3103,15 +3103,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// Whether what a job asked is answered, its outcome not yet taken.
-    fn has_outcome(&self, pending: Pending) -> bool {
-        match pending {
-            Pending::Command(ask) => self.commands_done.iter().any(|(a, _)| *a == ask),
-            Pending::Read(ask) => self.reads_done.iter().any(|(a, _)| *a == ask),
-            Pending::Chunk(ask) => self.chunks_done.iter().any(|(a, _)| *a == ask),
-        }
-    }
-
     /// An object's request arrived on `exchange` from `peer`, its body `body` bytes: a job that
     /// reads its fields first; parked, its body unread, where the host has no room for it now or
     /// requests parked before it wait (`take_parked`), as the S3 listener's door holds a request
@@ -4076,9 +4067,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.abandoned.is_empty() {
             return;
         }
-        let mut abandoned = std::mem::take(&mut self.abandoned);
-        abandoned.retain(|pending| self.outcome(*pending).is_none());
-        self.abandoned = abandoned;
+        // Each answer waiting probes the asks let go, rather than each ask let go searching the
+        // answers.
+        let Self {
+            abandoned,
+            commands_done,
+            reads_done,
+            chunks_done,
+            ..
+        } = self;
+        commands_done.retain(|(ask, _)| !abandoned.remove(&Pending::Command(*ask)));
+        reads_done.retain(|(ask, _)| !abandoned.remove(&Pending::Read(*ask)));
+        chunks_done.retain(|(ask, _)| !abandoned.remove(&Pending::Chunk(*ask)));
     }
 
     /// Whether the host holds `exchange`, for an event on it: a job's, or a reply its node's task
@@ -4222,15 +4222,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// freeing turns no node.
     pub(super) fn host_due(&self) -> Option<u64> {
         let shard = hyper_rt::futures::now_ns();
+        // A probe of the reads answered for each lookup asked, at most the door's capacity, which
+        // the turn's `step_lookups` walks as well.
         let looked_up = self
             .lookups
             .iter()
             .filter_map(|l| l.ask)
-            .any(|ask| self.reads_done.iter().any(|(a, _)| *a == ask));
-        let dropped = self
-            .abandoned
-            .iter()
-            .any(|pending| self.has_outcome(*pending));
+            .any(|ask| self.reads_done.contains(ask));
+        // Each answer waiting probes the asks let go, as `drop_abandoned` drops them.
+        let dropped = !self.abandoned.is_empty()
+            && self
+                .answers()
+                .any(|pending| self.abandoned.contains(&pending));
         if self.fed || self.replied || looked_up || dropped {
             return Some(shard);
         }

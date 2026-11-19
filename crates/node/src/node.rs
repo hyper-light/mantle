@@ -66,6 +66,7 @@ use crate::frame;
 use crate::layout::Layout;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
+use keyed::{Key, Keyed};
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object;
@@ -75,6 +76,7 @@ mod drivers;
 mod driving;
 mod enrollments;
 mod host;
+mod keyed;
 mod members;
 mod repair;
 mod shard;
@@ -752,6 +754,30 @@ struct Receiving {
     what: Arriving,
 }
 
+impl Key for ChunkOut {
+    type Of = ExchangeId;
+
+    fn key(&self) -> ExchangeId {
+        self.exchange
+    }
+}
+
+impl Key for Writing {
+    type Of = ExchangeId;
+
+    fn key(&self) -> ExchangeId {
+        self.exchange
+    }
+}
+
+impl Key for Receiving {
+    type Of = ExchangeId;
+
+    fn key(&self) -> ExchangeId {
+        self.exchange
+    }
+}
+
 /// What an arriving body is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arriving {
@@ -1148,8 +1174,11 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     plane_socket: PlaneSocket,
     remotes: Vec<Remote>,
     lane_window: usize,
-    writing: Vec<Writing>,
-    receiving: Vec<Receiving>,
+    /// The bodies going out on exchanges and those arriving, each found by its exchange at every
+    /// event on it (`keyed::Keyed`), not by a search of all: one an exchange, so at most the
+    /// exchanges the transport holds at once.
+    writing: Keyed<Writing>,
+    receiving: Keyed<Receiving>,
     /// Commands proposed and not yet answered, and reads asked and not yet served: at most what
     /// the transport admits as exchanges.
     commanded: Vec<Commanded>,
@@ -1201,12 +1230,13 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// as the driving shards are served (`Node::serve_driving`).
     room_freed: bool,
     /// The chunk puts and gets this node asked of its peers and not yet answered; at most
-    /// `chunk_asks` of them.
-    chunks_out: Vec<ChunkOut>,
+    /// `chunk_asks` of them, each found by its exchange at every event on it (`keyed::Keyed`).
+    chunks_out: Keyed<ChunkOut>,
     chunk_asks: usize,
     next_chunk: ChunkAsk,
-    /// The chunk puts and gets this node asked, answered and not yet taken.
-    chunks_done: Vec<(ChunkAsk, ChunkOutcome)>,
+    /// The chunk puts and gets this node asked, answered and not yet taken, each found by its ask
+    /// as its asker takes it (`keyed::Keyed`).
+    chunks_done: Keyed<(ChunkAsk, ChunkOutcome)>,
     chunk_bytes: u64,
     /// The commands this node asks of ranges itself (node.md §6.6): each range's session, waiting
     /// commands and entry out, holding at most `command_asks` commands with those answered and not
@@ -1221,13 +1251,15 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The node's run (§2.4 item 4), which its registrations name: a range ends the node's
     /// sessions of earlier runs as the node registers there.
     run: u64,
-    commands_done: Vec<(CommandAsk, CommandOutcome)>,
+    /// The commands answered and not yet taken, each found by its ask, as `chunks_done`.
+    commands_done: Keyed<(CommandAsk, CommandOutcome)>,
     /// The reads this node asks of ranges itself (`Node::read`): those out, and those answered and
     /// not yet taken, at most `read_asks` in all.
     reads_out: Vec<ReadOut>,
     read_asks: usize,
     next_read_ask: ReadAsk,
-    reads_done: Vec<(ReadAsk, ReadOutcome)>,
+    /// The reads answered and not yet taken, each found by its ask, as `chunks_done`.
+    reads_done: Keyed<(ReadAsk, ReadOutcome)>,
     wall: Wall,
     /// The gateway host's settings, and the object operations it runs: as many at once as it has
     /// learned its knee is (`crate::admit`), at most `GatewaySettings::objects`, the ceiling its
@@ -1283,9 +1315,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// a driving task runs on (`Node::spread_native`), and over the first alone where none does, so each
     /// is placed on the first, where the node's task runs it.
     drivers: drivers::Drivers,
-    /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
-    /// At most the node's asks.
-    abandoned: Vec<host::Pending>,
+    /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come,
+    /// each found by its ask from the answers waiting (`Node::drop_abandoned`). At most the node's
+    /// asks, each once.
+    abandoned: std::collections::HashSet<host::Pending>,
     /// The cell's repair, while this node's member leads the Block range (docs/design/repair.md
     /// §5); its repairs take the host's operation slots as jobs do.
     repair: Option<repair::Repair>,
@@ -1667,8 +1700,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             plane_socket,
             remotes,
             lane_window,
-            writing: Vec::new(),
-            receiving: Vec::new(),
+            writing: Keyed::default(),
+            receiving: Keyed::default(),
             commanded: Vec::new(),
             reading: Vec::new(),
             next_read: 0,
@@ -1691,21 +1724,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             storage: std::mem::take(&mut settings.storage),
             stored: Vec::new(),
             room_freed: false,
-            chunks_out: Vec::new(),
+            chunks_out: Keyed::default(),
             chunk_asks: settings.chunk_asks,
             next_chunk: 0,
-            chunks_done: Vec::new(),
+            chunks_done: Keyed::default(),
             chunk_bytes: settings.chunk_bytes,
             asking: Vec::new(),
             command_asks: settings.command_asks,
             next_command: 0,
             next_nonce: 0,
             run,
-            commands_done: Vec::new(),
+            commands_done: Keyed::default(),
             reads_out: Vec::new(),
             read_asks: settings.read_asks,
             next_read_ask: 0,
-            reads_done: Vec::new(),
+            reads_done: Keyed::default(),
             wall: settings.wall,
             admission: gateway.as_ref().map(|g| {
                 crate::admit::Admission::new(
@@ -1738,7 +1771,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             replies: Vec::new(),
             replied: false,
             drivers: drivers::Drivers::over(NonZeroUsize::MIN),
-            abandoned: Vec::new(),
+            abandoned: std::collections::HashSet::new(),
             repair: None,
             seeing: Vec::new(),
             doorway: None,
@@ -3340,7 +3373,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Event::BodyReady { exchange } if self.hosts(exchange) => Ok(()),
             Event::BodyReady { exchange } => self.read_exchange(exchange),
             Event::Reply { exchange, body } => {
-                if self.chunks_out.iter().any(|c| c.exchange == exchange) {
+                if self.chunks_out.contains(exchange) {
                     return self.chunk_replied(exchange, body.unwrap_or(0));
                 }
                 if self.asking_on(exchange).is_some() {
@@ -3361,19 +3394,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             } => {
                 self.snapshot_done(exchange, false);
                 // A chunk's body ended before it was whole: what came of it is kept nowhere.
-                for r in self.receiving.iter().filter(|r| r.exchange == exchange) {
-                    if matches!(r.what, Arriving::ChunkPut { .. }) {
-                        self.chunks_unkept = self.chunks_unkept.saturating_add(r.read);
-                    }
+                if let Some(r) = self.receiving.get(exchange)
+                    && matches!(r.what, Arriving::ChunkPut { .. })
+                {
+                    self.chunks_unkept = self.chunks_unkept.saturating_add(r.read);
                 }
-                if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
-                    let out = self.chunks_out.swap_remove(at);
+                if let Some(out) = self.chunks_out.remove(exchange) {
                     self.chunks_done
                         .push((out.asked, ChunkOutcome::Lost(refusal)));
                 }
                 self.give_back(exchange);
-                self.receiving.retain(|r| r.exchange != exchange);
-                self.writing.retain(|w| w.exchange != exchange);
+                self.receiving.remove(exchange);
+                self.writing.remove(exchange);
                 self.commanded
                     .retain(|c| c.origin != CommandOrigin::Exchange(exchange));
                 self.reading
@@ -3815,45 +3847,37 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Writes what an exchange takes of what is left of its body; a reply written whole ends its
     /// exchange, and a snapshot waits for its member's reply.
     fn write_exchange(&mut self, exchange: ExchangeId) {
-        let Some(at) = self.writing.iter().position(|w| w.exchange == exchange) else {
+        let Some(writing) = self.writing.get_mut(exchange) else {
             return;
         };
         let endpoint = self.driver.endpoint();
         let mut failed = None;
-        let mut whole = false;
-        let mut then = None;
         let mut sent = false;
-        if let Some(writing) = self.writing.get_mut(at) {
-            while let Some(rest) = writing.bytes.as_slice().get(writing.written..)
-                && !rest.is_empty()
-            {
-                match endpoint.write_body(exchange, rest) {
-                    Ok(0) => break,
-                    Ok(took) => {
-                        sent = true;
-                        writing.written = writing.written.saturating_add(took);
-                        self.moved = self
-                            .moved
-                            .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                    }
-                    Err(refusal) => {
-                        failed = Some(refusal);
-                        break;
-                    }
+        while let Some(rest) = writing.bytes.as_slice().get(writing.written..)
+            && !rest.is_empty()
+        {
+            match endpoint.write_body(exchange, rest) {
+                Ok(0) => break,
+                Ok(took) => {
+                    sent = true;
+                    writing.written = writing.written.saturating_add(took);
+                    self.moved = self
+                        .moved
+                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                }
+                Err(refusal) => {
+                    failed = Some(refusal);
+                    break;
                 }
             }
-            whole = writing.written >= writing.bytes.as_slice().len();
-            then = Some(writing.then);
         }
+        let whole = writing.written >= writing.bytes.as_slice().len();
+        let then = writing.then;
         // A piece of a chunk a job asked of a peer going is the job's work moving, as a piece of
         // one it reads arriving is (research/77 D2).
         if sent
-            && matches!(then, Some(Then::Asked))
-            && let Some(asked) = self
-                .chunks_out
-                .iter()
-                .find(|c| c.exchange == exchange)
-                .map(|c| c.asked)
+            && matches!(then, Then::Asked)
+            && let Some(asked) = self.chunks_out.get(exchange).map(|c| c.asked)
         {
             self.host.chunk_moved(asked);
             for lanes in &mut self.driving {
@@ -3861,57 +3885,53 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         match then {
-            Some(Then::Snapshot { .. }) if failed.is_some() => self.snapshot_done(exchange, false),
-            Some(Then::Reply) if failed.is_some() || whole => {
-                self.writing.swap_remove(at);
+            Then::Snapshot { .. } if failed.is_some() => self.snapshot_done(exchange, false),
+            Then::Reply if failed.is_some() || whole => {
+                self.writing.remove(exchange);
                 self.driver.endpoint().end(exchange);
             }
             // A put whose bytes could not all go is lost as the transport refused them, unless
             // the exchange had already ended, whose own refusal says (`chunk_put_refused`); one
             // sent whole waits for its reply.
-            Some(Then::Asked) if let Some(refusal) = failed => {
-                self.writing.swap_remove(at);
+            Then::Asked if let Some(refusal) = failed => {
+                self.writing.remove(exchange);
                 if let Some(outcome) = chunk_put_refused(refusal) {
-                    if let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) {
-                        let out = self.chunks_out.swap_remove(at);
+                    if let Some(out) = self.chunks_out.remove(exchange) {
                         self.chunks_done.push((out.asked, outcome));
                     }
                     self.driver.endpoint().end(exchange);
                 }
             }
-            Some(Then::Asked) if whole => {
-                self.writing.swap_remove(at);
+            Then::Asked if whole => {
+                self.writing.remove(exchange);
             }
             // An entry whose bytes could not all go is asked again; one sent whole waits.
-            Some(Then::Commanded) if failed.is_some() => {
-                self.writing.swap_remove(at);
+            Then::Commanded if failed.is_some() => {
+                self.writing.remove(exchange);
                 self.driver.endpoint().end(exchange);
                 self.ask_lost(exchange);
             }
-            Some(Then::Commanded) if whole => {
-                self.writing.swap_remove(at);
+            Then::Commanded if whole => {
+                self.writing.remove(exchange);
             }
             // A forward whose bytes could not all go is forwarded again; one sent whole waits.
-            Some(Then::Forwarded) if failed.is_some() => {
-                self.writing.swap_remove(at);
+            Then::Forwarded if failed.is_some() => {
+                self.writing.remove(exchange);
                 self.driver.endpoint().end(exchange);
                 self.enrollment_lost(exchange);
             }
-            Some(Then::Forwarded) if whole => {
-                self.writing.swap_remove(at);
+            Then::Forwarded if whole => {
+                self.writing.remove(exchange);
             }
             _ => {}
         }
     }
 
     fn snapshot_done(&mut self, exchange: ExchangeId, arrived: bool) {
-        let Some(at) = self.writing.iter().position(|w| w.exchange == exchange) else {
+        let Some(Then::Snapshot { group, to }) = self.writing.get(exchange).map(|w| w.then) else {
             return;
         };
-        let Some(Then::Snapshot { group, to }) = self.writing.get(at).map(|w| w.then) else {
-            return;
-        };
-        self.writing.swap_remove(at);
+        self.writing.remove(exchange);
         if arrived {
             self.snapshots_sent = self.snapshots_sent.saturating_add(1);
         }
@@ -3938,11 +3958,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// whole, with its checksum verified, takes it: a snapshot is answered and its frame stepped,
     /// an entry is proposed, a read asked, and a request answered without its body is answered.
     fn read_exchange(&mut self, exchange: ExchangeId) -> Result<(), NodeError> {
-        let Some(at) = self.receiving.iter().position(|r| r.exchange == exchange) else {
-            return Ok(());
-        };
         let endpoint = self.driver.endpoint();
-        let Some(receiving) = self.receiving.get_mut(at) else {
+        let Some(receiving) = self.receiving.get_mut(exchange) else {
             return Ok(());
         };
         // A chunk a job asked of a peer: each piece of it is the job's own work moving
@@ -3979,7 +3996,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(0) => return Ok(()),
                 Ok(_) => {}
                 Err(refusal) => {
-                    let lost = self.receiving.swap_remove(at);
+                    let Some(lost) = self.receiving.remove(exchange) else {
+                        return Ok(());
+                    };
                     match lost.what {
                         Arriving::ChunkPut { .. } => {
                             self.chunks_unkept = self.chunks_unkept.saturating_add(lost.read);
@@ -4003,7 +4022,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(());
             }
         }
-        let received = self.receiving.swap_remove(at);
+        let Some(received) = self.receiving.remove(exchange) else {
+            return Ok(());
+        };
         match received.what {
             Arriving::Snapshot => {
                 // The snapshot arrived whole and verified: it is stepped whether or not its
@@ -4447,17 +4468,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.chunks_done
                 .push((asked, ChunkOutcome::Lost(Refusal::Closed)));
             self.give_back(exchange);
-            self.receiving.retain(|r| r.exchange != exchange);
+            self.receiving.remove(exchange);
             self.driver.endpoint().end(exchange);
         }
     }
 
     /// Gives back the room a chunk put being read on `exchange` held, the exchange gone.
     fn give_back(&mut self, exchange: ExchangeId) {
-        for receiving in self.receiving.iter().filter(|r| r.exchange == exchange) {
-            if matches!(receiving.what, Arriving::ChunkPut { .. }) {
-                self.storage.give_room(receiving.body);
-            }
+        if let Some(receiving) = self.receiving.get(exchange)
+            && matches!(receiving.what, Arriving::ChunkPut { .. })
+        {
+            self.storage.give_room(receiving.body);
         }
     }
 
@@ -4547,12 +4568,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// A peer's reply to a chunk put or get this node asked: a put's status, or a get's bytes,
     /// read through the transfer class's budget as a body is.
     fn chunk_replied(&mut self, exchange: ExchangeId, body: u64) -> Result<(), NodeError> {
-        let Some(at) = self.chunks_out.iter().position(|c| c.exchange == exchange) else {
+        let Some(ChunkOut {
+            asked, peer, get, ..
+        }) = self.chunks_out.remove(exchange)
+        else {
             return Ok(());
         };
-        let ChunkOut {
-            asked, peer, get, ..
-        } = self.chunks_out.swap_remove(at);
         let endpoint = self.driver.endpoint();
         let status = chunk::read_reply_head(endpoint.head(exchange).unwrap_or_default())
             .unwrap_or(chunk::Status::Malformed);
@@ -4666,7 +4687,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.write_exchange(exchange);
             }
-            Err(refusal) => self.chunks_done.push((asked, ChunkOutcome::Lost(refusal))),
+            Err(refusal) => {
+                self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
+            }
         }
         Ok(asked)
     }
@@ -4722,13 +4745,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .endpoint()
             .open(clock, at, Kind::ChunkGet, &head, None, period)
         {
-            Ok(exchange) => self.chunks_out.push(ChunkOut {
-                exchange,
-                asked,
-                peer: at,
-                get: true,
-            }),
-            Err(refusal) => self.chunks_done.push((asked, ChunkOutcome::Lost(refusal))),
+            Ok(exchange) => {
+                self.chunks_out.push(ChunkOut {
+                    exchange,
+                    asked,
+                    peer: at,
+                    get: true,
+                });
+            }
+            Err(refusal) => {
+                self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
+            }
         }
         Ok(asked)
     }
@@ -4999,6 +5026,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// leading) is asked again after a pause.
     fn propose_own(&mut self, at: usize, id: u64, now: u64) -> Result<(), NodeError> {
         let Some((group, place, mut out)) = self.asking.get_mut(at).and_then(|a| {
+            // A search of the range's entries out, at most `ENTRIES_OUT`.
             let place = a.outs.iter().position(|o| o.id == id)?;
             Some((a.group, place, a.outs.remove(place)?))
         }) else {
@@ -5047,7 +5075,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// The range, and its entry out, on `exchange`.
+    /// The range, and its entry out, on `exchange`: a search of one `Asking` a range the node asks
+    /// commands of, each holding at most [`ENTRIES_OUT`] entries out.
     fn asking_on(&self, exchange: ExchangeId) -> Option<(usize, u64)> {
         self.asking.iter().enumerate().find_map(|(at, a)| {
             a.outs
@@ -5629,16 +5658,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let remotes = &self.remotes;
         self.plane_socket.flush(
             &mut self.plane,
+            // A search of the node's peers, at most the cell's nodes and its pinned peers.
             |peer| remotes.iter().find(|r| r.id == peer).and_then(|r| r.plane),
             |_, _| {},
         );
     }
 }
 
-/// Takes `ask`'s outcome out of `done`, if it is there.
-fn take_done<T>(done: &mut Vec<(u64, T)>, ask: u64) -> Option<T> {
-    let at = done.iter().position(|(a, _)| *a == ask)?;
-    Some(done.swap_remove(at).1)
+/// Takes `ask`'s outcome out of `done`, if it is there: one probe of its asks' slots.
+fn take_done<T>(done: &mut Keyed<(u64, T)>, ask: u64) -> Option<T> {
+    done.remove(ask).map(|(_, outcome)| outcome)
 }
 
 /// Whether `command` asks nothing its sender may not: an enlistment and a history name the sender,

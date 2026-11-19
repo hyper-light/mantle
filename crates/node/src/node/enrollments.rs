@@ -408,7 +408,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match held.stands {
             Stands::Forwarded(out) => {
                 self.driver.endpoint().end(out);
-                self.receiving.retain(|r| r.exchange != out);
+                self.receiving.remove(out);
             }
             Stands::Proposed { ask, .. } => self.duties.push((ask, held.enrolling.old)),
             Stands::Waiting | Stands::Removing { .. } => {}

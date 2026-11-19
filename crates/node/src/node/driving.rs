@@ -157,9 +157,13 @@ pub(crate) struct Lanes {
     /// Asks the node had no room for, in order, each under the shard's number: at most the asks
     /// the shard's host holds.
     waiting: VecDeque<(u64, JobAsk)>,
-    /// Asks the node holds for the shard, each under the shard's number and the node's: at most
-    /// the asks the shard's host holds.
-    asked: Vec<(u64, Pending)>,
+    /// Asks the node holds for the shard, the shard's number of each by the node's: each found by
+    /// an answer the node holds in one probe ([`Lanes::serve`]), not each ask held searching the
+    /// node's answers at every serve. At most the asks the shard's host holds.
+    asked: std::collections::HashMap<Pending, u64>,
+    /// The node's answers to asks in `asked`, found at a serve and taken after it: kept across
+    /// serves, emptied at each, at most the asks in `asked`.
+    found: Vec<Pending>,
     /// The shard's number of each chunk ask in `asked`, by the node's, and whether a piece of its
     /// chunk moved since the lanes were last served: a piece found in one probe
     /// ([`Lanes::tell_moved`]), not a search of every ask the shard holds, at each piece of every
@@ -208,7 +212,8 @@ impl Lanes {
             freed: false,
             wants_room: false,
             waiting: VecDeque::with_capacity(slots),
-            asked: Vec::with_capacity(slots),
+            asked: std::collections::HashMap::with_capacity(slots),
+            found: Vec::with_capacity(slots),
             chunks: std::collections::HashMap::with_capacity(chunk_asks),
             pieces: Vec::with_capacity(chunk_asks),
             doors,
@@ -286,7 +291,7 @@ impl Lanes {
 
     /// The node holds `pending` for the shard's ask `number`, a chunk's found by the node's ask.
     fn hold(&mut self, number: u64, pending: Pending) {
-        self.asked.push((number, pending));
+        self.asked.insert(pending, number);
         if let Pending::Chunk(ask) = pending {
             self.chunks.insert(ask, (number, false));
         }
@@ -352,19 +357,32 @@ impl Lanes {
             };
             self.ask(node, number, ask)?;
         }
-        let mut at = 0;
-        while let Some(&(number, pending)) = self.asked.get(at) {
-            match node.outcome(pending) {
-                Some(outcome) => {
-                    self.asked.swap_remove(at);
-                    if let Pending::Chunk(ask) = pending {
-                        self.chunks.remove(&ask);
-                    }
-                    self.answer(number, outcome)?;
-                }
-                None => at = at.saturating_add(1),
+        // Each answer the node holds probes the asks held, rather than each ask held searching the
+        // node's answers: what a serve reads is the answers waiting, not the asks in flight.
+        let mut found = std::mem::take(&mut self.found);
+        found.extend(
+            node.answers()
+                .filter(|pending| self.asked.contains_key(pending)),
+        );
+        let mut served = Ok(());
+        for pending in found.drain(..) {
+            if served.is_err() {
+                continue;
             }
+            let Some(&number) = self.asked.get(&pending) else {
+                continue;
+            };
+            let Some(outcome) = node.outcome(pending) else {
+                continue;
+            };
+            self.asked.remove(&pending);
+            if let Pending::Chunk(ask) = pending {
+                self.chunks.remove(&ask);
+            }
+            served = self.answer(number, outcome);
         }
+        self.found = found;
+        served?;
         // A chunk's pieces moved are its job's work moving, told once a serve, each a message that
         // wakes the shard: none for a chunk answered now, whose answer moves its job. Dropped where
         // the lane has no room, its next piece telling it again.
@@ -868,7 +886,8 @@ pub(super) mod tests {
             freed: false,
             wants_room: false,
             waiting: VecDeque::with_capacity(slots),
-            asked: Vec::with_capacity(slots),
+            asked: std::collections::HashMap::with_capacity(slots),
+            found: Vec::with_capacity(slots),
             chunks: std::collections::HashMap::with_capacity(slots),
             pieces: Vec::with_capacity(slots),
             doors: Arc::new(Notify::new().unwrap()),
@@ -1174,13 +1193,10 @@ pub(super) mod tests {
         let mut noted: Vec<u64> = Vec::new();
         for _ in 0..2 {
             for ask in 0..ASKS {
-                let at = lanes
-                    .asked
-                    .iter()
-                    .position(|(_, pending)| *pending == Pending::Chunk(ask))
-                    .unwrap();
-                searched += at + 1;
-                let number = lanes.asked[at].0;
+                // Held in order, each under its ask's number past the asks.
+                assert_eq!(lanes.asked.get(&Pending::Chunk(ask)), Some(&(ask + ASKS)));
+                searched += usize::try_from(ask).unwrap() + 1;
+                let number = ask + ASKS;
                 match noted.iter().position(|noted| *noted == number) {
                     Some(at) => searched += at + 1,
                     None => {

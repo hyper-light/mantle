@@ -2001,6 +2001,23 @@ time. A job's drivers (`Put`, `Get`, the bucket's `Coordinator`) need not cross:
 handed over once its fields are read, before its work is made (6c, 6f), so they are made on the
 shard that drives them. So step 6 needs no change in hyper-raft for what crosses.
 
+*As built (2026-11-18), step 6's second part: a job's asks as values* (6b,
+`crates/node/src/node/host.rs`). Each ask a job makes of the node is one value, `host::JobAsk`:
+a range's command or read, its group and its command or query, asked as a gateway asks one, until
+the range answers or its budget passes without a leader (`Wait::Request`), as every job asked
+before; or a chunk's put or get on a volume, of the node the volume table names as holding it,
+within the job's patience. `Node::ask` serves it by `Node::command`, `Node::read`,
+`Node::put_chunk` or `Node::get_chunk`, as the job called them, and says what the job waits on
+(`Pending`); `Node::outcome` takes that outcome once answered, which `take_answers` gives the job
+and `drop_abandoned` drops for a job that ended, and `Node::has_outcome` says whether it came
+(`host_due`). The bounds are as they were: each kind held to the node's (`command_asks`,
+`read_asks`, `chunk_asks`), one past it refused `NodeError::Asks` and asked again at the job's
+next turn. The S3 door's key lookups (`host::step_lookups`) are no job's asks and keep the node's
+read. Every job is still driven on the first shard. Tested: the host's and the node's unit tests
+pass over it unchanged, as nothing a job asks or is answered changed, which no test can show red;
+`node::tests::a_native_requests_work_may_cross_to_the_shard_that_drives_it` holds the value
+`Send`, so a lane may carry it (6e).
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

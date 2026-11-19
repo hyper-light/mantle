@@ -5562,9 +5562,10 @@ mod tests {
 
     /// What step 6 hands between the endpoint's shard and a shard that drives native requests
     /// (node.md §2.9) may cross threads: a request's operation, and its door's request, pieces and
-    /// answers as the S3 listener hands them over now; a job's asks (a range's command or read, a
-    /// chunk's bytes and key) and their outcomes; and the volume table its puts are placed by. The
-    /// gateway's settings, keys among them, may be shared by every shard's host.
+    /// answers as the S3 listener hands them over now; a job's asks, each one value (6b), of a
+    /// range's command or read or a chunk's bytes and key, and their outcomes; and the volume table
+    /// its puts are placed by. The gateway's settings, keys among them, may be shared by every
+    /// shard's host.
     #[test]
     fn a_native_requests_work_may_cross_to_the_shard_that_drives_it() {
         fn moves<T: Send>() {}
@@ -5573,6 +5574,7 @@ mod tests {
         moves::<crate::door::Request>();
         moves::<crate::door::Piece>();
         moves::<crate::door::Answer>();
+        moves::<host::JobAsk>();
         moves::<Command>();
         moves::<Query>();
         moves::<Bytes>();

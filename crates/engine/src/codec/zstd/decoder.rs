@@ -424,23 +424,14 @@ impl Decoder {
                     return Err(Corrupt::Block.into());
                 }
                 self.stage = Stage::Block { last, kind, size };
-                // An empty raw or compressed block has no content to gather.
+                // An empty raw or compressed block has no content to gather: it is decoded now,
+                // with its header.
                 if kind != 1 && size == 0 {
                     self.unit.clear();
-                    self.step()?;
+                    self.content(last, kind, size)?;
                 }
             }
-            Stage::Block { last, kind, size } => {
-                let unit = std::mem::take(&mut self.unit);
-                let decoded = self.block(kind, size, &unit);
-                self.unit = unit;
-                let frame = decoded?;
-                if last {
-                    self.end_blocks(frame)?;
-                } else {
-                    self.stage = Stage::BlockHeader;
-                }
-            }
+            Stage::Block { last, kind, size } => self.content(last, kind, size)?,
             Stage::Checksum => {
                 let stored = read_u32(&self.unit, 0).ok_or(Corrupt::Truncated)?;
                 // The low 4 bytes of XXH64 of the content, seed 0 (§3.1.1).
@@ -451,6 +442,21 @@ impl Decoder {
             }
         }
         Ok(())
+    }
+
+    /// Decodes the block whose content the unit holds, then readies the next block's header, or
+    /// the frame's end after its last block.
+    fn content(&mut self, last: bool, kind: u8, size: usize) -> Result<(), Error> {
+        let unit = std::mem::take(&mut self.unit);
+        let decoded = self.block(kind, size, &unit);
+        self.unit = unit;
+        let frame = decoded?;
+        if last {
+            self.end_blocks(frame)
+        } else {
+            self.stage = Stage::BlockHeader;
+            Ok(())
+        }
     }
 
     /// Decodes one block's `content` (a raw block's bytes, an RLE block's one byte, or a
@@ -807,8 +813,16 @@ impl Execution<'_> {
         }
         let frame_bytes = self.at.saturating_sub(self.frame_start);
         if offset > frame_bytes {
-            return self.copy_from_dictionary(offset, length);
+            return self.copy_from_dictionary(offset, length, end);
         }
+        self.copy_from_frame(offset, length, end)
+    }
+
+    /// Copies a match of `length` bytes, ending at `end`, from `offset` back within this frame's
+    /// own bytes: `offset` is positive and at most the frame's bytes before `at`, and `end` at
+    /// most the block's end.
+    #[inline(always)]
+    fn copy_from_frame(&mut self, offset: usize, length: usize, end: usize) -> Result<(), Corrupt> {
         // `offset <= frame_bytes <= at`.
         let src = self.at.wrapping_sub(offset);
         // Every range below is under `end + WILD_COPY`, inside the grown window.
@@ -864,9 +878,16 @@ impl Execution<'_> {
         Ok(())
     }
 
-    /// A match reaching back past the frame's first byte into the dictionary's content.
+    /// A match reaching back past the frame's first byte into the dictionary's content, ending at
+    /// `end`: at most two pieces, the dictionary's bytes and then, when the match is longer than
+    /// they are, the frame's own from its first byte.
     #[cold]
-    fn copy_from_dictionary(&mut self, offset: usize, length: usize) -> Result<(), Corrupt> {
+    fn copy_from_dictionary(
+        &mut self,
+        offset: usize,
+        length: usize,
+        end: usize,
+    ) -> Result<(), Corrupt> {
         let frame_bytes = self.at.saturating_sub(self.frame_start);
         // This frame's bytes so far, earlier blocks' and this one's (§5's "decoded from this
         // frame"): the window must hold every one, and they must be within the frame's window.
@@ -898,8 +919,9 @@ impl Execution<'_> {
         if rest == 0 {
             return Ok(());
         }
-        // The rest continues from the frame's first byte, `offset` back from the new end.
-        self.copy_match(offset, rest)
+        // The rest continues from the frame's first byte: the dictionary's `offset - frame_bytes`
+        // bytes are behind `at` now, so `offset` is exactly this frame's bytes before it.
+        self.copy_from_frame(offset, rest, end)
     }
 
     /// One sequence: its literals, then its match.

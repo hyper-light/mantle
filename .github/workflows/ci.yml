@@ -60,6 +60,13 @@ jobs:
       - name: Production panic policy
         shell: bash
         run: bash scripts/check-production.sh --target ${{ matrix.target }}
+      # Call-graph cycles in the built code (CLAUDE.md §10), on this one leg: the check is a second
+      # build of the workspace, to LLVM IR in its own target directory, through cargo running the
+      # script itself as its workspace wrapper, which Windows cannot run as a program; and the graph
+      # differs between targets only in code under a platform's cfg.
+      - name: Call-graph cycles
+        if: matrix.name == 'linux-x86_64'
+        run: python3 scripts/check-recursion.py --known scripts/recursion-open.txt
       # The stock S3 clients the suite in crates/mantle/tests/stock_clients.rs runs against a cell:
       # the AWS CLI v2 (AWS's installer where the image lacks it) and boto3 pinned with every hash,
       # test tools the owner approved (2026-10-25).

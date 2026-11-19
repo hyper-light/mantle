@@ -290,6 +290,128 @@ fn a_frame_naming_another_dictionary_is_refused() {
     assert!(decode(&frame, None, frame.len(), 4096).is_err());
 }
 
+/// A frame's magic number and a single-segment header with no dictionary ID, so its window is its
+/// content, `size` bytes (RFC 8878 §3.1.1.1); a content checksum when `checksum`.
+fn single_segment(size: u8, checksum: bool) -> Vec<u8> {
+    let descriptor = 0b0010_0000 | if checksum { 0b0100 } else { 0 };
+    vec![0x28, 0xB5, 0x2F, 0xFD, descriptor, size]
+}
+
+/// A block header (§3.1.1.2): `kind` 0 raw, 1 RLE, 2 compressed.
+fn block_header(last: bool, kind: u32, size: usize) -> [u8; 3] {
+    let raw = ((size as u32) << 3 | kind << 1 | u32::from(last)).to_le_bytes();
+    [raw[0], raw[1], raw[2]]
+}
+
+/// A frame of one compressed block: `literals` raw, then one sequence whose literals length,
+/// offset and match length codes (§3.1.1.3.2.1.1) are each its RLE mode's one symbol, with
+/// `extra` extra bits, all zero, under the bitstream's end marker (§4.1).
+fn one_sequence(literals: &[u8], codes: [u8; 3], extra: u32, size: u8) -> Vec<u8> {
+    let mut block = vec![(literals.len() as u8) << 3];
+    block.extend_from_slice(literals);
+    // One sequence; RLE_Mode for literals lengths, offsets and match lengths.
+    block.extend_from_slice(&[1, 0b0101_0100]);
+    block.extend_from_slice(&codes);
+    block.push(1u8 << extra);
+    let mut frame = single_segment(size, false);
+    frame.extend_from_slice(&block_header(true, 2, block.len()));
+    frame.extend_from_slice(&block);
+    frame
+}
+
+/// Empty raw blocks: a block header with no content to gather after it, whose block the
+/// streaming decoder decodes with the header, between blocks and as a frame's last before its
+/// checksum, fed and drained in pieces of every size. An empty compressed block has no literals
+/// section and is refused, by the reference too.
+#[test]
+fn empty_blocks_decode_with_their_headers() {
+    let mut frame = single_segment(5, false);
+    frame.extend_from_slice(&block_header(false, 0, 0));
+    frame.extend_from_slice(&block_header(false, 0, 3));
+    frame.extend_from_slice(b"abc");
+    frame.extend_from_slice(&block_header(false, 0, 0));
+    frame.extend_from_slice(&block_header(true, 0, 2));
+    frame.extend_from_slice(b"de");
+    let mut checked = single_segment(3, true);
+    checked.extend_from_slice(&block_header(false, 0, 3));
+    checked.extend_from_slice(b"abc");
+    checked.extend_from_slice(&block_header(true, 0, 0));
+    checked.extend_from_slice(&(xxh64(b"abc", 0) as u32).to_le_bytes());
+    for (frame, want) in [(&frame, &b"abcde"[..]), (&checked, &b"abc"[..])] {
+        assert_eq!(zstd::bulk::decompress(frame, 64).unwrap(), want);
+        for in_step in 1..=frame.len() {
+            for out_step in [1, 2, 3, 4096] {
+                let got = decode(frame, None, in_step, out_step).unwrap();
+                assert_eq!(got, want, "in {in_step} out {out_step}");
+            }
+        }
+    }
+    let mut refused = single_segment(3, false);
+    refused.extend_from_slice(&block_header(false, 0, 3));
+    refused.extend_from_slice(b"abc");
+    refused.extend_from_slice(&block_header(true, 2, 0));
+    assert!(zstd::bulk::decompress(&refused, 64).is_err());
+    for in_step in 1..=refused.len() {
+        for out_step in [1, 4096] {
+            let err = decode(&refused, None, in_step, out_step).unwrap_err();
+            assert!(err.contains("ZSTD literals section"), "{err}");
+        }
+    }
+    let err = decode_all(&mut Decoder::new(MAX_WINDOW, None), &refused).unwrap_err();
+    assert!(err.contains("ZSTD literals section"), "{err}");
+}
+
+/// A match reaching back past the frame's first byte starts in the dictionary's content (§5)
+/// and, when it is longer than the dictionary's bytes it reaches, goes on from the frame's own
+/// first byte. Hand-made frames, so each match is the one named, checked against the format's
+/// copy a byte at a time and against the reference: a match all in the dictionary, and ones
+/// going on into the frame's bytes in one piece, in 16-byte pieces, and overlapping the bytes it
+/// writes; then the crossing match with a dictionary shorter than it reaches, and with none.
+#[test]
+fn a_match_from_the_dictionary_into_the_frame_decodes() {
+    let dict: Vec<u8> = (b'0'..b'X').collect();
+    let ours = Dictionary::new(&dict).unwrap();
+    let literals = b"wxyz";
+    // Codes: 4 literals; offset code n, all extra bits zero, an offset of 2^n - 3; match length.
+    for (codes, extra, offset, length) in [
+        // 25 bytes back into the dictionary, all there.
+        ([4u8, 5, 10], 5, 29usize, 13usize),
+        // 25 from the dictionary, 9 from the frame's first byte.
+        ([4, 5, 31], 5, 29, 34),
+        // 25 from the dictionary, 18 from the frame's in pieces.
+        ([4, 5, 36], 7, 29, 43),
+        // 1 from the dictionary, 33 from the frame's, overlapping the bytes it writes.
+        ([4, 3, 31], 3, 5, 34),
+    ] {
+        let mut want = literals.to_vec();
+        for _ in 0..length {
+            let at = want.len();
+            want.push(if offset > at {
+                dict[dict.len() + at - offset]
+            } else {
+                want[at - offset]
+            });
+        }
+        let frame = one_sequence(literals, codes, extra, want.len() as u8);
+        let mut reference = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
+        let theirs = reference.decompress(&frame, 64).unwrap();
+        assert_eq!(theirs, want, "reference: offset {offset} length {length}");
+        for (in_step, out_step) in [(1, 1), (3, 7), (frame.len(), 4096)] {
+            let got = decode(&frame, Some(&ours), in_step, out_step).unwrap();
+            assert_eq!(got, want, "offset {offset} length {length}");
+        }
+    }
+    let frame = one_sequence(literals, [4, 5, 31], 5, 38);
+    let short = Dictionary::new(&dict[..20]).unwrap();
+    for dict in [Some(&short), None] {
+        let err = decode(&frame, dict, frame.len(), 4096).unwrap_err();
+        assert!(err.contains("ZSTD sequence execution"), "{err}");
+        let mut d = Decoder::new(MAX_WINDOW, dict.cloned());
+        let err = decode_all(&mut d, &frame).unwrap_err();
+        assert!(err.contains("ZSTD sequence execution"), "{err}");
+    }
+}
+
 #[test]
 fn a_window_above_the_bound_is_refused_before_it_is_used() {
     let frame = reference(&vec![1u8; 1 << 20], 19, false, false);

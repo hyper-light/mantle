@@ -505,10 +505,6 @@ impl Pki {
             role: Role::Gateway,
             certificate: certificate.clone(),
         }));
-        // Each peer's share holds a receive chunk, the largest datagram QUIC carries, for each of
-        // the node's four classes.
-        let transport_bytes =
-            u64::try_from(peers.len() * 4 * hyper_transport::RECEIVE_CHUNK).unwrap();
         NodeSettings {
             id,
             dir: dir.to_path_buf(),
@@ -520,7 +516,8 @@ impl Pki {
             ranges: vec![hosted(self.voters, engine)],
             shards: NonZeroUsize::MIN,
             log: log_config(),
-            transport_bytes,
+            // The budget a node derives, once its settings are whole ([`run`]).
+            transport_bytes: 0,
             seed: None,
             storage: Storage::none(),
             chunk_bytes: CHUNK_BYTES,
@@ -686,12 +683,17 @@ fn orders_bound(nodes: u64) -> usize {
 /// where it listens, then turns it, each turn raced against the test's next order, reporting its
 /// status when it changed and each registration's answer as it applied.
 async fn run<E: Engine + Send + 'static>(
-    settings: NodeSettings<E>,
+    mut settings: NodeSettings<E>,
     mut orders: ChannelReceiver<Order>,
     reports: mpsc::Sender<Report>,
     others: Vec<SlotHolder>,
 ) {
     let id = settings.id;
+    // The budget a node's configuration derives (`derive`'s transport class), for what its
+    // settings state with its volumes, its chunk bound and its shards: the least that statement
+    // holds (`bounds::least_transport`), its windows at QUIC's initial window.
+    settings.transport_bytes =
+        mantle_protocol::bounds::least_transport(&settings.stated().unwrap()).unwrap();
     // Each range placed past the first shard moves to its shard before the node's first turn, as
     // a node's process moves them (node.md §2.9).
     let opened = Node::open(settings)

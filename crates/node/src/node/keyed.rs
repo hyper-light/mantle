@@ -56,6 +56,15 @@ impl<T: Key> Default for Keyed<T> {
 }
 
 impl<T: Key> Keyed<T> {
+    /// Room for `entries` made at once (`Vec::with_capacity`, `HashMap::with_capacity`), for an
+    /// owner that holds at most that many: none grows past it.
+    pub(super) fn with_capacity(entries: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(entries),
+            slots: HashMap::with_capacity(entries),
+        }
+    }
+
     pub(super) fn len(&self) -> usize {
         self.entries.len()
     }

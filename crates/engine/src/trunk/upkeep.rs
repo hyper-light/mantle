@@ -1109,6 +1109,36 @@ impl Trunk {
         Ok(())
     }
 
+    /// The extents an inline task writes at most: its inputs' extents and one more a part, and
+    /// one for the last partial one, as a worker's job's grant is sized ([`Self::dispatch_tasks`]).
+    fn inline_asked(&self, task: &NodeTask) -> Result<u64, Error> {
+        let node = self.nodes.get(task.node).ok_or(corrupt())?;
+        let (extents, entries) =
+            task_inputs(node, &task.what)?.fold((0u64, 0u64), |(extents, entries), b| {
+                (
+                    extents.saturating_add(u64::try_from(b.extents.len()).unwrap_or(u64::MAX)),
+                    entries.saturating_add(b.count),
+                )
+            });
+        let parts = match &task.what {
+            What::Compact { .. } => 1,
+            What::Settle { .. } => self.leaf_parts(entries),
+        };
+        Ok(extents.saturating_add(parts).saturating_add(1))
+    }
+
+    /// The extents the inline tasks writing now may still take: each one's
+    /// [`Self::inline_asked`], counted whole, so a grant never takes room one of them writes into.
+    pub(crate) fn inline_room(&self) -> Result<u64, Error> {
+        let mut room = 0u64;
+        for t in &self.tasks {
+            if matches!(&t.run, Running::Inline(c) if c.holds_inputs() && !c.is_done()) {
+                room = room.saturating_add(self.inline_asked(t)?);
+            }
+        }
+        Ok(room)
+    }
+
     /// Steps the inline tasks for up to `budget` units, the root's first: each finished one
     /// keeps its parts to apply. A step that stops for a page still being read ends the pass.
     fn step_inline<F: BlockFile>(
@@ -1150,29 +1180,19 @@ impl Trunk {
                 if opens && holding {
                     continue;
                 }
-                let node = self.nodes.get(task.node).ok_or(corrupt())?;
+                let opening = c.opening();
                 // A task about to write takes its output's room first, as a worker's job takes
                 // its grant (`dispatch_tasks`): the inputs' extents and one more a part, the
                 // file grown in place where the shard may, else asked of the shard's growth and
-                // the task stepped once it has grown.
-                if c.opening() && store.segments().is_some() {
-                    let (extents, entries) = task_inputs(node, &task.what)?.fold(
-                        (0u64, 0u64),
-                        |(extents, entries), b| {
-                            (
-                                extents.saturating_add(
-                                    u64::try_from(b.extents.len()).unwrap_or(u64::MAX),
-                                ),
-                                entries.saturating_add(b.count),
-                            )
-                        },
-                    );
-                    let parts = match &task.what {
-                        What::Compact { .. } => 1,
-                        What::Settle { .. } => self.leaf_parts(entries),
-                    };
-                    let asked = extents.saturating_add(parts).saturating_add(1);
-                    if store.capacity() < asked {
+                // the task stepped once it has grown. A store at its limit holds it beside what
+                // a worker's job holds, or the task waits while a job out or done may give
+                // extents back: else it would take room the job's grant holds and inline
+                // maintenance has, and refused part way, fence the store (mantle-node
+                // tests/engine_workers.rs, a 10,200-row install). With none, it takes extents as
+                // it writes them, as without workers.
+                if opening {
+                    let asked = self.inline_asked(self.tasks.get(at).ok_or(corrupt())?)?;
+                    if store.segments().is_some() && store.capacity() < asked {
                         if store.grows_in_place() {
                             store.grow_now(asked)?;
                         }
@@ -1180,6 +1200,11 @@ impl Trunk {
                             self.capacity_wanted = self.capacity_wanted.max(asked);
                             continue;
                         }
+                    }
+                    if store.capacity() < asked
+                        && self.tasks.iter().any(|t| t.run.out() || t.run.done())
+                    {
+                        continue;
                     }
                 }
                 let Some(task) = self.tasks.get_mut(at) else {
@@ -1445,6 +1470,8 @@ impl Trunk {
         // Whether a job is out or done: its result gives back the grant it did not write as it is
         // taken, and its task frees its inputs as it applies.
         let mut others = self.tasks.iter().any(|t| t.run.out() || t.run.done());
+        // The inline tasks writing now take extents as they write: a grant leaves them room.
+        let inline_room = self.inline_room()?;
         // Two passes, the root's jobs first: they free room for pending branches.
         for roots in [true, false] {
             for at in 0..self.tasks.len() {
@@ -1519,13 +1546,16 @@ impl Trunk {
                         continue;
                     }
                 }
-                if store.capacity() < asked {
-                    // The store's extents hold no grant this size beside those held: its limit
-                    // is reached, and the grant is sized to what the job reads, more than it
-                    // writes. It waits while a job out or done may give extents back; with none,
-                    // the shard runs it, taking extents as it writes them, as it did without
-                    // workers. A grant so never takes room the store lacks, and the store is
-                    // refused only where what it holds fills it, as without workers.
+                if store.capacity() < asked.saturating_add(inline_room) {
+                    // The store's extents hold no grant this size beside those held and the room
+                    // the inline tasks writing now still take: its limit is reached, and the
+                    // grant is sized to what the job reads, more than it writes. It waits while a
+                    // job out or done may give extents back; with none, the shard runs it, taking
+                    // extents as it writes them, as it did without workers. A grant so never
+                    // takes room the store lacks or an inline task writes into (a 10,200-row
+                    // install fenced so, a grant of 4 out beside an inline compaction that then
+                    // found none: mantle-node tests/engine_workers.rs), and the store is refused
+                    // only where what it holds fills it, as without workers.
                     if others {
                         continue;
                     }

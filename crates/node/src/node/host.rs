@@ -536,6 +536,50 @@ pub(crate) fn record_bytes() -> Option<usize> {
         .checked_add(size_of::<(Box<Native>, Replies)>())
 }
 
+/// The shard's clock (`hyper_rt::futures::now_ns`), as a turn of the host or of the node's native
+/// replies reads it: once for the turn, and once after each step that did work ([`Timing`]). A
+/// test counts the reads its thread made ([`tests::clock_reads`]).
+fn clock() -> u64 {
+    #[cfg(test)]
+    tests::CLOCK_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+    hyper_rt::futures::now_ns()
+}
+
+/// A turn's steps timed for its label (`crate::labels`): the clock is read once as the turn begins
+/// and again only after a step that did work, a byte moved, an ask made or its job ended, each such
+/// step charged the time since the last read. A step that found nothing to do reads no clock: on
+/// the node's task a turn steps every job in flight, thousands, and reading the clock around each
+/// was a tenth of the shard (macOS `sample` of the 12k/s PUT bench, 2026-11-19: `mach_absolute_time`
+/// 11.7%, almost all of it there); its nanoseconds go to the next step that did work.
+struct Timing {
+    /// When, on the shard's clock, the last timed step ended, or the turn began.
+    last_ns: u64,
+    /// The step that held the turn longest, and its operation's label.
+    slowest: Option<(u64, &'static Label)>,
+}
+
+impl Timing {
+    /// A turn's timing, begun at `now`.
+    fn from(now: u64) -> Self {
+        Self {
+            last_ns: now,
+            slowest: None,
+        }
+    }
+
+    /// A step of `label`'s operation that did work just ended: the time since the last is its.
+    fn worked(&mut self, label: Option<&'static Label>) {
+        let now = clock();
+        let held = now.saturating_sub(self.last_ns);
+        self.last_ns = now;
+        if let Some(label) = label
+            && self.slowest.is_none_or(|(most, _)| held >= most)
+        {
+            self.slowest = Some((held, label));
+        }
+    }
+}
+
 /// What a held job's bound makes of it at a turn (research/77 D2).
 #[derive(Debug, PartialEq, Eq)]
 enum Bounded {
@@ -3329,6 +3373,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// over, ended, refused or let go, is let go.
     pub(super) fn write_replies(&mut self) -> Result<(), NodeError> {
         self.replied = false;
+        if self.replies.is_empty() {
+            return Ok(());
+        }
+        // The shard's clock, read once for the turn's replies, as the host's step reads it.
+        let now = clock();
         let rounds = self
             .gateway
             .as_ref()
@@ -3338,7 +3387,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         while at < self.replies.len() {
             let mut left = rounds;
             let over = loop {
-                match self.write_reply(at) {
+                match self.write_reply(at, now) {
                     Wrote::Over => break true,
                     Wrote::Still | Wrote::Draining | Wrote::Room => break false,
                     Wrote::More => {
@@ -3355,7 +3404,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         // A job that ended gave all it will: the next write finds its channel
                         // ended.
                         if let Some(job) = job {
-                            self.lend(|host, node| host.turn_job(node, job, &mut None))?;
+                            self.lend(|host, node| {
+                                host.turn_job(node, job, now, &mut Timing::from(now))
+                            })?;
                         }
                     }
                 }
@@ -3373,14 +3424,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// One native reply written as far as its exchange takes it: a reply with no bytes past its
-    /// fields once the request's body is read whole and dropped, after its feeding, as `drain_job`
-    /// wrote one; what else its job gave as it comes.
-    fn write_reply(&mut self, at: usize) -> Wrote {
+    /// One native reply written as far as its exchange takes it at the turn of `now`: a reply with
+    /// no bytes past its fields once the request's body is read whole and dropped, after its
+    /// feeding, as `drain_job` wrote one; what else its job gave as it comes.
+    fn write_reply(&mut self, at: usize, now: u64) -> Wrote {
         let Some(exchange) = self.replies.get(at).map(|(exchange, _)| *exchange) else {
             return Wrote::Over;
         };
-        let now = hyper_rt::futures::now_ns();
         let mut body_read = false;
         // A reply taken, then its body read: the second pass writes it.
         for _ in 0..2 {
@@ -3902,43 +3952,45 @@ impl Host {
     ///
     /// The task is labelled, as the turn ends, with the operation whose step held it longest, none
     /// where it stepped none (`crate::labels`): a long poll of the task is counted under the
-    /// operation that cost it most.
+    /// operation that cost it most. Only a step that did work is timed ([`Timing`]).
     pub(super) fn step<N: Serve>(&mut self, node: &mut N) -> Result<(), NodeError> {
         if self.jobs.is_empty() {
             labels::set(None);
             return Ok(());
         }
+        // The shard's clock, read once for the turn: every answer, bound, offer of room and moved
+        // job of the turn is stamped with it, a turn lasting microseconds against bounds of a
+        // beat or a client's patience.
+        let now = clock();
         // Every operation's answers taken before any asks again, so each asks with the room
         // that every answer taken this turn gave back.
         let freed = node.freed();
         for at in 0..self.jobs.len() {
-            self.take_answers(node, at)?;
+            self.take_answers(node, at, now)?;
         }
         // A chunk refused for room at a peer's volume hears nothing when that volume frees room
         // (its queue held by others' writes or by its cleaner, as a filling volume's is), and with
         // no other chunk of this node answered nothing offered it room again before its client's
         // patience: it is offered room again at each beat it waits, a probe timeout, as a held
         // job is vouched for (research/77 D2), at most once a beat.
-        let now = hyper_rt::futures::now_ns();
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
         let waiting = self.jobs.iter().any(Job::waits_for_room);
         let due = waiting && now >= self.room_offered_ns.saturating_add(beat);
         if freed || due {
-            self.offer_room(node)?;
+            self.offer_room(node, now)?;
         }
         if freed || due || !waiting {
             self.room_offered_ns = now;
         }
-        self.bound_jobs(node)?;
-        // The step that held the turn longest, and its operation's label.
-        let mut slowest: Option<(u64, &'static Label)> = None;
+        self.bound_jobs(node, now)?;
+        let mut timing = Timing::from(now);
         let mut at = 0;
         while at < self.jobs.len() {
-            if !self.turn_job(node, at, &mut slowest)? {
+            if !self.turn_job(node, at, now, &mut timing)? {
                 at = at.saturating_add(1);
             }
         }
-        labels::set(slowest.map(|(_, label)| label));
+        labels::set(timing.slowest.map(|(_, label)| label));
         Ok(())
     }
 
@@ -4121,26 +4173,23 @@ impl Host {
         self.reply_job(node, at, reply)
     }
 
-    /// Job `at`'s step at a turn, the longest step's time and label kept in `slowest`; whether it
-    /// is over, and so let go. Bytes of its own body taken or of its reply given are its work
+    /// Job `at`'s step at the turn of `now`, timed in `timing` where it did work; whether it is
+    /// over, and so let go. Bytes of its own body taken or of its reply given are its work
     /// moving, as its asks answered are: a native job counts them in its door, taken here as a
     /// value into the node's count (node.md §2.9 step 6c).
     fn turn_job<N: Serve>(
         &mut self,
         node: &mut N,
         at: usize,
-        slowest: &mut Option<(u64, &'static Label)>,
+        now: u64,
+        timing: &mut Timing,
     ) -> Result<bool, NodeError> {
         let before = (node.moved(), self.moved);
-        let label = self.jobs.get(at).and_then(|job| job.label);
-        let began = hyper_rt::futures::now_ns();
+        let (label, asks) = self
+            .jobs
+            .get(at)
+            .map_or((None, 0), |job| (job.label, job.pending.len()));
         let over = self.step_job(node, at)?;
-        let held = hyper_rt::futures::now_ns().saturating_sub(began);
-        if let Some(label) = label
-            && slowest.is_none_or(|(most, _)| held >= most)
-        {
-            *slowest = Some((held, label));
-        }
         if let Some(Job {
             door: Door::Native(_, native),
             ..
@@ -4148,10 +4197,16 @@ impl Host {
         {
             self.moved = self.moved.saturating_add(std::mem::take(&mut native.moved));
         }
-        if (node.moved(), self.moved) != before
-            && let Some(job) = self.jobs.get_mut(at)
-        {
-            job.moved_ns = hyper_rt::futures::now_ns();
+        let moved = (node.moved(), self.moved) != before;
+        let asked = self
+            .jobs
+            .get(at)
+            .is_some_and(|job| job.pending.len() != asks);
+        if moved && let Some(job) = self.jobs.get_mut(at) {
+            job.moved_ns = now;
+        }
+        if moved || asked || over {
+            timing.worked(label);
         }
         if over {
             // What it still waits on is let go: an ended get's chunks still out, say; and its
@@ -4187,8 +4242,7 @@ impl Host {
     /// Asks again each chunk a put's or a get's driver holds for want of room, its volume's or the
     /// transport's, of the same volume; a driver that fails doing so ends its job as its failed
     /// answers do. A job past its client's patience is offered none: `bound_jobs` ends it.
-    fn offer_room<N: Serve>(&mut self, node: &mut N) -> Result<(), NodeError> {
-        let now = hyper_rt::futures::now_ns();
+    fn offer_room<N: Serve>(&mut self, node: &mut N, now: u64) -> Result<(), NodeError> {
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get_mut(at) else {
                 continue;
@@ -4227,8 +4281,7 @@ impl Host {
     /// is the node's own wait, which no transport ends, and its driver ends `Patience`. An
     /// operation waiting on its client, for its body or room to write its reply, is the
     /// transport's to judge.
-    fn bound_jobs<N: Serve>(&mut self, node: &mut N) -> Result<(), NodeError> {
-        let now = hyper_rt::futures::now_ns();
+    fn bound_jobs<N: Serve>(&mut self, node: &mut N, now: u64) -> Result<(), NodeError> {
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get(at) else {
                 continue;
@@ -4261,6 +4314,8 @@ impl Host {
 
     /// One operation's turn; whether it is over.
     fn step_job<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+        #[cfg(test)]
+        tests::STEPS.with(|steps| steps.set(steps.get().saturating_add(1)));
         let Some(job) = self.jobs.get(at) else {
             return Ok(true);
         };
@@ -4282,8 +4337,14 @@ impl Host {
         }
     }
 
-    /// The outcomes of what job `at` asked, taken from the node's answers and given to it.
-    fn take_answers<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<(), NodeError> {
+    /// The outcomes of what job `at` asked, taken from the node's answers and given to it at the
+    /// turn of `now`.
+    fn take_answers<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        now: u64,
+    ) -> Result<(), NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
@@ -4304,18 +4365,19 @@ impl Host {
             job.pending = pending;
         }
         for (request, outcome) in answered {
-            self.answer_job(node, at, request, outcome)?;
+            self.answer_job(node, at, request, outcome, now)?;
         }
         Ok(())
     }
 
-    /// Gives job `at` an outcome of what it asked.
+    /// Gives job `at` an outcome of what it asked, at the turn of `now`.
     fn answer_job<N: Serve>(
         &mut self,
         node: &mut N,
         at: usize,
         request: Option<u64>,
         outcome: Outcome,
+        now: u64,
     ) -> Result<(), NodeError> {
         // A range step that waited its range's budget without a leader that can serve it (node.md
         // §5.4), the only end a job's steps have: the request is answered `SlowDown`, a cause that
@@ -4330,8 +4392,7 @@ impl Host {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
-        let moved = hyper_rt::futures::now_ns();
-        job.answered(&outcome, moved);
+        job.answered(&outcome, now);
         let principal = job.principal.clone();
         match &mut job.work {
             Work::Fields(..) | Work::Handing(_) | Work::Draining(_) | Work::Answering(_) => {}
@@ -4426,7 +4487,7 @@ impl Host {
                     // turn ends the exchange on. A block it read is timed for the window the
                     // node's next gets hold (`crate::window`).
                     if let Some(get) = getting.get.as_mut() {
-                        get.tick(moved);
+                        get.tick(now);
                         let _ = get.answer(id, get_answer(outcome));
                         if let Some(ns) = get.take_read() {
                             node.read(ns);
@@ -4529,7 +4590,7 @@ impl Host {
                     // the node's next gets and copies hold (`crate::window`).
                     (Driver::Get, id) => {
                         if let Some(get) = copying.get.as_mut() {
-                            get.tick(moved);
+                            get.tick(now);
                             let _ = get.answer(id, get_answer(outcome));
                             if let Some(ns) = get.take_read() {
                                 node.read(ns);
@@ -7948,6 +8009,55 @@ fn get_answer(outcome: Outcome) -> get::Answer {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    std::thread_local! {
+        /// The shard's clock's reads this thread made through [`clock`].
+        pub(super) static CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The jobs this thread's hosts stepped ([`Host::step_job`]).
+        pub(super) static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The clock's reads and the jobs stepped on this thread since the last call.
+    pub(super) fn clock_reads() -> (u64, u64) {
+        (
+            CLOCK_READS.with(|r| r.replace(0)),
+            STEPS.with(|s| s.replace(0)),
+        )
+    }
+
+    /// A turn of a host holding 64 puts waiting on their bodies, of which one's body ends, reads
+    /// the clock as the turn begins and once after the one step that did work, its commit asked:
+    /// none around the 63 steps that found nothing (`Timing`). Before, a turn read it as it began,
+    /// as it bounded its jobs, and twice around each step: 2 + 2 × 64 = 130.
+    #[test]
+    fn a_turn_reads_the_clock_once_and_once_more_for_each_step_that_did_work() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut bodies = Vec::new();
+        let mut replies = Vec::new();
+        for _ in 0..64 {
+            let mut putting = native_put(0);
+            putting.trailing = None;
+            let (job, body, answers) = local_job(Work::Put(putting), now, 7);
+            host.jobs.push(job);
+            bodies.push(body);
+            replies.push(answers);
+        }
+        let mut stub = put_and_get_stub();
+        host.step(&mut stub).unwrap();
+        assert_eq!(stub.asked, 0, "no body came: nothing is asked");
+        let _ = clock_reads();
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        assert!(bodies[0].try_send(Piece::End(Some(crc))).is_ok());
+        host.step(&mut stub).unwrap();
+        assert_eq!(
+            stub.asked, 1,
+            "the one put whose body ended asks its commit"
+        );
+        let (reads, steps) = clock_reads();
+        assert_eq!(steps, 64, "every job is still visited");
+        assert_eq!(reads, 2, "the turn's read and the one working step's");
+    }
 
     /// A gateway of the rates and target `mantle init`'s cells state (crates/mantle/tests/support).
     fn scheming_gateway() -> GatewaySettings {

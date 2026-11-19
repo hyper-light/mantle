@@ -160,8 +160,14 @@ pub(crate) struct Lanes {
     /// Asks the node holds for the shard, each under the shard's number and the node's: at most
     /// the asks the shard's host holds.
     asked: Vec<(u64, Pending)>,
-    /// The shard's numbers of the asks in `asked` a piece of whose chunk moved since the lanes
-    /// were last served, each once: at most the asks in `asked`.
+    /// The shard's number of each chunk ask in `asked`, by the node's, and whether a piece of its
+    /// chunk moved since the lanes were last served: a piece found in one probe
+    /// ([`Lanes::tell_moved`]), not a search of every ask the shard holds, at each piece of every
+    /// chunk the node moves, for each shard. At most the chunk asks the shard's host holds
+    /// (`chunk_asks`).
+    chunks: std::collections::HashMap<u64, (u64, bool)>,
+    /// The node's chunk asks in `chunks` a piece of which moved since the lanes were last served,
+    /// each once: at most the asks in `chunks`.
     pieces: Vec<u64>,
     /// The shard's word that a door of its jobs moved, which its task waits on.
     doors: Arc<Notify>,
@@ -176,7 +182,7 @@ impl Lanes {
     /// spawns it Normal, as the S3 connections beside it run. Refused when a lane cannot be made
     /// or the shard takes no task now: gone, or its control queue full.
     pub(crate) fn start(holder: SlotHolder, shard: usize, start: Start) -> Result<Self, NodeError> {
-        let (room, slots) = (start.requests, start.slots()?);
+        let (room, slots, chunk_asks) = (start.requests, start.slots()?, start.chunk_asks);
         let (into, taken) = channel(room)?;
         let (answers, answered) = channel(slots)?;
         let (given, from) = channel(room)?;
@@ -203,7 +209,8 @@ impl Lanes {
             wants_room: false,
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
-            pieces: Vec::with_capacity(slots),
+            chunks: std::collections::HashMap::with_capacity(chunk_asks),
+            pieces: Vec::with_capacity(chunk_asks),
             doors,
             moved: 0,
         })
@@ -267,13 +274,21 @@ impl Lanes {
     /// Notes that a piece of the chunk the node's ask `ask` asked for the shard moved, told once
     /// at the lanes' serve however many pieces moved before it ([`Lanes::serve`]).
     pub(crate) fn tell_moved(&mut self, ask: u64) {
-        if let Some((number, _)) = self
-            .asked
-            .iter()
-            .find(|(_, pending)| *pending == Pending::Chunk(ask))
-            && !self.pieces.contains(number)
+        #[cfg(test)]
+        tests::PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
+        if let Some((_, moved)) = self.chunks.get_mut(&ask)
+            && !*moved
         {
-            self.pieces.push(*number);
+            *moved = true;
+            self.pieces.push(ask);
+        }
+    }
+
+    /// The node holds `pending` for the shard's ask `number`, a chunk's found by the node's ask.
+    fn hold(&mut self, number: u64, pending: Pending) {
+        self.asked.push((number, pending));
+        if let Pending::Chunk(ask) = pending {
+            self.chunks.insert(ask, (number, false));
         }
     }
 
@@ -342,6 +357,9 @@ impl Lanes {
             match node.outcome(pending) {
                 Some(outcome) => {
                     self.asked.swap_remove(at);
+                    if let Pending::Chunk(ask) = pending {
+                        self.chunks.remove(&ask);
+                    }
                     self.answer(number, outcome)?;
                 }
                 None => at = at.saturating_add(1),
@@ -350,9 +368,10 @@ impl Lanes {
         // A chunk's pieces moved are its job's work moving, told once a serve, each a message that
         // wakes the shard: none for a chunk answered now, whose answer moves its job. Dropped where
         // the lane has no room, its next piece telling it again.
-        for number in self.pieces.drain(..) {
-            if self.asked.iter().any(|(asked, _)| *asked == number) {
-                let _ = self.into.try_send(In::ChunkMoved(number));
+        for ask in self.pieces.drain(..) {
+            if let Some((number, moved)) = self.chunks.get_mut(&ask) {
+                *moved = false;
+                let _ = self.into.try_send(In::ChunkMoved(*number));
             }
         }
         Ok(())
@@ -399,7 +418,7 @@ impl Lanes {
         let refusal = refusal_of(&ask);
         match node.ask(ask) {
             Ok(pending) => {
-                self.asked.push((number, pending));
+                self.hold(number, pending);
                 Ok(())
             }
             Err(_) => self.answer(number, refusal),
@@ -561,8 +580,8 @@ impl Serve for Served {
         Some(outcome)
     }
 
-    fn answered(&self, pending: Pending) -> bool {
-        self.answers.iter().any(|(p, _)| *p == pending)
+    fn answers(&self) -> impl Iterator<Item = Pending> {
+        self.answers.iter().map(|(pending, _)| *pending)
     }
 
     fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
@@ -819,6 +838,11 @@ pub(super) mod tests {
     use super::*;
     use crate::node::host::tests::Stub;
 
+    std::thread_local! {
+        /// The probes this thread's lanes made for a chunk's piece moved ([`Lanes::tell_moved`]).
+        pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// The shard's ends of its lanes: what it is handed, the answers, and what it gives.
     pub(crate) type Ends = (
         ChannelReceiver<In>,
@@ -845,6 +869,7 @@ pub(super) mod tests {
             wants_room: false,
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
+            chunks: std::collections::HashMap::with_capacity(slots),
             pieces: Vec::with_capacity(slots),
             doors: Arc::new(Notify::new().unwrap()),
             moved: 0,
@@ -948,7 +973,10 @@ pub(super) mod tests {
         assert!(shard.room(&chunk_get()), "its answer came and was dropped");
         assert!(shard.outcome(first).is_none());
         shard.came(1, Outcome::Chunk(ChunkOutcome::Stored));
-        assert!(shard.answered(second));
+        assert!(
+            shard.answers().eq([second]),
+            "the answer waiting, the abandoned one's dropped"
+        );
         assert!(shard.outcome(second).is_some());
         assert_eq!(shard.held, Kinds::default());
 
@@ -983,7 +1011,7 @@ pub(super) mod tests {
         // A chunk of the shard's answered for want of room, so room freed is told.
         lanes.wants_room = true;
         lanes.tell_freed();
-        lanes.asked.push((9, Pending::Chunk(5)));
+        lanes.hold(9, Pending::Chunk(5));
         lanes.tell_moved(5);
         assert_eq!(lanes.table.as_ref().map(|t| t.applied()), Some(4));
         assert!(lanes.freed);
@@ -1092,7 +1120,7 @@ pub(super) mod tests {
         let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
         let (mut lanes, (mut taken, mut answered, _given)) = unstarted(holder, 4, 4);
         let mut stub = Stub::chunks();
-        lanes.asked.push((9, Pending::Chunk(5)));
+        lanes.hold(9, Pending::Chunk(5));
         let told = |taken: &mut ChannelReceiver<In>| {
             let mut moved = Vec::new();
             while let Ok(Some(sent)) = taken.try_recv() {
@@ -1122,7 +1150,71 @@ pub(super) mod tests {
             answered.try_recv(),
             Ok(Some((9, Outcome::Chunk(ChunkOutcome::Stored))))
         ));
-        assert!(lanes.pieces.is_empty() && lanes.asked.is_empty());
+        assert!(lanes.pieces.is_empty() && lanes.asked.is_empty() && lanes.chunks.is_empty());
+        rt.shutdown().unwrap();
+    }
+
+    /// A chunk's piece moving is found among the asks a driving shard holds in one probe
+    /// (`Lanes::tell_moved`): 2,048 chunk asks held, two pieces of each moved before a serve, one
+    /// probe a piece and each chunk told once at the serve, where the search it replaces visited
+    /// the asks held up to the one moved and the chunks noted moved before it.
+    #[test]
+    fn a_chunks_piece_is_found_among_a_shards_asks_with_no_scan() {
+        const ASKS: u64 = 2048;
+        let rt = crate::node::host::tests::two_shards(4);
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let slots = usize::try_from(ASKS).unwrap();
+        let (mut lanes, (mut taken, _answered, _given)) = unstarted(holder, slots, slots);
+        let mut stub = Stub::chunks();
+        for ask in 0..ASKS {
+            lanes.hold(ask + ASKS, Pending::Chunk(ask));
+        }
+        // The search before: `find` over the asks held, then `contains` over the chunks noted.
+        let mut searched = 0;
+        let mut noted: Vec<u64> = Vec::new();
+        for _ in 0..2 {
+            for ask in 0..ASKS {
+                let at = lanes
+                    .asked
+                    .iter()
+                    .position(|(_, pending)| *pending == Pending::Chunk(ask))
+                    .unwrap();
+                searched += at + 1;
+                let number = lanes.asked[at].0;
+                match noted.iter().position(|noted| *noted == number) {
+                    Some(at) => searched += at + 1,
+                    None => {
+                        searched += noted.len();
+                        noted.push(number);
+                    }
+                }
+            }
+        }
+        PROBES.with(|probes| probes.set(0));
+        for _ in 0..2 {
+            for ask in 0..ASKS {
+                lanes.tell_moved(ask);
+            }
+        }
+        let probes = PROBES.with(std::cell::Cell::get);
+        println!(
+            "{} pieces over {ASKS} asks: {probes} probes, {searched} by the search",
+            2 * ASKS
+        );
+        assert_eq!(probes, 2 * slots, "one probe a piece");
+        lanes.serve(&mut stub, |_| {}).unwrap();
+        let mut told = Vec::new();
+        while let Ok(Some(In::ChunkMoved(number))) = taken.try_recv() {
+            told.push(number);
+        }
+        told.sort_unstable();
+        assert_eq!(
+            told,
+            (ASKS..2 * ASKS).collect::<Vec<_>>(),
+            "each chunk told once"
+        );
+        assert!(lanes.pieces.is_empty());
+        assert!(lanes.chunks.values().all(|(_, moved)| !moved));
         rt.shutdown().unwrap();
     }
 

@@ -116,7 +116,7 @@ pub(crate) struct Parked {
 }
 
 /// What the host waits on for an operation: a command, a read, or a chunk it asked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Pending {
     Command(CommandAsk),
     Read(ReadAsk),
@@ -274,6 +274,16 @@ impl Job {
         })
     }
 
+    /// When, on the wall clock, its put next renews what it holds (`Put::due_ns`): a put's or a
+    /// copy's, by its put's state alone.
+    fn renewal_ns(&self) -> Option<u64> {
+        match &self.work {
+            Work::Put(putting) => putting.put.as_ref()?.due_ns(),
+            Work::Copy(copying) => copying.put.as_ref()?.due_ns(),
+            _ => None,
+        }
+    }
+
     /// Tells its asker its work is held, through its native door, at most twice a beat
     /// (`vouch_every`) unless its work moved since it last did: a vouch reaches the asker in the next note on its connection,
     /// notes at most a beat apart, and its asker judges the exchange by it (hyper-transport's
@@ -342,6 +352,16 @@ pub(crate) struct Host {
     /// search of every job. Kept as each job is pushed and swap-removed (`Host::push`,
     /// `Host::remove`).
     exchanges: Slots<ExchangeId>,
+    /// Its jobs' slots by each ask a job waits on (`Job::pending`), one job an ask: the job a piece
+    /// of a chunk moved for found by its ask (`Host::chunk_moved`), not by a search of every job's
+    /// asks. Kept as each ask is waited on (`Host::wait_on`), answered (`take_answers`) or let go
+    /// (`reply_job`), and as each job is pushed and swap-removed.
+    asks: Slots<Pending>,
+    /// Its held jobs' next beats or bounds on the shard's clock (`Job::due_ns`), and its puts'
+    /// next renewals on the wall clock (`Job::renewal_ns`), each job's keyed from its state as
+    /// its turn ends (`Host::rekey`), the earliest of each read in one step by `Host::due`.
+    beats: Earliest,
+    renewals: Earliest,
 }
 
 /// Job slots by a key each job holds, kept in step with the jobs' vector as a job is pushed and
@@ -363,7 +383,15 @@ impl<K> Default for Slots<K> {
 impl<K: std::hash::Hash + Eq> Slots<K> {
     /// The slot of the job holding `key`.
     fn get(&self, key: &K) -> Option<usize> {
+        #[cfg(test)]
+        tests::PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
         self.of.get(key).copied()
+    }
+
+    /// The keys it holds.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.of.len()
     }
 
     /// A job holding `keys` is at `at`: pushed there, or moved there from the end.
@@ -381,6 +409,153 @@ impl<K: std::hash::Hash + Eq> Slots<K> {
     }
 }
 
+/// Job slots' keys, the least first: a binary min-heap each of whose entries names its job's slot,
+/// and each slot its entry's place (a priority queue with handles: Cormen, Leiserson, Rivest and
+/// Stein, Introduction to Algorithms, 3rd ed., 2009, §6.5), kept in step with the jobs' vector as
+/// a job is pushed and swap-removed. The least is read in one step where a search read every
+/// job's; a key set or let go moves its entry a level a step, at most the heap's depth, the log2 of
+/// its entries. Bound: one entry a job.
+#[derive(Default)]
+struct Earliest {
+    /// Each key with its job's slot, none less than its parent's (the entry at `(place - 1) / 2`).
+    heap: Vec<(u64, usize)>,
+    /// Each job slot's place in `heap`, none for a job with no key: one a job.
+    place: Vec<Option<usize>>,
+}
+
+impl Earliest {
+    /// The least key.
+    fn first(&self) -> Option<u64> {
+        self.heap.first().map(|(key, _)| *key)
+    }
+
+    /// A job pushed, holding no key yet.
+    fn grow(&mut self) {
+        self.place.push(None);
+    }
+
+    /// Slot `at`'s key set to `key`, or let go where none.
+    fn set(&mut self, at: usize, key: Option<u64>) {
+        let Some(&held) = self.place.get(at) else {
+            return;
+        };
+        match (held, key) {
+            (Some(place), Some(key)) => {
+                // A key kept as it was, a held job's from turn to turn, moves nothing.
+                match self.heap.get_mut(place) {
+                    Some(entry) if entry.0 != key => entry.0 = key,
+                    _ => return,
+                }
+                self.settle(place);
+            }
+            (Some(place), None) => self.take(place),
+            (None, Some(key)) => {
+                let place = self.heap.len();
+                self.heap.push((key, at));
+                if let Some(held) = self.place.get_mut(at) {
+                    *held = Some(place);
+                }
+                self.settle(place);
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Slot `at` let go as its job is swap-removed: its key taken out, and the last slot's, the job
+    /// moved into `at`, named there.
+    fn swap_remove(&mut self, at: usize) {
+        let Some(&held) = self.place.get(at) else {
+            return;
+        };
+        if let Some(place) = held {
+            self.take(place);
+        }
+        let last = self.place.pop().flatten();
+        if let Some(held) = self.place.get_mut(at) {
+            *held = last;
+            if let Some(entry) = last.and_then(|place| self.heap.get_mut(place)) {
+                entry.1 = at;
+            }
+        }
+    }
+
+    /// The entry at `place` taken out: the heap's last put in its place and settled there.
+    fn take(&mut self, place: usize) {
+        let Some(&(_, slot)) = self.heap.get(place) else {
+            return;
+        };
+        if let Some(held) = self.place.get_mut(slot) {
+            *held = None;
+        }
+        let Some(last) = self.heap.pop() else {
+            return;
+        };
+        if let Some(entry) = self.heap.get_mut(place) {
+            *entry = last;
+            if let Some(held) = self.place.get_mut(last.1) {
+                *held = Some(place);
+            }
+            self.settle(place);
+        }
+    }
+
+    /// The entry at `place` moved up past each parent whose key is greater, then down past the
+    /// lesser child whose key is less, until no key is less than its parent's: a level a step, so
+    /// at most the heap's depth, fewer steps than a `usize` has bits.
+    fn settle(&mut self, mut place: usize) {
+        for _ in 0..usize::BITS {
+            let Some(parent) = place.checked_sub(1).and_then(|p| p.checked_div(2)) else {
+                break;
+            };
+            if !self.less(place, parent) {
+                break;
+            }
+            self.exchange(place, parent);
+            place = parent;
+        }
+        for _ in 0..usize::BITS {
+            let left = place.checked_mul(2).and_then(|p| p.checked_add(1));
+            let right = left.and_then(|left| left.checked_add(1));
+            let mut least = place;
+            for child in [left, right].into_iter().flatten() {
+                if self.less(child, least) {
+                    least = child;
+                }
+            }
+            if least == place {
+                break;
+            }
+            self.exchange(place, least);
+            place = least;
+        }
+    }
+
+    /// Whether the key at `a` is less than the key at `b`, both held.
+    fn less(&self, a: usize, b: usize) -> bool {
+        #[cfg(test)]
+        tests::COMPARED_KEYS.with(|compared| compared.set(compared.get().saturating_add(1)));
+        match (self.heap.get(a), self.heap.get(b)) {
+            (Some((a, _)), Some((b, _))) => a < b,
+            _ => false,
+        }
+    }
+
+    /// The entries at `a` and `b` swapped, each slot naming its entry's new place.
+    fn exchange(&mut self, a: usize, b: usize) {
+        let Ok([first, second]) = self.heap.get_disjoint_mut([a, b]) else {
+            return;
+        };
+        std::mem::swap(first, second);
+        let (at_a, at_b) = (first.1, second.1);
+        if let Some(held) = self.place.get_mut(at_a) {
+            *held = Some(a);
+        }
+        if let Some(held) = self.place.get_mut(at_b) {
+            *held = Some(b);
+        }
+    }
+}
+
 /// What the host asks of whoever lends it a turn, the node's task now and a driving shard's task
 /// at 6e (node.md §2.9 step 6d): each ask of a job and its outcome (6b), the volume table and the
 /// ranges' groups, whether the node holds room for a command, the wall clock, a local door's
@@ -394,9 +569,9 @@ pub(crate) trait Serve {
     fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError>;
     /// The outcome of what a job asked, once answered, taken.
     fn outcome(&mut self, pending: Pending) -> Option<Outcome>;
-    /// Whether what a job asked is answered, its outcome not yet taken: the host's next turn is
-    /// due at once ([`Host::due`]).
-    fn answered(&self, pending: Pending) -> bool;
+    /// The asks answered whose outcomes are not yet taken, a job's or another's: the host's next
+    /// turn is due at once where one is a job's ([`Host::due`]).
+    fn answers(&self) -> impl Iterator<Item = Pending>;
     /// Asks a job let go of, their job ended or replied before they were answered: each outcome
     /// dropped as it comes, as one no job takes would hold one of the node's asks for good.
     fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>);
@@ -471,26 +646,83 @@ impl Host {
             gateway,
             room_offered_ns: 0,
             exchanges: Slots::default(),
+            asks: Slots::default(),
+            beats: Earliest::default(),
+            renewals: Earliest::default(),
         }
     }
 
-    /// Runs `job` from now: last of its jobs, its exchange's slot kept.
-    fn push(&mut self, job: Job) {
-        self.exchanges.hold(job.door.exchange(), self.jobs.len());
+    /// Runs `job` from `now`, the shard's clock: last of its jobs, its exchange's and its asks'
+    /// slots kept, and its keys.
+    fn push(&mut self, job: Job, now: u64) {
+        let at = self.jobs.len();
+        self.exchanges.hold(job.door.exchange(), at);
+        self.asks
+            .hold(job.pending.iter().map(|(pending, _)| *pending), at);
         self.jobs.push(job);
+        self.beats.grow();
+        self.renewals.grow();
+        self.rekey(at, now);
+        #[cfg(test)]
+        self.audit();
     }
 
-    /// Its job at `at` taken out, the last moved into its slot, both exchanges' slots kept.
+    /// Its job at `at` taken out, the last moved into its slot, both jobs' exchanges' and asks'
+    /// slots and their keys kept.
     fn remove(&mut self, at: usize) -> Option<Job> {
         if at >= self.jobs.len() {
             return None;
         }
         let job = self.jobs.swap_remove(at);
         self.exchanges.release(job.door.exchange());
+        self.asks
+            .release(job.pending.iter().map(|(pending, _)| *pending));
+        self.beats.swap_remove(at);
+        self.renewals.swap_remove(at);
         if let Some(moved) = self.jobs.get(at) {
             self.exchanges.hold(moved.door.exchange(), at);
+            self.asks
+                .hold(moved.pending.iter().map(|(pending, _)| *pending), at);
         }
+        #[cfg(test)]
+        self.audit();
         Some(job)
+    }
+
+    /// Job `at` waits on `pending`, the answer to its driver's `request` where a driver's: kept
+    /// with its asks, and its slot by the ask. Every ask a job waits on is kept here, so its slot
+    /// is never missed; nothing is kept where no job is at `at`.
+    fn wait_on(&mut self, at: usize, pending: Pending, request: Option<u64>) {
+        let Some(job) = self.jobs.get_mut(at) else {
+            return;
+        };
+        job.pending.push((pending, request));
+        self.asks.hold(Some(pending), at);
+        #[cfg(test)]
+        self.audit();
+    }
+
+    /// Job `at`'s keys from its state at `now`, the shard's clock: its beat or bound where its work
+    /// is held (`Job::due_ns`), and its put's next renewal (`Job::renewal_ns`). Set as it is
+    /// pushed, as its turn ends and as a piece of a chunk it asked moves: between its turns nothing
+    /// else moves its state (the host's step answers it, offers it room and bounds it just before
+    /// its turn). A key set at a turn can only come before the job's due at a later time, never
+    /// after: a beat or vouch counted from its turn rather than from a later `now`, or a bound
+    /// that passed with its reply begun, after which it needs no turn. Such a key costs one turn,
+    /// which keys it again.
+    fn rekey(&mut self, at: usize, now: u64) {
+        let Some(job) = self.jobs.get(at) else {
+            return;
+        };
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let due = if job.working() && job.held() {
+            job.due_ns(now, beat)
+        } else {
+            None
+        };
+        let renewal = job.renewal_ns();
+        self.beats.set(at, due);
+        self.renewals.set(at, renewal);
     }
 
     /// The slot of the job of the native request on `exchange`.
@@ -524,29 +756,38 @@ impl Host {
             driven,
         } = *handed;
         let label = Some(labels::host(&op));
-        self.push(Job {
-            door: Door::Native(exchange, half),
-            principal,
-            work: work(op, block),
-            pending: Vec::new(),
-            deadline_ns,
-            moved_ns: hyper_rt::futures::now_ns(),
-            vouched_ns: None,
-            admitted_ns,
-            charge,
-            window,
-            driven,
-            label,
-        });
+        let now = hyper_rt::futures::now_ns();
+        self.push(
+            Job {
+                door: Door::Native(exchange, half),
+                principal,
+                work: work(op, block),
+                pending: Vec::new(),
+                deadline_ns,
+                moved_ns: now,
+                vouched_ns: None,
+                admitted_ns,
+                charge,
+                window,
+                driven,
+                label,
+            },
+            now,
+        );
     }
 
-    /// A native job whose fields were read for a driving shard (`Work::Handing`), taken out to be
-    /// handed there: its request and its exchange.
-    fn handing(&mut self) -> Option<(Box<Handover>, Option<ExchangeId>)> {
+    /// The first native job from slot `from` on whose fields were read for a driving shard
+    /// (`Work::Handing`), taken out to be handed there: its request and its exchange. `from` is
+    /// left at its slot, where the job moved into it is looked at next, so a turn's handing passes
+    /// each job once, not every job again for each one handed.
+    fn handing(&mut self, from: &mut usize) -> Option<(Box<Handover>, Option<ExchangeId>)> {
         let at = self
             .jobs
+            .get(*from..)?
             .iter()
-            .position(|job| matches!(job.work, Work::Handing(_)))?;
+            .position(|job| matches!(job.work, Work::Handing(_)))?
+            .checked_add(*from)?;
+        *from = at;
         let job = self.remove(at)?;
         let (Door::Native(exchange, half), Work::Handing(handing)) = (job.door, job.work) else {
             return None;
@@ -570,53 +811,45 @@ impl Host {
 
     /// When, on the shard's clock, the host next needs a turn of whoever serves it, by its own
     /// jobs alone (node.md §2.9 step 6e), so a driving shard's task waits on its host and nothing
-    /// of the node's: at once where what a job asked is answered (`Serve::answered`), as an answer
+    /// of the node's: at once where what a job asked is answered (`Serve::answers`), as an answer
     /// that came after the host's step in a turn waits on no event; else a put's renewal coming
     /// due, or the beat or bound of a job whose work is held. Each operation at work is ended at
     /// its client's patience, and one whose asks are held says so each beat, a probe timeout, the
     /// transport's notes' beat of a third of the serve period (research/77 D2).
+    ///
+    /// Asked after every turn of the node's busiest task, it reads no job: each answer waiting is
+    /// known for a job's by one probe of its asks' slots, and the earliest renewal and beat are
+    /// each kept first in a heap (`renewals`, `beats`), each job keyed as its turn ends
+    /// (`Host::rekey`), a key at most early, which costs one turn.
     pub(super) fn due<N: Serve>(&self, node: &N) -> Option<u64> {
         let shard = hyper_rt::futures::now_ns();
-        if self
-            .jobs
-            .iter()
-            .flat_map(|job| job.pending.iter())
-            .any(|(pending, _)| node.answered(*pending))
+        if node
+            .answers()
+            .any(|pending| self.asks.get(&pending).is_some())
         {
             return Some(shard);
         }
-        let wall = node.wall_ns();
         let renewal = self
-            .jobs
-            .iter()
-            .filter_map(|job| match &job.work {
-                Work::Put(putting) => putting.put.as_ref()?.due_ns(),
-                Work::Copy(copying) => copying.put.as_ref()?.due_ns(),
-                _ => None,
-            })
-            .min()
-            .map(|due| shard.saturating_add(due.saturating_sub(wall)));
-        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
-        let bound = self
-            .jobs
-            .iter()
-            .filter(|job| job.working() && job.held())
-            .filter_map(|job| job.due_ns(shard, beat))
-            .min();
-        [renewal, bound].into_iter().flatten().min()
+            .renewals
+            .first()
+            .map(|due| shard.saturating_add(due.saturating_sub(node.wall_ns())));
+        [renewal, self.beats.first()].into_iter().flatten().min()
     }
 
     /// The job waiting on chunk ask `ask`, its work moved now: a piece of the chunk it reads came,
-    /// or one of the chunk it sends went (research/77 D2).
+    /// or one of the chunk it sends went (research/77 D2). Found by its ask in one probe of its
+    /// asks' slots: a piece moves many times a chunk, and a search of every job's asks at each was
+    /// the node's task's cost for every job in flight.
     pub(super) fn chunk_moved(&mut self, ask: u64) {
+        let Some(at) = self.asks.get(&Pending::Chunk(ask)) else {
+            return;
+        };
+        let Some(job) = self.jobs.get_mut(at) else {
+            return;
+        };
         let now = hyper_rt::futures::now_ns();
-        if let Some(job) = self.jobs.iter_mut().find(|job| {
-            job.pending
-                .iter()
-                .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask))
-        }) {
-            job.moved_ns = now;
-        }
+        job.moved_ns = now;
+        self.rekey(at, now);
     }
 }
 
@@ -3040,20 +3273,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.charge_admitted(charge);
         }
         self.replies.push((exchange, replies));
-        self.host.push(Job {
-            door: Door::Native(Some(exchange), native),
-            principal,
-            work,
-            pending: Vec::new(),
-            deadline_ns,
-            moved_ns: now,
-            vouched_ns: None,
-            admitted_ns,
-            charge,
-            window,
-            driven,
-            label: None,
-        });
+        self.host.push(
+            Job {
+                door: Door::Native(Some(exchange), native),
+                principal,
+                work,
+                pending: Vec::new(),
+                deadline_ns,
+                moved_ns: now,
+                vouched_ns: None,
+                admitted_ns,
+                charge,
+                window,
+                driven,
+                label: None,
+            },
+            now,
+        );
     }
 
     /// An operation the S3 listener handed over (`crate::door`): a job of its work, or the reply
@@ -3092,30 +3328,33 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if admitted_ns.is_some() {
             self.charge_admitted(charge);
         }
-        self.host.push(Job {
-            door: Door::Local(Box::new(Local {
-                body: Pieces {
-                    pieces: body,
-                    ended: None,
-                },
-                reply,
-                pending: VecDeque::new(),
-                ready: false,
-            })),
-            principal,
-            work,
-            pending: Vec::new(),
-            // S3 states no patience: its stock clients' is the bound (research/77 D2).
-            deadline_ns: None,
-            moved_ns: now,
-            vouched_ns: None,
-            admitted_ns,
-            charge,
-            window,
-            // The S3 door's operations are driven where the node's task runs (node.md §2.9).
-            driven: None,
-            label,
-        });
+        self.host.push(
+            Job {
+                door: Door::Local(Box::new(Local {
+                    body: Pieces {
+                        pieces: body,
+                        ended: None,
+                    },
+                    reply,
+                    pending: VecDeque::new(),
+                    ready: false,
+                })),
+                principal,
+                work,
+                pending: Vec::new(),
+                // S3 states no patience: its stock clients' is the bound (research/77 D2).
+                deadline_ns: None,
+                moved_ns: now,
+                vouched_ns: None,
+                admitted_ns,
+                charge,
+                window,
+                // The S3 door's operations are driven where the node's task runs (node.md §2.9).
+                driven: None,
+                label,
+            },
+            now,
+        );
     }
 
     /// A key the S3 listener asked for (`door::KeyAsk`): looked up at the next turn, or refused at
@@ -3435,7 +3674,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.driving.is_empty() {
             return;
         }
-        while let Some((request, exchange)) = self.host.handing() {
+        // Each job passed once: one handed leaves its slot to the job moved into it, and one its
+        // lane refuses runs here as a job pushed last, not handed.
+        let mut from = 0;
+        while let Some((request, exchange)) = self.host.handing(&mut from) {
             let lanes = self
                 .driving
                 .iter()
@@ -3990,8 +4232,14 @@ impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
         Node::outcome(self, pending)
     }
 
-    fn answered(&self, pending: Pending) -> bool {
-        self.has_outcome(pending)
+    fn answers(&self) -> impl Iterator<Item = Pending> {
+        let commands = self
+            .commands_done
+            .iter()
+            .map(|(ask, _)| Pending::Command(*ask));
+        let reads = self.reads_done.iter().map(|(ask, _)| Pending::Read(*ask));
+        let chunks = self.chunks_done.iter().map(|(ask, _)| Pending::Chunk(*ask));
+        commands.chain(reads).chain(chunks)
     }
 
     fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
@@ -4149,6 +4397,8 @@ impl Host {
             }
         }
         labels::set(timing.slowest.map(|(_, label)| label));
+        #[cfg(test)]
+        self.audit_keys(now);
         Ok(())
     }
 
@@ -4222,12 +4472,11 @@ impl Host {
             Ok(pending) => {
                 if let Some(Job {
                     work: Work::Admin(admin),
-                    pending: held,
                     ..
                 }) = self.jobs.get_mut(at)
                 {
-                    held.push((pending, None));
                     admin.asked = true;
+                    self.wait_on(at, pending, None);
                 }
                 Ok(false)
             }
@@ -4395,6 +4644,11 @@ impl Host {
                 self.doors.give_native(native);
             }
         }
+        // Its keys from its state as its turn ends; one over is let go, and the job moved into its
+        // slot keyed as its own turn ended, or at its turn next in the step.
+        if !over {
+            self.rekey(at, now);
+        }
         Ok(over)
     }
 
@@ -4506,11 +4760,14 @@ impl Host {
         if job.pending.is_empty() {
             return Ok(());
         }
-        // Taken out while the node gives each its outcome, and given back with those still out.
+        // Taken out while the node gives each its outcome, and given back with those still out,
+        // each answered let go of its slot.
         let mut pending = std::mem::take(&mut job.pending);
         let mut answered: Vec<(Option<u64>, Outcome)> = Vec::new();
+        let asks = &mut self.asks;
         pending.retain(|(asked, request)| match node.outcome(*asked) {
             Some(outcome) => {
+                asks.release(Some(*asked));
                 answered.push((*request, outcome));
                 false
             }
@@ -4519,6 +4776,8 @@ impl Host {
         if let Some(job) = self.jobs.get_mut(at) {
             job.pending = pending;
         }
+        #[cfg(test)]
+        self.audit();
         for (request, outcome) in answered {
             self.answer_job(node, at, request, outcome, now)?;
         }
@@ -4914,9 +5173,7 @@ impl Host {
     ) -> Result<bool, NodeError> {
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, request));
-                }
+                self.wait_on(at, pending, request);
                 Ok(false)
             }
             Err(NodeError::Asks) => Ok(false),
@@ -5414,9 +5671,7 @@ impl Host {
         };
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, Some(kept)));
-                }
+                self.wait_on(at, pending, Some(kept));
                 Ok(None)
             }
             Err(NodeError::Asks) => Ok(Some(request)),
@@ -5444,11 +5699,7 @@ impl Host {
             ))
             .and_then(|g| node.ask(JobAsk::Command(g, command)));
         match asked {
-            Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, Some(id)));
-                }
-            }
+            Ok(pending) => self.wait_on(at, pending, Some(id)),
             Err(_) => self.fail_job(node, at, Status::Failed)?,
         }
         Ok(None)
@@ -5832,9 +6083,7 @@ impl Host {
         };
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, Some(kept)));
-                }
+                self.wait_on(at, pending, Some(kept));
                 Ok(None)
             }
             Err(NodeError::Asks) => Ok(Some(request)),
@@ -6245,9 +6494,7 @@ impl Host {
         };
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
-                    job.pending.push((pending, Some(id)));
-                }
+                self.wait_on(at, pending, Some(id));
                 Ok(None)
             }
             Err(NodeError::Asks) => Ok(Some(request)),
@@ -6360,13 +6607,13 @@ impl Host {
                 Ok(asked) => {
                     if let Some(Job {
                         work: Work::Deletes(deleting),
-                        pending,
                         ..
                     }) = self.jobs.get_mut(at)
                     {
-                        pending.push((asked, Some(u64::try_from(index).unwrap_or(u64::MAX))));
                         deleting.out = deleting.out.saturating_add(1);
                         deleting.next = index.saturating_add(1);
+                        let request = u64::try_from(index).unwrap_or(u64::MAX);
+                        self.wait_on(at, asked, Some(request));
                     }
                 }
                 // The node holds as many commands as it keeps: the rest are asked at a later turn.
@@ -7123,8 +7370,12 @@ impl Host {
     ) -> Result<(), NodeError> {
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = Work::Draining(Box::new(reply));
+            self.asks
+                .release(job.pending.iter().map(|(pending, _)| *pending));
             node.abandon(job.pending.drain(..).map(|(pending, _)| pending));
         }
+        #[cfg(test)]
+        self.audit();
         Ok(())
     }
 
@@ -8170,6 +8421,84 @@ pub(super) mod tests {
         pub(super) static CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         /// The jobs this thread's hosts stepped ([`Host::step_job`]).
         pub(super) static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The probes this thread made of a host's slots ([`Slots::get`]).
+        pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The keys this thread's hosts compared in their heaps ([`Earliest::less`]).
+        pub(super) static COMPARED_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    impl Host {
+        /// The oracle, after each step of a host and each change to its jobs: its slots agree with
+        /// a full recount, each exchange and each ask its jobs hold at the slot of the job holding
+        /// it, and no other.
+        pub(super) fn audit(&self) {
+            let mut exchanges = 0;
+            let mut asks = 0;
+            for (at, job) in self.jobs.iter().enumerate() {
+                if let Some(exchange) = job.door.exchange() {
+                    exchanges += 1;
+                    assert_eq!(self.exchanges.of.get(&exchange), Some(&at), "{exchange:?}");
+                }
+                for (pending, _) in &job.pending {
+                    asks += 1;
+                    assert_eq!(self.asks.of.get(pending), Some(&at), "{pending:?}");
+                }
+            }
+            assert_eq!(
+                self.exchanges.len(),
+                exchanges,
+                "an exchange's slot no job holds"
+            );
+            assert_eq!(self.asks.len(), asks, "an ask's slot no job waits on");
+            for (keys, of) in [(&self.beats, "beat"), (&self.renewals, "renewal")] {
+                assert_eq!(keys.place.len(), self.jobs.len(), "a {of}'s place a job");
+                for (place, (key, at)) in keys.heap.iter().enumerate() {
+                    assert_eq!(keys.place[*at], Some(place), "job {at}'s {of}'s place");
+                    if let Some(parent) = place.checked_sub(1).map(|p| p / 2) {
+                        assert!(keys.heap[parent].0 <= *key, "{of}s out of order at {place}");
+                    }
+                }
+                assert_eq!(
+                    keys.place.iter().flatten().count(),
+                    keys.heap.len(),
+                    "a {of} a job keyed"
+                );
+            }
+        }
+
+        /// The oracle as a step ends at `now`, every job turned in it: [`Host::audit`], and each
+        /// job's keys what its state makes them at `now` (`Host::rekey`), the earliest of each
+        /// what a full recount finds.
+        pub(super) fn audit_keys(&self, now: u64) {
+            self.audit();
+            let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+            let mut beats = Vec::new();
+            for (at, job) in self.jobs.iter().enumerate() {
+                let due = if job.working() && job.held() {
+                    job.due_ns(now, beat)
+                } else {
+                    None
+                };
+                assert_eq!(self.beats.key(at), due, "job {at}'s beat");
+                assert_eq!(
+                    self.renewals.key(at),
+                    job.renewal_ns(),
+                    "job {at}'s renewal"
+                );
+                beats.extend(due);
+            }
+            assert_eq!(self.beats.first(), beats.into_iter().min());
+            let renewal = self.jobs.iter().filter_map(Job::renewal_ns).min();
+            assert_eq!(self.renewals.first(), renewal);
+        }
+    }
+
+    impl Earliest {
+        /// Slot `at`'s key.
+        fn key(&self, at: usize) -> Option<u64> {
+            let place = self.place.get(at).copied().flatten()?;
+            self.heap.get(place).map(|(key, _)| *key)
+        }
     }
 
     /// The clock's reads and the jobs stepped on this thread since the last call.
@@ -8194,7 +8523,7 @@ pub(super) mod tests {
             let mut putting = native_put(0);
             putting.trailing = None;
             let (job, body, answers) = local_job(Work::Put(putting), now, 7);
-            host.jobs.push(job);
+            host.push(job, now);
             bodies.push(body);
             replies.push(answers);
         }
@@ -9160,7 +9489,7 @@ pub(super) mod tests {
             Ok(Fed::Moved)
         );
         let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
-        host.jobs.push(job);
+        host.push(job, 0);
         host.step(&mut Stub::chunks()).unwrap();
         let free = freeing.free.lock().unwrap();
         assert_eq!(free.first(), Some(&true), "woken while it held the piece");
@@ -10185,8 +10514,8 @@ pub(super) mod tests {
             Some(self.answers.swap_remove(at).1)
         }
 
-        fn answered(&self, pending: Pending) -> bool {
-            self.answers.iter().any(|(p, _)| *p == pending)
+        fn answers(&self) -> impl Iterator<Item = Pending> {
+            self.answers.iter().map(|(pending, _)| *pending)
         }
 
         fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
@@ -11062,8 +11391,8 @@ pub(super) mod tests {
         // window holds no more (`reading`).
         let read = scheming_gateway().charges.read(1);
         let (get, _, mut get_answers) = local_job(get, now, read);
-        host.jobs.push(put);
-        host.jobs.push(get);
+        host.push(put, now);
+        host.push(get, now);
         let mut stub = put_and_get_stub();
         let mut turns = 0;
         while !host.idle() {
@@ -11175,8 +11504,8 @@ pub(super) mod tests {
         let read = scheming_gateway().charges.read(1);
         let (get, mut get_replies) = handed_job(get, now, read);
         assert!(put.door.exchange().is_none() && get.door.exchange().is_none());
-        host.jobs.push(put);
-        host.jobs.push(get);
+        host.push(put, now);
+        host.push(get, now);
         let mut stub = put_and_get_stub();
         let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
         let mut put_seen = Seen {
@@ -11232,7 +11561,7 @@ pub(super) mod tests {
             let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
             let done = Work::Draining(Box::new(Reply::status(Status::Done)));
             let (job, replies) = handed_job(done, 0, 0);
-            host.jobs.push(job);
+            host.push(job, 0);
             let mut stub = put_and_get_stub();
             stub.takes_halves = takes_halves;
             host.step(&mut stub).unwrap();
@@ -11686,8 +12015,8 @@ pub(super) mod tests {
             Some(self.answers.swap_remove(at).1)
         }
 
-        fn answered(&self, pending: Pending) -> bool {
-            self.answers.iter().any(|(p, _)| *p == pending)
+        fn answers(&self) -> impl Iterator<Item = Pending> {
+            self.answers.iter().map(|(pending, _)| *pending)
         }
 
         fn abandon(&mut self, _: impl IntoIterator<Item = Pending>) {}
@@ -12143,7 +12472,7 @@ pub(super) mod tests {
         let (mut job, _body, _answers) = local_job(get, now, 0);
         job.pending.push((Pending::Read(0), None));
         let patience = job.bound_ns();
-        host.jobs.push(job);
+        host.push(job, now);
         assert_eq!(host.due(&stub), Some(patience), "held to its patience");
         stub.answers.push((
             Pending::Read(0),
@@ -12166,7 +12495,7 @@ pub(super) mod tests {
         let (native, replies) = held.doors.take().unwrap();
         held.doors.keep(native, replies);
         let (job, _, _) = local_job(Work::Draining(Box::new(Reply::status(Status::Done))), 0, 0);
-        held.jobs.push(job);
+        held.push(job, 0);
         hyper_measure::alloc::begin();
         let mut lent = std::mem::take(&mut held);
         assert!(held.idle() && held.gateway.is_none());
@@ -12243,7 +12572,7 @@ pub(super) mod tests {
         let mut replies = Vec::new();
         for ask in 0..HELD {
             let (job, half) = held_native_get(ask as u64, 0);
-            host.jobs.push(job);
+            host.push(job, 0);
             replies.push(half);
         }
         let mut seen: Vec<Seen> = (0..HELD).map(|_| Seen::default()).collect();
@@ -12279,7 +12608,7 @@ pub(super) mod tests {
             let mut replies = Vec::new();
             for ask in 0..HELD {
                 let (job, half) = held_native_get(ask as u64, 1);
-                host.jobs.push(job);
+                host.push(job, 1);
                 replies.push(half);
             }
             let mut seen: Vec<Seen> = (0..HELD).map(|_| Seen::default()).collect();
@@ -12322,7 +12651,7 @@ pub(super) mod tests {
         let mut replies = Vec::new();
         for ask in 0..HELD {
             let (job, half) = held_native_get(ask as u64, 1);
-            host.jobs.push(job);
+            host.push(job, 1);
             replies.push(half);
         }
         let mut seen: Vec<Seen> = (0..HELD).map(|_| Seen::default()).collect();
@@ -12515,5 +12844,340 @@ pub(super) mod tests {
         for key in (0..JOBS).filter(|key| key.is_multiple_of(3)) {
             assert_eq!(slots.get(&Counted(key)), None, "ended");
         }
+    }
+
+    /// The asks the search `Host::chunk_moved` made before visited to find the job waiting on chunk
+    /// ask `ask`: each job's asks, in order, until the one waiting on it (`Iterator::find` over
+    /// every job, `any` over its asks).
+    fn searched_for(host: &Host, ask: u64) -> usize {
+        let mut visited = 0;
+        for job in &host.jobs {
+            for (pending, _) in &job.pending {
+                visited += 1;
+                if *pending == Pending::Chunk(ask) {
+                    return visited;
+                }
+            }
+        }
+        visited
+    }
+
+    /// A piece of a chunk moving moves the job waiting on its ask, found in one probe of its host's
+    /// asks' slots (`Host::chunk_moved`), kept as each ask is waited on, answered or let go and as
+    /// jobs are pushed and swap-removed: 2,048 jobs each waiting on a read and a chunk, every third
+    /// ended as `Host::remove` does, one answered and one let go, and each left told one probe,
+    /// where the search of every job's asks it replaces visited each job's asks until the one
+    /// waiting, about half of them a call.
+    #[test]
+    fn a_moved_chunks_job_is_found_by_its_ask_with_no_scan() {
+        const JOBS: u64 = 2048;
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut halves = Vec::new();
+        for ask in 0..JOBS {
+            let (mut job, half) = held_native_get(ask, 1);
+            job.pending.push((Pending::Chunk(ask), None));
+            host.push(job, 1);
+            halves.push(half);
+        }
+        let mut at = 0;
+        while at < host.jobs.len() {
+            let ask = match host.jobs[at].pending[0].0 {
+                Pending::Read(ask) => ask,
+                other => panic!("{other:?}"),
+            };
+            if ask.is_multiple_of(3) {
+                host.remove(at).unwrap();
+            } else {
+                at += 1;
+            }
+        }
+        // One job's read answered, no version, so its get is replied and its chunk let go; another
+        // failed, its asks let go.
+        let mut stub = silent_stub();
+        stub.answers.push((
+            Pending::Read(1),
+            Outcome::Read(ReadOutcome::Read(Box::new(Read::Current(None)))),
+        ));
+        let waiting = |host: &Host, read| {
+            host.jobs
+                .iter()
+                .position(|job| job.pending.first().map(|(p, _)| *p) == Some(Pending::Read(read)))
+                .unwrap()
+        };
+        let answered = waiting(&host, 1);
+        host.take_answers(&mut stub, answered, 1).unwrap();
+        assert!(
+            host.jobs[answered].pending.is_empty(),
+            "replied, its chunk let go"
+        );
+        let replied = waiting(&host, 2);
+        host.fail_job(&mut stub, replied, Status::Failed).unwrap();
+        let left: Vec<(usize, u64)> = host
+            .jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(at, job)| match job.pending.last()?.0 {
+                Pending::Chunk(ask) => Some((at, ask)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            left.len(),
+            host.jobs.len() - 2,
+            "the replied jobs wait on nothing"
+        );
+        let searched: usize = left.iter().map(|(_, ask)| searched_for(&host, *ask)).sum();
+        PROBES.with(|probes| probes.set(0));
+        COMPARED_KEYS.with(|compared| compared.set(0));
+        for (at, ask) in &left {
+            host.jobs[*at].moved_ns = u64::MAX;
+            host.chunk_moved(*ask);
+            assert!(host.jobs[*at].moved_ns < u64::MAX, "job {at} moved");
+        }
+        let probes = PROBES.with(std::cell::Cell::get);
+        let compared = COMPARED_KEYS.with(|compared| compared.replace(0));
+        println!(
+            "{} chunks moved over {} jobs: {probes} probes and {compared} keys compared keying \
+             them, {searched} asks visited by a search of every job's",
+            left.len(),
+            host.jobs.len()
+        );
+        assert_eq!(probes, left.len(), "one probe a chunk moved");
+        // Each keyed again, its entry moved at most the heap's depth, two keys compared a level.
+        let depth = usize::try_from(host.jobs.len().ilog2()).unwrap() + 1;
+        assert!(
+            compared <= left.len() * 2 * (depth + 1),
+            "{compared} compared"
+        );
+        // An ask no job waits on moves none, in one probe.
+        PROBES.with(|probes| probes.set(0));
+        host.chunk_moved(0);
+        assert_eq!(PROBES.with(std::cell::Cell::get), 1);
+        host.audit();
+    }
+
+    /// What the scan `Host::due` made before visits of `host`'s jobs, served by `stub`, at the
+    /// shard's `now`, and the due it finds: every job's asks until one is answered, each against
+    /// every answer waiting (the `Serve::answered` it called searched them); then every job once
+    /// for its put's renewal and once more for its beat or bound.
+    fn scanned_due(host: &Host, stub: &Stub, now: u64) -> (usize, Option<u64>) {
+        let mut visited = 0;
+        for job in &host.jobs {
+            for (pending, _) in &job.pending {
+                visited += 1;
+                for (answer, _) in &stub.answers {
+                    visited += 1;
+                    if answer == pending {
+                        return (visited, Some(now));
+                    }
+                }
+            }
+        }
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        let wall = stub.wall_ns();
+        let mut due = None;
+        for job in &host.jobs {
+            visited += 1;
+            let renewal = job.renewal_ns().map(|at| now + at.saturating_sub(wall));
+            due = [due, renewal].into_iter().flatten().min();
+        }
+        for job in &host.jobs {
+            visited += 1;
+            if job.working() && job.held() {
+                due = [due, job.due_ns(now, beat)].into_iter().flatten().min();
+            }
+        }
+        (visited, due)
+    }
+
+    /// A host's wait reads none of its jobs (`Host::due`): with 2,048 held, each waiting on a read,
+    /// its next turn is the earliest of its jobs' beats, read first of their heap, and an answer
+    /// waiting is known for a job's by one probe of its asks' slots, an answer of no job's by one
+    /// too; where the scan it replaces visited every job's asks, each against every answer waiting,
+    /// and every job twice more. The due each finds is the same.
+    #[test]
+    fn a_hosts_wait_reads_none_of_its_jobs() {
+        const JOBS: u64 = 2048;
+        const OTHERS: u64 = 16;
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut stub = silent_stub();
+        let mut halves = Vec::new();
+        for ask in 0..JOBS {
+            let (job, half) = held_native_get(ask, 0);
+            host.push(job, 0);
+            halves.push(half);
+        }
+        // Vouched for at its step, each keyed as its turn ended.
+        host.step(&mut stub).unwrap();
+        let now = hyper_rt::futures::now_ns();
+        let visits = |host: &Host, stub: &Stub| {
+            PROBES.with(|probes| probes.set(0));
+            COMPARED_KEYS.with(|compared| compared.set(0));
+            let due = host.due(stub);
+            let visited =
+                PROBES.with(std::cell::Cell::get) + COMPARED_KEYS.with(std::cell::Cell::get);
+            (visited, due)
+        };
+
+        // Nothing answered: the earliest beat, its vouch half a beat after the step's.
+        let (scanned, by_scan) = scanned_due(&host, &stub, now);
+        let (visited, due) = visits(&host, &stub);
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        assert_eq!(due, Some(now + vouch_every(beat)));
+        assert_eq!(due, by_scan);
+        println!("{JOBS} held, none answered: {visited} visited, {scanned} by the scan");
+        assert_eq!(visited, 0, "no job read, no key compared");
+        assert_eq!(scanned, 3 * usize::try_from(JOBS).unwrap());
+
+        // Answers waiting that are no job's (a repair's, a driving shard's), then the last job's.
+        for other in 0..OTHERS {
+            stub.answers.push((
+                Pending::Command(other),
+                Outcome::Command(CommandOutcome::Deadline),
+            ));
+        }
+        let (scanned, by_scan) = scanned_due(&host, &stub, now);
+        let (visited, due) = visits(&host, &stub);
+        assert_eq!(due, by_scan);
+        println!(
+            "{JOBS} held, {OTHERS} answers of no job's: {visited} visited, {scanned} by the scan"
+        );
+        assert_eq!(
+            visited,
+            usize::try_from(OTHERS).unwrap(),
+            "one probe an answer"
+        );
+        let last = host.jobs.last().unwrap().pending[0].0;
+        stub.answers.push((
+            last,
+            Outcome::Read(ReadOutcome::Read(Box::new(Read::Current(None)))),
+        ));
+        let (scanned, by_scan) = scanned_due(&host, &stub, now);
+        let (visited, due) = visits(&host, &stub);
+        assert_eq!((due, by_scan), (Some(now), Some(now)), "due at once");
+        println!(
+            "{JOBS} held, the last's answer waiting: {visited} visited, {scanned} by the scan"
+        );
+        assert_eq!(visited, usize::try_from(OTHERS).unwrap() + 1);
+        assert!(scanned > usize::try_from(JOBS * OTHERS).unwrap());
+
+        // Its answer taken at the next step: the job replied, its keys let go, the rest kept.
+        host.step(&mut stub).unwrap();
+        assert_eq!(host.jobs.len(), usize::try_from(JOBS).unwrap() - 1);
+        let (_, due) = visits(&host, &stub);
+        assert_eq!(due, Some(now + vouch_every(beat)));
+    }
+
+    /// A host's keys (`Earliest`) against a plain list of each job's key, through a long run of
+    /// jobs pushed, keyed, let go of their keys and swap-removed as `Host::push`, `Host::rekey` and
+    /// `Host::remove` do, drawn from a fixed seed: after each, every slot's key and the least are
+    /// the list's, each entry is named by its slot, and no key is less than its parent's.
+    #[test]
+    fn a_hosts_keys_agree_with_a_list_of_them() {
+        // A fixed xorshift64 (Marsaglia, 2003): the same run each time.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut draw = |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        let mut keys = Earliest::default();
+        let mut listed: Vec<Option<u64>> = Vec::new();
+        let mut most = 0;
+        for _ in 0..20_000 {
+            let drawn = draw(8);
+            if drawn <= 2 && listed.len() < 512 {
+                keys.grow();
+                listed.push(None);
+                let at = listed.len() - 1;
+                let key = (draw(4) > 0).then(|| draw(64));
+                keys.set(at, key);
+                listed[at] = key;
+            } else if drawn <= 5 && !listed.is_empty() {
+                let at = usize::try_from(draw(listed.len() as u64)).unwrap();
+                // Ties are common: keys from a small range.
+                let key = (draw(5) > 0).then(|| draw(64));
+                keys.set(at, key);
+                listed[at] = key;
+            } else if !listed.is_empty() {
+                let at = usize::try_from(draw(listed.len() as u64)).unwrap();
+                keys.swap_remove(at);
+                listed.swap_remove(at);
+            }
+            most = most.max(listed.len());
+            assert_eq!(keys.first(), listed.iter().flatten().min().copied());
+            assert_eq!(keys.place.len(), listed.len());
+            for (at, key) in listed.iter().enumerate() {
+                assert_eq!(keys.key(at), *key, "slot {at}");
+            }
+            for (place, (key, at)) in keys.heap.iter().enumerate() {
+                assert_eq!(keys.place[*at], Some(place));
+                if place > 0 {
+                    assert!(keys.heap[(place - 1) / 2].0 <= *key, "order at {place}");
+                }
+            }
+            assert_eq!(keys.heap.len(), listed.iter().flatten().count());
+        }
+        assert_eq!(most, 512, "the run reached its most jobs");
+    }
+
+    /// A turn's handing passes each job once (`Host::handing`, `Node::hand_off`): with 2,048 jobs,
+    /// every other one's fields read for a driving shard, each of those is taken out and the rest
+    /// stay, the jobs looked at at most the jobs and the ones handed, where a search of every job
+    /// from the first for each one handed looked at about an eighth of the jobs' square.
+    #[test]
+    fn a_turns_handing_passes_each_job_once() {
+        const JOBS: usize = 2048;
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut halves = Vec::new();
+        for job in 0..JOBS {
+            let op = Op::Get {
+                bucket: "b".into(),
+                key: format!("k{job}"),
+                headers: Headers::default(),
+                version: None,
+            };
+            let work = if job % 2 == 0 {
+                Work::Handing(Box::new((op, None)))
+            } else {
+                work(op, None)
+            };
+            let (job, half) = handed_job(work, 0, 0);
+            host.push(job, 0);
+            halves.push(half);
+        }
+        let (mut from, mut looked, mut searched, mut handed) = (0, 0, 0, 0);
+        loop {
+            let before = from;
+            let taken = host.handing(&mut from);
+            match taken {
+                Some(_) => {
+                    // This call looked at the jobs from `before` to the one taken; a search from
+                    // the first would have looked at every one up to it.
+                    looked += from - before + 1;
+                    searched += from + 1;
+                    handed += 1;
+                }
+                None => {
+                    looked += host.jobs.len() - before;
+                    searched += host.jobs.len();
+                    break;
+                }
+            }
+        }
+        println!(
+            "{handed} handed of {JOBS} jobs: {looked} looked at, {searched} by a search of each"
+        );
+        assert_eq!(handed, JOBS / 2);
+        assert_eq!(host.jobs.len(), JOBS / 2);
+        assert!(
+            host.jobs
+                .iter()
+                .all(|job| !matches!(job.work, Work::Handing(_)))
+        );
+        // Each job looked at once, and a job moved into a slot handed from looked at there again.
+        assert!(looked <= JOBS + handed, "{looked} looked at");
+        host.audit();
     }
 }

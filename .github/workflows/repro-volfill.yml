@@ -1,10 +1,7 @@
 name: repro-volfill
-# Bisect, all at once: crates/mantle/tests/serve.rs
-# `a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors`, whose HTTP PUT of o5 waits
-# with no progress past the test's 600 s about four runs in five at every perf-10k merge since
-# c3e73e7d (run 44575349545). It passed on every target at lean-doors' c33e5bf0 (CI 43330931920):
-# round 2: the sixteen commits from cb88c723 (two passes) to 89ddbc3e (a failure), each run until
-# it fails or passes three times.
+# The fix for the volumes-fill hang (reply-hang, merged in perf-10k c9998a0d) checked: crates/mantle/tests/serve.rs
+# `a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors`, which failed about four runs in five
+# from 9a312b2b, five times on each of two runners of each architecture.
 on:
   push:
     branches: ["repro/**"]
@@ -18,9 +15,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sha: [89ddbc3e, d07f606f, 9a312b2b, 0f93ff47, d19a1296, a6c132be, 12996f37, f768f91f, 65200579, f70d9573, 5af959c3, d6267781, 7f2c9d24, ef1af705, 8b246468, 2dd70bbe]
-    name: volumes fill at ${{ matrix.sha }}
-    runs-on: ubuntu-24.04
+        sha: [c9998a0d]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        copy: [1, 2]
+    name: volumes fill at ${{ matrix.sha }} on ${{ matrix.runner }}, copy ${{ matrix.copy }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
@@ -34,7 +33,7 @@ jobs:
         run: cargo test -p mantle --test serve --locked --no-run
       - name: The volumes-fill test
         run: |
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             start=$(date +%s)
             if timeout 1800 cargo test -p mantle --test serve --locked a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors -- --exact > out-$i.txt 2>&1; then
               echo "run $i passed at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
@@ -42,7 +41,7 @@ jobs:
               echo "run $i failed at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
               grep -m 3 -E "panicked at|not so" out-$i.txt | cut -c1-300 || true
               echo "VERDICT BAD ${{ matrix.sha }}"
-              exit 0
+              exit 1
             fi
           done
           echo "VERDICT GOOD ${{ matrix.sha }}"

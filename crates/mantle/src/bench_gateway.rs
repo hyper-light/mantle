@@ -234,6 +234,7 @@ impl Cell {
                 key,
                 offset,
                 len,
+                ..
             } => {
                 let bytes = self
                     .volumes

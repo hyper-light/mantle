@@ -537,6 +537,22 @@ idle timeouts, as long as the GET's own client waits for its answer: with a foun
 killed node, and read back whole once the node read no more from it. A put waits on its peer as
 before: ended by a detector's mistake, which a loaded host makes, it would be an object refused.
 
+*Amended (2026-11-19).* A suspected place is read last, not taken for lost. Such a read is
+answered `Suspected` at once, and the GET reads the block's other places first, as before; where
+they cannot give it (a copy none of whose other places reads, a code short of its data chunks), it
+asks each place answered `Suspected` once more, past the suspicion (`Request::Chunk`'s
+`past_suspicion`, `Node::get_chunk_past_suspicion`), and that read waits on its peer as a put
+does: a node truly gone answers at the transport's judgement or the GET's deadline, as the read
+would have failed anyway, and a node only slow gives the bytes. Answered lost at once, the
+detector's mistake failed reads of acknowledged objects: the membership suite's cell grown from
+one node to two (`a_cell_grows_from_one_to_five_and_back_to_two_voters_under_load`, CI gates run
+44619550115) answered `503 SlowDown`, `Unreadable`, on Linux x86_64 under two busy loops and on
+macOS aarch64; on macOS for a read through the joiner, whose link to the founder had recorded five
+suspicions, the founder's link to it none. A block written while the cell was one machine keeps
+the one copy its scheme gave it (`Copies(1)`, the only candidate one domain fits; repair's domain
+rule moves a chunk of a block holding two in one domain, repair.md §4, and a single copy has none
+to move), so every read of one through another node has no other place.
+
 **Checked** (`crates/gateway/tests/object_path.rs`): objects under copies and codes read back
 whole and in ranges across segment and block boundaries, with requests answered in either
 order, and any range of generated objects; a chunk a volume cannot read is read from another

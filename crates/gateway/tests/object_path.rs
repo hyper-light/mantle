@@ -193,6 +193,7 @@ impl Cell {
                 key,
                 offset,
                 len,
+                ..
             } => {
                 if self.unreadable.contains(&volume) {
                     return get::Answer::Unreadable;

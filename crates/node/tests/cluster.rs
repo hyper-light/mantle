@@ -87,7 +87,6 @@ use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, Runtime, RuntimeConfig, interests_for};
 use hyper_rt::sync::{ChannelReceiver, Sender, channel};
-use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_chunk::{ChunkKey, Config as VolumeConfig, Limits as VolumeLimits, Reads};
@@ -1360,7 +1359,7 @@ impl Cell {
     }
 
     /// Waits until node `from` holds a keyed connection to `to` and its detectors trust `to`: what
-    /// a chunk read of `to` needs, one of a peer they suspect being lost at once
+    /// a chunk read of `to` needs, one of a peer they suspect being answered `Suspected` at once
     /// (`Node::end_chunk_gets`).
     fn trusted(&mut self, from: u64, to: u64) {
         self.watch.until(&self.reports, |w| {
@@ -1425,11 +1424,11 @@ impl Cell {
     }
 
     /// Node `from`'s read of `key` on `at`'s `volume`, as `get_chunk`, once `from` trusts `at`,
-    /// and asked again each time it is lost to a suspicion: on a loaded host the detectors may
-    /// suspect a live peer, a mistake they allow (hyper-liveness's `PairReport::allowance`), and a
-    /// read of a suspected peer is lost at once (`Node::end_chunk_gets`). A loss counts as a
-    /// suspicion's only once `from`'s link to `at` reports one more suspicion than when the read
-    /// was asked; lost for any other cause, it stands.
+    /// and asked again each time a suspicion ends it: on a loaded host the detectors may suspect a
+    /// live peer, a mistake they allow (hyper-liveness's `PairReport::allowance`), and a read of a
+    /// suspected peer is answered `Suspected` at once (`Node::end_chunk_gets`), which a GET with no
+    /// other place asks past the suspicion. It counts as a suspicion's only once `from`'s link to
+    /// `at` reports one more suspicion than when the read was asked; lost for any cause, it stands.
     fn read_back(
         &mut self,
         from: u64,
@@ -1446,7 +1445,7 @@ impl Cell {
             self.trusted(from, at);
             let before = self.watch.links.get(&(from, at)).map_or(0, |l| l.suspected);
             let outcome = self.get_chunk(from, at, volume, key, offset, len);
-            if outcome != ChunkOutcome::Lost(Refusal::Closed) {
+            if outcome != ChunkOutcome::Suspected {
                 return outcome;
             }
             self.watch.until(&self.reports, |w| {

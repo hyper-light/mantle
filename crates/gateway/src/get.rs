@@ -39,12 +39,16 @@ pub enum Request {
     Extents { file: u128, offset: u64, max: usize },
     /// A block's header and its chunks' places, from the Block range that holds it.
     Block { block: u128 },
-    /// Bytes `[offset, offset + len)` of a chunk, from its volume, which verifies them.
+    /// Bytes `[offset, offset + len)` of a chunk, from its volume, which verifies them. Asked
+    /// `past_suspicion`, it goes to the volume's node even while the reading node's failure
+    /// detectors suspect it: the place answered [`Answer::Suspected`] once, and the block cannot
+    /// be read without it.
     Chunk {
         volume: u128,
         key: ChunkKey,
         offset: u64,
         len: u64,
+        past_suspicion: bool,
     },
 }
 
@@ -59,6 +63,12 @@ pub enum Answer {
     /// This place cannot give the bytes: its volume failed, is fenced or closing, or does not
     /// hold them whole and verified, or its peer is gone. Another place that holds them is read.
     Unreadable,
+    /// The reading node's failure detectors suspect this place's node, or it announced its stop:
+    /// the read was not sent, or ended as the suspicion came. Its node may still be up and hold
+    /// the bytes, as a loaded host's detectors suspect a peer that is only slow (gateway.md §3):
+    /// another place is read first, and this one is asked again past the suspicion only where the
+    /// block cannot be read without it.
+    Suspected,
     /// No room for the read now, at the volume's reads or in the transport toward it: the place
     /// still holds the bytes, and is asked again once room frees ([`Get::room`], research/77 D2).
     Busy,
@@ -159,6 +169,9 @@ struct Reading {
     /// Once a span of a coded block fails: the whole chunks read to decode it, held apart so a
     /// block read whole by its spans, the common case, holds none of it.
     whole: Option<Box<Whole>>,
+    /// Once a place answers [`Answer::Suspected`]: the places its node's suspicion kept from it,
+    /// held apart as `whole` is, so a block none of whose places is suspected holds none of it.
+    suspicion: Option<Box<Suspicion>>,
     /// Its requests in flight: it finishes only once none is, so no answer outlives it.
     inflight: usize,
     /// When, in the caller's time, its row was asked; none where the caller told no time.
@@ -174,6 +187,35 @@ struct Whole {
     asked: BTreeSet<usize>,
     failed: BTreeSet<usize>,
     tried: BTreeSet<usize>,
+}
+
+/// The places of a block answered [`Answer::Suspected`] and not yet asked past the suspicion, and
+/// those asked past it, each at most once: a place leaves the first for the second only where the
+/// block cannot be read without it.
+#[derive(Default)]
+struct Suspicion {
+    suspected: BTreeSet<usize>,
+    pressed: BTreeSet<usize>,
+}
+
+impl Suspicion {
+    /// Whether the place at `at` is asked past the suspicion.
+    fn pressed(suspicion: Option<&Self>, at: usize) -> bool {
+        suspicion.is_some_and(|s| s.pressed.contains(&at))
+    }
+
+    /// The place at `at` answered `Suspected`: kept to be asked past the suspicion, unless it was.
+    fn suspect(&mut self, at: usize) {
+        if !self.pressed.contains(&at) {
+            self.suspected.insert(at);
+        }
+    }
+
+    /// Place `at` taken to be asked past the suspicion.
+    fn press(&mut self, at: usize) {
+        self.suspected.remove(&at);
+        self.pressed.insert(at);
+    }
 }
 
 /// What a request in flight asked. Blocks are named by the first segment they hold.
@@ -522,8 +564,25 @@ impl Get {
             (Asked::Block(key), Answer::Block(row)) => self.block_row(key, row),
             (Asked::Span(key, i), Answer::Chunk(bytes)) => self.span(key, i, Some(bytes)),
             (Asked::Span(key, i), Answer::Unreadable) => self.span(key, i, None),
+            (Asked::Span(key, i), Answer::Suspected) => {
+                let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
+                let at = reading.spans.get(i).ok_or(GetError::Mismatch)?.chunk;
+                reading
+                    .suspicion
+                    .get_or_insert_with(Box::default)
+                    .suspect(at);
+                self.span(key, i, None)
+            }
             (Asked::Whole(key, c), Answer::Chunk(bytes)) => self.whole(key, c, Some(bytes)),
             (Asked::Whole(key, c), Answer::Unreadable) => self.whole(key, c, None),
+            (Asked::Whole(key, c), Answer::Suspected) => {
+                let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
+                reading
+                    .suspicion
+                    .get_or_insert_with(Box::default)
+                    .suspect(c);
+                self.whole(key, c, None)
+            }
             (Asked::Span(key, _) | Asked::Whole(key, _), Answer::Busy) => {
                 self.wait_for_room(key, asked)
             }
@@ -727,6 +786,7 @@ impl Get {
                 row: None,
                 spans: Vec::new(),
                 whole: None,
+                suspicion: None,
                 inflight: 0,
                 begun_ns: self.now_ns,
             },
@@ -824,13 +884,15 @@ impl Get {
             key: place.key,
             offset: span.range.start,
             len,
+            past_suspicion: Suspicion::pressed(reading.suspicion.as_deref(), span.chunk),
         };
         self.ask(request, Asked::Span(key, i))
     }
 
     /// Span `i` of block `key` answered: kept, or, when it failed, asked of another place that
     /// holds its bytes, a copy's any other, a code's chunk's kept one, or the block decoded from
-    /// whole chunks instead.
+    /// whole chunks instead; a copy with no other place left, of a place the detectors' suspicion
+    /// alone kept from it, past the suspicion.
     fn span(&mut self, key: u64, i: usize, got: Option<Bytes>) -> Result<(), GetError> {
         let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let block = reading.block;
@@ -860,6 +922,14 @@ impl Get {
                     !span.tried.contains(&c)
                         && (data == 1 || places.get(c).is_some_and(|p| p.key.index == index))
                 });
+                // A copy none of whose places is left untried is read from one the detectors'
+                // suspicion alone kept it from, past the suspicion, before the block is given up.
+                let next = next.or_else(|| {
+                    let suspicion = reading.suspicion.as_mut().filter(|_| data == 1)?;
+                    let p = suspicion.suspected.first().copied()?;
+                    suspicion.press(p);
+                    Some(p)
+                });
                 match next {
                     Some(next) => {
                         span.tried.insert(next);
@@ -884,7 +954,9 @@ impl Get {
     }
 
     /// Asks for as many whole chunks of block `key`, not yet read, asked or failed, as decoding
-    /// it still needs, data chunks first, each of the first of its places not yet tried.
+    /// it still needs, data chunks first, each of the first of its places not yet tried; and,
+    /// still short, chunks of places the detectors' suspicion alone kept from it, past the
+    /// suspicion.
     fn ask_wholes(&mut self, key: u64) -> Result<(), GetError> {
         let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
         let block = reading.block;
@@ -918,15 +990,45 @@ impl Get {
             })
             .take(short)
             .collect();
+        // Still short, a chunk none of whose places is left untried is read from one the
+        // detectors' suspicion alone kept it from, past the suspicion, one place a chunk.
+        let mut pressing: Vec<(usize, usize)> = Vec::new();
+        let mut planned = have.checked_add(next.len()).ok_or(GetError::Overflow)?;
+        let suspected = reading.suspicion.as_ref().map(|s| &s.suspected);
+        for &p in suspected.into_iter().flatten() {
+            if planned >= needed {
+                break;
+            }
+            let Some(c) = places.get(p).map(|pl| usize::from(pl.key.index)) else {
+                continue;
+            };
+            if whole.got.contains_key(&c)
+                || whole.asked.contains(&c)
+                || next.contains(&c)
+                || pressing.iter().any(|&(_, d)| d == c)
+            {
+                continue;
+            }
+            pressing.push((p, c));
+            planned = planned.checked_add(1).ok_or(GetError::Overflow)?;
+        }
         // Every chunk not yet tried is asked for when that is still short of the code's data
         // chunks: no read to come can make up the rest.
-        if have.checked_add(next.len()).ok_or(GetError::Overflow)? < needed {
+        if planned < needed {
             return Err(GetError::Unreadable(block));
+        }
+        if let Some(suspicion) = reading.suspicion.as_mut() {
+            for &(p, c) in &pressing {
+                suspicion.press(p);
+                whole.failed.remove(&c);
+                whole.asked.insert(c);
+            }
         }
         // A reservation the allocator refuses is an error, not an abort.
         let mut ats = Vec::new();
-        ats.try_reserve_exact(next.len())
+        ats.try_reserve_exact(next.len().saturating_add(pressing.len()))
             .map_err(|_| GetError::Overflow)?;
+        ats.extend(pressing.iter().map(|&(p, _)| p));
         for c in next {
             let at = (0..places.len())
                 .find(|&p| {
@@ -956,6 +1058,7 @@ impl Get {
             key: place.key,
             offset: 0,
             len: header.chunk_len,
+            past_suspicion: Suspicion::pressed(reading.suspicion.as_deref(), at),
         };
         self.ask(request, Asked::Whole(key, at))
     }
@@ -1343,6 +1446,95 @@ mod tests {
                 Scheme::Rs(_) => 2,
             };
             assert_eq!(volumes.len(), read, "{scheme:?}: {volumes:?}");
+        }
+    }
+
+    /// Answers each read `asked`, and each the GET asks after, until it ends: volume 1's node
+    /// suspected, so a read of it not asked past the suspicion answered `Suspected` and one asked
+    /// past it given its bytes; each volume of `refused` unreadable; the rest given their bytes.
+    /// The GET's plaintext and outcome, and the volumes asked past the suspicion.
+    fn read_out_suspecting(
+        get: &mut Get,
+        chunks: &[Vec<u8>],
+        asked: Vec<(Id, Request)>,
+        refused: &[u128],
+    ) -> (Vec<u8>, Result<(), GetError>, Vec<u128>) {
+        let mut asked = VecDeque::from(asked);
+        let (mut out, mut pressed) = (Vec::new(), Vec::new());
+        while let Some((id, request)) = asked.pop_front() {
+            let Request::Chunk {
+                volume,
+                past_suspicion,
+                ..
+            } = request
+            else {
+                panic!("{request:?}");
+            };
+            if past_suspicion {
+                pressed.push(volume);
+            }
+            let answer = match volume {
+                1 if !past_suspicion => Answer::Suspected,
+                v if refused.contains(&v) => Answer::Unreadable,
+                _ => served(chunks, &request),
+            };
+            if get.answer(id, answer).is_err() {
+                break;
+            }
+            asked.extend(std::iter::from_fn(|| get.poll()));
+            while let Some(bytes) = get.take() {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        let outcome = get.outcome().cloned().expect("the GET ended");
+        (out, outcome, pressed)
+    }
+
+    /// A place whose node the reading node's detectors suspect is read after every other: a block
+    /// the other places give is read whole and the suspected place never asked past the
+    /// suspicion. One the other places cannot give is read from it past the suspicion, once: a
+    /// detector's mistake, which a loaded host makes, never fails a read of a block a node still
+    /// up holds. Answered lost at once, a block whose only readable chunks a suspected node held
+    /// ended `Unreadable`, `503 SlowDown`, an acknowledged object unread: the membership suite's
+    /// cell grown from one node to two read a block of the founder's only copy so through the
+    /// joiner, which had suspected the founder five times.
+    #[test]
+    fn a_suspected_place_is_read_last_and_past_the_suspicion_only_where_none_else_reads() {
+        let plain = b"held where the reader's detectors suspect".to_vec();
+        for scheme in schemes() {
+            let (mut get, chunks, asked) = reading(scheme, &plain);
+            let (out, outcome, pressed) = read_out_suspecting(&mut get, &chunks, asked, &[]);
+            assert_eq!(outcome, Ok(()), "{scheme:?}");
+            assert_eq!(out, plain, "{scheme:?}");
+            assert!(pressed.is_empty(), "{scheme:?}: {pressed:?}");
+
+            // Every other place of a copy, and a code's parity, unreadable: only volume 1's chunk
+            // makes up the block.
+            let refused: &[u128] = match scheme {
+                Scheme::Copies(_) => &[2, 3],
+                Scheme::Rs(_) => &[3],
+            };
+            let (mut get, chunks, asked) = reading(scheme, &plain);
+            let (out, outcome, pressed) = read_out_suspecting(&mut get, &chunks, asked, refused);
+            assert_eq!(outcome, Ok(()), "{scheme:?}");
+            assert_eq!(out, plain, "{scheme:?}");
+            assert_eq!(pressed, vec![1], "{scheme:?}");
+        }
+    }
+
+    /// A place asked past the suspicion and unreadable then is not asked again: the GET ends
+    /// `Unreadable`, each place asked past the suspicion once at most.
+    #[test]
+    fn a_place_unreadable_past_the_suspicion_ends_the_get_unreadable() {
+        for scheme in schemes() {
+            let (mut get, chunks, asked) = reading(scheme, b"held nowhere readable");
+            let refused: &[u128] = match scheme {
+                Scheme::Copies(_) => &[1, 2, 3],
+                Scheme::Rs(_) => &[1, 3],
+            };
+            let (_, outcome, pressed) = read_out_suspecting(&mut get, &chunks, asked, refused);
+            assert_eq!(outcome, Err(GetError::Unreadable(BLOCK)), "{scheme:?}");
+            assert!(pressed.len() <= 1, "{scheme:?}: {pressed:?}");
         }
     }
 

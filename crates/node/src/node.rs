@@ -310,6 +310,11 @@ pub enum ChunkOutcome {
     /// transport's refusal: `Budget` when the peer holds as many chunks as its volumes queue), or
     /// its connection closed. A put may still have landed (node.md §5.2).
     Lost(Refusal),
+    /// A get not sent, or ended as it was out, because this node's failure detectors suspect its
+    /// peer or the peer announced its stop (`Node::end_chunk_gets`): the peer may still be up and
+    /// hold the chunk, as a loaded host's detectors suspect a peer that is only slow. A get asked
+    /// past the suspicion is never answered so.
+    Suspected,
 }
 
 /// A range the node hosts: its log group, the range, and its engine as it starts: a range's
@@ -706,6 +711,8 @@ struct ChunkOut {
     asked: ChunkAsk,
     peer: PeerId,
     get: bool,
+    /// A get asked past its peer's suspicion, which a suspicion does not end.
+    past_suspicion: bool,
 }
 
 /// A body going out on an exchange, with how much of it the exchange has taken (`write_body`
@@ -4674,23 +4681,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Ends the chunk reads out to `peer`, which the detectors now suspect: each read lost at once,
-    /// so its get asks another copy rather than waiting out the transport's judgement of a peer
-    /// that may be gone, two idle timeouts, as long as its client waits for the object (node.md
-    /// §2.4). Puts wait on: a put a suspicion ended would be one lost to a detector's mistake,
-    /// which a loaded host makes, and its object refused.
+    /// Ends the chunk reads out to `peer`, which the detectors now suspect: each read answered
+    /// `Suspected` at once, so its get asks another copy rather than waiting out the transport's
+    /// judgement of a peer that may be gone, two idle timeouts, as long as its client waits for
+    /// the object (node.md §2.4). Puts wait on: a put a suspicion ended would be one lost to a
+    /// detector's mistake, which a loaded host makes, and its object refused. So does a read asked
+    /// past the suspicion, its block readable no other way.
     fn end_chunk_gets(&mut self, peer: PeerId) {
         let mut ended = Vec::new();
         self.chunks_out.retain(|c| {
-            let read = c.get && c.peer == peer;
+            let read = c.get && !c.past_suspicion && c.peer == peer;
             if read {
                 ended.push((c.exchange, c.asked));
             }
             !read
         });
         for (exchange, asked) in ended {
-            self.chunks_done
-                .push((asked, ChunkOutcome::Lost(Refusal::Closed)));
+            self.chunks_done.push((asked, ChunkOutcome::Suspected));
             self.give_back(exchange);
             self.receiving.remove(exchange);
             self.driver.endpoint().end(exchange);
@@ -4902,6 +4909,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     asked,
                     peer: at,
                     get: false,
+                    past_suspicion: false,
                 });
                 self.writing.push(Writing {
                     exchange,
@@ -4919,25 +4927,55 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Gets bytes `[offset, offset + len)` of `key`'s chunk from `volume`, which `at` holds, as
-    /// [`Self::put_chunk`] puts one.
+    /// [`Self::put_chunk`] puts one; answered `Suspected` at once where the detectors suspect
+    /// `at` ([`Self::get_chunk_past_suspicion`] reads it anyway).
     pub fn get_chunk(
         &mut self,
         at: PeerId,
         volume: u128,
         key: ChunkKey,
+        span: (u64, u64),
+        remaining_ns: u64,
+    ) -> Result<ChunkAsk, NodeError> {
+        self.read_chunk(at, (volume, key), span, remaining_ns, false)
+    }
+
+    /// Gets a chunk as [`Self::get_chunk`] does, from `at` even while the detectors suspect it,
+    /// and not ended by a suspicion: a get whose block no other place can give (gateway.md §3).
+    /// A peer truly gone answers at the transport's judgement, or the get's deadline, as a put's
+    /// does.
+    pub fn get_chunk_past_suspicion(
+        &mut self,
+        at: PeerId,
+        volume: u128,
+        key: ChunkKey,
+        span: (u64, u64),
+        remaining_ns: u64,
+    ) -> Result<ChunkAsk, NodeError> {
+        self.read_chunk(at, (volume, key), span, remaining_ns, true)
+    }
+
+    /// The chunk read [`Self::get_chunk`] and [`Self::get_chunk_past_suspicion`] ask, sent to a
+    /// suspected peer only `past_suspicion`.
+    fn read_chunk(
+        &mut self,
+        at: PeerId,
+        (volume, key): (u128, ChunkKey),
         (offset, len): (u64, u64),
         remaining_ns: u64,
+        past_suspicion: bool,
     ) -> Result<ChunkAsk, NodeError> {
         if at != self.id && self.chunks_out.len() >= self.chunk_asks {
             return Err(NodeError::Asks);
         }
         let asked = self.next_chunk;
         self.next_chunk = asked.wrapping_add(1);
-        // A peer the detectors suspect is read from no more: the chunk is lost at once, and its
-        // get asks another copy (`end_chunk_gets`).
-        if at != self.id && self.remotes.iter().any(|r| r.id == at && r.suspect) {
-            self.chunks_done
-                .push((asked, ChunkOutcome::Lost(Refusal::Closed)));
+        // A peer the detectors suspect is not read first: the get answered `Suspected` at once
+        // asks another copy (`end_chunk_gets`), and this one past the suspicion only where its
+        // block can be read no other way.
+        if !past_suspicion && at != self.id && self.remotes.iter().any(|r| r.id == at && r.suspect)
+        {
+            self.chunks_done.push((asked, ChunkOutcome::Suspected));
             return Ok(asked);
         }
         if at == self.id {
@@ -4975,6 +5013,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     asked,
                     peer: at,
                     get: true,
+                    past_suspicion,
                 });
             }
             Err(refusal) => {

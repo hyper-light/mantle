@@ -1039,6 +1039,7 @@ pub(super) mod tests {
             },
             span: (0, 1),
             remaining_ns: 1,
+            past_suspicion: false,
         }
     }
 

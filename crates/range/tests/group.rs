@@ -2194,3 +2194,113 @@ fn a_write_refused_for_a_full_log_waits_until_another_group_compacts() {
     assert!(driven.stalled.is_none(), "{:?}", driven.stalled);
     assert_eq!(replica.applied(), applied + 1);
 }
+
+/// A group under heavy writes, whose members' logs refuse them for the group's retained bound
+/// again and again while one member is cut off and then caught up by a snapshot, fences no
+/// member. Each refusal is room the member waits out until its own compaction frees it; the
+/// writes it then makes again, the compactions that race them and the install that replaces the
+/// cut member's log are each taken by the log. A node under a closed ladder of 1-byte PUTs at
+/// 2,048 clients ended on a fence whose only words were "the log refused a write the group cannot
+/// take" (perf-10k, 2026-11-19); a fence here fails with the log's own reason. Do: three members
+/// whose logs retain a ready of their settings and no more (as
+/// `a_write_refused_for_room_waits_until_the_group_compacts`), 60 rounds of three bursts of 8
+/// proposals, each driven as a write of its own and delivered, a member compacting all it
+/// applied only when stalled, member 3 cut off for rounds 15 to 35. Expect: refusals for room
+/// and a snapshot sent, no member fenced, and member 3 applying what the leader applied.
+#[test]
+fn a_group_stalled_for_room_under_heavy_writes_and_an_install_fences_no_member() {
+    let small = Settings {
+        max_size_per_msg: 256,
+        max_inflight_msgs: 1,
+        max_uncommitted_size: 256,
+        max_entry_bytes: 256,
+        ..SETTINGS
+    };
+    let config = LogConfig {
+        group_entries: 102,
+        group_bytes: 1 << 20,
+        ..log_config()
+    };
+    let bounded = Range {
+        settings: small,
+        ..range()
+    };
+    let (mut stalls, mut installs) = (0u64, 0u64);
+    for seed in 0..6u64 {
+        let mut nodes: Vec<Node> = (1..=3u64)
+            .map(|id| {
+                let device = sim(300 + 3 * seed + id);
+                let log = Log::create(device, config, 0x6c6f67 + u128::from(id)).unwrap();
+                let replica = open(id, &log, first_range(), &bounded, 300 + seed + id).unwrap();
+                Node { replica, log }
+            })
+            .collect();
+        nodes[0].replica.campaign().unwrap();
+        let mut serial = 0;
+        let mut wire: VecDeque<Message> = VecDeque::new();
+        for round in 0..60u64 {
+            let cut = (15..35).contains(&round);
+            let live = |id: u64| !(cut && id == 3);
+            for _ in 0..3 {
+                for n in nodes.iter_mut().filter(|n| live(n.replica.id())) {
+                    if !n.replica.is_leader() {
+                        continue;
+                    }
+                    for _ in 0..8 {
+                        serial += 1;
+                        // Refused while stalled or past the uncommitted bound: a fence fails the
+                        // drive below.
+                        let _ = n.replica.propose(&registration(serial));
+                        wire.extend(drive(&mut n.replica, false).0.messages);
+                    }
+                }
+                for _ in 0..10_000 {
+                    for n in nodes.iter_mut().filter(|n| live(n.replica.id())) {
+                        if n.replica.is_stalled() {
+                            stalls += 1;
+                            n.replica.compact(0, 0, Waker::noop()).unwrap();
+                        }
+                        wire.extend(drive(&mut n.replica, true).0.messages);
+                    }
+                    let Some(m) = wire.pop_front() else { break };
+                    if !live(m.to) {
+                        continue;
+                    }
+                    let (from, to) = (m.from, m.to);
+                    let is_snapshot = m.msg_type == MessageType::MsgSnapshot;
+                    // A message the core refuses, or a stalled member, changes nothing.
+                    let _ = nodes[usize::try_from(to).unwrap() - 1].replica.step(m);
+                    if is_snapshot {
+                        installs += 1;
+                        let _ = nodes[usize::try_from(from).unwrap() - 1]
+                            .replica
+                            .report_snapshot(to, true);
+                    }
+                }
+            }
+            for n in nodes.iter_mut().filter(|n| live(n.replica.id())) {
+                n.replica.tick().unwrap();
+            }
+        }
+        for n in &nodes {
+            assert!(
+                !n.replica.is_fenced(),
+                "seed {seed}: member {} fenced: {}",
+                n.replica.id(),
+                n.replica.describe()
+            );
+        }
+        let leader = nodes
+            .iter()
+            .position(|n| n.replica.is_leader())
+            .unwrap_or_else(|| panic!("seed {seed}: no leader"));
+        assert_eq!(
+            nodes[2].replica.applied(),
+            nodes[leader].replica.applied(),
+            "seed {seed}: member 3 never caught up: {}",
+            nodes[leader].replica.describe()
+        );
+    }
+    assert!(stalls > 0, "no write was refused for room");
+    assert!(installs > 0, "no member was caught up by a snapshot");
+}

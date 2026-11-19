@@ -2028,6 +2028,47 @@ pass over it unchanged, as nothing a job asks or is answered changed, which no t
 `node::tests::a_native_requests_work_may_cross_to_the_shard_that_drives_it` holds the value
 `Send`, so a lane may carry it (6e).
 
+*As built (2026-11-18), step 6's third part, its first half: a native put's body as the S3 door's*
+(6c, `crates/node/src/node/host.rs`). A native request's fields are read by the node's task as
+before (`read_fields`); once they name a put (`Op::Put`, `UploadPart`, `Append`), its job's door
+becomes `Door::Fed`: the job takes its body from a bounded channel (`host::Pieces`) as an S3 job
+takes the listener's, through one function both doors' puts are fed by (`take_body`, which
+replaced `feed_put`'s read of the exchange and `feed_local_put`), and the node's task keeps the
+exchange's half (`host::Feeding`, `Node::feed_bodies`, after the host's step at each turn): it reads
+each piece the transport delivers as `feed_put` read it, gives the object's bytes as
+`door::Piece::Bytes`, keeps the trailer's value past them, and gives `Piece::End` carrying the
+trailer's checksum once the transport verified the body whole (`body_complete`), as an S3
+connection gives a body's end; the bytes read with the fields stay the job's carry, the trailer's
+among them the feeding's. Bounds: the channel holds one piece, the least that moves a body
+(`door::Depth::FIRST`), and a piece is read only once the job let go of the last, so while the
+job's driver takes nothing, nothing is read and the stream's flow control holds the client, as when
+the job read its exchange; an end the channel has no room for is held, one, and given once the job
+takes the last piece; one feeding a native put, each one of the host's jobs. Copies: a piece is
+copied once out of the transport's reservation, into storage of the feeding's own (`BytesMut`)
+that the piece the job takes is a view of (`Bytes`), where the job copied it into the bytes it
+carried; then once into the driver, as before. The storage is reused once the job let the piece go
+(`try_reclaim`), so no piece allocates past the first, as no piece did. The transport gives no
+owned bytes of a body: `Endpoint::read_body` copies QUIC's chunks into its owner's reservation, so
+handing QUIC's own chunks over, a copy fewer, is a change to hyper-transport, not made here. What
+the job did is kept: a job that lets go of its body, refused or done before its end, drops its
+channel, the node's task reads and drops the rest, and the job's reply goes once the body is read
+whole (`drain_job`); an exchange that fails tells the job `IncompleteBody` on its channel, and its
+end (`Node::job_lost`) lets both go; the job's vouching, its patience and its `SlowDown`s are as
+they were, and its reply is still written to the exchange by the job. A feeding that moved makes
+the node's next turn due at once (`host_due`), so the job takes what it was given there: a native
+put's body moves a piece a turn, where its job read as many as its driver took in one, the S3
+door's pace at its first depth. Tested (`node::host`): a body's pieces reach the driver in order and
+whole, its CRC-32C trailer holding, and a trailer that does not hold is refused (`BadChecksum`); a
+full channel holds the stream's bytes, the next piece read only once the job let go of the last,
+into the same storage, and an end held behind it given once it is taken; a stopped or reset stream
+ends the job `IncompleteBody`, and a job that let go has the rest dropped; and 63 pieces past the
+first ask the allocator for nothing, as the job's own read of them asked nothing (0 and 0
+allocations, 0 and 0 reallocations), each a view of the one storage. No node test runs the object
+host (each opens its nodes with no gateway), so the native suite (`crates/mantle/tests/native.rs`)
+is the end-to-end test, and the ladder its measure. Left, 6c's second half: the reply, which the
+node's task writes from a channel at the depth a reply needs (`door::Replying`), and with it the
+drain and the exchange's end.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

@@ -12,14 +12,15 @@
 //! preconditions and range are judged by `mantle_s3::conditional` and `mantle_s3::range`, a
 //! write's at the Name range's commit (05 §2).
 //!
-//! A put's body is read from its exchange only as fast as the driver takes it, a piece at a time,
-//! and a get's bytes are taken from its driver only as fast as the exchange takes them, so what an
-//! operation holds is its driver's window of blocks and one piece. The operations the host runs at
-//! once are bounded (`GatewaySettings::objects`); one past them is answered `SlowDown`.
+//! A put's body comes on a bounded channel as its door gives it, a native exchange's by the node's
+//! task (node.md §2.9 step 6c), only as fast as the driver takes it, a piece at a time, and a get's
+//! bytes are taken from its driver only as fast as the exchange takes them, so what an operation
+//! holds is its driver's window of blocks and a piece or two. The operations the host runs at once
+//! are bounded (`GatewaySettings::objects`); one past them is answered `SlowDown`.
 
 use std::collections::VecDeque;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use hyper_rt::compute;
 use hyper_rt::slow::Label;
 use hyper_rt::sync::{ChannelReceiver, OneshotReceiver, Sender, SyncError};
@@ -222,7 +223,7 @@ impl Job {
         }
         let bound = self.bound_ns();
         Some(match self.door {
-            Door::Exchange(_) => bound.min(now.saturating_add(beat)),
+            Door::Exchange(_) | Door::Fed(..) => bound.min(now.saturating_add(beat)),
             Door::Local(_) => bound,
         })
     }
@@ -259,23 +260,219 @@ enum Bounded {
 enum Door {
     /// A native exchange, the operation's fields at its body's start (`mantle_protocol::object`).
     Exchange(ExchangeId),
+    /// A native exchange whose fields were read and whose put's body the node's task gives from
+    /// it ([`Feeding`], node.md §2.9 step 6c), as the S3 listener gives a local door's: the job
+    /// takes its pieces from the channel and writes its reply to the exchange.
+    Fed(ExchangeId, Box<Pieces>),
     /// The S3 listener's, in-process (`crate::door`).
     Local(Box<Local>),
+}
+
+impl Door {
+    /// The native exchange the operation came in on, which its reply is written to; none for the
+    /// S3 listener's.
+    fn exchange(&self) -> Option<ExchangeId> {
+        match self {
+            Self::Exchange(exchange) | Self::Fed(exchange, _) => Some(*exchange),
+            Self::Local(_) => None,
+        }
+    }
+}
+
+/// A request's body as its door gives it: its pieces on a bounded channel, and its end once it
+/// came, with the checksum its trailer carried.
+struct Pieces {
+    pieces: ChannelReceiver<Piece>,
+    ended: Option<Option<checksum::Checksum>>,
 }
 
 /// A local door's ends: the request's body as the listener sends it, and the reply as the host
 /// writes it.
 struct Local {
-    body: ChannelReceiver<Piece>,
+    body: Pieces,
     reply: Sender<door::Answer>,
-    /// The body's end once it came, with the checksum its trailer carried.
-    ended: Option<Option<checksum::Checksum>>,
     /// Answers the reply's channel had no room for, sent before any other, in order. A stream's
     /// next piece is taken only once these are sent, so they are at most one piece of bytes and
     /// the few answers around it.
     pending: VecDeque<door::Answer>,
     /// Whether the listener was told the put wants its body.
     ready: bool,
+}
+
+/// A native put's body as the node's task reads it from its exchange for the put's job (node.md
+/// §2.9 step 6c), the exchange's half of what the S3 listener does for a local door: each piece
+/// the transport delivers given on the job's channel as an S3 connection gives one
+/// (`door::Piece`), the object's bytes apart from the trailer's value past them, and the body's
+/// end once the transport verified the body whole, the trailer's checksum with it. A piece is read
+/// only once the job let go of the last, so the channel holds one piece and the exchange's stream
+/// the rest: while the job's driver takes nothing, nothing is read, and the stream's flow control
+/// holds the client, as it did while the job read its own exchange.
+///
+/// Each piece is copied once out of the transport's reservation, into storage of the feeding's
+/// own that the piece is a view of (`Bytes`) and that is reused once the job let it go, where the
+/// job once copied it into the bytes it carries: a piece is copied no more than it was, and in
+/// storage reused from piece to piece, as the carried bytes were.
+pub(crate) struct Feeding {
+    pieces: Sender<Piece>,
+    /// The storage the piece in flight is a view of, made at the first piece.
+    storage: Option<BytesMut>,
+    /// A piece or end the channel had no room for, given before anything more is read.
+    held: Option<Piece>,
+    /// The object's bytes still to come, the trailer's algorithm, and its value read so far.
+    left: u64,
+    trailing: Option<checksum::Algorithm>,
+    trailer: Vec<u8>,
+    /// Whether the put's body is empty, its end given with no read of the exchange, as the job
+    /// ended it when it read its exchange.
+    empty: bool,
+    /// Whether the job let go of the body: the rest is read and dropped, so its exchange ends whole
+    /// for its reply.
+    dropping: bool,
+}
+
+/// What became of a body the node's task fed at a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fed {
+    /// Nothing moved: the job holds the last piece, or no bytes arrived.
+    Still,
+    /// A piece or the end given, or bytes read and dropped: the job's next turn is due at once.
+    Moved,
+    /// The body is ended, given or dropped whole, or its exchange failed.
+    Over,
+}
+
+impl Feeding {
+    /// The bytes `read` from the exchange, after the fields: the object's given to the job as a
+    /// piece, which counts them moved as it takes them, and the trailer's value past them kept for
+    /// the end, counted moved here. Refused `Malformed` where they pass the trailer's width, which
+    /// the transport's length of the body rules out (`Head::decode`).
+    fn give(&mut self, read: &[u8], moved: &mut u64) -> Result<Fed, Status> {
+        let object = usize::try_from(self.left)
+            .unwrap_or(usize::MAX)
+            .min(read.len());
+        let (bytes, trailer) = read.split_at_checked(object).ok_or(Status::Failed)?;
+        let width = self.trailing.map_or(0, checksum::Algorithm::width);
+        if self.trailer.len().saturating_add(trailer.len()) > width {
+            return Err(Status::Malformed);
+        }
+        self.trailer.extend_from_slice(trailer);
+        *moved = moved.saturating_add(u64::try_from(trailer.len()).unwrap_or(u64::MAX));
+        self.left = self
+            .left
+            .saturating_sub(u64::try_from(object).unwrap_or(u64::MAX));
+        if bytes.is_empty() {
+            return Ok(Fed::Still);
+        }
+        let storage = self
+            .storage
+            .get_or_insert_with(|| BytesMut::with_capacity(piece_len()));
+        storage.extend_from_slice(bytes);
+        let piece = Piece::Bytes(
+            storage.split().freeze(),
+            door::Paced {
+                sent: std::time::Instant::now(),
+                delivered_ns: None,
+            },
+        );
+        Ok(self.send(piece))
+    }
+
+    /// Whether the job let go of the last piece, so the next may be read into its storage: none
+    /// made yet, or reclaimed whole, every view of it dropped.
+    fn free(&mut self) -> bool {
+        self.held.is_none()
+            && self
+                .storage
+                .as_mut()
+                .is_none_or(|storage| storage.try_reclaim(piece_len()))
+    }
+
+    /// Whether the object's bytes and the trailer's value are all read.
+    fn read_whole(&self) -> bool {
+        self.left == 0 && self.trailer.len() == self.trailing.map_or(0, checksum::Algorithm::width)
+    }
+
+    /// The body's end, its trailer's checksum with it: `Over` once given, or once the job let go
+    /// of a body the transport already verified whole; held where the channel has no room.
+    fn end(&mut self) -> Fed {
+        let trailer = self.trailing.map(|algorithm| checksum::Checksum {
+            algorithm,
+            bytes: std::mem::take(&mut self.trailer),
+        });
+        match self.send(Piece::End(trailer)) {
+            Fed::Still => Fed::Still,
+            Fed::Moved | Fed::Over => Fed::Over,
+        }
+    }
+
+    /// Gives `piece` to the job, or holds it where the channel has no room; a job that let go of
+    /// its body has the rest dropped.
+    fn send(&mut self, piece: Piece) -> Fed {
+        match self.pieces.try_send(piece) {
+            Ok(()) => Fed::Moved,
+            Err(SyncError::Full(piece)) => {
+                self.held = Some(piece);
+                Fed::Still
+            }
+            Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => {
+                self.dropping = true;
+                Fed::Moved
+            }
+        }
+    }
+
+    /// Gives what the channel had no room for, first: whether it went, and whether it was the end.
+    fn send_held(&mut self) -> Option<Fed> {
+        let held = self.held.take()?;
+        let end = matches!(held, Piece::End(_));
+        Some(match self.send(held) {
+            Fed::Moved if end && !self.dropping => Fed::Over,
+            fed => fed,
+        })
+    }
+}
+
+/// A native put, its fields read, given its body by the node's task (node.md §2.9 step 6c): the
+/// object's bytes read past its fields kept as the bytes it carries, the trailer's value past them
+/// the feeding's, and the rest given on a channel of one piece, the least that moves a body
+/// (`door::Depth::FIRST`), from the feeding, which the node's task keeps, to the pieces, which the
+/// put's job takes. The reply its job ends with instead: `SlowDown` where the channel cannot be
+/// made, as the S3 listener answers one, and `Malformed` where the bytes past its fields pass the
+/// trailer's width, which the transport's length of the body rules out.
+fn feed(putting: &mut Putting) -> Result<(Feeding, Pieces), Box<Reply>> {
+    let width = putting.trailing.map_or(0, checksum::Algorithm::width);
+    let object = usize::try_from(putting.length)
+        .unwrap_or(usize::MAX)
+        .min(putting.carry.len());
+    let trailer = putting.carry.split_off(object);
+    if trailer.len() > width {
+        return Err(Box::new(Reply::status(Status::Malformed)));
+    }
+    let (pieces, taken) = hyper_rt::sync::channel(door::Depth::FIRST)
+        .map_err(|_| Box::new(Reply::slowed(door::Slowed::Door)))?;
+    let carried = u64::try_from(putting.carry.len()).unwrap_or(u64::MAX);
+    let feeding = Feeding {
+        pieces,
+        storage: None,
+        held: None,
+        left: putting.length.saturating_sub(carried),
+        trailing: putting.trailing,
+        trailer,
+        empty: putting.length == 0 && width == 0,
+        dropping: false,
+    };
+    Ok((
+        feeding,
+        Pieces {
+            pieces: taken,
+            ended: None,
+        },
+    ))
+}
+
+/// The bytes of a native body's piece: the transport's receive chunk (`PIECE`).
+fn piece_len() -> usize {
+    usize::try_from(PIECE).unwrap_or(usize::MAX)
 }
 
 /// What became of an answer sent on a local door.
@@ -540,10 +737,9 @@ struct Putting {
     /// What the body's end is checked against: its `Content-MD5` and checksum (05 §3.2).
     expected: Expected,
     /// The algorithm of the checksum a trailer brings with the body's end: aws-chunked's through
-    /// the listener's door, or the value past a native put's bytes (`object::Op::Put`).
+    /// the listener's door, or the value past a native put's bytes (`object::Op::Put`), which the
+    /// node's task reads ([`Feeding`]).
     trailing: Option<checksum::Algorithm>,
-    /// A native put's trailer read so far, at most its algorithm's width.
-    trailer: Vec<u8>,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
     /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
@@ -1416,9 +1612,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
-                body,
+                body: Pieces {
+                    pieces: body,
+                    ended: None,
+                },
                 reply,
-                ended: None,
                 pending: VecDeque::new(),
                 ready: false,
             })),
@@ -1770,6 +1968,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     work(op, carry, block)
                 }
             };
+            if let Work::Put(putting) = &mut job.work {
+                match feed(putting) {
+                    Ok((feeding, pieces)) => {
+                        job.door = Door::Fed(exchange, Box::new(pieces));
+                        self.feeding.push((exchange, feeding));
+                    }
+                    Err(reply) => job.work = Work::Draining(reply),
+                }
+            }
         }
         Ok(false)
     }
@@ -1911,6 +2118,141 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
+    /// The exchange's half of each native put's body (node.md §2.9 step 6c): read from its exchange
+    /// and given to its job as far as the job takes it, after the host's step in which the job took
+    /// what it was given ([`Feeding`]). One that moved makes the node's next turn due at once
+    /// (`host_due`), so its job takes what it was given; one ended, given or dropped whole or its
+    /// exchange failed, is let go.
+    pub(super) fn feed_bodies(&mut self) {
+        self.fed = false;
+        let mut at = 0;
+        while at < self.feeding.len() {
+            match self.feed_body(at) {
+                Fed::Still => at = at.saturating_add(1),
+                Fed::Moved => {
+                    self.fed = true;
+                    at = at.saturating_add(1);
+                }
+                Fed::Over => {
+                    self.fed = true;
+                    self.feeding.swap_remove(at);
+                }
+            }
+        }
+    }
+
+    /// One native put's body read from its exchange as far as its job takes it: a piece at a time
+    /// while the job let go of the last, the object's bytes given and the trailer's value kept,
+    /// then the body's end once the transport verified it whole, its trailer's checksum with it.
+    /// A job that let go of its body has the rest read and dropped, so the exchange ends whole for
+    /// its reply, as the job drained it when it read its exchange; an exchange that fails tells the
+    /// job its body did not come whole (`IncompleteBody`), as the job heard it then.
+    fn feed_body(&mut self, at: usize) -> Fed {
+        let Self {
+            feeding,
+            driver,
+            moved,
+            ..
+        } = self;
+        let Some((exchange, feeding)) = feeding.get_mut(at) else {
+            return Fed::Over;
+        };
+        let exchange = *exchange;
+        let endpoint = driver.endpoint();
+        let mut fed = Fed::Still;
+        loop {
+            match feeding.send_held() {
+                None => {}
+                Some(Fed::Still) => return fed,
+                Some(Fed::Over) => return Fed::Over,
+                Some(Fed::Moved) => fed = Fed::Moved,
+            }
+            if feeding.dropping {
+                break;
+            }
+            if feeding.read_whole() {
+                if !feeding.empty && !endpoint.body_complete(exchange) {
+                    // The body's checksum, after its last byte.
+                    let mut empty = hyper_transport::Reservation::default();
+                    let _ = endpoint.read_body(exchange, &mut empty);
+                    if !endpoint.body_complete(exchange) {
+                        return fed;
+                    }
+                }
+                match feeding.end() {
+                    Fed::Still => return fed,
+                    _ => return Fed::Over,
+                }
+            }
+            if !feeding.free() {
+                return fed;
+            }
+            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                return fed;
+            };
+            let got = endpoint.read_body(exchange, &mut piece);
+            let given = match got {
+                Ok(0) => Ok(Fed::Still),
+                Ok(_) => feeding.give(piece.bytes(), moved),
+                Err(_) => Err(Status::IncompleteBody),
+            };
+            endpoint.release(piece);
+            match (got, given) {
+                (Ok(0), _) => return fed,
+                (_, Ok(Fed::Still)) => {}
+                (_, Ok(_)) => fed = Fed::Moved,
+                // The exchange failed: its job hears its body did not come whole, and ends with
+                // the exchange.
+                (Err(_), Err(status)) => {
+                    let _ = feeding.pieces.try_send(Piece::Refused(status));
+                    return Fed::Over;
+                }
+                // Bytes past the trailer's value, which the transport's length of the body rules
+                // out: refused as the job refused them, the rest dropped for its reply.
+                (Ok(_), Err(status)) => {
+                    feeding.send(Piece::Refused(status));
+                    feeding.dropping = true;
+                    fed = Fed::Moved;
+                }
+            }
+        }
+        match self.drop_body(exchange) {
+            Fed::Still => fed,
+            dropped => dropped,
+        }
+    }
+
+    /// What is left of a body its job let go of, read and dropped as it arrives, so its exchange
+    /// ends whole for the job's reply (`drain_job`): `Over` once the transport verified it whole,
+    /// or the exchange is gone.
+    fn drop_body(&mut self, exchange: ExchangeId) -> Fed {
+        let endpoint = self.driver.endpoint();
+        loop {
+            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                return Fed::Still;
+            };
+            let got = endpoint.read_body(exchange, &mut piece);
+            self.moved = self
+                .moved
+                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
+            endpoint.release(piece);
+            match got {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => return Fed::Over,
+            }
+        }
+        if !endpoint.body_complete(exchange) && endpoint.head(exchange).is_some() {
+            let mut empty = hyper_transport::Reservation::default();
+            let _ = endpoint.read_body(exchange, &mut empty);
+        }
+        if endpoint.body_complete(exchange) || endpoint.head(exchange).is_none() {
+            Fed::Over
+        } else {
+            Fed::Still
+        }
+    }
+
     /// Asks again each chunk a put's driver holds for want of room, its volume's or the
     /// transport's; a driver that fails doing so ends its job as its failed answers do.
     fn offer_room(&mut self) -> Result<(), NodeError> {
@@ -1950,7 +2292,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             match job.bounded(now) {
                 Bounded::SlowDown => self.slow_job(at, door::Slowed::Patience)?,
                 Bounded::Held => {
-                    if let Door::Exchange(exchange) = job.door {
+                    if let Some(exchange) = job.door.exchange() {
                         self.driver.endpoint().working(exchange);
                     }
                 }
@@ -2729,182 +3071,50 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(false)
     }
 
-    /// Reads a put's body into its driver as far as the driver takes it: what it left of the
-    /// last piece first, then a piece at a time; at the body's end, the body ended, its digests
-    /// checked against what the request said before anything commits.
+    /// Reads a put's body into its driver as far as the driver takes it, from its door's channel
+    /// ([`take_body`]): a local door's as the S3 listener gives it, the listener told once the
+    /// driver first wants a byte, so a client that waits for `100 Continue` sends none before every
+    /// check that could refuse it passed, and each piece a sample of the body's depth
+    /// (`door::Depth`); a native exchange's as the node's task gives it ([`Feeding`]). A job whose
+    /// body does not hold ends with the status that says why.
     fn feed_put(&mut self, at: usize) -> Result<(), NodeError> {
-        if self
-            .jobs
-            .get(at)
-            .is_some_and(|j| matches!(j.door, Door::Local(_)))
-        {
-            return self.feed_local_put(at);
-        }
-        let Some(job) = self.jobs.get_mut(at) else {
-            return Ok(());
-        };
-        let Door::Exchange(exchange) = job.door else {
+        let Self {
+            jobs,
+            doorway,
+            moved,
+            ..
+        } = self;
+        let Some(job) = jobs.get_mut(at) else {
             return Ok(());
         };
         let Work::Put(putting) = &mut job.work else {
             return Ok(());
         };
-        let Some(put) = putting.put.as_mut() else {
+        let Some(put) = putting.put.as_ref() else {
             return Ok(());
         };
-        let endpoint = self.driver.endpoint();
-        // A trailer's value follows the object's bytes: the driver is fed those alone.
-        let width = putting.trailing.map_or(0, |a| a.width());
-        loop {
-            let left = usize::try_from(putting.length.saturating_sub(putting.taken))
-                .unwrap_or(usize::MAX)
-                .min(putting.carry.len());
-            if left > 0 {
-                if !put.wants_body() {
-                    return Ok(());
-                }
-                let took = match putting.carry.get(..left).map(|bytes| put.feed(bytes)) {
-                    Some(Ok(took)) => took,
-                    _ => return self.fail_job(at, Status::Failed),
-                };
-                putting.taken = putting
-                    .taken
-                    .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                putting.carry.drain(..took.min(putting.carry.len()));
-                if took < left {
-                    return Ok(());
-                }
-            }
-            if putting.taken >= putting.length && !putting.carry.is_empty() {
-                // Past the object's bytes, the trailer's; the transport holds the body to the
-                // length its head stated, the trailer's width within it.
-                if putting.trailer.len().saturating_add(putting.carry.len()) > width {
-                    return self.fail_job(at, Status::Malformed);
-                }
-                putting.trailer.append(&mut putting.carry);
-            }
-            if putting.taken >= putting.length && putting.trailer.len() == width {
-                if endpoint.body_complete(exchange) || (putting.length == 0 && width == 0) {
-                    if let Some(algorithm) = putting.trailing {
-                        putting.expected.checksum = Some(checksum::Checksum {
-                            algorithm,
-                            bytes: std::mem::take(&mut putting.trailer),
-                        });
+        let fed = match &mut job.door {
+            Door::Local(local) => {
+                if !local.ready && put.wants_body() {
+                    local.ready = true;
+                    if local.offer(door::Answer::Ready) == Sent::Gone {
+                        return self.fail_job(at, Status::IncompleteBody);
                     }
-                    if put.end(&putting.expected).is_err() && put.outcome().is_none() {
-                        return self.fail_job(at, Status::Failed);
-                    }
-                    // Ended once: nothing more is read, and the outcome answers it.
-                    putting.length = u64::MAX;
-                } else {
-                    // The body's checksum, after its last byte.
-                    let mut empty = hyper_transport::Reservation::default();
-                    let _ = endpoint.read_body(exchange, &mut empty);
                 }
-                return Ok(());
-            }
-            if putting.taken < putting.length && !put.wants_body() {
-                return Ok(());
-            }
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(());
-            };
-            let got = endpoint.read_body(exchange, &mut piece);
-            putting.carry.extend_from_slice(piece.bytes());
-            self.moved = self
-                .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
-            match got {
-                Ok(0) if putting.carry.is_empty() => return Ok(()),
-                Ok(_) => {}
-                Err(_) => return self.fail_job(at, Status::IncompleteBody),
-            }
-        }
-    }
-
-    /// A put's body from a local door (`crate::door`): the listener told once the driver first
-    /// wants a byte, so a client that waits for `100 Continue` sends none before every check
-    /// that could refuse it passed; each piece fed to the driver as it wants it, only what it did
-    /// not take kept; and the body's end taken only once the listener checked its signature and
-    /// its digest, its trailer's checksum then the one the end is checked against.
-    fn feed_local_put(&mut self, at: usize) -> Result<(), NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
-            return Ok(());
-        };
-        let (Door::Local(local), Work::Put(putting)) = (&mut job.door, &mut job.work) else {
-            return Ok(());
-        };
-        let Some(put) = putting.put.as_mut() else {
-            return Ok(());
-        };
-        if !local.ready && put.wants_body() {
-            local.ready = true;
-            if local.offer(door::Answer::Ready) == Sent::Gone {
-                return self.fail_job(at, Status::IncompleteBody);
-            }
-        }
-        loop {
-            if !putting.carry.is_empty() {
-                if !put.wants_body() {
-                    return Ok(());
-                }
-                let took = match put.feed(&putting.carry) {
-                    Ok(took) => took,
-                    Err(_) => return self.fail_job(at, Status::Failed),
-                };
-                putting.taken = putting
-                    .taken
-                    .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                putting.carry.drain(..took.min(putting.carry.len()));
-                if !putting.carry.is_empty() {
-                    return Ok(());
-                }
-            }
-            if let Some(trailer) = local.ended.take() {
-                // The listener framed the body at its stated length: an end before or past it is
-                // a body that does not hold.
-                if putting.taken != putting.length {
-                    return self.fail_job(at, Status::IncompleteBody);
-                }
-                if let Some(checksum) = trailer {
-                    putting.expected.checksum = Some(checksum);
-                }
-                if put.end(&putting.expected).is_err() && put.outcome().is_none() {
-                    return self.fail_job(at, Status::Failed);
-                }
-                // Ended once: nothing more is read, and the outcome answers it.
-                putting.length = u64::MAX;
-                return Ok(());
-            }
-            if putting.length == u64::MAX || !put.wants_body() {
-                return Ok(());
-            }
-            match local.body.try_recv() {
-                Ok(Some(Piece::Bytes(bytes, paced))) => {
-                    // The piece's time from its send to this turn: a sample of the body's depth.
-                    if let Some(doorway) = self.doorway.as_mut() {
+                take_body(&mut local.body, putting, moved, |paced| {
+                    if let Some(doorway) = doorway.as_mut() {
                         doorway.took(paced);
                     }
-                    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                    self.moved = self.moved.saturating_add(len);
-                    let took = match put.feed(&bytes) {
-                        Ok(took) => took,
-                        Err(_) => return self.fail_job(at, Status::Failed),
-                    };
-                    putting.taken = putting
-                        .taken
-                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                    if let Some(rest) = bytes.get(took..) {
-                        putting.carry.extend_from_slice(rest);
-                    }
-                }
-                Ok(Some(Piece::End(trailer))) => local.ended = Some(trailer),
-                Ok(Some(Piece::Refused(status))) => return self.fail_job(at, status),
-                Ok(None) => return Ok(()),
-                // The connection is gone with the body unfinished.
-                Err(_) => return self.fail_job(at, Status::IncompleteBody),
+                })
             }
+            // A native put's pieces come as its exchange delivers them, at no connection's pace.
+            Door::Fed(_, body) => take_body(body, putting, moved, |_| {}),
+            // A native request's fields are read before its put is made, which takes its body.
+            Door::Exchange(_) => Ok(()),
+        };
+        match fed {
+            Ok(()) => Ok(()),
+            Err(status) => self.fail_job(at, status),
         }
     }
 
@@ -3151,7 +3361,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let length = getting.total;
         let exchange = match door {
-            Door::Exchange(exchange) => *exchange,
+            Door::Exchange(exchange) | Door::Fed(exchange, _) => *exchange,
             // The reply goes first, its bytes after it as the driver gives them.
             Door::Local(local) => {
                 if local.offer(door::Answer::Head(reply)) == Sent::Gone {
@@ -3262,7 +3472,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(false);
         };
         let exchange = match &mut job.door {
-            Door::Exchange(exchange) => *exchange,
+            Door::Exchange(exchange) | Door::Fed(exchange, _) => *exchange,
             Door::Local(local) => {
                 // Every piece this turn sends carries the turn, the one held from the last turn's
                 // among them: the node learns the reply's depth from the time between turns its
@@ -4693,6 +4903,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let exchange = match job.door {
             Door::Exchange(exchange) => exchange,
+            // A put's body the node's task gives from the exchange: let go of, so the node's task
+            // reads and drops the rest (`Node::feed_body`).
+            Door::Fed(exchange, _) => {
+                job.door = Door::Exchange(exchange);
+                exchange
+            }
             // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
             // and its end go now.
             Door::Local(_) => {
@@ -4713,6 +4929,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Work::Draining(reply) = &job.work else {
             return Ok(false);
         };
+        // A body the node's task reads for the job is read and dropped there: the reply goes once
+        // it is let go, the body whole.
+        if self.feeding.iter().any(|(fed, _)| *fed == exchange) {
+            return Ok(false);
+        }
         let endpoint = self.driver.endpoint();
         loop {
             let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
@@ -4762,7 +4983,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let Door::Exchange(exchange) = job.door else {
+        let Some(exchange) = job.door.exchange() else {
             return Ok(true);
         };
         let Work::Replying(fields, written) = &mut job.work else {
@@ -4804,7 +5025,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub(super) fn job_on(&self, exchange: ExchangeId) -> Option<usize> {
         self.jobs
             .iter()
-            .position(|j| matches!(j.door, Door::Exchange(e) if e == exchange))
+            .position(|j| j.door.exchange() == Some(exchange))
     }
 
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
@@ -4818,8 +5039,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } = self;
         let now = hyper_rt::futures::now_ns();
         self.parked.retain(|p| p.exchange != exchange);
+        self.feeding.retain(|(fed, _)| *fed != exchange);
         jobs.retain_mut(|j| {
-            if !matches!(j.door, Door::Exchange(e) if e == exchange) {
+            if j.door.exchange() != Some(exchange) {
                 return true;
             }
             abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));
@@ -4907,7 +5129,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .iter()
             .filter_map(|l| l.ask)
             .any(|ask| self.reads_done.iter().any(|(a, _)| *a == ask));
-        if looked_up || pending.any(answered) {
+        // A body the node's task fed at the last turn: its job takes what it was given.
+        if self.fed || looked_up || pending.any(answered) {
             return Some(shard);
         }
         let wall = self.wall.now_ns();
@@ -4932,6 +5155,77 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .filter_map(|j| j.due_ns(shard, beat))
             .min();
         [renewal, bound].into_iter().flatten().min()
+    }
+}
+
+/// A put's body from its door's channel, fed to its driver as it wants it: what it did not take
+/// of the last piece first, then each piece as it comes, only what it did not take kept, each
+/// piece's bytes counted `moved` and its pacing told `took`; and the body's end taken only once
+/// the door gave it, its door having checked what the body's framing, signature and checksum
+/// say, its trailer's checksum then the one the end is checked against. The status the job ends
+/// with where the body does not hold.
+fn take_body(
+    body: &mut Pieces,
+    putting: &mut Putting,
+    moved: &mut u64,
+    mut took: impl FnMut(door::Paced),
+) -> Result<(), Status> {
+    let Some(put) = putting.put.as_mut() else {
+        return Ok(());
+    };
+    loop {
+        if !putting.carry.is_empty() {
+            if !put.wants_body() {
+                return Ok(());
+            }
+            let took = put.feed(&putting.carry).map_err(|_| Status::Failed)?;
+            putting.taken = putting
+                .taken
+                .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+            putting.carry.drain(..took.min(putting.carry.len()));
+            if !putting.carry.is_empty() {
+                return Ok(());
+            }
+        }
+        if let Some(trailer) = body.ended.take() {
+            // The door framed the body at its stated length: an end before or past it is a body
+            // that does not hold.
+            if putting.taken != putting.length {
+                return Err(Status::IncompleteBody);
+            }
+            if let Some(checksum) = trailer {
+                putting.expected.checksum = Some(checksum);
+            }
+            if put.end(&putting.expected).is_err() && put.outcome().is_none() {
+                return Err(Status::Failed);
+            }
+            // Ended once: nothing more is read, and the outcome answers it.
+            putting.length = u64::MAX;
+            return Ok(());
+        }
+        if putting.length == u64::MAX || !put.wants_body() {
+            return Ok(());
+        }
+        match body.pieces.try_recv() {
+            Ok(Some(Piece::Bytes(bytes, paced))) => {
+                // The piece's time from its send to this turn: a sample of the body's depth.
+                took(paced);
+                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                *moved = moved.saturating_add(len);
+                let took = put.feed(&bytes).map_err(|_| Status::Failed)?;
+                putting.taken = putting
+                    .taken
+                    .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                if let Some(rest) = bytes.get(took..) {
+                    putting.carry.extend_from_slice(rest);
+                }
+            }
+            Ok(Some(Piece::End(trailer))) => body.ended = Some(trailer),
+            Ok(Some(Piece::Refused(status))) => return Err(status),
+            Ok(None) => return Ok(()),
+            // The door is gone with the body unfinished.
+            Err(_) => return Err(Status::IncompleteBody),
+        }
     }
 }
 
@@ -5012,7 +5306,6 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             },
             expected: Expected { md5, checksum },
             trailing,
-            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry,
@@ -5111,7 +5404,6 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             preconditions: Preconditions::default(),
             expected: Expected { md5, checksum },
             trailing,
-            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry,
@@ -5215,7 +5507,6 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             preconditions: Preconditions::default(),
             expected: Expected::default(),
             trailing,
-            trailer: Vec::new(),
             put: None,
             taken: 0,
             carry,
@@ -5998,9 +6289,11 @@ mod tests {
         let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
         let mut job = Job {
             door: Door::Local(Box::new(Local {
-                body,
+                body: Pieces {
+                    pieces: body,
+                    ended: None,
+                },
                 reply,
-                ended: None,
                 pending: VecDeque::new(),
                 ready: false,
             })),
@@ -6043,6 +6336,327 @@ mod tests {
         assert_eq!(job.bounded(patience + 1), Bounded::Held);
         job.deadline_ns = Some(patience + 1);
         assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
+    }
+
+    /// A native put's work as its fields name it, with `carry` the bytes read past its fields and a
+    /// driver made over a body of `length` bytes whose trailer is a CRC-32C (`Op::Put`'s
+    /// `trailing`), which its end is checked against.
+    fn native_put(length: u64, carry: Vec<u8>) -> Box<Putting> {
+        let op = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+            trailing: Some(Algorithm::Crc32c),
+            metadata: Vec::new(),
+        };
+        let Work::Put(mut putting) = work(op, carry, None) else {
+            panic!("a put's work");
+        };
+        let root = WrappingKey::generate().unwrap();
+        let data = DataKey::generate().unwrap();
+        let keys = Keys {
+            file: 1,
+            wrapped: WrappedKey {
+                by: Wrapper::Root(1),
+                bytes: data.wrap(&root).unwrap(),
+            },
+            data,
+        };
+        let commit = Commit::Object(name::Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: 0,
+            ordered_ns: None,
+            version: Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".into(),
+                headers: Vec::new(),
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            },
+            default: None,
+            id: 1,
+            deadline_ns: u64::MAX,
+        });
+        let body = put::Body {
+            length,
+            checksum: Some(Algorithm::Crc32c),
+            content_md5: false,
+        };
+        let layout = Layout::new(durability::Scheme::Copies(3)).unwrap();
+        let holding = Holding {
+            handover_ns: 1,
+            window: 1,
+        };
+        putting.put =
+            Some(Put::new(commit, body, keys, layout, holding, Box::new(Random), 0).unwrap());
+        putting
+    }
+
+    /// A body past a native put's fields: `length` bytes of the object, then its CRC-32C, the
+    /// trailer's value.
+    fn native_body(length: usize) -> (Vec<u8>, Vec<u8>) {
+        let object: Vec<u8> = (0..length)
+            .map(|i| u8::try_from((i * 7 + i / 251) % 256).unwrap())
+            .collect();
+        let trailer = checksum::checksum(Algorithm::Crc32c, &object)
+            .unwrap()
+            .bytes;
+        (object, trailer)
+    }
+
+    /// The node's task's half of a stream (`Node::feed_body`) over `stream`, the bytes its
+    /// exchange delivers after the fields, as far as the put's job takes them, the job's turn
+    /// (`take_body`) between each of the node's: each read is of a piece at most, and only once
+    /// the job let go of the last. Whether the body ended.
+    fn feed_and_take(
+        feeding: &mut Feeding,
+        pieces: &mut Pieces,
+        putting: &mut Putting,
+        stream: &mut &[u8],
+    ) -> Result<bool, Status> {
+        let mut moved = 0;
+        for _ in 0..stream.len() / piece_len() + 8 {
+            if feeding.send_held() == Some(Fed::Still) {
+            } else if feeding.read_whole() {
+                assert_eq!(feeding.end(), Fed::Over);
+            } else if feeding.free() {
+                let (read, rest) = stream.split_at(stream.len().min(piece_len()));
+                feeding.give(read, &mut moved)?;
+                *stream = rest;
+            }
+            take_body(pieces, putting, &mut moved, |_| {})?;
+            if putting.length == u64::MAX {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// A native put's body, read past its fields by the node's task and given on its job's channel
+    /// a piece at a time, reaches its driver in order and whole: the bytes read with its fields
+    /// first, then each piece, the trailer's value carried by the end, against which the driver's
+    /// CRC-32C of the bytes it took holds. A trailer that does not hold is the driver's refusal.
+    #[test]
+    fn a_native_bodys_pieces_reach_its_put_in_order_and_whole() {
+        let (object, trailer) = native_body(3 * piece_len() + 1_000);
+        let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        // A read with the fields took 1,000 bytes of the object past them.
+        let mut putting = native_put(object.len() as u64, past[..1_000].to_vec());
+        let (mut feeding, mut pieces) = feed(&mut putting).unwrap();
+        let mut stream = &past[1_000..];
+        assert_eq!(
+            feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
+            Ok(true)
+        );
+        assert!(stream.is_empty());
+        let put = putting.put.as_ref().unwrap();
+        assert!(put.outcome().is_none(), "{:?}", put.outcome());
+        assert_eq!(
+            putting.expected.checksum.as_ref().map(|c| c.bytes.clone()),
+            Some(trailer.clone())
+        );
+
+        // The trailer, and the last object bytes, in the read with the fields: the end alone
+        // comes on the channel.
+        let (object, trailer) = native_body(10);
+        let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let mut putting = native_put(10, past.clone());
+        let (mut feeding, mut pieces) = feed(&mut putting).unwrap();
+        assert_eq!(putting.carry, object);
+        let mut stream: &[u8] = &[];
+        assert_eq!(
+            feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
+            Ok(true)
+        );
+        assert!(putting.put.as_ref().unwrap().outcome().is_none());
+
+        // A trailer that does not hold the bytes: the driver refuses the body.
+        let (object, mut trailer) = native_body(piece_len() + 5);
+        trailer[0] ^= 1;
+        let past: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let mut putting = native_put(object.len() as u64, Vec::new());
+        let (mut feeding, mut pieces) = feed(&mut putting).unwrap();
+        let mut stream = &past[..];
+        assert_eq!(
+            feed_and_take(&mut feeding, &mut pieces, &mut putting, &mut stream),
+            Ok(true)
+        );
+        assert!(matches!(
+            putting.put.as_ref().unwrap().outcome(),
+            Some(Err(PutError::BadChecksum))
+        ));
+    }
+
+    /// While a native put's job takes nothing, the node's task reads nothing more of its stream:
+    /// one piece on the channel, and the next read only once the job let go of it, in the same
+    /// storage, so nothing the body holds grows and the stream's flow control holds the client.
+    #[test]
+    fn a_full_channel_holds_the_streams_bytes() {
+        let (object, _) = native_body(4 * piece_len());
+        let mut putting = native_put(object.len() as u64, Vec::new());
+        let (mut feeding, mut pieces) = feed(&mut putting).unwrap();
+        let mut moved = 0;
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        // The job holds the piece on its channel: nothing more is read.
+        assert!(!feeding.free());
+        assert!(!feeding.free());
+        let Ok(Some(Piece::Bytes(first, _))) = pieces.pieces.try_recv() else {
+            panic!("the first piece");
+        };
+        assert_eq!(&first[..], &object[..piece_len()]);
+        // Taken but not let go: still nothing.
+        assert!(!feeding.free());
+        let storage = first.as_ptr();
+        drop(first);
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(&object[piece_len()..2 * piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        let Ok(Some(Piece::Bytes(second, _))) = pieces.pieces.try_recv() else {
+            panic!("the second piece");
+        };
+        assert_eq!(&second[..], &object[piece_len()..2 * piece_len()]);
+        assert_eq!(second.as_ptr(), storage, "the piece's storage is reused");
+        assert_eq!(feeding.left, 2 * piece_len() as u64);
+        // An end the channel has no room for is held, and given once the job takes the piece.
+        let mut putting = native_put(1, Vec::new());
+        let (mut feeding, mut pieces) = feed(&mut putting).unwrap();
+        assert_eq!(feeding.give(&[7, 1, 2, 3, 4], &mut moved), Ok(Fed::Moved));
+        assert!(feeding.read_whole());
+        assert_eq!(feeding.end(), Fed::Still);
+        assert_eq!(feeding.send_held(), Some(Fed::Still));
+        assert!(matches!(
+            pieces.pieces.try_recv(),
+            Ok(Some(Piece::Bytes(..)))
+        ));
+        assert_eq!(feeding.send_held(), Some(Fed::Over));
+        assert!(matches!(
+            pieces.pieces.try_recv(),
+            Ok(Some(Piece::End(Some(_))))
+        ));
+    }
+
+    /// A native put's stream that stops or is reset ends its job as it did when the job read the
+    /// stream: refused `IncompleteBody`, told on its channel or by its channel's end, the node's
+    /// task gone with the exchange (`Node::job_lost`). A job that lets go of its body has the rest
+    /// read and dropped by the node's task, nothing more given.
+    #[test]
+    fn a_stopped_or_reset_stream_ends_its_put_as_before() {
+        let (object, _) = native_body(2 * piece_len());
+        // The exchange failed mid-body: the node's task tells the job.
+        let mut putting = native_put(object.len() as u64, Vec::new());
+        let (feeding, mut pieces) = feed(&mut putting).unwrap();
+        feeding
+            .pieces
+            .try_send(Piece::Refused(Status::IncompleteBody))
+            .unwrap();
+        let mut moved = 0;
+        assert_eq!(
+            take_body(&mut pieces, &mut putting, &mut moved, |_| {}),
+            Err(Status::IncompleteBody)
+        );
+        // The exchange lost and its feeding let go with it, the body unfinished.
+        let mut putting = native_put(object.len() as u64, Vec::new());
+        let (mut feeding, mut pieces) = feed(&mut putting).unwrap();
+        assert_eq!(
+            feeding.give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        drop(feeding);
+        assert_eq!(
+            take_body(&mut pieces, &mut putting, &mut moved, |_| {}),
+            Err(Status::IncompleteBody)
+        );
+        assert_eq!(putting.taken, piece_len() as u64);
+        // The job let go of its body: the next piece read finds it gone, and the rest is dropped.
+        let mut putting = native_put(object.len() as u64, Vec::new());
+        let (mut feeding, pieces) = feed(&mut putting).unwrap();
+        drop(pieces);
+        assert!(feeding.free());
+        assert_eq!(
+            feeding.give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        assert!(feeding.dropping);
+    }
+
+    /// What a native body's piece asks of the allocator on its way to the job, against what the
+    /// job's own read of its exchange asked (research/71, step 5): none past the first piece's
+    /// storage either way. A read was copied once into the bytes the job carried and once into its
+    /// driver; now it is copied once into the feeding's storage, which the job's piece is a view
+    /// of, and once into its driver, so a piece is copied no more than it was.
+    #[test]
+    fn a_native_bodys_piece_is_copied_and_allocated_no_more_than_the_jobs_own_read() {
+        const PIECES: usize = 64;
+        let (object, _) = native_body(PIECES * piece_len());
+        let mut driver = Vec::with_capacity(piece_len());
+        // The job's own read of its exchange: each piece copied into its carry, then into its
+        // driver, the carry drained of what the driver took.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut was = |read: &[u8], driver: &mut Vec<u8>| {
+            carry.extend_from_slice(read);
+            driver.clear();
+            driver.extend_from_slice(&carry);
+            carry.drain(..);
+        };
+        was(&object[..piece_len()], &mut driver);
+        hyper_measure::alloc::begin();
+        for read in object.chunks(piece_len()).skip(1) {
+            was(read, &mut driver);
+        }
+        let before = hyper_measure::alloc::end();
+        // The node's task's half: each piece copied into the feeding's storage and handed over;
+        // the job copies it into its driver and lets it go.
+        let mut putting = native_put(object.len() as u64, Vec::new());
+        let (mut feeding, mut pieces) = feed(&mut putting).unwrap();
+        let mut moved = 0;
+        let mut now = |read: &[u8], driver: &mut Vec<u8>| {
+            assert!(feeding.free());
+            assert_eq!(feeding.give(read, &mut moved), Ok(Fed::Moved));
+            let Ok(Some(Piece::Bytes(piece, _))) = pieces.pieces.try_recv() else {
+                panic!("a piece");
+            };
+            driver.clear();
+            driver.extend_from_slice(&piece);
+            piece.as_ptr()
+        };
+        // The first piece makes the storage, and the view that shares it: what the counter sees.
+        hyper_measure::alloc::begin();
+        let storage = now(&object[..piece_len()], &mut driver);
+        let first = hyper_measure::alloc::end();
+        assert!(first.allocations > 0, "{first:?}");
+        hyper_measure::alloc::begin();
+        let mut views = 0;
+        for read in object.chunks(piece_len()).skip(1) {
+            views += usize::from(now(read, &mut driver) == storage);
+        }
+        let after = hyper_measure::alloc::end();
+        assert_eq!(views, PIECES - 1, "each piece is a view of the one storage");
+        assert_eq!(
+            (before.allocations, before.reallocations),
+            (after.allocations, after.reallocations)
+        );
+        assert_eq!((after.allocations, after.reallocations), (0, 0));
     }
 
     fn refused(work: &Work) -> Option<Status> {

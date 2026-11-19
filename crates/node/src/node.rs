@@ -1044,6 +1044,12 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// (`crate::window`).
     put_window: crate::window::Window,
     jobs: Vec<host::Job>,
+    /// The exchange's half of each native put's body, read from its exchange for its job (node.md
+    /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's.
+    feeding: Vec<(ExchangeId, host::Feeding)>,
+    /// Whether a body moved at the last turn's feeding (`Node::feed_bodies`): the next turn is due
+    /// at once, for its job to take what it was given.
+    fed: bool,
     /// The native requests the host admitted running on each of the node's shards, the count the
     /// rule places each on (node.md §2.9 step 6, `node::drivers`): over the one shard the node's
     /// task drives every request on, so each is placed on the first, where it runs.
@@ -1523,6 +1529,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             parked_most: exchanges,
             put_window: crate::window::Window::default(),
             jobs: Vec::new(),
+            feeding: Vec::new(),
+            fed: false,
             drivers: drivers::Drivers::over(NonZeroUsize::MIN),
             abandoned: Vec::new(),
             repair: None,
@@ -2422,6 +2430,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.take_door();
         self.take_parked();
         self.step_host()?;
+        self.feed_bodies();
         self.observe_presence()?;
         self.step_repair()?;
         self.step_asks(now)?;

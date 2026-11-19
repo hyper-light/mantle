@@ -668,10 +668,14 @@ pub struct Endpoint<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role
     /// sends goes to the back, as it may have more; one with nothing leaves until touched again.
     sending: VecDeque<usize>,
     /// The connections by their next deadline, the earliest first (src/deadlines.rs, by key): the
-    /// connection's QUIC timer or its exchanges' earliest wait, whichever comes first.
+    /// connection's QUIC timer or its exchanges' earliest wait, whichever comes first. Deferred: a
+    /// deadline that moved later is in `wanted`, its entry keyed earlier until it comes first.
     deadlines: Vec<(Instant, u64)>,
     /// Each connection's index in `deadlines`, by key.
     positions: Vec<Option<usize>>,
+    /// Each connection's deadline as last placed, by key: never earlier than its key in
+    /// `deadlines` (`deadlines::defer`).
+    wanted: Vec<Option<Instant>>,
     /// The connections a timeout found due, gathered before they are driven.
     due: Vec<u64>,
     /// The frontier of a walk of `deadlines` for the due ones.
@@ -1050,6 +1054,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             sending: VecDeque::new(),
             deadlines: Vec::new(),
             positions: Vec::new(),
+            wanted: Vec::new(),
             due: Vec::new(),
             walk: Vec::new(),
             serials: 0,
@@ -1151,7 +1156,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// When [`Endpoint::handle_timeout`] is next due.
     pub fn poll_timeout(&mut self) -> Option<Instant> {
         self.read_touched();
-        let first = self.deadlines.first().map(|(due, _)| *due);
+        let first = deadlines::first_wanted(&mut self.deadlines, &mut self.positions, &self.wanted);
         #[cfg(feature = "oracle")]
         self.check_deadlines(first);
         first
@@ -1164,7 +1169,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         self.read_touched();
         let mut due = std::mem::take(&mut self.due);
         due.clear();
-        deadlines::due(&self.deadlines, now, &mut self.walk, &mut due);
+        deadlines::due_wanted(&self.deadlines, &self.wanted, now, &mut self.walk, &mut due);
         for &id in &due {
             let Ok(key) = usize::try_from(id) else {
                 continue;
@@ -1341,6 +1346,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         if self.positions.len() <= key {
             self.positions.resize(key.saturating_add(1), None);
         }
+        if self.wanted.len() <= key {
+            self.wanted.resize(key.saturating_add(1), None);
+        }
     }
 
     /// Reads again the connections touched since the last poll: each is queued for its turn to
@@ -1386,7 +1394,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let Ok(id) = u64::try_from(key) else {
             return;
         };
-        deadlines::set(&mut self.deadlines, &mut self.positions, id, due);
+        deadlines::defer(
+            &mut self.deadlines,
+            &mut self.positions,
+            &mut self.wanted,
+            id,
+            due,
+        );
     }
 
     /// With the oracle on, the earliest deadline placed equals the one a visit of every connection

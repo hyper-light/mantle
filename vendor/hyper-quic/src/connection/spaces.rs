@@ -263,9 +263,14 @@ impl PacketSpace {
     }
 
     /// Whether a packet of the handshake's flights may still be in flight here: one numbered below
-    /// [`Self::flights_end`], the only packets [`Self::queue_copies`] copies
+    /// [`Self::flights_end`], the only packets [`Self::queue_copies`] copies. The packets held are
+    /// in number order, so the first answers it: every transmission asks, for every space, and a
+    /// search of the packets in flight for the bound cost a share of a busy connection's turn
+    /// (macOS `sample` of mantle, 2026-11-19: `SentPackets::range` 3.9% of a shard)
     pub(super) fn holds_flights(&self) -> bool {
-        self.sent_packets.range(..self.flights_end).next().is_some()
+        self.sent_packets
+            .first_number()
+            .is_some_and(|number| number < self.flights_end)
     }
 
     /// Get the next outgoing packet number in this space
@@ -641,14 +646,18 @@ impl Retransmits {
                 .any(|dir| *self.streams_blocked.get(dir) && streams.can_send_streams_blocked(dir))
             && self.reset_stream.is_empty()
             && self.stop_sending.is_empty()
-            && self
-                .max_stream_data
-                .iter()
-                .all(|&id| !streams.can_send_flow_control(id))
-            && self
-                .stream_data_blocked
-                .iter()
-                .all(|&id| streams.stream_data_blocked_limit(id).is_none())
+            // A set's walk visits every bucket it ever grew to, held or not: an empty one is
+            // asked first, as every transmission asks this of every space
+            && (self.max_stream_data.is_empty()
+                || self
+                    .max_stream_data
+                    .iter()
+                    .all(|&id| !streams.can_send_flow_control(id)))
+            && (self.stream_data_blocked.is_empty()
+                || self
+                    .stream_data_blocked
+                    .iter()
+                    .all(|&id| streams.stream_data_blocked_limit(id).is_none()))
             && self.crypto.is_empty()
             && self.new_cids.is_empty()
             && self.retire_cids.is_empty()
@@ -1494,6 +1503,11 @@ impl SentPackets {
         }
         .min(len);
         from.min(to)..to
+    }
+
+    /// The least number held: the first packet's, as they are held in number order.
+    pub(super) fn first_number(&self) -> Option<u64> {
+        self.packets.front().map(|(number, _)| *number)
     }
 
     /// Packets held (what a test of the copies' scan reads).

@@ -27,3 +27,20 @@ median of the six runs' medians.
 | Build | Median turn, quickest run | Median of the runs' medians | Tenth of turns under, quickest run | Datagrams a turn | Median turn a datagram, quickest run |
 |---|---|---|---|---|---|
 | perf-10k `518e78b8` | 434.2 µs | 469 µs | 360.8 µs | 816.2 | 532 ns |
+| deferred deadline heap, `holds_flights` from the first packet held, empty sets not walked, keyless handshake spaces passed first | 389.3 µs | 419 µs | 322.8 µs | 816.2 | 477 ns |
+
+The runs' medians, sorted: before 434.2, 453.3, 456.3, 482.0, 563.3, 726.9 µs; after 389.3,
+400.5, 415.8, 422.5, 426.2, 514.7 µs. About a tenth less a turn, at the same datagrams.
+
+Where the transmit side's time went, from a macOS `sample` of a 12,000-turn run of each build,
+self time within the server's timed calls:
+
+| Frame | Before | After |
+|---|---|---|
+| `deadlines::sift_down` + `sift_up` | 13.1% | 2.2% |
+| `Connection::fill_step` | 16.0% | 7.8% |
+| `PacketSpace::holds_flights` (`SentPackets::range`) | 1.2% | under 0.3% |
+| `Endpoint::place` | 1.9% | 2.2% |
+| `Retransmits::is_empty` | 1.7% | 2.7% |
+
+What is left is mostly each datagram's own: building its packet and sealing it (AES-GCM).

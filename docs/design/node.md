@@ -461,6 +461,20 @@ measures the second, and derives the rest by these rules:
   thread, or a stack size derived for each thread mantle spawns, would charge that. The issuer's
   workers, a read of the depth each where a pool carries the transfers, are most of them: 257 of
   269 at a depth of 256.
+  **The lanes:** a peer opens the node a lane for each shard that runs its ranges (§3.2), and
+  each shard past the first that runs ranges has its two lanes to the node's (§2.9); both are
+  counted for the shards the node places its ranges over (`range_shards`), as the process opens
+  the node with them (`NodeSettings::shards`): its first alone where unstated, so one lane a peer
+  and none between shards, whatever the runtime's shards. They were counted for every runtime
+  shard past the first, which runs no range where the ranges are on the first (`Node::spread`
+  moves none): a founder of the repair suite's cells (five founders, nine identities) on the
+  three-core 7 GiB macOS runner refused at 7,641,718,260 bytes with one volume measured 256 deep
+  and at 7,610,350,228 with two measured 4 deep (release candidate bd4d1b41). Counted at one lane a
+  peer, its transport's budget is the least the node's own transport takes there, 229,307,832
+  bytes less, and its runtime holds no lane between shards, 71,030,400 bytes less with one volume
+  and 126,418,560 with two: floors of 7,341,380,028 and 7,254,623,836 bytes (`derive.rs`'s
+  `a_repair_founder_on_cis_macos_runner_starts_at_the_lanes_its_ranges_open`). Two volumes
+  measured past 112 deep still pass that machine where a pool's worker carries each transfer.
   *Open:* a range's member is stated at the bounds hyper-raft puts on each queue, which mantle
   states as one `Ready` of the range's settings (`mantle_range::limits`): 52.9 MB a member at the
   floor, where three members held 11.0 MB at most through the shapes that fill each hold, and

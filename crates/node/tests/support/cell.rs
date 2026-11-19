@@ -39,6 +39,7 @@ use mantle_meta::engine::{Engine, Model};
 use mantle_meta::name;
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Entry};
+use mantle_node::ask::CommandOutcome;
 use mantle_node::client::{Asks, Client, ClientSettings};
 use mantle_node::directory::Peer;
 use mantle_node::node::{
@@ -483,6 +484,14 @@ enum Order {
     /// A read of the range the node asks itself, as a gateway's request does (`Node::read`),
     /// under the test's tag; asked of no one where the node holds as many of its own as it keeps.
     OwnRead(u64),
+    /// Commands the node asks of the range itself, as a gateway's requests do (`Node::command`):
+    /// a put of key `own-<tag>` for each tag from the first, `count` of them, each by the deadline
+    /// on the shard's clock.
+    OwnCommands {
+        first: u64,
+        count: u64,
+        deadline_ns: u64,
+    },
 }
 
 /// What a task tells the test.
@@ -513,6 +522,8 @@ enum Report {
     /// A node's own read under the test's tag, answered: whether it ended past its range's budget
     /// without a leader that serves it (`ReadOutcome::Deadline`).
     OwnRead(u64, u64, bool),
+    /// A node's own command under the test's tag, ended: its outcome, or why the node took it not.
+    OwnCommand(u64, u64, Result<CommandOutcome, String>),
 }
 
 /// A node's task: opens the node on its log, reports where it listens, then turns it, each turn
@@ -546,6 +557,7 @@ async fn run_node(
     };
     let mut told: Option<Status> = None;
     let mut own_reads: Vec<(u64, u64)> = Vec::new();
+    let mut own_commands: Vec<(u64, u64)> = Vec::new();
     loop {
         let ended = {
             let turn = pin!(node.turn());
@@ -579,6 +591,29 @@ async fn run_node(
                     own_reads.push((ask, tag));
                 }
             }
+            Either::Second(Ok(Order::OwnCommands {
+                first,
+                count,
+                deadline_ns,
+            })) => {
+                for tag in first..first + count {
+                    // A key of 256 bytes: an entry of the range's 1 KiB carries two such puts,
+                    // well within what a replication message carries.
+                    let key = format!("own-{tag:0>252}");
+                    let put = crate::history::put(&key, "e", u128::from(tag));
+                    match node.command(GROUP, put, deadline_ns, mantle_node::ask::Wait::Request) {
+                        Ok(ask) => own_commands.push((ask, tag)),
+                        Err(error) => {
+                            if reports
+                                .send(Report::OwnCommand(id, tag, Err(error.to_string())))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             Either::Second(Ok(Order::Replace(failed, joining))) => {
                 if let Err(error) = node.replace(GROUP, failed, joining) {
                     let _ = reports.send(Report::Failed(id, error.to_string()));
@@ -602,6 +637,21 @@ async fn run_node(
                     own_reads.remove(at);
                     let deadline = matches!(outcome, mantle_node::ask::ReadOutcome::Deadline);
                     if reports.send(Report::OwnRead(id, tag, deadline)).is_err() {
+                        return;
+                    }
+                }
+                None => at += 1,
+            }
+        }
+        let mut at = 0;
+        while let Some((ask, tag)) = own_commands.get(at).copied() {
+            match node.take_command(ask) {
+                Some(outcome) => {
+                    own_commands.remove(at);
+                    if reports
+                        .send(Report::OwnCommand(id, tag, Ok(outcome)))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -697,6 +747,12 @@ pub struct Sim {
     pub own_reads: Vec<(u64, u64, bool, u64)>,
     /// The reads of its own each node keeps out at once: none but in a cell with a spare.
     read_asks: usize,
+    /// The commands of its own each node holds at once: none but in a cell that asks them
+    /// ([`Sim::asking_itself`]).
+    command_asks: usize,
+    /// Each node's own command ended ([`Sim::own_commands`]): the node, the tag, its outcome, and
+    /// when the test took it.
+    pub own_commands: Vec<(u64, u64, Result<CommandOutcome, String>, u64)>,
     /// The node starts so far, each drawing its endpoint's seed afresh.
     starts: u64,
     /// The transport budget each node holds, from its statement.
@@ -739,7 +795,20 @@ impl Sim {
 
     /// The cell of `seed` of `nodes`, its range under `settings` and its nodes' logs under `log`.
     fn of(seed: u64, nodes: u64, settings: Settings, log: LogConfig, budget: Budget) -> Self {
-        Self::spared(seed, nodes, nodes, settings, log, budget)
+        Self::spared(seed, (nodes, nodes), (settings, log), budget, 0)
+    }
+
+    /// The cell of `seed`, its range under `settings`, each node holding `command_asks` commands
+    /// of its own at once ([`Sim::own_commands`]).
+    pub fn asking_itself(seed: u64, settings: Settings, command_asks: usize) -> Self {
+        let nodes = if seed % 2 == 1 { NODES } else { MOST_NODES };
+        Self::spared(
+            seed,
+            (nodes, nodes),
+            (settings, log_config()),
+            bounds::least_transport,
+            command_asks,
+        )
     }
 
     /// The cell of `seed` of `voters` founding voters and one spare past them, which runs from the
@@ -747,22 +816,20 @@ impl Sim {
     pub fn with_spare(seed: u64, voters: u64) -> Self {
         Self::spared(
             seed,
-            voters,
-            voters + 1,
-            SETTINGS,
-            log_config(),
+            (voters, voters + 1),
+            (SETTINGS, log_config()),
             bounds::least_transport,
+            0,
         )
     }
 
     /// The cell of `seed` of `nodes`, its range's founding voters nodes 1 to `voters`.
     fn spared(
         seed: u64,
-        voters: u64,
-        nodes: u64,
-        settings: Settings,
-        log: LogConfig,
+        (voters, nodes): (u64, u64),
+        (settings, log): (Settings, LogConfig),
         budget: Budget,
+        command_asks: usize,
     ) -> Self {
         let shards = usize::try_from(nodes + CLIENTS + 1).unwrap();
         let mut rt = SimRuntime::new(
@@ -839,6 +906,8 @@ impl Sim {
             replaced: Vec::new(),
             own_reads: Vec::new(),
             read_asks: if nodes > voters { OWN_READS } else { 0 },
+            command_asks,
+            own_commands: Vec::new(),
             starts: 0,
             budget,
         };
@@ -913,7 +982,7 @@ impl Sim {
             storage: Storage::none(),
             chunk_bytes: CHUNK_BYTES,
             chunk_asks: 0,
-            command_asks: 0,
+            command_asks: self.command_asks,
             read_asks: self.read_asks,
             // The run's clock from the Unix epoch: only differences of the times the ranges stamp
             // matter to the commands the simulation runs, and a seed replays them.
@@ -969,6 +1038,21 @@ impl Sim {
             .bound
             .map(|(q, p)| vec![q.port(), p.port()])
             .unwrap_or_default()
+    }
+
+    /// Has node `id` ask `count` commands of the range of its own, tagged from `first`, each by
+    /// `deadline_ns` on the shard's clock, as a gateway's requests do.
+    pub fn own_commands(&mut self, id: u64, first: u64, count: u64, deadline_ns: u64) {
+        if let Some(orders) = &self.members[&id].orders {
+            orders
+                .try_send(Order::OwnCommands {
+                    first,
+                    count,
+                    deadline_ns,
+                })
+                .map_err(|_| "a node's orders are full")
+                .unwrap();
+        }
     }
 
     /// Has node `id` ask a read of the range of its own under `tag`, as a gateway's request does.
@@ -1213,6 +1297,10 @@ impl Sim {
                 Report::OwnRead(id, tag, deadline) => {
                     let now = self.rt.now_ns();
                     self.own_reads.push((id, tag, deadline, now));
+                }
+                Report::OwnCommand(id, tag, outcome) => {
+                    let now = self.rt.now_ns();
+                    self.own_commands.push((id, tag, outcome, now));
                 }
                 Report::Part(id, part) => {
                     self.parts.insert(id, part);

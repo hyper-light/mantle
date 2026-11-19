@@ -1002,19 +1002,11 @@ pub fn init(said: &mut impl Write, out: &Path, cell: &Cell) -> Result<(), Error>
 }
 
 /// A client of the native protocol for the cell `mantle init` made in `cell`, its directory made at
-/// `out` (node.md §1.5, §3.6): its id drawn from the OS, nonzero and no founder's; its certificate
-/// issued under the cell's authority, `client-ID` acting for the cell's account, a connection's
-/// client end alone (`mantle_cert::client`); its key, owner-only; the authority's certificate,
-/// which its nodes' chain to; and its `config`, naming each founder where it listens.
+/// `out` (node.md §1.5, §3.6): its identity issued under the cell's authority
+/// ([`Authority::issue_client`]) and written durably, its key owner-only; the authority's
+/// certificate, which its nodes' chain to; and its `config`, naming each founder where it listens.
 pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Error> {
-    let Authority {
-        name: authority_name,
-        account,
-        nodes,
-        certificate: authority,
-        key: authority_key,
-        ..
-    } = Authority::read(cell)?;
+    let authority = Authority::read(cell)?;
     match std::fs::read_dir(out) {
         Ok(mut entries) => {
             if entries.next().is_some() {
@@ -1024,35 +1016,13 @@ pub fn client(said: &mut impl Write, out: &Path, cell: &Path) -> Result<(), Erro
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(Error::Io("looking in the directory it makes", e)),
     }
-    let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
-    let id = loop {
-        let id = u64::from_le_bytes(random::<8>()?);
-        if id != 0 && !nodes.iter().any(|(node, _)| *node == id) {
-            break id;
-        }
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::Cert(e.to_string()))?
-        .as_secs();
-    let own = KeyPair::generate().map_err(cert)?;
-    let certificate = mantle_cert::client(
-        &authority_key,
-        &authority_name,
-        own.public_key(),
-        (&mantle_protocol::client_name(id), &account),
-        (
-            Validity {
-                not_before: now,
-                not_after: NO_EXPIRY,
-            },
-            Serial::draw().map_err(cert)?,
-        ),
-    )
-    .map_err(cert)?;
-    // Issued under the authority whose certificate the client keeps: the check a node's start
-    // makes of its own (RFC 5280 §6.1.3 (a)).
-    mantle_cert::issued_by(&certificate, &authority, now).map_err(cert)?;
+    let (id, certificate, own) = authority.issue_client()?;
+    let Authority {
+        account,
+        nodes,
+        certificate: authority,
+        ..
+    } = authority;
     let identity = out.join("identity");
     files::create_dir(&identity)?;
     files::write(&identity.join("authority.der"), &authority)?;
@@ -1233,6 +1203,44 @@ impl Authority {
                 KeyPair::from_pkcs8(&pkcs8).map_err(|e| Error::Cert(format!("{e:?}")))
             })?;
         Ok(Some((der, pair)))
+    }
+
+    /// A native client's identity issued under the authority, in memory (node.md §3.6): its id
+    /// drawn from the OS, nonzero and no node's; its certificate, `client-ID` acting for the cell's
+    /// account, a connection's client end alone (`mantle_cert::client`); and its key. What
+    /// [`client`] writes for a client to keep, and what `mantle bench doors` gives each client it
+    /// opens, no file written.
+    pub(crate) fn issue_client(&self) -> Result<(u64, Vec<u8>, KeyPair), Error> {
+        let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
+        let id = loop {
+            let id = u64::from_le_bytes(random::<8>()?);
+            if id != 0 && !self.nodes.iter().any(|(node, _)| *node == id) {
+                break id;
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Error::Cert(e.to_string()))?
+            .as_secs();
+        let own = KeyPair::generate().map_err(cert)?;
+        let certificate = mantle_cert::client(
+            &self.key,
+            &self.name,
+            own.public_key(),
+            (&mantle_protocol::client_name(id), &self.account),
+            (
+                Validity {
+                    not_before: now,
+                    not_after: NO_EXPIRY,
+                },
+                Serial::draw().map_err(cert)?,
+            ),
+        )
+        .map_err(cert)?;
+        // Issued under the authority whose certificate the client keeps: the check a node's start
+        // makes of its own (RFC 5280 §6.1.3 (a)).
+        mantle_cert::issued_by(&certificate, &self.certificate, now).map_err(cert)?;
+        Ok((id, certificate, own))
     }
 }
 
@@ -2015,6 +2023,43 @@ mod tests {
             );
         }
         assert!(files::owner_only(&granted.join("identity").join(ISSUER.1)).unwrap());
+    }
+
+    /// A native client's identity issued in memory, as `mantle bench doors` gives one to each
+    /// client it opens: its id nonzero, no node's and no other client's, and its key its own; its
+    /// certificate for that key, `client-ID` acting for the cell's account, issued by the cell's
+    /// authority.
+    #[test]
+    fn each_clients_identity_is_its_own_under_the_cells_authority() {
+        let (_root, out, _) = made(&[
+            "quic=127.0.0.1:9101,plane=127.0.0.1:9201",
+            "quic=127.0.0.1:9102,plane=127.0.0.1:9202",
+        ]);
+        let authority = Authority::read(&out).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut issued: Vec<(u64, Vec<u8>)> = Vec::new();
+        for _ in 0..4 {
+            let (id, certificate, key) = authority.issue_client().unwrap();
+            assert_ne!(id, 0);
+            assert!(authority.nodes.iter().all(|(node, _)| *node != id));
+            mantle_cert::issued_by(&certificate, &authority.certificate, now).unwrap();
+            assert_eq!(
+                mantle_cert::public_key(&certificate).unwrap(),
+                key.public_key()
+            );
+            let names = mantle_cert::client_names(&certificate).unwrap();
+            assert_eq!(names.name, mantle_protocol::client_name(id));
+            assert_eq!(names.account, authority.account);
+            assert!(
+                issued
+                    .iter()
+                    .all(|(other, public)| *other != id && public != key.public_key())
+            );
+            issued.push((id, key.public_key().to_vec()));
+        }
     }
 
     /// A cell has its issuer from its founding, beside the authority's key and in each founder's

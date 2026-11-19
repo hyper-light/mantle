@@ -373,3 +373,65 @@ fn a_drawn_id_is_one_string_at_its_length() {
         assert!(drawn.insert(id));
     }
 }
+
+/// `checksum::multipart_etag` as it was before: its hex in a string of its own, then `format!`.
+fn reference_multipart_etag(parts: &[[u8; 16]]) -> String {
+    let mut h = crypto::Digest::new(&crypto::MD5).unwrap();
+    for part in parts {
+        h.update(part).unwrap();
+    }
+    let digest: [u8; 16] = h.finish_array().unwrap();
+    format!("{}-{}", reference_etag(&digest), parts.len())
+}
+
+/// A multipart object's ETag is one string made at its length, the parts' MD5's 32 hex digits, a
+/// dash and the count, as the encoder before wrote them: one part, ten and S3's most, 10,000.
+#[test]
+fn a_multipart_etag_is_one_string_at_its_length() {
+    for count in [1usize, 10, 10_000] {
+        let parts: Vec<[u8; 16]> = (0..count)
+            .map(|n| std::array::from_fn(|i| u8::try_from((n + i) % 251).unwrap()))
+            .collect();
+        let (expected, before) = counted(|| reference_multipart_etag(&parts));
+        let (etag, made) = counted(|| mantle_s3::checksum::multipart_etag(&parts).unwrap());
+        println!("multipart etag of {count}: before {before:?}, now {made:?}");
+        assert_eq!(made.1, 0, "{count}: no reallocation");
+        assert_eq!(etag.capacity(), etag.len(), "{count}");
+        assert_eq!(etag, expected);
+    }
+}
+
+/// An object of parts' composite checksum is one string made at its length, base64 of the parts'
+/// checksum, a dash and the count, as the encoder before wrote it.
+#[test]
+fn a_composite_checksum_is_one_string_at_its_length() {
+    use mantle_s3::checksum::{self, Algorithm, Checksum};
+    for algorithm in [
+        Algorithm::Crc32,
+        Algorithm::Crc32c,
+        Algorithm::Sha1,
+        Algorithm::Sha256,
+    ] {
+        for count in [1usize, 10, 10_000] {
+            let parts: Vec<Checksum> = (0..count)
+                .map(|n| {
+                    let mut h = checksum::Hasher::new(algorithm).unwrap();
+                    h.update(&n.to_le_bytes()).unwrap();
+                    h.finish().unwrap()
+                })
+                .collect();
+            let reference = {
+                let mut h = checksum::Hasher::new(algorithm).unwrap();
+                for part in &parts {
+                    h.update(&part.bytes).unwrap();
+                }
+                format!("{}-{}", h.finish().unwrap().to_base64(), parts.len())
+            };
+            let (value, made) = counted(|| checksum::composite(&parts).unwrap().unwrap());
+            println!("composite {algorithm:?} of {count}: now {made:?}");
+            assert_eq!(made.1, 0, "{algorithm:?} {count}: no reallocation");
+            assert_eq!(value.capacity(), value.len(), "{algorithm:?} {count}");
+            assert_eq!(value, reference);
+        }
+    }
+}

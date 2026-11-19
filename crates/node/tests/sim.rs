@@ -999,3 +999,89 @@ fn changed(seed: u64, voters: u64, change: impl Fn(&Sim, u64) -> (u64, u64)) {
         }
     });
 }
+
+/// REPRODUCTION of an open bug, failing, so ignored until it is fixed: a cell of one voter grows
+/// to two under the clients' load, each node asking a read of its own every 20 ms as a gateway's
+/// request does (`Node::read`), and the new voter's device holds its writes for 1 s from its
+/// promotion, as a new member's busy disk does. Every read asked after the device answers again
+/// must be answered, or ended past its range's budget, within the cell's quiet period
+/// (`Sim::quiet`) of its asking (CLAUDE.md §2). On seed 1 the founder's reads are all answered,
+/// but none of the new voter's is again: its reads wait paused at the longest backoff (its
+/// status says `asking: 3.072s`) and are asked again for good, never answered and never ended,
+/// its clock without a leader never started. Without the hold every read of both is answered.
+/// Seen while looking for CI gates run 44510117734's "2 nodes" SlowDown
+/// (`crates/mantle/tests/membership.rs`), which a cell grown to two voters answered a GET.
+#[test]
+#[ignore = "reproduction of an open bug: a new voter's own reads go unanswered after its device \
+            held its writes at its promotion"]
+fn a_new_voters_own_reads_are_answered_after_its_device_held_its_writes_at_its_promotion() {
+    let seed = 1;
+    let mut cell = Sim::with_spare(seed, 1);
+    cell.until("the founder leads", |c| {
+        if c.members[&1].status.is_some_and(|s| s.leader == 1) {
+            Some(())
+        } else {
+            None
+        }
+    });
+    cell.open_bucket();
+    let ops = (2 * (log_config().group_entries + 1)).div_ceil(CLIENTS);
+    let stops = cell.start_workload(ops);
+    cell.done_by(ops, 1);
+    cell.replace(cell.nodes + 1, 2);
+    let every = 20_000_000u64.max(2 * cell.longest_ns());
+    let hold = 1_000_000_000u64;
+    let (mut promoted, mut released, mut next) = (None::<u64>, None::<u64>, 0u64);
+    cell.until("the new voter's device answers again", |c| {
+        let now = c.now_ns();
+        if promoted.is_none() && !c.replaced.is_empty() {
+            promoted = Some(now);
+            c.hold_writes(2, true);
+        }
+        if let Some(at) = promoted
+            && now >= at + hold
+        {
+            c.hold_writes(2, false);
+            released = Some(now);
+            return Some(());
+        }
+        if now >= next {
+            c.own_read(1, now);
+            c.own_read(2, now);
+            next = now + every;
+        }
+        None
+    });
+    let released = released.unwrap();
+    let bound = cell.quiet();
+    // Reads asked after the release, each node's, until every one of them is answered.
+    let mut asked: Vec<(u64, u64)> = Vec::new();
+    let end = released + 10 * bound;
+    cell.until("every read asked after the release answered", |c| {
+        let now = c.now_ns();
+        if now >= next && now < end {
+            for id in [1, 2] {
+                c.own_read(id, now);
+                asked.push((id, now));
+            }
+            next = now + every;
+        }
+        for (id, at) in &asked {
+            let answered = c.own_reads.iter().any(|r| r.0 == *id && r.1 == *at);
+            assert!(
+                answered || now < at + bound,
+                "seed {seed}: node {id}'s own read asked {} ns after the release unanswered past \
+                 {bound} ns; node 1 answered {}, node 2 {}; statuses {:?}",
+                at - released,
+                c.own_reads.iter().filter(|r| r.0 == 1).count(),
+                c.own_reads.iter().filter(|r| r.0 == 2).count(),
+                c.members
+                    .iter()
+                    .map(|(id, m)| (*id, m.status))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if now >= end { Some(()) } else { None }
+    });
+    drop(stops);
+}

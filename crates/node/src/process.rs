@@ -2043,6 +2043,20 @@ fn run_node(
             .map_or(0, |g| u64::try_from(g.objects).unwrap_or(u64::MAX))
     });
     let runtime = runtime(&config, listening).map_err(step(Step::Network))?;
+    // The operations it is told within the process's descriptors, or the start refused, before a
+    // socket opens: `mantle serve` derives none past them, and `mantle node` runs what it is told.
+    crate::derive::within_descriptors(
+        crate::descriptors::limit().map_err(|e| ProcessError::Runtime(e.to_string()))?,
+        (
+            usize::from(runtime.shards),
+            config.volumes.len(),
+            config.ranges.len(),
+        ),
+        (&config.peers, config.seeds.len(), config.enlist.as_ref()),
+        listening.is_some() && gateway.is_some(),
+        gateway.as_ref().map_or(0, |g| g.objects),
+    )
+    .map_err(|e| step(Step::Network)(ProcessError::Derive(e)))?;
     let rt = Runtime::start(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
     // The compute pool beside the shards and below them (hyper-rt `compute`, its runtime.md

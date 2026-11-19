@@ -764,9 +764,14 @@ pub enum DeriveError {
     #[error("range {group:x}'s store: {why}")]
     Store { group: u128, why: String },
     #[error(
-        "the process may hold {limit} descriptors, short of the {fixed} the node holds whatever its operations and the {each} one operation holds beside them"
+        "the process may hold {limit} descriptors, short of the {fixed} the node holds whatever its operations and the {each} each of its {operations} operations holds beside them"
     )]
-    Descriptors { limit: u64, fixed: u64, each: u64 },
+    Descriptors {
+        limit: u64,
+        fixed: u64,
+        each: u64,
+        operations: u64,
+    },
 }
 
 /// The range's settings and rules, which every member of the cell derives alike, from the
@@ -1359,6 +1364,68 @@ pub fn operation_descriptors(listening: bool) -> Option<u64> {
     } else {
         Some(native)
     }
+}
+
+/// The cell's nodes and the gateways a node pins, from its `peers` lines, its `seeds` and its
+/// cell's bound on nodes where it states one: the nodes its lines name and itself, or the bound
+/// where more; the transport's peers are the nodes but itself and the gateways. `None` past a
+/// `usize`.
+pub fn cell_lines(
+    peers: &[PeerLine],
+    seeds: usize,
+    enlist: Option<&Enlisting>,
+) -> Option<(usize, usize)> {
+    let node_lines = peers
+        .iter()
+        .filter(|p| p.role == Role::Node)
+        .count()
+        .checked_add(seeds)?
+        .checked_add(1)?;
+    let cell_nodes = enlist
+        .and_then(|e| usize::try_from(e.max_nodes).ok())
+        .unwrap_or(0)
+        .max(node_lines);
+    let gateway_lines = peers.iter().filter(|p| p.role != Role::Node).count();
+    Some((cell_nodes, gateway_lines))
+}
+
+/// Whether a node of `shards` shards, `volumes` volumes, `ranges` ranges and the peers its `peers`
+/// lines, `seeds` and `enlist` make ([`cell_lines`]), serving S3 or not (`listening`), holds its
+/// `operations` within `limit` descriptors: the descriptors it holds at its most, or the refusal
+/// naming them. `mantle node` runs the numbers it is told, so its start checks them here, as
+/// `mantle serve` derives none past them ([`derive`]).
+pub fn within_descriptors(
+    limit: u64,
+    (shards, volumes, ranges): (usize, usize, usize),
+    (peers, seeds, enlist): (&[PeerLine], usize, Option<&Enlisting>),
+    listening: bool,
+    operations: usize,
+) -> Result<u64, DeriveError> {
+    let overflow = DeriveError::Overflow("the node's descriptors");
+    let (cell_nodes, gateway_lines) = cell_lines(peers, seeds, enlist).ok_or(overflow)?;
+    let transport_peers = cell_nodes
+        .saturating_sub(1)
+        .checked_add(gateway_lines)
+        .ok_or(DeriveError::Overflow("the transport's peers"))?;
+    let fixed = fixed_descriptors(shards, volumes, ranges, transport_peers, listening)
+        .ok_or(DeriveError::Overflow("the node's descriptors"))?;
+    let each = operation_descriptors(listening)
+        .ok_or(DeriveError::Overflow("an operation's descriptors"))?;
+    let operations =
+        u64::try_from(operations).map_err(|_| DeriveError::Overflow("the operations"))?;
+    let held = each
+        .checked_mul(operations)
+        .and_then(|held| held.checked_add(fixed))
+        .ok_or(DeriveError::Overflow("the node's descriptors"))?;
+    if held > limit {
+        return Err(DeriveError::Descriptors {
+            limit,
+            fixed,
+            each,
+            operations,
+        });
+    }
+    Ok(held)
 }
 
 /// The operations a process that may hold `limit` descriptors holds past the `fixed` its node
@@ -2125,21 +2192,9 @@ pub fn derive(
 
     // The cell's identities: its nodes, as many as it states it holds where it states it, else this
     // one and the nodes its lines name, and the gateways it pins (docs/design/membership.md §9).
-    let node_lines = stated
-        .peers
-        .iter()
-        .filter(|p| p.role == Role::Node)
-        .count()
-        .checked_add(stated.seeds.len())
-        .and_then(|n| n.checked_add(1))
-        .ok_or(overflow("the cell's nodes"))?;
-    let cell_nodes = stated
-        .enlist
-        .as_ref()
-        .and_then(|e| usize::try_from(e.max_nodes).ok())
-        .unwrap_or(0)
-        .max(node_lines);
-    let gateway_lines = stated.peers.iter().filter(|p| p.role != Role::Node).count();
+    let (cell_nodes, gateway_lines) =
+        cell_lines(&stated.peers, stated.seeds.len(), stated.enlist.as_ref())
+            .ok_or(overflow("the cell's nodes"))?;
     let identities = cell_nodes
         .checked_add(gateway_lines)
         .and_then(|n| u64::try_from(n).ok())
@@ -2268,6 +2323,7 @@ pub fn derive(
             limit: measured.descriptors,
             fixed: fixed_held,
             each: each_held,
+            operations: u64::from(hosts),
         });
     }
     // The shards the node places its ranges over, which its runtime's shards are sized for.
@@ -5273,6 +5329,53 @@ mod tests {
             derive(s3, &short, &mut fresh),
             Err(DeriveError::Descriptors { .. })
         ));
+    }
+
+    /// `mantle node` runs the operations it is told: within the limit its start says the
+    /// descriptors they take, past it the start is refused, naming them; `derive`'s own bound is
+    /// within it at its limit.
+    #[test]
+    fn a_told_node_past_its_descriptors_is_refused() {
+        let s3 = Stated {
+            s3: Some(crate::process::S3Stated {
+                listen: "127.0.0.1:7480".parse().unwrap(),
+                region: "us-east-1".into(),
+                names: Vec::new(),
+                certificate: at("/node/s3/cert.der"),
+                key: at("/node/s3/key.der"),
+                access: Vec::new(),
+            }),
+            ..stated(1)
+        };
+        let measured = Measured {
+            descriptors: 1_024,
+            ..facts(1)
+        };
+        let derived = derive(s3.clone(), &measured, &mut fresh).unwrap();
+        let objects = derived.config.gateway.as_ref().unwrap().objects;
+        let check = |operations| {
+            within_descriptors(
+                1_024,
+                (measured.cores, s3.volumes.len(), s3.ranges.len()),
+                (&s3.peers, s3.seeds.len(), s3.enlist.as_ref()),
+                true,
+                operations,
+            )
+        };
+        let held = check(objects).unwrap();
+        assert!(held <= 1_024, "{held}");
+        assert_eq!(
+            held,
+            said_bytes(&derived, "descriptors.fixed")
+                + said_bytes(&derived, "descriptors.each") * u64::try_from(objects).unwrap()
+        );
+        let past = usize::try_from(said_bytes(&derived, "descriptors.operations")).unwrap() + 1;
+        match check(past) {
+            Err(DeriveError::Descriptors {
+                limit, operations, ..
+            }) => assert_eq!((limit, operations), (1_024, u64::try_from(past).unwrap())),
+            other => panic!("{past} operations within 1,024 descriptors: {other:?}"),
+        }
     }
 
     /// A node holds a fixed descriptor for each shard's poller, volume and range more, and its

@@ -263,7 +263,9 @@ rest holds, `descriptors.operations`, bound `gateway.objects` where they are few
 holds, said `bound`, and with it the S3 listener's connections and the native clients the transport
 admits: a connection past them is answered `503 SlowDown`, `Connection: close`, or refused at
 admission, never met by `EMFILE` at `accept`. A limit short of the fixed descriptors and one
-operation refuses the start (`DeriveError::Descriptors`). `mantle node` runs the numbers it is told.
+operation refuses the start (`DeriveError::Descriptors`). `mantle node` runs the numbers it is told,
+and its start, before a socket opens, refuses operations whose descriptors with its fixed ones pass
+the limit, naming them (`derive::within_descriptors`).
 `mantle bench doors` counts its own clients' sockets, its cell's pipes and, under `--relay` and
 `--perf`, theirs, against the same limit before it starts, and refuses past it, naming both
 (`bench_doors::descriptors_fit`).

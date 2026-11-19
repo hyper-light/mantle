@@ -71,6 +71,7 @@ use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object;
 
 mod answers;
+mod drivers;
 mod enrollments;
 mod host;
 mod members;
@@ -1043,6 +1044,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// (`crate::window`).
     put_window: crate::window::Window,
     jobs: Vec<host::Job>,
+    /// The native requests the host admitted running on each of the node's shards, the count the
+    /// rule places each on (node.md §2.9 step 6, `node::drivers`): over the one shard the node's
+    /// task drives every request on, so each is placed on the first, where it runs.
+    drivers: drivers::Drivers,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
     abandoned: Vec<host::Pending>,
@@ -1518,6 +1523,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             parked_most: exchanges,
             put_window: crate::window::Window::default(),
             jobs: Vec::new(),
+            drivers: drivers::Drivers::over(NonZeroUsize::MIN),
             abandoned: Vec::new(),
             repair: None,
             seeing: Vec::new(),

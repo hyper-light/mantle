@@ -1964,6 +1964,28 @@ range, and neither changes. Tested: the task is spawned Critical and what it spa
 (`tests/shard_memory.rs`). What it buys in commit latency under S3 load is the `spread` ladder's
 to measure.
 
+*As built (2026-11-18), step 6's first part: the rule and its count* (6a,
+`crates/node/src/node/drivers.rs`). `Drivers` holds the native requests running on each of the
+node's shards, numbered from its first, and places each request the host admits, taken at once or
+from those parked (`host::start_object`), by the rule of 6a: the shard past the first running the
+fewest, the first of those tied, and the first where it is the only shard, as
+`listener::shards::least` places an S3 connection. The job keeps the shard it was placed on
+(`Job::driven`) and gives its place back as it ends: at the turn it is over (`Node::step_host`),
+or as its exchange ends unanswered (`Node::job_lost`). A request answered at once (refused,
+malformed or slowed) and an S3 door's operation are placed nowhere. The node holds it over the one
+shard its task drives every request on (`NonZeroUsize::MIN`), so each request is placed on the
+first, where it runs, until 6f places them over the shards `NodeSettings::shards` names, passing
+over one hyper-rt's watchdog sees held past its limit, as the listener's lanes do
+(`Lane::takes`). Bound: an entry a shard, and each count at most the host's jobs, each request
+placed being one; a count past a `usize`'s places nothing, and the request is answered `Failed`,
+one the host cannot run. Tested (`node::drivers`): a node of one shard drives every request on
+it; a request goes to the shard past the first running the fewest, the first of those tied, never
+the first while another exists; one that ended gives its place back to the rule; every shard past
+the first stays within one request of every other, from one shard to nine and one request to
+forty; an end where none runs counts nothing; and a count past a `usize`'s is refused, nothing
+placed. The host places and gives back inside a `Node`, which no unit test builds; the native
+suite (`crates/mantle/tests/native.rs`) runs both end to end.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

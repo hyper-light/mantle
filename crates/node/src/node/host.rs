@@ -138,6 +138,10 @@ pub(crate) struct Job {
     /// The blocks a put of it holds going down at once, as the node learned them when it was
     /// admitted (`crate::window`) and charged for them.
     window: usize,
+    /// The shard, numbered from the node's first, its native request was placed on and is counted
+    /// on until it ends (`node::drivers`); none for one not placed: the S3 door's, or one answered
+    /// at once.
+    driven: Option<usize>,
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
@@ -1249,17 +1253,25 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return;
         };
         let mut admitted_ns = None;
+        let mut driven = None;
         let work = match (head, self.gateway.as_ref(), slowed) {
             (_, None, _) => Work::Draining(Box::new(Reply::status(Status::Failed))),
             (Err(_), Some(_), _) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7), and one with no room for it
             // answers it at once: its client asks another, or again.
             (Ok(_), Some(_), Some(cause)) => Work::Draining(Box::new(Reply::slowed(cause))),
-            (Ok(head), Some(_), None) => {
-                admitted_ns = Some(now);
-                let fields = usize::try_from(head.fields()).unwrap_or(0);
-                Work::Fields(head, Vec::with_capacity(fields))
-            }
+            // Placed on the shard the rule picks, and counted there until its job ends (node.md
+            // §2.9 step 6). A count past a `usize`'s, which no host's jobs reach, each placed
+            // request being one of them, places nothing: the request is one the host cannot run.
+            (Ok(head), Some(_), None) => match self.drivers.place() {
+                Some(shard) => {
+                    admitted_ns = Some(now);
+                    driven = Some(shard);
+                    let fields = usize::try_from(head.fields()).unwrap_or(0);
+                    Work::Fields(head, Vec::with_capacity(fields))
+                }
+                None => Work::Draining(Box::new(Reply::status(Status::Failed))),
+            },
         };
         let charge = if admitted_ns.is_some() { charge } else { 0 };
         if admitted_ns.is_some()
@@ -1277,6 +1289,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            driven,
             label: None,
         });
     }
@@ -1336,6 +1349,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admitted_ns,
             charge,
             window,
+            // The S3 door's operations are driven where the node's task runs (node.md §2.9).
+            driven: None,
             label,
         });
     }
@@ -1805,6 +1820,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 // What it still waits on is let go: an ended get's chunks still out, say.
                 let job = self.jobs.swap_remove(at);
                 self.ended(job.admitted_ns, job.charge);
+                if let Some(shard) = job.driven {
+                    self.drivers.ended(shard);
+                }
                 self.abandoned
                     .extend(job.pending.into_iter().map(|(pending, _)| pending));
             } else {
@@ -4766,6 +4784,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             jobs,
             abandoned,
             admission,
+            drivers,
             ..
         } = self;
         let now = hyper_rt::futures::now_ns();
@@ -4775,6 +4794,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return true;
             }
             abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));
+            if let Some(shard) = j.driven {
+                drivers.ended(shard);
+            }
             if let (Some(at), Some(admission)) = (j.admitted_ns, admission.as_mut()) {
                 admission.completed(now.saturating_sub(at), now, j.charge);
             }
@@ -5965,6 +5987,7 @@ mod tests {
             admitted_ns: Some(1),
             charge: 0,
             window: 1,
+            driven: None,
             label: None,
         };
         assert!(job.held());

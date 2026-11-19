@@ -1467,6 +1467,10 @@ impl Trunk {
     /// more asks for it, and the pool answers from the store ([`Pool::take`]).
     fn dispatch_tasks<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         let wait = self.wait != Wait::No;
+        #[cfg(test)]
+        if self.hold_dispatch && !wait {
+            return Ok(());
+        }
         let admit = self.admit();
         let root = self.root;
         // Whether a job is out or done: its result gives back the grant it did not write as it is

@@ -2141,6 +2141,52 @@ the node as 6b made them; `Node::write_replies`' ask for a get's next piece beco
 stepping the host's reply step for one job, and `read_fields`, still a job's step that reads its
 exchange, becomes the node's task's before the job is made (6f), as `drop_body` already is.
 
+*As built (2026-11-18), step 6's fourth part, its first half: the host's state, and its doors kept*
+(6d, `crates/node/src/node/host.rs`). The jobs the node's task runs, the bytes their work moves and
+the doors of native requests are a `host::Host` the node's task holds (`Node::host`). `Node::moved`
+sums the node's task's count (fields read, bodies dropped, a trailer's value, a reply's fields
+written, chunks sent and received) and the host's (a body's pieces taken and a get's given, on
+either door). The `SlowDown`s by cause stay the node's: since 6c its task counts each as it writes
+the reply that carries its cause (`Opening::slowed`), and it writes every native reply wherever its
+job runs, the S3 door's counted by its listener. Admission, parking, the put window, the rule's
+count, the key lookups and the asks' outcomes stay the node's, `abandoned` among them, which repair
+shares; the node's step of the host (`step_host`, `turn_job`) still reads each job's end and tells
+admission and the rule, until the steps move (the second half, below).
+
+The doors kept (`host::Doors`). A native request's door, its reply's channel and what its two
+halves share (`Handed`), was made as the request was taken and dropped as it ended, even for one
+refused at once: 5 allocations (2,792 bytes) for the channel and what its halves share, a sixth
+boxing the job's half (`Native`) and a seventh at its first answer, its queue of held answers. Now
+the host keeps them: a request takes a door kept, one made only where none is; each half is given
+back as it is let go, the job's as its job ends (`turn_job`, `job_lost`), the node's task's once its
+reply is written whole or refused or its exchange ended (`write_replies`, `job_lost`); and a door
+both of whose halves are back is emptied of what its job gave that the node's task never took, its
+words cleared, and kept with its storage, its queue's among it. A kept door closes neither end of
+its channel, so its words say what the ends' drops said: `Handed::gone`, the node's task let go,
+which the job's `flush` reads before it sends; and `Handed::ended`, the job let go, read before the
+channel, so the node's task's write, finding the channel empty, ends the reply rather than waiting
+on it. A half dropped still closes its end, as before. Bound: the doors kept are at most the
+exchanges the transport holds at once (`parked_most`), as each door out is of an exchange the node
+holds, one given back past them let go; a half given back first waits for its other, then still out
+in a job or a reply of a request the node holds. A put's body channel (`host::Pieces`, `Feeding`) is
+still made for each put: kept the same way, its ends' drops would become the door's words too, in
+the body's code (`take_body`, `Feeding::send`), which upload-stall changes now.
+
+Tested (`node::host`): past its first request, 64 requests each take the one door kept, whichever
+half comes back first, the job's end given and written through it, and ask the allocator for nothing
+(0 allocations, 0 reallocations), where making a door asks it 5 times; a door given back with an
+answer the node's task never took is emptied, its next request's job not told its reply is gone nor
+its node's task that its job ended; and a host holding two exchanges keeps two doors, the third
+given back let go. The host and node unit tests pass unchanged.
+
+What the second half needs: the steps move into `impl Host`, each served by the node through one
+interface a shard's task can drive later (its asks, their outcomes, the volume table, the ranges'
+groups, the wall clock, a local door's pacing, the put window's samples and each job's end, its
+admission's charge, its shard and its asks let go); the node's step of the host takes the host out
+of `Node` for its turn (`std::mem::take`, allocating nothing) and hands it back; `write_replies`' ask
+for a get's next piece steps one job of the host; and a job's fields (`Work::Fields`, `read_fields`)
+are read by the node's task, served as one of those asks until 6f reads them before the job is made.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

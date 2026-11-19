@@ -239,6 +239,53 @@ impl Job {
     }
 }
 
+/// The object operations the node's task runs (node.md §2.9 step 6d): its jobs and what they hold,
+/// the bytes their work moved, and the native doors kept for its next requests ([`Doors`]). The
+/// node keeps admission, parking and the put window, one authority for its bottleneck (§2.5), and
+/// the exchanges, each request's fields read and its reply written by its own task.
+pub(crate) struct Host {
+    jobs: Vec<Job>,
+    /// Bytes of its jobs' bodies taken and of their replies given, as each job counted them since
+    /// the host was made: summed with the node's own where `Node::moved` is read.
+    moved: u64,
+    doors: Doors,
+}
+
+impl Host {
+    /// A host with no jobs, keeping at most `doors` native doors for its next requests: the
+    /// exchanges the transport holds at once.
+    pub(super) fn new(doors: usize) -> Self {
+        Self {
+            jobs: Vec::new(),
+            moved: 0,
+            doors: Doors::new(doors),
+        }
+    }
+
+    /// Bytes its jobs moved since it was made.
+    pub(super) fn moved(&self) -> u64 {
+        self.moved
+    }
+
+    /// Whether it runs no job.
+    pub(super) fn idle(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    /// The job waiting on chunk ask `ask`, its work moved now: a piece of the chunk it reads came,
+    /// or one of the chunk it sends went (research/77 D2).
+    pub(super) fn chunk_moved(&mut self, ask: u64) {
+        let now = hyper_rt::futures::now_ns();
+        if let Some(job) = self.jobs.iter_mut().find(|job| {
+            job.pending
+                .iter()
+                .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask))
+        }) {
+            job.moved_ns = now;
+        }
+    }
+}
+
 /// What the host keeps of one native put or get beside its charge, by design: its job, and the
 /// work it boxes, a put's or a get's whichever is larger, its driver inline in it; and its reply's
 /// door, the job's end and the node's task's, and what the two share (`derive::native`).
@@ -338,17 +385,24 @@ struct Opening {
 /// its exchange (`derive::Charges`: "a get's block taken and written out"); and whether its work is
 /// held, which the node's task tells the exchange's asker (`Endpoint::working`, research/77 D1).
 /// And whether the node's task let go of the reply, its exchange ended or refused, so a job waiting
-/// for what it gave to be written ends.
+/// for what it gave to be written ends; and whether the job let go of its door, so the node's task
+/// writes nothing past what it gave: a door kept for the next request ([`Doors`]) closes neither
+/// end of its channel, which once said both.
 #[derive(Default)]
 struct Handed {
     unwritten: std::sync::atomic::AtomicUsize,
     held: std::sync::atomic::AtomicBool,
     gone: std::sync::atomic::AtomicBool,
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl Native {
-    /// Sends what waits, in order: whether the door takes more now.
+    /// Sends what waits, in order: whether the door takes more now; `Gone` once the node's task let
+    /// go of the reply, whose channel's receiving end may be kept for the next request ([`Doors`]).
     fn flush(&mut self) -> Sent {
+        if self.gone() {
+            return Sent::Gone;
+        }
         flush(&self.reply, &mut self.pending)
     }
 
@@ -480,6 +534,132 @@ fn native_door() -> Option<(Native, Replies)> {
             out: None,
         },
     ))
+}
+
+/// The native doors the host keeps for its next requests (node.md §2.9 step 6d), so a request takes
+/// its reply's channel, and what its job and the node's task share beside it ([`Handed`]), from
+/// those kept rather than from the allocator. A door's two halves are each given back as it is let
+/// go: the job's ([`Native`]) as its job ends, the node's task's ([`Replies`]) once its reply is
+/// written whole or refused, or its exchange ended; and a door both of whose halves are back is
+/// emptied of what its job gave and the node's task never took, its shared words cleared, and kept.
+/// A half given back first waits for the other, which is then still out, a job's or a reply the
+/// node's task writes, each of a request the node holds. Bound: the doors kept, at most `most`,
+/// the exchanges the transport holds at once (the node's `parked_most`), as each door out is of an
+/// exchange the node holds; one given back past them is let go.
+struct Doors {
+    kept: Vec<(Box<Native>, Replies)>,
+    /// Halves given back whose door's other half is still out.
+    waiting: Vec<Half>,
+    most: usize,
+}
+
+/// A door's half given back.
+enum Half {
+    Native(Box<Native>),
+    Replies(Replies),
+}
+
+impl Half {
+    /// What its door's two halves share, which tells the door.
+    fn handed(&self) -> &std::sync::Arc<Handed> {
+        match self {
+            Self::Native(native) => &native.handed,
+            Self::Replies(replies) => &replies.handed,
+        }
+    }
+}
+
+impl Doors {
+    /// Doors for a host that keeps at most `most` of them.
+    fn new(most: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            waiting: Vec::new(),
+            most,
+        }
+    }
+
+    /// A door for a request: one kept, or one made; none where its channel cannot be made.
+    fn take(&mut self) -> Option<(Box<Native>, Replies)> {
+        if let Some(door) = self.kept.pop() {
+            return Some(door);
+        }
+        let (native, replies) = native_door()?;
+        Some((Box::new(native), replies))
+    }
+
+    /// A job's half of its door, the job ended: the node's task writes nothing past what it gave.
+    fn give_native(&mut self, native: Box<Native>) {
+        native
+            .handed
+            .ended
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.give(Half::Native(native));
+    }
+
+    /// The node's task's half of a door, its reply written whole or refused, or its exchange
+    /// ended: its job gives nothing more.
+    fn give_replies(&mut self, replies: Replies) {
+        replies
+            .handed
+            .gone
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.give(Half::Replies(replies));
+    }
+
+    /// A half given back: its door kept once the other half is back too, else held for it.
+    fn give(&mut self, half: Half) {
+        let other = self
+            .waiting
+            .iter()
+            .position(|waiting| std::sync::Arc::ptr_eq(waiting.handed(), half.handed()));
+        let Some(at) = other else {
+            self.waiting.push(half);
+            return;
+        };
+        match (half, self.waiting.swap_remove(at)) {
+            (Half::Native(native), Half::Replies(replies))
+            | (Half::Replies(replies), Half::Native(native)) => self.keep(native, replies),
+            // A door has one half of each: two of one are none of a door's, and go.
+            _ => {}
+        }
+    }
+
+    /// A door both of whose halves are back, kept for the next request where fewer than `most`
+    /// are: what its job gave that the node's task never took dropped, at most the channel's
+    /// answers, and its halves as a new door's.
+    fn keep(&mut self, mut native: Box<Native>, mut replies: Replies) {
+        if self.kept.len() >= self.most {
+            return;
+        }
+        let mut empty = false;
+        for _ in 0..=door::Replying::FIRST_ANSWERS {
+            match replies.told.try_recv() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    empty = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        if !empty {
+            return;
+        }
+        native.body = None;
+        native.pending.clear();
+        native.moved = 0;
+        replies.drained = None;
+        replies.out = None;
+        let handed = &native.handed;
+        handed
+            .unwritten
+            .store(0, std::sync::atomic::Ordering::Release);
+        for word in [&handed.held, &handed.gone, &handed.ended] {
+            word.store(false, std::sync::atomic::Ordering::Release);
+        }
+        self.kept.push((native, replies));
+    }
 }
 
 /// A native job's reply as the node's task writes it to the exchange (node.md §2.9 step 6c), the
@@ -648,6 +828,8 @@ impl Replies {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 whole = true;
             }
+            // Read before the channel, so what the job gave before it let go is taken first.
+            let ended = self.handed.ended.load(std::sync::atomic::Ordering::Acquire);
             match self.told.try_recv() {
                 Ok(Some(Told::Reply(opening))) => self.drained = Some(opening),
                 Ok(Some(Told::Head(opening))) => {
@@ -671,9 +853,11 @@ impl Replies {
                     to.refuse();
                     return Wrote::Over;
                 }
+                // The job let go with nothing more to write: the exchange is left as it left it,
+                // its door given back ([`Doors`]) or dropped.
+                Ok(None) if ended => return Wrote::Over,
                 Ok(None) if whole => return Wrote::More,
                 Ok(None) => return Wrote::Still,
-                // The job let go with nothing more to write: the exchange is left as it left it.
                 Err(_) => return Wrote::Over,
             }
         }
@@ -1944,10 +2128,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .refuse_exchange(exchange, Refusal::Identity);
             return;
         };
-        // Its reply goes on a channel the node's task writes from (node.md §2.9 step 6c): one that
-        // cannot be made leaves nothing to reply on, so the exchange is refused, as an owner past
-        // what it holds refuses one, which its asker asks again after.
-        let Some((native, replies)) = native_door() else {
+        // Its reply goes on a channel the node's task writes from (node.md §2.9 step 6c), a door
+        // the host kept from a request before it, or one made (6d): one that cannot be made leaves
+        // nothing to reply on, so the exchange is refused, as an owner past what it holds refuses
+        // one, which its asker asks again after.
+        let Some((native, replies)) = self.host.doors.take() else {
             self.driver
                 .endpoint()
                 .refuse_exchange(exchange, Refusal::Budget);
@@ -1981,8 +2166,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             admission.admitted(charge);
         }
         self.replies.push((exchange, replies));
-        self.jobs.push(Job {
-            door: Door::Native(exchange, Box::new(native)),
+        self.host.jobs.push(Job {
+            door: Door::Native(exchange, native),
             principal,
             work,
             pending: Vec::new(),
@@ -2034,7 +2219,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             admission.admitted(charge);
         }
-        self.jobs.push(Job {
+        self.host.jobs.push(Job {
             door: Door::Local(Box::new(Local {
                 body: Pieces {
                     pieces: body,
@@ -2166,7 +2351,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Admin(admin),
             pending,
             ..
-        }) = self.jobs.get(at)
+        }) = self.host.jobs.get(at)
         else {
             return Ok(true);
         };
@@ -2182,7 +2367,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some(Job {
                 work: Work::Admin(admin),
                 ..
-            }) = self.jobs.get_mut(at)
+            }) = self.host.jobs.get_mut(at)
             else {
                 return Ok(true);
             };
@@ -2201,7 +2386,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.fail_job(at, Status::Failed)?;
             return self.drain_job(at);
         };
-        let asking = match self.jobs.get(at) {
+        let asking = match self.host.jobs.get(at) {
             Some(Job {
                 work: Work::Admin(admin),
                 ..
@@ -2222,7 +2407,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     work: Work::Admin(admin),
                     pending: held,
                     ..
-                }) = self.jobs.get_mut(at)
+                }) = self.host.jobs.get_mut(at)
                 {
                     held.push((pending, None));
                     admin.asked = true;
@@ -2269,7 +2454,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// refusals (research/91 §2), a key made with its id and secret, and a page of principals.
     fn admin_answered(&mut self, at: usize, outcome: Outcome) -> Result<(), NodeError> {
         let one = matches!(
-            self.jobs.get(at),
+            self.host.jobs.get(at),
             Some(Job {
                 work: Work::Admin(admin),
                 ..
@@ -2283,7 +2468,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 | principal::Outcome::Set
                 | principal::Outcome::Removed => Reply::status(Status::Done),
                 principal::Outcome::KeyMade { replacing } => {
-                    let issued = match self.jobs.get_mut(at) {
+                    let issued = match self.host.jobs.get_mut(at) {
                         Some(Job {
                             work: Work::Admin(admin),
                             ..
@@ -2327,7 +2512,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// A job's fields read from its body's start, a piece at a time; once whole, the work they
     /// name, the bytes read past them the start of a put's body.
     fn read_fields(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Some(job) = self.host.jobs.get_mut(at) else {
             return Ok(true);
         };
         // A local operation comes typed, never as fields to read.
@@ -2378,7 +2563,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .admission
                 .as_ref()
                 .is_some_and(|admission| !admission.holds(more));
-        if let Some(job) = self.jobs.get_mut(at) {
+        if let Some(job) = self.host.jobs.get_mut(at) {
             job.work = match op {
                 Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
                 Ok(_) if crowded => Work::Draining(Box::new(Reply::slowed(door::Slowed::Crowded))),
@@ -2480,7 +2665,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub(super) fn step_host(&mut self) -> Result<(), NodeError> {
         self.drop_abandoned();
         self.step_lookups();
-        if self.jobs.is_empty() {
+        if self.host.jobs.is_empty() {
             labels::set(None);
             return Ok(());
         }
@@ -2498,7 +2683,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         | ChunkOutcome::Lost(Refusal::Budget)
                 )
             });
-        for at in 0..self.jobs.len() {
+        for at in 0..self.host.jobs.len() {
             self.take_answers(at)?;
         }
         if freed {
@@ -2508,7 +2693,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // The step that held the turn longest, and its operation's label.
         let mut slowest: Option<(u64, &'static Label)> = None;
         let mut at = 0;
-        while at < self.jobs.len() {
+        while at < self.host.jobs.len() {
             if !self.turn_job(at, &mut slowest)? {
                 at = at.saturating_add(1);
             }
@@ -2526,8 +2711,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         at: usize,
         slowest: &mut Option<(u64, &'static Label)>,
     ) -> Result<bool, NodeError> {
-        let before = self.moved;
-        let label = self.jobs.get(at).and_then(|job| job.label);
+        let before = (self.moved, self.host.moved);
+        let label = self.host.jobs.get(at).and_then(|job| job.label);
         let began = hyper_rt::futures::now_ns();
         let over = self.step_job(at)?;
         let held = hyper_rt::futures::now_ns().saturating_sub(began);
@@ -2539,24 +2724,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(Job {
             door: Door::Native(_, native),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         {
-            self.moved = self.moved.saturating_add(std::mem::take(&mut native.moved));
+            self.host.moved = self
+                .host
+                .moved
+                .saturating_add(std::mem::take(&mut native.moved));
         }
-        if self.moved != before
-            && let Some(job) = self.jobs.get_mut(at)
+        if (self.moved, self.host.moved) != before
+            && let Some(job) = self.host.jobs.get_mut(at)
         {
             job.moved_ns = hyper_rt::futures::now_ns();
         }
         if over {
-            // What it still waits on is let go: an ended get's chunks still out, say.
-            let job = self.jobs.swap_remove(at);
+            // What it still waits on is let go: an ended get's chunks still out, say; and its
+            // door's half is given back, kept for the next request once its reply's is.
+            let job = self.host.jobs.swap_remove(at);
             self.ended(job.admitted_ns, job.charge);
             if let Some(shard) = job.driven {
                 self.drivers.ended(shard);
             }
             self.abandoned
                 .extend(job.pending.into_iter().map(|(pending, _)| pending));
+            if let Door::Native(_, native) = job.door {
+                self.host.doors.give_native(native);
+            }
         }
         Ok(over)
     }
@@ -2590,10 +2782,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             break false;
                         }
                         let exchange = self.replies.get(at).map(|(exchange, _)| *exchange);
-                        let job = self
-                            .jobs
-                            .iter()
-                            .position(|job| exchange.is_some() && job.door.exchange() == exchange);
+                        let job =
+                            self.host.jobs.iter().position(|job| {
+                                exchange.is_some() && job.door.exchange() == exchange
+                            });
                         // A job that ended gave all it will: the next write finds its channel
                         // ended.
                         if let Some(job) = job {
@@ -2603,7 +2795,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             };
             if over {
-                self.replies.swap_remove(at);
+                let (_, replies) = self.replies.swap_remove(at);
+                self.host.doors.give_replies(replies);
             } else {
                 at = at.saturating_add(1);
             }
@@ -2795,8 +2988,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Asks again each chunk a put's driver holds for want of room, its volume's or the
     /// transport's; a driver that fails doing so ends its job as its failed answers do.
     fn offer_room(&mut self) -> Result<(), NodeError> {
-        for at in 0..self.jobs.len() {
-            let put = match self.jobs.get_mut(at).map(|job| &mut job.work) {
+        for at in 0..self.host.jobs.len() {
+            let put = match self.host.jobs.get_mut(at).map(|job| &mut job.work) {
                 Some(Work::Put(putting)) => putting.put.as_mut(),
                 Some(Work::Copy(copying)) => copying.put.as_mut(),
                 _ => None,
@@ -2821,8 +3014,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// for its body or room to write its reply, is the transport's to judge.
     fn bound_jobs(&mut self) -> Result<(), NodeError> {
         let now = hyper_rt::futures::now_ns();
-        for at in 0..self.jobs.len() {
-            let Some(job) = self.jobs.get(at) else {
+        for at in 0..self.host.jobs.len() {
+            let Some(job) = self.host.jobs.get(at) else {
                 continue;
             };
             if !job.working() || !job.held() {
@@ -2845,7 +3038,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// One operation's turn; whether it is over.
     fn step_job(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get(at) else {
+        let Some(job) = self.host.jobs.get(at) else {
             return Ok(true);
         };
         match job.work {
@@ -2866,7 +3059,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The outcomes of what job `at` asked, taken from the node's answers and given to it.
     fn take_answers(&mut self, at: usize) -> Result<(), NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Some(job) = self.host.jobs.get_mut(at) else {
             return Ok(());
         };
         if job.pending.is_empty() {
@@ -2882,7 +3075,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             None => true,
         });
-        if let Some(job) = self.jobs.get_mut(at) {
+        if let Some(job) = self.host.jobs.get_mut(at) {
             job.pending = pending;
         }
         for (request, outcome) in answered {
@@ -2905,10 +3098,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             outcome,
             Outcome::Read(ReadOutcome::Deadline) | Outcome::Command(CommandOutcome::Deadline)
         );
-        if leaderless && self.jobs.get(at).is_some_and(Job::working) {
+        if leaderless && self.host.jobs.get(at).is_some_and(Job::working) {
             return self.slow_job(at, door::Slowed::Leaderless);
         }
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Some(job) = self.host.jobs.get_mut(at) else {
             return Ok(());
         };
         // One of its own asks answered: the job's work moved.
@@ -3144,7 +3337,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Bucket(coordinating),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -3162,7 +3355,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// coordinator is done, its answer.
     fn step_bucket(&mut self, at: usize) -> Result<bool, NodeError> {
         let quota = self.gateway.as_ref().map_or(0, |g| g.bucket_quota);
-        let Some(job) = self.jobs.get(at) else {
+        let Some(job) = self.host.jobs.get(at) else {
             return Ok(true);
         };
         if !job.pending.is_empty() {
@@ -3240,7 +3433,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if let Some(Job {
                     work: Work::Bucket(coordinating),
                     ..
-                }) = self.jobs.get_mut(at)
+                }) = self.host.jobs.get_mut(at)
                     && let Some(c) = coordinating.coordinator.as_mut()
                     && c.answer(coordinator::Answer::Directory(directory()))
                         .is_err()
@@ -3263,7 +3456,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     ) -> Result<bool, NodeError> {
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
+                if let Some(job) = self.host.jobs.get_mut(at) {
                     job.pending.push((pending, request));
                 }
                 Ok(false)
@@ -3292,7 +3485,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(Job {
             work: Work::Put(putting),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
             && let Some(appending) = putting.run.as_mut()
         {
             appending.incarnation = Some(row.created_ns);
@@ -3316,7 +3509,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Put(putting),
             principal,
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -3370,7 +3563,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Put(putting),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -3457,7 +3650,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let holding = Holding {
             handover_ns: gateway.handover_ns,
-            window: self.jobs.get(at).map_or(gateway.window, |job| job.window),
+            window: self
+                .host
+                .jobs
+                .get(at)
+                .map_or(gateway.window, |job| job.window),
         };
         let made = (|| {
             let data = DataKey::generate().ok()?;
@@ -3480,7 +3677,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Put(putting),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -3512,7 +3709,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 work: Work::Put(putting),
                 pending,
                 ..
-            }) = self.jobs.get_mut(at)
+            }) = self.host.jobs.get_mut(at)
             else {
                 return Ok(true);
             };
@@ -3565,7 +3762,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match state {
             Step::Wait => return Ok(false),
             Step::Over(reply) => {
-                if let Some(job) = self.jobs.get_mut(at) {
+                if let Some(job) = self.host.jobs.get_mut(at) {
                     job.work = Work::Draining(reply);
                 }
                 return self.drain_job(at);
@@ -3583,7 +3780,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.feed_put(at)?;
         // The driver's requests, each asked of what serves it.
         loop {
-            let Some(job) = self.jobs.get_mut(at) else {
+            let Some(job) = self.host.jobs.get_mut(at) else {
                 return Ok(true);
             };
             let Work::Put(putting) = &mut job.work else {
@@ -3601,7 +3798,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if let Some(Job {
                     work: Work::Put(putting),
                     ..
-                }) = self.jobs.get_mut(at)
+                }) = self.host.jobs.get_mut(at)
                 {
                     putting.waiting.push_front((id, request));
                 }
@@ -3618,12 +3815,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// (`door::Depth`); a native exchange's as the node's task gives it ([`Feeding`]). A job whose
     /// body does not hold ends with the status that says why.
     fn feed_put(&mut self, at: usize) -> Result<(), NodeError> {
-        let Self {
-            jobs,
-            doorway,
-            moved,
-            ..
-        } = self;
+        let Self { host, doorway, .. } = self;
+        let Host { jobs, moved, .. } = host;
         let Some(job) = jobs.get_mut(at) else {
             return Ok(());
         };
@@ -3743,7 +3936,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
+                if let Some(job) = self.host.jobs.get_mut(at) {
                     job.pending.push((pending, Some(kept)));
                 }
                 Ok(None)
@@ -3773,7 +3966,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .and_then(|g| self.ask(JobAsk::Command(g, command)));
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
+                if let Some(job) = self.host.jobs.get_mut(at) {
                     job.pending.push((pending, Some(id)));
                 }
             }
@@ -3815,7 +4008,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Get(getting),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -3883,7 +4076,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Get(getting),
             door,
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(Some(true));
         };
@@ -3936,7 +4129,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// its end.
     fn step_get(&mut self, at: usize) -> Result<bool, NodeError> {
         let name = self.group_of(Layer::Name);
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Some(job) = self.host.jobs.get_mut(at) else {
             return Ok(true);
         };
         let Work::Get(getting) = &mut job.work else {
@@ -3968,7 +4161,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(true);
         }
         loop {
-            let Some(job) = self.jobs.get_mut(at) else {
+            let Some(job) = self.host.jobs.get_mut(at) else {
                 return Ok(true);
             };
             let Work::Get(getting) = &mut job.work else {
@@ -3985,7 +4178,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if let Some(Job {
                     work: Work::Get(getting),
                     ..
-                }) = self.jobs.get_mut(at)
+                }) = self.host.jobs.get_mut(at)
                 {
                     getting.waiting.push_front((id, request));
                 }
@@ -4002,7 +4195,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(over) = self.send_held(at)? {
             return Ok(over);
         }
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Some(job) = self.host.jobs.get_mut(at) else {
             return Ok(true);
         };
         let Work::Get(getting) = &mut job.work else {
@@ -4046,7 +4239,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     };
                     let took = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                     getting.written = getting.written.saturating_add(took);
-                    self.moved = self.moved.saturating_add(took);
+                    self.host.moved = self.host.moved.saturating_add(took);
                     if local.offer(door::Answer::Bytes(bytes, turn)) == Sent::Gone {
                         return Ok(true);
                     }
@@ -4131,7 +4324,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
+                if let Some(job) = self.host.jobs.get_mut(at) {
                     job.pending.push((pending, Some(kept)));
                 }
                 Ok(None)
@@ -4147,7 +4340,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// The request ID job `at` keeps its driver's request `id` under: the ID itself, or, for a
     /// copy, the ID tagged with its driver (`tagged`); none past what a u64 holds.
     fn kept_id(&self, at: usize, driver: Driver, id: u64) -> Option<u64> {
-        match self.jobs.get(at).map(|job| &job.work) {
+        match self.host.jobs.get(at).map(|job| &job.work) {
             Some(Work::Copy(_)) => tagged(driver, id),
             _ => Some(id),
         }
@@ -4155,7 +4348,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Job `at`'s get driver: its get's, or its copy's.
     fn get_of(&mut self, at: usize) -> Option<&mut Get> {
-        match self.jobs.get_mut(at).map(|job| &mut job.work) {
+        match self.host.jobs.get_mut(at).map(|job| &mut job.work) {
             Some(Work::Get(getting)) => getting.get.as_mut(),
             Some(Work::Copy(copying)) => copying.get.as_mut(),
             _ => None,
@@ -4164,7 +4357,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Job `at`'s put driver: its put's, or its copy's.
     fn put_of(&mut self, at: usize) -> Option<&mut Put> {
-        match self.jobs.get_mut(at).map(|job| &mut job.work) {
+        match self.host.jobs.get_mut(at).map(|job| &mut job.work) {
             Some(Work::Put(putting)) => putting.put.as_mut(),
             Some(Work::Copy(copying)) => copying.put.as_mut(),
             _ => None,
@@ -4178,7 +4371,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Command(commanding),
             pending,
             ..
-        }) = self.jobs.get(at)
+        }) = self.host.jobs.get(at)
         else {
             return Ok(true);
         };
@@ -4215,7 +4408,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Command(commanding),
             principal,
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -4342,7 +4535,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Complete(completing),
             pending,
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(true);
         };
@@ -4375,7 +4568,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return self.drain_job(at);
         }
         loop {
-            let Some(job) = self.jobs.get_mut(at) else {
+            let Some(job) = self.host.jobs.get_mut(at) else {
                 return Ok(true);
             };
             let Work::Complete(completing) = &mut job.work else {
@@ -4392,7 +4585,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if let Some(Job {
                     work: Work::Complete(completing),
                     ..
-                }) = self.jobs.get_mut(at)
+                }) = self.host.jobs.get_mut(at)
                 {
                     completing.waiting.push_front((id, request));
                 }
@@ -4422,7 +4615,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Complete(completing),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -4484,7 +4677,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Complete(completing),
             ..
-        }) = self.jobs.get(at)
+        }) = self.host.jobs.get(at)
         else {
             return Ok(None);
         };
@@ -4533,7 +4726,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         match asked {
             Ok(pending) => {
-                if let Some(job) = self.jobs.get_mut(at) {
+                if let Some(job) = self.host.jobs.get_mut(at) {
                     job.pending.push((pending, Some(id)));
                 }
                 Ok(None)
@@ -4563,7 +4756,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Deletes(deleting),
             pending,
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(true);
         };
@@ -4585,12 +4778,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.fail_job(at, Status::Failed)?;
             return self.drain_job(at);
         };
-        let principal = self.jobs.get(at).map(|j| j.principal.clone());
+        let principal = self.host.jobs.get(at).map(|j| j.principal.clone());
         loop {
             let Some(Job {
                 work: Work::Deletes(deleting),
                 ..
-            }) = self.jobs.get_mut(at)
+            }) = self.host.jobs.get_mut(at)
             else {
                 return Ok(true);
             };
@@ -4650,7 +4843,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         work: Work::Deletes(deleting),
                         pending,
                         ..
-                    }) = self.jobs.get_mut(at)
+                    }) = self.host.jobs.get_mut(at)
                     {
                         pending.push((asked, Some(u64::try_from(index).unwrap_or(u64::MAX))));
                         deleting.out = deleting.out.saturating_add(1);
@@ -4668,7 +4861,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Deletes(deleting),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(true);
         };
@@ -4703,7 +4896,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some(Job {
             work: Work::Deletes(deleting),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         {
             deleting.row = Some((row.created_ns, row.versioning));
         }
@@ -4720,7 +4913,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Copy(copying),
             pending,
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(true);
         };
@@ -4828,7 +5021,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // Each driver's requests, each asked of what serves it.
         for driver in [Driver::Get, Driver::Put] {
             loop {
-                let Some(job) = self.jobs.get_mut(at) else {
+                let Some(job) = self.host.jobs.get_mut(at) else {
                     return Ok(true);
                 };
                 let Work::Copy(copying) = &mut job.work else {
@@ -4847,7 +5040,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             if let Some(Job {
                                 work: Work::Copy(copying),
                                 ..
-                            }) = self.jobs.get_mut(at)
+                            }) = self.host.jobs.get_mut(at)
                             {
                                 copying.get_waiting.push_front((id, request));
                             }
@@ -4866,7 +5059,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             if let Some(Job {
                                 work: Work::Copy(copying),
                                 ..
-                            }) = self.jobs.get_mut(at)
+                            }) = self.host.jobs.get_mut(at)
                             {
                                 copying.put_waiting.push_front((id, request));
                             }
@@ -4887,7 +5080,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Copy(copying),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return;
         };
@@ -4928,7 +5121,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Copy(copying),
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -5036,7 +5229,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             work: Work::Copy(copying),
             principal,
             ..
-        }) = self.jobs.get_mut(at)
+        }) = self.host.jobs.get_mut(at)
         else {
             return Ok(());
         };
@@ -5206,7 +5399,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// An operation one read answers, at its turn: its read asked once.
     fn step_single(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get(at) else {
+        let Some(job) = self.host.jobs.get(at) else {
             return Ok(true);
         };
         if !job.pending.is_empty() {
@@ -5278,7 +5471,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The answer of an operation one read answers: its reply.
     fn single_read(&mut self, at: usize, read: Read) -> Result<(), NodeError> {
-        let Some(job) = self.jobs.get(at) else {
+        let Some(job) = self.host.jobs.get(at) else {
             return Ok(());
         };
         let reply = match (&job.work, read) {
@@ -5358,7 +5551,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Ends job `at` with `reply`: what it waits on is let go, and its body, if any is left, read
     /// to its end and dropped before the reply goes.
     fn reply_job(&mut self, at: usize, reply: Reply) -> Result<(), NodeError> {
-        if let Some(job) = self.jobs.get_mut(at) {
+        if let Some(job) = self.host.jobs.get_mut(at) {
             job.work = Work::Draining(Box::new(reply));
             self.abandoned
                 .extend(job.pending.drain(..).map(|(pending, _)| pending));
@@ -5373,7 +5566,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// that reply, and a get's end its channel held: the listener then closed the connection under
     /// a response whose every byte it had sent.
     fn moved_on(&mut self, at: usize) -> Result<bool, NodeError> {
-        match self.jobs.get(at).map(|job| &job.work) {
+        match self.host.jobs.get(at).map(|job| &job.work) {
             None => Ok(true),
             Some(Work::Draining(_)) => self.drain_job(at),
             Some(Work::Answering(_)) => self.answer_door(at),
@@ -5405,7 +5598,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// A draining job's turn: its reply given to its door, which goes once what is left of its
     /// body is read and dropped; whether it is over: the reply given, or its door gone.
     fn drain_job(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Some(job) = self.host.jobs.get_mut(at) else {
             return Ok(true);
         };
         let Work::Draining(reply) =
@@ -5448,7 +5641,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// A job's last answers sent as far as its door's channel takes them; whether it is over:
     /// every one sent, or the door gone.
     fn answer_door(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
+        let Some(job) = self.host.jobs.get_mut(at) else {
             return Ok(true);
         };
         let Work::Answering(answers) = &mut job.work else {
@@ -5467,7 +5660,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Whether the host holds `exchange`, for an event on it: a job's, or a reply its node's task
     /// writes.
     pub(super) fn hosts(&self, exchange: ExchangeId) -> bool {
-        self.jobs
+        self.host
+            .jobs
             .iter()
             .any(|j| j.door.exchange() == Some(exchange))
             || self.replies.iter().any(|(e, _)| *e == exchange)
@@ -5476,29 +5670,35 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
     pub(super) fn job_lost(&mut self, exchange: ExchangeId) {
         let Self {
-            jobs,
+            host,
             abandoned,
             admission,
             drivers,
+            parked,
+            feeding,
+            replies,
             ..
         } = self;
         let now = hyper_rt::futures::now_ns();
-        self.parked.retain(|p| p.exchange != exchange);
-        self.feeding.retain(|(fed, _)| *fed != exchange);
-        self.replies.retain(|(replied, _)| *replied != exchange);
-        jobs.retain_mut(|j| {
-            if j.door.exchange() != Some(exchange) {
-                return true;
-            }
-            abandoned.extend(j.pending.drain(..).map(|(pending, _)| pending));
+        parked.retain(|p| p.exchange != exchange);
+        feeding.retain(|(fed, _)| *fed != exchange);
+        // Each door's halves given back, kept for the next request.
+        for (_, lost) in replies.extract_if(.., |(replied, _)| *replied == exchange) {
+            host.doors.give_replies(lost);
+        }
+        let Host { jobs, doors, .. } = host;
+        for j in jobs.extract_if(.., |j| j.door.exchange() == Some(exchange)) {
+            abandoned.extend(j.pending.into_iter().map(|(pending, _)| pending));
             if let Some(shard) = j.driven {
                 drivers.ended(shard);
             }
             if let (Some(at), Some(admission)) = (j.admitted_ns, admission.as_mut()) {
                 admission.completed(now.saturating_sub(at), now, j.charge);
             }
-            false
-        });
+            if let Door::Native(_, native) = j.door {
+                doors.give_native(native);
+            }
+        }
     }
 
     /// The operations the host admits at once now, as it learned its knee (`crate::admit`): none
@@ -5557,7 +5757,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// (research/77 D2): at least one, as a time that has passed is none to wait on.
     fn remaining_of(&self, at: usize) -> u64 {
         let now = hyper_rt::futures::now_ns();
-        self.jobs
+        self.host
+            .jobs
             .get(at)
             .map_or(1, |job| job.bound_ns().saturating_sub(now).max(1))
     }
@@ -5566,6 +5767,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let shard = hyper_rt::futures::now_ns();
         let answered = |pending: &Pending| self.has_outcome(*pending);
         let mut pending = self
+            .host
             .jobs
             .iter()
             .flat_map(|j| j.pending.iter().map(|(p, _)| p))
@@ -5582,6 +5784,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let wall = self.wall.now_ns();
         let renewal = self
+            .host
             .jobs
             .iter()
             .filter_map(|j| match &j.work {
@@ -5596,6 +5799,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // period (research/77 D2).
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
         let bound = self
+            .host
             .jobs
             .iter()
             .filter(|j| j.working() && j.held())
@@ -6342,19 +6546,6 @@ enum Outcome {
     Command(CommandOutcome),
     Read(ReadOutcome),
     Chunk(ChunkOutcome),
-}
-
-/// The job of `jobs` waiting on chunk ask `ask`, its work moved now: a piece of the chunk it
-/// reads came, or one of the chunk it sends went (research/77 D2).
-pub(super) fn chunk_moved(jobs: &mut [Job], ask: u64) {
-    let now = hyper_rt::futures::now_ns();
-    if let Some(job) = jobs.iter_mut().find(|job| {
-        job.pending
-            .iter()
-            .any(|(pending, _)| matches!(pending, Pending::Chunk(asked) if *asked == ask))
-    }) {
-        job.moved_ns = now;
-    }
 }
 
 /// A put's driver's answer for what its request came to.
@@ -7594,6 +7785,94 @@ mod tests {
             Wrote::Over
         );
         assert!(seen.ended);
+    }
+
+    /// One native request's door as the host and the node's task use it: taken as the request is,
+    /// its job's end given and written, and both halves given back, the job's or the reply's first.
+    /// What its two halves share, which tells the door.
+    fn door_request(doors: &mut Doors, job_first: bool) -> *const Handed {
+        let (mut native, mut replies) = doors.take().unwrap();
+        assert!(!native.gone() && native.written());
+        assert_eq!(native.offer(Told::End), Sent::Taken);
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.ended && seen.working == 0);
+        let handed = std::sync::Arc::as_ptr(&native.handed);
+        if job_first {
+            doors.give_native(native);
+            doors.give_replies(replies);
+        } else {
+            doors.give_replies(replies);
+            doors.give_native(native);
+        }
+        handed
+    }
+
+    /// A native request's door is the one a request before it let go of (node.md §2.9 step 6d):
+    /// where each request made its own, its reply's channel and what its two halves share asking
+    /// the allocator each time, a request past the first asks it for nothing, whichever half comes
+    /// back first. A door given back with an answer its job gave that the node's task never took is
+    /// emptied, and its words cleared, so the next request's job is not told its reply is gone, nor
+    /// the node's task that its job ended. The host keeps no more doors than it holds exchanges.
+    #[test]
+    fn a_native_requests_door_is_kept_for_the_next_and_allocates_nothing() {
+        const REQUESTS: usize = 64;
+        hyper_measure::alloc::begin();
+        let made = native_door().unwrap();
+        let each = hyper_measure::alloc::end();
+        drop(made);
+        assert!(each.allocations > 0, "{each:?}");
+        let mut doors = Doors::new(2);
+        let first = door_request(&mut doors, true);
+        hyper_measure::alloc::begin();
+        let mut same = 0;
+        for request in 0..REQUESTS {
+            same += usize::from(door_request(&mut doors, request % 2 == 0) == first);
+        }
+        let kept = hyper_measure::alloc::end();
+        assert_eq!((kept.allocations, kept.reallocations), (0, 0));
+        assert_eq!(same, REQUESTS, "each request took the one door kept");
+        // A job that gave past the node's task's letting go: its answer dropped with the door's
+        // words, its next request's door as new.
+        let (mut native, replies) = doors.take().unwrap();
+        assert_eq!(
+            native.give(Told::Bytes(Bytes::from_static(b"never written"))),
+            Sent::Taken
+        );
+        native.held();
+        doors.give_replies(replies);
+        assert!(native.gone());
+        assert_eq!(native.offer(Told::End), Sent::Gone);
+        doors.give_native(native);
+        let (mut native, mut replies) = doors.take().unwrap();
+        assert!(!native.gone() && native.written() && native.pending.is_empty());
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert!(seen.answered.is_none() && seen.body.is_empty() && seen.working == 0);
+        assert_eq!(native.offer(Told::End), Sent::Taken);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.ended);
+        doors.give_native(native);
+        doors.give_replies(replies);
+        // Three out at once, the host holding two exchanges' doors: the third back is let go.
+        let out: Vec<_> = (0..3).map(|_| doors.take().unwrap()).collect();
+        for (native, replies) in out {
+            doors.give_native(native);
+            doors.give_replies(replies);
+        }
+        assert_eq!(doors.kept.len(), 2);
+        assert!(doors.waiting.is_empty());
     }
 
     fn refused(work: &Work) -> Option<Status> {

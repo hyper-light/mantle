@@ -1043,7 +1043,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// What the node measured of its puts' blocks and bodies, the window a put holds
     /// (`crate::window`).
     put_window: crate::window::Window,
-    jobs: Vec<host::Job>,
+    /// The object operations the node's task runs, and what they hold (node.md §2.9 step 6d).
+    host: host::Host,
     /// The exchange's half of each native put's body, read from its exchange for its job (node.md
     /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's.
     feeding: Vec<(ExchangeId, host::Feeding)>,
@@ -1053,7 +1054,7 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The exchange's half of each native reply, written to its exchange from its job's channel
     /// (node.md §2.9 step 6c, `host::Replies`): one a native request the host took, each ended
     /// with its exchange or once its reply is written whole, so at most the exchanges the
-    /// transport holds at once.
+    /// transport holds at once, and given back to the host's doors as it ends (6d, `host::Doors`).
     replies: Vec<(ExchangeId, host::Replies)>,
     /// Whether a reply's rounds ran out at the last turn's writing (`Node::write_replies`) with its
     /// exchange taking more: the next turn is due at once, for its job to give the next piece.
@@ -1091,8 +1092,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     dial_only: Option<Tls>,
     /// The volume table as this node's member of the root range last held it (`host::Table`).
     table: Option<host::Table>,
-    /// Bytes of exchanges' bodies this node has read and written: its transfers' progress
-    /// ([`Node::moved`]).
+    /// Bytes of exchanges' bodies this node's task has read and written: its transfers' progress,
+    /// summed with its host's jobs' ([`Node::moved`]).
     moved: u64,
     /// The native requests this node answered `SlowDown`, a count for each cause in
     /// `door::Slowed::ALL`'s order ([`Node::slowed`]).
@@ -1536,7 +1537,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             parked: VecDeque::new(),
             parked_most: exchanges,
             put_window: crate::window::Window::default(),
-            jobs: Vec::new(),
+            host: host::Host::new(exchanges),
             feeding: Vec::new(),
             fed: false,
             replies: Vec::new(),
@@ -2255,9 +2256,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Bytes of exchanges' bodies the node has read and written since it opened: what its
-    /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written).
+    /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written),
+    /// its own task's and its host's jobs' (node.md §2.9 step 6d).
     pub fn moved(&self) -> u64 {
-        self.moved
+        self.moved.saturating_add(self.host.moved())
     }
 
     /// The requests this node answered `SlowDown` since it opened, on either door, a count for
@@ -3556,7 +3558,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .find(|c| c.exchange == exchange)
                 .map(|c| c.asked)
         {
-            host::chunk_moved(&mut self.jobs, asked);
+            self.host.chunk_moved(asked);
         }
         match then {
             Some(Then::Snapshot { .. }) if failed.is_some() => self.snapshot_done(exchange, false),
@@ -3661,7 +3663,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if len > 0
                 && let Some(asked) = asked
             {
-                host::chunk_moved(&mut self.jobs, asked);
+                self.host.chunk_moved(asked);
             }
             if matches!(receiving.what, Arriving::ChunkPut { .. }) {
                 self.chunks_received = self.chunks_received.saturating_add(len);

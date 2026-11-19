@@ -1673,6 +1673,19 @@ impl Cell {
                 }
                 std::fs::write(&config, text).unwrap();
             }
+            // Where each founder places its ranges and drives its native requests (node.md §2.9),
+            // as `MANTLE_TEST_SHARDS=RANGES,NATIVE` states them (`first` or `spread` each), so the
+            // suites run under each placement; unset, the node's own default.
+            if let Ok(shards) = std::env::var("MANTLE_TEST_SHARDS") {
+                let (ranges, native) = shards
+                    .split_once(',')
+                    .unwrap_or_else(|| panic!("MANTLE_TEST_SHARDS={shards}: RANGES,NATIVE"));
+                let mut text = std::fs::read_to_string(&config).unwrap();
+                text.push_str(&format!(
+                    "range_shards = {ranges}\nnative_shards = {native}\n"
+                ));
+                std::fs::write(&config, text).unwrap();
+            }
             made.insert(*id, config);
         }
         let pki = Pki {

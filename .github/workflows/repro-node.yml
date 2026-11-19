@@ -1,0 +1,51 @@
+name: repro-node
+# The node suite (crates/mantle/tests/node.rs) again and again on CI's ubuntu-24.04-arm runner, as the gates
+# run it, on perf-10k 5fbd5059 (the o5 fix and the extents fix), to learn whether the 20 MiB put that ended `Lost(Stalled)` about one run in sixteen at
+# 068ee7a1 still does: a failed run's output is kept. Eight runners at once, twelve runs each.
+on:
+  push:
+    branches: ["repro/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3, 4, 5, 6, 7, 8]
+    name: node suite, runner ${{ matrix.runner }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build the node suite
+        run: cargo test -p mantle --test node --locked --no-run
+      - name: The node suite, twelve times
+        run: |
+          mkdir -p out
+          failed=0
+          for i in $(seq 12); do
+            mkdir -p "out/trace-$i"
+            start=$(date +%s)
+            if cargo test -p mantle --test node --locked -- --nocapture > "out/run-$i.txt" 2>&1; then
+              echo "run $i passed in $(($(date +%s) - start)) s"
+              rm -rf "out/trace-$i"
+            else
+              failed=$((failed + 1))
+              echo "run $i FAILED in $(($(date +%s) - start)) s: $(ls out/trace-$i | wc -l) trace files"
+              # The step's bash runs with -e and pipefail: a grep that finds nothing, or a pipe's
+              # reader that ends first, would end the loop here, the runs left never run.
+              grep -m 20 -E "panicked at|^the put|FAILED|Lost\(" "out/run-$i.txt" || true
+            fi
+          done
+          echo "failed $failed of 12"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: node-traced-${{ matrix.runner }}
+          path: out

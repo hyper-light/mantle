@@ -56,6 +56,10 @@ pub(super) struct Upkeep {
     /// Whether an engine that did work at the last turn still owed some at its end, or the budget
     /// ran out before every range was asked: the wait is due at once while so.
     owed: bool,
+    /// Whether an engine owed work at the last turn but could do none of it now, a job out on a
+    /// worker among such: the worker's message wakes the task, and the node's wait asks it again
+    /// before it sleeps (`Node::wait`).
+    waiting: bool,
 }
 
 impl Upkeep {
@@ -78,6 +82,11 @@ impl Upkeep {
         self.owed
     }
 
+    /// Whether an engine owed work at the last turn that it could do none of then.
+    pub(super) fn waiting(&self) -> bool {
+        self.waiting
+    }
+
     /// One turn's maintenance over `count` ranges, after `own_ns` of the turn's own work
     /// ([`Self::budget`]): `step(at, units)` steps range `at`'s engine with at most `units` and
     /// answers the units it did and whether its engine still owes work, or the node's error for a
@@ -90,6 +99,7 @@ impl Upkeep {
         mut step: impl FnMut(usize, u64) -> Result<(u64, bool), NodeError>,
     ) -> Result<u64, NodeError> {
         self.owed = false;
+        self.waiting = false;
         if count == 0 {
             return Ok(0);
         }
@@ -116,6 +126,7 @@ impl Upkeep {
             // worker) is asked again at the next turn something else brings, a worker's message
             // among them: turned at once, the shard would spin on it.
             self.owed |= owes && did > 0;
+            self.waiting |= owes && did == 0;
         }
         if done > 0 {
             let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -230,12 +241,16 @@ mod tests {
             assert!(!upkeep.owed());
         }
         assert_eq!(upkeep.budget(OWN_NS), 1, "an untimed rate grew");
-        // One that owes work but can do none now brings no wait forward either.
+        assert!(!upkeep.waiting());
+        // One that owes work but can do none now brings no wait forward either: it waits, as a
+        // job out on a worker does, to be asked again before the node's wait sleeps.
         assert_eq!(upkeep.turn(OWN_NS, 1, |_, _| Ok((0, true))).unwrap(), 0);
         assert!(!upkeep.owed());
+        assert!(upkeep.waiting());
         // With no ranges, none is asked.
         assert_eq!(upkeep.turn(OWN_NS, 0, |_, _| Ok((1, true))).unwrap(), 0);
         assert!(!upkeep.owed());
+        assert!(!upkeep.waiting());
     }
 
     /// The rows of a PUT burst a metadata range's engine takes: 40,000, as read-amp's counting
@@ -464,6 +479,7 @@ mod tests {
                             // Nothing owed, or nothing it can do now and no job out to wait for.
                             break;
                         }
+                        assert!(upkeep.waiting(), "turn {turns} looked and is not waiting");
                         waits.waited += 1;
                         woke = wait_for_wake(bound).await;
                         slept = !woke;

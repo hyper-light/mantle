@@ -3006,6 +3006,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             hyper_rt::futures::yield_now().await;
             return Ok(());
         }
+        // An engine that could do none of what it owed at the last turn (a job out on a worker) is
+        // asked again before the wait sleeps: the wake its worker's message gave may have ended an
+        // await between turns (the process saying a line) rather than this wait, which would then
+        // sleep with the result in hand. Asked, it takes the result, or leaves the task waiting on
+        // its workers again, with no await between that and this wait.
+        if self.upkeep.waiting() {
+            self.upkeep_ranges(std::time::Instant::now())?;
+            if self.upkeep.owed() {
+                hyper_rt::futures::yield_now().await;
+                return Ok(());
+            }
+        }
         let now = hyper_rt::futures::now_ns();
         let wake = self.liveness.wake();
         // A closing node dials no peer (`Node::dial`): the redial a connection it closed asks is

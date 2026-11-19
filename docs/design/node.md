@@ -4505,7 +4505,12 @@ work owed, and leaves the task it runs on registered on the pool's channel back,
 `receive` does for the runtime's ranges, so that the worker's next message wakes it once
 (`ShardDb::idle_step_now`, `Pool::wake_on_message`): the wake ends the shard's wait, and the turn
 it begins takes the result. Such a look used to answer a unit done, so the shard turned again at
-once to look until the job came back. Maintenance writes no checkpoint and flushes nothing, so
+once to look until the job came back. The node's own wait asks such an engine again before it
+sleeps (`Node::wait`): the process awaits between the node's turns (saying a line), and a wake
+that came then ended that await rather than the wait, which would sleep with the result in hand;
+asked, the engine takes the result or leaves the task waiting on its workers again, with no await
+between that and the wait. A range shard's loop awaits nothing between its maintenance and its
+wait. Maintenance writes no checkpoint and flushes nothing, so
 what is durable and when a checkpoint answers are unchanged. Counted (`node::upkeep::tests`,
 40,000 Name-sized rows under the derived engine, checkpointed, then a get a turn, each turn
 ending in its maintenance and followed, as a node's wait follows it, by a yield while maintenance

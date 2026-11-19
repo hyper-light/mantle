@@ -26,6 +26,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use hyper_block::sim::Fault as DeviceFault;
 use hyper_log::{Start, Tail};
@@ -33,6 +34,7 @@ use hyper_rt::sim::SimPath;
 use hyper_sim::rng::{Seeded, stream_seed};
 use mantle_meta::name;
 use mantle_meta::wire::{Answer, Entry, Sessioned};
+use mantle_node::ask::CommandOutcome;
 
 #[allow(dead_code)]
 #[path = "support/cell.rs"]
@@ -1174,6 +1176,107 @@ fn note(cell: &Sim, commits: &BTreeMap<u64, u64>, at: u64, committed: &mut BTree
     for (id, member) in &cell.members {
         if member.status.is_some_and(|s| s.commit > commits[id]) {
             committed.entry(*id).or_insert(cell.now_ns() - at);
+        }
+    }
+}
+
+/// The commands each node of [`commands_refused_for_room_wait_for_the_room_not_a_pause`] holds of
+/// its own at once.
+const OWN_COMMANDS: u64 = 24;
+
+/// A command a range's leader refuses for room waits for the room, never a backoff's pause: in a
+/// cell of three one switch apart whose range takes one entry uncommitted at a time, the leader and
+/// a follower each ask a burst of puts of their own past what they hold, every one by a deadline a
+/// second and a half away. Those past what a node holds are refused at once, typed; the rest go out
+/// as entries two at a time, the second refused for room while the first is uncommitted, on the
+/// leader by its own member and on the follower by the leader. Each refused entry is asked again
+/// once its range's member on the node shows the range move: on the leader the commit that frees
+/// its room, on the follower that commit as the leader's next append carries it. So every command
+/// is answered by its deadline; each wait for room ends on the range's move (none by a pause), the
+/// longest within the leader's round trip to a follower and back, and on the follower one more
+/// way. Asked again after a backoff's pause instead (half the initial probe timeout to all of it,
+/// about 0.5 s to 1 s), the burst's entries took that each, and the deadline passed first.
+#[test]
+fn commands_refused_for_room_wait_for_the_room_not_a_pause() {
+    for seed in seeds(&[1, 7]) {
+        // One entry of two puts uncommitted at a time; the process's message bounds as every
+        // other cell's (`message_bounds`).
+        let settings = mantle_range::Settings {
+            max_uncommitted_size: SETTINGS.max_size_per_msg,
+            ..SETTINGS
+        };
+        let mut cell = Sim::asking_itself(seed, settings, usize::try_from(OWN_COMMANDS).unwrap());
+        let leader = cell.leader();
+        cell.judged();
+        cell.open_bucket();
+        let follower = (1..=cell.nodes).find(|id| *id != leader).unwrap();
+        let at = cell.now_ns();
+        let deadline = at + 1_500_000_000;
+        let past = 4;
+        for (node, first) in [(leader, 0), (follower, 1_000)] {
+            cell.own_commands(node, first, OWN_COMMANDS + past, deadline);
+        }
+        let asked = 2 * (OWN_COMMANDS + past);
+        cell.until("every own command ended", |c| {
+            if c.own_commands.len() == usize::try_from(asked).unwrap() {
+                Some(())
+            } else {
+                None
+            }
+        });
+        let mut refused = 0;
+        let mut last = 0;
+        for (node, tag, outcome, taken) in &cell.own_commands {
+            match outcome {
+                Ok(CommandOutcome::Answered(Answer::Name(name::Outcome::Put { .. }))) => {}
+                Err(why) => {
+                    assert!(
+                        why.contains("commands"),
+                        "seed {seed}: node {node}'s command {tag} refused: {why}"
+                    );
+                    refused += 1;
+                    continue;
+                }
+                Ok(outcome) => panic!("seed {seed}: node {node}'s command {tag} ended {outcome:?}"),
+            }
+            assert!(
+                *taken <= deadline + cell.step_ns(),
+                "seed {seed}: node {node}'s command {tag} answered at {taken} ns, past its \
+                 deadline {deadline} ns"
+            );
+            last = last.max(taken - at);
+        }
+        assert_eq!(
+            refused,
+            2 * past,
+            "seed {seed}: the commands past what a node holds"
+        );
+        for (node, bound) in [
+            (leader, 2 * cell.longest_ns() + 2 * cell.step_ns()),
+            (follower, 3 * cell.longest_ns() + 2 * cell.step_ns()),
+        ] {
+            let room = cell.members[&node].status.unwrap().room;
+            eprintln!(
+                "seed {seed}: node {node} ({}): {} waits for room, {} ended by a pause, the \
+                 longest {:?}; the burst answered in {last} ns",
+                if node == leader { "leader" } else { "follower" },
+                room.ended,
+                room.timed,
+                room.longest
+            );
+            assert!(
+                room.ended > 0,
+                "seed {seed}: node {node} found its range with room"
+            );
+            assert_eq!(
+                room.timed, 0,
+                "seed {seed}: node {node}'s waits ended by a pause"
+            );
+            assert!(
+                room.longest <= Duration::from_nanos(bound),
+                "seed {seed}: node {node} waited {:?} for room, past {bound} ns",
+                room.longest
+            );
         }
     }
 }

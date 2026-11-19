@@ -4534,6 +4534,7 @@ mod tests {
             reads_confirming: 0,
             reading: 0,
             commanded: 0,
+            room: crate::node::RoomWaits::default(),
         };
         let turn = |lines: &mut String| {
             lines.clear();
@@ -4594,6 +4595,7 @@ mod tests {
             reads_confirming: 0,
             reading: 0,
             commanded: 0,
+            room: crate::node::RoomWaits::default(),
         };
         let (mut before, mut after) = (String::new(), String::new());
         status_line(&mut before, 0x2a, &status(54)).unwrap();

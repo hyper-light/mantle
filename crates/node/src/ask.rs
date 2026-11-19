@@ -124,12 +124,49 @@ pub(crate) enum Via {
     Unasked,
     /// Proposed to this node's own member, which led the range.
     Local,
-    /// On an exchange with a peer.
-    Exchange { exchange: ExchangeId, peer: PeerId },
+    /// On an exchange with a peer, asked as this node's member of the range showed `mark`
+    /// ([`Room`]).
+    Exchange {
+        exchange: ExchangeId,
+        peer: PeerId,
+        mark: Option<Mark>,
+    },
     /// Asked of no one until `at_ns`: no node named a leader (`leaderless`), which ends too as soon
-    /// as this node's own member of the range names one, or the leader refused it for room, or this
-    /// node's member took it not, which only the pause ends.
-    Paused { at_ns: u64, leaderless: bool },
+    /// as this node's own member of the range names one; or the leader, or this node's member
+    /// leading, refused it for room (`room`), which ends too as soon as the member here shows
+    /// anything that frees room moved ([`Room`]).
+    Paused {
+        at_ns: u64,
+        leaderless: bool,
+        room: Option<Room>,
+    },
+}
+
+/// A request refused for room: what this node's member of the range showed as it was refused,
+/// `None` where the node keeps none, and when, on the shard's clock. The leader's room is its
+/// uncommitted entries, its log and its lanes, freed by a commit applied, a checkpoint that lets
+/// its log compact, a write or a lane's message taken, its reads served, or its lead lost; each
+/// moves what its member shows ([`Mark`]), at once where this node's member leads and within the
+/// round trip that carries the leader's commit where it follows. So the request is asked again
+/// at the turn its mark moves, not after a backoff's pause, which ends it only where nothing
+/// here shows the range moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Room {
+    pub mark: Option<Mark>,
+    pub since_ns: u64,
+}
+
+/// What of a range's member moves as its leader's room frees ([`Room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Mark {
+    pub term: u64,
+    pub leader: u64,
+    pub commit: u64,
+    pub applied: u64,
+    pub checkpoints: (u64, u64),
+    pub stalled: bool,
+    pub in_flight: usize,
+    pub reads: usize,
 }
 
 /// The entries a node keeps out to one range at once: as many as the range's log has frames in

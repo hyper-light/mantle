@@ -58,8 +58,8 @@ use mantle_range::membership::Replacement;
 use mantle_range::{Applied, Elections, GroupStore, LogStore, Range, RangeMachine, ReplicaError};
 
 use crate::ask::{
-    Asking, CommandAsk, CommandOutcome, ENTRIES_OUT, ReadAsk, ReadOut, ReadOutcome, Via, Wait,
-    Wanted,
+    Asking, CommandAsk, CommandOutcome, ENTRIES_OUT, Mark, ReadAsk, ReadOut, ReadOutcome, Room,
+    Via, Wait, Wanted,
 };
 use crate::chunk;
 use crate::command;
@@ -584,6 +584,19 @@ pub struct Status {
     /// applied through, and commands waiting for every answer.
     pub reading: usize,
     pub commanded: usize,
+    /// The commands and reads of its own this node asked that a range's leader refused for room
+    /// and that waited for it since the node opened: the waits ended, those a backoff's pause
+    /// ended with nothing here showing the range move ([`Room`]), and the longest any waited from
+    /// its refusal to its asking again.
+    pub room: RoomWaits,
+}
+
+/// What the node's own commands and reads refused for room waited ([`Status::room`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoomWaits {
+    pub ended: u64,
+    pub timed: u64,
+    pub longest: Duration,
 }
 
 /// A peer's link as the node keeps it: whether the plane holds keys for its connection, the
@@ -1528,6 +1541,12 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The proposals and reads far ranges refused ([`Node::lane_counts`]).
     far_refused_proposals: u64,
     far_refused_reads: u64,
+    /// The waits of commands and reads of its own this node's ranges refused for room
+    /// ([`Room`]) since it opened: those ended, those a backoff's pause ended with nothing here
+    /// showing the range move, and the longest from refusal to asked again ([`Status::room`]).
+    room_waits: u64,
+    room_timed: u64,
+    room_longest_ns: u64,
     /// The clients the node admits at once (`GatewaySettings::clients`), none where it hosts no
     /// objects.
     clients: usize,
@@ -1966,6 +1985,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             proposed_commands: 0,
             far_refused_proposals: 0,
             far_refused_reads: 0,
+            room_waits: 0,
+            room_timed: 0,
+            room_longest_ns: 0,
             clients,
             generation: 0,
             held: Vec::new(),
@@ -2400,15 +2422,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 ReadOrigin::Exchange(exchange) => self.refuse_read(exchange, group),
                 ReadOrigin::Own(ask) => {
                     let (local, leads) = (self.id, self.leader_of(group) == self.id);
+                    let mark = if leads { self.room_mark(group) } else { None };
                     self.reads_out.change(ask, |out| {
                         out.via = if leads {
-                            let at_ns =
-                                paused_until(local, (&mut out.backoff, &mut out.pauses), now);
                             out.leaderless_since.get_or_insert(now);
-                            Via::Paused {
-                                at_ns,
-                                leaderless: false,
-                            }
+                            room_via(local, (&mut out.backoff, &mut out.pauses), now, mark)
                         } else {
                             Via::Unasked
                         };
@@ -2428,6 +2446,42 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.kept(group)
             .and_then(|k| self.owner.get(k.handle))
             .map(shard::Seen::of)
+    }
+
+    /// What of `group`'s member here moves as its leader's room frees ([`Room`]), `None` where the
+    /// node keeps no member of it.
+    fn room_mark(&self, group: u128) -> Option<Mark> {
+        self.seen(group).map(|seen| Mark {
+            term: seen.term,
+            leader: seen.leader,
+            commit: seen.commit,
+            applied: seen.applied,
+            checkpoints: seen.checkpoints,
+            stalled: seen.stalled,
+            in_flight: seen.in_flight,
+            reads: seen.reads_held.saturating_add(seen.reads_confirming),
+        })
+    }
+
+    /// When a request paused until `at_ns` is next asked: at once where it waits for `room` and
+    /// the range's member here moved since, which a turn may show after it stepped its asks (an
+    /// engine's checkpoint at its end, `Node::upkeep_ranges`), so the wait never sleeps past it.
+    fn room_due(&self, group: u128, room: Option<Room>, now: u64, at_ns: u64) -> u64 {
+        match room {
+            Some(room) if room.mark.is_some() && room.mark != self.room_mark(group) => now,
+            _ => at_ns,
+        }
+    }
+
+    /// A wait for room ended at `now` (`Via::Paused`'s `room`), counted: whether `mark`, what the
+    /// range's member here shows now, moved from what it showed at the refusal, or a backoff's
+    /// pause ended it.
+    fn room_ended(&mut self, room: Room, mark: Option<Mark>, now: u64) {
+        self.room_waits = self.room_waits.saturating_add(1);
+        if room.mark.is_none() || room.mark == mark {
+            self.room_timed = self.room_timed.saturating_add(1);
+        }
+        self.room_longest_ns = self.room_longest_ns.max(now.saturating_sub(room.since_ns));
     }
 
     /// Whether this node's member leads `group`.
@@ -2518,6 +2572,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             (CommandOrigin::Own(id), refusal) => {
                 let local = self.id;
+                let mark = match refusal {
+                    shard::Refusal::NotTaken => self.room_mark(group),
+                    shard::Refusal::TooLarge => None,
+                };
                 let Some(asking) = self.asking.iter_mut().find(|a| a.group == group) else {
                     return Ok(());
                 };
@@ -2533,7 +2591,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         if let Some(out) = asking.out_mut(id) {
                             out.leaderless_since.get_or_insert(now);
                         }
-                        pause(local, asking, id, now, false);
+                        wait_room(local, asking, id, now, mark);
                     }
                 }
                 Ok(())
@@ -2629,6 +2687,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             reads_confirming: seen.reads_confirming,
             reading: self.reading.iter().filter(|r| r.group == group).count(),
             commanded: self.commanded.iter().filter(|c| c.group == group).count(),
+            room: RoomWaits {
+                ended: self.room_waits,
+                timed: self.room_timed,
+                longest: Duration::from_nanos(self.room_longest_ns),
+            },
         })
     }
 
@@ -5134,23 +5197,48 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 let given_up = asking.unled(&spent, &mut self.commands_done);
                 self.end_asked(group, &given_up);
             }
-            let due: Vec<u64> = self
+            // A pause for want of a leader ends once this node's own member names one, and a wait
+            // for room once the range's member here shows it moved (`paused_due`).
+            let paused = self
+                .asking
+                .get(at)
+                .is_some_and(|a| a.outs.iter().any(|o| matches!(o.via, Via::Paused { .. })));
+            let (led, mark) = if paused {
+                (self.leader_of(group) != 0, self.room_mark(group))
+            } else {
+                (false, None)
+            };
+            let due: Vec<(u64, Option<Room>)> = self
                 .asking
                 .get(at)
                 .into_iter()
                 .flat_map(|a| &a.outs)
-                .filter(|o| match o.via {
-                    Via::Unasked => true,
-                    // A pause for want of a leader ends once this node's own member names one.
-                    Via::Paused { at_ns, leaderless } => {
-                        at_ns <= now || (leaderless && self.leader_of(group) != 0)
-                    }
-                    Via::Local | Via::Exchange { .. } => false,
-                })
-                .map(|o| o.id)
+                .filter(|o| paused_due(o.via, now, led, mark))
+                .map(|o| (o.id, room_of(o.via)))
                 .collect();
-            for id in due {
+            // The entries waiting for room asked again in order, as many as the freed room takes:
+            // once one is refused again at once, the rest wait for the range's next move rather
+            // than each asking a leader with no room (`refused_now`).
+            let mut full = false;
+            for (id, room) in due {
+                if let Some(room) = room {
+                    if full {
+                        let out = self.asking.get_mut(at).and_then(|a| a.out_mut(id));
+                        if let Some(out) = out {
+                            out.via = remarked(out.via, mark);
+                        }
+                        continue;
+                    }
+                    self.room_ended(room, mark, now);
+                }
                 self.ask_entry(at, id, now)?;
+                full = full
+                    || (room.is_some()
+                        && self
+                            .asking
+                            .get_mut(at)
+                            .and_then(|a| a.out_mut(id))
+                            .is_some_and(|o| refused_now(o.via, now)));
             }
         }
         Ok(())
@@ -5182,6 +5270,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if known == self.id {
             return self.propose_own(at, id, now);
         }
+        // What the range's member here shows as the entry is asked: a refusal for room answers
+        // for a moment past it (`command_replied`).
+        let asked = self.room_mark(group);
         let nodes = self.remotes.len().max(1);
         let Some(asking) = self.asking.get_mut(at) else {
             return Ok(());
@@ -5232,6 +5323,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 out.via = Via::Exchange {
                     exchange,
                     peer: target,
+                    mark: asked,
                 };
                 self.writing.push(Writing {
                     exchange,
@@ -5254,7 +5346,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Proposes range `at`'s entry out `id` to this node's own member, which leads the range, and
     /// keeps it, in its place among the entries out, until its entry applies (`reply_commands`);
     /// one the member does not take now (its log or its uncommitted bound full, or no longer
-    /// leading) is asked again after a pause.
+    /// leading) is asked again once the member shows its room may have freed ([`Room`]).
     fn propose_own(&mut self, at: usize, id: u64, now: u64) -> Result<(), NodeError> {
         let Some((group, place, mut out)) = self.asking.get_mut(at).and_then(|a| {
             // A search of the range's entries out, at most `ENTRIES_OUT`.
@@ -5275,6 +5367,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .iter()
             .map(|c| (c.session, c.serial, None))
             .collect();
+        let mark = match proposed {
+            Ok(_) => None,
+            Err(_) => self.room_mark(group),
+        };
         let Some(asking) = self.asking.get_mut(at) else {
             return Ok(());
         };
@@ -5297,10 +5393,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             Err(error @ NodeError::ShardEnded(_)) => return Err(error),
             Err(_) => {
-                // The member takes no entry now: the time without a leader that serves it counted.
+                // The member takes no entry now: the time without a leader that serves it counted,
+                // and the entry asked again once the member shows its room may have freed.
                 out.leaderless_since.get_or_insert(now);
                 asking.outs.insert(place, out);
-                pause(self.id, asking, id, now, false);
+                wait_room(self.id, asking, id, now, mark);
             }
         }
         Ok(())
@@ -5319,8 +5416,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// A reply's head to an entry this node asked: its answers follow; or the leader the node
     /// names, or none, and the entry is asked again of it, or of the next node; or the leader
-    /// refused it for room, and it is asked again after a pause; or the entry was refused for what
-    /// it is.
+    /// refused it for room, and it is asked again once this node's member shows the range moved
+    /// ([`Room`]); or the entry was refused for what it is.
     fn command_replied(
         &mut self,
         exchange: ExchangeId,
@@ -5335,7 +5432,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(asking) = self.asking.get_mut(at) else {
             return Ok(());
         };
-        let Some(Via::Exchange { peer, .. }) = asking.out_mut(id).map(|o| o.via) else {
+        let Some(Via::Exchange { peer, mark, .. }) = asking.out_mut(id).map(|o| o.via) else {
             return Ok(());
         };
         let status = head
@@ -5369,7 +5466,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 asking.leader = None;
                 unasked(asking);
             }
-            command::Status::Refused => pause(self.id, asking, id, now, false),
+            command::Status::Refused => {
+                // Refused by the leader, which answered: no round of asking that found none, so
+                // the entry, once its room frees, is asked of that leader again, not paused for
+                // the nodes the entries out asked meanwhile (`ask_entry`). It waits on what this
+                // node's member showed as it was asked: the leader refused it at a moment past
+                // that, and a commit it carried here since, on another path than the refusal,
+                // may have freed the room the refusal found full.
+                let named = head.as_ref().map_or(0, |h| h.leader);
+                asking.leader = Some(if named == 0 { peer } else { named });
+                asking.tried = 0;
+                wait_room(self.id, asking, id, now, mark);
+            }
             status => asking.refused_entry(id, status, &mut self.commands_done),
         }
         Ok(())
@@ -5481,6 +5589,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// not out asked.
     fn step_reads(&mut self, now: u64) -> Result<(), NodeError> {
         let mut at = 0;
+        // The ranges a read waiting for room was refused again by at this turn, at most one apiece
+        // of the reads out.
+        let mut full: Vec<u128> = Vec::new();
         while let Some(out) = self.reads_out.at(at) {
             let (group, via, deadline_ns) = (out.group, out.via, out.deadline_ns);
             let request = out.wait == Wait::Request;
@@ -5500,15 +5611,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.reads_out
                 .change_at(at, |out| out.leaderless_since = since);
             if deadline_ns > now && !leaderless {
-                let due = match via {
-                    Via::Unasked => true,
-                    Via::Paused { at_ns, leaderless } => {
-                        at_ns <= now || (leaderless && self.leader_of(group) != 0)
-                    }
-                    Via::Local | Via::Exchange { .. } => false,
+                let (led, mark) = match via {
+                    Via::Paused { .. } => (self.leader_of(group) != 0, self.room_mark(group)),
+                    Via::Unasked | Via::Local | Via::Exchange { .. } => (false, None),
                 };
-                if due {
-                    self.ask_read_out(at, now)?;
+                if paused_due(via, now, led, mark) {
+                    let room = room_of(via);
+                    // As a range's entries are (`step_asks`): the reads waiting for room asked
+                    // again in order, as many as the freed room takes.
+                    if room.is_some() && full.contains(&group) {
+                        self.reads_out
+                            .change_at(at, |out| out.via = remarked(out.via, mark));
+                    } else {
+                        if let Some(room) = room {
+                            self.room_ended(room, mark, now);
+                        }
+                        self.ask_read_out(at, now)?;
+                        if room.is_some()
+                            && self
+                                .reads_out
+                                .at(at)
+                                .is_some_and(|out| refused_now(out.via, now))
+                        {
+                            full.push(group);
+                        }
+                    }
                 }
                 at = at.saturating_add(1);
                 continue;
@@ -5562,6 +5689,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             };
             let local = self.id;
+            let mark = if asked { None } else { self.room_mark(group) };
             let Some(ask) = self.reads_out.change_at(at, |out| {
                 // Its wait for a quorum's confirmation, counted where nothing here judges
                 // (`unled`); or the member takes no read now (it is stepping down, or has no
@@ -5573,11 +5701,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 out.via = if asked {
                     Via::Local
                 } else {
-                    let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
-                    Via::Paused {
-                        at_ns,
-                        leaderless: false,
-                    }
+                    room_via(local, (&mut out.backoff, &mut out.pauses), now, mark)
                 };
                 out.ask
             }) else {
@@ -5595,6 +5719,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         let nodes = self.remotes.len().max(1);
         let local = self.id;
+        // What the range's member here shows as the read is asked, as for a command (`ask_entry`).
+        let mark = self.room_mark(group);
         let remotes = &self.remotes;
         // Every node asked this round and none answered, or no node to ask, as for a command
         // (`ask_entry`): asked again after a pause. Else of the leader known, or the next node.
@@ -5616,6 +5742,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 out.via = Via::Paused {
                     at_ns,
                     leaderless: known == 0,
+                    room: None,
                 };
                 out.leaderless_since.get_or_insert(now);
                 return None;
@@ -5642,6 +5769,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     out.via = Via::Exchange {
                         exchange,
                         peer: target,
+                        mark,
                     };
                 });
                 self.writing.push(Writing {
@@ -5671,7 +5799,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// A reply's head to a read this node asked: its answer follows; or the leader the node names,
     /// or none, and it is asked again of it or the next node; or the leader refused it for room,
-    /// and it is asked again after a pause; or it was refused for what it is.
+    /// and it is asked again once this node's member shows the range moved ([`Room`]); or it was
+    /// refused for what it is.
     fn read_replied(&mut self, exchange: ExchangeId, body: u64, now: u64) -> Result<(), NodeError> {
         let Some(ask) = self.read_on(exchange) else {
             return Ok(());
@@ -5679,7 +5808,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let endpoint = self.driver.endpoint();
         let head = command::read_reply_head(endpoint.head(exchange).unwrap_or_default());
         let local = self.id;
-        let Some(Via::Exchange { peer, .. }) = self.reads_out.get(ask).map(|out| out.via) else {
+        let Some(Via::Exchange { peer, mark, .. }) = self.reads_out.get(ask).map(|out| out.via)
+        else {
             return Ok(());
         };
         self.reads_out
@@ -5716,12 +5846,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
             }
             command::Status::Refused => {
+                // Asked again once this node's member of the range shows its room may have freed
+                // since the read was asked, as a command is (`command_replied`).
+                let named = head.as_ref().map_or(0, |h| h.leader);
                 self.reads_out.change(ask, |out| {
-                    let at_ns = paused_until(local, (&mut out.backoff, &mut out.pauses), now);
-                    out.via = Via::Paused {
-                        at_ns,
-                        leaderless: false,
-                    };
+                    // Refused by the leader, which answered, as a command is (`command_replied`).
+                    out.leader = Some(if named == 0 { peer } else { named });
+                    out.tried = 0;
+                    out.via = room_via(local, (&mut out.backoff, &mut out.pauses), now, mark);
                 });
             }
             status => {
@@ -5756,7 +5888,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|r| {
                 let asked = match r.via {
                     Via::Unasked => now,
-                    Via::Paused { at_ns, .. } => at_ns,
+                    Via::Paused { at_ns, room, .. } => self.room_due(r.group, room, now, at_ns),
                     Via::Local | Via::Exchange { .. } => r.deadline_ns,
                 };
                 // Or, a request's, its range's budget spent without a leader that can serve it.
@@ -5784,7 +5916,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 let outs = a.outs.iter().filter_map(|o| {
                     let asked = match o.via {
                         Via::Unasked => Some(now),
-                        Via::Paused { at_ns, .. } => Some(at_ns),
+                        Via::Paused { at_ns, room, .. } => {
+                            Some(self.room_due(a.group, room, now, at_ns))
+                        }
                         Via::Local | Via::Exchange { .. } => None,
                     };
                     // Or the range's budget spent without a leader that can serve the entry, which
@@ -5995,18 +6129,109 @@ fn waits_until(now: u64, remaining_ns: u64) -> u64 {
     now.saturating_add(wait)
 }
 
-/// Pauses `asking`'s entry out `id`: no node named a leader this round (`leaderless`), or the
-/// leader refused it for room. RFC 6298 §5.5's doubling backoff, at most the idle timeout
+/// Pauses `asking`'s entry out `id`: no node named a leader this round (`leaderless`), or every
+/// node asked this round answered nothing. RFC 6298 §5.5's doubling backoff, at most the idle timeout
 /// (`bounds::backed_off`), each pause drawn between its half and its whole (`bounds::pause`) so
 /// nodes do not ask again in step. The range's backoff is its entries' alike: a pause says what
 /// the range did, whichever entry found it.
 fn pause(local: u64, asking: &mut Asking, id: u64, now: u64, leaderless: bool) {
     let at_ns = paused_until(local, (&mut asking.backoff, &mut asking.pauses), now);
     if let Some(out) = asking.out_mut(id) {
-        out.via = Via::Paused { at_ns, leaderless };
+        out.via = Via::Paused {
+            at_ns,
+            leaderless,
+            room: None,
+        };
         if leaderless {
             out.leaderless_since.get_or_insert(now);
         }
+    }
+}
+
+/// Pauses `asking`'s entry out `id`, refused for room at `now` with its range's member here
+/// showing `mark` ([`Room`]): asked again at the turn the mark moves.
+fn wait_room(local: u64, asking: &mut Asking, id: u64, now: u64, mark: Option<Mark>) {
+    let via = room_via(local, (&mut asking.backoff, &mut asking.pauses), now, mark);
+    if let Some(out) = asking.out_mut(id) {
+        out.via = via;
+    }
+}
+
+/// The wait of a request refused for room at `now`, the range's member here showing `mark`
+/// ([`Room`]): until the mark moves, or, where nothing here shows the range moving, a backoff's
+/// pause, which a mark leaves undoubled, since what ends the wait is the range's move, not the
+/// pause; where the node keeps no member, as a round that found no leader is paused.
+fn room_via(
+    local: u64,
+    (backoff, pauses): (&mut Duration, &mut u32),
+    now: u64,
+    mark: Option<Mark>,
+) -> Via {
+    let at_ns = if mark.is_some() {
+        let pause = bounds::pause(*backoff, local, *pauses);
+        *pauses = pauses.wrapping_add(1);
+        now.saturating_add(u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX))
+    } else {
+        paused_until(local, (backoff, pauses), now)
+    };
+    Via::Paused {
+        at_ns,
+        leaderless: false,
+        room: Some(Room {
+            mark,
+            since_ns: now,
+        }),
+    }
+}
+
+/// Whether a request paused as `via` is asked at `now`: its pause over, a pause for want of a
+/// leader once this node's member names one (`led`), or a wait for room once its range's member
+/// here shows `mark` moved from what it showed at the refusal ([`Room`]).
+fn paused_due(via: Via, now: u64, led: bool, mark: Option<Mark>) -> bool {
+    match via {
+        Via::Unasked => true,
+        Via::Paused {
+            at_ns,
+            leaderless,
+            room,
+        } => {
+            at_ns <= now
+                || (leaderless && led)
+                || room.is_some_and(|room| room.mark.is_some() && room.mark != mark)
+        }
+        Via::Local | Via::Exchange { .. } => false,
+    }
+}
+
+/// What a request paused as `via` waits for room on, if it does.
+fn room_of(via: Via) -> Option<Room> {
+    match via {
+        Via::Paused { room, .. } => room,
+        Via::Unasked | Via::Local | Via::Exchange { .. } => None,
+    }
+}
+
+/// Whether a request asked at `now` was refused for room at once: its member here, leading, had
+/// none (`Node::propose_own`, `Node::ask_read_out`).
+fn refused_now(via: Via, now: u64) -> bool {
+    room_of(via).is_some_and(|room| room.since_ns == now)
+}
+
+/// A request waiting for room left waiting, a request before it refused again at once: it waits
+/// for the move after `mark`, what the range's member here shows now, its pause and its start
+/// kept.
+fn remarked(via: Via, mark: Option<Mark>) -> Via {
+    match via {
+        Via::Paused {
+            at_ns,
+            leaderless,
+            room: Some(room),
+        } => Via::Paused {
+            at_ns,
+            leaderless,
+            room: Some(Room { mark, ..room }),
+        },
+        via => via,
     }
 }
 

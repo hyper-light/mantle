@@ -11,8 +11,15 @@
 //! against the MD5 of those bytes for each phase's first [`ETAGS`] keys. A set's acknowledged
 //! objects are a bit each (`transfer::Oracle`). Three controls, a byte flipped on its way to the
 //! check, a key never put and an ETag expected of another object, must each be reported as
-//! failures, or the run is not exact; a door's controls whose objects could not be put are not
-//! run, so not caught. A phase's failures are told apart: `refused`, answered with an error;
+//! failures, or the run is not exact. A door's controls run on its cell before its phases, while
+//! the cell can take their objects' puts; where it does not, they are said not to have run and
+//! why, never counted caught or uncaught, and the run is not exact.
+//!
+//! Each door's phases run on a cell made for that door, and each set on a cell of its own
+//! ([`Bench::fresh`]): every door's phases of a kind start from the same state, a new cell holding
+//! only that door's two control objects, and no phase runs on a cell another door's phases
+//! filled. A phase's failures are told apart:
+//! `refused`, answered with an error;
 //! `unanswered`, throttled or lost on every attempt (each operation asked again as the AWS SDKs ask
 //! one, a listing's page and a control's put among them), whose outcome is unknown, as S3 leaves a
 //! 5xx's; `differed`, a read whose bytes or length were not what was put; and the checks' others
@@ -53,8 +60,12 @@
 //! their requests arrive as a Poisson process and each waits for a free client; closed, a ladder
 //! of clients doubles while throughput grows, up to `--clients`, each step judged in rounds as a
 //! benchmark point is (measurement.md §5, [`ROUNDS`]) and its growth told by their intervals, the
-//! ladder ending three steps after the last that grew ([`FLAT`]), or at a step that left an
-//! operation unanswered, which asks no more once one is ([`Climb::after`]). Each phase says the
+//! ladder ending three steps after the last that grew ([`FLAT`]), or at a step not every operation
+//! of which was answered as asked, which asks no more once one is refused or unanswered and whose
+//! first refusal the ladder's end says, its best the best clean step ([`Climb::after`]). Every
+//! throughput, a phase's, a step's and its rounds', counts the operations answered as asked alone,
+//! its goodput ([`Tally::goodput`]), with the refused, the unanswered and the failed beside it,
+//! and open loop the rate offered as well. Each phase says the
 //! threads the process ran as the OS counts them, read as its clients' requests were out, and what
 //! the harness's own work held at its peak: a phase's operations allocate nothing of the
 //! harness's, so neither grows with the clients or the objects.
@@ -1315,6 +1326,9 @@ struct Tally {
     latency: Histogram,
     lateness: Histogram,
     ops: u64,
+    /// Of the operations, those answered as asked ([`Came::Done`]), a throttled one's answer after
+    /// it was asked again among them: the only ones a throughput counts, the phase's goodput.
+    answered: u64,
     failed: u64,
     /// Of the failed, those the server refused ([`Came::Refused`]).
     refused: u64,
@@ -1365,12 +1379,104 @@ impl Failure {
 }
 
 impl Tally {
+    fn new() -> Self {
+        Self {
+            latency: Histogram::new(),
+            lateness: Histogram::new(),
+            ops: 0,
+            answered: 0,
+            failed: 0,
+            refused: 0,
+            differed: 0,
+            unanswered: 0,
+            skipped: 0,
+            most: 0,
+            threads: 0,
+            first: [None, None, None],
+        }
+    }
+
     /// Keeps `why` as its kind's first failure, where there is none yet.
     fn keep_first(&mut self, kind: Failure, why: String) {
         if let Some(slot) = self.first.get_mut(kind.at()) {
             slot.get_or_insert(why);
         }
     }
+
+    /// One operation counted by what it came to: answered as asked, failed by its kind, or not
+    /// asked.
+    fn count(&mut self, came: Came) {
+        self.ops = self.ops.saturating_add(1);
+        match came {
+            Came::Done => self.answered = self.answered.saturating_add(1),
+            Came::Skipped => self.skipped = self.skipped.saturating_add(1),
+            Came::Failed(why) => {
+                self.failed = self.failed.saturating_add(1);
+                self.keep_first(Failure::Check, why);
+            }
+            Came::Differed(why) => {
+                self.failed = self.failed.saturating_add(1);
+                self.differed = self.differed.saturating_add(1);
+                self.keep_first(Failure::Check, why);
+            }
+            Came::Refused(why) => {
+                self.failed = self.failed.saturating_add(1);
+                self.refused = self.refused.saturating_add(1);
+                self.keep_first(Failure::Refusal, why);
+            }
+            Came::Unanswered(why) | Came::Lost(why) => {
+                self.failed = self.failed.saturating_add(1);
+                self.unanswered = self.unanswered.saturating_add(1);
+                self.keep_first(Failure::Unanswered, why);
+            }
+            // Settled into `Unanswered` before it is tallied (`Work::settled`): counted so.
+            Came::Slowed(_) => {
+                self.failed = self.failed.saturating_add(1);
+                self.unanswered = self.unanswered.saturating_add(1);
+            }
+        }
+    }
+
+    /// Whether every operation asked was answered as asked: none refused, none unanswered and
+    /// none whose answer failed its check. Only such a step is a ladder's to judge
+    /// ([`Climb::after`]).
+    fn clean(&self) -> bool {
+        self.failed == 0
+    }
+
+    /// The operations answered as asked a second over `elapsed_ns`: what the cell served, its
+    /// refusals and the operations it left unanswered counting in none of it.
+    fn goodput(&self, elapsed_ns: u64) -> f64 {
+        self.answered as f64 / (elapsed_ns.max(1) as f64 / 1e9)
+    }
+
+    /// The first reason the operations were not all answered as asked, a refusal's before an
+    /// unanswered operation's before a check's, and its kind's tag; none where they were.
+    fn why(&self) -> Option<(&'static str, &str)> {
+        [Failure::Refusal, Failure::Unanswered, Failure::Check]
+            .into_iter()
+            .find_map(|kind| {
+                let why = self.first.get(kind.at())?.as_deref()?;
+                Some((kind.tag(), why))
+            })
+    }
+}
+
+/// Whether an operation's outcome counts in a closed step's round: answered as asked. A refused
+/// or unanswered operation is not the cell's service, and a round that counted it measured the
+/// rate the cell refuses at (measurement.md §12).
+fn served(came: &Came) -> bool {
+    matches!(came, Came::Done)
+}
+
+/// Whether an operation's outcome ends a closed step in rounds: refused, or throttled or lost on
+/// every attempt. The cell no longer serves the load offered, so the step past it measures
+/// refusals, and each operation more is one more the cell is asked to refuse.
+fn refuses(came: &Came) -> bool {
+    matches!(
+        came,
+        Came::Refused(_) | Came::Unanswered(_) | Came::Lost(_) | Came::Slowed(_)
+    )
 }
 
 /// When a phase's operations are to start: each one's index, and its intended start on the
@@ -1443,19 +1549,7 @@ fn shared(
         Ok(lock_of(Shared {
             rounds: round.map(|size| Rounds::new(size, clock())),
             schedule: Schedule::new(load, seed, (from, end), clock())?,
-            tally: Tally {
-                latency: Histogram::new(),
-                lateness: Histogram::new(),
-                ops: 0,
-                failed: 0,
-                refused: 0,
-                differed: 0,
-                unanswered: 0,
-                skipped: 0,
-                most: 0,
-                threads: 0,
-                first: [None, None, None],
-            },
+            tally: Tally::new(),
             out: 0,
         }))
     })
@@ -1589,8 +1683,8 @@ impl Stepped {
     }
 }
 
-/// Where a closed ladder stands after a step: the best step so far, of the greatest median; the
-/// steps in a row since one grew, its interval wholly above the best's; and whether it ends.
+/// Where a closed ladder stands after a step: the best clean step so far, of the greatest median;
+/// the steps in a row since one grew, its interval wholly above the best's; and whether it ends.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Climb {
     best: Option<Stepped>,
@@ -1598,12 +1692,15 @@ struct Climb {
 }
 
 impl Climb {
-    /// The ladder after `step`, of whose operations `unanswered` went unanswered: whether it goes
-    /// on. A step that left one unanswered ends the ladder and is not its best: the cell did not
-    /// answer its load within its own patience, so the step is past the knee the ladder looks for
-    /// (measurement.md §12), and doubling its clients asks the cell to refuse more.
-    fn after(&mut self, step: Stepped, unanswered: u64) -> bool {
-        if unanswered > 0 {
+    /// The ladder after `step`, `clean` where every one of its operations was answered as asked
+    /// ([`Tally::clean`]): whether it goes on. A step that was not ends the ladder and is not its
+    /// best: one refused, the cell did not serve its load, and one left unanswered, it did not
+    /// answer it within its own patience, so the step is past the knee the ladder looks for
+    /// (measurement.md §12), its throughput not the cell's, and doubling its clients asks the cell
+    /// to refuse more. An operation throttled and then answered, asked again as the AWS SDKs ask
+    /// one, was answered as asked, and its step stays clean.
+    fn after(&mut self, step: Stepped, clean: bool) -> bool {
+        if !clean {
             return false;
         }
         let grew = self.best.is_none_or(|best| step.low > best.high);
@@ -1685,61 +1782,35 @@ async fn client<A: Ask>(
             let mut shared = locked(&shared)?;
             let shared = &mut *shared;
             shared.out = shared.out.saturating_sub(1);
-            // A closed step's round ends with its operations, an operation not asked counting in
-            // none; once the rounds are enough, the step asks no more. Nor once one of its
-            // operations went unanswered, throttled or lost on every attempt: the cell no longer
-            // answers the load offered within its own patience, so the step past it measures
-            // refusals, and each operation more is one more the cell is asked to refuse. A
-            // harness's error ends the phase, so it asks no more either. The operations out end on
+            // A harness's error ends the phase, so it asks no more. The operations out end on
             // their own bounds.
-            let enough = !matches!(came, Ok(Came::Skipped))
+            let came = match came {
+                Ok(came) => came,
+                Err(e) => {
+                    shared.schedule.stop();
+                    return Err(e);
+                }
+            };
+            // A closed step's round ends with the operations answered as asked, its throughput
+            // the cell's goodput ([`served`]); once the rounds are enough, the step asks no more.
+            // Nor once one of its operations was refused or went unanswered, throttled or lost on
+            // every attempt ([`refuses`]): the cell no longer serves the load offered, so the step
+            // past it measures refusals, and each operation more is one more the cell is asked to
+            // refuse.
+            let enough = served(&came)
                 && shared
                     .rounds
                     .as_mut()
                     .is_some_and(|rounds| rounds.completed(ended));
-            let unanswered = shared.rounds.is_some()
-                && matches!(
-                    came,
-                    Ok(Came::Unanswered(_) | Came::Lost(_) | Came::Slowed(_))
-                );
-            if enough || unanswered || came.is_err() {
+            if enough || (shared.rounds.is_some() && refuses(&came)) {
                 shared.schedule.stop();
             }
             let tally = &mut shared.tally;
-            tally.ops = tally.ops.saturating_add(1);
-            if !matches!(came, Ok(Came::Skipped)) {
+            if !matches!(came, Came::Skipped) {
                 tally.latency.record(took);
                 tally.lateness.record(started.saturating_sub(intended));
             }
-            match came {
-                Ok(Came::Done) => {}
-                Ok(Came::Skipped) => tally.skipped = tally.skipped.saturating_add(1),
-                Ok(Came::Failed(why)) => {
-                    tally.failed = tally.failed.saturating_add(1);
-                    tally.keep_first(Failure::Check, why);
-                }
-                Ok(Came::Differed(why)) => {
-                    tally.failed = tally.failed.saturating_add(1);
-                    tally.differed = tally.differed.saturating_add(1);
-                    tally.keep_first(Failure::Check, why);
-                }
-                Ok(Came::Refused(why)) => {
-                    tally.failed = tally.failed.saturating_add(1);
-                    tally.refused = tally.refused.saturating_add(1);
-                    tally.keep_first(Failure::Refusal, why);
-                }
-                Ok(Came::Unanswered(why) | Came::Lost(why)) => {
-                    tally.failed = tally.failed.saturating_add(1);
-                    tally.unanswered = tally.unanswered.saturating_add(1);
-                    tally.keep_first(Failure::Unanswered, why);
-                }
-                // Settled into `Unanswered` before it is tallied (`Work::settled`): counted so.
-                Ok(Came::Slowed(_)) => {
-                    tally.failed = tally.failed.saturating_add(1);
-                    tally.unanswered = tally.unanswered.saturating_add(1);
-                }
-                Err(e) => return Err(e),
-            }
+            tally.count(came);
             Ok(())
         });
         if let Err(e) = counted {
@@ -2989,6 +3060,8 @@ struct Bench<'o> {
     drivers: Vec<Driver>,
     /// The cell this program runs, none against an `--endpoint`.
     cell: Option<Cell>,
+    /// The directory the cell was made in ([`Bench::fresh`]).
+    cell_dir: PathBuf,
     rt: LocalRuntime,
     /// The relay condition's path the native clients dial through, when `--relay` asks for it.
     relay: Option<crate::relay::Relay>,
@@ -3642,15 +3715,15 @@ impl<'o> Bench<'o> {
     }
 
     /// One phase on `clients` connections, operations `from..end`, and its line: the operations it
-    /// asked, its throughput, a closed step's in rounds (`in_rounds`) as they judged it, and its
-    /// operations unanswered.
+    /// asked, its throughput, the operations answered as asked a second (a closed step's in rounds,
+    /// `in_rounds`, as they judged it), and its tally.
     fn step(
         &mut self,
         out: &mut impl Write,
         work: &Arc<Work>,
         (size, clients): (&str, usize),
         (from, end, in_rounds): (u64, u64, bool),
-    ) -> Result<(u64, Stepped, u64), Error> {
+    ) -> Result<(u64, Stepped, Tally), Error> {
         let round = match (in_rounds, self.options.load) {
             (true, Load::Closed) => Some(round_ops(clients)?),
             _ => None,
@@ -3721,8 +3794,9 @@ impl<'o> Bench<'o> {
         if let Some(pool) = self.pools.get_mut(work.door.at()) {
             pool.extend(held);
         }
-        let (ops, unanswered) = (tally.ops, tally.unanswered);
-        let rate = ops as f64 / (elapsed_ns.max(1) as f64 / 1e9);
+        let ops = tally.ops;
+        // The cell's goodput: the operations it answered as asked, its refusals in none of it.
+        let rate = tally.goodput(elapsed_ns);
         // A server outside this program that refuses every operation of a phase does not offer
         // it: the phase is excluded with the server's answer, not counted as a failed check. A
         // check that failed on an answer it gave is a failure.
@@ -3772,7 +3846,7 @@ impl<'o> Bench<'o> {
                 .as_ref()
                 .and_then(|j| Stepped::of(clients, j))
                 .unwrap_or(point),
-            unanswered,
+            measured.tally,
         ))
     }
 
@@ -3856,7 +3930,7 @@ impl<'o> Bench<'o> {
         let stalled = stalls_grown(&before.counts, &after.counts);
         writeln!(
             out,
-            "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
+            "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} answered {} goodput_ops/s {:.1} offered_ops/s {} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {}{} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
              latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}{}{}{}",
@@ -3866,6 +3940,12 @@ impl<'o> Bench<'o> {
             self.options.condition,
             m.clients,
             m.elapsed_ns.checked_div(1_000_000).unwrap_or(0),
+            t.answered,
+            t.goodput(m.elapsed_ns),
+            match self.options.load {
+                Load::Open(rate) => rate.to_string(),
+                Load::Closed => "-".to_owned(),
+            },
             per(counted(|c| c.allocations), ops),
             per(counted(|c| c.reallocations), ops),
             per(counted(|c| c.moved), ops),
@@ -4033,10 +4113,12 @@ impl<'o> Bench<'o> {
     /// closed, a ladder from one client doubling up to `--clients`, each step judged in rounds
     /// ([`ROUNDS`]) where `n` holds them and asking at most `n` operations further on, and ending
     /// [`FLAT`] steps after the last whose interval lay wholly above the best's before it, or at a
-    /// step that left an operation unanswered, which is not its best ([`Climb::after`]). A step
+    /// step not every operation of which was answered as asked, one refused, unanswered or failing
+    /// its check, which is not its best and whose line says so and why ([`Climb::after`]). A step
     /// whose `n` holds no judged rounds (a large object's, its bytes capped) is its one throughput.
-    /// Operations end at `end` where the phase's keys end; `finish` runs what the ladder left of
-    /// them at its best step's clients. Says how far the steps went.
+    /// Every throughput is the operations answered as asked ([`Tally::goodput`]). Operations end
+    /// at `end` where the phase's keys end; `finish` runs what the ladder left of them at its best
+    /// step's clients. Says how far the steps went.
     fn ladder(
         &mut self,
         out: &mut impl Write,
@@ -4059,28 +4141,34 @@ impl<'o> Bench<'o> {
             best: None,
             flat: 0,
         };
-        let (mut at, mut clients) = (from, 1usize);
+        let (mut at, mut clients, mut ran) = (from, 1usize, false);
         while at < end {
+            ran = true;
             let to = at.saturating_add(n.min(step_ops(clients)?)).min(end);
-            let (asked, stepped, unanswered) =
+            let (asked, stepped, tally) =
                 self.step(out, work, (size, clients), (at, to, judged(clients)?))?;
             at = at.saturating_add(asked).min(to);
-            if !climb.after(stepped, unanswered) || clients >= budget {
-                if unanswered > 0 {
+            if !climb.after(stepped, tally.clean()) || clients >= budget {
+                if !tally.clean() {
+                    let (tag, why) = tally.why().unwrap_or((Failure::Check.tag(), "-"));
                     writeln!(
                         out,
-                        "doors {} {} {size} {} ladder ended clients {clients} unanswered {unanswered}",
+                        "doors {} {} {size} {} ladder ended clients {clients} refused {} unanswered {} failed {} first {tag}: {why}",
                         self.named(work.door),
                         work.kind.name(),
                         self.options.condition,
+                        tally.refused,
+                        tally.unanswered,
+                        tally.failed,
                     ).map_err(doing("writing output"))?;
                 }
                 break;
             }
             clients = clients.saturating_mul(2).min(budget);
         }
-        if let Some(best) = climb.best {
-            writeln!(
+        match climb.best {
+            None if !ran => Ok(()),
+            Some(best) => writeln!(
                 out,
                 "doors {} {} {size} {} ladder best clients {} ops/s median {:.1} low {:.1} high {:.1}",
                 self.named(work.door),
@@ -4090,8 +4178,16 @@ impl<'o> Bench<'o> {
                 best.median,
                 best.low,
                 best.high,
-            ).map_err(doing("writing output"))?;
+            ),
+            None => writeln!(
+                out,
+                "doors {} {} {size} {} ladder best none: no step answered every operation as asked",
+                self.named(work.door),
+                work.kind.name(),
+                self.options.condition,
+            ),
         }
+        .map_err(doing("writing output"))?;
         if finish && at < end {
             let clients = climb.best.map_or(1, |best| best.clients);
             self.step(out, work, (size, clients), (at, end, false))?;
@@ -4650,11 +4746,7 @@ fn run(
     (cell, listeners, signer, counting): (Option<Cell>, Vec<SocketAddr>, Signer, bool),
     drivers: Vec<Driver>,
 ) -> Result<bool, Error> {
-    let most = options
-        .clients
-        .saturating_mul(2)
-        .saturating_add(SLOPE_HIGH)
-        .saturating_add(1);
+    let most = most_held(options);
     // Each node admits as many native clients at once as it derived (`gateway.clients`), so a
     // client past them is refused at admission (node.md §3.6): the native door's clients stay
     // within. An endpoint this program did not start has no native door.
@@ -4677,28 +4769,12 @@ fn run(
                 "--relay asks the cell's own nodes, which an --endpoint has none of",
             ));
         }
-        (true, Some(cell)) => {
-            let nodes = cell.quic();
-            let held = mantle_client::least_transport(nodes.len()).map_err(failed)?;
-            let relay = crate::relay::Relay::start(
-                &options.dir.join("relay"),
-                &nodes,
-                most,
-                (held, options.seed),
-            )
-            .map_err(|e| failed(e.to_string()))?;
-            writeln!(
-                out,
-                "doors relay one_way_ns {} jitter_ns {} loss {}/{} in runs of {}/{} link_sets {most} held_bytes {held}",
-                crate::relay::ONE_WAY_NS,
-                crate::relay::JITTER_NS,
-                crate::relay::LOST,
-                crate::relay::SENT,
-                crate::relay::LOST,
-                crate::relay::RUNS,
-            ).map_err(doing("writing output"))?;
-            Some(relay)
-        }
+        (true, Some(cell)) => Some(start_relay(
+            out,
+            &options.dir.join("relay"),
+            cell,
+            (most, options.seed),
+        )?),
     };
     let mut bench = Bench {
         options,
@@ -4706,6 +4782,7 @@ fn run(
         drivers,
         listeners,
         cell,
+        cell_dir: options.dir.clone(),
         rt: runtime(most)?,
         relay,
         authority,
@@ -4729,17 +4806,27 @@ fn run(
     let idle = drive::thread_count();
     bench.create()?;
     let doors = bench.doors();
-    for &door in doors {
+    // Each door's phases run on a cell made for that door, its controls first, while the cell can
+    // take their puts, and each set on a cell of its own: every door's phases of a kind start from
+    // the same state, a new cell holding only that door's two control objects, and no phase runs
+    // on a cell another door's phases filled (measurement.md §12, [`Bench::fresh`]).
+    let mut caught = 0u32;
+    let mut unrun: Vec<String> = Vec::new();
+    for (k, &door) in doors.iter().enumerate() {
+        if k > 0 {
+            bench.fresh(out, door.name())?;
+        }
+        match bench.controls(out, door)? {
+            Ok(n) => caught = caught.saturating_add(n),
+            Err(why) => unrun.push(format!("{}: {why}", bench.named(door))),
+        }
         for &size in &options.sizes {
             bench.sized(out, door, size)?;
         }
     }
-    for &count in &options.objects {
+    for (k, &count) in options.objects.iter().enumerate() {
+        bench.fresh(out, &format!("set{count}-{k}"))?;
         bench.set(out, count)?;
-    }
-    let mut caught = 0u32;
-    for &door in doors {
-        caught = caught.saturating_add(bench.controls(out, door)?);
     }
     for &door in doors {
         bench.slope(out, door)?;
@@ -4753,18 +4840,7 @@ fn run(
     // The relay's own count: what its chain lost, what passed a direction's bytes, and how late it
     // sent what it held, so its cost is not charged to the stack (research/70 [12]).
     if let Some(relay) = bench.relay.take() {
-        let said = relay.stop().map_err(|e| failed(e.to_string()))?;
-        writeln!(
-            out,
-            "doors relay taken {} lost {} over {} sent {} late_mean_ns {} late_max_ns {}",
-            said.taken,
-            said.lost,
-            said.over,
-            said.sent,
-            said.late_ns.checked_div(said.sent).unwrap_or(0),
-            said.latest_ns,
-        )
-        .map_err(doing("writing output"))?;
+        stop_relay(out, relay)?;
     }
     writeln!(
         out,
@@ -4780,13 +4856,168 @@ fn run(
     let controls = u32::try_from(doors.len()).unwrap_or(0).saturating_mul(3);
     writeln!(
         out,
-        "doors verified ops {} differed {} refused {} unanswered {} skipped {} failed {} controls caught {caught} of {controls}",
-        bench.ops, bench.differed, bench.refused, bench.unanswered, bench.skipped, bench.failures
-    ).map_err(doing("writing output"))?;
-    Ok(bench.exact && caught == controls)
+        "doors verified ops {} differed {} refused {} unanswered {} skipped {} failed {} {}",
+        bench.ops,
+        bench.differed,
+        bench.refused,
+        bench.unanswered,
+        bench.skipped,
+        bench.failures,
+        controls_said(caught, controls, &unrun),
+    )
+    .map_err(doing("writing output"))?;
+    Ok(bench.exact && unrun.is_empty() && caught == controls)
+}
+
+/// What the run's controls came to: those caught of those run, and where a door's could not run,
+/// how many and why, rather than a count caught of controls that never ran.
+fn controls_said(caught: u32, controls: u32, unrun: &[String]) -> String {
+    if unrun.is_empty() {
+        return format!("controls caught {caught} of {controls}");
+    }
+    let not_run = u32::try_from(unrun.len())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(3)
+        .min(controls);
+    format!(
+        "controls caught {caught} of {} run, {not_run} could not run: {}",
+        controls.saturating_sub(not_run),
+        unrun.join("; ")
+    )
+}
+
+/// The clients the harness holds at once at most, both doors' and the slope's, each a link set
+/// of the relay condition's.
+fn most_held(options: &Options) -> usize {
+    options
+        .clients
+        .saturating_mul(2)
+        .saturating_add(SLOPE_HIGH)
+        .saturating_add(1)
+}
+
+/// The relay condition's path to `cell`'s nodes, made in `dir`: a link set for each of `sets`
+/// clients, each direction holding what one client's transport may have unacknowledged or
+/// unread; its line said.
+fn start_relay(
+    out: &mut impl Write,
+    dir: &Path,
+    cell: &Cell,
+    (sets, seed): (usize, u64),
+) -> Result<crate::relay::Relay, Error> {
+    let nodes = cell.quic();
+    let held = mantle_client::least_transport(nodes.len()).map_err(failed)?;
+    let relay = crate::relay::Relay::start(dir, &nodes, sets, (held, seed))
+        .map_err(|e| failed(e.to_string()))?;
+    writeln!(
+        out,
+        "doors relay one_way_ns {} jitter_ns {} loss {}/{} in runs of {}/{} link_sets {sets} held_bytes {held}",
+        crate::relay::ONE_WAY_NS,
+        crate::relay::JITTER_NS,
+        crate::relay::LOST,
+        crate::relay::SENT,
+        crate::relay::LOST,
+        crate::relay::RUNS,
+    )
+    .map_err(doing("writing output"))?;
+    Ok(relay)
+}
+
+/// The relay stopped and its own count said: what its chain lost, what passed a direction's
+/// bytes, and how late it sent what it held, so its cost is not charged to the stack
+/// (research/70 [12]).
+fn stop_relay(out: &mut impl Write, relay: crate::relay::Relay) -> Result<(), Error> {
+    let said = relay.stop().map_err(|e| failed(e.to_string()))?;
+    writeln!(
+        out,
+        "doors relay taken {} lost {} over {} sent {} late_mean_ns {} late_max_ns {}",
+        said.taken,
+        said.lost,
+        said.over,
+        said.sent,
+        said.late_ns.checked_div(said.sent).unwrap_or(0),
+        said.latest_ns,
+    )
+    .map_err(doing("writing output"))?;
+    Ok(())
 }
 
 impl Bench<'_> {
+    /// A cell made for the phases that follow, in a directory of its own, `cell-NAME` within the
+    /// run's, its bucket made, once the cell before is stopped and every client of it dropped:
+    /// each door's phases and each set start from an empty cell, so every door's phases of a kind
+    /// start from the same state and none runs on a cell another door's phases filled
+    /// (measurement.md §12). The cell before is stopped first, so the run holds one cell's
+    /// processes and descriptors at once ([`descriptors_fit`]), and its volumes, each preallocated
+    /// whole at `--volume`, are removed, so it holds one cell's volumes on disk at once; the rest of
+    /// its directory is kept, its servers' own account of what they did. The relay condition's
+    /// relay is made again to the new cell's nodes, the one before said as it stops. Against an
+    /// `--endpoint`, which this program did not start, there is no cell to make, and the phases
+    /// run on the server as they find it.
+    fn fresh(&mut self, out: &mut impl Write, name: &str) -> Result<(), Error> {
+        let Some(mut before) = self.cell.take() else {
+            return Ok(());
+        };
+        for door in DOORS {
+            let held = self
+                .pools
+                .get_mut(door.at())
+                .map(std::mem::take)
+                .unwrap_or_default();
+            self.release(held)?;
+        }
+        self.release_drivers()?;
+        let relayed = match self.relay.take() {
+            Some(relay) => {
+                stop_relay(out, relay)?;
+                true
+            }
+            None => false,
+        };
+        // Each server killed and reaped, so none holds its volume as it is removed.
+        for at in 0..cell::FOUNDERS {
+            before.kill(at).map_err(failed)?;
+        }
+        drop(before);
+        // Its founders' volume directories, as `Cell::make` names them.
+        for n in 0..cell::FOUNDERS {
+            let volume = self.cell_dir.join(format!("volume-{n}"));
+            std::fs::remove_dir_all(&volume).map_err(doing("removing a stopped cell's volume"))?;
+        }
+        let dir = self.options.dir.join(format!("cell-{name}"));
+        std::fs::create_dir(&dir).map_err(doing("making a cell's directory"))?;
+        let shards = (self.options.range_shards, self.options.native_shards);
+        let mut cell = Cell::make(&dir, self.options.volume, shards).map_err(failed)?;
+        // Every range led before the first phase, so no phase measures the cell's first
+        // elections.
+        cell.led().map_err(failed)?;
+        let s3 = cell.s3();
+        let region = s3
+            .first()
+            .map(|(_, r)| r.clone())
+            .ok_or_else(|| failed("no S3 listener"))?;
+        self.signer = Rc::new(Signer::read(cell.out(), region)?);
+        self.listeners = s3
+            .iter()
+            .map(|(at, _)| at.parse::<SocketAddr>().map_err(failed))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.authority = Some(crate::init::Authority::read(cell.out()).map_err(failed)?);
+        self.native_most = cell.native_clients();
+        if relayed {
+            let sets = (most_held(self.options), self.options.seed);
+            self.relay = Some(start_relay(out, &dir.join("relay"), &cell, sets)?);
+        }
+        self.cell = Some(cell);
+        writeln!(
+            out,
+            "doors cell {name} made in {}: its phases start from an empty cell, the cell before stopped and its volumes removed",
+            dir.display()
+        )
+        .map_err(doing("writing output"))?;
+        self.cell_dir = dir;
+        self.create()
+    }
+
     /// The run's bucket, made through the native door; against an endpoint, through the HTTP door,
     /// a bucket it already holds for this key as good.
     fn create(&mut self) -> Result<(), Error> {
@@ -4838,8 +5069,9 @@ impl Bench<'_> {
 
     /// The three controls through `door`, each a fault the checks must report as a failure: a byte
     /// flipped on its way to the check, a key never put, and an ETag expected of another object.
-    /// The controls caught.
-    fn controls(&mut self, out: &mut impl Write, door: Door) -> Result<u32, Error> {
+    /// The controls caught; or, where the cell did not take their objects' puts, why they could
+    /// not run, which is no control caught and no control failed either.
+    fn controls(&mut self, out: &mut impl Write, door: Door) -> Result<Result<u32, String>, Error> {
         let mut held = self.hold(door, 1)?;
         let logical = held.pop().ok_or_else(|| failed("no connection"))?;
         let generator = Arc::clone(&self.generator);
@@ -4916,9 +5148,13 @@ impl Bench<'_> {
         let [flipped, missing, etag] = match said {
             Ok(said) => said,
             Err(why) => {
-                writeln!(out, "doors control {} NOT run: {why}", self.named(door))
-                    .map_err(doing("writing output"))?;
-                return Ok(0);
+                writeln!(
+                    out,
+                    "doors control {} could NOT run: {why}",
+                    self.named(door)
+                )
+                .map_err(doing("writing output"))?;
+                return Ok(Err(why));
             }
         };
         let expected = checksum::etag(&other);
@@ -4958,7 +5194,7 @@ impl Bench<'_> {
                 .map_err(doing("writing output"))?;
             }
         }
-        Ok(caught)
+        Ok(Ok(caught))
     }
 
     /// Each connection's cost through `door` (measurement.md §10): what the servers and this
@@ -5572,14 +5808,14 @@ mod tests {
             best: None,
             flat: 0,
         };
-        assert!(climb.after(step(1, 30.0, 1.0), 0));
-        assert!(climb.after(step(2, 60.0, 2.0), 0));
-        assert!(climb.after(step(4, 59.0, 3.0), 0));
-        assert!(climb.after(step(8, 120.0, 5.0), 0));
+        assert!(climb.after(step(1, 30.0, 1.0), true));
+        assert!(climb.after(step(2, 60.0, 2.0), true));
+        assert!(climb.after(step(4, 59.0, 3.0), true));
+        assert!(climb.after(step(8, 120.0, 5.0), true));
         assert_eq!(climb.flat, 0);
-        assert!(climb.after(step(16, 125.0, 6.0), 0));
-        assert!(climb.after(step(32, 118.0, 6.0), 0));
-        assert!(!climb.after(step(64, 121.0, 6.0), 0));
+        assert!(climb.after(step(16, 125.0, 6.0), true));
+        assert!(climb.after(step(32, 118.0, 6.0), true));
+        assert!(!climb.after(step(64, 121.0, 6.0), true));
         assert_eq!(climb.best.unwrap().clients, 16);
     }
 
@@ -5597,18 +5833,212 @@ mod tests {
             best: None,
             flat: 0,
         };
-        assert!(climb.after(step(1, 30.0), 0));
-        assert!(climb.after(step(2, 60.0), 0));
+        assert!(climb.after(step(1, 30.0), true));
+        assert!(climb.after(step(2, 60.0), true));
         let before = climb;
-        assert!(!climb.after(step(4, 500.0), 1));
+        assert!(!climb.after(step(4, 500.0), false));
         assert_eq!(climb, before);
         assert_eq!(climb.best.unwrap().clients, 2);
         let mut first = Climb {
             best: None,
             flat: 0,
         };
-        assert!(!first.after(step(1, 30.0), 3));
+        assert!(!first.after(step(1, 30.0), false));
         assert_eq!(first.best, None);
+    }
+
+    /// What a step's operations came to, each counted as its clients count it.
+    fn tallied(came: impl IntoIterator<Item = Came>) -> Tally {
+        let mut tally = Tally::new();
+        for came in came {
+            tally.count(came);
+        }
+        tally
+    }
+
+    /// A step is clean only where every operation was answered as asked: one refused (a full
+    /// cell's 507), one throttled on every attempt (`SlowDown`, settled or not), one lost on every
+    /// attempt, or one whose answer failed its check spoils it, and the ladder ends at it however
+    /// its throughput grew, the step not its best, so the best stays the best clean step before
+    /// it. The run says why: the first refusal's text, before an unanswered operation's, before a
+    /// check's. An operation throttled and then answered comes to `Done`, asked again as the AWS
+    /// SDKs ask one, and its step stays clean and may be the best.
+    #[test]
+    fn a_ladder_judges_steps_with_refused_slowed_and_unanswered_operations() {
+        let full = "HTTP 507 InsufficientStorage The cell has no room for the object";
+        let slow = "SlowDown, asked 3 times: No volume offered took a block's chunk";
+        let refused = tallied([
+            Came::Done,
+            Came::Unanswered(slow.to_owned()),
+            Came::Refused(full.to_owned()),
+        ]);
+        let slowed = tallied([Came::Done, Came::Slowed(None)]);
+        let unanswered = tallied([Came::Done, Came::Unanswered(slow.to_owned())]);
+        let lost = tallied([Came::Lost("its exchange ended unanswered".to_owned())]);
+        let differed = tallied([Came::Done, Came::Differed("byte 7 differed".to_owned())]);
+        // Throttled, asked again, then answered: `Done`, its retry counted in the step's `again`.
+        let answered_after_slowing = tallied([Came::Done, Came::Done, Came::Skipped]);
+        assert_eq!(
+            (refused.refused, refused.unanswered, refused.failed),
+            (1, 1, 2)
+        );
+        assert_eq!(refused.why(), Some(("refusal", full)));
+        assert_eq!((slowed.unanswered, slowed.failed), (1, 1));
+        assert_eq!(unanswered.why(), Some(("unanswered", slow)));
+        assert_eq!(lost.unanswered, 1);
+        assert_eq!(differed.why(), Some(("failure", "byte 7 differed")));
+        assert_eq!(answered_after_slowing.why(), None);
+        for spoiled in [&refused, &slowed, &unanswered, &lost, &differed] {
+            assert!(!spoiled.clean());
+        }
+        assert!(answered_after_slowing.clean());
+
+        let step = |clients, median: f64| Stepped {
+            clients,
+            median,
+            low: median - 1.0,
+            high: median + 1.0,
+        };
+        let mut climb = Climb {
+            best: None,
+            flat: 0,
+        };
+        assert!(climb.after(step(1, 30.0), answered_after_slowing.clean()));
+        assert!(climb.after(step(2, 3_700.0), answered_after_slowing.clean()));
+        let before = climb;
+        for spoiled in [&refused, &slowed, &unanswered, &lost, &differed] {
+            // The rate of a step the cell refused, 15,453 a second, is never the ladder's best.
+            let mut after = before;
+            assert!(!after.after(step(4, 15_453.0), spoiled.clean()));
+            assert_eq!(after, before);
+            assert_eq!(after.best.map(|b| b.clients), Some(2));
+        }
+        let mut first = Climb {
+            best: None,
+            flat: 0,
+        };
+        assert!(!first.after(step(1, 15_453.0), refused.clean()));
+        assert_eq!(first.best, None);
+    }
+
+    /// A phase's throughput counts only the operations answered as asked: the refused, the
+    /// unanswered, those whose answer failed its check and those not asked are among its
+    /// operations and in none of its goodput; a phase the cell refused whole served nothing.
+    #[test]
+    fn goodput_counts_only_the_operations_answered_as_asked() {
+        let tally = tallied([
+            Came::Done,
+            Came::Done,
+            Came::Done,
+            Came::Refused("HTTP 507 InsufficientStorage".to_owned()),
+            Came::Refused("HTTP 507 InsufficientStorage".to_owned()),
+            Came::Unanswered("SlowDown, asked 3 times".to_owned()),
+            Came::Differed("byte 7 differed".to_owned()),
+            Came::Skipped,
+        ]);
+        assert_eq!(
+            (tally.ops, tally.answered, tally.failed, tally.skipped),
+            (8, 3, 4, 1)
+        );
+        assert!((tally.goodput(2_000_000_000) - 1.5).abs() < 1e-9);
+        let refused = tallied((0..636_927u64).map(|_| Came::Refused("HTTP 507".to_owned())));
+        assert_eq!(refused.goodput(1_000_000_000), 0.0);
+        // A round counts the operations served alone; a refused or unanswered one ends a step in
+        // rounds, and a check's failure does not.
+        assert!(served(&Came::Done));
+        for came in [
+            Came::Refused(String::new()),
+            Came::Unanswered(String::new()),
+            Came::Lost(String::new()),
+            Came::Slowed(None),
+        ] {
+            assert!(!served(&came) && refuses(&came));
+        }
+        for came in [
+            Came::Failed(String::new()),
+            Came::Differed(String::new()),
+            Came::Skipped,
+        ] {
+            assert!(!served(&came) && !refuses(&came));
+        }
+        assert!(!refuses(&Came::Done));
+    }
+
+    /// Controls whose objects the cell did not take are said to have not run, and why, never a
+    /// count caught of controls that never ran; all run, the count is as the smoke reads it.
+    #[test]
+    fn controls_that_could_not_run_are_said_so() {
+        assert_eq!(controls_said(6, 6, &[]), "controls caught 6 of 6");
+        let why = "http: its object control-http-a was not put: HTTP 507 InsufficientStorage";
+        let said = controls_said(3, 6, &[why.to_owned()]);
+        assert_eq!(
+            said,
+            format!("controls caught 3 of 3 run, 3 could not run: {why}")
+        );
+        let none = controls_said(0, 6, &["native: a".to_owned(), "http: b".to_owned()]);
+        assert_eq!(
+            none,
+            "controls caught 0 of 0 run, 6 could not run: native: a; http: b"
+        );
+    }
+
+    /// Simulated operations answered after a turn of the runtime, each from the `from`-th on
+    /// refused as a full cell refuses a put.
+    struct Refusing {
+        from: u64,
+    }
+
+    impl Ask for Refusing {
+        async fn ask(&self, _: &mut Logical, j: u64) -> Result<Came, Error> {
+            hyper_rt::futures::yield_now().await;
+            Ok(if j >= self.from {
+                Came::Refused("HTTP 507 InsufficientStorage".to_owned())
+            } else {
+                Came::Done
+            })
+        }
+    }
+
+    /// A closed step in rounds asks no more past its first refused operation, as past an
+    /// unanswered one: every operation before it answered, the refused counted apart, few as the
+    /// clients that had one out, and none of them in its answered or its rounds; a step not in
+    /// rounds asks every operation it was given, and counts the refused in none of its goodput.
+    #[test]
+    fn a_step_in_rounds_ends_at_its_first_refusal_and_counts_it_apart() {
+        let clients = 4;
+        let from = 50;
+        let most = step_ops(clients).unwrap();
+        let mut rt = runtime(clients).unwrap();
+        let work = Arc::new(Refusing { from });
+        let round = Some(round_ops(clients).unwrap());
+        let state = shared(Load::Closed, 1, (0, most), round).unwrap();
+        let back = rt
+            .block_on(phase(
+                idle_clients(clients),
+                Arc::clone(&work),
+                Arc::clone(&state),
+            ))
+            .unwrap()
+            .unwrap();
+        let (tally, rates) = finished(state).unwrap();
+        assert_eq!(back.len(), clients);
+        assert_eq!(tally.answered, from);
+        let out = u64::try_from(clients).unwrap();
+        assert!((1..=out).contains(&tally.refused), "{}", tally.refused);
+        assert_eq!(tally.failed, tally.refused);
+        assert_eq!(tally.ops, tally.answered + tally.refused);
+        assert!(!tally.clean());
+        assert!(rates.len() < ROUNDS.min);
+        let state = shared(Load::Closed, 1, (0, 2 * from), None).unwrap();
+        rt.block_on(phase(back, work, Arc::clone(&state)))
+            .unwrap()
+            .unwrap();
+        let (tally, _) = finished(state).unwrap();
+        assert_eq!(
+            (tally.ops, tally.answered, tally.refused),
+            (2 * from, from, from)
+        );
+        assert!((tally.goodput(1_000_000_000) - 50.0).abs() < 1e-9);
     }
 
     /// A simulated client's operations for [`phase`], each answered after a turn of the runtime but

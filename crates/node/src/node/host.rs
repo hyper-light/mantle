@@ -9889,7 +9889,7 @@ pub(super) mod tests {
     /// typed through the S3 door.
     pub(crate) struct Stub {
         pub(crate) answer: fn(&JobAsk) -> Outcome,
-        answers: Vec<(Pending, Outcome)>,
+        pub(crate) answers: Vec<(Pending, Outcome)>,
         pub(crate) asked: u64,
         /// Whether it says it has no room for any ask (`Serve::room`).
         pub(crate) no_room: bool,
@@ -11511,6 +11511,7 @@ pub(super) mod tests {
         let mut feeding = Some(feed(body_of(&put).unwrap(), pieces, handed, driving));
         assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
         let mut cell = Cell::new();
+        let mut gave = super::super::driving::tests::Gave::default();
         let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
         let mut put_seen = Seen {
             credit: usize::MAX,
@@ -11531,7 +11532,7 @@ pub(super) mod tests {
                 cell.ended
             );
             lanes
-                .serve(&mut cell, |half| doors.give_native(half))
+                .serve_counting(&mut cell, |half| doors.give_native(half), &mut gave)
                 .unwrap();
             // The body a piece at a time, each read only once the job let go of the last.
             if let Some(fed) = feeding.as_mut() {
@@ -11586,7 +11587,7 @@ pub(super) mod tests {
                 lanes.moved()
             );
             lanes
-                .serve(&mut cell, |half| doors.give_native(half))
+                .serve_counting(&mut cell, |half| doors.give_native(half), &mut gave)
                 .unwrap();
             std::thread::yield_now();
         }
@@ -11612,7 +11613,164 @@ pub(super) mod tests {
             4,
             "the get's fields, then its three blocks"
         );
+        // The bytes its jobs moved rode what else the shard gave, never a message of their own
+        // at each piece taken or given.
+        println!("a put and a get of {} bytes: {gave:?}", object.len());
+        assert!(
+            gave.moved <= gave.asks + gave.ends,
+            "the bytes moved ride what else the shard gave: {gave:?}"
+        );
         rt.shutdown().unwrap();
+    }
+
+    /// What a native put and a native get of one byte cost in crossings between the node's task
+    /// and a driving shard (node.md §2.9 step 6f), counted over rounds of a put then a get of its
+    /// bytes, each handed to the second shard of a two-shard runtime and driven over its lanes by a
+    /// cell in memory on the test's thread: each ask crosses out and its answer back; each job's
+    /// end and its samples ride out; and the bytes its jobs moved ride what else the shard gave,
+    /// never a message of their own. The shard's polls, wakes from the test's thread and parks
+    /// are said for each round.
+    #[test]
+    fn a_native_put_and_get_cross_the_lanes_as_counted() {
+        const ROUNDS: usize = 8;
+        let rt = two_shards(4);
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        gateway.handover_ns = 600_000_000_000;
+        let start = super::super::driving::Start {
+            command_asks: 4,
+            read_asks: 4,
+            chunk_asks: 4,
+            groups: vec![
+                (Layer::Bucket, 1),
+                (Layer::Name, 2),
+                (Layer::File, 3),
+                (Layer::Block, 4),
+            ],
+            ranges: 4,
+            wall: super::super::Wall::From(0),
+            gateway: std::sync::Arc::new(gateway),
+            requests: 3,
+        };
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let mut lanes = super::super::driving::Lanes::start(holder, 1, start).unwrap();
+        lanes.tell_table(Box::new(Table::volumes(1)));
+        let mut doors = Doors::new(2);
+        let mut cell = Cell::new();
+        let mut gave = super::super::driving::tests::Gave::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let (object, trailer) = native_body(1);
+        let stream: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let mut per_put = None;
+        for round in 0..ROUNDS {
+            let put = Op::Put {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 1,
+                length: object.len() as u64,
+                headers: Headers::default(),
+                checksum: None,
+                md5: None,
+                trailing: Some(Algorithm::Crc32c),
+                metadata: Vec::new(),
+            };
+            let now = hyper_rt::futures::now_ns();
+            let (put_half, mut put_replies) = doors.take().unwrap();
+            put_replies.driving = Some(lanes.doors());
+            let pieces = put_replies.body.take().unwrap();
+            let handed = std::sync::Arc::clone(&put_replies.handed);
+            let driving = put_replies.driving.clone();
+            let mut feeding = Some(feed(body_of(&put).unwrap(), pieces, handed, driving));
+            assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
+            let mut put_seen = Seen {
+                credit: usize::MAX,
+                ..Seen::default()
+            };
+            let mut rest = &stream[..];
+            let mut put_over = false;
+            while !(put_over && cell.ended == 2 * round + 1) {
+                assert!(std::time::Instant::now() < until, "the put never ended");
+                lanes
+                    .serve_counting(&mut cell, |half| doors.give_native(half), &mut gave)
+                    .unwrap();
+                if let Some(fed) = feeding.as_mut() {
+                    let over = match fed.send_held() {
+                        Some(Fed::Over) => true,
+                        Some(Fed::Still) => false,
+                        _ if fed.read_whole() => fed.end() == Fed::Over,
+                        _ if fed.free() => {
+                            let (read, left) = rest.split_at(rest.len().min(piece_len()));
+                            fed.give(read, &mut moved).unwrap();
+                            rest = left;
+                            false
+                        }
+                        _ => false,
+                    };
+                    if over {
+                        put_replies.body = feeding.take().map(Feeding::let_go);
+                    }
+                }
+                let now = hyper_rt::futures::now_ns();
+                let body_read = feeding.is_none();
+                put_over = put_over
+                    || put_replies.write(&mut put_seen, body_read, now, &mut moved, &mut slowed)
+                        == Wrote::Over;
+                std::thread::yield_now();
+            }
+            assert_eq!(reply_seen(&put_seen).status, Status::Done);
+            doors.give_replies(put_replies);
+            if round == 0 {
+                per_put = Some(gave);
+            }
+            let (get_half, mut get_replies) = doors.take().unwrap();
+            get_replies.driving = Some(lanes.doors());
+            let get = Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            };
+            let read = scheming_gateway().charges.read(1);
+            assert!(lanes.hand(handover(get_half, get, read, now)).is_none());
+            let mut get_seen = Seen {
+                credit: usize::MAX,
+                ..Seen::default()
+            };
+            let mut get_over = false;
+            while !(get_over && cell.ended == 2 * round + 2) {
+                assert!(std::time::Instant::now() < until, "the get never ended");
+                lanes
+                    .serve_counting(&mut cell, |half| doors.give_native(half), &mut gave)
+                    .unwrap();
+                let now = hyper_rt::futures::now_ns();
+                get_over = get_over
+                    || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                        == Wrote::Over;
+                std::thread::yield_now();
+            }
+            let get_reply = reply_seen(&get_seen);
+            assert_eq!((get_reply.status, get_reply.size), (Status::Done, 1));
+            doors.give_replies(get_replies);
+        }
+        let counters = rt.shutdown().unwrap();
+        let shard = &counters[1];
+        let per_put = per_put.unwrap();
+        println!(
+            "a put: {per_put:?}; {ROUNDS} puts and gets: {gave:?}, {} asks answered; the shard \
+             polled {}, woken {} times from the test's thread, parked {}",
+            cell.asked, shard.polls, shard.wakes_foreign, shard.waits
+        );
+        assert_eq!(gave.ends, 2 * ROUNDS);
+        assert_eq!(
+            cell.asked,
+            u64::try_from(gave.asks).unwrap(),
+            "each ask answered once"
+        );
+        assert!(
+            gave.moved <= gave.asks + gave.ends,
+            "the bytes moved ride what else the shard gave: {gave:?}"
+        );
     }
 
     /// A host's wait is its own jobs' alone (node.md §2.9 step 6e), so a driving shard's task can

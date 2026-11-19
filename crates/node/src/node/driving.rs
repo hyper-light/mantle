@@ -11,16 +11,17 @@
 //! the node reads, a settled copy, the latest superseding one the lane had no room for; that room
 //! at a volume or in the transport was freed, told only to a shard a chunk of whose jobs was
 //! answered for want of room since it was last told, the one thing room freed moves, and held as a
-//! flag while the lane is full; and that a piece of a chunk a job asked moved, dropped where the
-//! lane is full, its next piece telling it again. Each message into a parked shard wakes it, so
+//! flag while the lane is full; and that a piece of a chunk a job asked moved, once a serve however
+//! many pieces moved and none for a chunk answered at that serve, dropped where the lane is full,
+//! its next piece telling it again. Each message into a parked shard wakes it, so
 //! none goes to a shard it gives nothing to do: a shard with no chunk waiting for room is not told
 //! room was freed, however often the node's own requests free it.
 //!
 //! Out of it ([`Out`]): each ask of its jobs, under a number of the shard's; each job's end, its
 //! door's half riding it to the node's task, which holds the other half; the put and get windows'
-//! samples; what its jobs gave back of their charges; and the bytes its jobs moved, after each step
-//! that moved some, which the node's count sums (`Node::moved`). The shard waits for room on its
-//! way out, as a range's shard does.
+//! samples; what its jobs gave back of their charges; and the bytes its jobs moved, riding what else
+//! a step gave, each job's end among it, which the node's count sums (`Node::moved`). The shard
+//! waits for room on its way out, as a range's shard does.
 //!
 //! The node's admission is the node's task's alone (node.md §2.5), which a shard cannot ask within
 //! its step: a job here takes no bytes past what it was admitted at ([`Serve::holds`]), so a get
@@ -159,6 +160,9 @@ pub(crate) struct Lanes {
     /// Asks the node holds for the shard, each under the shard's number and the node's: at most
     /// the asks the shard's host holds.
     asked: Vec<(u64, Pending)>,
+    /// The shard's numbers of the asks in `asked` a piece of whose chunk moved since the lanes
+    /// were last served, each once: at most the asks in `asked`.
+    pieces: Vec<u64>,
     /// The shard's word that a door of its jobs moved, which its task waits on.
     doors: Arc<Notify>,
     /// The bytes the shard's jobs moved since its task started, as it last said.
@@ -199,6 +203,7 @@ impl Lanes {
             wants_room: false,
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
+            pieces: Vec::with_capacity(slots),
             doors,
             moved: 0,
         })
@@ -259,15 +264,16 @@ impl Lanes {
         self.tell_held();
     }
 
-    /// Tells the shard a piece of the chunk the node's ask `ask` asked for it moved: dropped where
-    /// its lane has no room, its next piece telling it again.
-    pub(crate) fn tell_moved(&self, ask: u64) {
+    /// Notes that a piece of the chunk the node's ask `ask` asked for the shard moved, told once
+    /// at the lanes' serve however many pieces moved before it ([`Lanes::serve`]).
+    pub(crate) fn tell_moved(&mut self, ask: u64) {
         if let Some((number, _)) = self
             .asked
             .iter()
             .find(|(_, pending)| *pending == Pending::Chunk(ask))
+            && !self.pieces.contains(number)
         {
-            let _ = self.into.try_send(In::ChunkMoved(*number));
+            self.pieces.push(*number);
         }
     }
 
@@ -339,6 +345,14 @@ impl Lanes {
                     self.answer(number, outcome)?;
                 }
                 None => at = at.saturating_add(1),
+            }
+        }
+        // A chunk's pieces moved are its job's work moving, told once a serve, each a message that
+        // wakes the shard: none for a chunk answered now, whose answer moves its job. Dropped where
+        // the lane has no room, its next piece telling it again.
+        for number in self.pieces.drain(..) {
+            if self.asked.iter().any(|(asked, _)| *asked == number) {
+                let _ = self.into.try_send(In::ChunkMoved(number));
             }
         }
         Ok(())
@@ -744,7 +758,10 @@ async fn run(
             served.came(number, outcome);
         }
         let stopped = host.step(&mut served).err();
-        if host.moved() != said {
+        // The bytes its jobs moved ride what the step gave, each job's end among it, rather than
+        // a message of their own, which would wake the node's task at each piece a get gives,
+        // as its door already does: the node's count is a figure for its lines (`Node::moved`).
+        if host.moved() != said && !served.gave.is_empty() {
             said = host.moved();
             served.gave.push(Out::Moved(said));
         }
@@ -828,10 +845,48 @@ pub(super) mod tests {
             wants_room: false,
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
+            pieces: Vec::with_capacity(slots),
             doors: Arc::new(Notify::new().unwrap()),
             moved: 0,
         };
         (lanes, (taken, answered, given))
+    }
+
+    /// What a driving shard gave its lanes, by kind, as the node's side took it.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Gave {
+        pub(crate) asks: usize,
+        pub(crate) ends: usize,
+        pub(crate) samples: usize,
+        pub(crate) moved: usize,
+    }
+
+    impl Lanes {
+        /// The node's turn of the lanes ([`Lanes::serve`]), each thing the shard gave counted in
+        /// `gave` by its kind as it is taken.
+        pub(crate) fn serve_counting<N: Serve>(
+            &mut self,
+            node: &mut N,
+            mut keep: impl FnMut(Box<Native>),
+            gave: &mut Gave,
+        ) -> Result<(), NodeError> {
+            while let Ok(Some(out)) = self.from.try_recv() {
+                match &out {
+                    Out::Ask(..) => gave.asks += 1,
+                    Out::Ended { .. } => gave.ends += 1,
+                    Out::Committed(_) | Out::Filled(..) | Out::Read(_) | Out::Recharged(..) => {
+                        gave.samples += 1;
+                    }
+                    Out::Moved(_) => gave.moved += 1,
+                    Out::Stopped(_) => {}
+                }
+                self.take(node, out, &mut keep)?;
+            }
+            let room = std::mem::replace(&mut self.room, 0);
+            let served = self.serve(node, keep);
+            self.room = room;
+            served
+        }
     }
 
     /// The shard's side of its lanes, holding `bound` asks of each kind.
@@ -920,7 +975,7 @@ pub(super) mod tests {
         ));
 
         // Into the shard: a lane of one. The table held where it is full, the latest kept; the
-        // freed flag held; a chunk's move dropped.
+        // freed flag held; a chunk's move told at the serve, and dropped there, the lane full.
         assert!(lanes.into.try_send(In::Freed).is_ok());
         let table = || Box::new(Table::empty(3));
         lanes.tell_table(table());
@@ -934,7 +989,10 @@ pub(super) mod tests {
         assert!(lanes.freed);
         let mut taken = taken;
         assert!(matches!(taken.try_recv(), Ok(Some(In::Freed))));
-        assert!(matches!(taken.try_recv(), Ok(None)), "the move was dropped");
+        assert!(
+            matches!(taken.try_recv(), Ok(None)),
+            "the move waits for the serve"
+        );
         lanes.serve(&mut stub, |_| {}).unwrap();
         assert!(matches!(taken.try_recv(), Ok(Some(In::Table(t))) if t.applied() == 4));
         lanes.serve(&mut stub, |_| {}).unwrap();
@@ -1022,6 +1080,49 @@ pub(super) mod tests {
             assert_eq!(told(&mut lanes, &mut taken), 0, "told once");
         }
         drop((given, answered));
+        rt.shutdown().unwrap();
+    }
+
+    /// A chunk's pieces moved are told a driving shard once a serve of its lanes, however many
+    /// moved since the last, each told a message that wakes it: and none for a chunk answered at
+    /// that serve, whose answer moves its job, nor for an ask of another shard's.
+    #[test]
+    fn a_chunks_pieces_moved_are_told_once_a_serve() {
+        let rt = crate::node::host::tests::two_shards(4);
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let (mut lanes, (mut taken, mut answered, _given)) = unstarted(holder, 4, 4);
+        let mut stub = Stub::chunks();
+        lanes.asked.push((9, Pending::Chunk(5)));
+        let told = |taken: &mut ChannelReceiver<In>| {
+            let mut moved = Vec::new();
+            while let Ok(Some(sent)) = taken.try_recv() {
+                let In::ChunkMoved(number) = sent else {
+                    panic!("only a chunk's move is told");
+                };
+                moved.push(number);
+            }
+            moved
+        };
+        for _ in 0..8 {
+            lanes.tell_moved(5);
+        }
+        lanes.tell_moved(6);
+        assert!(told(&mut taken).is_empty(), "told at the serve");
+        lanes.serve(&mut stub, |_| {}).unwrap();
+        assert_eq!(told(&mut taken), vec![9], "eight pieces, one word");
+        lanes.serve(&mut stub, |_| {}).unwrap();
+        assert!(told(&mut taken).is_empty(), "nothing moved since");
+        // A piece moved and the chunk answered by the same serve: its answer alone.
+        lanes.tell_moved(5);
+        stub.answers
+            .push((Pending::Chunk(5), Outcome::Chunk(ChunkOutcome::Stored)));
+        lanes.serve(&mut stub, |_| {}).unwrap();
+        assert!(told(&mut taken).is_empty(), "its answer moves its job");
+        assert!(matches!(
+            answered.try_recv(),
+            Ok(Some((9, Outcome::Chunk(ChunkOutcome::Stored))))
+        ));
+        assert!(lanes.pieces.is_empty() && lanes.asked.is_empty());
         rt.shutdown().unwrap();
     }
 

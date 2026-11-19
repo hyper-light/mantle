@@ -3764,7 +3764,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .map(|c| c.asked)
         {
             self.host.chunk_moved(asked);
-            for lanes in &self.driving {
+            for lanes in &mut self.driving {
                 lanes.tell_moved(asked);
             }
         }
@@ -3872,7 +3872,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 && let Some(asked) = asked
             {
                 self.host.chunk_moved(asked);
-                for lanes in &self.driving {
+                for lanes in &mut self.driving {
                     lanes.tell_moved(asked);
                 }
             }

@@ -1,0 +1,50 @@
+name: repro-node
+# The node suite (crates/mantle/tests/node.rs) again and again on CI's ubuntu-24.04-arm runner, as the gates
+# run it, with the stall trace on (diag-doors-final, `--features diag-trace`: each request's stages in every
+# node), to catch the 20 MiB put that ends `Lost(Stalled)` about one run in twenty-five with what its node did:
+# a failed run's traces and output are kept, a passing run's traces removed. Four runners at once, ten runs each.
+on:
+  push:
+    branches: ["repro/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3, 4]
+    name: node suite traced, runner ${{ matrix.runner }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build the node suite with the trace
+        run: cargo test -p mantle --features diag-trace --test node --locked --no-run
+      - name: The node suite, ten times, traced
+        run: |
+          mkdir -p out
+          failed=0
+          for i in $(seq 10); do
+            mkdir -p "out/trace-$i"
+            start=$(date +%s)
+            if MANTLE_DIAG_TRACE="$PWD/out/trace-$i" cargo test -p mantle --features diag-trace --test node --locked -- --nocapture > "out/run-$i.txt" 2>&1; then
+              echo "run $i passed in $(($(date +%s) - start)) s"
+              rm -rf "out/trace-$i"
+            else
+              failed=$((failed + 1))
+              echo "run $i FAILED in $(($(date +%s) - start)) s: $(ls out/trace-$i | wc -l) trace files"
+              grep -E "panicked at|^the put|FAILED|Lost\(" "out/run-$i.txt" | head -20
+            fi
+          done
+          echo "failed $failed of 10"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: node-traced-${{ matrix.runner }}
+          path: out

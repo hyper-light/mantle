@@ -2354,22 +2354,103 @@ pub fn derive(
     stores: &mut dyn FnMut(u128, usize) -> Result<Option<Shape>, String>,
 ) -> Result<Derived, DeriveError> {
     let allowed = allowance(stated.ceiling, &measured.memory)?;
-    let (bare, need) = derive_with(stated.clone(), measured, stores, (0, None))?;
-    match derive_with(stated, measured, stores, (ENGINE_WORKERS, Some(need))) {
+    let (bare, need, depth) = deepest_held(&stated, measured, stores)?;
+    match derive_with(
+        stated,
+        measured,
+        stores,
+        (ENGINE_WORKERS, Some(need)),
+        depth,
+    ) {
         Ok((derived, needed)) if needed <= allowed => Ok(derived),
         _ => Ok(bare),
     }
 }
 
+/// [`derive`] with no maintenance workers at the deepest transfers each device's issuer may keep
+/// in flight that the allowance holds (CLAUDE.md §5: the depth derives from the device and the
+/// machine both): the depth measured where it holds it, `None`; else the deepest that does, at
+/// most one short of the deepest measured, found by halving the depths between one that fits and
+/// one that does not, as each transfer deeper holds no less (a worker's stack where a pool carries
+/// the transfers, its exchanges and its reads; [`threads`], [`wholes`]). Refused only where even
+/// one transfer at a time is past the allowance, with that refusal. On CI's 7 GiB macOS runner a
+/// founder of the repair suite's cell whose device measured 240 deep was refused at its threads,
+/// 7,831,251,011 bytes (gates run 44596668868): its issuer's 240 workers' stacks alone were
+/// 503 MB, and at 109 it starts.
+fn deepest_held(
+    stated: &Stated,
+    measured: &Measured,
+    stores: &mut dyn FnMut(u128, usize) -> Result<Option<Shape>, String>,
+) -> Result<(Derived, u64, Option<usize>), DeriveError> {
+    let refused = match derive_with(stated.clone(), measured, stores, (0, None), None) {
+        Ok((derived, need)) => return Ok((derived, need, None)),
+        Err(e @ (DeriveError::Memory { .. } | DeriveError::Metadata { .. })) => e,
+        Err(e) => return Err(e),
+    };
+    let measured_most = measured
+        .volumes
+        .iter()
+        .map(|facts| facts.profile.depth)
+        .max()
+        .unwrap_or(0);
+    // The deepest known to fit (none yet) and the deepest not yet ruled out; a u64's span halves
+    // to nothing within 64 steps, the loop's bound.
+    let (mut low, mut high) = (0usize, measured_most.saturating_sub(1));
+    let mut held = None;
+    for _ in 0..=u64::BITS {
+        let Some(span) = high.checked_sub(low).filter(|span| *span > 0) else {
+            break;
+        };
+        let middle = low.saturating_add(span.div_ceil(2));
+        match derive_with(stated.clone(), measured, stores, (0, None), Some(middle)) {
+            Ok((derived, need)) => {
+                low = middle;
+                held = Some((derived, need, Some(middle)));
+            }
+            Err(DeriveError::Memory { .. } | DeriveError::Metadata { .. }) => {
+                high = middle.saturating_sub(1);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    match held {
+        Some(held) => Ok(held),
+        None if measured_most > 1 => {
+            derive_with(stated.clone(), measured, stores, (0, None), Some(1))
+                .map(|(derived, need)| (derived, need, Some(1)))
+        }
+        None => Err(refused),
+    }
+}
+
 /// [`derive`] with `workers` maintenance workers each engine, and the node's need with them;
-/// `bare` the need without, said as `memory.need` where given.
+/// `bare` the need without, said as `memory.need` where given; each device's transfers at most
+/// `depth` at once where given ([`deepest_held`]), else as measured.
 fn derive_with(
     stated: Stated,
     measured: &Measured,
     stores: &mut dyn FnMut(u128, usize) -> Result<Option<Shape>, String>,
     (workers, bare): (usize, Option<u64>),
+    depth: Option<usize>,
 ) -> Result<(Derived, u64), DeriveError> {
     let overflow = DeriveError::Overflow;
+    // The devices as the node runs them: each profile's depth the one measured, at most `depth`.
+    // The volumes' transfers, their issuers' workers and every class that holds them follow it;
+    // the need stays at the deepest each queue lets calibration measure.
+    let running = Measured {
+        volumes: measured
+            .volumes
+            .iter()
+            .map(|facts| VolumeFacts {
+                profile: Profile {
+                    depth: depth.map_or(facts.profile.depth, |most| facts.profile.depth.min(most)),
+                    ..facts.profile
+                },
+                ..facts.clone()
+            })
+            .collect(),
+        ..measured.clone()
+    };
     let mut said = Said::default();
     say_stated(&mut said, &stated);
     said.add(
@@ -2489,7 +2570,7 @@ fn derive_with(
         transfers,
         fragments,
         wants,
-    } = wholes(&sizes, measured, |facts| facts.profile)?;
+    } = wholes(&sizes, &running, |facts| facts.profile)?;
 
     // Each range's engine on its share of what the log and the volumes on the node directory's
     // device leave of its file system.
@@ -2716,7 +2797,7 @@ fn derive_with(
     .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
     .ok_or(overflow("the engines' buffers"))?;
     // A device's issuer, one a device the OS names, started by its first volume.
-    let depths: Vec<usize> = devices_of(measured, issuer_depth)
+    let depths: Vec<usize> = devices_of(&running, issuer_depth)
         .into_iter()
         .map(|(_, depth)| depth)
         .collect();
@@ -3093,10 +3174,11 @@ fn derive_with(
         .ok_or(overflow("an engine's metadata"))?
         .min(most);
     let mut volumes = Vec::with_capacity(stated.volumes.len());
-    for (n, ((((dir, _), size), facts), &index_bytes)) in stated
+    for (n, (((((dir, _), size), facts), measured_facts), &index_bytes)) in stated
         .volumes
         .iter()
         .zip(&sizes)
+        .zip(&running.volumes)
         .zip(&measured.volumes)
         .zip(indexes)
         .enumerate()
@@ -3109,7 +3191,13 @@ fn derive_with(
             index_bytes,
             facts.formatted.as_ref(),
         )?;
-        say_volume(&mut said, n.saturating_add(1), facts, &config, index_bytes);
+        say_volume(
+            &mut said,
+            n.saturating_add(1),
+            (measured_facts, facts),
+            &config,
+            index_bytes,
+        );
         volumes.push(VolumeSettings {
             dir: dir.clone(),
             size: *size,
@@ -3973,7 +4061,7 @@ fn say_floor(
 fn say_volume(
     said: &mut Said,
     n: usize,
-    facts: &VolumeFacts,
+    (measured, facts): (&VolumeFacts, &VolumeFacts),
     config: &VolumeConfig,
     index_bytes: u64,
 ) {
@@ -3986,10 +4074,24 @@ fn say_volume(
     let p = &facts.profile;
     said.add(
         format!("volume.{n}.depth"),
-        p.depth,
+        measured.profile.depth,
         Kind::Measured,
         profile,
     );
+    let (kind, taken) = if p.depth < measured.profile.depth {
+        (
+            Kind::Derived,
+            "the deepest the allowance holds, short of the depth measured: each transfer deeper \
+             holds a worker's stack where a pool carries the transfers, and its exchanges and \
+             reads (derive::deepest_held)",
+        )
+    } else {
+        (
+            Kind::Measured,
+            "the depth measured, which the allowance holds (derive::deepest_held)",
+        )
+    };
+    said.add(format!("volume.{n}.depth_taken"), p.depth, kind, taken);
     said.add(
         format!("volume.{n}.issuer_depth"),
         issuer_depth(facts),
@@ -5845,10 +5947,10 @@ mod tests {
         for basis in bases {
             if let Some(field) = basis.key.strip_prefix("volume.1.") {
                 match field {
-                    "dir" | "size" | "depth" | "read_bytes" | "read_gap" | "prewrite" => {
+                    "dir" | "size" | "depth_taken" | "read_bytes" | "read_gap" | "prewrite" => {
                         line.push(basis.value.clone());
                     }
-                    "index_bytes" | "issuer_depth" => {}
+                    "depth" | "index_bytes" | "issuer_depth" => {}
                     _ => text.push_str(&format!("volume.{field} = {}\n", basis.value)),
                 }
             } else if KEYS.contains(&basis.key.as_str()) || REPEATED.contains(&basis.key.as_str()) {
@@ -5882,7 +5984,15 @@ mod tests {
         ] {
             assert_eq!(said(key), lines, "{key}");
         }
-        for key in ["dir", "size", "depth", "read_bytes", "read_gap", "prewrite"] {
+        for key in [
+            "dir",
+            "size",
+            "depth",
+            "depth_taken",
+            "read_bytes",
+            "read_gap",
+            "prewrite",
+        ] {
             assert_eq!(said(&format!("volume.1.{key}")), 1, "{key}");
         }
         // Each says where it comes from, and why.
@@ -6312,17 +6422,7 @@ mod tests {
             let case = format!("{volumes} volumes, {depth} deep");
             // The floor at one operation, what the node is refused at where it passes the
             // allowance: a ceiling of a byte leaves the operations nothing past their first.
-            let one = match derive(
-                Stated {
-                    ceiling: Some(1),
-                    ..founder(volumes)
-                },
-                &runner(volumes, depth),
-                &mut fresh,
-            ) {
-                Err(DeriveError::Memory { floor, .. }) => floor,
-                other => panic!("{case}: {:?}", other.err()),
-            };
+            let one = floor_at_one(founder(volumes), &runner(volumes, depth));
             assert!(one <= memory, "{case}: {one}");
             let derived = derive(founder(volumes), &runner(volumes, depth), &mut fresh)
                 .unwrap_or_else(|e| panic!("{case}: {e}"));
@@ -6377,49 +6477,25 @@ mod tests {
             );
         }
         // Two volumes measured at the device's queue: the issuer's 257 threads' stacks where a pool
-        // carries the transfers pass the machine; Linux's kernel holds them, and it starts.
-        let deepest = derive(founder(2), &runner(2, 256), &mut fresh);
-        if cfg!(target_os = "linux") {
-            assert!(deepest.is_ok(), "{:?}", deepest.err());
-        } else {
-            assert!(
-                matches!(
-                    deepest,
-                    Err(DeriveError::Memory {
-                        class: Class::Threads,
-                        ..
-                    })
-                ),
-                "{:?}",
-                deepest.err()
-            );
-        }
+        // carries the transfers pass the machine, and the node takes the deepest its allowance
+        // holds; Linux's kernel holds them, and it takes the depth measured.
+        let deepest = derive(founder(2), &runner(2, 256), &mut fresh).unwrap();
+        assert_eq!(said_bytes(&deepest, "volume.1.depth"), 256);
+        assert_eq!(
+            said_bytes(&deepest, "volume.1.depth_taken"),
+            if cfg!(target_os = "linux") { 256 } else { 109 }
+        );
         // Spread over the shards, the same founder's ranges take a lane from each peer for each
         // shard past the first, and two lanes to the node's shard from each.
-        let spread = derive(
+        let spread = floor_at_one(
             Stated {
                 range_shards: Some(RangeShards::Spread),
-                ceiling: Some(1),
                 ..founder(1)
             },
             &runner(1, 4),
-            &mut fresh,
         );
-        let first = derive(
-            Stated {
-                ceiling: Some(1),
-                ..founder(1)
-            },
-            &runner(1, 4),
-            &mut fresh,
-        );
-        match (spread, first) {
-            (
-                Err(DeriveError::Memory { floor: spread, .. }),
-                Err(DeriveError::Memory { floor: first, .. }),
-            ) => assert!(spread > first, "{spread} {first}"),
-            (spread, first) => panic!("{:?} {:?}", spread.err(), first.err()),
-        }
+        let first = floor_at_one(founder(1), &runner(1, 4));
+        assert!(spread > first, "{spread} {first}");
     }
 
     /// What a node needs (`memory.need`) is its floor at the most its device can be measured to
@@ -7205,6 +7281,64 @@ mod tests {
         ));
     }
 
+    /// The floor of `stated` at one operation on `measured`, its devices at the depths measured:
+    /// a ceiling of a byte leaves the operations nothing past their first, and [`derive_with`]
+    /// takes no depth short of the measured ([`deepest_held`]).
+    fn floor_at_one(stated: Stated, measured: &Measured) -> u64 {
+        let one = Stated {
+            ceiling: Some(1),
+            ..stated
+        };
+        match derive_with(one, measured, &mut fresh, (0, None), None) {
+            Err(DeriveError::Memory { floor, .. }) => floor,
+            other => panic!("{:?}", other.err()),
+        }
+    }
+
+    /// A founder of the repair suite's cells as `mantle init` makes it (crates/mantle/tests/repair.rs
+    /// `founders`, five founders of two 256 MiB volumes each): S3 served, the five founding ranges,
+    /// the table's bounds five nodes and 40 volumes, its four fellow founders pinned and the four
+    /// test clients pinned as gateways.
+    fn repair_founder() -> Stated {
+        let mut s = Stated {
+            quic: "127.0.0.1:0".parse().unwrap(),
+            plane: "127.0.0.1:0".parse().unwrap(),
+            s3: s3(),
+            voters: vec![1, 2, 3, 4, 5],
+            enlist: Some(Enlisting {
+                root: 0x10,
+                domain: "rack-0".into(),
+                max_nodes: 5,
+                max_volumes: 40,
+            }),
+            ..stated(2)
+        };
+        for (_, bytes) in &mut s.volumes {
+            *bytes = VolumeBytes::Stated(256 << 20);
+        }
+        s.peers = (2..=5)
+            .map(|id| peer(id, Role::Node, "/node/identity/peers/p.der", None))
+            .chain((6..=9).map(|id| peer(id, Role::Gateway, "/node/identity/c.der", None)))
+            .collect();
+        s
+    }
+
+    /// CI's macOS arm64 runner, three cores and 7 GiB, as a node of the repair suite measures it:
+    /// its two volumes on the node directory's device, of queue 256, measured `depth` deep, and
+    /// `ring` control entries a shard.
+    fn repair_runner(depth: usize, ring: usize) -> Measured {
+        let mut measured = facts(2);
+        measured.cores = 3;
+        measured.ring = ring;
+        measured.memory = machine(7 << 30, None);
+        for v in &mut measured.volumes {
+            v.device.name = measured.meta.name.clone();
+            v.device.queue = Some(256);
+            v.profile.depth = depth;
+        }
+        measured
+    }
+
     /// A founder of the repair suite's cell written off and rejoined (crates/mantle/tests/repair.rs
     /// `a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks`): its
     /// configuration keeps the `peer` lines naming its four fellow founders, and its switch to its
@@ -7222,29 +7356,7 @@ mod tests {
     /// machine: it starts.
     #[test]
     fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
-        let founder = || {
-            let mut s = Stated {
-                quic: "127.0.0.1:0".parse().unwrap(),
-                plane: "127.0.0.1:0".parse().unwrap(),
-                s3: s3(),
-                voters: vec![1, 2, 3, 4, 5],
-                enlist: Some(Enlisting {
-                    root: 0x10,
-                    domain: "rack-0".into(),
-                    max_nodes: 5,
-                    max_volumes: 40,
-                }),
-                ..stated(2)
-            };
-            for (_, bytes) in &mut s.volumes {
-                *bytes = VolumeBytes::Stated(256 << 20);
-            }
-            s.peers = (2..=5)
-                .map(|id| peer(id, Role::Node, "/node/identity/peers/p.der", None))
-                .chain((6..=9).map(|id| peer(id, Role::Gateway, "/node/identity/c.der", None)))
-                .collect();
-            s
-        };
+        let founder = repair_founder;
         // Written off as node 1 and granted 11, its seeds the three members that kept running.
         let rejoined = || Stated {
             id: 11,
@@ -7271,30 +7383,8 @@ mod tests {
         for key in ["transport_bytes", "transport.floor", "memory.floor.log"] {
             assert_eq!(said_bytes(&r, key), said_bytes(&f, key), "{key}");
         }
-        let runner = || {
-            let mut measured = facts(2);
-            measured.cores = 3;
-            measured.ring = 64;
-            measured.memory = machine(7 << 30, None);
-            for v in &mut measured.volumes {
-                v.device.name = measured.meta.name.clone();
-                v.device.queue = Some(256);
-                v.profile.depth = 16;
-            }
-            measured
-        };
-        // The floor at one operation: a ceiling of a byte leaves the operations nothing past it.
-        let one = |stated: Stated| match derive(
-            Stated {
-                ceiling: Some(1),
-                ..stated
-            },
-            &runner(),
-            &mut fresh,
-        ) {
-            Err(DeriveError::Memory { floor, .. }) => floor,
-            other => panic!("{:?}", other.err()),
-        };
+        let runner = || repair_runner(16, 64);
+        let one = |stated: Stated| floor_at_one(stated, &runner());
         let (founded, again) = (one(founder()), one(rejoined()));
         eprintln!("7 GiB, 16 deep: a founder's floor {founded}, the rejoined node's {again}");
         assert_eq!(again, founded);
@@ -7361,5 +7451,92 @@ mod tests {
         }
         assert_eq!(twice.config.settings, alone.config.settings);
         assert_eq!(twice.config.rules, alone.config.rules);
+    }
+
+    /// A founder of the repair suite's cell on CI's 7 GiB macOS runner whose device measured 240
+    /// deep and its shards 436 control entries, as one did at its first start in gates run
+    /// 44596668868 (macos-aarch64, `Cell::made_partly`, repair.rs:809), was refused at its threads
+    /// at 7,831,251,011 bytes, CI's exactly, its floor at that depth. Every byte past its floor at
+    /// 16 deep and 64 entries, 7,289,300,291, is what its depth and its ring hold: the device's
+    /// issuer carries each transfer on a worker of its own where a pool carries them (macOS,
+    /// Windows; `Issuer::device_threads`), 224 more threads' 2 MiB stacks, 469,762,048 bytes; its
+    /// two volumes take 448 more transfers at once, whose exchanges the transport holds,
+    /// 34,843,648, and whose reads the ranges hold, 37,273,600; and three shards' rings 372 entries
+    /// longer, 71,424. Its floor grows 2,419,104 bytes a transfer, so the deepest its allowance
+    /// holds is 109, 7,514,348,387 bytes at one operation, 1,844,381 within, and 110 is past it. It
+    /// takes 109 and starts: its issuer's workers, its volumes' reads and transfers and the
+    /// transport's room for them all at the depth taken. Where the kernel holds the transfers on
+    /// the issuer's one thread (Linux), its threads are 16 stacks at any depth, and it takes the
+    /// 240 measured.
+    #[test]
+    fn a_repair_founder_measured_deep_on_cis_macos_runner_takes_the_deepest_its_allowance_holds() {
+        let measured = repair_runner(240, 436);
+        let at_measured = floor_at_one(repair_founder(), &measured);
+        let derived = derive(repair_founder(), &measured, &mut fresh)
+            .unwrap_or_else(|e| panic!("240 deep, 436 entries: {e}"));
+        let taken = said_bytes(&derived, "volume.1.depth_taken");
+        let depth = usize::try_from(taken).unwrap();
+        let at_taken = floor_at_one(repair_founder(), &repair_runner(depth, 436));
+        eprintln!(
+            "240 deep, 436 entries: its floor at one operation {at_measured} measured, \
+             {at_taken} at the {taken} taken"
+        );
+        for n in [1, 2] {
+            assert_eq!(said_bytes(&derived, &format!("volume.{n}.depth")), 240);
+            assert_eq!(
+                said_bytes(&derived, &format!("volume.{n}.depth_taken")),
+                taken
+            );
+            assert_eq!(
+                said_bytes(&derived, &format!("volume.{n}.issuer_depth")),
+                taken
+            );
+        }
+        if cfg!(target_os = "linux") {
+            assert_eq!(taken, 240);
+            // Derive's Linux model, not measured here: the issuer's 240 workers' stacks fewer
+            // than macOS's, and about 133 KB more a train ([`runs`]).
+            assert_eq!(at_taken, at_measured);
+            assert!(
+                (7_327_000_000..7_332_000_000).contains(&at_measured),
+                "{at_measured}"
+            );
+        } else {
+            assert_eq!(at_measured, 7_831_251_011);
+            assert_eq!(taken, 109);
+            assert_eq!(at_taken, 7_514_348_387);
+            assert_eq!((7u64 << 30) - at_taken, 1_844_381);
+            assert!(floor_at_one(repair_founder(), &repair_runner(110, 436)) > 7 << 30);
+        }
+        // Every term that holds the depth holds the one taken: the issuer's workers among the
+        // threads, each volume's reads and transfers, and the transport's room for them.
+        assert_eq!(
+            said_bytes(&derived, "memory.floor.threads"),
+            threads(3, &[depth], &[true, true], 0).unwrap() * STACK
+        );
+        let config = &derived.config;
+        for v in &config.volumes {
+            assert_eq!(v.depth, depth);
+            assert_eq!(v.config.reads, Reads::measured(depth, 1 << 20, 64 << 10));
+        }
+        let gateway = config.gateway.as_ref().unwrap();
+        let opened = mantle_protocol::bounds::Stated {
+            peers: 8,
+            replicas: 4,
+            clients: gateway.clients,
+            pool: gateway.objects,
+            ranges: 5,
+            inflight: config.settings.max_inflight_msgs,
+            lanes: crate::node::lanes(NonZeroUsize::MIN, 5),
+            transfers: config.volumes.iter().map(|v| v.config.transfers()).sum(),
+            asked: config.chunk_asks,
+            transport_bytes: config.transport_bytes,
+            messages: messages().unwrap(),
+            max_head: crate::node::MAX_HEAD,
+        };
+        assert!(
+            config.transport_bytes >= mantle_protocol::bounds::least_transport(&opened).unwrap()
+        );
+        assert!(mantle_protocol::bounds::limits(&opened).is_ok());
     }
 }

@@ -640,6 +640,13 @@ pub struct Trunk {
     /// A ready job's grant the shard's file had no admitted extents for: the most asked since the
     /// shard last looked ([`Trunk::take_capacity_wanted`]), so its file grows enough.
     capacity_wanted: u64,
+    /// A test's estimates that fall short of what a job writes: a compaction's grant and a
+    /// packing's at most this many extents each, so the job asks its pool for more as it writes
+    /// ([`pool::Message::Need`]).
+    #[cfg(test)]
+    pub(crate) compact_most: Option<usize>,
+    #[cfg(test)]
+    pub(crate) pack_most: Option<usize>,
     /// Gets, which with its branches' visits set the filters' plan ([`Trunk::filter_plan`]).
     gets: u64,
     /// Nanoseconds maintenance steps took and the keys they merged: the measured price of a
@@ -907,6 +914,10 @@ impl Trunk {
             inflight_nodes: 0,
             wanting_nodes: 0,
             capacity_wanted: 0,
+            #[cfg(test)]
+            compact_most: None,
+            #[cfg(test)]
+            pack_most: None,
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,
@@ -2430,6 +2441,10 @@ impl Trunk {
             inflight_nodes: 0,
             wanting_nodes: 0,
             capacity_wanted: 0,
+            #[cfg(test)]
+            compact_most: None,
+            #[cfg(test)]
+            pack_most: None,
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,

@@ -224,6 +224,23 @@ under load, at moderate load and saturated.
   one descriptor a segment whatever its workers, where each handle opening every segment again
   held about 188 a segment on 32 cores; a flush through any handle covers every handle's writes
   (research/93).
+- **A worker's ask for more extents waits; it does not fail.** A job whose grant falls short of
+  what it writes asks for as many again as it holds (the doubling of a dynamic table, Cormen et
+  al., Introduction to Algorithms, 3rd ed., §17.4), so the ask may be up to twice what the job
+  still needs. A store that does not grow by segments, as a node's range's does not, answered from
+  the extents it had left and refused an ask past them, and the refused job failed its shard: a
+  compaction's failure is the step's error, a packing's its frozen memtable's. The ask now waits,
+  one a worker, while a job out whose worker is not itself waiting may give extents back, and is
+  answered as results are taken (`Pool::answer_needs`, called before every take of a worker's
+  message). Once no job out may give any back, the oldest ask takes what is left: with its own
+  grant, all the room the shard would have to run that job inline, without running it again. Only a
+  store with no extent left refuses it, full as the job run inline would find it. Two cases still
+  end in that refusal with room to come: two or more jobs out each waiting on an ask with no extent
+  left, where one must give its extents up and a refused job is not yet run again inline; and an
+  ask decided with none left just after another job's result was taken for an owner that has not
+  yet given back the grant that job did not write. A test's grants of one extent against
+  a store holding one extent free for each ask failed every fill before the change and fail none
+  after, each store reopened with every row (`shard_db/worker_need.rs`).
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

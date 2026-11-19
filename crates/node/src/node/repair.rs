@@ -443,9 +443,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let repair = self.repair.as_ref()?;
         let shard = hyper_rt::futures::now_ns();
         let answered = |pending: &Pending| match pending {
-            Pending::Command(ask) => self.commands_done.iter().any(|(a, _)| a == ask),
-            Pending::Read(ask) => self.reads_done.iter().any(|(a, _)| a == ask),
-            Pending::Chunk(ask) => self.chunks_done.iter().any(|(a, _)| a == ask),
+            Pending::Command(ask) => self.commands_done.contains(*ask),
+            Pending::Read(ask) => self.reads_done.contains(*ask),
+            Pending::Chunk(ask) => self.chunks_done.contains(*ask),
         };
         let waiting = repair
             .running
@@ -455,7 +455,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .commanding
                 .iter()
                 .chain(&repair.retiring)
-                .any(|(ask, _)| self.commands_done.iter().any(|(a, _)| a == ask));
+                .any(|(ask, _)| self.commands_done.contains(*ask));
         // A pass whose walk is over waits for its answers, which `waiting` says; one waiting on
         // the Block range's shard for a read resumes once its answer wakes the node.
         let resumes = !self.block_reading()

@@ -1234,8 +1234,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     chunks_out: Keyed<ChunkOut>,
     chunk_asks: usize,
     next_chunk: ChunkAsk,
-    /// The chunk puts and gets this node asked, answered and not yet taken.
-    chunks_done: Vec<(ChunkAsk, ChunkOutcome)>,
+    /// The chunk puts and gets this node asked, answered and not yet taken, each found by its ask
+    /// as its asker takes it (`keyed::Keyed`).
+    chunks_done: Keyed<(ChunkAsk, ChunkOutcome)>,
     chunk_bytes: u64,
     /// The commands this node asks of ranges itself (node.md §6.6): each range's session, waiting
     /// commands and entry out, holding at most `command_asks` commands with those answered and not
@@ -1250,13 +1251,15 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The node's run (§2.4 item 4), which its registrations name: a range ends the node's
     /// sessions of earlier runs as the node registers there.
     run: u64,
-    commands_done: Vec<(CommandAsk, CommandOutcome)>,
+    /// The commands answered and not yet taken, each found by its ask, as `chunks_done`.
+    commands_done: Keyed<(CommandAsk, CommandOutcome)>,
     /// The reads this node asks of ranges itself (`Node::read`): those out, and those answered and
     /// not yet taken, at most `read_asks` in all.
     reads_out: Vec<ReadOut>,
     read_asks: usize,
     next_read_ask: ReadAsk,
-    reads_done: Vec<(ReadAsk, ReadOutcome)>,
+    /// The reads answered and not yet taken, each found by its ask, as `chunks_done`.
+    reads_done: Keyed<(ReadAsk, ReadOutcome)>,
     wall: Wall,
     /// The gateway host's settings, and the object operations it runs: as many at once as it has
     /// learned its knee is (`crate::admit`), at most `GatewaySettings::objects`, the ceiling its
@@ -1312,9 +1315,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// a driving task runs on (`Node::spread_native`), and over the first alone where none does, so each
     /// is placed on the first, where the node's task runs it.
     drivers: drivers::Drivers,
-    /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
-    /// At most the node's asks.
-    abandoned: Vec<host::Pending>,
+    /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come,
+    /// each found by its ask from the answers waiting (`Node::drop_abandoned`). At most the node's
+    /// asks, each once.
+    abandoned: std::collections::HashSet<host::Pending>,
     /// The cell's repair, while this node's member leads the Block range (docs/design/repair.md
     /// §5); its repairs take the host's operation slots as jobs do.
     repair: Option<repair::Repair>,
@@ -1723,18 +1727,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             chunks_out: Keyed::default(),
             chunk_asks: settings.chunk_asks,
             next_chunk: 0,
-            chunks_done: Vec::new(),
+            chunks_done: Keyed::default(),
             chunk_bytes: settings.chunk_bytes,
             asking: Vec::new(),
             command_asks: settings.command_asks,
             next_command: 0,
             next_nonce: 0,
             run,
-            commands_done: Vec::new(),
+            commands_done: Keyed::default(),
             reads_out: Vec::new(),
             read_asks: settings.read_asks,
             next_read_ask: 0,
-            reads_done: Vec::new(),
+            reads_done: Keyed::default(),
             wall: settings.wall,
             admission: gateway.as_ref().map(|g| {
                 crate::admit::Admission::new(
@@ -1767,7 +1771,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             replies: Vec::new(),
             replied: false,
             drivers: drivers::Drivers::over(NonZeroUsize::MIN),
-            abandoned: Vec::new(),
+            abandoned: std::collections::HashSet::new(),
             repair: None,
             seeing: Vec::new(),
             doorway: None,
@@ -4668,7 +4672,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.write_exchange(exchange);
             }
-            Err(refusal) => self.chunks_done.push((asked, ChunkOutcome::Lost(refusal))),
+            Err(refusal) => {
+                self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
+            }
         }
         Ok(asked)
     }
@@ -4732,7 +4738,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     get: true,
                 });
             }
-            Err(refusal) => self.chunks_done.push((asked, ChunkOutcome::Lost(refusal))),
+            Err(refusal) => {
+                self.chunks_done.push((asked, ChunkOutcome::Lost(refusal)));
+            }
         }
         Ok(asked)
     }
@@ -5633,16 +5641,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let remotes = &self.remotes;
         self.plane_socket.flush(
             &mut self.plane,
+            // A search of the node's peers, at most the cell's nodes and its pinned peers.
             |peer| remotes.iter().find(|r| r.id == peer).and_then(|r| r.plane),
             |_, _| {},
         );
     }
 }
 
-/// Takes `ask`'s outcome out of `done`, if it is there.
-fn take_done<T>(done: &mut Vec<(u64, T)>, ask: u64) -> Option<T> {
-    let at = done.iter().position(|(a, _)| *a == ask)?;
-    Some(done.swap_remove(at).1)
+/// Takes `ask`'s outcome out of `done`, if it is there: one probe of its asks' slots.
+fn take_done<T>(done: &mut Keyed<(u64, T)>, ask: u64) -> Option<T> {
+    done.remove(ask).map(|(_, outcome)| outcome)
 }
 
 /// Whether `command` asks nothing its sender may not: an enlistment and a history name the sender,

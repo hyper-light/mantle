@@ -281,7 +281,7 @@ impl Asking {
         max_entry_bytes: usize,
         (owner, run, nth): (u64, u64, u64),
         nonce: u64,
-        refused: &mut Vec<(CommandAsk, CommandOutcome)>,
+        refused: &mut impl Extend<(CommandAsk, CommandOutcome)>,
     ) {
         if !self.room() {
             return;
@@ -336,10 +336,10 @@ impl Asking {
             if commands.is_empty() {
                 // No entry carries this command alone: it is answered and the next tried.
                 if let Some(wanted) = self.waiting.pop_front() {
-                    refused.push((
+                    refused.extend([(
                         wanted.ask,
                         CommandOutcome::Refused(command::Status::Malformed),
-                    ));
+                    )]);
                 }
                 if self.waiting.is_empty() {
                     return;
@@ -406,7 +406,7 @@ impl Asking {
         &mut self,
         id: u64,
         answers: Vec<Answer>,
-        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+        done: &mut impl Extend<(CommandAsk, CommandOutcome)>,
     ) {
         let Some(out) = self.take_out(id) else {
             return;
@@ -420,7 +420,7 @@ impl Asking {
                 }
                 [Answer::Superseded] => {
                     for wanted in self.waiting.drain(..) {
-                        done.push((wanted.ask, CommandOutcome::Answered(Answer::Superseded)));
+                        done.extend([(wanted.ask, CommandOutcome::Answered(Answer::Superseded))]);
                     }
                 }
                 _ => {}
@@ -428,7 +428,7 @@ impl Asking {
             Carried::Commands(commands) => {
                 if answers.len() != commands.len() || out.entry.commands.len() != commands.len() {
                     for (ask, _, _) in commands {
-                        done.push((ask, CommandOutcome::Refused(command::Status::Malformed)));
+                        done.extend([(ask, CommandOutcome::Refused(command::Status::Malformed))]);
                     }
                     return;
                 }
@@ -453,14 +453,14 @@ impl Asking {
                             self.corrupt = self.corrupt.saturating_add(1);
                             if let Some(at) = self.corrupted.iter().position(|a| *a == ask) {
                                 self.corrupted.swap_remove(at);
-                                done.push((ask, CommandOutcome::Answered(Answer::Corrupt)));
+                                done.extend([(ask, CommandOutcome::Answered(Answer::Corrupt))]);
                                 continue;
                             }
                             self.corrupted.push(ask);
                             if current { Some(serial) } else { None }
                         }
                         answer => {
-                            done.push((ask, CommandOutcome::Answered(answer)));
+                            done.extend([(ask, CommandOutcome::Answered(answer))]);
                             continue;
                         }
                     };
@@ -496,7 +496,7 @@ impl Asking {
         &mut self,
         id: u64,
         status: command::Status,
-        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+        done: &mut impl Extend<(CommandAsk, CommandOutcome)>,
     ) {
         if let Some(Out {
             carried: Carried::Commands(commands),
@@ -504,7 +504,7 @@ impl Asking {
         }) = self.take_out(id)
         {
             for (ask, _, _) in commands {
-                done.push((ask, CommandOutcome::Refused(status)));
+                done.extend([(ask, CommandOutcome::Refused(status))]);
             }
         }
     }
@@ -516,12 +516,12 @@ impl Asking {
     pub fn expire(
         &mut self,
         now_ns: u64,
-        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+        done: &mut impl Extend<(CommandAsk, CommandOutcome)>,
     ) -> Vec<(u64, Via)> {
         let mut kept = VecDeque::with_capacity(self.waiting.len());
         for wanted in self.waiting.drain(..) {
             if wanted.deadline_ns <= now_ns {
-                done.push((wanted.ask, CommandOutcome::Deadline));
+                done.extend([(wanted.ask, CommandOutcome::Deadline)]);
             } else {
                 kept.push_back(wanted);
             }
@@ -545,12 +545,12 @@ impl Asking {
     pub fn unled(
         &mut self,
         spent: &[u64],
-        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+        done: &mut impl Extend<(CommandAsk, CommandOutcome)>,
     ) -> Vec<(u64, Via)> {
         let mut kept = VecDeque::with_capacity(self.waiting.len());
         for wanted in self.waiting.drain(..) {
             match wanted.wait {
-                Wait::Request => done.push((wanted.ask, CommandOutcome::Deadline)),
+                Wait::Request => done.extend([(wanted.ask, CommandOutcome::Deadline)]),
                 Wait::Answered => kept.push_back(wanted),
             }
         }
@@ -574,7 +574,7 @@ impl Asking {
     /// each its place and how it was being asked: at most [`ENTRIES_OUT`].
     fn give_up(
         &mut self,
-        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+        done: &mut impl Extend<(CommandAsk, CommandOutcome)>,
         past: impl Fn(&Out) -> bool,
     ) -> Vec<(u64, Via)> {
         let mut given_up = Vec::new();
@@ -613,10 +613,10 @@ impl Asking {
 }
 
 /// An entry out given up: each of its commands answered as past its deadline.
-fn given_up_with(out: Out, done: &mut Vec<(CommandAsk, CommandOutcome)>) {
+fn given_up_with(out: Out, done: &mut impl Extend<(CommandAsk, CommandOutcome)>) {
     if let Carried::Commands(commands) = out.carried {
         for (ask, _, _) in commands {
-            done.push((ask, CommandOutcome::Deadline));
+            done.extend([(ask, CommandOutcome::Deadline)]);
         }
     }
 }
@@ -667,7 +667,7 @@ mod tests {
     fn answered(
         a: &mut Asking,
         answers: Vec<Answer>,
-        done: &mut Vec<(CommandAsk, CommandOutcome)>,
+        done: &mut impl Extend<(CommandAsk, CommandOutcome)>,
     ) {
         if let Some(id) = a.outs.front().map(|o| o.id) {
             a.answered_entry(id, answers, done);

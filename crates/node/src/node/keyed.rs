@@ -15,6 +15,16 @@ pub(super) trait Key {
     fn key(&self) -> Self::Of;
 }
 
+/// An answer kept for its asker, found by its ask (`Node::chunks_done`, `commands_done`,
+/// `reads_done`).
+impl<T> Key for (u64, T) {
+    type Of = u64;
+
+    fn key(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Entries in a vector, each found by its key in one probe of the map of their slots, kept in step
 /// as each is pushed and swap-removed: the entry moved into a removed one's slot is re-pointed.
 /// Bound: its owner's, each entry's key once.
@@ -38,8 +48,12 @@ impl<T: Key> Keyed<T> {
         self.entries.len()
     }
 
-    /// Its entries, in no order a caller may rely on: a removal moves the last into its slot.
     #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Its entries, in no order a caller may rely on: a removal moves the last into its slot.
     pub(super) fn iter(&self) -> std::slice::Iter<'_, T> {
         self.entries.iter()
     }
@@ -272,5 +286,51 @@ pub(super) mod tests {
         assert_eq!(after[1], 2 * puts.len(), "two probes a Reply");
         assert_eq!(after[2], 5 * arriving.len(), "five probes a Refused");
         assert!(chunks_out.len() + receiving.len() == 0 && writing.len() == puts.len());
+    }
+
+    /// A driving shard's lanes take the node's answers to their asks at each serve by reading the
+    /// answers waiting, each probing the asks held (`Lanes::serve`), and each answer taken is one
+    /// probe of its done list (`take_done`): 2,048 asks held, 16 of them answered. Before, each
+    /// ask held searched the done list at every serve (`node.outcome` for each), and `host_due`
+    /// and `drop_abandoned` likewise searched it for each ask let go.
+    #[test]
+    fn a_serve_reads_the_answers_waiting_not_the_asks_held() {
+        const HELD: u64 = 2048;
+        const ANSWERED: u64 = 16;
+        let asked: std::collections::HashMap<u64, u64> =
+            (0..HELD).map(|ask| (ask, ask + HELD)).collect();
+        let answers = || {
+            let mut done: Keyed<(u64, ())> = Keyed::default();
+            done.extend((HELD - ANSWERED..HELD).map(|ask| (ask, ())));
+            done
+        };
+        // Before: each ask held, in order, searched the answers, each found taken out.
+        let mut done = answers();
+        let mut searched = 0;
+        for ask in 0..HELD {
+            let at = done.iter().position(|(answered, _)| *answered == ask);
+            searched += at.map_or(done.len(), |at| at + 1);
+            if at.is_some() {
+                done.remove(ask);
+            }
+        }
+        // Now: each answer waiting probes the asks held, and each found is taken in one probe.
+        let mut done = answers();
+        let found: Vec<u64> = done
+            .iter()
+            .map(|(ask, _)| *ask)
+            .filter(|ask| asked.contains_key(ask))
+            .collect();
+        probes();
+        for ask in &found {
+            assert!(done.remove(*ask).is_some());
+        }
+        let visited = found.len() + probes();
+        println!(
+            "{HELD} asks held, {ANSWERED} answered: {visited} entries visited, {searched} by a \
+             search of the answers for each ask held"
+        );
+        assert_eq!(visited, 2 * usize::try_from(ANSWERED).unwrap());
+        assert!(done.is_empty());
     }
 }

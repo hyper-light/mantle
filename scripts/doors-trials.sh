@@ -7,7 +7,7 @@
 #   OUT=DIR MACHINE=M scripts/doors-trials.sh plan       write DIR/plan.tsv, the batch's cases in order
 #   OUT=DIR MACHINE=M scripts/doors-trials.sh run        run each planned case not yet run
 #   OUT=DIR MACHINE=M scripts/doors-trials.sh case SEQ   run the planned case SEQ alone
-#   python3 scripts/doors-tables.py DIR                  regenerate the tables and the trial report
+#   python3 scripts/doors-tables.py DIR [COMPARE]        regenerate the tables and the trial report
 #
 # MACHINE is box (Linux x86_64: CPUSET 8-15, each case in a systemd memory scope), mac (macOS
 # arm64: no CPU binding and no memory limit, so cpu1, cpu2 and memfloor are excluded) or vm (the
@@ -556,7 +556,7 @@ case ${1:-} in
       run_case "$seq"
       echo "$(date -u +%FT%TZ) $seq" >> "$OUT/progress"
     done
-    python3 -I "$ROOT/scripts/doors-tables.py" "$OUT"
+    python3 -I "$ROOT/scripts/doors-tables.py" "$OUT" "$COMPARE"
     ;;
   case) run_case "$2" ;;
   endpoint-case) shift; endpoint_case "$@" ;;

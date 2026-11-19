@@ -1168,7 +1168,13 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   suspected each other as soon as the third gave them evidence, and a survivor took the suspicion
   of its range's next leader into the term (the roll test, 2026-10-28).
 - (3) A member's id is its node's, and a node keeps a pair for each node it is told of; placement's
-  map and its bound on pairs are not built (§7).
+  map is not built (§7). The bound on pairs (`Settings::max_peers`) is each hosted range's bound on
+  the members its configuration names summed, and one range's more for the range moving its pairs,
+  which attaches its new peers before it detaches the ones it left (`node::liveness_pairs`): ranges
+  lagging the cell name members it has since written off beside their successors. With pairs for
+  the cell's nodes less one, a founder started after a member was written off and its identity
+  replaced held one range at the founding configuration and another at the cell's, overflowed them
+  and ended (`TooManyPeers`, 2026-11-19).
 - (4) The run is kept as hyper-block's `record` in the node's directory (`crates/node/src/layout.rs`).
 - (5) `Driven::flushed` feeds `Liveness::on_durable`, and a stream that asks for a flush gets an
   empty update of a log group of its own (the top of the group space, since group 0 holds

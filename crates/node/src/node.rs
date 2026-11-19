@@ -1154,6 +1154,31 @@ pub fn plane(stated: &Stated) -> Result<PlaneLimits, bounds::Unfit> {
     })
 }
 
+/// The pairs the node's liveness stream may keep at once (hyper-liveness's `Settings::max_peers`):
+/// one for each peer a hosted range's configuration names. A configuration names at most the
+/// members its range is opened for (`mantle_range::limits`; hyper-raft stops a member given more),
+/// and a range moving to a new configuration attaches its new peers before it detaches the ones it
+/// left (hyper-durable's `Owner::pairs`, [`Node::pair_far`]), one range at a time, so the range
+/// moving names two configurations' at once. Ranges lagging the cell name members it has since
+/// written off beside their successors: a node replaying from its founding configuration held one
+/// range at it and another at the cell's, and with pairs for the cell's nodes alone (its bound on
+/// nodes less one) the founder written off and the identity that replaced it overflowed them, and
+/// the node ended (`TooManyPeers`, 2026-11-19). So each range's own bound counts, and one more for
+/// the range moving.
+fn liveness_pairs<E>(ranges: &[Hosted<E>]) -> Result<usize, NodeError> {
+    let unfit = || NodeError::Bounds("the liveness stream's pairs overflow a count".into());
+    let mut pairs = 0usize;
+    let mut largest = 0usize;
+    for hosted in ranges {
+        let members = mantle_range::limits(&hosted.range)
+            .map_err(|e| NodeError::Bounds(e.to_string()))?
+            .members;
+        pairs = pairs.checked_add(members).ok_or_else(unfit)?;
+        largest = largest.max(members);
+    }
+    pairs.checked_add(largest).ok_or_else(unfit)
+}
+
 /// The node's message bounds: a Raft message is at most the larger of a page of entries and one
 /// entry of the range's largest, inside the core's fixed bytes, in a frame; a command is an entry
 /// behind its head, and its reply no larger (`command::Status::TooLarge` otherwise); a snapshot's
@@ -1226,6 +1251,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             message_bounds(&settings.ranges, settings.chunk_bytes).map_err(at(Step::Budgets))?;
         classes::state_bounds(messages)
             .map_err(|e| at(Step::Budgets)(NodeError::Bounds(e.to_string())))?;
+        // A pair for each peer a hosted range's configuration names ([`liveness_pairs`]), read
+        // before the ranges are taken to open their replicas.
+        let range_pairs = liveness_pairs(&settings.ranges).map_err(at(Step::Budgets))?;
         let inflight = settings
             .ranges
             .iter()
@@ -1325,10 +1353,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } else {
             hyper_rt::machine::clock::resolution_ns()
         };
+        // And at least one for each node the node may keep.
+        let pairs = range_pairs.max(node_peers);
         let liveness = Liveness::new(hyper_liveness::Settings {
             local: settings.id,
             run,
-            max_peers: node_peers.max(1),
+            max_peers: pairs.max(1),
             history: Exposure::of(
                 Duration::from_nanos(settings.history.exposure_ns),
                 settings.history.crashes,
@@ -5422,6 +5452,39 @@ mod tests {
     use mantle_meta::root;
 
     use super::*;
+
+    /// The liveness stream keeps a pair for each peer every hosted range may name at once: each
+    /// range's own bound on members, and one more range's for the range moving its pairs, so a
+    /// node of five ranges in a cell of five nodes keeps thirty, not the four the cell's nodes
+    /// less itself are; a range of fixed members counts its boot configuration and the learner a
+    /// replacement adds.
+    #[test]
+    fn the_liveness_stream_keeps_a_pair_for_every_peer_its_ranges_may_name() {
+        let (settings, rules) = crate::derive::cell(1).unwrap();
+        let range = |members: usize, voters: Vec<u64>| Hosted {
+            group: 0,
+            range: Range {
+                layer: Layer::Name,
+                rules,
+                boot: mantle_range::ConfState {
+                    voters,
+                    ..mantle_range::ConfState::default()
+                },
+                settings,
+                members,
+            },
+            engine: (),
+        };
+        // Three founders in a cell of five nodes: each range's bound the cell's.
+        let grown: Vec<Hosted<()>> = (0..5).map(|_| range(5, vec![1, 2, 3])).collect();
+        assert_eq!(liveness_pairs(&grown).unwrap(), 5 * 5 + 5);
+        // Five founders: their boot configuration and a replacement's learner, past the cell's.
+        let founded: Vec<Hosted<()>> = (0..5).map(|_| range(5, vec![1, 2, 3, 4, 5])).collect();
+        assert_eq!(liveness_pairs(&founded).unwrap(), 5 * 6 + 6);
+        // Fixed members: three voters and a replacement's learner.
+        assert_eq!(liveness_pairs(&[range(0, vec![1, 2, 3])]).unwrap(), 4 + 4);
+        assert_eq!(liveness_pairs::<()>(&[]).unwrap(), 0);
+    }
 
     /// A peer whose handshake measured its path across a hold of this node's shard is dialed
     /// again, once its connection ends, within the reconnect the node states for it, the idle

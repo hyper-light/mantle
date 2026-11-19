@@ -925,14 +925,9 @@ pub fn engine_wants_for(engine: &Engine, objects: u64) -> Option<u64> {
     extents.checked_mul(mantle_engine::shard_db::measured_per_extent(&engine.store)?)
 }
 
-/// The extents an engine opens with: its superblocks' and one more for its rows.
+/// The extents an engine opens with: its superblocks' and one more for its rows. A share holding
+/// fewer is refused ([`engine_within`]).
 const OPENS_WITH: u64 = 2;
-
-/// What `engine`'s resident metadata takes for the extents it opens with ([`OPENS_WITH`]), the
-/// least of its want in [`shares`]: a share below it is one [`engine_within`] refuses.
-pub fn engine_least(engine: &Engine) -> Option<u64> {
-    mantle_engine::shard_db::measured_per_extent(&engine.store)?.checked_mul(OPENS_WITH)
-}
 
 /// `engine` with as many extents as `metadata` bytes of the node's memory hold at the metadata
 /// measured at the densest rows and their allocator's own
@@ -1770,6 +1765,10 @@ pub struct Stated {
     pub voters: Vec<u64>,
     /// Each volume's device directory and bytes.
     pub volumes: Vec<(PathBuf, VolumeBytes)>,
+    /// For a node with no volume of its own, the bytes each member's volumes hold in its cell, as
+    /// its founders state theirs (`cell.volume`, which `mantle init grant` writes from the cell
+    /// file): what its engines estimate the cell's rows by.
+    pub cell_volume: Option<u64>,
     pub enlist: Option<Enlisting>,
     /// The root key's generations, for a node that hosts objects.
     pub keys: Vec<(u32, PathBuf)>,
@@ -2297,16 +2296,22 @@ pub fn derive(
     };
     // What remains, shared: each index wants a fragment at each of its volume's blocks, and each
     // engine the rows of the objects those fragments make across the cell, so both fill together.
-    let held_objects = cell_blocks(fragments, spread)?;
-    // And each engine at least the extents it opens with ([`engine_least`]): a node with no
-    // volume of its own counts no fragment, yet its ranges hold the cell's rows as every member's
-    // do, and with no want its engines took what the operations' share left, which on CI's macOS
-    // runner, 7 GiB, was nothing, and the node refused to start (`DeriveError::Metadata`,
-    // 2026-11-19).
-    let engine_want = engine_wants_for(&made, held_objects)
-        .zip(engine_least(&made))
-        .map(|(want, least)| want.max(least))
-        .ok_or(overflow("an engine's metadata"))?;
+    // A node with no volume of its own counts no fragment, yet its ranges hold the cell's rows as
+    // every member's do: it counts the fragments of a volume of the bytes its cell's founders state
+    // theirs at (`cell.volume`), at its own device's block, each node's volumes holding what a
+    // founder's do as a founder estimates them. Wanting nothing, its engines took what the
+    // operations' share left, rounding, which on CI's 7 GiB macOS runner was nothing: the node
+    // refused to start (`DeriveError::Metadata`) and, given only the two extents an engine opens
+    // with, its first writes were refused and its engine fenced (2026-11-19).
+    let counted = match (stated.volumes.is_empty(), stated.cell_volume) {
+        (true, Some(bytes)) => volume_layout::block(measured.meta.align)
+            .and_then(|block| bytes.checked_div(block))
+            .ok_or(overflow("the cell's volume"))?,
+        _ => fragments,
+    };
+    let held_objects = cell_blocks(counted, spread)?;
+    let engine_want =
+        engine_wants_for(&made, held_objects).ok_or(overflow("an engine's metadata"))?;
     let mut all = wants;
     all.resize(
         stated
@@ -4461,6 +4466,7 @@ mod tests {
     fn stated(volumes: usize) -> Stated {
         Stated {
             repair: None,
+            cell_volume: None,
             id: 1,
             dir: at("/node"),
             quic: "127.0.0.1:7000".parse().unwrap(),
@@ -4703,28 +4709,16 @@ mod tests {
         }
     }
 
-    /// A founder of the membership suite's cell (`three_of_five` made by `Cell::made`: five nodes
-    /// at most and the four test clients pinned as gateways, nine identities; its five founding
-    /// ranges; a volume of 256 MiB; S3 served) on CI's macOS arm64 runner, three cores and 7 GiB,
-    /// its device's queue 256 and measured 256 deep, starts on every platform. CI's founder refused
-    /// to start at its threads, its floor 7,718,104,000 bytes (run 44349745026), its transport
-    /// charged a lane's frames to each of the four gateways, which no range's message goes to
-    /// (`Node::send`); charged to the four other nodes alone, the floor holds the issuer's 257
-    /// threads' stacks where a pool's worker carries each transfer (macOS, Windows). Its ranges
-    /// and log, a range's entries counted at the least an entry takes since nothing bounds their
-    /// count but their bytes (node.md §1.4), hold more than 5 GiB at any depth, the ranges alone
-    /// more than a third of the machine: the suite's three founders, which are alike, each start,
-    /// but their floors together pass the machine. Its need, its floor at the deepest its queue lets
-    /// calibration measure with every want whole, passes the machine: no memory it states starts
-    /// it there.
     /// A node of the membership suite granted with no volume of its own (`mantle init grant`, the
-    /// founders its seeds, the four test clients pinned as gateways) starts on CI's three-core
-    /// 7 GiB macOS runner at every depth its device may measure: it counts no fragment, so its
-    /// engines' wants were none and they took what the operations' share left, nothing there, and
-    /// it refused to start (`DeriveError::Metadata`, CI run 44420627795). Each engine now wants at
-    /// least the extents it opens with, which the operations' share leaves it.
+    /// founders its seeds, the four test clients pinned as gateways, the founders' 256 MiB volumes
+    /// its cell's, `cell.volume`) starts on CI's three-core 7 GiB macOS runner at every depth its
+    /// device may measure, its engines wanting what a founder's do there and its door serving
+    /// operations past them. Counting no fragment, its engines' wants were none and they took what
+    /// the operations' share left, nothing there (`DeriveError::Metadata`, CI run 44420627795),
+    /// and given only the extents an engine opens with its engine was fenced at its first writes
+    /// (run 44442435486). Without the cell's volume it still refuses there.
     #[test]
-    fn a_node_with_no_volume_on_cis_macos_runner_keeps_its_engines_the_extents_they_open_with() {
+    fn a_node_with_no_volume_on_cis_macos_runner_wants_its_cells_rows() {
         let granted = || {
             let mut s = Stated {
                 s3: Some(crate::process::S3Stated {
@@ -4744,6 +4738,7 @@ mod tests {
                 ..stated(1)
             };
             s.volumes.clear();
+            s.cell_volume = Some(256 << 20);
             s.peers.retain(|p| p.role == Role::Node);
             for id in 6..=9 {
                 s.peers
@@ -4758,19 +4753,45 @@ mod tests {
             measured.volumes.clear();
             let derived = derive(granted(), &measured, &mut fresh)
                 .unwrap_or_else(|e| panic!("depth {depth}: {e}"));
+            // Its engines want what a founder's do on the same runner, the rows of the cell's
+            // blocks at the founders' volumes (18,029,352 bytes each), and hold it, far past the
+            // extents an engine opens with; its operations hold what is left.
             let per_extent =
                 mantle_engine::shard_db::measured_per_extent(&derived.config.store).unwrap();
+            let metadata = said_bytes(&derived, "engine.metadata_bytes");
+            assert!(metadata >= per_extent * OPENS_WITH, "depth {depth}");
+            assert!(metadata >= 18_029_352, "depth {depth}: {metadata}");
             assert!(
-                said_bytes(&derived, "engine.metadata_bytes") >= per_extent * OPENS_WITH,
+                said_bytes(&derived, "gateway.objects") >= 2,
                 "depth {depth}"
             );
+            // Without its cell's volume it has nothing to estimate the rows by, and refuses there.
+            let mut unstated = granted();
+            unstated.cell_volume = None;
             assert!(
-                derived.config.store.max_extents >= OPENS_WITH,
+                matches!(
+                    derive(unstated, &measured, &mut fresh),
+                    Err(DeriveError::Metadata { .. })
+                ),
                 "depth {depth}"
             );
         }
     }
 
+    /// A founder of the membership suite's cell (`three_of_five` made by `Cell::made`: five nodes
+    /// at most and the four test clients pinned as gateways, nine identities; its five founding
+    /// ranges; a volume of 256 MiB; S3 served) on CI's macOS arm64 runner, three cores and 7 GiB,
+    /// its device's queue 256 and measured 256 deep, starts on every platform. CI's founder refused
+    /// to start at its threads, its floor 7,718,104,000 bytes (run 44349745026), its transport
+    /// charged a lane's frames to each of the four gateways, which no range's message goes to
+    /// (`Node::send`); charged to the four other nodes alone, the floor holds the issuer's 257
+    /// threads' stacks where a pool's worker carries each transfer (macOS, Windows). Its ranges
+    /// and log, a range's entries counted at the least an entry takes since nothing bounds their
+    /// count but their bytes (node.md §1.4), hold more than 5 GiB at any depth, the ranges alone
+    /// more than a third of the machine: the suite's three founders, which are alike, each start,
+    /// but their floors together pass the machine. Its need, its floor at the deepest its queue lets
+    /// calibration measure with every want whole, passes the machine: no memory it states starts
+    /// it there.
     #[test]
     fn a_membership_founder_on_cis_macos_runner_starts_at_its_issuers_stacks() {
         let founder = || {

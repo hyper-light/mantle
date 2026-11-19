@@ -725,7 +725,7 @@ a range's voters are, `2f + 1` one to a failure domain (§6.5), is placement's, 
 | Command | What it does |
 |---|---|
 | `mantle init OUT --node ... --max-nodes N ...` | as before; its founders' certificates carry grants 1 to F, and its cell file the cell's ranges, bounds and each founder's dial addresses |
-| `mantle init grant DIR --cell OUT --node quic=ADDR,plane=ADDR,domain=NAME,volume=DIR:SIZE (or DIR:spare:KEEP),...` | a new node's directory in DIR: its id and grant, its certificate and its S3 endpoint's, the cell's keys, its configuration with the cell's ranges and seeds; `granted ID GRANT DIR` |
+| `mantle init grant DIR --cell OUT --node quic=ADDR,plane=ADDR,domain=NAME,volume=DIR:SIZE (or DIR:spare:KEEP),...` | a new node's directory in DIR: its id and grant, its certificate and its S3 endpoint's, the cell's keys, its configuration with the cell's ranges and seeds, and for a node with no volume of its own `cell.volume`, the most bytes any founder's volumes state (the cell file's `volume_bytes`), which its engines estimate the cell's rows by (node.md §1.4); `granted ID GRANT DIR` |
 | `mantle serve CONFIG` | runs a founder or a granted node; a granted node joins at its first start |
 | `mantle serve CONFIG --leave` | runs the node until it has left (§4), then exits 0 |
 | `leave`, `gone ID` on a running node's standard input | the same leave; an operator's statement that `ID` is gone (§5) |

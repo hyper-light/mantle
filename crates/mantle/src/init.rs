@@ -75,6 +75,9 @@ fn cell_file<'a>(
     let mut text = format!(
         "authority = {authority}\ns3_authority = {endpoint_authority}\naccount = {account}\n"
     );
+    // The most bytes any founder's volumes state, each volume at its stated bytes: what a node
+    // granted with no volume of its own estimates the cell's rows by (`cell.volume`, `grant`).
+    let mut volume_bytes: Option<u64> = None;
     for (founder, id) in founders {
         let quic = founder
             .dialed(founder.quic)
@@ -83,6 +86,20 @@ fn cell_file<'a>(
         if let Some(plane) = founder.dialed(founder.plane) {
             text.push_str(&format!("plane = {id} {plane}\n"));
         }
+        let stated = founder
+            .volumes
+            .iter()
+            .try_fold(0u64, |sum, (_, bytes)| match bytes {
+                VolumeBytes::Stated(size) => sum.checked_add(*size),
+                VolumeBytes::Spare { .. } => None,
+            })
+            .filter(|bytes| *bytes > 0);
+        if let Some(bytes) = stated {
+            volume_bytes = Some(volume_bytes.map_or(bytes, |most| most.max(bytes)));
+        }
+    }
+    if let Some(bytes) = volume_bytes {
+        text.push_str(&format!("volume_bytes = {bytes}\n"));
     }
     for (group, layer) in groups.iter().zip(LAYERS) {
         text.push_str(&format!("range = {group:x} {}\n", layer_name(layer)));
@@ -1087,6 +1104,9 @@ pub(crate) struct Authority {
     pub(crate) gateways: Vec<u64>,
     /// The S3 endpoint's authority's name, which its endpoints' certificates name as their issuer.
     pub(crate) endpoint_authority: Option<String>,
+    /// The most bytes any founder's volumes state, where the cell file states it: what a node
+    /// granted with no volume of its own estimates the cell's rows by (`cell.volume`).
+    pub(crate) volume_bytes: Option<u64>,
     /// The directory the authority's key is in.
     pub(crate) dir: PathBuf,
     pub(crate) certificate: Vec<u8>,
@@ -1115,6 +1135,7 @@ impl Authority {
         let (mut region, mut target, mut access_key) = (None, None, None);
         let mut gateways = Vec::new();
         let mut endpoint_authority = None;
+        let mut volume_bytes = None;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let bad = || Error::Cell(format!("the cell file's line does not read: {line}"));
             let (key, value) = line.split_once('=').ok_or_else(bad)?;
@@ -1144,6 +1165,7 @@ impl Authority {
                 "access_key" => access_key = Some(value.to_owned()),
                 "gateway" => gateways.push(value.parse().map_err(|_| bad())?),
                 "s3_authority" => endpoint_authority = Some(value.to_owned()),
+                "volume_bytes" => volume_bytes = Some(value.parse().map_err(|_| bad())?),
                 _ => return Err(bad()),
             }
         }
@@ -1172,6 +1194,7 @@ impl Authority {
             access_key,
             gateways,
             endpoint_authority,
+            volume_bytes,
             dir: authority_dir,
             certificate,
             key,
@@ -1572,6 +1595,13 @@ pub fn grant(
     if let Some(reach) = &founder.reach {
         text.push_str(&format!("reach = {reach}\n"));
     }
+    // A node with no volume of its own holds the cell's rows all the same: its engines estimate
+    // them as each node's volumes holding what the founders' do (docs/design/node.md §1.4).
+    if founder.volumes.is_empty()
+        && let Some(bytes) = authority.volume_bytes
+    {
+        text.push_str(&format!("cell.volume = {bytes}\n"));
+    }
     text.push_str(&format!(
         "root.max_nodes = {max_nodes}\nroot.max_volumes = {max_volumes}\n"
     ));
@@ -1859,6 +1889,68 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// The cell file states the most bytes any founder's volumes state, and a node granted with no
+    /// volume of its own states them as its cell's (`cell.volume`), which its engines estimate the
+    /// cell's rows by; one granted with a volume states none, and a cell whose founders state no
+    /// volume at its bytes states nothing to grant.
+    #[test]
+    fn a_node_granted_with_no_volume_states_its_founders_volumes() {
+        let root = tempfile::tempdir().unwrap();
+        let founder = |n: u16, volumes: Vec<(PathBuf, VolumeBytes)>| Founder {
+            quic: address(&format!("127.0.0.1:{}", 7300 + n)),
+            plane: address(&format!("127.0.0.1:{}", 8300 + n)),
+            s3: None,
+            names: Vec::new(),
+            domain: Some("rack".into()),
+            volumes,
+            memory: None,
+            reach: None,
+        };
+        let stated = |at: &str, bytes: u64| (root.path().join(at), VolumeBytes::Stated(bytes));
+        let cell = Cell {
+            founders: vec![
+                founder(0, vec![stated("v0", 256 << 20)]),
+                founder(1, vec![stated("v1a", 256 << 20), stated("v1b", 256 << 20)]),
+            ],
+            max_nodes: Some(5),
+            max_volumes: Some(10),
+            ..Cell::default()
+        };
+        let out = root.path().join("cell");
+        init(&mut Vec::new(), &out, &cell).unwrap();
+        let config = |dir: &Path| std::fs::read_to_string(dir.join("config")).unwrap();
+        let bare = root.path().join("bare");
+        grant(&mut Vec::new(), &bare, &out, &founder(2, Vec::new())).unwrap();
+        assert!(
+            config(&bare)
+                .lines()
+                .any(|l| l == format!("cell.volume = {}", 512u64 << 20))
+        );
+        let with = root.path().join("with");
+        grant(
+            &mut Vec::new(),
+            &with,
+            &out,
+            &founder(3, vec![stated("v3", 1 << 30)]),
+        )
+        .unwrap();
+        assert!(!config(&with).contains("cell.volume"));
+        let spared = Cell {
+            founders: vec![founder(
+                4,
+                vec![(root.path().join("v4"), VolumeBytes::Spare { keep: 0 })],
+            )],
+            max_nodes: Some(5),
+            max_volumes: Some(10),
+            ..Cell::default()
+        };
+        let other = root.path().join("other");
+        init(&mut Vec::new(), &other, &spared).unwrap();
+        let none = root.path().join("none");
+        grant(&mut Vec::new(), &none, &other, &founder(5, Vec::new())).unwrap();
+        assert!(!config(&none).contains("cell.volume"));
     }
 
     /// A granted node keeps the cell's issuer as a founder does, its certificate and its key

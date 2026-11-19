@@ -269,10 +269,11 @@ measures the second, and derives the rest by these rules:
   volume's index a fragment at each of its blocks (`derive::index_wants`), and an engine the
   extents its rows take for the cell's blocks when each node's volumes hold what this node's do, an
   object a block, each block's chunks on as many nodes as the scheme chosen at the cell's domains
-  (`derive::cell_blocks`), and at least the extents it opens with (`derive::engine_least`: a node
-  with no volume of its own counts no fragment, yet its ranges hold the cell's rows; wanting
-  nothing, its engines took what the operations left, which on CI's 7 GiB macOS runner was
-  nothing, and it refused to start, 2026-11-19), at the most store a range's engine took an object
+  (`derive::cell_blocks`); a node with no volume of its own counts the fragments of a volume of the
+  bytes its cell's founders state theirs at (`cell.volume`, which `mantle init grant` writes from
+  the cell file's `volume_bytes`, the most any founder's volumes state), at its own device's block:
+  counting none, its engines wanted nothing, took what the operations left, nothing on CI's 7 GiB
+  macOS runner, and it refused to start (2026-11-19); at the most store a range's engine took an object
   (`derive::STORE_BYTES_AN_OBJECT`, measured), each extent at the metadata measured at the densest
   rows, 89,208 millionths of an extent's bytes, and its allocator's own (`derive::engine_wants_for`,
   `shard_db::MEASURED_METADATA_PPM`, the owner's choice of 2026-10-23 over its statement for any

@@ -1212,12 +1212,12 @@ impl Authority {
     /// opens, no file written.
     pub(crate) fn issue_client(&self) -> Result<(u64, Vec<u8>, KeyPair), Error> {
         let cert = |e: mantle_cert::CertError| Error::Cert(format!("{e:?}"));
-        let id = loop {
-            let id = u64::from_le_bytes(random::<8>()?);
-            if id != 0 && !self.nodes.iter().any(|(node, _)| *node == id) {
-                break id;
-            }
-        };
+        // One draw from the OS: zero, which names no member, or a node's id is refused rather than
+        // drawn again, as `distinct` refuses one, so the draw ends.
+        let id = u64::from_le_bytes(random::<8>()?);
+        if id == 0 || self.nodes.iter().any(|(node, _)| *node == id) {
+            return Err(Error::Random("a client id drawn zero, or a node's".into()));
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| Error::Cert(e.to_string()))?

@@ -13,8 +13,9 @@
 //! A get's client waits while its window is read: a block's row and chunks are read and its
 //! segments opened before its bytes go. Its time is how long each block took from its row asked to
 //! its plaintext opened (`Get::take_read`), and its client's pace how fast the client took a block
-//! the node held whole once the client's room for it was full, which no window holds back
-//! (`host::Drain`).
+//! the node held whole once the client's room for it was full, which no window holds back: a
+//! native stream's flow-control window (`host::Drain`), or an S3 connection's socket
+//! (`listener::io::Drained`).
 //!
 //! Each is smoothed as RFC 6298 §2 smooths a round trip, gain 1/8 (`hyper_block::commit::smooth`).
 //! Until both are measured the window is one block, the least that moves.

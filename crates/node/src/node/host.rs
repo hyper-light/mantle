@@ -559,21 +559,19 @@ struct Getting {
     drain: Drain,
 }
 
-/// What a get's client took of a block the host held whole, timed from when the client's room for
-/// it was full, so its client's pace with no window holding it back (`crate::window`): a block its
-/// room took at once says only that the room was there. On a native exchange the room is the
-/// stream's flow-control window, smaller than a block, so each block's writing waits on its
-/// client; on the S3 door it is the reply's channel, which holds whole blocks, so only a block
-/// held behind the one its connection had just begun times that one's writing.
+/// What a native get's client took of a block the host held whole, timed from when the client's
+/// room for it was full, so its client's pace with no window holding it back (`crate::window`): a
+/// block its room took at once says only that the room was there. The room is the stream's
+/// flow-control window, smaller than a block, so each block's writing waits on its client. On the
+/// S3 door the reply's channel holds whole blocks, so the connection times the same of its socket
+/// as it writes each (`listener::io::Drained`), and the node takes it from the door
+/// (`door::Doorway::drained`).
 #[derive(Debug, Clone, Copy, Default)]
 struct Drain {
     /// When, on the shard's clock, the client's room was full; none while it was not.
     held_ns: Option<u64>,
     /// The bytes it took since.
     bytes: u64,
-    /// On the S3 door: the block held as its connection began the one before, so the time until
-    /// the channel takes it is that one's writing.
-    whole: bool,
 }
 
 /// An operation whose bucket's row is read first, for the incarnation, versioning and owner its
@@ -3307,22 +3305,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 }
                 // A piece is taken from the driver only once the last is sent, so the channel holds
-                // what the client has yet to read and the driver the rest of its window.
-                let mut freed = false;
+                // what the client has yet to read and the driver the rest of its window. Its
+                // client's pace is the connection's to time (`Drain`).
                 loop {
                     match local.flush() {
-                        Sent::Taken => {
-                            // A block held behind the one its connection had just begun: the
-                            // time until the channel took it is that one's writing, its client's
-                            // pace (`Drain`).
-                            if let Some(held) = getting.drain.held_ns.take() {
-                                if getting.drain.whole {
-                                    let ns = now.saturating_sub(held);
-                                    self.windows.get.paced(getting.drain.bytes, ns);
-                                }
-                                freed = true;
-                            }
-                        }
+                        Sent::Taken => {}
                         Sent::Held => return Ok(false),
                         Sent::Gone => return Ok(true),
                     }
@@ -3332,16 +3319,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     let took = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                     getting.written = getting.written.saturating_add(took);
                     self.moved = self.moved.saturating_add(took);
-                    match local.offer(door::Answer::Bytes(bytes, turn)) {
-                        Sent::Gone => return Ok(true),
-                        Sent::Held => {
-                            getting.drain = Drain {
-                                held_ns: Some(now),
-                                bytes: took,
-                                whole: freed,
-                            };
-                        }
-                        Sent::Taken => {}
+                    if local.offer(door::Answer::Bytes(bytes, turn)) == Sent::Gone {
+                        return Ok(true);
                     }
                 }
                 let last = match get.outcome() {

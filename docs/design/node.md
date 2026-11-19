@@ -1477,10 +1477,15 @@ becomes:
   rate the client takes the body, over a block's bytes. The node measures both from its own gets:
   each block's time to read, in the host's time (`Get::tick`, `Get::take_read`), and how fast the
   client took a block the host held whole once the client's room for it was full, which no window
-  holds back (`host::Drain`): on a native exchange the stream's flow-control window, smaller than a
-  block, so every block's writing waits on its client; on the S3 door the reply's channel, which
-  holds whole blocks, so only a block held behind the one its connection had just begun times that
-  one's writing. Each is smoothed with the same gain. A get's object's size is known only once its
+  holds back: on a native exchange the stream's flow-control window, smaller than a block, so
+  every block's writing waits on its client (`host::Drain`); on the S3 door, whose reply's channel
+  holds whole blocks, the connection's socket, which the connection times as it writes each piece,
+  from when the socket first took less than it was offered to the piece's last octet written, and
+  tells the node through the door (`listener::io::Drained`, `door::Doorway::drained`), so a client
+  that drains faster than the reads is paced as one slower is. Timed from the reply's channel
+  instead, a block held behind the one its connection had just begun, a client faster than the
+  reads never filled the channel and its gets kept the window they were admitted with. Each is
+  smoothed with the same gain. A get's object's size is known only once its
   row is read, so it is admitted at the floor's one block and charged for it, its window of blocks
   at the largest block and the block taken to be written out (`derive::Charges::read`). Once its
   version is read it widens to the window learned, no more than the blocks its range is cut into

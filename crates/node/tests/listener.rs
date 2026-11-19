@@ -494,3 +494,120 @@ fn ask(
         body: String::from_utf8_lossy(&read[end..end + length]).into_owned(),
     }
 }
+
+/// A get's blocks as the test's host gives them: larger than a loopback socket's buffers on both
+/// sides together (4 MiB each by default on Linux and macOS), so each fills its socket however fast
+/// its client reads.
+const BLOCK: usize = 32 << 20;
+
+/// What a get's connection told the node its client's pace was (`door::Doorway::drained`): the
+/// octets its client took once the socket was full and the time they took, summed over the
+/// pieces, from a get of `blocks` blocks that the test's host gives as a node's driver gives a
+/// block it read, each `read` after the last, and that its client reads `throttle`'s octets at a
+/// time, waiting its time after each; none where no piece filled its socket.
+fn paced(blocks: usize, read: Duration, throttle: Option<(usize, Duration)>) -> Option<(u64, u64)> {
+    use mantle_protocol::object::{Reply, Status};
+    let access = access();
+    let key = s3::Key {
+        id: access.id.clone(),
+        secret: access.secret.clone(),
+    };
+    let size = blocks * BLOCK;
+    let (paced, client) = runtime()
+        .block_on(async move {
+            let (mut doorway, submitter) = door::doorway(1, Waker::noop().clone()).unwrap();
+            let listener = Listener::bind(plain(access), submitter).unwrap();
+            let at = listener.local_addr().unwrap();
+            let (told, mut heard) = hyper_rt::sync::channel::<()>(1).unwrap();
+            let client = std::thread::spawn(move || {
+                let signer = s3::Client::new(at, key, "us-east-1");
+                let payload = mantle_s3::sigv4::hex(&mantle_s3::crypto::sha256(b"").unwrap());
+                let head = signer.head("GET", "/bucket/key", &[], &payload);
+                let mut tcp = TcpStream::connect(at).unwrap();
+                tcp.write_all(head.as_bytes()).unwrap();
+                let mut said = Vec::new();
+                let mut byte = [0u8; 1];
+                while !said.ends_with(b"\r\n\r\n") {
+                    assert_eq!(tcp.read(&mut byte).unwrap(), 1, "closed before its head");
+                    said.push(byte[0]);
+                }
+                assert!(said.starts_with(b"HTTP/1.1 200"), "{said:?}");
+                let (piece, wait) = throttle.unwrap_or((BLOCK, Duration::ZERO));
+                let mut buf = vec![0u8; piece];
+                let mut left = size;
+                while left > 0 {
+                    let n = tcp.read(&mut buf[..piece.min(left)]).unwrap();
+                    assert!(n > 0, "closed with {left} octets of its body unread");
+                    left -= n;
+                    // The client's own thread, no runtime's worker: its wait is its pace.
+                    #[allow(clippy::disallowed_methods)]
+                    std::thread::sleep(wait);
+                }
+                if told.blocking_send(()).is_err() {
+                    panic!("the listener's side ended");
+                }
+            });
+            let serve = async {
+                let started = std::time::Instant::now();
+                let request = loop {
+                    match doorway.take() {
+                        Some(door::Asked::Op(request)) => break request,
+                        Some(door::Asked::Key(_)) => panic!("a root key's request asked a key"),
+                        None if started.elapsed() > STOCK_PATIENCE => panic!("no request"),
+                        None => hyper_rt::futures::sleep(1_000_000).await.unwrap(),
+                    }
+                };
+                let reply = Reply {
+                    size: u64::try_from(size).unwrap(),
+                    etag: "0123456789abcdef0123456789abcdef".into(),
+                    ..Reply::status(Status::Done)
+                };
+                let reply = door::Answer::Head(Box::new(reply));
+                request.reply.send(reply).await.unwrap();
+                let block = bytes::Bytes::from(vec![0x5a; BLOCK]);
+                for _ in 0..blocks {
+                    let read = u64::try_from(read.as_nanos()).unwrap();
+                    hyper_rt::futures::sleep(read).await.unwrap();
+                    let bytes = door::Answer::Bytes(block.clone(), std::time::Instant::now());
+                    request.reply.send(bytes).await.unwrap();
+                }
+                request.reply.send(door::Answer::End).await.unwrap();
+                // The client read every octet: the connection told what it took of each piece as
+                // it wrote it, before it took the next.
+                heard.recv().await.ok()?;
+                doorway.drained()
+            };
+            match race2(listener.serve(), serve).await {
+                Either::Second(paced) => (paced, client),
+                Either::First(e) => panic!("the listener ended: {e}"),
+            }
+        })
+        .unwrap();
+    client.join().unwrap();
+    paced
+}
+
+/// The octets a second a pace of `octets` in `ns` is.
+fn rate((octets, ns): (u64, u64)) -> u128 {
+    u128::from(octets) * 1_000_000_000 / u128::from(ns)
+}
+
+/// A get's client is paced by what its connection's socket took once it was full, from then to
+/// each piece's last octet written, as a native get's is by its stream's flow-control window
+/// (`host::Drain`): one that reads slower than the host reads its blocks, the reply's channel
+/// full behind the piece being written, at no more than it reads; and one that reads faster than
+/// the host reads them, the channel never full, at its own pace, past the slow one's. The host
+/// learns the window a get holds being read from it (`crate::window`). Before, the S3 door timed
+/// only a block the reply's channel held behind the one its connection had just begun, so the
+/// fast client was never paced and its gets kept the window they were admitted with.
+#[test]
+fn a_gets_client_is_paced_by_what_its_socket_took_however_fast_it_reads() {
+    // 256 KiB a read, 2 ms after each: at most 128 MiB a second.
+    let throttle = (256 << 10, Duration::from_millis(2));
+    let most = u128::try_from(throttle.0).unwrap() * 1_000_000_000 / throttle.1.as_nanos();
+    let slow = paced(2, Duration::ZERO, Some(throttle)).expect("a slow client paced");
+    assert!(rate(slow) <= most, "{} past {most}", rate(slow));
+    // Blocks read 20 ms apart, the client reading as fast as its socket gives.
+    let fast = paced(2, Duration::from_millis(20), None).expect("a fast client paced");
+    assert!(rate(fast) > most, "{} within {most}", rate(fast));
+}

@@ -486,6 +486,7 @@ impl Connection {
         self.io
             .write_pair(&self.output, &response.document)
             .await
+            .map(drop)
             .map_err(|_| ())
     }
 
@@ -628,7 +629,10 @@ impl Connection {
     /// ends short ends the connection with the response unfinished, so no client takes a short
     /// body for the object's (node.md §4.4). Each turn of the host's that gave pieces, and each
     /// piece's writing, timed from its taking to its last octet written, are the reply depth's
-    /// samples (`door::Replying`), told the node at each turn's first piece and at the end.
+    /// samples (`door::Replying`), told the node at each turn's first piece and at the end. What
+    /// the client took of a piece once the socket was full, from then to its last octet written,
+    /// is its pace (`io::Drained`), told the node as each piece is written (`door::Submitter::
+    /// drained`), however fast the client reads beside the host's reads.
     async fn object(
         &mut self,
         replies: &mut hyper_rt::sync::ChannelReceiver<Answer>,
@@ -665,11 +669,16 @@ impl Connection {
                         .filter(|sent| *sent <= length)
                         .ok_or(())?;
                     let head_bytes: &[u8] = if head { &self.output } else { &[] };
-                    self.io
+                    let drained = self
+                        .io
                         .write_pair(head_bytes, &bytes)
                         .await
                         .map_err(|_| ())?;
                     head = false;
+                    if let Some(full) = drained.full {
+                        let ns = u64::try_from(full.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        self.door.drained(drained.octets, ns);
+                    }
                     let took = u64::try_from(taken.elapsed().as_nanos()).unwrap_or(u64::MAX);
                     pieces = pieces.saturating_add(1);
                     written_ns = written_ns.saturating_add(took.max(1));

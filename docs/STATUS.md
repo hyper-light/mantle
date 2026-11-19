@@ -1401,7 +1401,9 @@ targets. Each item is done when its test passes on every supported target.
    node.md §2.8). *Built (2026-11-18)*: a GET's window learned the same way from the node's own
    gets, a block's time from its row asked to its plaintext opened times the pace its client takes
    a block the node holds whole; a get is admitted at one block and widens to that window once its
-   version is read, as its range's blocks and the operations' bytes hold (node.md §2.8). A replica's chunk put no longer ends at the
+   version is read, as its range's blocks and the operations' bytes hold (node.md §2.8). On the S3
+   door the connection times its client's pace from its socket as it writes each block, so a client
+   that outpaces the reads is paced too (`listener::io::Drained`; node.md §2.8). A replica's chunk put no longer ends at the
    idle timeout (3.07 s) while the peer's
    device makes it durable, a write slower than that once ending the put as stalled (on
    windows-11-arm a volume's first write took up to 8.0 s before calibration saw NTFS's zeros;
@@ -1411,9 +1413,7 @@ targets. Each item is done when its test passes on every supported target.
    gives an object's or a chunk's exchange at least the node's serve period and at most the stock
    patience before it has measured a reply (above). *Open*: the entitled rate `min(body rate,
    principal's fair share)`, which needs item 6; a copy's get's and put's windows, still one block,
-   the floor (`gateway:window` in `scripts/arbitrary-open.txt`); a GET on the S3 door whose
-   client outpaces its reads, which times no drain while its channel never fills; the hedge
-   quantile, with hedging (gateway.md
+   the floor (`gateway:window` in `scripts/arbitrary-open.txt`); the hedge quantile, with hedging (gateway.md
    §3); telling held from moved in a note for an asker with no deadline (research/77); and the done
    test.
 9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,

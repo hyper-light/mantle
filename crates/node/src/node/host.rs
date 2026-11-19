@@ -462,6 +462,11 @@ impl Earliest {
         self.heap.first().map(|(key, _)| *key)
     }
 
+    /// Each key with its slot, in the heap's order: the slots keyed, and only those.
+    fn entries(&self) -> &[(u64, usize)] {
+        &self.heap
+    }
+
     /// A job pushed, holding no key yet.
     fn grow(&mut self) {
         self.place.push(None);
@@ -1474,11 +1479,11 @@ pub(crate) struct Replies {
     drain: Drain,
     /// While the piece its request's body drains through waits for room in the endpoint's budget,
     /// its client's patience (`Opening::bound_ns`) and when, on the shard's clock, its exchange's
-    /// asker was last told its work is held: offered again at each turn, since the budget freeing
-    /// turns no node (`Endpoint::release` retries only the transport's lossless frames), its
-    /// exchange vouched for half a beat apart meanwhile (`vouch_every`), and the node's turn due at
-    /// its next vouch (research/77 D1, D2; `Node::host_due`); past it, its exchange refused
-    /// `Budget`.
+    /// asker was last told its work is held: offered again as the budget gives bytes back, at the
+    /// turn it does (`Writes::room_freed`; `Endpoint::release` retries only the transport's
+    /// lossless frames, and tells its owner nothing), and its exchange vouched for half a beat
+    /// apart meanwhile (`vouch_every`), its node's turn due at its next vouch (research/77 D1, D2;
+    /// `Node::host_due`); past it, its exchange refused `Budget`.
     room: Option<(u64, u64)>,
     /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
     /// of its moved (`driving::Lanes::doors`), told as the node's task takes what the job gave or
@@ -1621,7 +1626,8 @@ impl Replies {
 
     /// When, on the shard's clock, the node's next turn is due for a reply that waits for room in
     /// the endpoint's budget: at its next vouch, half a beat after its last, at most its client's
-    /// patience (`room`). Its room is offered again at every turn, each at most half a beat apart.
+    /// patience (`room`). Its room is offered again then, and as the budget gives bytes back
+    /// (`Writes::wake_rooms`).
     pub(super) fn room_due_ns(&self, beat: u64) -> Option<u64> {
         self.room
             .map(|(bound, vouched)| bound.min(vouched.saturating_add(vouch_every(beat))))
@@ -1789,14 +1795,14 @@ impl Replies {
     }
 
     /// The reply held, the piece its request's body drains through refused for room in the
-    /// endpoint's budget: within its client's patience it waits, offered again at the next turn,
-    /// and its exchange vouched for (`Endpoint::working`) at its first turn waiting and then half
-    /// a beat after its last (`vouch_every`), as a held job's (`Job::vouch`): nothing of it moves
-    /// while it waits, and a vouch at every turn said nothing more. Past it, its exchange is
-    /// refused `Budget`, which needs no room and its asker hears at once, as it hears a request
-    /// whose head the budget refused. A reply never ends with its exchange open and its asker
-    /// waiting on nothing, which its client gave up a period later (`Lost(Stalled)`,
-    /// tests/put_body.rs).
+    /// endpoint's budget: within its client's patience it waits, offered again as the budget gives
+    /// bytes back (`Writes::wake_rooms`), and its exchange vouched for (`Endpoint::working`) at
+    /// its first turn waiting and then half a beat after its last (`vouch_every`), as a held
+    /// job's (`Job::vouch`): nothing of it moves while it waits, and a vouch at every turn said
+    /// nothing more. Past it, its exchange is refused `Budget`, which needs no room and its asker
+    /// hears at once, as it hears a request whose head the budget refused. A reply never ends with
+    /// its exchange open and its asker waiting on nothing, which its client gave up a period later
+    /// (`Lost(Stalled)`, tests/put_body.rs).
     fn wait_for_room(&mut self, to: &mut impl Exchange, now: u64, beat: u64) -> Wrote {
         let bound = self
             .drained
@@ -1834,6 +1840,12 @@ where
 {
     replies: super::keyed::Readied<(K, Replies)>,
     due: Earliest,
+    /// The bytes the endpoint's budget held when a reply's visit last found no room in it for the
+    /// piece its request's body drains through (`Writes::short_of`); none since its waiting
+    /// replies were last marked for room given back. A piece fits again only once the budget
+    /// holds fewer, bytes given back (`Endpoint::release`, an exchange's end): the event a waiting
+    /// reply waits on (`Writes::room_freed`), not each of the node's turns.
+    short: Option<u64>,
 }
 
 impl<K> Default for Writes<K>
@@ -1845,6 +1857,7 @@ where
         Self {
             replies: super::keyed::Readied::default(),
             due: Earliest::default(),
+            short: None,
         }
     }
 }
@@ -1874,6 +1887,47 @@ where
     /// The earliest due of the replies waiting for room, on the shard's clock.
     pub(super) fn first(&self) -> Option<u64> {
         self.due.first()
+    }
+
+    /// A reply's visit found no room in the endpoint's budget, which held `used` bytes.
+    pub(super) fn short_of(&mut self, used: u64) {
+        self.short = Some(used);
+    }
+
+    /// Whether a reply waits for room in the endpoint's budget and the budget, holding `used`
+    /// bytes, gave bytes back since a visit last found it short: the one event that lets a waiting
+    /// reply's piece fit, as one refused at `short` bytes fits only once fewer are held.
+    pub(super) fn room_freed(&self, used: u64) -> bool {
+        self.due.first().is_some() && self.short.is_some_and(|short| used < short)
+    }
+
+    /// Marks to visit the replies waiting for room in the endpoint's budget that move now: every
+    /// one where the budget, holding `used` bytes, gave bytes back since a visit found it short
+    /// (`room_freed`), else each whose due, its next vouch or its client's patience, is `now` or
+    /// past. Each waiting one found in the heap of their dues, never by a walk of every reply, and
+    /// none marked while nothing it waits on changed. How many it marked.
+    pub(super) fn wake_rooms(&mut self, used: u64, now: u64) -> usize {
+        let freed = self.room_freed(used);
+        if !freed && self.due.first().is_none_or(|first| first > now) {
+            return 0;
+        }
+        if freed {
+            self.short = None;
+        }
+        let Self { replies, due, .. } = self;
+        let mut woken = 0usize;
+        for (key, at) in due.entries() {
+            if !freed && *key > now {
+                continue;
+            }
+            if let Some(exchange) = replies.at(*at).map(|(exchange, _)| *exchange) {
+                replies.mark(exchange);
+                woken = woken.saturating_add(1);
+            }
+        }
+        #[cfg(test)]
+        self.audit();
+        woken
     }
 
     /// Holds `reply`, last, keyed by its due. One already held on its exchange, which no caller
@@ -4205,7 +4259,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// bodies' feeding at each turn ([`Replies`]), of the replies marked since the last
     /// ([`Writes`]): each at its push, as its job gives it anything or ends (`Native::mark`), as
     /// its exchange takes more or its request's body arrives (`Node::on_event`), as its feeding
-    /// ends, and at each turn while its rounds ran out or it waits for room. A walk of every reply
+    /// ends, at each turn while its rounds ran out, and, while it waits for room in the endpoint's
+    /// budget, as the budget gives bytes back or its next vouch comes. A walk of every reply
     /// visited thousands that had nothing to write. A get's job gives a piece only once the last
     /// is written whole, so where one is and the exchange takes more, its job gives the next
     /// within the turn: as many of its pieces go in a turn as the exchange takes, as when its job
@@ -4215,11 +4270,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub(super) fn write_replies(&mut self) -> Result<(), NodeError> {
         self.replied = false;
         self.take_marks();
+        let read = self.wake_rooms();
         if self.replies.begin_visits() == 0 {
             return Ok(());
         }
         // The shard's clock, read once for the turn's replies, as the host's step reads it.
-        let now = clock();
+        let now = read.unwrap_or_else(clock);
         let rounds = self
             .gateway
             .as_ref()
@@ -4227,9 +4283,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .saturating_add(2);
         while let Some((exchange, at)) = self.replies.next_visit() {
             let mut left = rounds;
-            // Whether it is visited at the next turn with nothing more said: its rounds ran out,
-            // or it waits for room in the endpoint's budget, whose freeing turns no node, and its
-            // exchange is vouched for at a visit (`Replies::wait_for_room`).
+            // Whether it is visited at the next turn with nothing more said: its rounds ran out.
+            // One waiting for room in the endpoint's budget is visited as the budget gives bytes
+            // back or at its next vouch (`Node::wake_rooms`).
             let mut again = false;
             let over = loop {
                 match self.write_reply(at, now) {
@@ -4252,10 +4308,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 }
             };
-            again |= self
-                .replies
-                .at(at)
-                .is_some_and(|(_, replies)| replies.room.is_some());
             if over {
                 let Some((exchange, mut replies)) = self.replies.take(at) else {
                     continue;
@@ -4269,6 +4321,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         Ok(())
+    }
+
+    /// Marks the replies waiting for room in the endpoint's budget that this turn moves
+    /// (`Writes::wake_rooms`): every one where the budget gave bytes back since a visit last found
+    /// it short, which made this turn due at once (`Node::host_due`), else each whose next vouch
+    /// or client's patience came. The shard's clock read where one waits, for the turn's replies.
+    fn wake_rooms(&mut self) -> Option<u64> {
+        self.replies.first()?;
+        let used = self.driver.endpoint().budget().used();
+        let now = clock();
+        self.replies.wake_rooms(used, now);
+        Some(now)
     }
 
     /// The exchanges the node's marks name since the last turn's, each one's reply and feeding
@@ -4312,8 +4376,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     return Wrote::Still;
                 }
                 match self.drop_body(exchange, admitted) {
-                    Fed::Still => return Wrote::Still,
-                    Fed::Room => room = true,
+                    // It drained what came and waits for the rest of its body, room or none.
+                    Fed::Still => {
+                        self.replies.change_at(at, |replies| replies.room = None);
+                        return Wrote::Still;
+                    }
+                    // Refused at the bytes the budget holds now: it fits only once fewer are.
+                    Fed::Room => {
+                        let used = self.driver.endpoint().budget().used();
+                        self.replies.short_of(used);
+                        room = true;
+                    }
                     // Its asker is gone: nothing to answer.
                     Fed::Moved | Fed::Over if !self.driver.endpoint().body_complete(exchange) => {
                         return Wrote::Over;
@@ -4671,11 +4744,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// 6e): at once where an ask of a job that ended is answered, its outcome to drop, a lookup is
     /// answered, a body was fed at the last turn (its job takes what it was given), or a reply's
     /// exchange took more than its rounds gave (its job gives the next); and a reply that waits for
-    /// the piece its request's body drains through, room in the endpoint's budget, at its next
-    /// vouch, half a beat after its last, whose turn asks the budget for again, since the budget
-    /// freeing turns no node.
-    pub(super) fn host_due(&self) -> Option<u64> {
+    /// the piece its request's body drains through, room in the endpoint's budget: at once where
+    /// the budget gave bytes back since a visit found it short (`Writes::room_freed`), as the
+    /// turn's own work gives them back (a piece read and released, an exchange ended), else at its
+    /// next vouch, half a beat after its last, or its client's patience. The budget is the node's
+    /// task's own: what its turn gives back is read as the turn ends, and what its transport gives
+    /// back between turns, the driver telling no event of it, at the next turn, at the latest that
+    /// next vouch.
+    pub(super) fn host_due(&mut self) -> Option<u64> {
         let shard = hyper_rt::futures::now_ns();
+        // A reply waiting for room whose budget gave bytes back this turn, after its replies were
+        // written: one probe of the budget's count.
+        let used = self.driver.endpoint().budget().used();
+        if self.replies.room_freed(used) {
+            return Some(shard);
+        }
         // A probe of the reads answered for each lookup asked, at most the door's capacity, which
         // the turn's `step_lookups` walks as well.
         let looked_up = self
@@ -9010,19 +9093,20 @@ pub(super) mod tests {
     }
 
     impl Replies {
-        /// Whether, by its own state and its job's alone, its visit would move it now: it waits
-        /// for room, which only a visit asks the budget for; or, waiting for no body, its job said
-        /// its work is held, or, writing nothing, its job gave an answer or ended. What its
-        /// exchange says (`BodyReady`, `Writable`) marks it as it is said (`Node::on_event`).
+        /// Whether, by its own state and its job's alone, its visit would move it now: waiting for
+        /// no body, its job said its work is held, or, writing nothing, its job gave an answer or
+        /// ended. What its exchange says (`BodyReady`, `Writable`) marks it as it is said
+        /// (`Node::on_event`), and one waiting for room in the endpoint's budget is marked as the
+        /// budget gives bytes back or its next vouch comes (`Writes::wake_rooms`): nothing of its
+        /// own moves it.
         pub(super) fn could_move(&self) -> bool {
             let load = |word: &std::sync::atomic::AtomicBool| {
                 word.load(std::sync::atomic::Ordering::Acquire)
             };
             let told = self.handed.told.load(std::sync::atomic::Ordering::Acquire) > 0;
-            self.room.is_some()
-                || (self.drained.is_none()
-                    && (load(&self.handed.held)
-                        || (self.out.is_none() && (told || load(&self.handed.ended)))))
+            self.drained.is_none()
+                && (load(&self.handed.held)
+                    || (self.out.is_none() && (told || load(&self.handed.ended))))
         }
     }
 
@@ -12039,6 +12123,97 @@ pub(super) mod tests {
         // Two a beat each, the first turn's and each half beat's after.
         assert_eq!(told, WAITING * (2 * usize::try_from(BEATS).unwrap() + 1));
         assert_eq!(per_turn[0], WAITING, "each at its first turn waiting");
+    }
+
+    /// A reply waiting for room in the endpoint's budget is offered it again at the turn the budget
+    /// gives bytes back (`Writes::wake_rooms`, `Node::host_due`), and visited at no turn while
+    /// nothing it waits on changed: 64 replies in flight, 16 of them refused a piece at a budget
+    /// holding `SHORT` bytes, each vouched for as it was, then turns a sixteenth of a beat apart.
+    /// Before, each waiting reply was marked again at every turn, and its node's turn was due only
+    /// at its next vouch, half a beat after its last: room given back just after a vouch was
+    /// offered half a beat (512 ms) later.
+    #[test]
+    fn a_reply_waiting_for_room_is_offered_it_as_the_budget_gives_bytes_back() {
+        const IN_FLIGHT: u64 = 64;
+        const WAITING: u64 = 16;
+        const SHORT: u64 = 1 << 20;
+        let beat = room_beat();
+        let every = vouch_every(beat);
+        let mut writes: Writes<u64> = Writes::default();
+        // Each door's job half kept, so no reply's job ends while it is counted.
+        let mut halves = Vec::new();
+        for exchange in 0..IN_FLIGHT {
+            let (native, replies) = native_door().unwrap();
+            assert!(writes.push((exchange, replies)).is_none());
+            halves.push(native);
+        }
+        let visit = |writes: &mut Writes<u64>| {
+            writes.begin_visits();
+            let mut visited = 0u64;
+            while writes.next_visit().is_some() {
+                visited += 1;
+            }
+            visited
+        };
+        assert_eq!(
+            visit(&mut writes),
+            IN_FLIGHT,
+            "each visited as it was pushed"
+        );
+        // Refused at 0, the budget holding `SHORT` bytes: each vouched for then, due half a beat
+        // on.
+        for exchange in 0..WAITING {
+            writes.change(exchange, |replies| replies.room = Some((10 * beat, 0)));
+        }
+        writes.short_of(SHORT);
+        assert_eq!(writes.first(), Some(every));
+        // Turns with the budget as it was, or holding more: none of them visited.
+        let (mut visited, mut turns) = (0, 0);
+        let mut now = 1;
+        while now < every {
+            let used = SHORT + (now % 3) * 4096;
+            assert!(!writes.room_freed(used), "no turn due for room at {now}");
+            assert_eq!(writes.wake_rooms(used, now), 0);
+            visited += visit(&mut writes);
+            turns += 1;
+            now += beat / 16;
+        }
+        assert_eq!(visited, 0, "nothing visited while nothing changed");
+        // Bytes given back at `now`: the node's turn is due at once, and every waiting reply is
+        // offered room at it, where its next vouch was `every`.
+        let freed_at = every / 2 + 1;
+        let used = SHORT - 1;
+        assert!(writes.room_freed(used), "the node turns at once");
+        let before = writes.first().unwrap() - freed_at;
+        assert_eq!(
+            writes.wake_rooms(used, freed_at),
+            usize::try_from(WAITING).unwrap()
+        );
+        assert_eq!(
+            visit(&mut writes),
+            WAITING,
+            "each offered room at that turn"
+        );
+        println!(
+            "{WAITING} of {IN_FLIGHT} replies waiting for room over {turns} turns: 0 visits, {} \
+             before; room given back {before} ns before their next vouch, offered it at once",
+            WAITING * turns
+        );
+        assert!(before >= every / 2 - 1);
+        // Offered once: until a visit finds the budget short again, no wait is cut short, so a
+        // reply whose visit drained what came and now waits for its body turns no node.
+        assert!(!writes.room_freed(0));
+        assert_eq!(writes.wake_rooms(0, freed_at + 1), 0);
+        // Short again at fewer bytes, its next vouch comes: each visited then, by its due.
+        writes.short_of(used);
+        assert!(!writes.room_freed(used));
+        assert_eq!(
+            writes.wake_rooms(used, every),
+            usize::try_from(WAITING).unwrap()
+        );
+        assert_eq!(visit(&mut writes), WAITING);
+        writes.audit();
+        drop(halves);
     }
 
     /// A get's piece its client's room took only in part is timed from then: once written whole,

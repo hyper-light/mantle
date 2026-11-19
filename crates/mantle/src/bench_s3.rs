@@ -52,8 +52,17 @@ const ETAG: &str = "0123456789abcdef0123456789abcdef";
 
 #[derive(Debug)]
 pub enum Error {
+    /// The benchmark's rows could not be written to its output.
     Output(std::io::Error),
     Setup(String),
+    /// A client's connection to the listener could not be opened.
+    Connect(std::io::Error),
+    /// A client's TLS connection could not be made over its socket.
+    Client(String),
+    /// A request could not be written to a client's connection.
+    Send(std::io::Error),
+    /// The listener's response could not be read from a client's connection.
+    Receive(std::io::Error),
     Exchange(String),
 }
 
@@ -62,14 +71,12 @@ impl std::fmt::Display for Error {
         match self {
             Self::Output(e) => write!(f, "writing output: {e}"),
             Self::Setup(e) => write!(f, "starting the listener: {e}"),
+            Self::Connect(e) => write!(f, "opening a client's connection to the listener: {e}"),
+            Self::Client(e) => write!(f, "making a client's TLS connection: {e}"),
+            Self::Send(e) => write!(f, "sending a request to the listener: {e}"),
+            Self::Receive(e) => write!(f, "reading the listener's response: {e}"),
             Self::Exchange(e) => write!(f, "an exchange: {e}"),
         }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
     }
 }
 
@@ -79,6 +86,10 @@ fn setup(e: impl std::fmt::Debug) -> Error {
 
 fn exchange(e: impl std::fmt::Debug) -> Error {
     Error::Exchange(format!("{e:?}"))
+}
+
+fn client(e: impl std::fmt::Debug) -> Error {
+    Error::Client(format!("{e:?}"))
 }
 
 /// A request of the stub host's: its answers still to send, in order, and whether its body is
@@ -310,22 +321,22 @@ impl Write for Connection {
 
 /// A connection to the listener at `at`, under TLS 1.3 verified by `authority` where given.
 fn connect(at: SocketAddr, authority: Option<&[u8]>) -> Result<Connection, Error> {
-    let stream = TcpStream::connect(at).map_err(exchange)?;
+    let stream = TcpStream::connect(at).map_err(Error::Connect)?;
     let Some(authority) = authority else {
         return Ok(Connection::Plain(stream));
     };
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(authority.to_vec()))
-        .map_err(setup)?;
+        .map_err(client)?;
     let mut config =
         ClientConfig::builder_with_provider(&hyper_tls::crypto::aws_lc_rs::DEFAULT_PROVIDER)
             .with_protocol_versions(&[&version::TLS13])
-            .map_err(setup)?
+            .map_err(client)?
             .with_root_certificates(roots)
             .with_no_client_auth();
-    let name = ServerName::try_from("localhost").map_err(setup)?;
-    let connection = ClientConnection::new(&mut config, name).map_err(setup)?;
+    let name = ServerName::try_from("localhost").map_err(client)?;
+    let connection = ClientConnection::new(&mut config, name).map_err(client)?;
     Ok(Connection::Tls(Box::new(StreamOwned::new(
         connection, config, stream,
     ))))
@@ -411,13 +422,13 @@ fn exchange_once(
     read: &mut Vec<u8>,
     buf: &mut [u8],
 ) -> Result<(u16, u64), Error> {
-    connection.write_all(head).map_err(exchange)?;
-    connection.write_all(body).map_err(exchange)?;
+    connection.write_all(head).map_err(Error::Send)?;
+    connection.write_all(body).map_err(Error::Send)?;
     let end = loop {
         if let Some(end) = read.windows(4).position(|w| w == b"\r\n\r\n") {
             break end.saturating_add(4);
         }
-        let n = connection.read(buf).map_err(exchange)?;
+        let n = connection.read(buf).map_err(Error::Receive)?;
         if n == 0 {
             return Err(exchange("the listener closed the connection"));
         }
@@ -446,7 +457,7 @@ fn exchange_once(
     read.drain(..usize::try_from(buffered).unwrap_or(usize::MAX));
     left = left.saturating_sub(buffered);
     while left > 0 {
-        let n = connection.read(buf).map_err(exchange)?;
+        let n = connection.read(buf).map_err(Error::Receive)?;
         if n == 0 {
             return Err(exchange("the listener ended a body short"));
         }
@@ -562,7 +573,8 @@ pub fn s3(out: &mut impl Write, step: Duration) -> Result<(), Error> {
         out,
         "  {:<6} {:<30} {:>8} {:>10} {:>10} {:>12}",
         "", "request", "n", "median", "p99", "rate"
-    )?;
+    )
+    .map_err(Error::Output)?;
     // The endpoint's chain as `mantle init` makes it, for the TLS rows.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -626,8 +638,9 @@ pub fn s3(out: &mut impl Write, step: Duration) -> Result<(), Error> {
                 display::quantile(nearest(&took, 50)),
                 display::quantile(nearest(&took, 99)),
                 rate,
-            )?;
-            out.flush()?;
+            )
+            .map_err(Error::Output)?;
+            out.flush().map_err(Error::Output)?;
         }
         drop(connection);
         drop(stop);

@@ -73,10 +73,10 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
     } else {
         options.replicas.clone()
     };
-    writeln!(out, "{}", path.display())?;
+    writeln!(out, "{}", path.display()).map_err(Error::Output)?;
     if !options.skip_device {
-        writeln!(out, "measuring the device (about 30 s)")?;
-        out.flush()?;
+        writeln!(out, "measuring the device (about 30 s)").map_err(Error::Output)?;
+        out.flush().map_err(Error::Output)?;
         let device = calibrate::calibrate(
             path,
             align,
@@ -84,13 +84,14 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
             &calibrate::Plan::standard(align, id.queue_depth),
         )
         .map_err(Error::Disk)?;
-        report_device(out, &device, &id.file_system.kind)?;
+        report_device(out, &device, &id.file_system.kind).map_err(Error::Output)?;
     }
     let most = replicas.iter().copied().max().unwrap_or(1).max(1);
     writeln!(
         out,
         "raft log in a scratch file (removed afterwards), one entry an append"
-    )?;
+    )
+    .map_err(Error::Output)?;
     writeln!(
         out,
         "  {:<12} {:>9} {:>8} {:>5} {:>8} {:>11} {:>12} {:>10} {:>10} {:>10} {:>11} {:>10} {:>20}",
@@ -107,7 +108,8 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
         "per flush",
         "reopen",
         "read back"
-    )?;
+    )
+    .map_err(Error::Output)?;
     let mut point = 0u64;
     // The threads the process ran idle before the last point: none before the first.
     let mut was_idle: Option<usize> = None;
@@ -154,8 +156,8 @@ pub fn log(out: &mut impl Write, path: &Path, options: &Options) -> Result<(), E
                 per_flush,
                 display::nanos(nanos(reopen)),
                 format!("{} in {}", read, display::nanos(nanos(read_back)))
-            )?;
-            out.flush()?;
+            ).map_err(Error::Output)?;
+            out.flush().map_err(Error::Output)?;
             drop(log);
         }
     }

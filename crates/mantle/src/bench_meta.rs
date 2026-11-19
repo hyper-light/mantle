@@ -41,6 +41,7 @@ use crate::display;
 
 #[derive(Debug)]
 pub enum Error {
+    /// The benchmark's rows could not be written to its output.
     Output(std::io::Error),
     Meta(MetaError),
     Coordinator(CoordinatorError),
@@ -56,12 +57,6 @@ impl std::fmt::Display for Error {
             Self::Coordinator(e) => write!(f, "coordinating: {e}"),
             Self::Unexpected(what) => write!(f, "unexpected answer: {what}"),
         }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
     }
 }
 
@@ -107,7 +102,8 @@ fn row(out: &mut impl Write, label: String, times: &Histogram) -> Result<(), Err
         display::nanos(times.p50()),
         display::nanos(times.max()),
         times.count()
-    )?;
+    )
+    .map_err(Error::Output)?;
     Ok(())
 }
 
@@ -115,12 +111,14 @@ pub fn meta(out: &mut impl Write, step: Duration) -> Result<(), Error> {
     writeln!(
         out,
         "metadata commands applied over the model engine, one core; the median and slowest run"
-    )?;
+    )
+    .map_err(Error::Output)?;
     writeln!(
         out,
         "  {:<34} {:>10} {:>10} {:>7}",
         "", "p50", "max", "runs"
-    )?;
+    )
+    .map_err(Error::Output)?;
     for parts in [1u16, 100, 1_000, 10_000] {
         let times = timed(step, || completion(parts))?;
         row(out, format!("complete an upload of {parts} parts"), &times)?;

@@ -25,6 +25,7 @@ use crate::display;
 
 #[derive(Debug)]
 pub enum Error {
+    /// The benchmark's rows could not be written to its output.
     Output(std::io::Error),
     Auth(AuthError),
     Chunk(ChunkError),
@@ -45,12 +46,6 @@ impl std::fmt::Display for Error {
             Self::Post(e) => write!(f, "checking a form's policy: {e}"),
             Self::Seal(e) => write!(f, "sealing: {e}"),
         }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Output(e)
     }
 }
 
@@ -112,26 +107,26 @@ const POST_POLICY: &str = "eyAiZXhwaXJhdGlvbiI6ICIyMDE1LTEyLTMwVDEyOjAwOjAwLjAwM
 const POST_SIGNATURE: &str = "8afdbf4008c03f22c2cd3cdb72e4afbb1f6a588f3255ac628749a66d7f09699e";
 
 pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(), Error> {
-    write!(out, "  {:<10}", "algorithm")?;
+    write!(out, "  {:<10}", "algorithm").map_err(Error::Output)?;
     for &size in sizes {
-        write!(out, " {:>12}", display::size(size))?;
+        write!(out, " {:>12}", display::size(size)).map_err(Error::Output)?;
     }
-    writeln!(out)?;
+    writeln!(out).map_err(Error::Output)?;
     let largest = sizes.iter().copied().max().unwrap_or(0);
     let mut data = vec![0u8; largest];
     SplitMix64::new(u64::try_from(largest).unwrap_or(0)).fill(&mut data);
     for algorithm in Algorithm::ALL {
-        write!(out, "  {:<10}", algorithm.name())?;
+        write!(out, "  {:<10}", algorithm.name()).map_err(Error::Output)?;
         for &size in sizes {
             let buf = data.get(..size).unwrap_or(&data);
             let run = repeat(step, || {
                 std::hint::black_box(checksum::checksum(algorithm, std::hint::black_box(buf))?);
                 Ok(())
             })?;
-            write!(out, " {:>12}", display::rate(run.per_second(size)))?;
+            write!(out, " {:>12}", display::rate(run.per_second(size))).map_err(Error::Output)?;
         }
-        writeln!(out)?;
-        out.flush()?;
+        writeln!(out).map_err(Error::Output)?;
+        out.flush().map_err(Error::Output)?;
     }
 
     let when = mantle_s3::time::parse_amz_date(WHEN).unwrap_or(0);
@@ -162,7 +157,8 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
         "  a request's signature: {} verified/s, {} each",
         display::count(run.per_second(1)),
         display::nanos(run.nanos_each()),
-    )?;
+    )
+    .map_err(Error::Output)?;
 
     let min = usize::try_from(chunked::MIN_CHUNK).unwrap_or(usize::MAX);
     for &size in sizes.iter().filter(|&&size| size >= min) {
@@ -186,8 +182,9 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
             "  signed chunks of {}: {}",
             display::size(size),
             display::rate(run.per_second(len))
-        )?;
-        out.flush()?;
+        )
+        .map_err(Error::Output)?;
+        out.flush().map_err(Error::Output)?;
     }
 
     // Random bytes hold a CR every 256 on average, each a place the delimiter could begin.
@@ -211,8 +208,9 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
             "  a form's file in pieces of {}: {}",
             display::size(size),
             display::rate(run.per_second(FORM_FILE))
-        )?;
-        out.flush()?;
+        )
+        .map_err(Error::Output)?;
+        out.flush().map_err(Error::Output)?;
     }
 
     let mut decoder = form::Decoder::new(Some(&content_type))?;
@@ -235,7 +233,8 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
         "  a form's policy: {} verified/s, {} each",
         display::count(run.per_second(1)),
         display::nanos(run.nanos_each()),
-    )?;
+    )
+    .map_err(Error::Output)?;
 
     // Every stored byte is sealed on its way in and opened on its way out
     // (docs/design/encryption.md §3), a 64 KiB segment at a time.
@@ -257,7 +256,8 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
         out,
         "  sealing 64 KiB segments: {}",
         display::rate(run.per_second(FORM_FILE))
-    )?;
+    )
+    .map_err(Error::Output)?;
     let mut opened = Vec::with_capacity(seal::SEGMENT + seal::TAG);
     let run = repeat(step, || {
         for (index, segment) in (0..count).zip(&sealed) {
@@ -271,7 +271,8 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
         out,
         "  opening 64 KiB segments: {}",
         display::rate(run.per_second(FORM_FILE))
-    )?;
+    )
+    .map_err(Error::Output)?;
     let root = WrappingKey::generate()?;
     let run = repeat(step, || {
         let wrapped = DataKey::generate()?.wrap(&root)?;
@@ -283,7 +284,8 @@ pub fn hash(out: &mut impl Write, sizes: &[usize], step: Duration) -> Result<(),
         "  a file's data key: {} made, wrapped and unwrapped/s, {} each",
         display::count(run.per_second(1)),
         display::nanos(run.nanos_each()),
-    )?;
+    )
+    .map_err(Error::Output)?;
     Ok(())
 }
 

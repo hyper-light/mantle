@@ -5090,7 +5090,8 @@ impl Host {
             // and their bytes are counted in its door. Its fields are read before its put is made,
             // which takes its body.
             // A piece taken frees the storage the node's task reads the next into, so a job on a
-            // driving shard turns it.
+            // driving shard turns it: once `take_body` returns, every piece it took let go, as the
+            // node's task reads the next only into storage no piece holds (`Feeding::free`).
             Door::Native(_, native) => {
                 let Native {
                     body,
@@ -5099,11 +5100,12 @@ impl Host {
                     node,
                     ..
                 } = &mut **native;
-                take_body(body, Some(&handed.cut), putting, moved, |_| {
-                    if let Some(node) = node {
-                        node.wake_by_ref();
-                    }
-                })
+                let mut took = false;
+                let fed = take_body(body, Some(&handed.cut), putting, moved, |_| took = true);
+                if took && let Some(node) = node {
+                    node.wake_by_ref();
+                }
+                fed
             }
         };
         match fed {
@@ -8833,6 +8835,65 @@ pub(super) mod tests {
             pieces.pieces.try_recv(),
             Ok(Some(Piece::End(Some(_))))
         ));
+    }
+
+    /// The node's task's waker as a put's job on a driving shard holds it, the job's feeding with
+    /// it: at each wake, whether the feeding may read the next piece then (`Feeding::free`).
+    struct Freeing {
+        feeding: std::sync::Mutex<Feeding>,
+        free: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl std::task::Wake for Freeing {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            let free = self.feeding.lock().unwrap().free();
+            self.free.lock().unwrap().push(free);
+        }
+    }
+
+    /// A put's job on a driving shard wakes the node's task for a piece of its body it took only
+    /// once it let go of it (node.md §2.9 step 6f): the node's task reads the next into the
+    /// piece's storage, once no piece holds it (`Feeding::free`), so a wake while the job held it
+    /// would turn the node's task to find nothing to read, its next piece waiting on another word.
+    #[test]
+    fn a_driving_shards_put_wakes_the_node_once_it_let_go_of_a_piece() {
+        let (object, _) = native_body(2 * piece_len());
+        let putting = native_put(object.len() as u64);
+        let (length, trailing) = (putting.length, putting.trailing);
+        let (mut job, mut replies) = handed_job(Work::Put(putting), 0, 0);
+        let Door::Native(_, native) = &mut job.door else {
+            panic!("a native door");
+        };
+        let handed = std::sync::Arc::clone(&native.handed);
+        let feeding = feed(
+            (length, trailing),
+            replies.body.take().unwrap(),
+            handed,
+            None,
+        );
+        let freeing = std::sync::Arc::new(Freeing {
+            feeding: std::sync::Mutex::new(feeding),
+            free: std::sync::Mutex::new(Vec::new()),
+        });
+        native.node = Some(std::task::Waker::from(std::sync::Arc::clone(&freeing)));
+        let mut moved = 0;
+        assert_eq!(
+            freeing
+                .feeding
+                .lock()
+                .unwrap()
+                .give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        host.jobs.push(job);
+        host.step(&mut Stub::chunks()).unwrap();
+        let free = freeing.free.lock().unwrap();
+        assert_eq!(free.first(), Some(&true), "woken while it held the piece");
     }
 
     /// A native put's stream that stops or is reset ends its job as it did when the job read the

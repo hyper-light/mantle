@@ -3036,8 +3036,9 @@ impl<'o> Bench<'o> {
                     let number = self.opened.first().copied().unwrap_or(0);
                     let dir = self.options.dir.join("clients").join(number.to_string());
                     let settings = harness(|| {
-                        crate::init::client(&mut Vec::new(), &dir, self.cell()?.out())
-                            .map_err(failed)?;
+                        crate::init::client(&mut Vec::new(), &dir, self.cell()?.out()).map_err(
+                            |e| failed(format!("making a native client's identity: {e}")),
+                        )?;
                         self.settings(&dir, at)
                     })?;
                     Opening::Native(settings)

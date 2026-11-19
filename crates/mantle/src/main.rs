@@ -777,7 +777,8 @@ fn stated_cell(
 ) -> Result<init::Cell, init::Error> {
     let mut cell = match file {
         Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(init::Error::Output)?;
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| init::Error::Io("reading the machines file", e))?;
             init::parse_file(path, &text)?
         }
         None => init::Cell::default(),

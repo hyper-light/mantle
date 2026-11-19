@@ -136,16 +136,15 @@ fn a_puts_body_is_read_while_other_traffic_holds_the_transports_whole_budget() {
     net.nodes[1].release(held.unwrap());
 }
 
-/// Node 1 puts a small body to node 2, which reads it whole and then answers it while other
-/// traffic holds node 2's whole budget for three of node 1's periods: the reply's head, which the
-/// endpoint takes from that budget, is refused for room, as a finished job's was on CI's Linux
-/// runners. Offered through `reply_head` at each of node 2's turns, the reply waits for room, its
-/// exchange vouched for as the host vouches for a job whose reply waits (`bound_jobs`), and goes
-/// once the budget frees: node 1 has its reply and never gives the put up. Ended at the refusal,
-/// as `drain_job` ended it, the job left its exchange open with nothing more to come, and node 1
-/// gave the put up `Stalled` a period later.
+/// Node 1 puts a small body to node 2, which reads it whole and then answers it once other traffic
+/// holds every byte of node 2's budget: the reply's head fills the room node 2's endpoint took with
+/// the request's head (hyper-transport's `Core::admit_prefix`), so it goes at its first offer and
+/// node 1 has its reply. Taken from the budget as the reply was given, the head was refused for
+/// room, as a finished job's was on CI's Linux runners, and a job ended at that refusal, as
+/// `drain_job` ended it, left its exchange open with nothing more to come: node 1 gave the put up
+/// `Stalled` a period later.
 #[test]
-fn a_reply_whose_head_the_budget_refuses_waits_for_room_and_is_answered() {
+fn a_reply_given_while_other_traffic_holds_the_whole_budget_goes_at_once() {
     let least = bounds::least_transport(&stated(0)).unwrap();
     classes::state_bounds(stated(least).messages).unwrap();
     let mut net = Net::new(
@@ -180,12 +179,11 @@ fn a_reply_whose_head_the_budget_refuses_waits_for_room_and_is_answered() {
         .unwrap();
     let began = net.now;
     let mut written = 0;
-    let (mut taken, mut held, mut waited) = (None, None, None);
+    let (mut taken, mut held, mut offered) = (None, None, None);
     let (mut piece, mut read) = (Vec::new(), 0);
-    let (mut replied, mut refused, mut over, mut waits) = (false, None, false, 0);
-    // Bounded by the clock: the budget is held three periods, and a put given up is given up
-    // within two periods of its last progress.
-    while net.now.duration_since(began) < period * 8 {
+    let (mut replied, mut refused) = (false, None);
+    // Bounded by the clock: a put given up is given up within two periods of its last progress.
+    while net.now.duration_since(began) < period * 4 {
         for event in net.events[0].drain(..) {
             match event {
                 Event::Reply { exchange, .. } if exchange == put => replied = true,
@@ -211,7 +209,7 @@ fn a_reply_whose_head_the_budget_refuses_waits_for_room_and_is_answered() {
             net.tick();
             continue;
         };
-        // Node 2's turn: the body read whole into a piece of its own, then the reply offered.
+        // Node 2's turn: the body read whole into a piece of its own, then the reply offered once.
         while !net.nodes[1].body_complete(exchange) {
             match mantle_node::node::read_piece(&mut net.nodes[1], exchange, &mut piece) {
                 Ok(0) => break,
@@ -222,42 +220,36 @@ fn a_reply_whose_head_the_budget_refuses_waits_for_room_and_is_answered() {
                 Err(refusal) => panic!("node 2's read of the put refused {refusal:?}"),
             }
         }
-        if !net.nodes[1].body_complete(exchange) || over {
-            net.tick();
-            continue;
-        }
-        let since = *waited.get_or_insert(net.now);
-        if held.is_none() && net.now.duration_since(since) < period * 3 {
+        if net.nodes[1].body_complete(exchange) && offered.is_none() {
             let free = least - net.nodes[1].budget().used();
             held = Some(net.nodes[1].reserve(Class::Transfer, free).unwrap());
-        }
-        if net.now.duration_since(since) >= period * 3
-            && let Some(held) = held.take()
-        {
-            net.nodes[1].release(held);
-        }
-        match mantle_node::node::reply_head(&mut net.nodes[1], exchange, &[1, 2, 3], None) {
-            Replied::Sent => {
+            assert_eq!(
+                net.nodes[1].reserve(Class::Transfer, 1).err(),
+                Some(hyper_transport::Refusal::Budget),
+                "node 2's budget is full"
+            );
+            let reply =
+                mantle_node::node::reply_head(&mut net.nodes[1], exchange, &[1, 2, 3], None);
+            if reply == Replied::Sent {
                 net.nodes[1].end(exchange);
-                over = true;
             }
-            Replied::WaitsForRoom => {
-                waits += 1;
-                net.nodes[1].working(exchange);
-            }
-            Replied::Ended => over = true,
+            offered = Some(reply);
         }
         net.pump();
         net.tick();
     }
     assert_eq!(read, body.len(), "node 2 read the put's body whole");
     assert_eq!(
+        offered,
+        Some(Replied::Sent),
+        "node 2's reply went at its offer"
+    );
+    assert_eq!(
         refused,
         None,
-        "node 1 gave its put up {:?} after asking it, node 2's reply refused for room {waits} times",
+        "node 1 gave its put up {:?} after asking it",
         net.now.duration_since(began)
     );
     assert!(replied, "node 1 had no reply");
-    assert!(waits > 0, "node 2's reply was never refused for room");
-    assert!(held.is_none(), "the budget was let go");
+    net.nodes[1].release(held.unwrap());
 }

@@ -2177,14 +2177,21 @@ ubuntu-24.04 runners, 2026-11-18). The budget's sizing now
 holds the ring's most, `(batch − 1) × 64 KiB` on Linux and none elsewhere, beside the messages,
 so the floor counts it.
 
-A reply's head the budget refuses waits for room (`node::reply_head`, 2026-11-18): the endpoint
-takes a reply's head from the budget, and a finished job whose head it refused had ended there,
-its exchange left open with nothing more to come, so its client gave it up a period later
-(`Lost(Stalled)`, `tests/put_body.rs`). The job is held instead, as one whose ask is out is:
-vouched for and offered its head again at each beat within its client's patience, the piece a
-refusal's body drains through waiting so too, and past that patience its exchange is refused
-`Budget`, which needs no room and its asker hears at once (`host`'s `wait_to_reply`, research/77
-D1, D2). A job never ends with its exchange open.
+A reply is never refused for room (2026-11-18). The endpoint took a reply's prefix and head from
+the budget as the reply was given (hyper-transport's `Core::message`), and a finished job whose
+head it refused `Budget` had ended there, its exchange left open with nothing more to come, so its
+client gave it up a period later (`Lost(Stalled)`, `tests/put_body.rs`); so did the node's other
+replies, which dropped such a refusal (`node::exchange_ended`). A peer's exchange now takes the
+room its reply's prefix and head take at their longest, `frame_grant(max_head)`, with its request's
+head, both or neither, a request the budget cannot fund refused `Budget` as it arrives, which its
+asker hears at once; the reply fills that room, and the exchange's end gives it back however it
+ends (hyper-transport's `Core::admit_prefix`, `Core::reply`, vendor/UPSTREAM.md). The messages'
+bytes already count every exchange's head both ways (`bounds::messages`), so the room needs no
+memory past what the sizing states. What still waits for room is the piece a refusal's body
+drains through before its reply, the endpoint's one piece for its owner's reads: the job is held as
+one whose ask is out is, vouched for and asking again at each beat within its client's patience,
+and past that patience its exchange is refused `Budget`, which needs no room and its asker hears
+at once (`host`'s `wait_to_reply`, research/77 D1, D2). A job never ends with its exchange open.
 
 Bulk work is lowest, but it has a floor. A cell must rebuild its largest failure domain within
 the time its durability target allows, so repair needs at least `D/T` of bandwidth for lost

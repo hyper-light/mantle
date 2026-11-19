@@ -150,13 +150,18 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// cell at rest's count): the clients' run asks 420 liveness writes where it asked 481, ends
 /// 1.0 ms later on the virtual clock (862.4 ms against 861.4 ms), and counts 438 allocations
 /// fewer, 2,050 reallocations and 15,797,631 bytes. On Linux 33,544, this Mac's and the 51 its
-/// sockets' batched headers add, derived and not yet counted there.
+/// sockets' batched headers add, derived and not yet counted there. 33,494 since a peer's exchange
+/// takes its reply's room with its request's head (hyper-transport's `Core::admit_prefix`, a local
+/// change): the room is reserved at the longest head's frame, 82 bytes, as the request's head
+/// arrives, where the reply's was reserved at its own head's length as it was given, and the
+/// budget's spare buffers go round in another order: one allocation and 322 bytes more,
+/// reallocations 2,050 both. On Linux 33,545, derived as before and not yet counted there.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        33_544
+        33_545
     } else {
-        33_493
+        33_494
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

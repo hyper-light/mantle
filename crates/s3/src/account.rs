@@ -73,10 +73,12 @@ pub fn valid_key_id(id: &str) -> bool {
 pub fn draw_id() -> Result<String, RandomError> {
     let mut drawn = [0u8; KEY_ID_CHARS];
     getrandom::fill(&mut drawn).map_err(|_| RandomError)?;
-    Ok(drawn
-        .iter()
-        .filter_map(|b| BASE32.get(usize::from(b & 0x1f)).map(|c| char::from(*c)))
-        .collect())
+    // Each byte drawn becomes its character in place: the id is written on the stack and copied
+    // once into a string made at its length.
+    for b in &mut drawn {
+        *b = BASE32.get(usize::from(*b & 0x1f)).copied().unwrap_or(b'A');
+    }
+    Ok(String::from_utf8_lossy(&drawn).into_owned())
 }
 
 /// A secret of [`SECRET_BYTES`] octets from the OS, as its [`SECRET_CHARS`] characters of base64;

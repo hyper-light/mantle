@@ -129,12 +129,12 @@ pub fn reason(status: u16) -> &'static str {
 }
 
 /// The answer of an S3 request slowed for `cause`: `503 SlowDown`, its message S3's words and then
-/// the cause's.
+/// the cause's, joined in one string made at their length.
 pub fn slowed(cause: crate::door::Slowed) -> Refused {
     Refused::new(
         "SlowDown",
         503,
-        format!("Please reduce your request rate. {}", cause.words()),
+        ["Please reduce your request rate. ", cause.words()].concat(),
     )
 }
 
@@ -466,11 +466,12 @@ pub fn reply(
     }
 }
 
-/// The resource an error names: the bucket and key as the request's path names them.
+/// The resource an error names: the bucket and key as the request's path names them, joined in one
+/// string made at their length.
 pub fn resource(route: &Route<'_>) -> String {
     match (&route.bucket, &route.key) {
-        (Some(bucket), Some(key)) => format!("/{bucket}/{key}"),
-        (Some(bucket), None) => format!("/{bucket}"),
+        (Some(bucket), Some(key)) => ["/", bucket, "/", key].concat(),
+        (Some(bucket), None) => ["/", bucket].concat(),
         _ => "/".into(),
     }
 }
@@ -661,10 +662,9 @@ fn answered(echo: &Echo<'_>, reply: Reply, fields: &mut Fields) -> Result<Answer
                 }
                 _ => None,
             };
-            let location = format!(
-                "/{bucket}/{}",
-                mantle_s3::sigv4::uri_encode(key.as_bytes(), false)
-            );
+            // The key encoded at its length, then joined behind the bucket in one string at theirs.
+            let encoded = mantle_s3::sigv4::uri_encode(key.as_bytes(), false);
+            let location = ["/", bucket, "/", &encoded].concat();
             document(s3::complete_multipart_upload(&s3::Completed {
                 location: &location,
                 bucket,
@@ -842,7 +842,11 @@ fn kind(parts: u16) -> ChecksumType {
     }
 }
 
-/// A kept checksum's value as its header writes it: base64, a composite's followed by `-n`.
+/// The longest `-n` behind a composite's value: `-` and u16's 5 digits.
+const PARTS_SUFFIX: usize = 6;
+
+/// A kept checksum's value as its header writes it: base64, a composite's followed by `-n`, its
+/// suffix written on the stack and joined behind the value in one string at their length.
 fn checksum_value(kept: &Stored) -> Option<String> {
     let algorithm = Algorithm::from_code(kept.algorithm)?;
     let value = Checksum {
@@ -850,11 +854,15 @@ fn checksum_value(kept: &Stored) -> Option<String> {
         bytes: kept.value.clone(),
     }
     .to_base64();
-    Some(if kept.parts == 0 {
-        value
-    } else {
-        format!("{value}-{}", kept.parts)
-    })
+    if kept.parts == 0 {
+        return Some(value);
+    }
+    let mut suffix = [0u8; PARTS_SUFFIX];
+    let mut room = suffix.as_mut_slice();
+    write!(room, "-{}", kept.parts).ok()?;
+    let len = PARTS_SUFFIX.saturating_sub(room.len());
+    let suffix = std::str::from_utf8(suffix.get(..len)?).ok()?;
+    Some([value.as_str(), suffix].concat())
 }
 
 fn checksum(reply: &Reply, fields: &mut Fields) {
@@ -1152,6 +1160,591 @@ mod tests {
             let document = String::from_utf8(response.document).unwrap();
             assert!(document.contains("<Code>SlowDown</Code>"), "{document}");
             assert!(document.contains(&refused.message), "{document}");
+        }
+    }
+
+    /// The allocations and reallocations `f` makes on this thread, on the counting allocator the
+    /// unit tests run on (lib.rs).
+    fn counted<T>(f: impl FnOnce() -> T) -> (T, (u64, u64)) {
+        hyper_measure::alloc::begin();
+        let out = f();
+        let counts = hyper_measure::alloc::end();
+        (out, (counts.allocations, counts.reallocations))
+    }
+
+    /// `resource` as it was before Lean doors step 7, `format!`ed into a string that grows.
+    fn reference_resource(route: &Route<'_>) -> String {
+        match (&route.bucket, &route.key) {
+            (Some(bucket), Some(key)) => format!("/{bucket}/{key}"),
+            (Some(bucket), None) => format!("/{bucket}"),
+            _ => "/".into(),
+        }
+    }
+
+    /// `checksum_value` as it was before Lean doors step 7: a composite's `format!`ed.
+    fn reference_checksum_value(kept: &Stored) -> Option<String> {
+        let algorithm = Algorithm::from_code(kept.algorithm)?;
+        let value = Checksum {
+            algorithm,
+            bytes: kept.value.clone(),
+        }
+        .to_base64();
+        Some(if kept.parts == 0 {
+            value
+        } else {
+            format!("{value}-{}", kept.parts)
+        })
+    }
+
+    /// A key that `encoding-type=url` and a completion's `Location` escape: spaces, `+` and UTF-8.
+    const KEY: &str = "photos/2026/a b+c \u{e9}.jpg";
+    const MODIFIED: u64 = 1_727_179_200;
+    const ETAG: &str = "6805f2cfc46c0f04559748bb039d69ae";
+
+    fn stored(parts: u16) -> Stored {
+        Stored {
+            algorithm: Algorithm::Crc32c.code(),
+            parts,
+            value: vec![0xab; 4],
+        }
+    }
+
+    fn done() -> Reply {
+        Reply::status(Status::Done)
+    }
+
+    /// An object's reply: a get's, a head's, a put's or a copy's, its checksum a composite's.
+    fn object() -> Reply {
+        Reply {
+            size: 100,
+            version: "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY".into(),
+            etag: format!("{ETAG}-3"),
+            modified: MODIFIED,
+            checksum: Some(stored(3)),
+            metadata: vec![
+                ("content-type".into(), "text/plain".into()),
+                ("x-amz-meta-a".into(), "b".into()),
+            ],
+            source_version: "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHZ".into(),
+            ..done()
+        }
+    }
+
+    fn listing(listing: Listing) -> Reply {
+        Reply {
+            listing: Some(listing),
+            ..done()
+        }
+    }
+
+    fn keys() -> Listing {
+        use mantle_protocol::object::{Listed, Page};
+        Listing::Keys(Page {
+            contents: (0..3)
+                .map(|i| Listed {
+                    key: format!("{KEY}-{i}"),
+                    etag: ETAG.into(),
+                    size: 5,
+                    modified: MODIFIED,
+                    checksum: Some((Algorithm::Crc32c, 3)),
+                    owner: Some("owner".into()),
+                })
+                .collect(),
+            common_prefixes: vec!["photos/2027 a/".into()],
+            truncated: true,
+            next: Some(s3list::Resume::After(format!("{KEY}-2"))),
+        })
+    }
+
+    fn buckets() -> Listing {
+        Listing::Buckets(mantle_protocol::object::Buckets {
+            buckets: (0..3).map(|i| (format!("bucket-{i}"), MODIFIED)).collect(),
+            next: Some("token".into()),
+        })
+    }
+
+    fn parts() -> Reply {
+        use mantle_protocol::object::{PartListed, Parts};
+        Reply {
+            checksum: Some(stored(3)),
+            ..listing(Listing::Parts(Parts {
+                parts: (1..=3)
+                    .map(|number| PartListed {
+                        number,
+                        etag: ETAG.into(),
+                        size: 5 << 20,
+                        modified: MODIFIED,
+                        checksum: Some(vec![0xab; 4]),
+                    })
+                    .collect(),
+                truncated: true,
+                next: Some(3),
+            }))
+        }
+    }
+
+    fn uploads() -> Listing {
+        use mantle_protocol::object::{UploadListed, Uploads};
+        Listing::Uploads(Uploads {
+            uploads: (0..3)
+                .map(|i| UploadListed {
+                    key: format!("{KEY}-{i}"),
+                    id: format!("upload-{i}"),
+                    initiated: MODIFIED,
+                    owner: "owner".into(),
+                })
+                .collect(),
+            common_prefixes: vec!["photos/2027 a/".into()],
+            truncated: true,
+            next: Some((format!("{KEY}-2"), "upload-2".into())),
+        })
+    }
+
+    fn versions() -> Listing {
+        use mantle_protocol::object::{VersionListed, Versions};
+        Listing::Versions(Versions {
+            versions: (0..3)
+                .map(|i| VersionListed {
+                    key: format!("{KEY}-{i}"),
+                    id: format!("version-{i}"),
+                    latest: i == 0,
+                    marker: i == 2,
+                    etag: ETAG.into(),
+                    size: 5,
+                    modified: MODIFIED,
+                    checksum: Some((Algorithm::Crc32c, 0)),
+                    owner: "owner".into(),
+                })
+                .collect(),
+            common_prefixes: vec!["photos/2027 a/".into()],
+            truncated: true,
+            next: Some((format!("{KEY}-2"), "version-2".into())),
+        })
+    }
+
+    fn deleted() -> Listing {
+        use mantle_protocol::object::Deleted;
+        Listing::Deleted(vec![
+            Deleted {
+                key: KEY.into(),
+                version: Some("version-0".into()),
+                status: Status::Done,
+                marker: Some("version-1".into()),
+            },
+            Deleted {
+                key: format!("{KEY}-1"),
+                version: None,
+                status: Status::AccessDenied,
+                marker: None,
+            },
+        ])
+    }
+
+    /// A response asked: its operation, query, whether a HEAD asked and with checksums, its key,
+    /// and the host's reply.
+    type Asked = (
+        Operation,
+        &'static str,
+        bool,
+        bool,
+        Option<&'static str>,
+        Reply,
+    );
+
+    /// Every response the listener writes: each operation's done reply, the documents with their
+    /// keys escaped where `encoding-type=url` asks, the refusals `reply` answers itself, and a
+    /// refusal of each kind of resource.
+    fn responses() -> Vec<Asked> {
+        use Operation as O;
+        let url = "encoding-type=url&fetch-owner=true&max-keys=3";
+        vec![
+            (O::CreateBucket, "", false, false, None, done()),
+            (O::HeadBucket, "", true, false, None, done()),
+            (O::GetBucketLocation, "location", false, false, None, done()),
+            (O::DeleteBucket, "", false, false, None, done()),
+            (
+                O::AbortMultipartUpload,
+                "uploadId=u",
+                false,
+                false,
+                Some(KEY),
+                done(),
+            ),
+            (
+                O::PutBucketVersioning,
+                "versioning",
+                false,
+                false,
+                None,
+                done(),
+            ),
+            (
+                O::GetBucketVersioning,
+                "versioning",
+                false,
+                false,
+                None,
+                done(),
+            ),
+            (O::ListBuckets, "", false, false, None, listing(buckets())),
+            (
+                O::ListBuckets,
+                "prefix=b",
+                false,
+                false,
+                None,
+                listing(buckets()),
+            ),
+            (
+                O::ListObjectsV2,
+                "list-type=2",
+                false,
+                false,
+                None,
+                listing(keys()),
+            ),
+            (O::ListObjectsV2, url, false, false, None, listing(keys())),
+            (O::PutObject, "", false, false, Some(KEY), object()),
+            (
+                O::UploadPart,
+                "partNumber=1&uploadId=u",
+                false,
+                false,
+                Some(KEY),
+                object(),
+            ),
+            (O::GetObject, "", false, false, Some(KEY), object()),
+            (
+                O::GetObject,
+                "",
+                false,
+                false,
+                Some(KEY),
+                Reply {
+                    range: Some((10, 19)),
+                    ..object()
+                },
+            ),
+            (O::HeadObject, "", true, true, Some(KEY), object()),
+            (
+                O::GetObjectTagging,
+                "tagging",
+                false,
+                false,
+                Some(KEY),
+                object(),
+            ),
+            (
+                O::DeleteObject,
+                "versionId=v",
+                false,
+                false,
+                Some(KEY),
+                Reply {
+                    marker: true,
+                    ..object()
+                },
+            ),
+            (O::CopyObject, "", false, false, Some(KEY), object()),
+            (
+                O::UploadPartCopy,
+                "partNumber=1&uploadId=u",
+                false,
+                false,
+                Some(KEY),
+                Reply {
+                    checksum: Some(stored(0)),
+                    ..object()
+                },
+            ),
+            (
+                O::DeleteObjects,
+                "delete",
+                false,
+                false,
+                None,
+                listing(deleted()),
+            ),
+            (
+                O::ListObjectVersions,
+                "versions",
+                false,
+                false,
+                None,
+                listing(versions()),
+            ),
+            (
+                O::ListObjectVersions,
+                url,
+                false,
+                false,
+                None,
+                listing(versions()),
+            ),
+            (
+                O::CreateMultipartUpload,
+                "uploads",
+                false,
+                false,
+                Some(KEY),
+                Reply {
+                    upload: "upload-0".into(),
+                    ..done()
+                },
+            ),
+            (
+                O::CompleteMultipartUpload,
+                "uploadId=u",
+                false,
+                false,
+                Some(KEY),
+                object(),
+            ),
+            (
+                O::ListParts,
+                "uploadId=u&max-parts=3",
+                false,
+                false,
+                Some(KEY),
+                parts(),
+            ),
+            (
+                O::ListMultipartUploads,
+                "uploads",
+                false,
+                false,
+                None,
+                listing(uploads()),
+            ),
+            (
+                O::ListMultipartUploads,
+                url,
+                false,
+                false,
+                None,
+                listing(uploads()),
+            ),
+            (
+                O::GetObject,
+                "",
+                false,
+                false,
+                Some(KEY),
+                Reply {
+                    status: Status::NotModified,
+                    ..object()
+                },
+            ),
+            (
+                O::GetObject,
+                "",
+                false,
+                false,
+                Some(KEY),
+                Reply {
+                    status: Status::NoSuchKey,
+                    marker: true,
+                    ..object()
+                },
+            ),
+            (
+                O::HeadObject,
+                "versionId=v",
+                true,
+                false,
+                Some(KEY),
+                Reply {
+                    status: Status::MethodNotAllowed,
+                    ..object()
+                },
+            ),
+            (
+                O::GetObject,
+                "",
+                false,
+                false,
+                Some(KEY),
+                Reply::status(Status::EntityTooLarge),
+            ),
+            (
+                O::ListObjectsV2,
+                "list-type=2",
+                false,
+                false,
+                None,
+                Reply::status(Status::NoSuchBucket),
+            ),
+            (
+                O::PutObject,
+                "",
+                false,
+                false,
+                Some(KEY),
+                Reply::status(Status::AccessDenied),
+            ),
+            (
+                O::CompleteMultipartUpload,
+                "uploadId=u",
+                false,
+                false,
+                Some(KEY),
+                Reply::status(Status::InvalidPart),
+            ),
+            (
+                O::PutObject,
+                "",
+                false,
+                false,
+                Some(KEY),
+                Reply::status(Status::InsufficientStorage),
+            ),
+        ]
+    }
+
+    /// Every response the listener writes to a done reply or a refusal, its document and its fields
+    /// in a buffer its connection's earlier requests warmed, reallocates nothing: each document is
+    /// made at its length, and each string it is made from (the resource an error names, a
+    /// completion's `Location`, a composite's checksum, a key escaped for `encoding-type=url`) at
+    /// its own. `resource`, `checksum_value`, `slowed`'s message and a completion's `Location` are
+    /// the strings `format!` made before Lean doors step 7 (kept here), and the documents built
+    /// from them those it built.
+    #[test]
+    fn every_response_is_written_with_no_reallocation() {
+        let ids = Ids {
+            request: *b"0123456789ABCDEF",
+            host: "host",
+        };
+        let mut wrong = Vec::new();
+        for (operation, asked, head, checksums, key, r) in responses() {
+            let route = Route {
+                operation,
+                bucket: Some("bucket".into()),
+                key: key.map(Into::into),
+            };
+            let query = Query::parse(asked);
+            let echo = Echo {
+                route: &route,
+                query: &query,
+                principal: "owner",
+                region: "eu-west-1",
+                head,
+                checksums,
+            };
+            // The field lines' buffer as a connection's earlier requests left it.
+            let fields = Fields::new(Vec::with_capacity(1 << 14));
+            let status = r.status;
+            let (response, made) = counted(|| reply(&echo, r, &ids, fields));
+            let response = match response {
+                Ok(response) => response,
+                Err((why, _)) => panic!("{operation:?} {status:?}: {why:?}"),
+            };
+            let document = &response.document;
+            println!(
+                "{operation:?} {status:?} {asked:?}: {made:?}, a document of {} bytes",
+                document.len()
+            );
+            if made.1 != 0 || document.capacity() != document.len() {
+                wrong.push(format!(
+                    "{operation:?} {status:?}: {made:?}, capacity {} for {}",
+                    document.capacity(),
+                    document.len()
+                ));
+            }
+            if status != Status::Done && !head {
+                let expected = s3::error(&Failure {
+                    code: refusal_code(operation, status),
+                    message: &message(operation, status),
+                    resource: Some(&reference_resource(&route)),
+                    details: &[],
+                    request_id: ids.request(),
+                    host_id: ids.host,
+                });
+                if status != Status::NotModified {
+                    assert_eq!(*document, expected.into_bytes(), "{operation:?} {status:?}");
+                }
+            }
+            if operation == Operation::CompleteMultipartUpload && status == Status::Done {
+                let value = reference_checksum_value(&stored(3)).unwrap();
+                let location = format!(
+                    "/bucket/{}",
+                    mantle_s3::sigv4::uri_encode(KEY.as_bytes(), false)
+                );
+                let expected = s3::complete_multipart_upload(&s3::Completed {
+                    location: &location,
+                    bucket: "bucket",
+                    key: KEY,
+                    etag: &format!("{ETAG}-3"),
+                    checksum: Some(s3::ObjectChecksum {
+                        algorithm: Algorithm::Crc32c,
+                        kind: ChecksumType::Composite,
+                        value: &value,
+                    }),
+                });
+                assert_eq!(*document, expected.into_bytes());
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // The strings themselves, each as `format!` made it before.
+        for route in [
+            Route {
+                operation: Operation::GetObject,
+                bucket: Some("bucket".into()),
+                key: Some(KEY.into()),
+            },
+            Route {
+                operation: Operation::ListObjectsV2,
+                bucket: Some("bucket".into()),
+                key: None,
+            },
+            Route {
+                operation: Operation::ListBuckets,
+                bucket: None,
+                key: None,
+            },
+        ] {
+            let (text, made) = counted(|| resource(&route));
+            assert_eq!((made, text.capacity()), ((1, 0), text.len()));
+            assert_eq!(text, reference_resource(&route));
+        }
+        for parts in [0, 1, 3, 10_000, u16::MAX] {
+            let kept = stored(parts);
+            let (value, made) = counted(|| checksum_value(&kept).unwrap());
+            assert_eq!(
+                (made, value.capacity()),
+                ((2 + u64::from(parts != 0), 0), value.len()),
+                "{parts} parts"
+            );
+            assert_eq!(Some(value), reference_checksum_value(&kept));
+        }
+        for cause in crate::door::Slowed::ALL {
+            let (refused, made) = counted(|| slowed(cause));
+            assert_eq!(
+                (made, refused.message.capacity()),
+                ((1, 0), refused.message.len()),
+                "{cause:?}"
+            );
+            assert_eq!(
+                refused.message,
+                format!("Please reduce your request rate. {}", cause.words())
+            );
+        }
+    }
+
+    /// The code a refused reply's error document names.
+    fn refusal_code(operation: Operation, status: Status) -> &'static str {
+        match (operation, status) {
+            (Operation::GetObject, Status::EntityTooLarge) => "EntityTooLarge",
+            _ => refusal(status).code,
+        }
+    }
+
+    /// The message a refused reply's error document names.
+    fn message(operation: Operation, status: Status) -> String {
+        match (operation, status) {
+            (Operation::GetObject, Status::EntityTooLarge) => {
+                "Your proposed download exceeds the maximum allowed size".into()
+            }
+            _ => refusal(status).message,
         }
     }
 }

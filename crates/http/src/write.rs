@@ -81,8 +81,11 @@ pub fn field(lines: &mut Vec<u8>, name: &str, value: &[&[u8]]) -> Result<(), Wri
     Ok(())
 }
 
-/// Writes a response's head around `lines`, field lines [`field`] wrote: its status line, them,
-/// the length's field, and the empty line that ends it.
+/// Writes a response's head around `lines`, field lines [`field`] wrote, into `out`, a buffer kept
+/// from head to head: its status line, them, the length's field, and the empty line that ends it.
+/// The head's length is taken first and `out` emptied: one smaller than the head is replaced,
+/// before a byte is written, by one made at its length (the old one freed first, so the two are
+/// never held together), and one large enough is written in place, so no head grows its buffer.
 pub fn head_lines(
     out: &mut Vec<u8>,
     version: Version,
@@ -92,10 +95,40 @@ pub fn head_lines(
     length: Length,
 ) -> Result<(), WriteError> {
     check_status(version, status, reason, length)?;
+    let len = head_len(status, reason, lines, length);
+    out.clear();
+    if out.capacity() < len {
+        drop(std::mem::take(out));
+        // Refused only for more than memory holds, where the writes below fail as well.
+        let _ = out.try_reserve_exact(len);
+    }
     status_line(out, status, reason);
     out.extend_from_slice(lines);
     end(out, length);
     Ok(())
+}
+
+/// The bytes [`head_lines`] writes: `HTTP/1.1 `, the status and a space, the reason and its line's
+/// end; the lines; the length's field; and the empty line.
+fn head_len(status: u16, reason: &str, lines: &[u8], length: Length) -> usize {
+    let length = match length {
+        Length::None => 0,
+        Length::Known(n) => "Content-Length: \r\n".len().saturating_add(digits(n)),
+        Length::Chunked => "Transfer-Encoding: chunked\r\n".len(),
+    };
+    "HTTP/1.1  \r\n\r\n"
+        .len()
+        .saturating_add(digits(u64::from(status)))
+        .saturating_add(reason.len())
+        .saturating_add(lines.len())
+        .saturating_add(length)
+}
+
+/// The decimal digits `n` is written in.
+fn digits(n: u64) -> usize {
+    n.checked_ilog10()
+        .and_then(|log| usize::try_from(log).ok())
+        .map_or(1, |log| log.saturating_add(1))
 }
 
 /// Writes a request's head: its request line, `method` and its `target` in origin form (a path and

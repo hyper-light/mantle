@@ -349,3 +349,134 @@ fn a_json_values_compact_form_is_one_string_at_its_length() {
     );
     assert!(compact.starts_with("[{\"Effect\":\"Allow\","), "{compact}");
 }
+
+/// `sigv4::uri_encode` as it was before Lean doors step 7: each character pushed onto a string that
+/// grows.
+fn reference_uri_encode(bytes: &[u8], slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::new();
+    for &b in bytes {
+        let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if keep || (b == b'/' && !slash) {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 15)]));
+        }
+    }
+    out
+}
+
+/// S3's `UriEncode` of a key, a listing's `encoding-type=url` and a completion's `Location`, is
+/// one string made at its length, as the encoder before Lean doors step 7 wrote it: a key that
+/// needs none escaped, one with spaces, slashes and UTF-8, and keys at S3's 1,024-byte bound kept
+/// whole and escaped whole, each with `/` kept and escaped.
+#[test]
+fn a_uri_encoded_text_is_one_string_at_its_length() {
+    let longest = mantle_s3::route::MAX_KEY;
+    let keys: [Vec<u8>; 5] = [
+        b"photos".to_vec(),
+        "photos/2026/a b+c~d.é".as_bytes().to_vec(),
+        "k".repeat(longest).into_bytes(),
+        " ".repeat(longest).into_bytes(),
+        (0..=u8::MAX).cycle().take(longest).collect(),
+    ];
+    for key in &keys {
+        for slash in [false, true] {
+            let (expected, before) = counted(|| reference_uri_encode(key, slash));
+            let (encoded, made) = counted(|| sigv4::uri_encode(key, slash));
+            println!(
+                "uri_encode of {} bytes, slash {slash}: before {before:?}, now {made:?}",
+                key.len()
+            );
+            assert_eq!(
+                (made, encoded.capacity()),
+                ((1, 0), encoded.len()),
+                "{} bytes, slash {slash}",
+                key.len()
+            );
+            assert_eq!(encoded, expected);
+        }
+    }
+}
+
+/// An access key's or a principal's id is one string at its length: its characters written on the
+/// stack, each drawn byte's base32 character as before Lean doors step 7, and copied once.
+#[test]
+fn a_drawn_id_is_one_string_at_its_length() {
+    use mantle_s3::account::{KEY_ID_CHARS, draw_id, valid_key_id};
+    let mut drawn = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let (id, made) = counted(|| draw_id().unwrap());
+        println!("draw_id: now {made:?}");
+        assert_eq!(
+            (made, id.len(), id.capacity()),
+            ((1, 0), KEY_ID_CHARS, KEY_ID_CHARS)
+        );
+        assert!(valid_key_id(&id), "{id}");
+        assert!(drawn.insert(id));
+    }
+}
+
+/// `checksum::multipart_etag` as it was before: its hex in a string of its own, then `format!`.
+fn reference_multipart_etag(parts: &[[u8; 16]]) -> String {
+    let mut h = crypto::Digest::new(&crypto::MD5).unwrap();
+    for part in parts {
+        h.update(part).unwrap();
+    }
+    let digest: [u8; 16] = h.finish_array().unwrap();
+    format!("{}-{}", reference_etag(&digest), parts.len())
+}
+
+/// A multipart object's ETag is one string made at its length, the parts' MD5's 32 hex digits, a
+/// dash and the count, as the encoder before wrote them: one part, ten and S3's most, 10,000.
+#[test]
+fn a_multipart_etag_is_one_string_at_its_length() {
+    for count in [1usize, 10, 10_000] {
+        let parts: Vec<[u8; 16]> = (0..count)
+            .map(|n| std::array::from_fn(|i| u8::try_from((n + i) % 251).unwrap()))
+            .collect();
+        let (expected, before) = counted(|| reference_multipart_etag(&parts));
+        let (etag, made) = counted(|| mantle_s3::checksum::multipart_etag(&parts).unwrap());
+        println!("multipart etag of {count}: before {before:?}, now {made:?}");
+        assert_eq!(made.1, 0, "{count}: no reallocation");
+        assert_eq!(etag.capacity(), etag.len(), "{count}");
+        assert_eq!(etag, expected);
+    }
+}
+
+/// An object of parts' composite checksum is one string made at its length, base64 of the parts'
+/// checksum, a dash and the count, as the encoder before wrote it.
+#[test]
+fn a_composite_checksum_is_one_string_at_its_length() {
+    use mantle_s3::checksum::{self, Algorithm, Checksum};
+    for algorithm in [
+        Algorithm::Crc32,
+        Algorithm::Crc32c,
+        Algorithm::Sha1,
+        Algorithm::Sha256,
+    ] {
+        for count in [1usize, 10, 10_000] {
+            let parts: Vec<Checksum> = (0..count)
+                .map(|n| {
+                    let mut h = checksum::Hasher::new(algorithm).unwrap();
+                    h.update(&n.to_le_bytes()).unwrap();
+                    h.finish().unwrap()
+                })
+                .collect();
+            let reference = {
+                let mut h = checksum::Hasher::new(algorithm).unwrap();
+                for part in &parts {
+                    h.update(&part.bytes).unwrap();
+                }
+                format!("{}-{}", h.finish().unwrap().to_base64(), parts.len())
+            };
+            let (value, made) = counted(|| checksum::composite(&parts).unwrap().unwrap());
+            println!("composite {algorithm:?} of {count}: now {made:?}");
+            assert_eq!(made.1, 0, "{algorithm:?} {count}: no reallocation");
+            assert_eq!(value.capacity(), value.len(), "{algorithm:?} {count}");
+            assert_eq!(value, reference);
+        }
+    }
+}

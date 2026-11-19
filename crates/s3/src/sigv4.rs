@@ -1018,13 +1018,21 @@ fn query_pairs(query: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// S3's `UriEncode`: every byte but `A-Z a-z 0-9 - . _ ~` becomes `%XX` in uppercase hex, and
-/// `/` too unless `slash` is false (05 §1.2.1).
+/// `/` too unless `slash` is false (05 §1.2.1). The text is made at its length, a byte kept one
+/// character and every other three, counted first.
 pub fn uri_encode(bytes: &[u8], slash: bool) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let kept = |b: u8| {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') || (b == b'/' && !slash)
+    };
+    let len = bytes.iter().fold(0usize, |len, &b| {
+        len.saturating_add(if kept(b) { 1 } else { 3 })
+    });
     let mut out = String::new();
+    // Refused only for more than memory holds, where the writes below fail as well.
+    let _ = out.try_reserve_exact(len);
     for &b in bytes {
-        let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
-        if keep || (b == b'/' && !slash) {
+        if kept(b) {
             out.push(char::from(b));
         } else {
             out.push('%');

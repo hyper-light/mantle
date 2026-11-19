@@ -490,7 +490,8 @@ impl Connection {
             .map_err(|_| ())
     }
 
-    /// Writes a response's head into `output`, its field lines' buffer kept for the next.
+    /// Writes a response's head into `output` at its length (`write::head_lines`), its field
+    /// lines' buffer kept for the next.
     fn head(
         &mut self,
         status: u16,
@@ -499,7 +500,6 @@ impl Connection {
         close: bool,
         length: Length,
     ) -> Result<(), ()> {
-        self.output.clear();
         if close {
             fields.close();
         }

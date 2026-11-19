@@ -313,7 +313,19 @@ pub fn composite(parts: &[Checksum]) -> Result<Option<String>, CryptoError> {
     for part in parts {
         h.update(&part.bytes)?;
     }
-    Ok(Some(format!("{}-{}", h.finish()?.to_base64(), parts.len())))
+    let value = h.finish()?;
+    // base64's length, four characters for each three bytes begun (RFC 4648 §4), the dash and
+    // the parts' count: the string made at that length and written once.
+    let encoded = value
+        .bytes
+        .len()
+        .div_ceil(3)
+        .checked_mul(4)
+        .ok_or(CryptoError)?;
+    let mut out = String::with_capacity(dashed_len(encoded, parts.len()));
+    BASE64.encode_string(&value.bytes, &mut out);
+    push_dashed(&mut out, parts.len());
+    Ok(Some(out))
 }
 
 /// A single-part object's ETag, bare of the quotes a response adds: the MD5 of its bytes in
@@ -330,7 +342,31 @@ pub fn multipart_etag(parts: &[[u8; 16]]) -> Result<String, CryptoError> {
         h.update(part)?;
     }
     let digest: [u8; 16] = h.finish_array()?;
-    Ok(format!("{}-{}", hex(&digest), parts.len()))
+    let digits = hex_digits(&digest);
+    let mut out = String::with_capacity(dashed_len(digits.len(), parts.len()));
+    for &digit in &digits {
+        out.push(char::from(digit));
+    }
+    push_dashed(&mut out, parts.len());
+    Ok(out)
+}
+
+/// The length of a value written `TEXT-n`: the text's, the dash and `n`'s decimal digits.
+fn dashed_len(text: usize, n: usize) -> usize {
+    let digits = n
+        .checked_ilog10()
+        .and_then(|log| usize::try_from(log).ok())
+        .map_or(1, |log| log.saturating_add(1));
+    text.saturating_add(1).saturating_add(digits)
+}
+
+/// The dash and `n` in decimal after a value's text, into a string made with room for them
+/// ([`dashed_len`]), which so does not grow.
+fn push_dashed(out: &mut String, n: usize) {
+    use std::fmt::Write as _;
+    out.push('-');
+    // Writing to a `String` cannot fail (`<String as fmt::Write>::write_str` returns `Ok`).
+    let _ = write!(out, "{n}");
 }
 
 /// A `Content-MD5` header's value: base64 of 16 bytes.
@@ -341,6 +377,12 @@ pub fn content_md5(text: &str) -> Option<[u8; 16]> {
 /// An MD5 in lowercase hex, written on the stack and copied once into a string made at its
 /// length.
 fn hex(bytes: &[u8; 16]) -> String {
+    // Hex digits are ASCII, so the text is borrowed whole and copied once.
+    String::from_utf8_lossy(&hex_digits(bytes)).into_owned()
+}
+
+/// An MD5's 32 lowercase hex digits, on the stack.
+fn hex_digits(bytes: &[u8; 16]) -> [u8; 32] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 32];
     let (pairs, _) = out.as_chunks_mut::<2>();
@@ -348,8 +390,7 @@ fn hex(bytes: &[u8; 16]) -> String {
         *high = HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0');
         *low = HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0');
     }
-    // Hex digits are ASCII, so the text is borrowed whole and copied once.
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 #[cfg(test)]

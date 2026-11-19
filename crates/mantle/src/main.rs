@@ -652,9 +652,10 @@ enum BenchCommand {
     /// a cell of three `mantle serve` processes this program makes and runs under DIR: a line a
     /// door, operation, size and step, with the servers' allocations (a `count-allocs` build),
     /// faults, CPU and switches per operation, this program's own, and latency from each
-    /// operation's intended start (docs/design/measurement.md §12). Every read is checked against
-    /// the seed's bytes; three controls must each be reported as failures. Exits non-zero when any
-    /// check is not exact or a control is missed.
+    /// operation's intended start (docs/design/measurement.md §12). Each door's phases run on a
+    /// cell made for that door, and each set on one of its own. Every read is checked against the
+    /// seed's bytes; three controls must each be reported as failures. Exits non-zero when any
+    /// check is not exact, or a control is missed or could not run.
     Doors {
         /// The run's directory, which must not exist yet: the cell's volumes are made in it.
         dir: PathBuf,
@@ -672,7 +673,9 @@ enum BenchCommand {
         objects: Vec<u64>,
         /// open:RATE, requests a second arriving as a Poisson process, latency from each one's
         /// intended start; or closed, a ladder of clients doubling while throughput grows, each
-        /// step judged in rounds, ending three steps after the last that grew.
+        /// step judged in rounds, ending three steps after the last that grew or at a step that
+        /// had an operation refused or unanswered. Every throughput counts only the operations
+        /// answered as asked.
         #[arg(long, value_parser = bench_doors::load_arg, default_value = "open:100")]
         load: bench_doors::Load,
         /// Logical clients at most, each a task holding one connection: open loop's clients, and

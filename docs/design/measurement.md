@@ -377,15 +377,48 @@ stock clients stay the correctness suite.
   before it calls a pipe full (Linux `tcp_bbr.c`, `bbr_full_bw_cnt`): a ladder that stopped at
   the first step not a tenth above the last stopped where one noisy step fell, its best 66 and 156
   PUTs a second in two runs of one build (measurements/2026-11-14-the-ladder-paced.md). A step in
-  rounds also ends at its first operation unanswered, throttled or lost on each attempt the AWS SDKs
-  give one (research/73), and the ladder ends at any step that left one, that step not its best: the
-  cell no longer answers the load offered within its own patience (research/77 D2), so a step past
+  rounds also ends at its first operation refused, or unanswered, throttled or lost on each attempt
+  the AWS SDKs give one (research/73), and the ladder ends at any step not every operation of which
+  was answered as asked, one refused, unanswered or failing its check, that step not its best: the
+  cell no longer serves the load offered within its own patience (research/77 D2), so a step past
   it measures refusals and each doubling multiplies the retries it refuses (77 F3). The operations
-  out end on their own bounds and the step's line counts the failure. A ladder that went on past one
-  did not end: run r20 on the Mac Studio (lean-doors aef9efae), native PUT 1 B, left a PUT
-  unanswered (`SlowDown` asked three times) at 2,048 clients and then said nothing for three hours.
-  The HTTP door waits on a listener as the stock clients do, at most their 60 s between bytes
-  (research/77 [9, 10]).
+  out end on their own bounds, the step's line counts the failures, and the ladder's last line says
+  the step's refused, unanswered and failed and the first refusal's text, before an unanswered
+  operation's, before a check's. A ladder that went on past one did not end: run r20 on the Mac
+  Studio (lean-doors aef9efae), native PUT 1 B, left a PUT unanswered (`SlowDown` asked three times)
+  at 2,048 clients and then said nothing for three hours. An operation throttled and then answered
+  was answered as asked, its retry counted in the line's `again`. The HTTP door waits on a listener
+  as the stock clients do, at most their 60 s between bytes (research/77 [9, 10]).
+- **Goodput**: every throughput, a phase's, a closed step's rounds' and the ladder's best, counts
+  only the operations answered as asked: a round is §5a's count of them, and a refused, unanswered
+  or failed operation counts in none, since it did not do what was asked and a rate that counted it
+  is the rate the cell refuses at. Each phase's line says `answered` and `goodput_ops/s` beside its
+  `ops`, with its `refused`, `unanswered`, `again` and `failed` as before, and `offered_ops/s`, open
+  loop the Poisson rate asked, a closed ladder's `-`; the ladder's best is the best clean step. A
+  ladder of 1 B PUTs on macOS (`--sizes 1 --objects 0 --kinds PUT --load closed --clients 2048
+  --volume 4G`, perf-10k fea8b145) reported its HTTP door's best at 15,453 a second, a rate of
+  refusals: at 1,024 clients 226,331 of 318,463 were refused (`HTTP 507 InsufficientStorage`), at
+  2,048 all 636,927 were, and its rounds counted each.
+- **State per door**: each door's phases run on a cell made for that door in a directory of its own
+  (`cell-http` within the run's; the first door's on the run's first cell), and each set on a cell
+  of its own (`cell-setN-K`, the set of N objects at place K among the sets, from 0). The cell
+  before is stopped once its clients are dropped and its volumes, each preallocated whole at
+  `--volume`, removed, so a run holds one cell's processes and volumes at once; the rest of its
+  directory is kept, its servers' own account. So every door's phases of a kind start from the same
+  state, a new cell holding only that door's two control objects (below), and no phase runs on a
+  cell another door's phases filled; within a set the two doors' halves share its cell, as each
+  lists the whole set and reads the other's half. Deleting what a door put would not give the next
+  door the same state: the cell deletes a block's chunks only after a grace period unreferenced
+  (chunk-store.md §8), and `--kinds` may name no DELETE at all. Nor would volumes sized to the run's
+  bound, which keep the first door's objects under the second's. In the run above the HTTP door ran
+  on the cell the native door had filled with about 850,000 objects, and in another its ladder
+  stopped at 32 clients after 1,012 `SlowDown` at 64 on that nearly full cell. The relay condition's
+  relay is made again to each cell's nodes. Against an `--endpoint`, which the harness did not
+  start, the phases run on the server as they find it.
+- **Controls**: a door's three controls run on its cell before its phases, while the cell can take
+  their objects' puts; where it does not, the run says they could not run and why, not a count
+  caught of controls that never ran (the run above said `controls caught 0 of 6` on its full cell),
+  and the run is not exact. `--smoke` requires all six caught.
 - **Stops**: each phase says how long the harness's process went without running past the 10 ms
   waits a thread of its asks, the sum and the longest. A process stopped whole (a frozen cgroup,
   a pacer duty-cycling the work it runs) stops the cell and its clients together, and every

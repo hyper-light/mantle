@@ -933,7 +933,13 @@ fn a_growth_handed_by_an_unprepared_pool_in_a_runtime_is_refused_untouched() {
     let worker_path = path.clone();
     let spawn: Spawn = Box::new(move |mut seat| {
         let (relay, mut relayed) = hyper_rt::sync::channel(MESSAGES_A_WORKER).unwrap();
-        let back = std::mem::replace(&mut seat.back, relay);
+        let back = std::mem::replace(
+            &mut seat.back,
+            BackChannel {
+                tx: relay,
+                signal: Arc::default(),
+            },
+        );
         let asked_tx = asked_tx.clone();
         let relaying = std::thread::Builder::new()
             .name("growth-asker-relay".into())

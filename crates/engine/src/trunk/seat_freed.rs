@@ -51,7 +51,13 @@ fn a_worker_is_free_once_its_result_is_sent() {
     let worker_path = path.clone();
     let spawn: Spawn = Box::new(move |mut seat| {
         let (relay, mut relayed) = hyper_rt::sync::channel(MESSAGES_A_WORKER).unwrap();
-        let back = std::mem::replace(&mut seat.back, relay);
+        let back = std::mem::replace(
+            &mut seat.back,
+            BackChannel {
+                tx: relay,
+                signal: Arc::default(),
+            },
+        );
         let results_tx = results_tx.clone();
         let relaying = std::thread::Builder::new()
             .name(format!("seat-freed-relay-{}", seat.id))

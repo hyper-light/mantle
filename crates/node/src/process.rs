@@ -497,8 +497,9 @@ pub struct ProcessConfig {
     pub rules: Rules,
     pub log: LogConfig,
     pub store: StoreConfig,
-    /// The bytes of each range's engine's page cache (`engine.cache_bytes`): as many of its
-    /// store's pages as they hold, verified as read (`ShardDb::set_cache`).
+    /// The most each range's engine's page cache holds (`engine.cache_bytes`), its want: as many
+    /// of its store's pages as it borrows of the operations' idle bytes, verified as read
+    /// (`GatewaySettings::cache_bytes`, `Engine::lend_cache`).
     pub cache_bytes: u64,
     pub memtable_bytes: usize,
     pub trunk: TrunkConfig,
@@ -1301,6 +1302,7 @@ fn gateway_settings(
     config: GatewayConfig,
     keys: Vec<(u32, WrappingKey)>,
     enlist: Option<&Enlisting>,
+    cache_bytes: u64,
 ) -> Result<GatewaySettings, ProcessError> {
     let rates = Rates {
         chunk: config.chunk_rate,
@@ -1316,6 +1318,7 @@ fn gateway_settings(
         window: config.window,
         objects: config.objects,
         objects_bytes: config.objects_bytes,
+        cache_bytes,
         charges,
         clients: config.clients,
         bucket_quota: config.bucket_quota,
@@ -2028,7 +2031,7 @@ fn run_node(
     let gateway = config
         .gateway
         .take()
-        .map(|g| gateway_settings(g, keys, config.enlist.as_ref()))
+        .map(|g| gateway_settings(g, keys, config.enlist.as_ref(), config.cache_bytes))
         .transpose()?;
     let resolved = resolve(&config).map_err(step(Step::Network))?;
     // A named peer is looked up again as the node runs, on hyper-rt's blocking pool, off its shards:

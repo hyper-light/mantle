@@ -94,6 +94,10 @@ pub(crate) struct Admission {
     /// operations hold now, each charged what it holds at its own size.
     budget: u64,
     held: u64,
+    /// The bytes of it the page caches of the ranges on the node's shard hold now, lent of those
+    /// no running operation holds ([`cache_part`]): `held` and `lent` are within `budget` at
+    /// every moment, as each cache gives back what an operation is charged before it is.
+    lent: u64,
     /// The limit the cycle is about, and the limit now.
     base: usize,
     limit: usize,
@@ -125,6 +129,7 @@ impl Admission {
             ceiling,
             budget,
             held: 0,
+            lent: 0,
             base: ceiling,
             limit: ceiling,
             descent: Some(Descent::Waiting),
@@ -183,6 +188,23 @@ impl Admission {
     /// admitted at (`host::copy_windows`).
     pub(crate) fn gave(&mut self, bytes: u64) {
         self.held = self.held.saturating_sub(bytes);
+    }
+
+    /// The bytes no running operation holds once `more` are charged: what the caches may hold
+    /// then.
+    pub(crate) fn idle_past(&self, more: u64) -> u64 {
+        self.budget.saturating_sub(self.held).saturating_sub(more)
+    }
+
+    /// The caches hold `bytes` of the operations' memory now.
+    pub(crate) fn lend(&mut self, bytes: u64) {
+        self.lent = bytes;
+    }
+
+    /// The bytes the caches hold, and those the running operations hold.
+    #[cfg(test)]
+    pub(crate) fn lent(&self) -> (u64, u64) {
+        (self.lent, self.held)
     }
 
     /// An operation was turned away, or left waiting at a door, for want of room.
@@ -332,6 +354,36 @@ impl Admission {
             Quarter::Down | Quarter::At => quarters.checked_div(4).unwrap_or(0),
         };
         limit.clamp(1, self.ceiling)
+    }
+}
+
+/// Each page cache's part of `idle` bytes, the operations' bytes no running operation holds,
+/// shared among `caches` caches on the node's shard in proportion to their wants: each range's
+/// engine wants the pages of the rows the cell's volumes make (`derive::engine_cache_wants_for`),
+/// the same `want` (`engine.cache_bytes`), so each takes the same part, at most its want. A cache
+/// borrows them while no operation is charged them, and gives them back before one is: an
+/// operation's bytes are its own while it runs, so a cache never makes one wait for room, and
+/// between operations every idle byte serves reads from memory, where without it each read its
+/// pages from the device on the node's busy shard.
+pub(crate) fn cache_part(idle: u64, want: u64, caches: usize) -> u64 {
+    let caches = u64::try_from(caches).unwrap_or(u64::MAX).max(1);
+    idle.checked_div(caches).unwrap_or(0).min(want)
+}
+
+/// A cache holding `lent` bytes given its `part` ([`cache_part`]): shrunk to it at once where it
+/// holds more, before the bytes it gives back are charged; grown to it, keeping its pages, where it
+/// holds less and `grow`, once a turn. The bytes it holds after, a whole number of its pages
+/// (`Engine::lend_cache`).
+pub(crate) fn lend_to<E: mantle_meta::engine::Engine>(
+    engine: &mut E,
+    lent: u64,
+    part: u64,
+    grow: bool,
+) -> u64 {
+    if lent > part || (grow && lent < part) {
+        engine.lend_cache(part)
+    } else {
+        lent
     }
 }
 

@@ -614,6 +614,9 @@ struct Kept {
     wake: Option<u64>,
     /// A member lost for good the node replaces while it leads the range ([`Node::replace`]).
     replacing: Option<Replacement>,
+    /// The bytes its engine's page cache holds, lent of the operations' idle bytes
+    /// (`host::lend`): none while its replica runs on another shard.
+    lent: u64,
 }
 
 /// A peer as the node keeps it.
@@ -1404,6 +1407,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 max_entry_bytes: hosted.range.settings.max_entry_bytes,
                 wake: None,
                 replacing: None,
+                lent: 0,
             });
         }
         // On a simulated shard the node's times are the simulation's, whole virtual nanoseconds
@@ -2484,6 +2488,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.step_host()?;
         self.observe_presence()?;
         self.step_repair()?;
+        // What the turn's operations and repairs left idle, lent to the caches once a turn.
+        self.lend_caches(0, true);
         self.step_asks(now)?;
         self.step_reads(now)?;
         self.step_replacements();

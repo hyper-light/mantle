@@ -79,6 +79,10 @@ pub struct GatewaySettings {
     /// The bytes the host's operations hold at once, each charged what it holds at its own size
     /// (`charges`): one whose bytes would pass them waits, or is answered `SlowDown`.
     pub objects_bytes: u64,
+    /// The most each range's engine's page cache holds (`engine.cache_bytes`), its want: it
+    /// borrows its part of the operations' bytes no running operation holds, and gives it back
+    /// before one is charged them ([`lend`]).
+    pub cache_bytes: u64,
     pub charges: crate::derive::Charges,
     /// The clients of the native protocol it admits at once, each by the certificate the cell's
     /// authority issued it for the client role (node.md §3.6). One past them is refused as the
@@ -1200,19 +1204,18 @@ fn reading(
 /// one is read (`Windows::copy_get`), no more than the span is cut into at the smallest block;
 /// each the widest whose charge (`derive::Charges::copy`) the operations' bytes hold, past what it
 /// was admitted at beside the other operations' (`admit::Admission::holds`), the floor's where none
-/// wider fits. The bytes past `charge` are taken, and those the span does not need, as a span
-/// shorter than the largest a copy writes holds less, are given back. Its source's size is known
+/// wider fits. The caller takes the bytes past `charge`, and gives back those the span does not
+/// need, as a span shorter than the largest a copy writes holds less. Its source's size is known
 /// only once its version is read, so it is fitted then, before its drivers hold the blocks
 /// (`Node::copy_source_read`).
 fn copy_windows(
     gateway: &GatewaySettings,
     learned: &crate::window::Windows,
-    admission: Option<&mut crate::admit::Admission>,
+    room: Option<&crate::admit::Admission>,
     length: u64,
     charge: u64,
 ) -> (usize, usize, u64) {
     let charges = &gateway.charges;
-    let room = admission.as_deref();
     let fits = |bytes: u64| {
         let more = bytes.saturating_sub(charge);
         if room.is_none_or(|room| room.holds(more)) {
@@ -1226,12 +1229,40 @@ fn copy_windows(
     let put = fitting(gateway, put, |put| fits(charges.copy(floor, put, length)));
     let get = learned.copy_get(put, length, charges.smallest_block());
     let get = fitting(gateway, get, |get| fits(charges.copy(get, put, length)));
-    let held = charges.copy(get, put, length);
-    if let Some(admission) = admission {
-        admission.took(held.saturating_sub(charge));
-        admission.gave(charge.saturating_sub(held));
+    (get, put, charges.copy(get, put, length))
+}
+
+/// The page caches of the ranges on the node's shard lent their parts of the operations' bytes
+/// that no running operation holds once `more` are charged (`admit::cache_part`), each at most
+/// `want`: a cache past its part shrinks at once (`Engine::lend_cache`), before the bytes are
+/// charged and in the same turn, on the shard where both run, so the operations' charges and the
+/// caches' bytes are within the operations' memory at every moment; one below its part grows,
+/// keeping its pages, where `grow`, once a turn (`Node::turn`), so operations that end and begin
+/// within a turn move no cache, and a part that moves by less than a page resizes none. A range
+/// on another shard (`range_shards = spread`) borrows nothing: its cache is not on this shard.
+pub(super) fn lend<E: Engine, S: mantle_range::LogStore>(
+    want: u64,
+    admission: &mut crate::admit::Admission,
+    ranges: &mut [super::Kept],
+    owner: &mut shard::Here<E, S>,
+    more: u64,
+    grow: bool,
+) {
+    let here = ranges
+        .iter()
+        .filter(|kept| owner.get(kept.handle).is_some())
+        .count();
+    let part = crate::admit::cache_part(admission.idle_past(more), want, here);
+    let mut lent = 0u64;
+    for kept in ranges.iter_mut() {
+        let Some(shell) = owner.get_mut(kept.handle) else {
+            continue;
+        };
+        let engine = shell.machine_mut().engine_mut();
+        kept.lent = crate::admit::lend_to(engine, kept.lent, part, grow);
+        lent = lent.saturating_add(kept.lent);
     }
-    (get, put, held)
+    admission.lend(lent);
 }
 
 /// A bucket's versioning as GetBucketVersioning answers it: none for a bucket never versioned.
@@ -1407,10 +1438,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         };
         let charge = if admitted_ns.is_some() { charge } else { 0 };
-        if admitted_ns.is_some()
-            && let Some(admission) = self.admission.as_mut()
-        {
-            admission.admitted(charge);
+        if admitted_ns.is_some() {
+            self.charge_admitted(charge);
         }
         self.jobs.push(Job {
             door: Door::Exchange(exchange),
@@ -1460,10 +1489,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         };
         let charge = if admitted_ns.is_some() { charge } else { 0 };
-        if admitted_ns.is_some()
-            && let Some(admission) = self.admission.as_mut()
-        {
-            admission.admitted(charge);
+        if admitted_ns.is_some() {
+            self.charge_admitted(charge);
         }
         self.jobs.push(Job {
             door: Door::Local(Box::new(Local {
@@ -1829,15 +1856,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .admission
                 .as_ref()
                 .is_some_and(|admission| !admission.holds(more));
+        // The bytes past its charge, taken where it runs: the caches give back first what of
+        // them they hold.
+        let taking =
+            more > 0 && !crowded && op.is_ok() && self.admission.is_some() && at < self.jobs.len();
+        if taking {
+            self.charge_more(more);
+        }
         if let Some(job) = self.jobs.get_mut(at) {
             job.work = match op {
                 Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
                 Ok(_) if crowded => Work::Draining(Box::new(Reply::slowed(door::Slowed::Crowded))),
                 Ok(op) => {
-                    if more > 0
-                        && let Some(admission) = self.admission.as_mut()
-                    {
-                        admission.took(more);
+                    if taking {
                         job.charge = job.charge.saturating_add(more);
                     }
                     job.label = Some(labels::host(&op));
@@ -3268,9 +3299,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         getting.held = Some(Box::new(reply));
         *window = held;
         *charge = charge.saturating_add(more);
-        if let Some(admission) = self.admission.as_mut() {
-            admission.took(more);
-        }
+        self.charge_more(more);
         Ok(())
     }
 
@@ -4673,10 +4702,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let (reads, writes, held) = copy_windows(
             gateway,
             &self.windows,
-            self.admission.as_mut(),
+            self.admission.as_ref(),
             length,
             *charge,
         );
+        if let Some(admission) = self.admission.as_mut() {
+            let more = held.saturating_sub(*charge);
+            lend(
+                gateway.cache_bytes,
+                admission,
+                &mut self.ranges,
+                &mut self.owner,
+                more,
+                false,
+            );
+            admission.took(more);
+            admission.gave(charge.saturating_sub(held));
+        }
         *charge = held;
         let holding = Holding {
             handover_ns: gateway.handover_ns,
@@ -5118,6 +5160,40 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 false
             }
             Err(crate::admit::Held::Bytes) => false,
+        }
+    }
+
+    /// The ranges' page caches on the node's shard lent their parts of the operations' idle
+    /// bytes once `more` are charged ([`lend`]), growing where `grow`; none for a node that hosts
+    /// no objects, which has no operations' memory to lend.
+    pub(super) fn lend_caches(&mut self, more: u64, grow: bool) {
+        let Self {
+            gateway,
+            admission,
+            ranges,
+            owner,
+            ..
+        } = self;
+        if let (Some(gateway), Some(admission)) = (gateway.as_ref(), admission.as_mut()) {
+            lend(gateway.cache_bytes, admission, ranges, owner, more, grow);
+        }
+    }
+
+    /// An operation admitted, charged `charge` bytes: the caches give back first what of them
+    /// they hold.
+    fn charge_admitted(&mut self, charge: u64) {
+        self.lend_caches(charge, false);
+        if let Some(admission) = self.admission.as_mut() {
+            admission.admitted(charge);
+        }
+    }
+
+    /// A running operation takes `more` bytes past its charge, or the cell's repair takes them
+    /// for a rebuild: the caches give back first what of them they hold.
+    pub(super) fn charge_more(&mut self, more: u64) {
+        self.lend_caches(more, false);
+        if let Some(admission) = self.admission.as_mut() {
+            admission.took(more);
         }
     }
 
@@ -6082,6 +6158,7 @@ mod tests {
             window: 1,
             objects: 1,
             objects_bytes: 1,
+            cache_bytes: 0,
             charges: crate::derive::Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap(),
             clients: 1,
             bucket_quota: 1,
@@ -6358,6 +6435,7 @@ mod tests {
             window: 1,
             objects: 1,
             objects_bytes: crate::derive::most_charged(&charges()),
+            cache_bytes: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,
@@ -6399,6 +6477,7 @@ mod tests {
             window: 1,
             objects: 1,
             objects_bytes: charges().read(64),
+            cache_bytes: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,
@@ -6469,6 +6548,7 @@ mod tests {
             window: 1,
             objects: 1,
             objects_bytes: crate::derive::most_charged(&charges()),
+            cache_bytes: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,
@@ -6549,6 +6629,7 @@ mod tests {
             window: 1,
             objects: 1,
             objects_bytes: charges().copy(64, 64, long),
+            cache_bytes: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,
@@ -6573,15 +6654,26 @@ mod tests {
             admission.holds(budget - held) && !admission.holds(budget - held + 1)
         };
         let budget = gateway.objects_bytes;
+        // As `Node::copy_source_read` fits them: the bytes past its charge taken, and those its
+        // span does not need given back.
+        let windows = |gateway: &GatewaySettings,
+                       learned: &crate::window::Windows,
+                       room: &mut crate::admit::Admission,
+                       length: u64| {
+            let fitted = copy_windows(gateway, learned, Some(&*room), length, admitted);
+            room.took(fitted.2.saturating_sub(admitted));
+            room.gave(admitted.saturating_sub(fitted.2));
+            fitted
+        };
         let fitted = |gateway: &GatewaySettings, learned: &crate::window::Windows, length: u64| {
             let mut room = admission(gateway.objects_bytes, 0);
-            copy_windows(gateway, learned, Some(&mut room), length, admitted)
+            windows(gateway, learned, &mut room, length)
         };
 
         // Nothing learned: one block each, and the bytes a gigabyte's copy does not need given back.
         let mut learned = crate::window::Windows::default();
         let mut room = admission(budget, 0);
-        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        let (get, put, held) = windows(&gateway, &learned, &mut room, long);
         assert_eq!((get, put), (1, 1));
         assert_eq!(held, charges().copy(1, 1, long));
         assert!(held < admitted);
@@ -6604,7 +6696,7 @@ mod tests {
         // admission takes the bytes past the floor's.
         learned.put.paced(1_000_000_000, 1_000_000_000);
         let mut room = admission(budget, 0);
-        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        let (get, put, held) = windows(&gateway, &learned, &mut room, long);
         assert_eq!((get, put), (8, 2));
         assert_eq!(held, charges().read(8) + charges().write(2, long));
         assert!(held > admitted);
@@ -6628,12 +6720,12 @@ mod tests {
         // And to what they hold beside the others': the room left for three blocks read.
         let others = budget - charges().copy(3, 2, long);
         let mut room = admission(budget, others);
-        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        let (get, put, held) = windows(&gateway, &learned, &mut room, long);
         assert_eq!((get, put), (3, 2));
         assert!(holding(&room, budget, others + held));
         // With no room past what it was admitted at, the floor's, and the rest given back.
         let mut room = admission(budget, budget - admitted);
-        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        let (get, put, held) = windows(&gateway, &learned, &mut room, long);
         assert_eq!((get, put), (1, 1));
         assert!(holding(&room, budget, budget - admitted + held));
     }

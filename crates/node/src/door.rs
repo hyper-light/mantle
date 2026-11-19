@@ -164,7 +164,10 @@ impl Depth {
 /// their writing and the depth holds a turn's group. A phase is as many turns as admission's phase
 /// measures (`admit::PHASE`), turns the fewer samples of the two, and its depth replaces the last's.
 /// Until a phase is measured the depth is one, the least that moves a reply: its head, or the piece
-/// the host gives while the connection writes the last.
+/// the host gives while the connection writes the last. A reply's head and its end are two answers,
+/// so at one the end waits for the connection to read the head, which a connection sending a body
+/// does only once the body is sent or its channel closed: a job answered before its body ended lets
+/// go of the body as it answers (`host::Local::body`), so the connection reads the reply.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Replying {
     turns: u64,

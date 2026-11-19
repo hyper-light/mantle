@@ -1890,7 +1890,9 @@ struct Pieces {
 /// A local door's ends: the request's body as the listener sends it, and the reply as the host
 /// writes it.
 struct Local {
-    body: Pieces,
+    /// The body, until the job answers: let go of then (`Host::drain_job`), its channel closed, so
+    /// a connection still sending it stops and reads the reply.
+    body: Option<Pieces>,
     reply: Sender<door::Answer>,
     /// Answers the reply's channel had no room for, sent before any other, in order. A stream's
     /// next piece is taken only once these are sent, so they are at most one piece of bytes and
@@ -3478,10 +3480,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.host.push(
             Job {
                 door: Door::Local(Box::new(Local {
-                    body: Pieces {
+                    body: Some(Pieces {
                         pieces: body,
                         ended: None,
-                    },
+                    }),
                     reply,
                     pending: VecDeque::new(),
                     ready: false,
@@ -5716,9 +5718,11 @@ impl Host {
                         return self.fail_job(node, at, Status::IncompleteBody);
                     }
                 }
-                take_body(&mut local.body, None, putting, moved, |paced| {
-                    node.took(paced)
-                })
+                match local.body.as_mut() {
+                    Some(body) => take_body(body, None, putting, moved, |paced| node.took(paced)),
+                    // Let go of as its job answered, after which no put of it takes a piece.
+                    None => Err(Status::IncompleteBody),
+                }
             }
             // A native put's pieces come as its exchange delivers them, at no connection's pace,
             // and their bytes are counted in its door. Its fields are read before its put is made,
@@ -7604,9 +7608,20 @@ impl Host {
                 };
                 Ok(native.offer(told) != Sent::Held)
             }
-            // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
-            // and its end go now.
-            Door::Local(_) => {
+            // What is left of the body is the listener's to read or drop (node.md §4.5): the body
+            // is let go of, its channel closed, and the reply and its end go now. A connection
+            // sends the body before it reads the reply (`listener::conn`'s `stream`), so while it
+            // sends it waits on the body's channel until the job takes a piece or lets go; and the
+            // reply and its end are two answers, more than a reply's channel of one holds
+            // (`door::Replying`: one before a phase is measured, and wherever a phase learns one),
+            // so the end waits for the connection to read the reply. Held until the job ended, its
+            // end gone, the body kept the connection from the reply and the reply kept the job
+            // from its end: the fill suite's S3 put, held for room and then refused
+            // `InsufficientStorage` with its body unread, hung until its client gave it up
+            // (crates/mantle/tests/serve.rs; CI runs 44575349545, 44578467575 and 44581897076,
+            // since 9a312b2b learned the reply's depth from one).
+            Door::Local(local) => {
+                local.body = None;
                 // A reply slowed for a cause says it (`door::Slowed`); any other, its head.
                 let head = match reply.slowed {
                     Some(cause) => door::Answer::Slowed(cause),
@@ -9351,10 +9366,10 @@ pub(super) mod tests {
         let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
         let mut job = Job {
             door: Door::Local(Box::new(Local {
-                body: Pieces {
+                body: Some(Pieces {
                     pieces: body,
                     ended: None,
-                },
+                }),
                 reply,
                 pending: VecDeque::new(),
                 ready: false,
@@ -10706,6 +10721,8 @@ pub(super) mod tests {
         pub(crate) asked: u64,
         /// Whether it says it has no room for any ask (`Serve::room`).
         pub(crate) no_room: bool,
+        /// The volume table it places a put's blocks by (`Serve::table`), where it holds one.
+        table: Option<Table>,
         ended: Vec<(Option<u64>, u64, Option<usize>, usize)>,
         abandoned: usize,
         /// Whether it takes each ended job's door half, as a driving shard's lanes take it to the
@@ -10741,7 +10758,9 @@ pub(super) mod tests {
         }
 
         fn table(&mut self) -> Result<&Table, NodeError> {
-            Err(NodeError::Bounds("a stub holds no volume table".into()))
+            self.table
+                .as_ref()
+                .ok_or_else(|| NodeError::Bounds("a stub holds no volume table".into()))
         }
 
         fn group_of(&self, _: Layer) -> Option<u128> {
@@ -10824,6 +10843,7 @@ pub(super) mod tests {
                 answers: Vec::with_capacity(4),
                 asked: 0,
                 no_room: false,
+                table: None,
                 ended: Vec::with_capacity(4),
                 abandoned: 0,
                 takes_halves: false,
@@ -10879,10 +10899,10 @@ pub(super) mod tests {
         let (reply, answers) = hyper_rt::sync::channel(4).unwrap();
         let job = Job {
             door: Door::Local(Box::new(Local {
-                body: Pieces {
+                body: Some(Pieces {
                     pieces,
                     ended: None,
-                },
+                }),
                 reply,
                 pending: VecDeque::new(),
                 ready: false,
@@ -10992,6 +11012,121 @@ pub(super) mod tests {
         let job = put_job(put);
         assert!(job.held() && job.waits_for_room());
         assert_eq!(job.due_ns(5, 2), Some(7), "the S3 door's put, at its beat");
+    }
+
+    /// An S3 put whose chunk waits for room at its volume past two beats, its volume's cleaner
+    /// then finding none, is answered `InsufficientStorage` while its client's body is unread, and
+    /// its connection reads that answer. The connection, as the S3 listener runs it, reads the
+    /// reply until the host wants the body, then sends the body a piece at a time as its channel
+    /// has room, and reads the reply again only once the body is sent or its channel is closed
+    /// (`listener::conn`'s `exchange` and `stream`), its channels at the depths it makes before
+    /// any phase is measured, a piece and an answer (`door::Depth::FIRST`,
+    /// `door::Replying::FIRST_ANSWERS`). A job that held its body until its reply and the reply's
+    /// end both went, two answers to a channel of one, left the connection waiting for room in the
+    /// body's channel, which the job no longer took, and the job waiting for room in the reply's,
+    /// which the connection reads only once the body is sent: neither moved, and the fill suite's
+    /// S3 put of its first object held for room went unanswered until its client gave it up
+    /// (crates/mantle/tests/serve.rs; CI runs 44575349545, 44578467575 and 44581897076, the first
+    /// bad commit 9a312b2b, which learns the reply's depth from one rather than holding two).
+    #[test]
+    fn an_s3_put_answered_while_its_body_waits_lets_go_of_the_body_so_its_answer_is_read() {
+        // The fill suite's object, sent in pieces of a MiB.
+        const OBJECT: usize = 32 << 20;
+        const PIECE: usize = 1 << 20;
+        /// Where the connection is in its exchange.
+        enum Connection {
+            /// Reading the reply for the host's word that it wants the body.
+            Asking,
+            /// Sending the body from this octet, its end once past the object.
+            Sending(usize),
+            /// Reading the reply, the body sent or its channel closed.
+            Reading,
+        }
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let (body, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
+        let (reply, mut answers) = hyper_rt::sync::channel(door::Replying::FIRST_ANSWERS).unwrap();
+        let (mut job, _, _) =
+            local_job(Work::Put(native_put(u64::try_from(OBJECT).unwrap())), 0, 0);
+        job.door = Door::Local(Box::new(Local {
+            body: Some(Pieces {
+                pieces,
+                ended: None,
+            }),
+            reply,
+            pending: VecDeque::new(),
+            ready: false,
+        }));
+        host.push(job, 0);
+        // Three volumes, each refusing its copy of the block for want of room until the ask at
+        // the second beat, which its cleaner answers full.
+        let mut stub = Stub {
+            answer: |_| Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Busy)),
+            table: Some(Table::volumes(1)),
+            ..Stub::chunks()
+        };
+        let object = Bytes::from(vec![7u8; OBJECT]);
+        let mut connection = Connection::Asking;
+        let (mut beats, mut answer) = (0, None);
+        for _ in 0..256 {
+            match connection {
+                Connection::Asking => match answers.try_recv().unwrap() {
+                    Some(door::Answer::Ready) => connection = Connection::Sending(0),
+                    Some(other) => answer = Some(other),
+                    None => {}
+                },
+                Connection::Sending(at) => {
+                    let end = (at + PIECE).min(OBJECT);
+                    let piece = if at < OBJECT {
+                        let paced = door::Paced {
+                            sent: std::time::Instant::now(),
+                            delivered_ns: None,
+                        };
+                        Piece::Bytes(object.slice(at..end), paced)
+                    } else {
+                        Piece::End(None)
+                    };
+                    match body.try_send(piece) {
+                        Ok(()) if at < OBJECT => connection = Connection::Sending(end),
+                        // Waiting for room, it reads nothing of the reply.
+                        Err(SyncError::Full(_)) => {}
+                        // The body sent, or let go of by the host: its answer is read.
+                        Ok(()) | Err(_) => connection = Connection::Reading,
+                    }
+                }
+                Connection::Reading => answer = answers.try_recv().unwrap(),
+            }
+            if answer.is_some() {
+                break;
+            }
+            // A beat passes while the job waits for room: its chunks are asked again, as the
+            // host's step offers room at each beat (`Host::step`).
+            if host.jobs.first().is_some_and(Job::waits_for_room) {
+                beats += 1;
+                if beats == 2 {
+                    stub.answer = |_| Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Full));
+                }
+                host.offer_room(&mut stub, 0).unwrap();
+            }
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(beats, 2, "held for room past two beats");
+        let Some(door::Answer::Head(reply)) = answer else {
+            panic!(
+                "the connection waits for room in the body's channel, which the job no longer \
+                 takes, and the job for room in the reply's, which the connection reads only once \
+                 the body is sent: {answer:?}"
+            );
+        };
+        assert_eq!(reply.status, Status::InsufficientStorage);
+        assert!(
+            matches!(connection, Connection::Reading),
+            "the body's rest unsent"
+        );
+        // The host's turn the connection's take of the answer woke: the reply's end, held for
+        // room, goes, and the job ends.
+        host.step(&mut stub).unwrap();
+        assert!(host.idle(), "the job ended once its answer was read");
+        assert_eq!(answers.try_recv().unwrap(), Some(door::Answer::End));
     }
 
     /// Every outcome that says no room now, at the volume or in the transport toward it, here or at
@@ -11687,6 +11822,7 @@ pub(super) mod tests {
             answers: Vec::new(),
             asked: 0,
             no_room: false,
+            table: None,
             ended: Vec::new(),
             abandoned: 0,
             takes_halves: false,
@@ -12672,6 +12808,7 @@ pub(super) mod tests {
             answers: Vec::new(),
             asked: 0,
             no_room: false,
+            table: None,
             ended: Vec::new(),
             abandoned: 0,
             takes_halves: false,
@@ -12755,6 +12892,7 @@ pub(super) mod tests {
             answers: Vec::new(),
             asked: 0,
             no_room: false,
+            table: None,
             ended: Vec::new(),
             abandoned: 0,
             takes_halves: false,

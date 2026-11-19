@@ -5754,6 +5754,10 @@ mod room_seats;
 mod worker_need;
 
 #[cfg(test)]
+#[path = "shard_db/read_rent.rs"]
+mod read_rent;
+
+#[cfg(test)]
 mod grant_tests {
     //! The budget's grant charges each cache's share what the cache's index and ghost take now,
     //! so an index that grew lowers its cache's limit: a region a grant leaves above its limit

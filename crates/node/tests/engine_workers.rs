@@ -474,10 +474,17 @@ fn read_cost<F: BlockFile + 'static>(db: &mut mantle_engine::shard_db::ShardDb<F
     }
 }
 
+/// Passes of idle time and reads after the burst's maintenance is done: a quiet trunk's reads pay
+/// for its consolidation (mantle-engine `Trunk::charge_get`), and the passes show what it settles
+/// to. Three: the engine's own runs of a quiet trunk read and left idle settled it in two to four
+/// passes (`shard_db::read_rent`, 2026-11-19).
+const SETTLE_PASSES: usize = 3;
+
 /// A range's engine under the node's derived configuration (`derive::engine` of a cell's rules on
 /// a device of 4 KiB writes), opened as `process::engine` opens it, with `workers` maintenance
 /// workers or none, takes the burst; then its read costs, at once and after each doubling of the
-/// maintenance jobs applied since, until none is owed.
+/// maintenance jobs applied since, until none is owed, and after each of [`SETTLE_PASSES`] passes
+/// of idle time once its reads have charged the quiet trunk.
 fn burst_costs(workers: usize) -> Vec<ReadCost> {
     std::thread::spawn(move || {
         let dir = tempfile::tempdir().unwrap();
@@ -542,6 +549,18 @@ fn burst_costs(workers: usize) -> Vec<ReadCost> {
                 }
                 assert!(!db.owed(), "maintenance never caught up");
                 costs.push(read_cost(&mut db));
+                // Read once idle, the trunk is owed the consolidation its reads paid for: idle
+                // time spends it, and the reads after list what the layout settles to.
+                for _ in 0..SETTLE_PASSES {
+                    for _ in 0..1_000_000 {
+                        if !db.owed() {
+                            break;
+                        }
+                        db.idle_step(engine.trunk.leaf_entries).unwrap();
+                    }
+                    assert!(!db.owed(), "maintenance never caught up");
+                    costs.push(read_cost(&mut db));
+                }
                 costs
             })
             .unwrap()

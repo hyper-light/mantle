@@ -550,10 +550,10 @@ pub struct TrunkStats {
     /// and leave them: what [`Trunk::writes_cover_consolidation`] weighs the writes since
     /// against, the shape's entries counted another way.
     pub held_entries: u64,
-    /// Sources seeks were given by leaves' pivots and by index pivots ([`Trunk::charge`]); the
-    /// pivots seeks' rent paid for, leaves' and index pivots' apart; the pivots a paid flush
-    /// marked paid below it; and the consolidations started: where a consolidation's work
-    /// comes from.
+    /// Sources seeks, and gets through a quiet trunk, were given by leaves' pivots and by index
+    /// pivots ([`Trunk::charge`]); the pivots their rent paid for, leaves' and index pivots'
+    /// apart; the pivots a paid flush marked paid below it; and the consolidations started:
+    /// where a consolidation's work comes from.
     pub charged_leaf_sources: u64,
     pub charged_index_sources: u64,
     /// Consolidations seeks' charges priced, each a pivot's bundles summed.
@@ -647,6 +647,12 @@ pub struct Trunk {
     pub(crate) compact_most: Option<usize>,
     #[cfg(test)]
     pub(crate) pack_most: Option<usize>,
+    /// A test's workers held behind: while set, a step that does not wait hands out no job, so
+    /// jobs go out only when a put or a drain waits for them, as a worker that falls behind a
+    /// burst on a loaded machine takes them ([`Self::dispatch_tasks`]). Never a hold of the shard,
+    /// which waits for the jobs it needs.
+    #[cfg(test)]
+    pub(crate) hold_dispatch: bool,
     /// Gets, which with its branches' visits set the filters' plan ([`Trunk::filter_plan`]).
     gets: u64,
     /// Nanoseconds maintenance steps took and the keys they merged: the measured price of a
@@ -668,6 +674,11 @@ pub struct Trunk {
     consolidation: Consolidation,
     /// The pivots above paid ones, found before a consolidation marks them; kept for the next.
     marks: Vec<(usize, usize)>,
+    /// The pivots a get through a quiet trunk passed, and their rents: kept for the next get, so
+    /// a get charges its rent without allocating ([`Self::charge_get`]). At most the trunk's
+    /// height each.
+    get_path: Vec<Passed>,
+    get_rents: Vec<(Passed, u64)>,
     /// The maintenance workers compactions run on, when the shard has any ([`Self::set_pool`]).
     pool: Option<Pool>,
     /// How long this step waits on the workers ([`Wait`]), and whether it stopped for them.
@@ -918,6 +929,8 @@ impl Trunk {
             compact_most: None,
             #[cfg(test)]
             pack_most: None,
+            #[cfg(test)]
+            hold_dispatch: false,
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,
@@ -928,6 +941,8 @@ impl Trunk {
             consolidating: false,
             consolidation: Consolidation::Measured,
             marks: Vec::new(),
+            get_path: Vec::new(),
+            get_rents: Vec::new(),
             pool: None,
             wait: Wait::No,
             workers_waiting: false,
@@ -998,6 +1013,28 @@ impl Trunk {
         hash: u64,
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
+        let rent = self.get_rent_start();
+        let found = self
+            .search_async(store, key, hash, value, rent.is_some())
+            .await;
+        if let Some(t) = rent
+            && found.is_ok()
+        {
+            self.charge_get(store, t);
+        }
+        found
+    }
+
+    /// [`Self::get_hashed_async`]'s search, each pivot it passes noted for its rent when
+    /// `charging` ([`Self::get_path`]).
+    async fn search_async<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+        charging: bool,
+    ) -> Result<Option<Op>, Error> {
         self.gets = self.gets.saturating_add(1);
         self.stats.gets = self.stats.gets.saturating_add(1);
         for p in self.pending.iter_mut().rev() {
@@ -1024,6 +1061,7 @@ impl Trunk {
             // Every candidate's filter block read first, their misses overlapping; the probes in
             // order then find them cached.
             let mut touched = 0u64;
+            let mut listed = 0usize;
             for b in inflight
                 .get(pivot.start..)
                 .unwrap_or_default()
@@ -1032,9 +1070,23 @@ impl Trunk {
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
-                self.stats.get_sources = self.stats.get_sources.saturating_add(1);
+                listed = listed.saturating_add(1);
             }
             std::hint::black_box(touched);
+            let count = u64::try_from(listed).unwrap_or(u64::MAX);
+            self.stats.get_sources = self.stats.get_sources.saturating_add(count);
+            if charging {
+                // A quiet trunk holds no in-flight bundle: the pivot's sources are its bundle's,
+                // newest first, the shape a seek's descent names ([`Self::segment_at`]).
+                self.get_path.push(Passed {
+                    node: at,
+                    pivot: p,
+                    first: 0,
+                    sources: listed,
+                    newest: pivot.bundle.branches.first().map_or(0, |b| b.root),
+                    leaf: pivot.child.is_none(),
+                });
+            }
             for bundle in inflight
                 .get_mut(pivot.start..)
                 .unwrap_or_default()
@@ -1079,13 +1131,34 @@ impl Trunk {
         passes
     }
 
-    /// [`Self::get_hashed`], counting each filter's probes on its branch ([`Branch::probes`]).
+    /// [`Self::get_hashed`], counting each filter's probes on its branch ([`Branch::probes`]),
+    /// and charging a quiet trunk's pivots the get's rent ([`Self::charge_get`]).
     fn find<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         key: &[u8],
         hash: u64,
         value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
+        let rent = self.get_rent_start();
+        let found = self.search(store, key, hash, value, rent.is_some());
+        if let Some(t) = rent
+            && found.is_ok()
+        {
+            self.charge_get(store, t);
+        }
+        found
+    }
+
+    /// [`Self::find`]'s search, each pivot it passes noted for its rent when `charging`
+    /// ([`Self::get_path`]).
+    fn search<F: BlockFile>(
+        &mut self,
+        store: &mut Store<F>,
+        key: &[u8],
+        hash: u64,
+        value: &mut Vec<u8>,
+        charging: bool,
     ) -> Result<Option<Op>, Error> {
         self.gets = self.gets.saturating_add(1);
         self.stats.gets = self.stats.gets.saturating_add(1);
@@ -1113,6 +1186,7 @@ impl Trunk {
             // Every candidate's filter block read first, their misses overlapping; the probes in
             // order then find them cached.
             let mut touched = 0u64;
+            let mut listed = 0usize;
             for b in inflight
                 .get(pivot.start..)
                 .unwrap_or_default()
@@ -1121,9 +1195,23 @@ impl Trunk {
                 .chain(pivot.bundle.branches.iter())
             {
                 touched ^= b.filter.touch(hash);
-                self.stats.get_sources = self.stats.get_sources.saturating_add(1);
+                listed = listed.saturating_add(1);
             }
             std::hint::black_box(touched);
+            let count = u64::try_from(listed).unwrap_or(u64::MAX);
+            self.stats.get_sources = self.stats.get_sources.saturating_add(count);
+            if charging {
+                // A quiet trunk holds no in-flight bundle: the pivot's sources are its bundle's,
+                // newest first, the shape a seek's descent names ([`Self::segment_at`]).
+                self.get_path.push(Passed {
+                    node: at,
+                    pivot: p,
+                    first: 0,
+                    sources: listed,
+                    newest: pivot.bundle.branches.first().map_or(0, |b| b.root),
+                    leaf: pivot.child.is_none(),
+                });
+            }
             for bundle in inflight
                 .get_mut(pivot.start..)
                 .unwrap_or_default()
@@ -1400,6 +1488,60 @@ impl Trunk {
                 *counted = counted.saturating_add(1);
             }
         }
+    }
+
+    /// A get's rent is counted only through a quiet trunk, with consolidation on: nothing
+    /// pending, no maintenance in progress and no in-flight bundle, so a burst's gets cost no
+    /// clock and charge nothing a write's maintenance is about to change. The get's start, then.
+    fn get_rent_start(&mut self) -> Option<std::time::Instant> {
+        if self.consolidation == Consolidation::Never || !self.is_idle() {
+            return None;
+        }
+        self.get_path.clear();
+        Some(std::time::Instant::now())
+    }
+
+    /// Charges the pivots a get through a quiet trunk passed ([`Self::get_path`]) the rent for
+    /// its sources past the one a settled path keeps, as a seek's are charged ([`rents`],
+    /// [`Self::charge`]): the get's measured nanoseconds since `t`, each source listed taking an
+    /// equal share (a get times its descent, not each source, so its clock reads are two), all an
+    /// index pivot gave and all but one of the deepest pivot that gave any. The exchange of
+    /// those nanoseconds for a consolidation's is the seeks' measured rule: a pivot is paid once
+    /// its rent covers its consolidation's measured price, and idle time spends it
+    /// ([`Self::consolidate_step`]). A get of one source owes none and charges nothing.
+    fn charge_get<F: BlockFile>(&mut self, store: &Store<F>, t: std::time::Instant) {
+        let listed = self
+            .get_path
+            .iter()
+            .map(|p| p.sources)
+            .fold(0usize, usize::saturating_add);
+        if listed <= 1 {
+            return;
+        }
+        let ns = ns_since(Some(t));
+        let share = ns
+            .checked_div(u64::try_from(listed).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let deepest = self.get_path.iter().rposition(|p| p.sources > 0);
+        let mut charges = std::mem::take(&mut self.get_rents);
+        charges.clear();
+        charges.extend(self.get_path.iter().enumerate().map(|(i, &p)| {
+            let spare = if Some(i) == deepest {
+                p.sources.saturating_sub(1)
+            } else {
+                p.sources
+            };
+            let rent = share.saturating_mul(u64::try_from(spare).unwrap_or(u64::MAX));
+            (p, if spare > 0 { rent.max(1) } else { rent })
+        }));
+        let (read_ns, write_ns) = store.page_costs();
+        let pages = PageCosts {
+            read_ns,
+            write_ns,
+            extent_pages: u64::from(store.extent_pages()),
+        };
+        self.charge(&charges, pages);
+        self.get_rents = charges;
     }
 
     /// The entries and pages a pivot's own bundle and live in-flight branches hold.
@@ -2445,6 +2587,8 @@ impl Trunk {
             compact_most: None,
             #[cfg(test)]
             pack_most: None,
+            #[cfg(test)]
+            hold_dispatch: false,
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,
@@ -2455,6 +2599,8 @@ impl Trunk {
             consolidating: false,
             consolidation: Consolidation::Measured,
             marks: Vec::new(),
+            get_path: Vec::new(),
+            get_rents: Vec::new(),
             pool: None,
             wait: Wait::No,
             workers_waiting: false,

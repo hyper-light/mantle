@@ -396,6 +396,24 @@ rent alone and against consolidating at every quiet moment, with bursts of puts 
 The rent still buys pivots wherever a shard never falls quiet or its writes have not paid for a
 rebuild.
 
+**Gets pay rent through a quiet trunk** (2026-11-19). A maintenance worker that falls behind a
+burst runs fewer compactions than the shard runs inline, each of more in-flight bundles, so the
+trunk falls quiet with pivot bundles near the fanout: after 40,000 Name rows under the node's
+derived engine, a loaded worker's quiet trunk listed 5.0–10.4 sources a get against inline's
+2.6–2.8 (mantle-node tests/engine_workers.rs). Only seeks paid for consolidating it, and a range
+serving GETs runs few; a worker's merge measured about three times the shard's a key (29–32 µs
+against 9.3 µs, debug build), so the seeks' rent bought its pivots about three times later; and
+its memtable never emptied for its writes to pay for a whole consolidation. A get through a quiet
+trunk (nothing pending, no maintenance in progress, no in-flight bundle) now pays the pivots it
+passed rent as a seek does (`Trunk::charge_get`): its descent's measured nanoseconds, each source
+listed an equal share, all an index pivot gave and all but one of the deepest pivot's, against
+the seeks' measured price (research/50 §3, §10). So a pivot is consolidated once its reads have
+cost what its consolidation does, in idle time and within the idle step's budget; a trunk nobody
+reads is not rewritten, and a get through a busy trunk reads no clock and charges nothing. With
+the worker held behind through a 20,000-row burst (`Trunk::hold_dispatch`, the engine's
+`read_rent` tests), the quiet trunk's gets listed 4.0 sources and, once read and idle, 1.0;
+inline maintenance's trunk listed 7.85 and settled to 1.0 under the same reads.
+
 A whole consolidation is a pass down from the root, writing each leaf once (2026-10-15;
 research/57 §2). Its flushes came down a trunk of several index levels in waves, and a leaf settled
 before a wave reached it was paid again and settled again: at 100M every leaf of the drain's

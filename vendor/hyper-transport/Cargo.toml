@@ -46,5 +46,10 @@ name = "e2e"
 # (CLAUDE.md §1a; no thread per anything). The binary also serves as the peer process.
 harness = false
 
+[[bench]]
+# The transmit side of an endpoint holding thousands of connections (docs/benchmarks.md).
+name = "transmit"
+harness = false
+
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

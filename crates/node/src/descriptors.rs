@@ -7,17 +7,18 @@
 //!   limit" (getrlimit(2), Linux man-pages). A refusal (a sandbox's) leaves the limit as it stands,
 //!   and the read-back says it.
 //! - macOS: the same, with the kernel's own ceiling `kern.maxfilesperproc` (sysctl(3)) beside it:
-//!   `setrlimit` "no longer accepts "rlim_cur = RLIM_INFINITY" for RLIM_NOFILE. Use "rlim_cur =
-//!   min(OPEN_MAX, rlim_max)"" (getrlimit(2), macOS, COMPATIBILITY), refusing a soft limit past
-//!   that ceiling with `EINVAL`, and a process holds no more than it whatever its soft limit says
-//!   (XNU `bsd/kern/kern_resource.c`, `dosetrlimit`). The soft limit is raised to the smaller of the
-//!   hard limit and the ceiling, and the bound read back is the smaller of the soft limit and the
-//!   ceiling.
+//!   "The real NOFILE limits enforced by the kernel is capped at MIN(RLIMIT_NOFILE,
+//!   maxfilesperproc)" (XNU `bsd/kern/kern_resource.c`, `dosetrlimit`; `proc_limitgetcur_nofile`),
+//!   whatever the soft limit says, and `setrlimit` "no longer accepts "rlim_cur = RLIM_INFINITY"
+//!   for RLIM_NOFILE. Use "rlim_cur = min(OPEN_MAX, rlim_max)"" (getrlimit(2), macOS,
+//!   COMPATIBILITY). The soft limit is raised to the smaller of the hard limit and the ceiling, and
+//!   the bound read back is the smaller of the soft limit and the ceiling.
 //! - Windows: nothing to raise. The C runtime's limit (`_setmaxstdio`) bounds only its own streams
 //!   and low-level descriptors, which Rust's std does not use: its files are handles and its
 //!   sockets Winsock's, both kernel objects, and "The per-process limit on kernel handles is 2^24"
-//!   (Microsoft Learn, Kernel Objects). That is the bound, which memory meets first on any machine
-//!   mantle runs on.
+//!   (Microsoft Learn, Kernel Objects). That is the bound, though "handles are stored in the paged
+//!   pool, so the actual number of handles you can create is based on available memory" (the same
+//!   page).
 
 #[cfg(target_os = "macos")]
 mod macos;

@@ -175,41 +175,65 @@ pub struct Gateway {
 }
 
 /// How many operations `share` bytes hold, and the bytes left for what they hold at their own
-/// sizes, where each operation costs its charge and `beside` bytes of the node's other classes
-/// (its exchanges, its client's connections, its read's state): the bytes for what the node
-/// serves first ([`served`]), and as many operations more at the least one holds as the share
-/// then holds; never fewer than the operations served where the share holds them at the least,
-/// the bytes past them its parts', and at least one, its bytes at least the most one operation is
-/// charged ([`most_charged`]), where the share holds less: every operation is admitted alone. Never
-/// more than `most`, the operations the process's descriptors hold ([`descriptor_operations`]), at
-/// least one, which [`derive`] refuses to start without.
+/// sizes, where `n` operations cost their charges and `beside(n)` bytes of the node's other classes
+/// (their exchanges, their clients' connections and trains, their reads' state), counted at `n`:
+/// the bytes for what the node serves first ([`served`]), and as many operations more at the least
+/// one holds as the share then holds; never fewer than the operations served where the share holds
+/// them at the least, the bytes past them their parts', and at least one, its bytes at least the
+/// most one operation is charged ([`most_charged`]), where the share holds less: every operation is
+/// admitted alone. Never more than `most`, the operations the process's descriptors hold
+/// ([`descriptor_operations`]), at least one, which [`derive`] refuses to start without.
+/// `beside` grows with the operations and never shrinks; it may grow by less with each past a
+/// bound the count reaches, as a receive's batch stops at `MAX_BATCH` trains (`bounds::io`), and
+/// the operations past it hold only what they hold.
 pub fn operations(
     share: u64,
-    beside: u64,
+    beside: &dyn Fn(u64) -> Option<u64>,
     charges: &Charges,
     serving: Served,
     most: u64,
 ) -> (usize, u64) {
     let floor = most_charged(charges);
     let held = serving.bytes.max(floor);
-    let each = charges.least().saturating_add(beside).max(1);
-    let by_least = share.checked_div(each).unwrap_or(0);
+    let least = charges.least();
+    let by_least = most_within(share, share.checked_div(least.max(1)).unwrap_or(0), &|n| {
+        n.checked_mul(least)?.checked_add(beside(n)?)
+    });
     let past = |bytes: u64| {
         share
             .checked_sub(bytes)
-            .and_then(|rest| rest.checked_div(beside.max(1)))
-            .unwrap_or(0)
+            .map_or(0, |rest| most_within(rest, by_least, beside))
     };
     let (by_held, by_floor) = (past(held), past(floor));
-    let count = by_least
-        .min(by_held)
-        .max(serving.operations.min(by_least).min(by_floor))
+    let count = by_held
+        .max(serving.operations.min(by_floor))
         .max(1)
         .min(most.max(1));
     let bytes = share
-        .saturating_sub(count.saturating_mul(beside))
+        .saturating_sub(beside(count).unwrap_or(u64::MAX))
         .max(floor);
     (usize::try_from(count).unwrap_or(usize::MAX), bytes)
+}
+
+/// The most operations, at most `upper`, whose `cost` is within `bytes`, none where one's is past
+/// it; a cost of `None` is past any bytes. `cost` never shrinks as the operations grow, so the
+/// count lies from `low`, whose cost fits, to `high`, past which every cost is past the bytes, and
+/// halving that span finds it: a u64's span halves to nothing within 64 steps, the loop's bound.
+fn most_within(bytes: u64, upper: u64, cost: &dyn Fn(u64) -> Option<u64>) -> u64 {
+    let (mut low, mut high) = (0u64, upper);
+    for _ in 0..=u64::BITS {
+        let Some(span) = high.checked_sub(low).filter(|span| *span > 0) else {
+            break;
+        };
+        // The upper middle, past `low`, so the span shrinks whichever side it falls.
+        let middle = low.saturating_add(span.div_ceil(2));
+        if cost(middle).is_some_and(|cost| cost <= bytes) {
+            low = middle;
+        } else {
+            high = middle.saturating_sub(1);
+        }
+    }
+    low
 }
 
 /// The drivers a copy runs at once once taken, its get of the source and its put of the copy
@@ -293,14 +317,29 @@ pub fn served(charges: &Charges, s3: bool) -> Served {
 pub fn gateway(objects: usize, objects_bytes: u64) -> Result<Gateway, DeriveError> {
     Ok(Gateway {
         window: 1,
-        objects,
-        objects_bytes,
-        clients: objects,
+        objects: 0,
+        objects_bytes: 0,
+        clients: 0,
         bucket_quota: BUCKET_QUOTA,
         scan_rows: scan_rows()?,
         handover_ns: u64::try_from(HANDOVER.as_nanos())
             .map_err(|_| DeriveError::Overflow("the handover"))?,
-    })
+    }
+    .running(objects, objects_bytes))
+}
+
+impl Gateway {
+    /// This gateway running `objects` operations at once at most, their bytes `objects_bytes`,
+    /// as [`gateway`] has it, without reckoning its scan's rows again: [`derive`] counts the
+    /// node at many counts of operations, and the rows encode the largest entry to measure it.
+    fn running(self, objects: usize, objects_bytes: u64) -> Self {
+        Self {
+            objects,
+            objects_bytes,
+            clients: objects,
+            ..self
+        }
+    }
 }
 
 /// The rows one step of a bucket's attempt passes or removes (`coordinator::Bounds`): as many as the
@@ -1645,7 +1684,7 @@ pub const SHARD_INTEREST_SLOT_BYTES: u64 = 16;
 /// power of two at or past twice its waiters (hyper-rt `Interests::new`), so it holds fewer than
 /// four slots a waiter at every count, and four bounds it. Charged at its power of two instead, the
 /// runtime grew by nothing from one S3 connection to two and by a doubled table at each power of
-/// two past them, so the operations' count, which charges each operation that difference
+/// two past them, so the operations' count, which charged each operation that difference then
 /// (`derive`), passed the floor it was counted for: a node of three shards at 7 GiB counted a floor
 /// 190,464 bytes past its allowance, three tables grown from 128 slots to 4,096 at 16 bytes each
 /// (CI run 44286448798, macOS x86_64).
@@ -2267,7 +2306,9 @@ fn layer_name(layer: Layer) -> &'static str {
 ///   floor to a receive chunk each share for the connections those operations open
 ///   (`bounds::chunked_transport`), whole while what remains past (1) and (2) holds it; (4) every
 ///   operation more that what remains past those holds, each with its client's windows at the
-///   transport's ([`operations`]). What no want takes goes to the engines' metadata, up to their
+///   transport's, what they hold beside their charges counted at their count, so a bound the
+///   count reaches (a receive's batch at `MAX_BATCH` trains) charges none past it
+///   ([`operations`]). What no want takes goes to the engines' metadata, up to their
 ///   devices' shares: a volume's fragments and an engine's extents as many as their shares hold
 ///   ([`volume`], [`engine_within`]), an engine never fewer than its store holds, which it would
 ///   not open below (`Store::open`). An engine's page cache takes no share: its want, every page
@@ -2391,7 +2432,9 @@ fn derive_with(
     } else {
         Vec::new()
     };
-    let charges = Charges::new(gateway(0, 0)?.window, &schemes)?;
+    // The gateway at no operations, its scan's rows reckoned once: the node is counted at many.
+    let idle = gateway(0, 0)?;
+    let charges = Charges::new(idle.window, &schemes)?;
 
     // Each volume as its index's whole want would have it: its buffers, its transfers, its want.
     if stated.volumes.len() != measured.volumes.len() {
@@ -2526,7 +2569,7 @@ fn derive_with(
     // peers (node.md §3.6) drawing its exchanges from a pool of as many, each share of its windows
     // at `window` (`bounds::transport_at`), and each range's reads.
     let held_at = |objects: usize, transfers: usize, window: u64| -> Result<Held, DeriveError> {
-        let gateway = gateway(objects, 0)?;
+        let gateway = idle.running(objects, 0);
         let asked = if hosts {
             asks(&gateway, &schemes)?
         } else {
@@ -2687,7 +2730,7 @@ fn derive_with(
     // The operations' first, at the most one is charged ([`operations`]); none where the node
     // hosts no objects.
     let first = if hosts {
-        crate::derive::objects(&gateway(1, most_charged(&charges))?, &schemes)?
+        crate::derive::objects(&idle.running(1, most_charged(&charges)), &schemes)?
     } else {
         0
     };
@@ -2722,7 +2765,7 @@ fn derive_with(
         // boto3's ten 8 MiB parts at a time, and the last waited at the door past its client's
         // patience (kind-cell, CI run 43790965629).
         let served_bytes = if hosts {
-            crate::derive::objects(&gateway(served, serving.bytes)?, &schemes)?
+            crate::derive::objects(&idle.running(served, serving.bytes), &schemes)?
         } else {
             0
         };
@@ -2803,15 +2846,35 @@ fn derive_with(
             .checked_add(held.runtime)
     };
     // What one more operation adds to the transport and the ranges with each share of the
-    // transport's windows at `window`, the model's own difference, and the floor with one
-    // operation at the most one is charged.
-    let one_at = |window: u64| -> Result<(u64, u64), DeriveError> {
+    // transport's windows at `window`, the model's own difference, the most one adds; the floor
+    // with one operation at the most one is charged; and what that one's transport, ranges,
+    // listener and runtime hold.
+    let one_at = |window: u64| -> Result<(u64, u64, u64), DeriveError> {
         let one = held_by(1, window)?;
+        let held = total(&one).ok_or(overflow("an operation's state"))?;
         let each = total(&held_by(2, window)?)
-            .zip(total(&one))
-            .and_then(|(two, one)| two.checked_sub(one))
+            .and_then(|two| two.checked_sub(held))
             .ok_or(overflow("an operation's state"))?;
-        Ok((each, floor_at(&one, first)?))
+        Ok((each, floor_at(&one, first)?, held))
+    };
+    // What `n` operations hold beside their charges with each share at `window`, where one holds
+    // `one` and `each` is what one more adds: `each` for the first, as the operations' share
+    // counts it, and what `n` hold past one, counted at `n` (`held_by`), so a bound the count
+    // reaches stops what grows with it. A receive's batch takes a train from each peer and client
+    // at once within `MAX_BATCH` trains (`bounds::io`), and a range holds its reads within its
+    // `pending_reads` (`range_bytes`). Charged the difference from one operation to two, every
+    // operation past the batch's 1,024 trains was charged a train no batch holds, the plane
+    // socket's outbound slot (65,592 bytes; `Io::held_bound`), and on Linux the transport's
+    // ring's and the plane's 64 KiB buffers and their headers too (197,752;
+    // `bounds::ring_growth`), and every one past a range's reads their state: a ladder founder on
+    // 96 GiB had 4.42 GB on macOS and 11.10 GB on Linux charged to operations and never held, 3.83
+    // GB and 10.59 GB of it trains, which went to its engines' metadata (`derive::tests`).
+    let beside_at = |n: u64, window: u64, (one, each): (u64, u64)| -> Option<u64> {
+        if n == 0 {
+            return Some(0);
+        }
+        let held = held_by(usize::try_from(n).ok()?, window).ok()?;
+        total(&held)?.checked_sub(one)?.checked_add(each)
     };
     // Rule D's order (research/87 §4): (1) the capacity wants, whole while the memory past the
     // floor holds them; (2) the operations the node serves at least ([`served`]), the one the
@@ -2821,7 +2884,7 @@ fn derive_with(
     // client's windows at a receive chunk. No page cache takes a share: each engine's borrows the
     // operations' idle bytes (`admit::cache_part`, `node::host::lend`), at most its want,
     // `engine.cache_bytes`.
-    let (each, floor_one) = if hosts { one_at(initial)? } else { (0, 0) };
+    let (each, floor_one, one) = if hosts { one_at(initial)? } else { (0, 0, 0) };
     let base = if hosts {
         floor_one
     } else {
@@ -2832,14 +2895,19 @@ fn derive_with(
     } else {
         0
     };
+    // What the operations served hold past the one the floor holds: their parts' bytes past its
+    // charge, and their state past its.
     let served_past = if hosts {
         let most = most_charged(&charges);
         serving
             .bytes
             .max(most)
             .checked_sub(most)
-            .zip(serving.operations.checked_sub(1))
-            .and_then(|(bytes, more)| bytes.checked_add(more.checked_mul(each)?))
+            .zip(
+                beside_at(serving.operations, initial, (one, each))
+                    .and_then(|state| state.checked_sub(each)),
+            )
+            .and_then(|(bytes, state)| bytes.checked_add(state))
             .ok_or(overflow("the operations served"))?
     } else {
         0
@@ -2869,9 +2937,10 @@ fn derive_with(
         // is the operations', with the one, its state and its charge, each operation adding its
         // client's windows at `window`: a chunk each where (3) is whole, so a datagram each
         // connection receives is cut from a chunk, not copied (10,414 operations where 13,764 at
-        // QUIC's initial window on a 16 GiB host, research/87 §4).
-        let (each, floor_one) = if window == initial {
-            (each, floor_one)
+        // QUIC's initial window on a 16 GiB host, research/87 §4). What they hold beside their
+        // charges is counted at their count (`beside_at`).
+        let (each, floor_one, one) = if window == initial {
+            (each, floor_one, one)
         } else {
             one_at(window)?
         };
@@ -2884,8 +2953,9 @@ fn derive_with(
             .checked_add(each)
             .and_then(|share| share.checked_add(slack))
             .ok_or(overflow("the operations' share"))?;
-        let (by_memory, _) = operations(share, each, &charges, serving, u64::MAX);
-        let (objects, bytes) = operations(share, each, &charges, serving, by_descriptors);
+        let beside = |n: u64| beside_at(n, window, (one, each));
+        let (by_memory, _) = operations(share, &beside, &charges, serving, u64::MAX);
+        let (objects, bytes) = operations(share, &beside, &charges, serving, by_descriptors);
         let native = native(&charges, each).ok_or(overflow("a native operation's bound"))?;
         say_descriptors(
             &mut said,
@@ -2905,7 +2975,7 @@ fn derive_with(
         );
         (0, 0, None)
     };
-    let gateway = gateway(objects, objects_bytes)?;
+    let gateway = idle.running(objects, objects_bytes);
     let Held {
         asked,
         mut bounds,
@@ -3642,8 +3712,9 @@ fn say_objects(
         gateway.objects,
         Kind::Derived,
         "the most operations at once, those bytes at the least an operation holds, a write of no \
-         bytes (derive::Charges); within it the node runs as many as it learns its knee is \
-         (crate::admit, node.md §2.8)",
+         bytes (derive::Charges), with what they hold beside it counted at their count, a \
+         receive's batch at most MAX_BATCH trains (derive::operations); within it the node runs \
+         as many as it learns its knee is (crate::admit, node.md §2.8)",
     );
     said.add(
         "gateway.clients",
@@ -4479,7 +4550,13 @@ mod tests {
     /// that suite's joiner has, at their cores and memory: three on the macOS runner's 7 GiB, four on
     /// Windows' 16 GiB. Its listener serves thousands of connections, past the two at once that
     /// suite's load and reads open, so its door answers none of them `503 SlowDown` for want of a
-    /// slot, and its floor, counted at the operations it derived, stays within its allowance.
+    /// slot, and its floor, counted at the operations it derived, stays within its allowance. It is
+    /// granted its cell's volume, as `mantle init grant` writes the suite's (`cell.volume`), so
+    /// its engines want the cell's rows. Stating none, they want nothing and hold what the
+    /// operations leave: nothing, now that each operation is charged what it holds, and the node
+    /// refuses (`DeriveError::Metadata`), as it did on the macOS runner before `cell.volume`
+    /// (node.md §1.4); it had started here only on the trains past the receive batch's cap each
+    /// operation was charged and no batch holds, which its engines took.
     #[test]
     fn a_joiner_on_a_ci_runner_serves_thousands_of_connections_within_its_allowance() {
         let joiner = || Stated {
@@ -4498,6 +4575,7 @@ mod tests {
                 max_nodes: 5,
                 max_volumes: 5,
             }),
+            cell_volume: Some(256 << 20),
             ..stated(0)
         };
         for (cores, memory) in [(3usize, 7u64 << 30), (4, 16 << 30)] {
@@ -4644,6 +4722,86 @@ mod tests {
         }
     }
 
+    /// A receive's batch takes a datagram train from each peer and client at once, within
+    /// `MAX_BATCH` trains (`bounds::io`, `UIO_MAXIOV`): the plane's socket holds an outbound slot
+    /// for each, a 64 KiB datagram and its address (hyper-rt `Io::held_bound`), and on Linux, where
+    /// a receive takes a batch (recvmmsg(2) with `UDP_GRO`), the transport's receive ring and the
+    /// plane's socket a 64 KiB buffer for each besides, with their messages' headers
+    /// (`bounds::ring_growth`, `Ring::bytes_for`). A client adds a train only while the batch has
+    /// room for it; past its 1,024 trains it adds its connections, windows and exchanges alone, a
+    /// train less: 65,592 bytes on macOS and Windows, 197,752 on Linux. Charged what a client adds
+    /// below the cap, as derive charged every operation the difference from one to two
+    /// (c1589e30), a node of three peers and 60,000 clients is charged a train for each of the
+    /// 58,979 past the cap, which no batch holds: 3.87 GB on macOS, 11.66 GB on Linux.
+    #[test]
+    fn a_receive_batch_holds_a_train_a_client_to_its_cap_and_no_more() {
+        use hyper_rt::udp::{Io, MAX_BATCH, RECEIVE_BYTES, Ring, Slot};
+        use mantle_protocol::bounds;
+        let (settings, _) = cell(3).unwrap();
+        let messages = messages().unwrap();
+        // The trains a node of three peers and `clients` clients batches, and what its transport
+        // holds in its budget and beside it, each share at a receive chunk.
+        let held = |clients: usize| {
+            let mut stated = bounds::Stated {
+                peers: 3,
+                replicas: 2,
+                clients,
+                pool: clients,
+                ranges: 5,
+                inflight: settings.max_inflight_msgs,
+                lanes: 1,
+                transfers: 38,
+                asked: 0,
+                transport_bytes: 0,
+                messages,
+                max_head: crate::node::MAX_HEAD,
+            };
+            stated.transport_bytes = bounds::chunked_transport(&stated).unwrap();
+            let bytes = stated.transport_bytes + transport_bytes_beside(&stated).unwrap();
+            (bounds::io(&stated).batch, bytes)
+        };
+        // A train, as hyper-rt states what the ring and the socket that hold it hold.
+        let bytes = |n: usize| u64::try_from(n).unwrap();
+        let ring = |batch: usize| bytes(Ring::bytes_for(Io { batch }, batch));
+        let socket = |batch: usize| bytes(Io { batch }.held_bound());
+        let train =
+            ring(MAX_BATCH) - ring(MAX_BATCH - 1) + socket(MAX_BATCH) - socket(MAX_BATCH - 1);
+        let slot = bytes(RECEIVE_BYTES + size_of::<Slot>());
+        assert_eq!(slot, 65_592);
+        // On Linux, besides the slot: the ring's buffer and the socket's, and their headers, the
+        // ring's place for a buffer (24 bytes), a receive's header and its account (384) and the
+        // socket's send's and receive's headers and the account (680; glibc and musl on aarch64
+        // and x86_64).
+        let linux = slot + 2 * bytes(RECEIVE_BYTES) + 24 + 384 + 680;
+        assert_eq!(linux, 197_752);
+        assert_eq!(
+            train,
+            if cfg!(target_os = "linux") {
+                linux
+            } else {
+                slot
+            }
+        );
+        // The clients whose trains fill the batch beside the three peers'.
+        let full = MAX_BATCH - 3;
+        let (short, below) = held(full - 1);
+        let (filled, at) = held(full);
+        let (past, beyond) = held(full + 1);
+        assert_eq!((short, filled, past), (MAX_BATCH - 1, MAX_BATCH, MAX_BATCH));
+        // What one client more adds below the cap and past it: a train apart.
+        let (below, beyond) = (at - below, beyond - at);
+        assert_eq!(below - beyond, train);
+        // Past the cap the batch stays, and each client more adds what one adds past it.
+        let many = 60_000;
+        let (batch, most) = held(many);
+        assert_eq!(batch, MAX_BATCH);
+        let more = bytes(many - full);
+        assert_eq!(most - at, more * beyond);
+        // Charged at what one adds below the cap, they are charged a train each that no batch
+        // holds.
+        assert_eq!(more * below - (most - at), more * train);
+    }
+
     /// The S3 endpoint a test node states.
     fn s3() -> Option<crate::process::S3Stated> {
         Some(crate::process::S3Stated {
@@ -4668,14 +4826,17 @@ mod tests {
     }
 
     /// The operations a node derived on this platform runs: `linux` on Linux, `elsewhere` on macOS
-    /// and Windows. Each operation holds 133,520 bytes more on Linux, its client's train in a
-    /// receive's batch: a receive there takes a datagram train from each peer and client at once
-    /// (recvmmsg(2) with `UDP_GRO`, `bounds::io`), so the transport's receive ring and the plane's
-    /// socket each hold a buffer of 64 KiB for it (hyper-rt `RECEIVE_BYTES`; `bounds::ring_growth`,
-    /// `Io::held_bound`), 131,072 bytes, and the headers of its messages, 2,448; a receive
-    /// elsewhere takes one datagram into one buffer. Read as `memory.native`, an operation's charge,
-    /// what one more adds beside it and its records: 133,520 bytes apart on Linux and macOS in
-    /// every node these tests derive (c1589e30).
+    /// and Windows. Each operation holds 133,520 bytes more on Linux while the receive's batch
+    /// holds its client's train: a receive there takes a datagram train from each peer and client
+    /// at once (recvmmsg(2) with `UDP_GRO`, `bounds::io`), so the transport's receive ring and the
+    /// plane's socket each hold a buffer of 64 KiB for it (hyper-rt `RECEIVE_BYTES`;
+    /// `bounds::ring_growth`, `Io::held_bound`), 131,072 bytes, and the headers of its messages,
+    /// 2,448; a receive elsewhere takes one datagram into one buffer. Read as `memory.native`, an
+    /// operation's charge, what one more adds beside it and its records: 133,520 bytes apart on
+    /// Linux and macOS in every node these tests derive (c1589e30). Past the batch's 1,024 trains
+    /// an operation holds no train on either, and 1,360 bytes more on Linux, the headers of its
+    /// client's two connections' sockets
+    /// ([`a_receive_batch_holds_a_train_a_client_to_its_cap_and_no_more`]).
     fn runs(linux: std::ops::Range<u64>, elsewhere: std::ops::Range<u64>) -> std::ops::Range<u64> {
         if cfg!(target_os = "linux") {
             linux
@@ -4687,12 +4848,19 @@ mod tests {
     /// A founder of the ladder's cell (three founders, each a 32 GiB volume and its S3 endpoint)
     /// on the Mac Studio's 96 GiB and 32 cores gives its transport its want whole: every share,
     /// each operation's client's among them, at a receive chunk, so each datagram is cut from a
-    /// chunk, not copied. Each operation so costs its client's windows at a chunk: 58,965
-    /// operations where 71,522 at QUIC's initial window (36ad012b), 9.47 GB past the transport's
-    /// floor; the need is 36ad012b's, which holds the capacity wants and the operations served,
-    /// and the piece the node's task reads every native body into, which step 6 counts in the
-    /// transport's floor (`node::PIECE`, node.md §2.9 step 6c). Each operation holds 133,520 bytes
-    /// more on Linux ([`runs`]), and the founder runs 54,591 there (c1589e30).
+    /// chunk, not copied. Each operation so costs its client's windows at a chunk, 10.04 GB past
+    /// the transport's floor on macOS; the need is 36ad012b's, which holds the capacity wants and
+    /// the operations served, and the piece the node's task reads every native body into, which
+    /// step 6 counts in the transport's floor (`node::PIECE`, node.md §2.9 step 6c). What its
+    /// operations hold beside their charges is counted at their count: it runs 62,502 on macOS and
+    /// 62,354 on Linux ([`runs`]), and every byte past its capacity wants is its operations', so
+    /// each engine's metadata is its want. Charged the difference from one operation to two, it
+    /// ran 59,412 and 54,591 (c1589e30): each of the 58,391 and 53,570 past the receive batch's
+    /// 1,024 trains was charged a train no batch holds, 65,592 bytes on macOS and 197,752 on Linux
+    /// ([`a_receive_batch_holds_a_train_a_client_to_its_cap_and_no_more`]), and each past the
+    /// reads a range holds (`pending_reads`) their state, 4.42 GB and 11.10 GB in all, which went
+    /// to the engines' metadata: 2.27 GB each on macOS and 3.60 GB on Linux, where it wants
+    /// 1.38 GB.
     #[test]
     fn a_node_with_memory_to_spare_gives_every_operations_windows_a_receive_chunk() {
         let mut founder = Stated {
@@ -4721,7 +4889,7 @@ mod tests {
         assert_eq!(bytes - floor, want);
         let operations = said_bytes(&derived, "gateway.objects");
         assert!(
-            runs(54_000..56_000, 58_000..60_000).contains(&operations),
+            runs(61_350..63_350, 61_500..63_500).contains(&operations),
             "{operations}"
         );
         assert_eq!(
@@ -4741,6 +4909,15 @@ mod tests {
             memtable_bytes: c.memtable_bytes,
             trunk: c.trunk,
         };
+        // What remains past the floor is the capacity wants whole and nothing more: the
+        // operations took the rest, so no engine's metadata takes what no want does.
+        let objects = said_bytes(&derived, "engine.objects");
+        let metadata = engine_wants_for(&engine, objects).unwrap();
+        assert_eq!(said_bytes(&derived, "engine.metadata_bytes"), metadata);
+        assert_eq!(
+            said_bytes(&derived, "memory.remaining"),
+            said_bytes(&derived, "volume.1.index_bytes") + 5 * metadata
+        );
         let each = workers_bytes(&engine, c.rules.max_key_bytes, ENGINE_WORKERS).unwrap();
         assert!((80_000_000..100_000_000).contains(&each), "{each}");
         assert_eq!(
@@ -4777,8 +4954,10 @@ mod tests {
     /// founder measuring four deep runs 235, where 27 while its floor counted a lane at each of
     /// its three shards (5f3839f2) and 31 at QUIC's initial window (36ad012b). On Linux it runs
     /// 219: each operation holds 133,520 bytes more there ([`runs`]), though the kernel holds the
-    /// device's four transfers on the issuer's one thread, four stacks fewer. Each cache's line is
-    /// its want, its store's pages at most.
+    /// device's four transfers on the issuer's one thread, four stacks fewer. Counting its
+    /// operations at their count moves neither: with its eight peers they make 243 trains and 227,
+    /// within the receive batch's 1,024, and every train charged is one it holds. Each cache's
+    /// line is its want, its store's pages at most.
     #[test]
     fn on_cis_macos_runner_the_capacity_wants_stand_and_the_operations_take_the_rest() {
         let member = |volume: bool| {
@@ -4997,30 +5176,34 @@ mod tests {
     }
 
     /// A share holds an operation of the largest blocks and as many more at the least an operation
-    /// holds and what it adds beside as fit; at least one at the most where it holds less.
+    /// holds and what it adds beside as fit; at least one at the most where it holds less. What
+    /// the operations hold beside is counted at their count: past a bound that stops a part of it,
+    /// each operation more costs only what still grows, and the bytes the share holds for their
+    /// charges are what their count leaves.
     #[test]
     fn the_operations_hold_their_share_of_the_memory() {
         let charges = Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap();
         let share = 1u64 << 30;
         let beside = 300_000;
+        let each = |n: u64| n.checked_mul(beside);
         let most = most_charged(&charges);
         let one = Served {
             operations: 1,
             bytes: most,
         };
-        let (count, bytes) = operations(share, beside, &charges, one, u64::MAX);
+        let (count, bytes) = operations(share, &each, &charges, one, u64::MAX);
         let count = u64::try_from(count).unwrap();
         assert_eq!(count, share / (charges.least() + beside));
         assert_eq!(bytes, share - count * beside);
         assert!(bytes >= most && bytes >= count * charges.least());
-        assert_eq!(operations(1, beside, &charges, one, u64::MAX), (1, most));
+        assert_eq!(operations(1, &each, &charges, one, u64::MAX), (1, most));
         // Bytes held for what the node serves come first, the operations past them each at the
         // least.
         let held = Served {
             operations: 10,
             bytes: share / 2,
         };
-        let (count, bytes) = operations(share, beside, &charges, held, u64::MAX);
+        let (count, bytes) = operations(share, &each, &charges, held, u64::MAX);
         let count = u64::try_from(count).unwrap();
         assert!(bytes >= held.bytes, "{bytes} of {}", held.bytes);
         assert_eq!(count, (share - held.bytes) / beside);
@@ -5030,9 +5213,40 @@ mod tests {
             operations: 10,
             bytes: share * 2,
         };
-        let (count, bytes) = operations(share, beside, &charges, short, u64::MAX);
+        let (count, bytes) = operations(share, &each, &charges, short, u64::MAX);
         assert_eq!(count, 10);
         assert_eq!(bytes, share - 10 * beside);
+        // A part of what each operation holds beside, a train, stops growing at the hundredth:
+        // the operations past it cost the rest alone, and the share holds as many more as that
+        // frees, every byte of it charged to an operation held. Charged the train each, they
+        // were fewer, and the share's bytes for their charges kept what no train held.
+        let (train, trains) = (100_000u64, 100u64);
+        let capped = |n: u64| {
+            n.checked_mul(beside - train)?
+                .checked_add(n.min(trains) * train)
+        };
+        let (count, bytes) = operations(share, &capped, &charges, one, u64::MAX);
+        let count = u64::try_from(count).unwrap();
+        let least = charges.least();
+        let held = |n: u64| n * least + capped(n).unwrap();
+        assert!(held(count) <= share && held(count + 1) > share, "{count}");
+        assert_eq!(bytes, share - capped(count).unwrap());
+        assert_eq!(
+            count,
+            trains + (share - trains * (least + beside)) / (least + beside - train)
+        );
+        let (charged, _) = operations(share, &each, &charges, one, u64::MAX);
+        let charged = u64::try_from(charged).unwrap();
+        assert!(count > charged, "{count} {charged}");
+        assert!(share - held(count) < least + beside - train);
+        assert!(share - (charged * least + capped(charged).unwrap()) >= least + beside - train);
+        // The count never passes the descriptors' bound, nor the bytes a cost the closure cannot
+        // count.
+        assert_eq!(operations(share, &capped, &charges, one, 7).0, 7);
+        assert_eq!(
+            operations(share, &|_| None, &charges, one, u64::MAX),
+            (1, most)
+        );
         let g = gateway(7, 9).unwrap();
         assert_eq!(
             (g.objects, g.objects_bytes, g.clients, g.window),
@@ -6524,12 +6738,15 @@ mod tests {
     /// Rule D's order (research/87 §4): on a host whose memory holds every want and on a 16 GiB
     /// host alike, the index and the engines' metadata take their whole wants, the transport its
     /// want whole, every operation's client's windows at a receive chunk, and the operations
-    /// everything past those, no more on the smaller host: 10,414 on 16 GiB, where 13,764 at
-    /// QUIC's initial window (36ad012b), 1.67 GB past the transport's floor; on Linux 9,264, each
-    /// operation holding 133,520 bytes more there ([`runs`], c1589e30). No cache takes a
-    /// share: `engine.cache_bytes` is each cache's want, the most it may borrow of the
-    /// operations' idle bytes, the same on either host. The classes the operations and the
-    /// transport do not size are the same on either host.
+    /// everything past those, no more on the smaller host: on 16 GiB 10,999 on macOS and 10,860 on
+    /// Linux ([`runs`]), 1.77 GB past the transport's floor, and each engine's metadata its want.
+    /// Charged the difference from one operation to two, it ran 10,396 and 9,264 (c1589e30):
+    /// each of the 9,375 and 8,243 past the receive batch's 1,024 trains was charged a train no
+    /// batch holds, 65,592 bytes on macOS and 197,752 on Linux
+    /// ([`a_receive_batch_holds_a_train_a_client_to_its_cap_and_no_more`]), 0.61 GB and 1.63 GB
+    /// that went to the engines' metadata. No cache takes a share: `engine.cache_bytes` is each
+    /// cache's want, the most it may borrow of the operations' idle bytes, the same on either host.
+    /// The classes the operations and the transport do not size are the same on either host.
     #[test]
     fn the_caches_take_no_share_and_the_operations_take_what_the_wants_leave() {
         let roomy = derive(stated(1), &roomy(facts(1)), &mut fresh).unwrap();
@@ -6554,9 +6771,10 @@ mod tests {
             };
             engine_wants_for(&engine, objects).unwrap()
         };
-        assert!(
-            said_bytes(&small, "engine.metadata_bytes") >= metadata,
-            "each engine's metadata's want whole"
+        assert_eq!(
+            said_bytes(&small, "engine.metadata_bytes"),
+            metadata,
+            "each engine's metadata its want whole, and what no want takes the operations'"
         );
         let (floor, want_past, bytes) = transport(&small);
         let (roomy_floor, _, roomy_bytes) = transport(&roomy);
@@ -6576,7 +6794,7 @@ mod tests {
         assert_eq!(roomy_bytes - roomy_floor, roomy_want);
         let operations = said_bytes(&small, "gateway.objects");
         assert!(
-            runs(9_000..10_000, 10_000..11_000).contains(&operations),
+            runs(10_350..11_350, 10_500..11_500).contains(&operations),
             "{operations}"
         );
         assert!(operations <= said_bytes(&roomy, "gateway.objects"));

@@ -1,0 +1,49 @@
+name: repro-node
+# The node suite (crates/mantle/tests/node.rs) again and again on CI's ubuntu-24.04-arm runner as
+# the gates run it, its tests side by side, to catch the put that ended `Lost(Stalled)` in run
+# 44454089741 (`objects_round_trip_through_any_node_and_read_back_after_one_is_killed`, the put of
+# o5, 20 MiB, on bd4d1b41) with every node's output: each run's whole output is kept, and how
+# often it fails says whether a fix holds. Four runners at once, ten runs each.
+on:
+  push:
+    branches: ["repro/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3, 4]
+    name: node suite, runner ${{ matrix.runner }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build the node suite
+        run: cargo test -p mantle --test node --locked --no-run
+      - name: The node suite, ten times
+        run: |
+          mkdir -p out
+          failed=0
+          for i in $(seq 10); do
+            start=$(date +%s)
+            if cargo test -p mantle --test node --locked -- --nocapture > "out/run-$i.txt" 2>&1; then
+              echo "run $i passed in $(($(date +%s) - start)) s"
+            else
+              failed=$((failed + 1))
+              echo "run $i FAILED in $(($(date +%s) - start)) s:"
+              grep -E "panicked at|^the put|FAILED|Lost\(" "out/run-$i.txt" | head -20
+            fi
+          done
+          echo "failed $failed of 10"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: node-runner-${{ matrix.runner }}
+          path: out

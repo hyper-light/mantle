@@ -332,6 +332,48 @@ pub(crate) struct Host {
     /// for it: a put or a get whose chunk waits for room is offered it again a beat after
     /// (`Host::step`).
     room_offered_ns: u64,
+    /// Its jobs' slots by the native exchange each came in on (`Door::exchange`), one exchange a
+    /// job, each request's: a reply's job found by its exchange (`Node::write_replies`), not by a
+    /// search of every job. Kept as each job is pushed and swap-removed (`Host::push`,
+    /// `Host::remove`).
+    exchanges: Slots<ExchangeId>,
+}
+
+/// Job slots by a key each job holds, kept in step with the jobs' vector as a job is pushed and
+/// swap-removed: a job found by its key in one probe of a hash table rather than a search of every
+/// job, thousands on a loaded node's task. Bound: the keys the jobs hold, each once.
+struct Slots<K> {
+    of: std::collections::HashMap<K, usize>,
+}
+
+impl<K> Default for Slots<K> {
+    /// None, which allocates nothing (`HashMap::new`): a host lent out leaves its default.
+    fn default() -> Self {
+        Self {
+            of: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Slots<K> {
+    /// The slot of the job holding `key`.
+    fn get(&self, key: &K) -> Option<usize> {
+        self.of.get(key).copied()
+    }
+
+    /// A job holding `keys` is at `at`: pushed there, or moved there from the end.
+    fn hold(&mut self, keys: impl IntoIterator<Item = K>, at: usize) {
+        for key in keys {
+            self.of.insert(key, at);
+        }
+    }
+
+    /// A job holding `keys` let go of them, swap-removed.
+    fn release(&mut self, keys: impl IntoIterator<Item = K>) {
+        for key in keys {
+            self.of.remove(&key);
+        }
+    }
 }
 
 /// What the host asks of whoever lends it a turn, the node's task now and a driving shard's task
@@ -423,7 +465,32 @@ impl Host {
             doors: Doors::new(doors),
             gateway,
             room_offered_ns: 0,
+            exchanges: Slots::default(),
         }
+    }
+
+    /// Runs `job` from now: last of its jobs, its exchange's slot kept.
+    fn push(&mut self, job: Job) {
+        self.exchanges.hold(job.door.exchange(), self.jobs.len());
+        self.jobs.push(job);
+    }
+
+    /// Its job at `at` taken out, the last moved into its slot, both exchanges' slots kept.
+    fn remove(&mut self, at: usize) -> Option<Job> {
+        if at >= self.jobs.len() {
+            return None;
+        }
+        let job = self.jobs.swap_remove(at);
+        self.exchanges.release(job.door.exchange());
+        if let Some(moved) = self.jobs.get(at) {
+            self.exchanges.hold(moved.door.exchange(), at);
+        }
+        Some(job)
+    }
+
+    /// The slot of the job of the native request on `exchange`.
+    pub(super) fn job_of(&self, exchange: ExchangeId) -> Option<usize> {
+        self.exchanges.get(&exchange)
     }
 
     /// Bytes its jobs moved since it was made.
@@ -452,7 +519,7 @@ impl Host {
             driven,
         } = *handed;
         let label = Some(labels::host(&op));
-        self.jobs.push(Job {
+        self.push(Job {
             door: Door::Native(exchange, half),
             principal,
             work: work(op, block),
@@ -475,7 +542,7 @@ impl Host {
             .jobs
             .iter()
             .position(|job| matches!(job.work, Work::Handing(_)))?;
-        let job = self.jobs.swap_remove(at);
+        let job = self.remove(at)?;
         let (Door::Native(exchange, half), Work::Handing(handing)) = (job.door, job.work) else {
             return None;
         };
@@ -2924,7 +2991,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.charge_admitted(charge);
         }
         self.replies.push((exchange, replies));
-        self.host.jobs.push(Job {
+        self.host.push(Job {
             door: Door::Native(Some(exchange), native),
             principal,
             work,
@@ -2976,7 +3043,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if admitted_ns.is_some() {
             self.charge_admitted(charge);
         }
-        self.host.jobs.push(Job {
+        self.host.push(Job {
             door: Door::Local(Box::new(Local {
                 body: Pieces {
                     pieces: body,
@@ -3442,11 +3509,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             self.replied = true;
                             break false;
                         }
-                        let exchange = self.replies.get(at).map(|(exchange, _)| *exchange);
-                        let job =
-                            self.host.jobs.iter().position(|job| {
-                                exchange.is_some() && job.door.exchange() == exchange
-                            });
+                        let job = self
+                            .replies
+                            .get(at)
+                            .and_then(|(exchange, _)| self.host.job_of(*exchange));
                         // A job that ended gave all it will: the next write finds its channel
                         // ended.
                         if let Some(job) = job {
@@ -3703,11 +3769,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Whether the host holds `exchange`, for an event on it: a job's, or a reply its node's task
     /// writes.
     pub(super) fn hosts(&self, exchange: ExchangeId) -> bool {
-        self.host
-            .jobs
-            .iter()
-            .any(|j| j.door.exchange() == Some(exchange))
-            || self.replies.iter().any(|(e, _)| *e == exchange)
+        self.host.job_of(exchange).is_some() || self.replies.iter().any(|(e, _)| *e == exchange)
     }
 
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
@@ -3736,8 +3798,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             host.doors.give_replies(lost);
         }
-        let Host { jobs, doors, .. } = host;
-        for j in jobs.extract_if(.., |j| j.door.exchange() == Some(exchange)) {
+        // An exchange's one job, its request's.
+        if let Some(j) = host.job_of(exchange).and_then(|at| host.remove(at)) {
             abandoned.extend(j.pending.into_iter().map(|(pending, _)| pending));
             if let Some(shard) = j.driven {
                 drivers.ended(shard);
@@ -3746,7 +3808,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 admission.completed(now.saturating_sub(at), now, j.charge);
             }
             if let Door::Native(_, native) = j.door {
-                doors.give_native(native);
+                host.doors.give_native(native);
             }
         }
     }
@@ -4254,19 +4316,20 @@ impl Host {
         if moved || asked || over {
             timing.worked(label);
         }
-        if over {
-            // What it still waits on is let go: an ended get's chunks still out, say; and its
-            // door's half goes with its end, told first that its job let go, so the node's task
-            // writes nothing past what it gave wherever the half is kept: here, once its reply's
-            // half is back too, where the node's task holds that half (`Serve::job_ended`).
-            let Job {
+        // What it still waits on is let go: an ended get's chunks still out, say; and its door's
+        // half goes with its end, told first that its job let go, so the node's task writes
+        // nothing past what it gave wherever the half is kept: here, once its reply's half is back
+        // too, where the node's task holds that half (`Serve::job_ended`).
+        if over
+            && let Some(Job {
                 door,
                 admitted_ns,
                 charge,
                 driven,
                 pending,
                 ..
-            } = self.jobs.swap_remove(at);
+            }) = self.remove(at)
+        {
             let half = match door {
                 Door::Native(_, native) => {
                     native
@@ -12181,5 +12244,76 @@ pub(super) mod tests {
             "{PARKED} parked over {turns} turns: {PARKED} vouches a beat, {} before",
             PARKED * turns
         );
+    }
+
+    thread_local! {
+        /// The key comparisons [`Counted`] made on this test's thread.
+        static COMPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A job's key that counts each comparison made of it, as a search of every job's makes one
+    /// for each job it passes.
+    #[derive(Debug, Clone, Copy)]
+    struct Counted(u64);
+
+    impl std::hash::Hash for Counted {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Self) -> bool {
+            COMPARED.with(|compared| compared.set(compared.get() + 1));
+            self.0 == other.0
+        }
+    }
+
+    impl Eq for Counted {}
+
+    /// A reply's job is found by its exchange in one probe of its host's slots (`Host::job_of`),
+    /// kept as jobs are pushed and swap-removed (`Host::push`, `Host::remove`): with 4,096 jobs and
+    /// every third ended, each lookup compares about one key, where the search of every job it
+    /// replaces compared one a job passed, half the jobs a lookup.
+    #[test]
+    fn a_job_is_found_by_its_exchange_with_no_scan() {
+        const JOBS: u64 = 4096;
+        let mut slots = Slots::default();
+        // Each slot's job, by its key, as the host's jobs hold them.
+        let mut jobs: Vec<Counted> = Vec::new();
+        for key in 0..JOBS {
+            slots.hold(Some(Counted(key)), jobs.len());
+            jobs.push(Counted(key));
+        }
+        let mut at = 0;
+        while at < jobs.len() {
+            if jobs[at].0.is_multiple_of(3) {
+                let gone = jobs.swap_remove(at);
+                slots.release(Some(gone));
+                if let Some(moved) = jobs.get(at) {
+                    slots.hold(Some(*moved), at);
+                }
+            } else {
+                at += 1;
+            }
+        }
+        COMPARED.with(|compared| compared.set(0));
+        for (at, key) in jobs.iter().enumerate() {
+            assert_eq!(slots.get(key), Some(at), "{key:?}");
+        }
+        let compared = COMPARED.with(std::cell::Cell::get);
+        let scanned: usize = (1..=jobs.len()).sum();
+        println!(
+            "{} lookups: {compared} key comparisons, {scanned} by a search of every job",
+            jobs.len()
+        );
+        assert!(
+            compared <= 2 * jobs.len(),
+            "{compared} comparisons for {} lookups",
+            jobs.len()
+        );
+        for key in (0..JOBS).filter(|key| key.is_multiple_of(3)) {
+            assert_eq!(slots.get(&Counted(key)), None, "ended");
+        }
     }
 }

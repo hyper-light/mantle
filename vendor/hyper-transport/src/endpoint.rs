@@ -424,9 +424,17 @@ fn exchange_tables(streams: u32) -> u64 {
 /// hosts and two allocators (docs/benchmarks.md), which no constant says for a host it was not
 /// measured on.
 pub fn state_charge<C: Classes>(limits: &Limits) -> u64 {
+    state_charge_for::<C>(limits.streams_per_connection)
+}
+
+/// [`state_charge`] under limits whose connections each take `streams_per_connection` exchanges at
+/// once, the one bound it depends on: what an owner sizing its budget before its limits are whole
+/// (their windows cut from what the budget holds past everything else) counts each connection's
+/// state at. mantle: vendor/UPSTREAM.md.
+pub fn state_charge_for<C: Classes>(streams_per_connection: u32) -> u64 {
     u64::try_from(size_of::<Conn<C::Role>>())
         .unwrap_or(u64::MAX)
-        .saturating_add(exchange_tables(limits.streams_per_connection))
+        .saturating_add(exchange_tables(streams_per_connection))
 }
 
 /// What a connection of classes `C` is charged under `limits` as it is made before its endpoint has

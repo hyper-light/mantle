@@ -63,7 +63,7 @@ pub use credit::{
 };
 pub use endpoint::{
     Acknowledgement, AskQueue, Config, Endpoint, Limits, PathFacts, REPLY_ACK_DELAY, Stats,
-    StreamCredit, connection_charge, state_charge,
+    StreamCredit, connection_charge, state_charge, state_charge_for,
 };
 pub use error::Refusal;
 pub use frame::Embedded;

@@ -78,13 +78,19 @@ fn at_rest(seed: u64) -> alloc::Counts {
 /// proofs' tail, no longer raises the floor, and the ten seconds ask 4,042 liveness writes where
 /// they asked 4,011, 31 more heartbeats' proofs, and count 540 allocations more, reallocations 0
 /// both. The rule changes no allocation site: what moved is when the stream sends and asks its
-/// writes, and the work that schedule gives.
+/// writes, and the work that schedule gives. 95,768 since the transport budget's sizing holds the
+/// connections' state apart (`bounds::connections_state`): the cell's nodes state their budgets by
+/// hand, five peers' four receive chunks each (1,310,540 bytes), whose windows' ceiling the state
+/// takes from 74,550 bytes to 64,870 on macOS, below a chunk's 65,527, so a node holds no receive
+/// chunk where it held one a peer and copies each datagram into a buffer of its own: 126 more
+/// allocations, reallocations 0 both. On Linux the receive ring held apart (`bounds::ring_growth`)
+/// had already left them none.
 #[test]
 fn a_cell_at_rest_turns_without_remaking_what_a_turn_keeps() {
     let counts = at_rest(1);
     assert_eq!(
         (counts.allocations, counts.reallocations),
-        (95_642, 0),
+        (95_768, 0),
         "{counts:?}"
     );
 }
@@ -156,12 +162,18 @@ fn serving(seed: u64, ops: u64) -> alloc::Counts {
 /// arrives, where the reply's was reserved at its own head's length as it was given, and the
 /// budget's spare buffers go round in another order: one allocation and 322 bytes more,
 /// reallocations 2,050 both. On Linux 33,545, derived as before and not yet counted there.
+/// 35,255 since the budget's sizing holds the connections' state apart
+/// (`bounds::connections_state`): the nodes' hand-stated budgets no longer hold a receive chunk a
+/// peer (the cell at rest's count), and each datagram the clients' run carries to a node is copied
+/// into a buffer of its own: 1,761 allocations and 5,483,027 bytes more, reallocations 2,046. On
+/// Linux 35,306, derived as before and not yet counted there; its ring had already left the nodes no
+/// chunk.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        33_545
+        35_306
     } else {
-        33_494
+        35_255
     };
     let counts = serving(1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

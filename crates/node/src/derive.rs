@@ -2478,8 +2478,9 @@ pub fn derive(
         "transport_bytes",
         transport_bytes,
         Kind::Derived,
-        "the transport's floor: what it holds besides QUIC's windows, the receive ring's growth \
-         at its most among it (bounds::ring_growth), and each share at QUIC's initial window, for \
+        "the transport's floor: what it holds besides QUIC's windows, the connections' state at \
+         the most connections it holds (bounds::connections_state) and the receive ring's growth \
+         at its most (bounds::ring_growth) among it, and each share at QUIC's initial window, for \
          the node's peers, ranges, transfers and messages (bounds::least_transport)",
     );
     // In whole milliseconds, as the key states it, rounded up: a bound on a starved host only.
@@ -3897,6 +3898,24 @@ mod tests {
                     "{peers} peers"
                 );
             }
+            // And the connections' state, which the endpoint charges to the budget as each
+            // connection is made: hyper-transport's `state_charge` for each connection admission
+            // holds and each handshake it lets wait beside them, three a peer; a budget that
+            // leaves it less is refused.
+            let floor = mantle_protocol::bounds::limits(&stated(peers, least(peers))).unwrap();
+            let state = mantle_protocol::bounds::connections_state(&stated(peers, 0)).unwrap();
+            assert_eq!(
+                state,
+                3 * peers as u64
+                    * hyper_transport::state_charge::<mantle_protocol::classes::NodeClasses>(
+                        &floor
+                    )
+            );
+            let short = stated(peers, least(peers) - state);
+            assert!(
+                mantle_protocol::bounds::limits(&short).is_err(),
+                "{peers} peers"
+            );
         }
     }
 

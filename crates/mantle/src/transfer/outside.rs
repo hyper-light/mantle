@@ -55,7 +55,8 @@ impl Outside {
             let at = Endpoint::parse(reach)
                 .ok_or_else(|| unread(format!("node {id}'s endpoint {reach}")))?;
             let address = (at.host.as_str(), at.port)
-                .to_socket_addrs()?
+                .to_socket_addrs()
+                .map_err(super::doing("resolving a node's S3 endpoint"))?
                 .next()
                 .ok_or_else(|| unread(format!("{reach} resolves to no address")))?;
             quic.push((*id, address));

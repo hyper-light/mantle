@@ -122,6 +122,11 @@ impl Volume {
 #[derive(Debug)]
 pub enum TransferError {
     Io(std::io::Error),
+    /// The run's rows could not be written to its output.
+    Output(std::io::Error),
+    /// A file, directory, process or address the run reads, makes or starts, which failed: what was
+    /// being done.
+    Doing(&'static str, std::io::Error),
     Cell(cell::CellError),
     Init(crate::init::Error),
     Client(crate::client::Error),
@@ -134,6 +139,8 @@ impl std::fmt::Display for TransferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{e}"),
+            Self::Output(e) => write!(f, "writing output: {e}"),
+            Self::Doing(what, e) => write!(f, "{what}: {e}"),
             Self::Cell(e) => write!(f, "the cell: {e}"),
             Self::Init(e) => write!(f, "the case's client: {e}"),
             Self::Client(e) => write!(f, "the case's client: {e}"),
@@ -144,10 +151,9 @@ impl std::fmt::Display for TransferError {
     }
 }
 
-impl From<std::io::Error> for TransferError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
+/// An I/O failure named by what the run was doing ([`TransferError::Doing`]).
+fn doing(what: &'static str) -> impl Fn(std::io::Error) -> TransferError {
+    move |e| TransferError::Doing(what, e)
 }
 
 impl From<cell::CellError> for TransferError {
@@ -529,9 +535,9 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
             "refused",
             "wrong",
             "missing"
-        )?;
+        ).map_err(TransferError::Output)?;
     }
-    std::fs::create_dir_all(&options.dir)?;
+    std::fs::create_dir_all(&options.dir).map_err(doing("making the run's directory"))?;
     let outside = options.cell.as_deref().map(Outside::open).transpose()?;
     if !options.disrupt.is_empty() && (outside.is_none() || options.small.is_empty()) {
         return Err(TransferError::Io(std::io::Error::other(
@@ -546,13 +552,14 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
         // A case's directory is its own: one an earlier run left is refused, not reused.
         let name = format!("small-{count}");
         let dir = options.dir.join(&name);
-        std::fs::create_dir(&dir)?;
+        std::fs::create_dir(&dir).map_err(doing("making a case's directory"))?;
         let case = format!("small {count}");
         let bucket = bucket(options.seed, &name);
         let (tallies, short) = match &outside {
             None => {
                 let (volume_bytes, why) = options.volume.bytes(&dir)?;
-                writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
+                writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")
+                    .map_err(TransferError::Output)?;
                 let mut cell = Cell::make(&dir, volume_bytes, RangeShards::First)?;
                 let mut natives = Natives::new(&cell, &dir, messages)?;
                 let (tallies, oracle) = small(
@@ -574,7 +581,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
                     out,
                     "  {case} volumes: {} bytes each (the cell's own)",
                     cell.volume_bytes()
-                )?;
+                )
+                .map_err(TransferError::Output)?;
                 let mut natives = Natives::new(cell, &dir, messages)?;
                 let (tallies, oracle) = small(
                     cell,
@@ -613,7 +621,7 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
                 tally.refused,
                 tally.wrong,
                 tally.missing,
-            )?;
+            ).map_err(TransferError::Output)?;
             if !tally.refusals.is_empty() {
                 let said: Vec<String> = tally
                     .refusals
@@ -624,7 +632,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
                     out,
                     "  small {count} {door} refused with: {}",
                     said.join(", ")
-                )?;
+                )
+                .map_err(TransferError::Output)?;
             }
             if tally.lost > 0 {
                 writeln!(
@@ -632,7 +641,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
                     "  small {count} {door} lost: {} puts no node took, or whose answer was lost, \
                      while the cell was short a node",
                     tally.lost
-                )?;
+                )
+                .map_err(TransferError::Output)?;
             }
             exact &= tally.exact(short);
         }
@@ -652,12 +662,13 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
             "refused",
             "wrong",
             "missing"
-        )?;
+        )
+        .map_err(TransferError::Output)?;
     }
     for &length in &options.large {
         let name = format!("large-{length}");
         let dir = options.dir.join(&name);
-        std::fs::create_dir(&dir)?;
+        std::fs::create_dir(&dir).map_err(doing("making a case's directory"))?;
         let case = format!("large {length}");
         let bucket = bucket(options.seed, &name);
         let ways: &[Way] = if options.ways.is_empty() {
@@ -668,7 +679,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
         let done = match &outside {
             None => {
                 let (volume_bytes, why) = options.volume.bytes(&dir)?;
-                writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")?;
+                writeln!(out, "  {case} volumes: {volume_bytes} bytes each ({why})")
+                    .map_err(TransferError::Output)?;
                 let mut cell = Cell::make(&dir, volume_bytes, RangeShards::First)?;
                 let mut natives = Natives::new(&cell, &dir, messages)?;
                 let (done, oracle, budget) = large::large(
@@ -690,7 +702,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
                     out,
                     "  {case} volumes: {} bytes each (the cell's own)",
                     cell.volume_bytes()
-                )?;
+                )
+                .map_err(TransferError::Output)?;
                 let mut natives = Natives::new(cell, &dir, messages)?;
                 let (done, oracle, budget) = large::large(
                     cell,
@@ -726,7 +739,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
                 tally.refused,
                 tally.wrong,
                 tally.missing,
-            )?;
+            )
+            .map_err(TransferError::Output)?;
         }
         let refused = |door: usize| match (done.doors.get(door), done.full.get(door)) {
             (Some(true), Some(Some(i))) => format!("l{i}"),
@@ -740,7 +754,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
             refused(0),
             refused(1),
             if done.unlisted { "yes" } else { "no" },
-        )?;
+        )
+        .map_err(TransferError::Output)?;
         let otherwise: Vec<String> = done
             .refused
             .iter()
@@ -754,7 +769,8 @@ fn cases(out: &mut impl Write, options: &Options) -> Result<bool, TransferError>
             } else {
                 otherwise.join(", ")
             },
-        )?;
+        )
+        .map_err(TransferError::Output)?;
         exact &= done.exact(options.count.is_none());
     }
     Ok(exact)
@@ -815,7 +831,8 @@ fn placed(
         placement.blocks,
         placement.objects,
         if placement.exact() { "yes" } else { "no" },
-    )?;
+    )
+    .map_err(TransferError::Output)?;
     Ok(placement.exact())
 }
 
@@ -854,7 +871,8 @@ fn killed(
         out,
         "  {case} kills: each founder killed in turn and started again, {read} reads through the \
          others and through it, {again} asked again, {wrong} wrong, {missing} missing",
-    )?;
+    )
+    .map_err(TransferError::Output)?;
     Ok(wrong == 0 && missing == 0)
 }
 
@@ -882,7 +900,8 @@ fn through_each(
         "  {case} through each node{}: {read} reads, {again} asked again, {wrong} wrong, \
          {missing} missing",
         if short { " after the disruption" } else { "" },
-    )?;
+    )
+    .map_err(TransferError::Output)?;
     Ok(wrong == 0 && missing == 0)
 }
 
@@ -891,7 +910,8 @@ fn uncounted(out: &mut impl Write, case: &str) -> Result<(), TransferError> {
     writeln!(
         out,
         "  {case} chunks held a node: not counted, the cell's nodes are not this run's children"
-    )?;
+    )
+    .map_err(TransferError::Output)?;
     Ok(())
 }
 
@@ -942,7 +962,8 @@ fn controls(
             } else {
                 "NOT missing"
             },
-        )?;
+        )
+        .map_err(TransferError::Output)?;
         return Ok(found_missing);
     };
     let flip = length.checked_div(2).unwrap_or(0);
@@ -983,7 +1004,8 @@ fn controls(
         } else {
             "NOT missing"
         },
-    )?;
+    )
+    .map_err(TransferError::Output)?;
     Ok(found_flip && found_missing && found_moved)
 }
 
@@ -1015,7 +1037,8 @@ fn accounted(
          put in-process: {}",
         held.join(", "),
         if exact { "yes" } else { "no" },
-    )?;
+    )
+    .map_err(TransferError::Output)?;
     Ok(exact)
 }
 
@@ -1197,15 +1220,18 @@ fn start(words: &[String]) -> Result<std::process::Child, TransferError> {
     let (program, args) = words
         .split_first()
         .ok_or_else(|| TransferError::Io(std::io::Error::other("a disruption of no words")))?;
-    Ok(std::process::Command::new(program)
+    std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
-        .spawn()?)
+        .spawn()
+        .map_err(doing("starting the disruption's command"))
 }
 
 /// Waits for the disruption's command, its words `words`, to end, which must be in success.
 fn settled(mut child: std::process::Child, words: &[String]) -> Result<(), TransferError> {
-    let status = child.wait()?;
+    let status = child
+        .wait()
+        .map_err(doing("waiting for the disruption's command"))?;
     if status.success() {
         Ok(())
     } else {

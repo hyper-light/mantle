@@ -280,6 +280,8 @@ impl Enclosed {
     }
 
     fn mul(self, other: Self) -> Self {
+        #[cfg(test)]
+        tests::count_operation();
         Self {
             lo: down(self.lo * other.lo),
             est: self.est * other.est,
@@ -289,6 +291,8 @@ impl Enclosed {
 
     /// `self / other`; a divisor whose lower end is zero leaves the upper end unbounded.
     fn div(self, other: Self) -> Self {
+        #[cfg(test)]
+        tests::count_operation();
         let hi = if self.hi == 0.0 {
             0.0
         } else if other.lo > 0.0 {
@@ -538,65 +542,66 @@ fn struck(state: &Occupancy, f: f64) -> Vec<(Occupancy, Enclosed)> {
 }
 
 /// Every way `n` domains fall into outcomes of probabilities `p`, each domain on its own, with
-/// the multinomial chance of each: `split[j]` domains have outcome `j`.
+/// the multinomial chance of each: `split[j]` domains have outcome `j`, in lexicographic order
+/// of `split`. The ways are built an outcome at a time: each way so far is followed by one for
+/// each count m of the domains it left that the next outcome takes, m counting up, its chance
+/// times C(left, m)·pⱼ^m; the last outcome takes every domain left. Every way so far has at
+/// least one follower, so no list built is longer than the ways returned.
 fn splits(n: usize, p: &[Enclosed]) -> Vec<(Vec<usize>, Enclosed)> {
-    let mut out = Vec::new();
-    let mut split = vec![0usize; p.len()];
-    fill(n, p, 0, &mut split, Enclosed::exact(1.0), &mut out);
-    out
-}
-
-/// Assigns the domains left, `left` of them, to outcomes from `j` on, each assignment's chance
-/// the multinomial term built so far.
-fn fill(
-    left: usize,
-    p: &[Enclosed],
-    j: usize,
-    split: &mut Vec<usize>,
-    chance: Enclosed,
-    out: &mut Vec<(Vec<usize>, Enclosed)>,
-) {
-    let Some(&pj) = p.get(j) else {
-        return;
+    let Some((&last, before)) = p.split_last() else {
+        return Vec::new();
     };
-    let Some(after) = j.checked_add(1) else {
-        return;
-    };
-    if after == p.len() {
-        // The last outcome takes every domain left: C(left, left)·pj^left.
-        if let Some(s) = split.get_mut(j) {
-            *s = left;
+    // Each way the outcomes before the last take domains: what each took, the domains left, and
+    // its chance so far.
+    let mut ways = vec![(vec![0; p.len()], n, Enclosed::exact(1.0))];
+    for (j, &pj) in before.iter().enumerate() {
+        let mut next = Vec::new();
+        for (took, left, chance) in &ways {
+            // C(left, m) and pj^m, each built up as m counts.
+            let (mut choose, mut raised) = (Enclosed::exact(1.0), Enclosed::exact(1.0));
+            for m in 0..=*left {
+                let (Some(rest), Some(after)) = (left.checked_sub(m), m.checked_add(1)) else {
+                    break;
+                };
+                let mut split = took.clone();
+                if let Some(s) = split.get_mut(j) {
+                    *s = m;
+                }
+                next.push((split, rest, chance.mul(choose).mul(raised)));
+                // Built on for the next count, where one is left.
+                if rest > 0 {
+                    choose = choose
+                        .mul(Enclosed::exact(count(rest)))
+                        .div(Enclosed::exact(count(after)));
+                    raised = raised.mul(pj);
+                }
+            }
         }
-        out.push((split.clone(), chance.mul(power(pj, left))));
-        if let Some(s) = split.get_mut(j) {
-            *s = 0;
+        ways = next;
+    }
+    // The last outcome's p^left, built as [`power`] builds it, `built` products from one. Read
+    // from the ways' end, the domains each way leaves it climb by one from none within each run
+    // of ways that differ only in their last two counts, so each way takes one product more than
+    // the way read before it, or starts again from none.
+    let (mut raised, mut built) = (Enclosed::exact(1.0), 0usize);
+    for (split, left, chance) in ways.iter_mut().rev() {
+        if *left < built {
+            (raised, built) = (Enclosed::exact(1.0), 0);
         }
-        return;
-    }
-    // C(left, m)·pj^m for m of the domains left taking outcome j.
-    let mut choose = Enclosed::exact(1.0);
-    for m in 0..=left {
-        if let Some(s) = split.get_mut(j) {
-            *s = m;
+        while built < *left {
+            let Some(more) = built.checked_add(1) else {
+                break;
+            };
+            (raised, built) = (raised.mul(last), more);
         }
-        let (Some(rest), Some(next)) = (left.checked_sub(m), m.checked_add(1)) else {
-            break;
-        };
-        fill(
-            rest,
-            p,
-            after,
-            split,
-            chance.mul(choose).mul(power(pj, m)),
-            out,
-        );
-        choose = choose
-            .mul(Enclosed::exact(count(rest)))
-            .div(Enclosed::exact(count(next)));
+        if let Some(s) = split.get_mut(before.len()) {
+            *s = *left;
+        }
+        *chance = chance.mul(raised);
     }
-    if let Some(s) = split.get_mut(j) {
-        *s = 0;
-    }
+    ways.into_iter()
+        .map(|(split, _, chance)| (split, chance))
+        .collect()
 }
 
 /// `x` to the power `n` by repeated multiplication, each rounding enclosed; `n` is at most a
@@ -919,7 +924,174 @@ fn transient_loss(q: &[Vec<Enclosed>], hours: f64) -> Option<LossBounds> {
 }
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// The enclosed products and quotients this thread has taken.
+        static OPERATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Counts an enclosed product or quotient: [`Enclosed::mul`] and [`Enclosed::div`] call it
+    /// in tests, the measure of what [`splits`] costs.
+    pub(super) fn count_operation() {
+        OPERATIONS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// What `f` returns, and the enclosed products and quotients it took.
+    fn counted<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = OPERATIONS.with(Cell::get);
+        let out = f();
+        (out, OPERATIONS.with(Cell::get) - before)
+    }
+
+    /// The ways [`splits`] gives: each one's counts by outcome, and its chance.
+    type Ways = Vec<(Vec<usize>, Enclosed)>;
+
+    /// The depth-first recursion `splits` was before it was made flat (CLAUDE.md §10), kept as
+    /// the reference its answers are held to.
+    fn recursive_splits(n: usize, p: &[Enclosed]) -> Ways {
+        let mut out = Vec::new();
+        let mut split = vec![0usize; p.len()];
+        fill(n, p, 0, &mut split, Enclosed::exact(1.0), &mut out);
+        out
+    }
+
+    /// Assigns the domains left, `left` of them, to outcomes from `j` on, each assignment's chance
+    /// the multinomial term built so far.
+    fn fill(
+        left: usize,
+        p: &[Enclosed],
+        j: usize,
+        split: &mut Vec<usize>,
+        chance: Enclosed,
+        out: &mut Ways,
+    ) {
+        let Some(&pj) = p.get(j) else {
+            return;
+        };
+        let Some(after) = j.checked_add(1) else {
+            return;
+        };
+        if after == p.len() {
+            // The last outcome takes every domain left: C(left, left)·pj^left.
+            if let Some(s) = split.get_mut(j) {
+                *s = left;
+            }
+            out.push((split.clone(), chance.mul(power(pj, left))));
+            if let Some(s) = split.get_mut(j) {
+                *s = 0;
+            }
+            return;
+        }
+        // C(left, m)·pj^m for m of the domains left taking outcome j.
+        let mut choose = Enclosed::exact(1.0);
+        for m in 0..=left {
+            if let Some(s) = split.get_mut(j) {
+                *s = m;
+            }
+            let (Some(rest), Some(next)) = (left.checked_sub(m), m.checked_add(1)) else {
+                break;
+            };
+            fill(
+                rest,
+                p,
+                after,
+                split,
+                chance.mul(choose).mul(power(pj, m)),
+                out,
+            );
+            choose = choose
+                .mul(Enclosed::exact(count(rest)))
+                .div(Enclosed::exact(count(next)));
+        }
+        if let Some(s) = split.get_mut(j) {
+            *s = 0;
+        }
+    }
+
+    /// Two lists of ways alike to the bit: each way's counts, and its chance's three ends.
+    fn same_ways(a: &[(Vec<usize>, Enclosed)], b: &[(Vec<usize>, Enclosed)]) -> bool {
+        let bits = |e: &Enclosed| (e.lo.to_bits(), e.est.to_bits(), e.hi.to_bits());
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|((sa, ca), (sb, cb))| sa == sb && bits(ca) == bits(cb))
+    }
+
+    /// The flat `splits` gives the recursion's ways, in its order, with its chances to the bit:
+    /// every count of domains to twelve over no outcome to seven, the outcomes a burst's binomial
+    /// gives a domain of up to six chunks across struck fractions from none to all, and outcomes
+    /// whose enclosures are wide, uneven or zero.
+    #[test]
+    fn splits_gives_the_recursions_ways_to_the_bit() {
+        let mut outcomes: Vec<Vec<Enclosed>> = vec![Vec::new()];
+        for k in 0..=6 {
+            for f in [0.0, 1e-9, 0.01, 0.3, 0.5, 0.999, 1.0] {
+                outcomes.push(binomial(k, f));
+            }
+        }
+        let odd = |lo: f64, est: f64, hi: f64| Enclosed { lo, est, hi };
+        outcomes.push(vec![odd(0.1, 0.2, 0.3)]);
+        outcomes.push(vec![odd(0.0, 0.0, 0.0), odd(1.0, 1.0, 1.0)]);
+        outcomes.push(vec![
+            odd(0.25, 0.5, 0.75),
+            odd(1e-300, 1e-200, 1e-100),
+            odd(0.9, 1.0, 1.1),
+        ]);
+        outcomes.push(vec![odd(0.3, 0.3, 0.3); 7]);
+        let mut ways = 0;
+        for p in &outcomes {
+            for n in 0..=12 {
+                let flat = splits(n, p);
+                let recursive = recursive_splits(n, p);
+                assert!(same_ways(&flat, &recursive), "{n} domains over {p:?}");
+                ways += flat.len();
+            }
+        }
+        assert!(ways > 100_000, "{ways} ways compared");
+    }
+
+    /// The flat `splits` takes fewer enclosed products and quotients than the recursion, which
+    /// built each pⱼ^m again from one for every m: counted over the calls the model makes for a
+    /// cell of the field inputs' rates (`mantle_node::derive::rates`: each chunk its own domain,
+    /// one burst), for every candidate scheme, a state for each count of chunks lost that the
+    /// stripe survives; and over the sweep of [`splits_gives_the_recursions_ways_to_the_bit`]'s
+    /// binomials.
+    #[test]
+    fn splits_takes_fewer_operations_than_the_recursion() {
+        let fraction = field::POWER_LOSS_FRACTION;
+        let mut calls: Vec<(usize, Vec<Enclosed>)> = Vec::new();
+        for scheme in candidates() {
+            let (width, needed) = (scheme.width(), scheme.needed());
+            for lost in 0..=width - needed {
+                // `struck` of the state where `lost` domains hold nothing and the rest one each:
+                // a call for each count of chunks some domain holds.
+                let held = [
+                    (lost, binomial(0, fraction)),
+                    (width - lost, binomial(1, fraction)),
+                ];
+                calls.extend(held.into_iter().filter(|(domains, _)| *domains > 0));
+            }
+        }
+        let total = |f: fn(usize, &[Enclosed]) -> Ways| {
+            counted(|| calls.iter().map(|(n, p)| f(*n, p).len()).sum::<usize>())
+        };
+        let ((flat_ways, flat), (recursive_ways, recursive)) =
+            (total(splits), total(recursive_splits));
+        assert_eq!(flat_ways, recursive_ways);
+        assert_eq!((recursive, flat), (4_520, 2_050), "the model's calls");
+        let mut sweep = (0, 0);
+        for k in 0..=6 {
+            let p = binomial(k, 0.3);
+            for n in 0..=12 {
+                sweep.0 += counted(|| recursive_splits(n, &p)).1;
+                sweep.1 += counted(|| splits(n, &p)).1;
+            }
+        }
+        assert_eq!(sweep, (871_039, 592_618), "the sweep");
+    }
 
     fn rs(data: usize, parity: usize) -> Scheme {
         Scheme::Rs(Code::new(data, parity).unwrap())

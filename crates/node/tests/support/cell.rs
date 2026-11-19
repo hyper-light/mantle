@@ -505,8 +505,15 @@ async fn run_node(
     reports: mpsc::Sender<Report>,
 ) {
     let id = settings.id;
-    let opened = Node::open_on(settings, log).await;
-    let mut node = match opened.and_then(|node| node.addresses().map(|a| (node, a))) {
+    let opened = Node::open_on(settings, log)
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|node| {
+            node.addresses()
+                .map(|a| (node, a))
+                .map_err(|e| e.to_string())
+        });
+    let mut node = match opened {
         Ok((node, (quic, plane))) => {
             if reports.send(Report::Bound(id, quic, plane)).is_err() {
                 return;
@@ -514,7 +521,7 @@ async fn run_node(
             node
         }
         Err(error) => {
-            let _ = reports.send(Report::Failed(id, error.to_string()));
+            let _ = reports.send(Report::Failed(id, error));
             return;
         }
     };

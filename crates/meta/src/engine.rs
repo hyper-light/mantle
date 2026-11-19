@@ -82,6 +82,13 @@ pub trait Engine: Rows {
         let _ = bytes;
         0
     }
+
+    /// The checkpoints that made something durable since the engine opened, and the flushes of
+    /// its device it made in all: what its durability cost the device, for its owner's counts. An
+    /// engine held in memory flushes nothing.
+    fn checkpoints(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// An engine held in memory for deterministic simulation (06 §C.b.3): what is applied, and

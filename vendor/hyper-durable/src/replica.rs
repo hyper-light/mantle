@@ -240,6 +240,10 @@ pub struct Driven {
 pub struct Writes {
     /// `Ready`s whose write held something.
     pub readies: u64,
+    /// Of `readies`, those whose write carried entries, a snapshot or proposals; the rest held a
+    /// hard state alone (a term, a vote, a promise, or a commit the fence needed). mantle:
+    /// vendor/UPSTREAM.md.
+    pub entries: u64,
     /// `Ready`s that held nothing to make durable: no write.
     pub empty: u64,
     /// Writes of the commit alone the fence asked for.
@@ -2153,6 +2157,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.writes_made.empty = self.writes_made.empty.saturating_add(1);
         } else {
             self.writes_made.readies = self.writes_made.readies.saturating_add(1);
+            if carries {
+                self.writes_made.entries = self.writes_made.entries.saturating_add(1);
+            }
         }
         out.displaced.append(&mut ready.take_displaced());
         let issued = self.node.advance_issued(ready);

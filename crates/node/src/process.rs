@@ -1563,6 +1563,34 @@ fn write_path_counts(
     Ok(())
 }
 
+/// What made the node's devices flush, written after the commands found corrupt in a `counts`
+/// answer, each a name and a value since the node opened: the log's confirmations written on their
+/// own and its slots filled ahead, each a flush besides its frames' (hyper-log's `LogStats`); then
+/// what the node submitted ([`crate::node::FlushCauses`]): the liveness stream's writes, the
+/// ranges' writes by what they carried (entries, a hard state alone, the commit alone, a new
+/// start), the engines' checkpoints and their stores' flushes, and the puts the chunk volumes
+/// took. A phase's growth of each says which cause its flushes came from (`mantle bench doors`).
+pub fn flush_counts(
+    said: &mut String,
+    (confirmations, fills): (u64, u64),
+    causes: &crate::node::FlushCauses,
+) -> std::fmt::Result {
+    write!(
+        said,
+        " confirmations {confirmations} fills {fills} liveness_writes {} entry_writes {} \
+         hard_state_writes {} commit_writes {} start_writes {} checkpoints {} engine_syncs {} \
+         chunk_puts {}",
+        causes.liveness,
+        causes.entries,
+        causes.hard_states,
+        causes.commits,
+        causes.starts,
+        causes.checkpoints,
+        causes.engine_syncs,
+        causes.chunk_puts,
+    )
+}
+
 /// The lanes between the node's shards, written after the write path's counts in a `counts`
 /// answer, each a name and a value since the node opened (`Node::lane_counts`, node.md §2.9):
 /// `lane_full_KIND`, the sends of each kind a full lane refused, every kind named
@@ -3071,6 +3099,12 @@ async fn serve(
                         // it as their gateway (replica.md §2; node.md §5.6).
                         write!(line, " corrupt_commands {}", node.corrupt_commands())
                             .map_err(wrote)?;
+                        flush_counts(
+                            &mut line,
+                            (log.confirmations, log.fills),
+                            &node.flush_causes(),
+                        )
+                        .map_err(wrote)?;
                         // The table of the shard this task runs on, none where the runtime
                         // registers no table for it.
                         let slow = hyper_rt::registry::current_shard()
@@ -4330,6 +4364,28 @@ mod tests {
             said,
             " lane_full_step 3 lane_full_propose 2 far_refused_proposals 5 far_refused_reads 6 \
              stream_held 4"
+        );
+    }
+
+    /// The flushes' causes are said by name, the log's first and then the node's submitters'.
+    #[test]
+    fn the_flushes_causes_are_said_by_name() {
+        let causes = crate::node::FlushCauses {
+            liveness: 3,
+            entries: 4,
+            hard_states: 5,
+            commits: 6,
+            starts: 7,
+            checkpoints: 8,
+            engine_syncs: 16,
+            chunk_puts: 9,
+        };
+        let mut said = String::new();
+        flush_counts(&mut said, (1, 2), &causes).unwrap();
+        assert_eq!(
+            said,
+            " confirmations 1 fills 2 liveness_writes 3 entry_writes 4 hard_state_writes 5 \
+             commit_writes 6 start_writes 7 checkpoints 8 engine_syncs 16 chunk_puts 9"
         );
     }
 

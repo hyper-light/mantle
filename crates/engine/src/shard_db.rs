@@ -5310,6 +5310,12 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(())
     }
 
+    /// The store's flushes since the engine started (`IoStats::syncs`), read alone: what a
+    /// caller that counts them at every turn reads without copying the rest of [`Self::stats`].
+    pub fn syncs(&self) -> u64 {
+        self.store.syncs()
+    }
+
     /// The flushes' time, the trunk's maintenance, and the store's I/O since the engine started.
     pub fn stats(&self) -> (FlushStats, crate::trunk::TrunkStats, crate::store::IoStats) {
         let mut flush = self.flush_stats;

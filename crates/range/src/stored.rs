@@ -45,6 +45,9 @@ pub struct Stored<F: BlockFile> {
     /// Whether anything was applied or installed since the last checkpoint: an image installed
     /// at the index the engine stands at, a range's founding rows at 0, changes it all the same.
     unpersisted: bool,
+    /// The checkpoints taken since the engine opened: each `persist` that found something to make
+    /// durable, two flushes of the store's device apiece (`Store::checkpoint`).
+    checkpoints: u64,
     /// A get's value and a scan's rows: the engine's buffers, kept across calls.
     value: Vec<u8>,
     rows: EngineRows,
@@ -79,6 +82,7 @@ impl<F: BlockFile + 'static> Stored<F> {
             applied,
             durable: applied,
             unpersisted: false,
+            checkpoints: 0,
             value: Vec::new(),
             rows: EngineRows::new(),
         }
@@ -205,6 +209,7 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
             self.db.checkpoint(self.applied).map_err(fenced)?;
             self.durable = self.applied;
             self.unpersisted = false;
+            self.checkpoints = self.checkpoints.saturating_add(1);
         }
         Ok(())
     }
@@ -221,6 +226,10 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
     /// The engine counts no rows apart from reading them.
     fn image_size(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    fn checkpoints(&self) -> (u64, u64) {
+        (self.checkpoints, self.db.syncs())
     }
 
     fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
@@ -428,6 +437,53 @@ mod tests {
         e.install(ROWS + 10, image.clone()).unwrap();
         e.persist().unwrap();
         assert_eq!(e.image().unwrap(), image);
+    }
+
+    /// A range's engine flushes its store's device only at a checkpoint, twice (the map, then the
+    /// superblock naming it, `Store::checkpoint`): a burst whose memtables its maintenance worker
+    /// packs and whose trunk it compacts flushes nothing of its own, every output made durable by
+    /// the checkpoint that first names it, and a checkpoint asked with nothing applied since, as a
+    /// range that only serves reads asks it, flushes nothing. Opened again, it stands at the
+    /// checkpoint with every row of the burst.
+    #[test]
+    fn its_store_flushes_only_at_a_checkpoint_and_twice_there() {
+        const ROWS: u64 = 2_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.store");
+        let mut e = Stored::create(file(&path, true), CONFIG, CONFIG.page_size, TRUNK).unwrap();
+        // A new store's first checkpoint, of nothing, is its creation's.
+        assert_eq!(e.checkpoints(), (0, 2));
+        let reopen = path.clone();
+        e.set_workers(move || Ok(file(&reopen, false)), 1).unwrap();
+        for i in 0..ROWS {
+            let (k, v) = row(i, 1);
+            e.apply(i + 1, vec![Write::Put(k, v)]).unwrap();
+        }
+        let trunk = e.trunk_stats();
+        assert!(trunk.flushes > 0, "the burst packed no memtable: {trunk:?}");
+        assert_eq!(e.checkpoints(), (0, 2), "maintenance flushed on its own");
+        e.persist().unwrap();
+        let trunk = e.trunk_stats();
+        assert!(
+            trunk.pivot_compactions + trunk.leaf_compactions > 0,
+            "the burst compacted nothing: {trunk:?}"
+        );
+        assert_eq!(e.checkpoints(), (1, 4));
+        // Quiet: asked again with nothing applied, as a compaction of a range serving reads asks.
+        for _ in 0..3 {
+            e.persist().unwrap();
+        }
+        assert_eq!(e.checkpoints(), (1, 4), "a quiet checkpoint flushed");
+        assert_eq!(e.durable(), ROWS);
+        drop(e);
+        let mut e = Stored::open(file(&path, false), CONFIG, CONFIG.page_size, TRUNK).unwrap();
+        assert_eq!(
+            (e.applied(), e.durable(), e.checkpoints()),
+            (ROWS, ROWS, (0, 0))
+        );
+        let image = e.image().unwrap();
+        assert_eq!(image.len(), usize::try_from(ROWS).unwrap());
+        assert_eq!(image, (0..ROWS).map(|i| row(i, 1)).collect::<Vec<_>>());
     }
 
     #[test]

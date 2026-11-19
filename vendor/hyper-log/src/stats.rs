@@ -29,6 +29,12 @@ pub struct LogStats {
     /// Flushes made: each frame's, and each confirmation's written on its own; a failed one,
     /// which fences the log, among them.
     pub flushes: u64,
+    /// Confirmations written on their own: each confirms a frame no later frame followed at once,
+    /// its own record written again, flushed or written durable. What a lone frame costs beyond
+    /// its own flush; a frame the next frame's record confirms costs none. Each also counts in
+    /// `flushes`, or in `durable_writes` where the device wrote it durable on its own. mantle:
+    /// vendor/UPSTREAM.md.
+    pub confirmations: u64,
     /// Each flush's `sync_data`: the platform's full flush (`fdatasync`, `F_FULLFSYNC`,
     /// `FlushFileBuffers`).
     pub flush: Histogram,
@@ -86,6 +92,7 @@ impl LogStats {
             updates: 0,
             bytes: 0,
             flushes: 0,
+            confirmations: 0,
             durable_writes: 0,
             durable_fallbacks: 0,
             flushed_confirmations: 0,
@@ -149,6 +156,8 @@ pub(crate) fn nanos(from: Instant, to: Instant) -> u64 {
 pub(crate) struct Tally {
     pub(crate) bytes: u64,
     pub(crate) flushes: u64,
+    /// Confirmations written on their own (`LogStats::confirmations`).
+    pub(crate) confirmations: u64,
     /// Writes made durable on their own, no flush with them (`Timing::durable_write`).
     pub(crate) durable_writes: u64,
     /// Durable writes made with a write and a flush instead (`Timing::durable_fallback`).
@@ -174,6 +183,7 @@ impl Tally {
         Box::new(Self {
             bytes: 0,
             flushes: 0,
+            confirmations: 0,
             durable_writes: 0,
             durable_fallbacks: 0,
             flushed_confirmations: 0,

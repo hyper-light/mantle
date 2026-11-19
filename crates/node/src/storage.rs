@@ -113,6 +113,9 @@ pub struct Storage {
     room: u64,
     /// The chunk exchanges the volumes take at once (`mantle_chunk::Config::transfers`).
     transfers: usize,
+    /// The puts the volumes took since the node opened, each answered once a flush of its
+    /// volume's device made it durable, one flush covering every put its batch took.
+    put_count: u64,
 }
 
 /// A put out on a volume: who asked it, the volume's answer, the room it holds of what the node
@@ -275,6 +278,12 @@ impl Storage {
         self.volumes.iter().position(|h| h.id == volume)
     }
 
+    /// The puts the node's volumes took since it opened, each made durable by a flush of its
+    /// volume's device that may cover others its batch took.
+    pub(crate) fn put_count(&self) -> u64 {
+        self.put_count
+    }
+
     /// The chunk exchanges the node's volumes take at once: each one's writer queue and its reads
     /// at the device and waiting, past which it refuses `Busy`.
     pub(crate) fn transfers(&self) -> usize {
@@ -323,6 +332,7 @@ impl Storage {
         let answer = held
             .volume
             .put_checked_waking(key, bytes, crc32c, waker.clone())?;
+        self.put_count = self.put_count.saturating_add(1);
         self.puts.push(PutOut {
             origin,
             answer,

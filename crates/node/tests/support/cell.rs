@@ -480,7 +480,7 @@ enum Order {
 enum Report {
     /// Where a node listens, once open.
     Bound(u64, SocketAddr, SocketAddr),
-    Status(u64, Status),
+    Status(u64, Box<Status>),
     /// A node's power cut: its log and its range's engine, as they stood.
     Crashed(u64, SimLog, Vec<(u128, Model)>),
     /// A node stopped on an error, as its process would, giving back what it held.
@@ -563,7 +563,7 @@ async fn run_node(
         if status != told
             && let Some(now) = status
         {
-            if reports.send(Report::Status(id, now)).is_err() {
+            if reports.send(Report::Status(id, Box::new(now))).is_err() {
                 return;
             }
             told = status;
@@ -1051,7 +1051,7 @@ impl Sim {
                     self.members.get_mut(&id).unwrap().bound = Some((quic, plane));
                 }
                 Report::Status(id, status) => {
-                    self.members.get_mut(&id).unwrap().status = Some(status);
+                    self.members.get_mut(&id).unwrap().status = Some(*status);
                 }
                 Report::Crashed(id, log, engines) => {
                     let file = only(log.log).close().unwrap();

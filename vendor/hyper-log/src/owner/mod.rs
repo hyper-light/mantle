@@ -915,6 +915,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             } => {
                 self.give_confirm(record);
                 self.tally.job(&timing, false);
+                // mantle: confirmations counted apart (vendor/UPSTREAM.md).
+                self.tally.confirmations = self.tally.confirmations.saturating_add(1);
                 self.flushing_since = None;
                 self.confirmed(result, these, timing.flushed_at);
             }

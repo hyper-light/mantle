@@ -861,6 +861,49 @@ pub struct LaneCounts {
     pub refused_reads: u64,
 }
 
+/// What made a node's devices flush, as `Node::flush_causes` counts it since the node opened: the
+/// writes each submitter put on the log, every range's summed, each a frame's update; the engines'
+/// checkpoints and their stores' flushes; and the puts its chunk volumes took. A frame no later
+/// frame follows at once costs a confirmation besides its own flush (raft-log.md §6), which the
+/// log counts (hyper-log's `LogStats::confirmations`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlushCauses {
+    /// The liveness stream's writes: an empty update each, the proof that the log's device
+    /// flushes, asked when no other write became durable within a heartbeat's interval.
+    pub liveness: u64,
+    /// The ranges' writes that carried entries, a snapshot or proposals.
+    pub entries: u64,
+    /// The ranges' writes of a hard state alone: a term, a vote or a promise moved, or the commit
+    /// the fence needed.
+    pub hard_states: u64,
+    /// The ranges' writes of the commit alone: the fence's and a quiet period's.
+    pub commits: u64,
+    /// The ranges' writes that moved their log's start: their compactions.
+    pub starts: u64,
+    /// The ranges' engines' checkpoints, and the flushes of their stores' devices: two a
+    /// checkpoint, and none of a compaction's output on its own.
+    pub checkpoints: u64,
+    pub engine_syncs: u64,
+    /// The puts the node's chunk volumes took, each durable by a flush that may cover others.
+    pub chunk_puts: u64,
+}
+
+impl FlushCauses {
+    /// Adds a range's writes and its engine's checkpoints and flushes.
+    fn add(&mut self, writes: &hyper_durable::Writes, (checkpoints, syncs): (u64, u64)) {
+        self.entries = self.entries.saturating_add(writes.entries);
+        self.hard_states = self
+            .hard_states
+            .saturating_add(writes.readies.saturating_sub(writes.entries));
+        self.commits = self
+            .commits
+            .saturating_add(writes.fenced.saturating_add(writes.quiet));
+        self.starts = self.starts.saturating_add(writes.starts);
+        self.checkpoints = self.checkpoints.saturating_add(checkpoints);
+        self.engine_syncs = self.engine_syncs.saturating_add(syncs);
+    }
+}
+
 /// Whom a read is answered to: a peer's exchange, or this node's own read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadOrigin {
@@ -1095,6 +1138,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     stall_tried: Option<(u64, u64)>,
     /// The stream's writes the log refused for room since the node started.
     liveness_waits: u64,
+    /// The stream's writes the log took since the node started, each an empty update on its own
+    /// group made durable as a proof that the log's device flushes (hyper-liveness `Output::flush`).
+    liveness_writes: u64,
     /// The rounds of compaction the log's refusals for room asked ([`Status::compactions`]).
     compactions: u64,
     driver: Driver<NodeClasses, Fixed, Peers>,
@@ -1614,6 +1660,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             log_durables: 0,
             stall_tried: None,
             liveness_waits: 0,
+            liveness_writes: 0,
             compactions: 0,
             driver,
             plane,
@@ -2473,6 +2520,26 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         (self.proposed_entries, self.proposed_commands)
     }
 
+    /// What made this node's devices flush since it opened ([`FlushCauses`]): its ranges' writes
+    /// and engines as the node's task drives them and as each far range's shard last showed them,
+    /// the stream's writes, and its volumes' puts.
+    pub fn flush_causes(&self) -> FlushCauses {
+        let mut causes = FlushCauses {
+            liveness: self.liveness_writes,
+            chunk_puts: self.storage.put_count(),
+            ..FlushCauses::default()
+        };
+        for kept in &self.ranges {
+            if let Some(replica) = self.owner.get(kept.handle) {
+                causes.add(&replica.writes(), replica.machine().engine().checkpoints());
+            }
+        }
+        for far in &self.far {
+            causes.add(&far.seen.writes, far.seen.checkpoints);
+        }
+        causes
+    }
+
     /// The commands this node built that a range answered corrupt since it opened
     /// (`Answer::Corrupt`): each one whose bytes no longer matched the CRC-32C this node computed
     /// as it encoded them, every member finding the same mismatch, attributed to this node, their
@@ -3094,6 +3161,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Ok(pending) => {
                     self.liveness_owed = None;
                     self.liveness_write = Some((pending, started));
+                    self.liveness_writes = self.liveness_writes.saturating_add(1);
                 }
                 Err(e) if refused_for_room(&e) => self.owe_liveness(),
                 Err(e) => return Err(NodeError::Log(e.to_string())),

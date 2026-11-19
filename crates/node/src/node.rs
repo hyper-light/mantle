@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -41,7 +41,7 @@ use hyper_liveness::{Change, Liveness};
 use hyper_log::{Class as LogClass, Config as LogConfig, Log, LogError, LogStats, Pending, Update};
 use hyper_raft::proto::{Message, MessageType};
 use hyper_rt::combine::{Either, Either3, race2, race3};
-use hyper_rt_transport::{Driver, PlaneSocket};
+use hyper_rt_transport::{Arrival, Driver, PlaneSocket};
 use hyper_timing::Exposure;
 use hyper_transport::tls::{Credentials, Tls};
 use hyper_transport::{
@@ -2672,7 +2672,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.liveness_written()?;
         let now = hyper_rt::futures::now_ns();
         self.take_inbox();
-        let emptied = self.drain_plane()?;
+        let emptied = poll_fn(|context| Poll::Ready(self.drain_plane(context, now))).await?;
         if emptied {
             self.liveness.poll(now, &mut self.asked);
         }
@@ -3051,11 +3051,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         })
     }
 
-    /// Every datagram already on the plane's socket, each message taken where its datagram was
-    /// opened, in the socket's receive buffer; whether a drain found the socket empty. A drain
-    /// takes at most hyper-rt-transport's `TURNS` batches, so a second tells a socket emptied from
-    /// one that still held datagrams; past that the stream waits for the next turn's drain.
-    fn drain_plane(&mut self) -> Result<bool, NodeError> {
+    /// The datagrams on the plane's socket, each message taken where its datagram was opened, in
+    /// the socket's receive buffer; whether a drain found the socket empty. A drain takes at most
+    /// hyper-rt-transport's `TURNS` batches, so a second tells a socket emptied from one that still
+    /// held datagrams; past that the stream waits for the next turn's drain.
+    ///
+    /// The stream judges at `now` only what falls due by then (`Liveness::wake`). With something
+    /// due, the socket is asked whatever its readiness says (`PlaneSocket::receive_ready`), so every
+    /// heartbeat the kernel stamped before `now` is fed before the stream is polled, one that came
+    /// through a stop of the process between the wait and `now` among them. With nothing due, it is
+    /// asked only once its readiness fired (`PlaneSocket::receive_readable`), armed for the task's
+    /// `context`: an empty socket costs the turn no system call, where each turn asked the kernel.
+    fn drain_plane(&mut self, context: &mut Context<'_>, now: u64) -> Result<bool, NodeError> {
+        let exact = self.liveness.wake().is_some_and(|at| at <= now);
         let Self {
             id,
             owner,
@@ -3081,16 +3089,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             moved: liveness_moved,
             received,
         };
-        for _ in 0..2 {
-            let taken = plane_socket.receive_ready(plane, &AdmitAll, |arrival, opened| {
+        let mut deliver =
+            |arrival: Arrival,
+             opened: Result<hyper_datagram::Opened<'_>, hyper_datagram::Refusal>| {
                 if let Ok(opened) = opened {
                     let sender = opened.sender;
                     for message in opened.messages() {
                         taking.message(sender, arrival.at_ns, message);
                     }
                 }
-            })?;
-            if taken == 0 {
+            };
+        for _ in 0..2 {
+            if exact {
+                plane_socket.receive_ready(plane, &AdmitAll, &mut deliver)?;
+            } else {
+                plane_socket.receive_readable(context, plane, &AdmitAll, &mut deliver)?;
+            }
+            if plane_socket.emptied() {
                 return Ok(true);
             }
         }

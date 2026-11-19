@@ -203,6 +203,13 @@ fn socklen(bytes: usize) -> libc::socklen_t {
 
 /// The headers one `sendmmsg` or `recvmmsg` call is given, kept between calls so that a call
 /// allocates nothing.
+///
+/// A receive's headers are made once, as a call first offers their places, and kept (mantle:
+/// vendor/UPSTREAM.md): each points at its own name, iovec and control, and a call sets back only
+/// the lengths the kernel wrote in the messages the last call filled, and points an iovec again
+/// only where its buffer is not the one it points at. Made again for every call, a call offering 1,024 places zeroed and filled 1,024
+/// headers whatever it received: `receive` was 9.3% of a node's samples under a native GET load
+/// (perf, Linux x86_64, perf-10k c1589e30), most of it for sockets that held nothing.
 pub(crate) struct Headers {
     headers: Vec<libc::mmsghdr>,
     iovecs: Vec<libc::iovec>,
@@ -210,12 +217,20 @@ pub(crate) struct Headers {
     controls: Vec<Control>,
     /// How many slots each message of a send carries.
     groups: Vec<usize>,
+    /// Whether `headers` and `iovecs` hold a receive's: an iovec for every name, and a header for
+    /// each place a call has offered, pointing at its name, iovec and control. A send makes its own
+    /// in their place.
+    receiving: bool,
+    /// How many of the receive's headers, from the first, the kernel may have written lengths into
+    /// since they were last set: the messages the last call filled, and the one after.
+    written: usize,
 }
 
-// SAFETY: the raw pointers in `headers` and `iovecs` are written by `send` and `receive` from
-// borrows that live for the call, and are read only by the system call inside it; between calls
-// they are stale and never dereferenced. Moving the vectors to another thread moves nothing they
-// point to that anyone reads.
+// SAFETY: the raw pointers in `headers` point into the headers' own `names`, `iovecs` and
+// `controls`, heap allocations that move with them, and those in `iovecs` at the buffers of the
+// call that set them, which `receive` checks against its buffers before each call; either is read
+// only by the system call, never dereferenced here. Moving the vectors to another thread moves
+// nothing they point to that anyone reads.
 unsafe impl Send for Headers {}
 
 /// The bytes one message of a batch holds in a call's headers ([`Headers::new`]).
@@ -256,6 +271,8 @@ impl Headers {
             names: vec![unsafe { zeroed::<libc::sockaddr_storage>() }; batch],
             controls: vec![[0; CONTROL_WORDS]; batch],
             groups: Vec::with_capacity(batch),
+            receiving: false,
+            written: 0,
         }
     }
 }
@@ -367,7 +384,10 @@ pub(crate) fn send(
         names,
         controls,
         groups,
+        receiving,
+        ..
     } = headers;
+    *receiving = false;
     messages.clear();
     iovecs.clear();
     groups.clear();
@@ -456,7 +476,10 @@ pub(crate) fn send_one(
         names,
         controls,
         groups,
+        receiving,
+        ..
     } = headers;
+    *receiving = false;
     messages.clear();
     iovecs.clear();
     groups.clear();
@@ -567,7 +590,10 @@ pub(crate) struct Received {
 /// is skipped: QUIC and the plane treat it as lost.
 ///
 /// Each buffer is offered its whole room, written or not, and its length is set to what the kernel
-/// wrote into it if that is more than it had: nothing is zeroed ahead of the kernel.
+/// wrote into it if that is more than it had: nothing is zeroed ahead of the kernel. The headers
+/// are made as their places are first offered and kept ([`Headers`]): a call sets back the lengths
+/// of the messages the last one filled and compares each offered buffer with its iovec, so what it
+/// writes is what was received.
 pub(crate) fn receive(
     fd: RawFd,
     buffers: &mut [Vec<u8>],
@@ -579,22 +605,40 @@ pub(crate) fn receive(
         iovecs,
         names,
         controls,
+        receiving,
+        written,
         ..
     } = headers;
-    messages.clear();
-    iovecs.clear();
-    let count = buffers.len().min(names.len());
-    for buffer in buffers.iter_mut().take(count) {
-        iovecs.push(libc::iovec {
-            iov_base: buffer.as_mut_ptr().cast(),
-            iov_len: buffer.capacity(),
-        });
+    if !*receiving {
+        messages.clear();
+        iovecs.clear();
+        // `iovecs` is filled here and never grows while the headers are a receive's: pointers into
+        // it are taken only after, so none moves. `names` and `controls` never grow.
+        iovecs.resize(
+            names.len(),
+            libc::iovec {
+                iov_base: ptr::null_mut(),
+                iov_len: 0,
+            },
+        );
+        *receiving = true;
+        *written = 0;
     }
-    for ((iovec, name), control) in iovecs
-        .iter_mut()
-        .zip(names.iter_mut())
-        .zip(controls.iter_mut())
-    {
+    // The kernel writes a filled message's name and control lengths back (recvmsg(2)): those are
+    // set back to the room each has. A message it did not fill it did not write.
+    for message in messages.iter_mut().take(*written) {
+        message.msg_hdr.msg_namelen = socklen(size_of::<libc::sockaddr_storage>());
+        message.msg_hdr.msg_controllen = field(size_of::<Control>());
+    }
+    // A header for each place offered past those made, once: made with the whole name and control.
+    let wanted = buffers.len().min(names.len());
+    while messages.len() < wanted {
+        let at = messages.len();
+        let (Some(iovec), Some(name), Some(control)) =
+            (iovecs.get_mut(at), names.get_mut(at), controls.get_mut(at))
+        else {
+            break;
+        };
         // SAFETY: an all-zero `mmsghdr` is valid: null pointers with zero lengths.
         let mut message: libc::mmsghdr = unsafe { zeroed() };
         message.msg_hdr.msg_name = ptr::from_mut(name).cast();
@@ -605,11 +649,23 @@ pub(crate) fn receive(
         message.msg_hdr.msg_controllen = field(size_of::<Control>());
         messages.push(message);
     }
-    let length = libc::c_uint::try_from(messages.len()).unwrap_or(libc::c_uint::MAX);
-    // SAFETY: `messages` holds `length` headers whose names, iovecs and controls point into
-    // `names`, `iovecs`, `controls` and `buffers`' allocations, each iovec the whole capacity of
-    // its buffer, borrowed mutably for this call and not moved since; recvmmsg writes within the
-    // lengths each header gives. The timeout is null: the socket is non-blocking.
+    let count = wanted.min(messages.len());
+    for (iovec, buffer) in iovecs.iter_mut().zip(buffers.iter_mut()).take(count) {
+        let base = buffer.as_mut_ptr().cast::<libc::c_void>();
+        let room = buffer.capacity();
+        if iovec.iov_base != base || iovec.iov_len != room {
+            iovec.iov_base = base;
+            iovec.iov_len = room;
+        }
+    }
+    let length = libc::c_uint::try_from(count).unwrap_or(libc::c_uint::MAX);
+    // SAFETY: `messages` holds at least `length` headers (`count` is at most its length), each
+    // pointing at its own entry of `names`, `iovecs` and `controls`, allocations that have not
+    // moved since the pointers were taken (`messages` itself is passed by its address now), with
+    // the lengths of the whole name and control; each of the first `length` iovecs points at the
+    // buffer of its index, the whole capacity of its allocation, checked above, and `buffers` is
+    // borrowed mutably for this call. recvmmsg writes within the lengths each header gives. The
+    // timeout is null: the socket is non-blocking.
     let received = unsafe {
         libc::syscall(
             libc::SYS_recvmmsg,
@@ -620,6 +676,12 @@ pub(crate) fn receive(
             ptr::null_mut::<libc::timespec>(),
         )
     };
+    // The messages filled, and the one after, which a call that failed past its first message
+    // may have begun: the lengths the next call sets back.
+    *written = usize::try_from(received)
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(count);
     let Ok(received) = usize::try_from(received) else {
         return Err(io::Error::last_os_error());
     };

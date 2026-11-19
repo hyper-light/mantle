@@ -2163,6 +2163,15 @@ leaves no window is refused at start. Before, the windows and the chunks were ea
 whole budget: on macos-aarch64 a gateway's three connections grew their windows to the budget's
 whole and the piece a 1 MiB reply is read into was refused (CI run 39694528095).
 
+A reply's head the budget refuses waits for room (`node::reply_head`, 2026-11-18): the endpoint
+takes a reply's head from the budget, and a finished job whose head it refused had ended there,
+its exchange left open with nothing more to come, so its client gave it up a period later
+(`Lost(Stalled)`, `tests/put_body.rs`). The job is held instead, as one whose ask is out is:
+vouched for and offered its head again at each beat within its client's patience, the piece a
+refusal's body drains through waiting so too, and past that patience its exchange is refused
+`Budget`, which needs no room and its asker hears at once (`host`'s `wait_to_reply`, research/77
+D1, D2). A job never ends with its exchange open.
+
 Bulk work is lowest, but it has a floor. A cell must rebuild its largest failure domain within
 the time its durability target allows, so repair needs at least `D/T` of bandwidth for lost
 capacity `D` and repair time `T` (audit §14.3; durability.md §5). While repair is behind that

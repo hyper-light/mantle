@@ -824,6 +824,41 @@ pub fn read_piece(
     got
 }
 
+/// What became of a reply's head offered to its exchange ([`reply_head`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replied {
+    /// It went; its body, if it has one, follows.
+    Sent,
+    /// The endpoint's budget has no room for it now: the exchange stays open, untouched, for its
+    /// owner to offer the head again, the job held meanwhile (`host`'s `Job::room_to_reply`).
+    WaitsForRoom,
+    /// The exchange is over: its asker gone, or the head refused for a cause no wait mends, which
+    /// the exchange is refused with, so its asker hears it at once.
+    Ended,
+}
+
+/// Offers `head` as the reply on `exchange`, with a body of `body` bytes to follow. The endpoint
+/// takes the head's room from its budget (hyper-transport's `Core::message`), which every
+/// connection's windows, receive chunks, heads and frames share, and refuses it `Budget` while
+/// that is held: a reply refused so is not lost, it waits for room ([`Replied::WaitsForRoom`]).
+/// Taken as the exchange's end, a job ended with its exchange open and its asker waiting on
+/// nothing, and its client gave it up a period later (`Lost(Stalled)`, tests/put_body.rs).
+pub fn reply_head(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    head: &[u8],
+    body: Option<u64>,
+) -> Replied {
+    match endpoint.reply(exchange, head, body) {
+        Ok(()) => Replied::Sent,
+        Err(Refusal::Budget) => Replied::WaitsForRoom,
+        Err(refusal) => {
+            endpoint.refuse_exchange(exchange, refusal);
+            Replied::Ended
+        }
+    }
+}
+
 /// The parts of a node a plane message or a Raft frame steps, borrowed apart from the plane and its
 /// socket, so a message is taken where its datagram was opened (`Node::drain_plane`).
 struct Taking<'a, E: Engine + 'static, L: NodeLog> {

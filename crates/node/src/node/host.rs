@@ -314,14 +314,19 @@ pub(crate) trait Serve {
     /// A put's body of `bytes` came in `ns`: a sample of the put window (`Window::filled`).
     fn filled(&mut self, bytes: u64, ns: u64);
     /// A job ended: admitted at `admitted_ns` and charged `charge`, placed on shard `driven`,
-    /// with what it still waited on let go.
+    /// with what it still waited on let go, and its native door's half (`half`), told already
+    /// that its job let go: what the host keeps of it, back. The node's task holds a native door's
+    /// other half, so its host keeps the half, in its doors for the next request; a driving
+    /// shard's host keeps none, the half riding the job's end to the node's task (node.md §2.9
+    /// step 6e), as a half its host kept would wait there with no bound for a half it never sees.
     fn job_ended(
         &mut self,
         admitted_ns: Option<u64>,
         charge: u64,
         driven: Option<usize>,
         asks: impl IntoIterator<Item = Pending>,
-    );
+        half: Option<Box<Native>>,
+    ) -> Option<Box<Native>>;
 }
 
 impl Host {
@@ -455,7 +460,7 @@ impl Door {
 /// node's task gives it, and its reply as the job gives it, which the node's task writes, with what
 /// the two share beside it ([`Handed`]). The job touches nothing of the node's but these: the bytes
 /// it moves it counts here, which the host's step takes as a value (`Host::turn_job`).
-struct Native {
+pub(crate) struct Native {
     /// A put's body, once its fields named one.
     body: Option<Pieces>,
     reply: Sender<Told>,
@@ -3197,12 +3202,14 @@ impl<E: Engine + 'static, L: NodeLog> Serve for Node<E, L> {
         charge: u64,
         driven: Option<usize>,
         asks: impl IntoIterator<Item = Pending>,
-    ) {
+        half: Option<Box<Native>>,
+    ) -> Option<Box<Native>> {
         self.ended(admitted_ns, charge);
         if let Some(shard) = driven {
             self.drivers.ended(shard);
         }
         self.abandoned.extend(asks);
+        half
     }
 }
 
@@ -3465,15 +3472,29 @@ impl Host {
         }
         if over {
             // What it still waits on is let go: an ended get's chunks still out, say; and its
-            // door's half is given back, kept for the next request once its reply's is.
-            let job = self.jobs.swap_remove(at);
-            node.job_ended(
-                job.admitted_ns,
-                job.charge,
-                job.driven,
-                job.pending.into_iter().map(|(pending, _)| pending),
-            );
-            if let Door::Native(_, native) = job.door {
+            // door's half goes with its end, told first that its job let go, so the node's task
+            // writes nothing past what it gave wherever the half is kept: here, once its reply's
+            // half is back too, where the node's task holds that half (`Serve::job_ended`).
+            let Job {
+                door,
+                admitted_ns,
+                charge,
+                driven,
+                pending,
+                ..
+            } = self.jobs.swap_remove(at);
+            let half = match door {
+                Door::Native(_, native) => {
+                    native
+                        .handed
+                        .ended
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    Some(native)
+                }
+                Door::Local(_) => None,
+            };
+            let asks = pending.into_iter().map(|(pending, _)| pending);
+            if let Some(native) = node.job_ended(admitted_ns, charge, driven, asks, half) {
                 self.doors.give_native(native);
             }
         }
@@ -8498,6 +8519,11 @@ mod tests {
         asked: u64,
         ended: Vec<(Option<u64>, u64, Option<usize>, usize)>,
         abandoned: usize,
+        /// Whether it takes each ended job's door half, as a driving shard's lanes take it to the
+        /// node's task, rather than giving it back for the host to keep, as the node does; and
+        /// the last it took.
+        takes_halves: bool,
+        half: Option<Box<Native>>,
     }
 
     impl Serve for Stub {
@@ -8573,9 +8599,15 @@ mod tests {
             charge: u64,
             driven: Option<usize>,
             asks: impl IntoIterator<Item = Pending>,
-        ) {
+            half: Option<Box<Native>>,
+        ) -> Option<Box<Native>> {
             self.ended
                 .push((admitted_ns, charge, driven, asks.into_iter().count()));
+            if !self.takes_halves {
+                return half;
+            }
+            self.half = half;
+            None
         }
     }
 
@@ -8926,6 +8958,8 @@ mod tests {
             asked: 0,
             ended: Vec::new(),
             abandoned: 0,
+            takes_halves: false,
+            half: None,
         }
     }
 
@@ -9010,6 +9044,44 @@ mod tests {
         drop(body);
     }
 
+    /// A job's end carries its native door's half to whoever serves its host (node.md §2.9 step
+    /// 6e), told first that its job let go: the node gives it back, and its host keeps it for the
+    /// next request once its reply's half is back too; a driving shard's lanes take it to the
+    /// node's task, which holds the other half, so that host keeps no door, and the node's task's
+    /// doors keep it whole.
+    #[test]
+    fn a_jobs_end_carries_its_doors_half_to_whoever_serves_its_host() {
+        for takes_halves in [false, true] {
+            let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+            let done = Work::Draining(Box::new(Reply::status(Status::Done)));
+            let (job, replies) = handed_job(done, 0, 0);
+            host.jobs.push(job);
+            let mut stub = put_and_get_stub();
+            stub.takes_halves = takes_halves;
+            host.step(&mut stub).unwrap();
+            assert!(host.idle() && stub.ended.len() == 1);
+            assert!(
+                replies
+                    .handed
+                    .ended
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "told its job let go before its half went"
+            );
+            let mut doors = if takes_halves {
+                assert!(host.doors.waiting.is_empty() && host.doors.kept.is_empty());
+                let mut doors = Doors::new(1);
+                doors.give_native(stub.half.take().unwrap());
+                doors
+            } else {
+                assert!(stub.half.is_none());
+                std::mem::take(&mut host.doors)
+            };
+            assert_eq!(doors.waiting.len(), 1);
+            doors.give_replies(replies);
+            assert_eq!((doors.kept.len(), doors.waiting.len()), (1, 0));
+        }
+    }
+
     /// A host's wait is its own jobs' alone (node.md §2.9 step 6e), so a driving shard's task can
     /// wait on its host: none while it runs no job; a job whose ask is out is due at its client's
     /// patience, an S3 door's get holding no beat; and at once once whoever serves it holds the
@@ -9024,6 +9096,8 @@ mod tests {
             asked: 0,
             ended: Vec::new(),
             abandoned: 0,
+            takes_halves: false,
+            half: None,
         };
         assert_eq!(host.due(&stub), None, "no job, no wait");
         let get = work(

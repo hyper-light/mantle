@@ -1617,13 +1617,15 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
      depth a reply needs (`door::Replying`), as an S3 connection does for its job (`Door::Local`).
      The node's task keeps the exchange: its vouching (`Endpoint::working`) and its end
      (`Node::job_lost`).
-   - *6d, a host of its own* (`host::Job` and the host's `impl Node`; `Node`'s `jobs`,
-     `abandoned`, `gateway`, `moved`, `slowed`): the jobs and what they hold move from `Node` into
-     a `host::Host` that the node's task holds and steps, its asks (6b) served by the node, its
-     doors (6c) channels and its puts placed by the volume table the node last read
-     (`Node::table`, `host::Table`), so a shard past the first can hold one. Admission, parking and
-     the put window stay the node's, one authority for its bottleneck (§2.5), told of each job's
-     end. The largest part, which may land as two: the state, then the steps.
+   - *6d, a host of its own* (`host::Job` and the host's `impl Node`; `Node`'s `jobs`, `abandoned`,
+     `gateway`, `moved`, `slowed`): the jobs and what they hold move from `Node` into a `host::Host`
+     that the node's task holds and steps, its asks (6b) served by the node, its doors (6c) channels
+     and its puts placed by the volume table the node last read (`Node::table`, `host::Table`), so a
+     shard past the first can hold one. Admission, parking and the put window stay the node's, one
+     authority for its bottleneck (§2.5), told of each job's end and each put's samples of its
+     blocks (`Window::committed`, `Window::filled`); the bytes moved and the `SlowDown`s by cause
+     are each host's, summed where `Node::moved` and `Node::slowed` are read. The largest part,
+     which may land as two: the state, then the steps.
    - *6e, a driving shard's task and its lanes* (a module beside `node::shard`, made as
      `shard::Lanes` is): a task on a shard past the first holding a `Host`, started through that
      shard's control queue as the listener's takers are, Normal as the S3 connections beside it.
@@ -1635,9 +1637,11 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
      at the job's next turn, each with a slot for its answer made as it is asked
      (`hyper_rt::sync::oneshot`), so the answer cannot be refused; the node's task answers `Asks` in
      the slot of one it has no room for now, its other asks holding the room (the table above). And
-     each job's end. Production starts none. Tested on a two-shard runtime: a request handed is
-     driven there, its asks served by the node's task, its end given back; a full lane refuses,
-     typed; a shard whose task ended stops the node, `NodeError::ShardEnded`.
+     each job's end with its put's samples, the host's counts, and each held job's beat, by which
+     the node's task tells its exchange's asker its work is held (`Endpoint::working`, research/77
+     D1). Production starts none. Tested on a two-shard runtime: a request handed is driven there,
+     its asks served by the node's task, its end given back; a full lane refuses, typed; a shard
+     whose task ended stops the node, `NodeError::ShardEnded`.
    - *6f, requests placed by the rule* (`host::start_object`, `Node::spread`, `process::serve`,
      `derive::shard_shape`, `node::shard_lanes_bytes`): each native request admitted, its fields
      read, is handed to the shard 6a's rule picks among those `NodeSettings::shards` names past the

@@ -3774,9 +3774,45 @@ impl<F: BlockFile> ShardDb<F> {
                 p.mem = mem;
                 p.sort = Some(pack);
                 self.packing = Some(p);
+                // No job out, so none frees a seat or gives extents back: a store that does not
+                // grow by segments has no room for its grant, so the shard packs it, taking
+                // extents as it writes them, as without workers ([`Self::sort_off`]).
+                if self.store.segments().is_none()
+                    && self.trunk.pool_mut().is_none_or(|pool| !pool.busy())
+                {
+                    self.pack_here()?;
+                }
                 Ok(false)
             }
         }
+    }
+
+    /// The packing memtable a worker was to sort, packed by the shard instead: closed, its
+    /// sorter's buffers kept for the next, and its builder made, a file kept as segments grown
+    /// first, as the shard's own allocations may.
+    fn pack_here(&mut self) -> Result<(), Error> {
+        let Some(p) = self.packing.as_mut() else {
+            return Ok(());
+        };
+        let Some(pack) = p.sort.take() else {
+            return Ok(());
+        };
+        p.mem.close();
+        let entries = u64::try_from(p.mem.len()).unwrap_or(u64::MAX);
+        // The memtable's bytes in extents, and one for the last partial one.
+        let run = self.store.run_bytes().max(1);
+        let extents = crate::util::div_ceil_usize(p.mem.bytes(), run)
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.keep_sort_pack(pack);
+        self.grow_for(u64::try_from(extents).unwrap_or(u64::MAX))?;
+        let mut builder = Builder::new(&mut self.store, Keys::Exactly(entries))?;
+        if let Some(p) = self.packing.as_mut() {
+            // Every key of the memtable shares what it kept of its first key's.
+            builder.set_shared(p.mem.skip())?;
+            p.builder = Some(builder);
+        }
+        Ok(())
     }
 
     /// The packing still to do: the packing memtable's ([`Packing::left`]).
@@ -4753,28 +4789,11 @@ impl<F: BlockFile> ShardDb<F> {
         if self.packing.as_ref().is_some_and(|p| p.sort.is_some()) && self.hand_off_sorted()? {
             return self.drain_frozen();
         }
-        let Some(p) = self.packing.as_mut() else {
+        if self.packing.is_none() {
             return self.drain_frozen();
-        };
-        let t = self.timed.then(std::time::Instant::now);
-        if let Some(pack) = p.sort.take() {
-            p.mem.close();
-            let entries = u64::try_from(p.mem.len()).unwrap_or(u64::MAX);
-            // The memtable's bytes in extents, and one for the last partial one: a file kept as
-            // segments grows first, waited for, as the shard's own allocations may.
-            let run = self.store.run_bytes().max(1);
-            let extents = crate::util::div_ceil_usize(p.mem.bytes(), run)
-                .unwrap_or(0)
-                .saturating_add(1);
-            self.keep_sort_pack(pack);
-            self.grow_for(u64::try_from(extents).unwrap_or(u64::MAX))?;
-            let mut builder = Builder::new(&mut self.store, Keys::Exactly(entries))?;
-            if let Some(p) = self.packing.as_mut() {
-                // Every key of the memtable shares what it kept of its first key's.
-                builder.set_shared(p.mem.skip())?;
-                p.builder = Some(builder);
-            }
         }
+        let t = self.timed.then(std::time::Instant::now);
+        self.pack_here()?;
         let Some(p) = self.packing.as_mut() else {
             return self.drain_frozen();
         };
@@ -4965,8 +4984,14 @@ impl<F: BlockFile> ShardDb<F> {
             Some(pool) => pool.can_take(&mut self.store, true)?,
             None => false,
         };
-        if self.store.segments().is_some() && self.store.capacity() < asked {
-            self.packing_wanted = self.packing_wanted.max(asked);
+        if self.store.capacity() < asked {
+            // A file grown by segments grows first. A store at its limit holds no grant this
+            // size beside the extents held, more than the packing writes: the memtable waits
+            // while a job out may give extents back, and with none the shard packs it, taking
+            // extents as it writes them, as it did without workers ([`Self::hand_off_sorted`]).
+            if self.store.segments().is_some() {
+                self.packing_wanted = self.packing_wanted.max(asked);
+            }
             return Ok(Some((full, pack)));
         }
         let Some(pool) = self.trunk.pool_mut().filter(|_| admitted) else {

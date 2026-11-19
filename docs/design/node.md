@@ -1198,7 +1198,15 @@ turn does this, in order:
    is durable, and its members open afresh from it.
 
 The node as built gives every range on a shard one waker, its task's, and queues each range with
-a write out at every turn, where its drive takes the answer if it came. A wake is an edge, not a
+a write out at every turn, where its drive takes the answer if it came. A leader reading a page of
+a lagging member's catch-up from its log's file (hyper-durable's `LogStore::catch_up`) is queued
+the same way while the read is out (`shard::answer_due`): the read's answer wakes the task as a
+write's does, and the drive it queues sends the page and opens the read of the next, so each read
+starts as the one before it is answered, within the store's window (one read out for the group,
+and for each member the run that holds its next index and the one after it, opened only once the
+member's credit took a page of the first). Queued for its writes alone, a leader whose read was
+answered was driven only by the next message into its range or its next tick, and the page
+waited for it. A wake is an edge, not a
 state: it ends whichever await of the task it finds, and the process's own awaits between turns
 (a line it says) take some. A lone node pinned to one CPU had its enlistment's answer, and the
 wake for it, arrive 0.2 ms before its wait began, while the process said a line; the wait then

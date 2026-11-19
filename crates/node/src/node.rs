@@ -3796,8 +3796,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// Queues the replicas whose deadline has come, and those with a write out, which a log's
-    /// answer may have woken.
+    /// Queues the replicas whose deadline has come, and those with a write out or a page of a
+    /// member's catch-up being read, which a log's answer may have woken ([`shard::answer_due`]).
     fn schedule_due(&mut self, now: u64) {
         while let Some(&(at, slot)) = self.deadlines.first() {
             if at > now {
@@ -3810,11 +3810,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         for kept in &self.ranges {
-            if self
-                .owner
-                .get(kept.handle)
-                .is_some_and(|r| r.in_flight() > 0)
-            {
+            if self.owner.get(kept.handle).is_some_and(shard::answer_due) {
                 self.owner.schedule(kept.handle);
             }
         }

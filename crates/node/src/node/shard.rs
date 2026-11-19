@@ -611,6 +611,17 @@ pub(crate) enum Served {
     Read(Box<Read>),
 }
 
+/// Whether the log may have answered `replica` since its last drive, which a turn drives it to
+/// take: a write of its own out, or, leading, a page of a member's catch-up being read or waiting
+/// its turn (hyper-durable's `Replica::catching_up`), whose answer wakes the task as a write's does
+/// (node.md §2.2). The drive sends the members the pages read and opens the read of the next, so
+/// each read starts as the one before it is answered. Queued for its writes alone, a leader whose
+/// read was answered with none out was driven only by the next message into its range or its
+/// next tick, and the page waited for it.
+pub(crate) fn answer_due<E: Engine + 'static, S: LogStore>(replica: &Replica<E, S>) -> bool {
+    replica.in_flight() > 0 || replica.catching_up()
+}
+
 /// Compacts each of `handles`' ranges in `owner` through what its engine made durable, freeing the
 /// log's room, the compaction's write waking `waker`'s task: the node's own for the ranges its task
 /// drives, a shard's for that shard's (node.md §6.2). A range with a write out is passed over: that
@@ -1489,8 +1500,8 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
         }
     }
 
-    /// Queues the replicas whose deadline came, and those with a write out, which a log's answer
-    /// may have woken.
+    /// Queues the replicas whose deadline came, and those with a write out or a page of a member's
+    /// catch-up being read, which a log's answer may have woken ([`answer_due`]).
     fn schedule_due(&mut self, now: u64) {
         while let Some(&(at, place)) = self.deadlines.first() {
             if at > now {
@@ -1503,11 +1514,7 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             }
         }
         for kept in &self.ranges {
-            if self
-                .owner
-                .get(kept.handle)
-                .is_some_and(|replica| replica.in_flight() > 0)
-            {
+            if self.owner.get(kept.handle).is_some_and(answer_due) {
                 self.owner.schedule(kept.handle);
             }
         }

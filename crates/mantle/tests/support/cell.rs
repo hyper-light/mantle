@@ -1940,6 +1940,12 @@ impl Cell {
                 let (at, into) = (entry.path(), to.join(entry.file_name()));
                 if entry.file_type().unwrap().is_dir() {
                     left.push_back((at, into));
+                } else if mantle_node::files::owner_only(&at).unwrap() {
+                    // A key kept to its owner is copied kept so, as a copy of the disk keeps it: a
+                    // file copied takes its new directory's permissions on Windows (CopyFileEx
+                    // gives the copy the target directory's inherited DACL), and the copy's start
+                    // refused the key as readable by others (CI's windows-x86_64, run 44437080511).
+                    mantle_node::files::write_secret(&into, &std::fs::read(&at).unwrap()).unwrap();
                 } else {
                     std::fs::copy(&at, &into).unwrap();
                 }

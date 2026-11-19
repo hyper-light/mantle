@@ -253,3 +253,147 @@ fn a_reply_given_while_other_traffic_holds_the_whole_budget_goes_at_once() {
     assert!(replied, "node 1 had no reply");
     net.nodes[1].release(held.unwrap());
 }
+
+/// Node 2 has no room for the chunk node 1 puts, and holds its exchange unread while it has none,
+/// telling node 1 at every half beat that it is at work on it, as it tells the asker of a chunk its
+/// volume holds (`Node::vouch_held`): node 1 keeps the put out across three of its periods, and
+/// node 2, given room, reads the body whole and answers it. Held without a word, node 1 gives it
+/// up as a put its peer stopped taking, within two periods (`Stalled`). The body, smaller than a
+/// stream's window, all reached node 2 before it was held: it holds the room its window took, which
+/// the node's queue of held puts bounds (`node::hold`).
+#[test]
+fn a_put_held_unread_for_room_is_kept_out_by_its_vouches_and_given_up_without() {
+    let held = hold_unread(true, 3);
+    assert_eq!(
+        held.refused, None,
+        "a held put vouched for is given up after {:?}",
+        held.ended
+    );
+    assert!(held.replied, "node 1 had no reply after {:?}", held.ended);
+    assert!(
+        held.ended >= bounds::idle_timeout() * 3,
+        "answered after its hold, {:?}",
+        held.ended
+    );
+    let unsaid = hold_unread(false, 3);
+    assert_eq!(
+        unsaid.refused,
+        Some(hyper_transport::Refusal::Stalled),
+        "a held put not vouched for after {:?}",
+        unsaid.ended
+    );
+    assert!(
+        unsaid.ended <= bounds::idle_timeout() * 2 + bounds::initial_pto(),
+        "given up after {:?}",
+        unsaid.ended
+    );
+}
+
+/// What came of a put node 2 held unread for `periods` of node 1's, vouched for or not.
+struct Held {
+    refused: Option<hyper_transport::Refusal>,
+    replied: bool,
+    ended: std::time::Duration,
+}
+
+fn hold_unread(vouched: bool, periods: u32) -> Held {
+    let least = bounds::least_transport(&stated(0)).unwrap();
+    classes::state_bounds(stated(least).messages).unwrap();
+    let mut net = Net::new(
+        &certificates(),
+        &stated(least),
+        Instant::now(),
+        (VecDeque::new(), Vec::new()),
+    );
+    net.connect();
+    let body = vec![7u8; 4 << 10];
+    let head = mantle_node::chunk::Put {
+        volume: 1,
+        key: mantle_chunk::ChunkKey {
+            block: 1,
+            epoch: 0,
+            index: 0,
+        },
+        crc32c: 0,
+        remaining_ns: 0,
+    }
+    .encode();
+    let period = bounds::idle_timeout();
+    let half = bounds::initial_pto() / 2;
+    let put = net.nodes[0]
+        .open(
+            net.now,
+            2,
+            Kind::ChunkPut,
+            &head,
+            Some(body.len() as u64),
+            Progress::new(period).unwrap(),
+        )
+        .unwrap();
+    let began = net.now;
+    let (mut written, mut taken, mut vouched_at) = (0, None, None);
+    let (mut piece, mut answered) = (Vec::new(), false);
+    let (mut replied, mut refused) = (false, None);
+    while net.now.duration_since(began) < period * (periods + 4) {
+        for event in net.events[0].drain(..) {
+            match event {
+                Event::Reply { exchange, .. } if exchange == put => replied = true,
+                Event::Refused {
+                    exchange, refusal, ..
+                } if exchange == put => refused = Some(refusal),
+                _ => {}
+            }
+        }
+        if replied || refused.is_some() {
+            break;
+        }
+        if written < body.len() {
+            written += net.nodes[0].write_body(put, &body[written..]).unwrap();
+        }
+        net.pump();
+        for event in net.events[1].drain(..) {
+            if let Event::Request { exchange, .. } = event {
+                taken = Some(exchange);
+            }
+        }
+        if let Some(exchange) = taken.filter(|_| !answered) {
+            if net.now.duration_since(began) >= period * periods {
+                // Room came: the body read whole, then answered.
+                while !net.nodes[1].body_complete(exchange) {
+                    match mantle_node::node::read_piece(&mut net.nodes[1], exchange, &mut piece) {
+                        Ok(0) => break,
+                        Ok(_) => piece.clear(),
+                        Err(refusal) => panic!("node 2's read of the put refused {refusal:?}"),
+                    }
+                }
+                if net.nodes[1].body_complete(exchange) {
+                    let reply =
+                        mantle_node::node::reply_head(&mut net.nodes[1], exchange, &[1], None);
+                    assert_eq!(reply, Replied::Sent);
+                    net.nodes[1].end(exchange);
+                    answered = true;
+                }
+            } else if vouched && vouched_at.is_none_or(|at| net.now >= at + half) {
+                net.nodes[1].working(exchange);
+                vouched_at = Some(net.now);
+            }
+        }
+        // The clock moves to the earlier of the nodes' next timer and node 2's next vouch.
+        let vouch = vouched_at
+            .filter(|_| vouched && taken.is_some() && !answered)
+            .map(|at| at + half);
+        let timer = net.nodes.iter_mut().filter_map(|n| n.poll_timeout()).min();
+        if let Some(next) = [timer, vouch].into_iter().flatten().min() {
+            net.now = net.now.max(next);
+            for node in &mut net.nodes {
+                node.handle_timeout(net.now);
+            }
+        }
+        net.pump();
+    }
+    Held {
+        refused,
+        replied,
+        ended: net.now.duration_since(began),
+    }
+}

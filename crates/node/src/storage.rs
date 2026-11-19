@@ -111,6 +111,9 @@ pub struct Storage {
     /// `Busy` anyway (`Volume::queue_bytes`).
     taken: u64,
     room: u64,
+    /// Each time room was given back, counted: a put the node held for room is offered it again
+    /// only once this moved (`node::hold`).
+    freed: u64,
     /// The chunk exchanges the volumes take at once (`mantle_chunk::Config::transfers`).
     transfers: usize,
     /// The puts the volumes took since the node opened, each answered once a flush of its
@@ -311,6 +314,18 @@ impl Storage {
     /// Gives back room a chunk held: answered, or its body never read whole.
     pub(crate) fn give_room(&mut self, len: u64) {
         self.taken = self.taken.saturating_sub(len);
+        self.freed = self.freed.wrapping_add(1);
+    }
+
+    /// The room the chunks peers send are taken into: what the volumes' writer queues hold.
+    pub(crate) fn room(&self) -> u64 {
+        self.room
+    }
+
+    /// How many times room was given back since the node opened, wrapping: changed whenever some
+    /// was ([`Self::give_room`], a put answered).
+    pub(crate) fn freed(&self) -> u64 {
+        self.freed
     }
 
     /// Puts `bytes`, `key`'s whole chunk, on the volume in `slot`, checked against `crc32c`, for
@@ -415,7 +430,7 @@ impl Storage {
             match out.answer.poll() {
                 Some(answered) => {
                     done.push(Done::Put(out.origin, out.len, answered));
-                    self.taken = self.taken.saturating_sub(out.room);
+                    self.give_room(out.room);
                     self.puts.swap_remove(at);
                 }
                 None => at = at.saturating_add(1),

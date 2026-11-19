@@ -4939,7 +4939,9 @@ impl Host {
         // (its queue held by others' writes or by its cleaner, as a filling volume's is), and with
         // no other chunk of this node answered nothing offered it room again before its client's
         // patience: it is offered room again at each beat it waits, a probe timeout, as a held
-        // job is vouched for (research/77 D2), at most once a beat.
+        // job is vouched for (research/77 D2), at most once a beat. A peer holds a put it has no
+        // room for on its exchange and reads it as room frees (`node::hold`): the beat serves the
+        // puts refused past what it holds, and a volume's `Busy`.
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
         let waiting = self.jobs.iter().any(Job::waits_for_room);
         let due = waiting && now >= self.room_offered_ns.saturating_add(beat);
@@ -11492,6 +11494,44 @@ pub(super) mod tests {
         let job = put_job(put);
         assert!(job.held() && job.waits_for_room());
         assert_eq!(job.due_ns(5, 2), Some(7), "the S3 door's put, at its beat");
+    }
+
+    /// The time from a peer's room freeing to a chunk it had no room for being written, on the
+    /// asking side. Refused for room, as every peer refused one before it held it (`node::hold`),
+    /// the chunk is asked again at its put's next beat, a probe timeout, about a second: room freed
+    /// by the peer's other writers or its cleaner answers nothing of this node's, so nothing offers
+    /// it room sooner (`Host::step`). Held on its exchange instead, it is never refused: its put
+    /// waits on no room of its own, is due at its client's patience alone, and its answer, which the
+    /// peer gives at the turn room frees, moves it at the host's next step.
+    #[test]
+    fn a_chunk_held_at_its_peer_is_answered_as_room_frees_and_one_refused_waits_its_beat() {
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        // The peer's room frees just after its refusal reached the put.
+        let freed = 1_000;
+        let (mut put, chunks) = put_of_copies(3);
+        put.answer(chunks[0].0, put::Answer::Busy).unwrap();
+        let job = put_job(put);
+        assert!(job.waits_for_room());
+        assert_eq!(
+            job.due_ns(freed, beat).map(|due| due - freed),
+            Some(beat),
+            "refused, its chunk is asked again a beat after the room freed"
+        );
+        let (put, chunks) = put_of_copies(3);
+        let mut job = put_job(put);
+        assert!(!job.waits_for_room(), "held, it waits for no room");
+        assert_eq!(
+            job.due_ns(freed, beat),
+            Some(job.bound_ns()),
+            "held, it is due at its client's patience alone"
+        );
+        // The peer writes it at the turn its room freed, and answers: the put moves on.
+        let Work::Put(putting) = &mut job.work else {
+            panic!("a put's job");
+        };
+        let put = putting.put.as_mut().unwrap();
+        put.answer(chunks[0].0, put::Answer::Stored).unwrap();
+        assert!(!put.waits_for_room() && put.outcome().is_none());
     }
 
     /// An S3 put whose chunk waits for room at its volume past two beats, its volume's cleaner

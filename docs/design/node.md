@@ -4282,8 +4282,24 @@ is the volume's own answer, typed (`Stored`, `Read`, `Busy`, `Full`, `Fenced`, `
 buffer it arrived in (`Volume::put_checked_waking`) and answered when the volume's writer wakes
 the node; a get is a batch at the device's issuer, taken as its answer comes (`Volume::reader`),
 so the shard never waits on a chunk's I/O. A put a peer sends takes room from what the volumes'
-writer queues hold before its body is read, and one the node has no room for is refused unread
-(`Refusal::Budget`), as the queue would refuse it `Busy` once read. A node asks its own volumes
+writer queues hold before its body is read, and one the node has no room for is held on its
+exchange, its body unread, first come first served, and read in the turn a volume's answered
+write gives room back (`node::hold`, 2026-11-19): refused unread (`Refusal::Budget`), as every
+such put was before, its asker heard nothing when the room came back, room freed by other nodes'
+writes or the volume's cleaner answering nothing of its own, and asked again only at its put's
+next beat, a probe timeout, about a second (`Host::step`). A held put's asker is told at every
+half beat that it is held, as a chunk its volume holds is (research/77 D2), the vouch resting on
+the writes in flight that hold the room (a put is held only once its room was refused, which
+`take_room` does only while some is taken; STATUS.md's conditions on a vouch), so its transport
+keeps the exchange out (`Endpoint::working`; `tests/put_body.rs`: a 4 KiB put held unread three
+periods is answered, and given up `Stalled` within two when not vouched for); it is refused
+`Budget` as before once its request's patience passes, and let go if its exchange ends. The held
+puts are bounded by the chunk exchanges the volumes take at once and their bodies by the room
+(one larger alone, as it is taken alone), past either refused `Budget` as it came. A full volume
+still answers each put `Full` once taken, which gives its room back, so a full cell still
+answers `InsufficientStorage` (chunk-store.md §8). A put the queue refuses `Busy` once read is
+still answered so: holding it would keep its bytes, and `Volume::put_checked_waking` takes them
+whether or not it queues them. A node asks its own volumes
 in-process, the laptop's path (§5.5), and its peers' over the transfer class (`Node::put_chunk`,
 `Node::get_chunk`); a gateway asks them through a client whose certificate the nodes name a
 gateway's (§3.6; `Client::put_chunk`, `Client::get_chunk`), one exchange at a time, a reply's

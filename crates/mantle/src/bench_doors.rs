@@ -338,8 +338,10 @@ fn descriptors_fit(
 /// refused at none or past `cores`, a thread driving at most a core; else `cores` less a core for
 /// each of the cell's servers, whose first shard runs its node's task, ranges, log, transport and
 /// doors under every placement (node.md §2.9), so the generator takes the cores the servers' busiest
-/// shards leave. At least one, and no more than `clients`, as a thread with no client drives none.
-fn client_threads(stated: Option<usize>, cores: usize, clients: usize) -> Result<usize, Error> {
+/// shards leave. At least one, and the same whatever the clients: the harness's threads never grow
+/// with its logical clients (lean-doors step 2's acceptance: its threads at 10R clients less at R
+/// are none), a thread whose share of a phase is no client idle through it.
+fn client_threads(stated: Option<usize>, cores: usize) -> Result<usize, Error> {
     let threads = match stated {
         Some(0) => return Err(failed("--client-threads 0: the clients need a thread")),
         Some(n) if n > cores => {
@@ -350,7 +352,7 @@ fn client_threads(stated: Option<usize>, cores: usize, clients: usize) -> Result
         Some(n) => n,
         None => cores.saturating_sub(cell::FOUNDERS),
     };
-    Ok(threads.min(clients).max(1))
+    Ok(threads.max(1))
 }
 
 /// Thread `k`'s share of `clients` spread over `threads`: each the same, and the first
@@ -4498,7 +4500,7 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
     // The threads the native door's clients run on; one against an endpoint, which has none.
     let cores = Facts::query().cpus_at_once().max(1);
     let threads = match options.endpoint {
-        None => client_threads(options.client_threads, cores, options.clients)?,
+        None => client_threads(options.client_threads, cores)?,
         Some(_) => 1,
     };
     // Its clients and its cell fit the process's descriptors, or the run is refused before it
@@ -4540,9 +4542,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             Some(_) => format!("as --client-threads states, of {cores} cores"),
             None => format!(
                 "the {cores} cores this process runs on at once less one for each of the cell's {} \
-                 servers' first shards, at most its {} clients",
-                cell::FOUNDERS,
-                options.clients
+                 servers' first shards, whatever its clients",
+                cell::FOUNDERS
             ),
         };
         writeln!(out, "doors native client threads {threads}: {how}")
@@ -5805,21 +5806,23 @@ mod tests {
     }
 
     /// The native door's threads are the cores the process runs on at once less one for each of
-    /// the cell's servers, at least one and at most the clients; `--client-threads` states a count
-    /// within the cores, and none or one past them is refused.
+    /// the cell's servers, at least one, the same at 2 clients as at 2,048: the harness's threads
+    /// never grow with its clients; `--client-threads` states a count within the cores, and none
+    /// or one past them is refused.
     #[test]
     fn the_client_threads_are_the_cores_the_servers_leave() {
         let founders = cell::FOUNDERS;
-        assert_eq!(client_threads(None, 16, 2_048).unwrap(), 16 - founders);
-        assert_eq!(client_threads(None, 8, 2_048).unwrap(), 8 - founders);
-        assert_eq!(client_threads(None, 16, 2).unwrap(), 2);
-        assert_eq!(client_threads(None, founders, 2_048).unwrap(), 1);
-        assert_eq!(client_threads(None, 1, 2_048).unwrap(), 1);
-        assert_eq!(client_threads(Some(4), 16, 2_048).unwrap(), 4);
-        assert_eq!(client_threads(Some(16), 16, 2_048).unwrap(), 16);
-        assert_eq!(client_threads(Some(8), 16, 3).unwrap(), 3);
-        assert!(client_threads(Some(0), 16, 2_048).is_err());
-        assert!(client_threads(Some(17), 16, 2_048).is_err());
+        assert_eq!(client_threads(None, 16).unwrap(), 16 - founders);
+        assert_eq!(client_threads(None, 8).unwrap(), 8 - founders);
+        assert_eq!(client_threads(None, founders).unwrap(), 1);
+        assert_eq!(client_threads(None, 1).unwrap(), 1);
+        assert_eq!(client_threads(Some(4), 16).unwrap(), 4);
+        assert_eq!(client_threads(Some(16), 16).unwrap(), 16);
+        assert!(client_threads(Some(0), 16).is_err());
+        assert!(client_threads(Some(17), 16).is_err());
+        // Two clients' threads are 2,048's: the phase's share leaves the rest idle.
+        assert_eq!(share(2, 13, 0).unwrap(), 1);
+        assert_eq!(share(2, 13, 12).unwrap(), 0);
     }
 
     /// Each thread's part of a phase merges into the phase's one line: the CPU its threads spent,

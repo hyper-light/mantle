@@ -360,8 +360,10 @@ stock clients stay the correctness suite.
   an operation halved between two builds and the rate did not move. The threads are the cores the
   process runs on at once (hyper-rt `Facts::cpus_at_once`, as each server counts its shards) less
   one for each server's first shard, which runs its node's task, ranges, log, transport and doors
-  under every placement (node.md §2.9), at least one and at most the clients, or as
-  `--client-threads` states within the cores; the run's second line says how many and why. Every
+  under every placement (node.md §2.9), at least one and the same whatever the clients, so the
+  harness's threads never grow with its logical clients (step 2's acceptance: its threads at 10R
+  clients less at R are none), or as `--client-threads` states within the cores; the run's second
+  line says how many and why. Every
   thread's clients take their operations from the phase's one schedule, in order, each operation's
   intended start the arrival process's, and count into its one tally and rounds, read on the host's
   shard clock alike on every thread; each thread's own CPU, allocations and wire are summed into the

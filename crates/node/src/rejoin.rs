@@ -87,6 +87,9 @@ pub struct Configured {
     pub ranges: Vec<u128>,
     /// Each volume's device directory.
     pub volumes: Vec<PathBuf>,
+    /// The cell's bound on nodes (`root.max_nodes`, none stated 0): the most members the rejoin
+    /// marker holds.
+    pub max_nodes: u32,
 }
 
 /// Where a start stands in a rejoin, from its files alone (§5.1's resume table).
@@ -191,9 +194,10 @@ fn configured_fingerprint(configured: &Configured) -> Result<[u8; FINGERPRINT], 
 /// identity, the rest of the switch and the join. A next certificate the marker names is the old
 /// identity's, not the cell's answer, and asks again.
 pub fn state(configured: &Configured) -> Result<Resume, RejoinError> {
-    let Some(marker) = Layout::new(&configured.dir).retired()? else {
+    let Some(marker) = Layout::new(&configured.dir).retired(configured.max_nodes)? else {
         return Ok(Resume::Start);
     };
+    let marker = marker.fingerprint;
     let named = configured_fingerprint(configured)?;
     if named != marker {
         return Ok(Resume::Finish);
@@ -489,9 +493,10 @@ pub enum AskError {
     /// or a supervisor acts.
     #[error("rejoin refused {0:?}: {0}")]
     Refused(wire::Refusal),
-    /// No member answered within the stock patience.
-    #[error("rejoin unreachable: no member answered")]
-    Unreachable,
+    /// No member answered within the stock patience: each member asked, and why it gave no answer
+    /// (at most the members asked, `root.max_nodes`).
+    #[error("rejoin unreachable: no member answered: {}", unanswered(.0))]
+    Unreachable(Vec<(PeerId, String)>),
     /// A member's answer does not decode.
     #[error("a member's answer: {0}")]
     Answer(#[from] wire::EnrollError),
@@ -570,55 +575,78 @@ pub async fn ask(asking: Asking) -> Result<wire::Granted, AskError> {
     let mut driver = Driver::bind(endpoint, asking.bind, io)?;
     let request = wire::Request::Regrant { key: asking.key }.encode();
     let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
+    // Why each member gave no answer: at most the members asked, said if none answers.
+    let mut unanswered = Vec::with_capacity(asking.members.len());
     for (id, at) in &asking.members {
         let until_ns = hyper_rt::futures::now_ns().saturating_add(patience);
         let answered = ask_one(&mut driver, (*id, *at), &request, until_ns).await?;
         let clock = driver.clock()?;
         driver.endpoint().disconnect(clock, *id);
-        match answered
-            .map(|bytes| wire::Answer::decode(&bytes))
-            .transpose()?
-        {
-            Some(wire::Answer::Granted(granted)) => return Ok(granted),
-            Some(wire::Answer::Refused(wire::Refusal::Unanswered | wire::Refusal::Unled))
-            | None => {}
-            Some(wire::Answer::Refused(refusal)) => return Err(AskError::Refused(refusal)),
+        let bytes = match answered {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                unanswered.push((*id, why));
+                continue;
+            }
+        };
+        match wire::Answer::decode(&bytes)? {
+            wire::Answer::Granted(granted) => return Ok(granted),
+            wire::Answer::Refused(refusal @ (wire::Refusal::Unanswered | wire::Refusal::Unled)) => {
+                unanswered.push((*id, format!("answered {refusal:?}")))
+            }
+            wire::Answer::Refused(refusal) => return Err(AskError::Refused(refusal)),
         }
     }
-    Err(AskError::Unreachable)
+    Err(AskError::Unreachable(unanswered))
+}
+
+/// Each member asked and why it gave no answer, on one line.
+fn unanswered(why: &[(PeerId, String)]) -> String {
+    let mut line = String::new();
+    for (at, (id, reason)) in why.iter().enumerate() {
+        if at > 0 {
+            line.push_str("; ");
+        }
+        line.push_str(&format!("{id}: {reason}"));
+    }
+    line
 }
 
 /// Asks member `id`, listening at `at`, once, by `until_ns` on the shard's clock: the answer's
-/// bytes, or none where it was not reached or the exchange ended without one.
+/// bytes, or why there is none (not reached, refused, or the exchange ended without one).
 async fn ask_one(
     driver: &mut Asker,
     (id, at): (PeerId, SocketAddr),
     request: &[u8],
     until_ns: u64,
-) -> Result<Option<Vec<u8>>, AskError> {
+) -> Result<Result<Vec<u8>, String>, AskError> {
     let clock = driver.clock()?;
-    if driver.endpoint().connect(clock, id, at).is_err() {
-        return Ok(None);
+    if let Err(refusal) = driver.endpoint().connect(clock, id, at) {
+        return Ok(Err(format!("not dialed: {refusal:?}")));
     }
     loop {
         match next_event(driver, until_ns).await? {
             Some(Event::Connected { peer, .. }) if peer == id => break,
-            Some(Event::Unreachable { peer, .. } | Event::Closed { peer, .. }) if peer == id => {
-                return Ok(None);
+            Some(Event::Unreachable { peer, refusal }) if peer == id => {
+                return Ok(Err(format!("unreachable: {refusal:?}")));
+            }
+            Some(Event::Closed { peer, refusal, .. }) if peer == id => {
+                return Ok(Err(format!("closed before it was up: {refusal:?}")));
             }
             Some(_) => {}
-            None => return Ok(None),
+            None => return Ok(Err("no connection within its patience".to_owned())),
         }
     }
     let clock = driver.clock()?;
     let left = until_ns.saturating_sub(hyper_rt::futures::now_ns()).max(1);
     let period = Progress::new(Duration::from_nanos(left))?;
     let len = u64::try_from(request.len()).unwrap_or(u64::MAX);
-    let Ok(exchange) = driver
+    let exchange = match driver
         .endpoint()
         .open(clock, id, Kind::Enroll, &[], Some(len), period)
-    else {
-        return Ok(None);
+    {
+        Ok(exchange) => exchange,
+        Err(refusal) => return Ok(Err(format!("request not opened: {refusal:?}"))),
     };
     let mut written = 0usize;
     let mut bytes = Vec::new();
@@ -630,29 +658,46 @@ async fn ask_one(
             match driver.endpoint().write_body(exchange, rest) {
                 Ok(0) => break,
                 Ok(took) => written = written.saturating_add(took),
-                Err(_) => return Ok(None),
+                Err(refusal) => return Ok(Err(format!("request not written: {refusal:?}"))),
             }
         }
         match next_event(driver, until_ns).await? {
             Some(Event::Reply { exchange: e, .. }) if e == exchange => {
                 replied = true;
                 if read_answer(driver, exchange, &mut bytes)? {
-                    return Ok(Some(bytes));
+                    return Ok(Ok(bytes));
                 }
             }
             Some(Event::BodyReady { exchange: e }) if e == exchange && replied => {
                 if read_answer(driver, exchange, &mut bytes)? {
-                    return Ok(Some(bytes));
+                    return Ok(Ok(bytes));
                 }
             }
-            Some(Event::Refused { exchange: e, .. }) if e == exchange => return Ok(None),
-            Some(Event::Unreachable { peer, .. } | Event::Closed { peer, .. }) if peer == id => {
-                return Ok(None);
+            Some(Event::Refused {
+                exchange: e,
+                refusal,
+                by_peer,
+                ..
+            }) if e == exchange => {
+                return Ok(Err(format!(
+                    "request refused: {refusal:?}{}",
+                    if by_peer { " by the member" } else { " here" }
+                )));
+            }
+            Some(Event::Unreachable { peer, refusal }) if peer == id => {
+                return Ok(Err(format!("unreachable mid-request: {refusal:?}")));
+            }
+            Some(Event::Closed { peer, refusal, .. }) if peer == id => {
+                return Ok(Err(format!("closed mid-request: {refusal:?}")));
             }
             Some(_) => {}
             None => {
                 driver.endpoint().end(exchange);
-                return Ok(None);
+                return Ok(Err(format!(
+                    "no answer within its patience ({written} of {} request bytes written{})",
+                    request.len(),
+                    if replied { ", a reply begun" } else { "" }
+                )));
             }
         }
     }
@@ -796,7 +841,7 @@ pub(crate) mod tests {
             std::fs::write(dir.join(name), name.as_bytes()).unwrap();
         }
         Layout::new(dir)
-            .retire(&mantle_cert::fingerprint(&der))
+            .retire(&mantle_cert::fingerprint(&der), &[], 1)
             .unwrap();
         config
     }
@@ -811,6 +856,7 @@ pub(crate) mod tests {
             certificate: stated.certificate.clone(),
             ranges: stated.ranges.iter().map(|(group, _)| *group).collect(),
             volumes: stated.volumes.iter().map(|(dir, _)| dir.clone()).collect(),
+            max_nodes: stated.enlist.as_ref().map_or(0, |e| e.max_nodes),
         }
     }
 
@@ -895,7 +941,11 @@ pub(crate) mod tests {
     fn a_start_finds_its_place_in_the_rejoin_from_its_files_alone() {
         let dir = tempfile::tempdir().unwrap();
         let file = laid_out(dir.path(), 5);
-        let marker = Layout::new(dir.path()).retired().unwrap().unwrap();
+        let marker = Layout::new(dir.path())
+            .retired(1)
+            .unwrap()
+            .unwrap()
+            .fingerprint;
         assert_eq!(state(&configured(&file)).unwrap(), Resume::Ask(marker));
         let (der, _) = certificate(9);
         assert!(matches!(
@@ -1044,7 +1094,7 @@ pub(crate) mod tests {
         answered(&file, 9);
         resume(|| Ok::<_, RejoinError>(configured(&file))).unwrap();
         let first = one_identity(&file);
-        Layout::new(dir.path()).retire(&first).unwrap();
+        Layout::new(dir.path()).retire(&first, &[], 1).unwrap();
         assert_eq!(state(&configured(&file)).unwrap(), Resume::Ask(first));
         let second = answered(&file, 11);
         assert!(dir.path().join("identity/node.der").exists());

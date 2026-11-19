@@ -10,6 +10,7 @@
 //! stop in order, its crashes, are its last run less its stops (docs/design/node.md §2.4, item 7).
 
 use std::fs::{File, OpenOptions, TryLockError};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::path::{Path, PathBuf};
 
 use mantle_meta::record::FINGERPRINT;
@@ -30,9 +31,26 @@ pub(crate) const STOPPED: &str = "stopped";
 /// orderly stops.
 const STOPPED_BYTES: usize = 24;
 /// The marker of a node the cell wrote off (docs/design/membership.md §5.1 step 1): the fingerprint
-/// of the certificate it was refused under, kept as the other records are. A start that finds it
-/// serves nothing (step 2).
+/// of the certificate it was refused under, then where each member the node knew as it was written
+/// off listens, kept as the other records are. A start that finds it serves nothing (step 2), and
+/// its ask dials those members (step 3).
 const REJOIN: &str = "rejoin";
+/// A member's QUIC address in its rejoin marker entry, a field of fixed width: the address's
+/// family (4 or 6), its 16 bytes (an IPv4 address in the first 4, the rest zero), its port and its
+/// IPv6 scope.
+const FIELD_BYTES: usize = 1 + 16 + 2 + 4;
+/// A member's entry in the rejoin marker: its id, then its address's field.
+const MEMBER_BYTES: usize = 8 + FIELD_BYTES;
+const IPV4: u8 = 4;
+const IPV6: u8 = 6;
+
+/// What the rejoin marker holds: the fingerprint of the certificate the cell wrote the node off
+/// under, and where each member the node knew as it was written off listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retired {
+    pub fingerprint: [u8; FINGERPRINT],
+    pub members: Vec<(u64, SocketAddr)>,
+}
 
 /// The node's last orderly stop: the run that stopped, the node's time run over all its runs when it
 /// did, and how many of its runs had then stopped in order.
@@ -56,8 +74,12 @@ pub enum LayoutError {
     Exhausted(u64),
     #[error("the node's readiness lock: {0}")]
     Live(std::io::Error),
-    #[error("the node's rejoin marker holds {0} bytes, not one certificate's fingerprint")]
+    #[error(
+        "the node's rejoin marker holds {0} bytes, not one certificate's fingerprint and whole members"
+    )]
     MalformedRejoin(usize),
+    #[error("the node's rejoin marker's bound of {0} members is past what a length holds")]
+    RejoinBound(u32),
     #[error("the node's rejoin marker: {0}")]
     Unretire(String),
 }
@@ -188,25 +210,60 @@ impl Layout {
     }
 
     /// Keeps the marker that the cell wrote the node off under the certificate whose fingerprint is
-    /// `fingerprint`: whole and durable when this returns (membership.md §5.1 step 1).
-    pub fn retire(&self, fingerprint: &[u8; FINGERPRINT]) -> Result<(), LayoutError> {
-        hyper_block::record::write(&self.dir.join(REJOIN), fingerprint)
+    /// `fingerprint`, with the first `most` of `members`, where each member the node knows listens
+    /// (`most` the cell's bound on nodes): whole and durable when this returns (membership.md §5.1
+    /// step 1).
+    pub fn retire(
+        &self,
+        fingerprint: &[u8; FINGERPRINT],
+        members: &[(u64, SocketAddr)],
+        most: u32,
+    ) -> Result<(), LayoutError> {
+        let first = usize::try_from(most).map_err(|_| LayoutError::RejoinBound(most))?;
+        let kept = members.get(..first).unwrap_or(members);
+        let bytes = rejoin_bytes(kept.len()).ok_or(LayoutError::RejoinBound(most))?;
+        let mut marker = Vec::with_capacity(bytes);
+        marker.extend_from_slice(fingerprint);
+        for (id, at) in kept {
+            marker.extend_from_slice(&id.to_le_bytes());
+            marker.extend_from_slice(&address_field(at));
+        }
+        hyper_block::record::write(&self.dir.join(REJOIN), &marker)
             .map_err(|e| LayoutError::Record(e.to_string()))
     }
 
-    /// The fingerprint the rejoin marker holds, none where the cell has not written the node off.
-    pub fn retired(&self) -> Result<Option<[u8; FINGERPRINT]>, LayoutError> {
+    /// What the rejoin marker holds, of at most `most` members (the cell's bound on nodes), none
+    /// where the cell has not written the node off. One holding more, or bytes no whole member's
+    /// entry ends, is malformed.
+    pub fn retired(&self, most: u32) -> Result<Option<Retired>, LayoutError> {
         let path = self.dir.join(REJOIN);
-        let Some(bytes) = hyper_block::record::read(&path, FINGERPRINT)
+        let limit = usize::try_from(most)
+            .ok()
+            .and_then(rejoin_bytes)
+            .ok_or(LayoutError::RejoinBound(most))?;
+        let Some(bytes) = hyper_block::record::read(&path, limit)
             .map_err(|e| LayoutError::Record(e.to_string()))?
         else {
             return Ok(None);
         };
-        let fingerprint: [u8; FINGERPRINT] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| LayoutError::MalformedRejoin(bytes.len()))?;
-        Ok(Some(fingerprint))
+        let malformed = || LayoutError::MalformedRejoin(bytes.len());
+        let (fingerprint, rest) = bytes
+            .split_first_chunk::<FINGERPRINT>()
+            .ok_or_else(malformed)?;
+        let (entries, left) = rest.as_chunks::<MEMBER_BYTES>();
+        if !left.is_empty() {
+            return Err(malformed());
+        }
+        let mut members = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (id, field) = entry.split_first_chunk::<8>().ok_or_else(malformed)?;
+            let at = field_address(field).ok_or_else(malformed)?;
+            members.push((u64::from_le_bytes(*id), at));
+        }
+        Ok(Some(Retired {
+            fingerprint: *fingerprint,
+            members,
+        }))
     }
 
     /// Removes the rejoin marker, once the node took its new identity (membership.md §5.1 step 5):
@@ -221,6 +278,57 @@ impl Layout {
             Err(e) => return Err(LayoutError::Unretire(e.to_string())),
         }
         hyper_block::file::sync_dir(&self.dir).map_err(|e| LayoutError::Unretire(e.to_string()))
+    }
+}
+
+/// The bytes of a rejoin marker of `members` members, its fingerprint and each member's entry; none
+/// past what a length holds.
+fn rejoin_bytes(members: usize) -> Option<usize> {
+    members.checked_mul(MEMBER_BYTES)?.checked_add(FINGERPRINT)
+}
+
+/// `at` in a marker entry's fixed field: its family, its 16 address bytes, its port and its scope.
+fn address_field(at: &SocketAddr) -> Vec<u8> {
+    let (family, octets, scope) = match at {
+        SocketAddr::V4(v4) => {
+            let [a, b, c, d] = v4.ip().octets();
+            (IPV4, [a, b, c, d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0u32)
+        }
+        SocketAddr::V6(v6) => (IPV6, v6.ip().octets(), v6.scope_id()),
+    };
+    let mut field = Vec::with_capacity(FIELD_BYTES);
+    field.push(family);
+    field.extend_from_slice(&octets);
+    field.extend_from_slice(&at.port().to_le_bytes());
+    field.extend_from_slice(&scope.to_le_bytes());
+    field
+}
+
+/// The address a marker entry's field holds, none where its family is neither IPv4's nor IPv6's.
+fn field_address(field: &[u8]) -> Option<SocketAddr> {
+    let (family, rest) = field.split_first()?;
+    let (octets, rest) = rest.split_first_chunk::<16>()?;
+    let (port, rest) = rest.split_first_chunk::<2>()?;
+    let (scope, rest) = rest.split_first_chunk::<4>()?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let port = u16::from_le_bytes(*port);
+    match *family {
+        IPV4 => {
+            let (v4, zero) = octets.split_first_chunk::<4>()?;
+            if zero.iter().any(|b| *b != 0) {
+                return None;
+            }
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(*v4)), port))
+        }
+        IPV6 => Some(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from(*octets),
+            port,
+            0,
+            u32::from_le_bytes(*scope),
+        ))),
+        _ => None,
     }
 }
 
@@ -324,15 +432,21 @@ mod tests {
         assert!(layout.stopped().is_err());
     }
 
-    /// The rejoin marker is written whole, survives into the next start's reading, and a damaged one
-    /// is refused as corrupt rather than read as no marker (membership.md §5.1 step 1).
+    /// The rejoin marker is written whole, survives into the next start's reading with its
+    /// fingerprint and each member's address, IPv4 and IPv6 with its scope, and a damaged one is
+    /// refused as corrupt rather than read as no marker (membership.md §5.1 step 1).
     #[test]
     fn the_rejoin_marker_is_kept_whole_and_read_back_at_the_next_start() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::new(dir.path());
-        assert_eq!(layout.retired().unwrap(), None);
+        assert_eq!(layout.retired(3).unwrap(), None);
         let fingerprint = [7u8; FINGERPRINT];
-        layout.retire(&fingerprint).unwrap();
+        let members: Vec<(u64, SocketAddr)> = vec![
+            (11, "127.0.0.1:7000".parse().unwrap()),
+            (12, "[fe80::1%3]:7001".parse().unwrap()),
+            (13, "[2001:db8::2]:7002".parse().unwrap()),
+        ];
+        layout.retire(&fingerprint, &members, 3).unwrap();
         // The temporary name is gone: the marker is in place under its own.
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -340,13 +454,58 @@ mod tests {
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(REJOIN)]);
         assert_eq!(
-            Layout::new(dir.path()).retired().unwrap(),
-            Some(fingerprint)
+            Layout::new(dir.path()).retired(3).unwrap(),
+            Some(Retired {
+                fingerprint,
+                members: members.clone(),
+            })
         );
+        // A marker of more members than the bound read with is refused, not cut short.
+        assert!(layout.retired(2).is_err());
         let path = dir.path().join(REJOIN);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[0] ^= 0xff;
         std::fs::write(&path, bytes).unwrap();
-        assert!(layout.retired().is_err());
+        assert!(layout.retired(3).is_err());
+    }
+
+    /// A marker keeps the first `most` members it is given, and one of none holds the fingerprint
+    /// alone; bytes that end no whole member, or an entry of no address family, are malformed.
+    #[test]
+    fn the_rejoin_marker_keeps_at_most_its_bound_and_refuses_partial_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let fingerprint = [9u8; FINGERPRINT];
+        let members: Vec<(u64, SocketAddr)> = (0..5u16)
+            .map(|n| (u64::from(n), SocketAddr::from(([10, 0, 0, 1], 7000 + n))))
+            .collect();
+        layout.retire(&fingerprint, &members, 2).unwrap();
+        assert_eq!(
+            layout.retired(2).unwrap().unwrap().members,
+            members[..2].to_vec()
+        );
+        layout.retire(&fingerprint, &[], 0).unwrap();
+        assert_eq!(
+            layout.retired(0).unwrap(),
+            Some(Retired {
+                fingerprint,
+                members: Vec::new(),
+            })
+        );
+        let path = dir.path().join(REJOIN);
+        let mut partial = fingerprint.to_vec();
+        partial.extend_from_slice(&[0u8; MEMBER_BYTES - 1]);
+        hyper_block::record::write(&path, &partial).unwrap();
+        assert!(matches!(
+            layout.retired(1),
+            Err(LayoutError::MalformedRejoin(_))
+        ));
+        let mut familyless = fingerprint.to_vec();
+        familyless.extend_from_slice(&[0u8; MEMBER_BYTES]);
+        hyper_block::record::write(&path, &familyless).unwrap();
+        assert!(matches!(
+            layout.retired(1),
+            Err(LayoutError::MalformedRejoin(_))
+        ));
     }
 }

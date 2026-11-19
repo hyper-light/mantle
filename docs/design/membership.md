@@ -412,9 +412,16 @@ node's volumes, and a node refused (a ban, the setting) keeps its disks for whoe
    node that stops; and a written-off node above every member it holds, and pinned by none, hears no
    refusal at all, which the rejoin closes (slice 6: a member that reached no member over its
    patience dials each one its replica holds, each once). The node writes a marker, `rejoin`,
-   holding its old certificate's fingerprint, whole and durable (hyper-block's record: a temporary
-   name, the platform's full flush, a rename, its directory flushed, and a CRC-32C checked on read,
-   as the node keeps its run, node.md §1.6), and says `retired`.
+   holding its old certificate's fingerprint and where each member it knows listens, at most
+   `root.max_nodes` of them, whole and durable (hyper-block's record: a temporary name, the
+   platform's full flush, a rename, its directory flushed, and a CRC-32C checked on read, as the
+   node keeps its run, node.md §1.6), and says `retired`. The addresses are kept because a node may
+   know where a member listens only from what its process was told as it ran (a `learn` line on a
+   harness's standard input, a member's row its replica no longer holds): its next start reads
+   nothing but its files and its configuration before it asks, so what it is not told again it
+   would not know (found 2026-11-19: a node of the tests, told every member's address on its input,
+   its root range's store as read before the node opens it, its log not replayed, naming none of
+   them, asked no member and ended `rejoin unreachable`).
 2. **It stops serving.** Its doors, ranges and chunk service stop; it dials no member under its old
    identity and writes no liveness record. A node that starts with the marker present starts here.
    Until the rejoin is built (slices 3 to 6), the process ends here: the marker kept, it says
@@ -424,9 +431,9 @@ node's volumes, and a node refused (a ban, the setting) keeps its disks for whoe
    opens, measures, dials or writes.
 3. **It asks.** It makes a key pair and writes it (`identity/next.key`) whole and durable before
    sending anything, and keeps it through every retry, since the cell may commit a certificate for
-   it before the answer arrives. It dials each member it knows, its seeds and the members its
-   replica holds, each once, at most `root.max_nodes`, each within the transport's handshake
-   deadline, under the enrollment protocol, and sends `Regrant { key }`. A member's directory
+   it before the answer arrives. It dials each member it knows, its seeds, the members its marker
+   names and the members its replica holds, each once, at most `root.max_nodes`, each within the
+   transport's handshake deadline, under the enrollment protocol, and sends `Regrant { key }`. A member's directory
    admits under that protocol only a certificate whose fingerprint is a ledger entry, and only for
    that request and its answer. The member forwards it to the root range's leader with the
    fingerprint its handshake proved, never one the request names, as `Join` is taken only from the

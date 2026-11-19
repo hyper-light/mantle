@@ -188,6 +188,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.cell.as_ref()
     }
 
+    /// Where each member this node knows listens, its QUIC address as its lines, its replica of the
+    /// root range and its input last said it: each peer the root range holds serving or leaving
+    /// where this node holds the cell's members, else each peer, in the order the node keeps them.
+    /// What a written-off node keeps to ask for its new identity (membership.md §5.1 step 1).
+    pub fn listening(&self) -> impl Iterator<Item = (PeerId, SocketAddr)> + '_ {
+        let cell = self.cell.as_ref();
+        self.remotes.iter().filter_map(move |r| {
+            let member = cell.is_none_or(|c| {
+                c.member(r.id).is_some_and(|row| {
+                    matches!(row.state, MemberState::Serving | MemberState::Leaving)
+                })
+            });
+            r.quic.filter(|_| member).map(|quic| (r.id, quic))
+        })
+    }
+
     /// Whether this node is a member of the cell, serving or leaving, by its own replica of the
     /// root range.
     pub fn member(&self) -> bool {

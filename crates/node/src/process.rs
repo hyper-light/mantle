@@ -1708,7 +1708,7 @@ type CellAnswer = Result<wire::Granted, rejoin::AskError>;
 fn unanswered_line(unanswered: &rejoin::AskError) -> Option<String> {
     match unanswered {
         rejoin::AskError::Refused(refusal) => Some(format!("rejoin refused {refusal:?}")),
-        rejoin::AskError::Unreachable | rejoin::AskError::Answer(_) => {
+        rejoin::AskError::Unreachable(_) | rejoin::AskError::Answer(_) => {
             Some("rejoin unreachable".to_owned())
         }
         rejoin::AskError::Transport(_)
@@ -1779,19 +1779,37 @@ fn ask_cell(
 
 /// The members the start's ask dials (membership.md §5.1 step 3), each once and never itself:
 /// its seeds and peers whose lines say where they listen ([`resolve`]), then each member its
-/// replica of the root range holds serving or leaving ([`held_members`]); at most the cell's bound
-/// on nodes where the configuration states it, else as many as its lines and its replica's table
-/// name, each bounded already.
+/// marker says listened where the node knew it as it was written off ([`Layout::retired`]), then
+/// each member its replica of the root range holds serving or leaving ([`held_members`]); at most
+/// the cell's bound on nodes where the configuration states it, else as many as its lines, its
+/// marker and its replica's table name, each bounded already.
 fn asked_members(config: &ProcessConfig) -> Result<Vec<(PeerId, SocketAddr)>, ProcessError> {
-    let lined = resolve(config).map_err(step(Step::Network))?.addresses;
-    let held = held_members(config).map_err(step(Step::Storage))?;
-    let most = match config.enlist.as_ref() {
-        Some(e) => usize::try_from(e.max_nodes)
-            .map_err(|e| ProcessError::Value("root.max_nodes", e.to_string()))?,
-        None => lined.len().saturating_add(held.len()),
+    let max_nodes = config.enlist.as_ref().map(|e| e.max_nodes);
+    let stated = match max_nodes {
+        Some(n) => Some(
+            usize::try_from(n).map_err(|e| ProcessError::Value("root.max_nodes", e.to_string()))?,
+        ),
+        None => None,
     };
+    let lined = resolve(config).map_err(step(Step::Network))?.addresses;
+    let kept = Layout::new(&config.dir)
+        .retired(max_nodes.unwrap_or(0))
+        .map_err(|e| step(Step::Storage)(ProcessError::History(e.to_string())))?
+        .map(|retired| retired.members)
+        .unwrap_or_default();
+    let held = held_members(config).map_err(step(Step::Storage))?;
+    let most = stated.unwrap_or_else(|| {
+        lined
+            .len()
+            .saturating_add(kept.len())
+            .saturating_add(held.len())
+    });
     let mut members: Vec<(PeerId, SocketAddr)> = Vec::with_capacity(most);
-    let known = lined.iter().map(|(id, quic, _)| (*id, *quic)).chain(held);
+    let known = lined
+        .iter()
+        .map(|(id, quic, _)| (*id, *quic))
+        .chain(kept)
+        .chain(held);
     for (id, at) in known {
         if members.len() >= most {
             break;
@@ -1843,6 +1861,7 @@ fn process_rejoining(file: &Path, config: &ProcessConfig) -> Configured {
         certificate: config.certificate.clone(),
         ranges: config.ranges.iter().map(|(group, _)| *group).collect(),
         volumes: config.volumes.iter().map(|v| v.dir.clone()).collect(),
+        max_nodes: config.enlist.as_ref().map_or(0, |e| e.max_nodes),
     }
 }
 
@@ -1855,6 +1874,7 @@ fn stated_rejoining(file: &Path, stated: &Stated) -> Configured {
         certificate: stated.certificate.clone(),
         ranges: stated.ranges.iter().map(|(group, _)| *group).collect(),
         volumes: stated.volumes.iter().map(|(dir, _)| dir.clone()).collect(),
+        max_nodes: stated.enlist.as_ref().map_or(0, |e| e.max_nodes),
     }
 }
 
@@ -3082,8 +3102,12 @@ async fn serve(
             )
         };
         if retired {
+            // Where each member listens as the node knows it now, which the next start's ask
+            // dials beside its seeds (membership.md §5.1 step 3): an address told on this run's
+            // input is told to no later start.
+            let listening: Vec<(PeerId, SocketAddr)> = node.listening().take(members).collect();
             layout
-                .retire(&fingerprint)
+                .retire(&fingerprint, &listening, max_nodes)
                 .map_err(|e| ProcessError::History(e.to_string()))?;
             say(&mut output, "retired\n").await?;
             return Err(ProcessError::Retired(hex(&fingerprint)));
@@ -5281,13 +5305,13 @@ mod tests {
         }
         match resume_rejoin(read(&file).unwrap(), read, |_, key| {
             keys.push(key.public_key().to_vec());
-            Ok(Err(rejoin::AskError::Unreachable))
+            Ok(Err(rejoin::AskError::Unreachable(Vec::new())))
         }) {
-            Err(ProcessError::Unrejoined(rejoin::AskError::Unreachable)) => {}
+            Err(ProcessError::Unrejoined(rejoin::AskError::Unreachable(_))) => {}
             other => panic!("not unreachable: {other:?}"),
         }
         assert_eq!(
-            unanswered_line(&rejoin::AskError::Unreachable),
+            unanswered_line(&rejoin::AskError::Unreachable(Vec::new())),
             Some("rejoin unreachable".to_owned())
         );
         // Every ask asked for one key, and nothing but it was kept: the directory's files as they
@@ -5319,7 +5343,7 @@ mod tests {
             stated.seeds.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![3]
         );
-        assert_eq!(Layout::new(dir.path()).retired().unwrap(), None);
+        assert_eq!(Layout::new(dir.path()).retired(1).unwrap(), None);
         assert_eq!(Layout::new(dir.path()).run().unwrap(), None);
         // The next start is a member's: nothing asked.
         let member = resume_rejoin(read(&file).unwrap(), read, |_, _| {

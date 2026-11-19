@@ -5011,6 +5011,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// leading) is asked again after a pause.
     fn propose_own(&mut self, at: usize, id: u64, now: u64) -> Result<(), NodeError> {
         let Some((group, place, mut out)) = self.asking.get_mut(at).and_then(|a| {
+            // A search of the range's entries out, at most `ENTRIES_OUT`.
             let place = a.outs.iter().position(|o| o.id == id)?;
             Some((a.group, place, a.outs.remove(place)?))
         }) else {
@@ -5059,7 +5060,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// The range, and its entry out, on `exchange`.
+    /// The range, and its entry out, on `exchange`: a search of one `Asking` a range the node asks
+    /// commands of, each holding at most [`ENTRIES_OUT`] entries out.
     fn asking_on(&self, exchange: ExchangeId) -> Option<(usize, u64)> {
         self.asking.iter().enumerate().find_map(|(at, a)| {
             a.outs

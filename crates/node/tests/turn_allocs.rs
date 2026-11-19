@@ -173,13 +173,20 @@ fn serving(make: fn(u64) -> Sim, seed: u64, ops: u64) -> alloc::Counts {
 /// 2,051. With the state held apart, the hand-stated budget's windows of 64,870 bytes had held no
 /// chunk either, and its run counted 35,255, carrying 7,021 datagrams where the floor's windows
 /// carry 6,873. On Linux 35,126, this Mac's and the 51 its sockets' batched headers add, derived
-/// and not yet counted there: the floor's windows are this Mac's.
+/// and not yet counted there: the floor's windows are this Mac's. 34,319 on perf-10k, whose
+/// sessions' expiry keeps a watermark (b237dadd, on perf-10k before the floor's budget was merged
+/// into it): an entry within a session's lifetime of it reads nothing to expire sessions, where
+/// every entry's expiry had read the order of last use from its first row on every replica of
+/// every range. 756 allocations and 4,536 bytes fewer (17,557,473), reallocations 2,051 both: the
+/// floor's budget alone (a08f3f83) counts 35,075 on this Mac, and with b237dadd applied 34,319, as
+/// perf-10k's merge of the two (7a37446a) does. On Linux 34,370, this Mac's and the 51 its
+/// sockets' batched headers add, derived and not yet counted there.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        35_126
+        34_370
     } else {
-        35_075
+        34_319
     };
     let counts = serving(Sim::new, 1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");

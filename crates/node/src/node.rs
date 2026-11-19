@@ -1402,9 +1402,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// with its exchange or once its reply is written whole, so at most the exchanges the
     /// transport holds at once, and given back to the host's doors as it ends (6d, `host::Doors`).
     /// Each found by its exchange in one probe (`keyed::Keyed`) at every event on it
-    /// (`Node::hosts`); written in no order a reply depends on, a removal moving the last into its
-    /// slot.
-    replies: Keyed<(ExchangeId, host::Replies)>,
+    /// (`Node::hosts`), and each one's due while it waits for room a key in a heap, which the
+    /// node's wait reads the earliest of (`host::Writes`); written in no order a reply depends on,
+    /// a removal moving the last into its slot.
+    replies: host::Writes,
     /// Whether a reply's rounds ran out at the last turn's writing (`Node::write_replies`) with its
     /// exchange taking more: the next turn is due at once, for its job to give the next piece.
     replied: bool,
@@ -1866,7 +1867,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             feeding: Keyed::default(),
             piece: Vec::new(),
             fed: false,
-            replies: Keyed::default(),
+            replies: host::Writes::default(),
             replied: false,
             drivers: drivers::Drivers::over(NonZeroUsize::MIN),
             abandoned: std::collections::HashSet::new(),

@@ -90,7 +90,7 @@ impl<T: Key> Keyed<T> {
     }
 
     /// The slot of the entry holding `key`.
-    fn slot(&self, key: T::Of) -> Option<usize> {
+    pub(super) fn slot(&self, key: T::Of) -> Option<usize> {
         #[cfg(test)]
         tests::PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
         self.slots.get(&key).copied()

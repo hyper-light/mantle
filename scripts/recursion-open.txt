@@ -3,7 +3,6 @@
 # list only shrinks: rewrite a cycle as flat work and take it off here.
 <mantle_engine::codec::zstd::decoder::Decoder>::step
 <mantle_engine::codec::zstd::decoder::Execution>::copy_from_dictionary
-<mantle_gateway::repair::Repairer>::read_more | <mantle_gateway::repair::Repairer>::rebuild
 <mantle_s3::json::Reader>::array | <mantle_s3::json::Reader>::object | <mantle_s3::json::Reader>::value
 <mantle_s3::json::Value>::write
 core::ptr::drop_glue::<(alloc::string::String, mantle_s3::json::Value)> | core::ptr::drop_glue::<[(alloc::string::String, mantle_s3::json::Value)]> | core::ptr::drop_glue::<[mantle_s3::json::Value]> | core::ptr::drop_glue::<alloc::vec::Vec<(alloc::string::String, mantle_s3::json::Value)>> | core::ptr::drop_glue::<alloc::vec::Vec<mantle_s3::json::Value>> | core::ptr::drop_glue::<mantle_s3::json::Value>

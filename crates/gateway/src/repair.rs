@@ -476,6 +476,17 @@ enum Phase {
     Over,
 }
 
+/// What a rebuild came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuilt {
+    /// The chunk rebuilt and checked, and the request after it asked: the volume to write it on,
+    /// or the commit naming a place found to hold it.
+    Asked,
+    /// No set of the chunks read rebuilt the block: `suspect` is set, and every readable chunk is
+    /// to be read.
+    Suspect,
+}
+
 /// The rebuilding of one chunk of one block (docs/design/repair.md §3).
 pub struct Repairer {
     block: u128,
@@ -585,7 +596,7 @@ impl Repairer {
             next_id: 0,
             outcome: None,
         };
-        let started = repairer.read_more();
+        let started = repairer.read_on();
         repairer.guard(started);
         Ok(repairer)
     }
@@ -658,10 +669,28 @@ impl Repairer {
         }
     }
 
+    /// Reads until none is out, then rebuilds: sources asked ([`Self::read_more`]), and with none
+    /// out the chunk rebuilt ([`Self::rebuild`]), too few read leaving the block unreadable. A
+    /// rebuild whose decode failed sets `suspect`, and the next round asks every readable chunk not
+    /// yet tried. A round past the first follows that failure, which `suspect` lets come once, so
+    /// there are two rounds at most; they are counted against the block's chunks, at least two
+    /// wherever a decode can fail (a copy is never decoded), and past them the block is corrupt.
+    fn read_on(&mut self) -> Result<(), RepairError> {
+        let chunks = usize::from(self.header.data)
+            .checked_add(usize::from(self.header.parity))
+            .ok_or(RepairError::Overflow)?;
+        for _ in 0..chunks {
+            self.read_more();
+            if self.reading > 0 || self.rebuild()? == Rebuilt::Asked {
+                return Ok(());
+            }
+        }
+        Err(RepairError::Corrupt(self.block))
+    }
+
     /// Asks as many more sources as the rebuild still wants, each of a chunk not yet read or out,
-    /// from its first place not yet tried; done, the chunk is rebuilt, and with none left to ask
-    /// and too few read, the block is unreadable.
-    fn read_more(&mut self) -> Result<(), RepairError> {
+    /// from its first place not yet tried.
+    fn read_more(&mut self) {
         let out: BTreeSet<usize> = self
             .asked
             .values()
@@ -706,10 +735,6 @@ impl Repairer {
                 },
             );
         }
-        if self.reading == 0 {
-            return self.rebuild();
-        }
-        Ok(())
     }
 
     fn answered(&mut self, asked: Asked, answer: Answer) -> Result<(), RepairError> {
@@ -746,7 +771,7 @@ impl Repairer {
                 } else if !matches!(answer, Answer::Unreadable) {
                     return Err(RepairError::Mismatch);
                 }
-                self.read_more()
+                self.read_on()
             }
             (Asked::Place, Answer::Volumes(volumes)) if self.phase == Phase::Placing => {
                 let mut seen = BTreeSet::new();
@@ -913,8 +938,9 @@ impl Repairer {
         Ok(())
     }
 
-    /// With every source read, the chunk rebuilt and checked, and its volume asked for.
-    fn rebuild(&mut self) -> Result<(), RepairError> {
+    /// With every source read, the chunk rebuilt and checked, and its volume asked for; a first
+    /// decode that fails asks instead for every readable chunk ([`Rebuilt::Suspect`]).
+    fn rebuild(&mut self) -> Result<Rebuilt, RepairError> {
         let rebuilt = if self.header.data == 1 {
             // A copy read is the block itself, checked as it came.
             match self.got.values().next() {
@@ -928,14 +954,14 @@ impl Repairer {
                 // A decode failed: every readable chunk read, each left out in turn.
                 None if !self.suspect => {
                     self.suspect = true;
-                    return self.read_more();
+                    return Ok(Rebuilt::Suspect);
                 }
                 None => return Err(RepairError::Corrupt(self.block)),
             }
         };
         if let Some((volume, command)) = self.verified(&rebuilt) {
             self.commit_to(volume, command);
-            return Ok(());
+            return Ok(Rebuilt::Asked);
         }
         let crc = mantle_crc::crc32c(&rebuilt);
         self.rebuilt = Some((rebuilt, crc));
@@ -949,7 +975,7 @@ impl Repairer {
                 spread: self.spread,
             },
         );
-        Ok(())
+        Ok(Rebuilt::Asked)
     }
 
     /// The chunk rebuilt from the coded chunks read: cut or coded from the block of the first set
@@ -1065,6 +1091,161 @@ pub fn most_bytes(header: &BlockHeader, places: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use mantle_chunk::ChunkKey;
+
+    const BLOCK: u128 = 7;
+
+    /// A block of `data` and `parity` chunks, its own places on volumes 10, 11, … and `kept` more
+    /// places of the chunks named, after them; each volume in a domain of its own, readable but
+    /// those of `gone`'s places. Its chunks as coded, and the cell as judged.
+    fn coded(
+        (data, parity): (u8, u8),
+        kept: &[u16],
+        gone: &[usize],
+    ) -> (BlockHeader, Vec<Bytes>, Vec<ChunkPlace>, Judged) {
+        let block: Vec<u8> = (0..300u32).map(|b| (b * 7 + 3) as u8).collect();
+        let code = Code::new(data.into(), parity.into()).unwrap();
+        let chunks: Vec<Bytes> = code
+            .encode(&block)
+            .unwrap()
+            .into_iter()
+            .map(Bytes::from)
+            .collect();
+        let header = BlockHeader {
+            length: block.len() as u64,
+            data,
+            parity,
+            chunk_len: chunks[0].len() as u64,
+            crc32c: mantle_crc::crc32c(&block),
+        };
+        let indices = (0..u16::from(data) + u16::from(parity)).chain(kept.iter().copied());
+        let places: Vec<ChunkPlace> = indices
+            .enumerate()
+            .map(|(p, index)| ChunkPlace {
+                volume: 10 + p as u128,
+                key: ChunkKey {
+                    block: BLOCK,
+                    epoch: 1,
+                    index,
+                },
+            })
+            .collect();
+        let volumes = (0..places.len())
+            .map(|p| Volume {
+                volume: places[p].volume,
+                domain: p as u32,
+                reach: if gone.contains(&p) {
+                    Reach::Gone
+                } else {
+                    Reach::Readable
+                },
+            })
+            .collect();
+        let takers = (0..places.len() as u32).collect();
+        (header, chunks, places, Judged::new(volumes, takers))
+    }
+
+    /// The source read the repairer asks next, by its volume.
+    fn source(repairer: &mut Repairer) -> (Id, u128) {
+        match repairer.poll() {
+            Some((id, Request::Chunk { volume, .. })) => (id, volume),
+            other => panic!("asked {other:?}"),
+        }
+    }
+
+    /// A rebuild short of a block that verifies asks for more reads, and their answers rebuild
+    /// again, round after round: RS(2,2), its last chunk's place gone, chunk 1 kept on a second
+    /// place, and chunk 0 rotted where its volume cannot see. The first two reads asked are chunks
+    /// 0 and 1; chunk 1's is lost and asked again of its kept place; the decode of chunks 0 and 1
+    /// fails the block's CRC-32C, so chunk 2 is read too, and the set leaving chunk 0 out rebuilds
+    /// chunk 3, written on the volume offered and named there.
+    #[test]
+    fn a_rebuild_short_of_the_block_reads_more_and_rebuilds_again() {
+        let (header, chunks, places, cell) = coded((2, 2), &[1], &[3]);
+        let mut rotted = chunks[0].to_vec();
+        rotted[0] ^= 1;
+        let commit = Commit::Move { from: 13 };
+        let mut repairer =
+            Repairer::new(BLOCK, header, places, &cell, (3, commit, false), 8).unwrap();
+        let (first, at) = source(&mut repairer);
+        assert_eq!(at, 10);
+        let (lost, at) = source(&mut repairer);
+        assert_eq!(at, 11);
+        assert_eq!(
+            repairer.poll(),
+            None,
+            "a decode reads its data chunks alone"
+        );
+        repairer.answer(lost, Answer::Unreadable).unwrap();
+        let (kept, at) = source(&mut repairer);
+        assert_eq!(at, 14, "chunk 1 asked again, of its kept place");
+        repairer
+            .answer(first, Answer::Chunk(rotted.into()))
+            .unwrap();
+        assert_eq!(repairer.poll(), None);
+        repairer
+            .answer(kept, Answer::Chunk(chunks[1].clone()))
+            .unwrap();
+        let (more, at) = source(&mut repairer);
+        assert_eq!(at, 12, "the decode failed: every readable chunk is read");
+        assert_eq!(repairer.poll(), None);
+        assert_eq!(repairer.outcome(), None);
+        repairer
+            .answer(more, Answer::Chunk(chunks[2].clone()))
+            .unwrap();
+        let Some((placed, Request::Place { avoid, .. })) = repairer.poll() else {
+            panic!("no volume asked for");
+        };
+        assert_eq!(avoid, vec![10, 11, 12, 13, 14]);
+        repairer.answer(placed, Answer::Volumes(vec![20])).unwrap();
+        let Some((put, Request::Put { volume, bytes, .. })) = repairer.poll() else {
+            panic!("nothing written");
+        };
+        assert_eq!((volume, &bytes), (20, &chunks[3]), "chunk 3, rebuilt");
+        repairer.answer(put, Answer::Stored).unwrap();
+        let Some((named, Request::Block(command))) = repairer.poll() else {
+            panic!("nothing named");
+        };
+        assert!(
+            matches!(
+                command,
+                block::Command::Move {
+                    from: 13,
+                    to: 20,
+                    ..
+                }
+            ),
+            "{command:?}"
+        );
+        repairer
+            .answer(named, Answer::Block(block::Outcome::Moved))
+            .unwrap();
+        assert_eq!(repairer.outcome(), Some(&Ok(Repaired::Done { volume: 20 })));
+    }
+
+    /// A failed decode with no chunk left to read rebuilds again in the same answer's round, and
+    /// with no other set to try, the block is corrupt: RS(2,1), its last chunk's place gone and
+    /// chunk 0 rotted.
+    #[test]
+    fn a_failed_decode_with_nothing_left_to_read_is_corrupt() {
+        let (header, chunks, places, cell) = coded((2, 1), &[], &[2]);
+        let mut rotted = chunks[0].to_vec();
+        rotted[0] ^= 1;
+        let commit = Commit::Move { from: 12 };
+        let mut repairer =
+            Repairer::new(BLOCK, header, places, &cell, (2, commit, false), 8).unwrap();
+        let (first, _) = source(&mut repairer);
+        let (second, _) = source(&mut repairer);
+        repairer
+            .answer(first, Answer::Chunk(rotted.into()))
+            .unwrap();
+        repairer
+            .answer(second, Answer::Chunk(chunks[1].clone()))
+            .unwrap();
+        assert_eq!(repairer.poll(), None, "nothing is written");
+        assert_eq!(repairer.outcome(), Some(&Err(RepairError::Corrupt(BLOCK))));
+    }
 
     /// Every set of `k` of `0..n` once, in lexicographic order: `C(n, k)` of them.
     #[test]

@@ -3847,12 +3847,31 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(());
             };
             wait = false;
+            let mut back = back;
             let Some(f) = self.frozen.iter_mut().find(|f| f.ticket == back.ticket) else {
                 return Err(Error::InvalidArgument {
                     what: "a packed branch for no frozen memtable",
                 });
             };
+            // The grant it did not write goes back now, not as it retires: a memtable retires
+            // only once every older one has, and its grant is sized to the memtable and one
+            // extent more a cut, so frozen memtables held extents they never wrote beside a
+            // store at its limit (mantle-node tests/engine_workers.rs), as a compaction's result
+            // did until 9e62e0f9. A refused return changes no count, and the extents stay the
+            // memtable's to give back as it retires ([`Self::retire`]).
+            let mut given_back = Ok(());
+            if back.physical_error.is_none()
+                && let Ok(out) = back.result.as_mut()
+            {
+                given_back = self.store.grant_back(&out.unused);
+                if given_back.is_ok() {
+                    f.grant.retain(|held| !out.unused.contains(held));
+                    back.topped.retain(|held| !out.unused.contains(held));
+                    out.unused.clear();
+                }
+            }
             f.back = Some(back);
+            given_back?;
         }
     }
 
@@ -4984,13 +5003,17 @@ impl<F: BlockFile> ShardDb<F> {
             Some(pool) => pool.can_take(&mut self.store, true)?,
             None => false,
         };
-        if self.store.capacity() < asked {
+        // The inline compactions writing now take extents as they write: the grant leaves them
+        // room, as a compaction's does (`Trunk::inline_room`).
+        let room = asked.saturating_add(self.trunk.inline_room()?);
+        if self.store.capacity() < room {
             // A file grown by segments grows first. A store at its limit holds no grant this
-            // size beside the extents held, more than the packing writes: the memtable waits
-            // while a job out may give extents back, and with none the shard packs it, taking
-            // extents as it writes them, as it did without workers ([`Self::hand_off_sorted`]).
+            // size beside the extents held and the inline compactions' room, more than the
+            // packing writes: the memtable waits while a job out may give extents back, and with
+            // none the shard packs it, taking extents as it writes them, as it did without
+            // workers ([`Self::hand_off_sorted`]).
             if self.store.segments().is_some() {
-                self.packing_wanted = self.packing_wanted.max(asked);
+                self.packing_wanted = self.packing_wanted.max(room);
             }
             return Ok(Some((full, pack)));
         }

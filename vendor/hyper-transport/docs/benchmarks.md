@@ -1,8 +1,8 @@
 # hyper-transport benchmarks (mantle's snapshot)
 
 The benches hyper-raft keeps for this crate (`benches/lookup.rs`; hyper-raft `docs/benchmarks.md`,
-"Exchange lookup by stream") and the one mantle added with the change below
-(`benches/progress.rs`), recorded here until the change and its bench go upstream
+"Exchange lookup by stream") and the ones mantle added with the changes below
+(`benches/progress.rs`, `benches/budget.rs`), recorded here until the change and its bench go upstream
 (vendor/UPSTREAM.md, "Local changes"). Each runs from this directory against hyper-raft's lock file
 (vendor/UPSTREAM.md): `cp <hyper-raft>/Cargo.lock vendor/hyper-transport/` and then
 `cargo bench --manifest-path vendor/hyper-transport/Cargo.toml --bench <name> --offline`.
@@ -75,6 +75,37 @@ visit list's next exchange found by a binary search of that list alone.
 A second run of the committed tree measured 0.05 µs at every `n` without lanes and 0.11 µs with
 them. A call costs the same beside 1,023 heads waiting and 512 frames as beside one: 162 times less than
 before at 1,023 without lanes, 3,900 times less with them. Neither allocates.
+
+## A reservation beside spare buffers (2026-11-19)
+
+`benches/budget.rs`: a `Fixed` budget keeping `n` spare buffers, given back at capacities from 64
+bytes up, then a reservation of 1,000 bytes and its release, timed 20,000 times after 2,000 warm-up
+rounds. A node keeps a spare for each peer and client it may serve (mantle's
+`Fixed::new(.., peers + clients)`), and on the range leader above `Fixed::reserve` was 6.7% of
+`hyper-rt-shard-0`, 94% of it under `Core::read_exchange` and mantle's `Node::read_exchange`.
+
+Same machine, one run each: before at load average 12.6, after at 5.2. Before, perf-10k at
+`518e78b8`: a reservation searched every spare for the smallest that held it, twice when none did.
+After: the spares are kept in TLSF's classes (Masmano et al., ECRTS 2004), sixty-fourths of a power
+of two, a power of two's classes one word of an occupancy map; a reservation takes the last given
+back of its size's class if that holds it, else one of the first later class that holds any, else
+the largest class's, grown.
+
+| Spare buffers | Before: allocations | Before: time | After: allocations | After: time |
+|---|---|---|---|---|
+| 1 | 0.00 | 3.3 ns | 0.00 | 7.7 ns |
+| 16 | 0.00 | 6.0 ns | 0.00 | 7.7 ns |
+| 64 | 0.00 | 17.9 ns | 0.00 | 7.9 ns |
+| 256 | 0.00 | 118.0 ns | 0.00 | 7.7 ns |
+| 1024 | 0.00 | 694.7 ns | 0.00 | 8.4 ns |
+| 4096 | 0.00 | 2953.4 ns | 0.00 | 8.4 ns |
+| 16384 | 0.00 | 12061.4 ns | 0.00 | 8.4 ns |
+
+At 4,096 spares a reservation cost 2.95 µs, about what the leader's share implies (some 35,000
+reservations a second in 6.7% of a busy core is 1.8 µs each); now 8.4 ns at any count, 4 ns more
+than before beside one. The choice differs from the search's only where a size's class, a
+sixty-fourth of its power of two, holds buffers of several capacities: the last given back is
+tried, not the smallest of them.
 
 ## Exchange lookup by stream, again (2026-11-19)
 

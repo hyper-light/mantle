@@ -54,5 +54,9 @@ harness = false
 name = "progress"
 harness = false
 
+[[bench]]
+name = "budget"
+harness = false
+
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

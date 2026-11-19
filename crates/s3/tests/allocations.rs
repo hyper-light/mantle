@@ -304,3 +304,72 @@ fn a_requests_metadata_copies_only_the_fields_a_version_keeps() {
     assert_eq!(few_made, (1 + 2 * 2, 0));
     assert_eq!(many_made, few_made);
 }
+
+/// `sigv4::uri_encode` as it was before Lean doors step 7: each character pushed onto a string that
+/// grows.
+fn reference_uri_encode(bytes: &[u8], slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::new();
+    for &b in bytes {
+        let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if keep || (b == b'/' && !slash) {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 15)]));
+        }
+    }
+    out
+}
+
+/// S3's `UriEncode` of a key, a listing's `encoding-type=url` and a completion's `Location`, is
+/// one string made at its length, as the encoder before Lean doors step 7 wrote it: a key that
+/// needs none escaped, one with spaces, slashes and UTF-8, and keys at S3's 1,024-byte bound kept
+/// whole and escaped whole, each with `/` kept and escaped.
+#[test]
+fn a_uri_encoded_text_is_one_string_at_its_length() {
+    let longest = mantle_s3::route::MAX_KEY;
+    let keys: [Vec<u8>; 5] = [
+        b"photos".to_vec(),
+        "photos/2026/a b+c~d.é".as_bytes().to_vec(),
+        "k".repeat(longest).into_bytes(),
+        " ".repeat(longest).into_bytes(),
+        (0..=u8::MAX).cycle().take(longest).collect(),
+    ];
+    for key in &keys {
+        for slash in [false, true] {
+            let (expected, before) = counted(|| reference_uri_encode(key, slash));
+            let (encoded, made) = counted(|| sigv4::uri_encode(key, slash));
+            println!(
+                "uri_encode of {} bytes, slash {slash}: before {before:?}, now {made:?}",
+                key.len()
+            );
+            assert_eq!(
+                (made, encoded.capacity()),
+                ((1, 0), encoded.len()),
+                "{} bytes, slash {slash}",
+                key.len()
+            );
+            assert_eq!(encoded, expected);
+        }
+    }
+}
+
+/// An access key's or a principal's id is one string at its length: its characters written on the
+/// stack, each drawn byte's base32 character as before Lean doors step 7, and copied once.
+#[test]
+fn a_drawn_id_is_one_string_at_its_length() {
+    use mantle_s3::account::{KEY_ID_CHARS, draw_id, valid_key_id};
+    let mut drawn = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let (id, made) = counted(|| draw_id().unwrap());
+        println!("draw_id: now {made:?}");
+        assert_eq!(
+            (made, id.len(), id.capacity()),
+            ((1, 0), KEY_ID_CHARS, KEY_ID_CHARS)
+        );
+        assert!(valid_key_id(&id), "{id}");
+        assert!(drawn.insert(id));
+    }
+}

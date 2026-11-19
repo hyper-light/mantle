@@ -68,6 +68,7 @@ use mantle_meta::apply::Layer;
 use super::host::{
     GatewaySettings, Handover, Host, JobAsk, Native, Outcome, Pending, Serve, Table, Taken, taken,
 };
+use super::keyed::{Key, Keyed};
 use super::{ChunkOutcome, NodeError, Wall};
 use crate::ask::{CommandOutcome, ReadOutcome};
 use crate::command;
@@ -531,10 +532,12 @@ struct Served {
     /// What the host's step gave, sent after it, waiting for room: each a job's ask, end or
     /// sample, so at most the asks it holds and its jobs' ends and samples.
     gave: Vec<Out>,
-    /// Answers come and not yet taken: at most the asks held.
-    answers: Vec<(Pending, Outcome)>,
-    /// Asks let go before their answers came, each dropped as it comes: at most the asks held.
-    abandoned: Vec<Pending>,
+    /// Answers come and not yet taken, each found by its ask in one probe as its job takes it
+    /// (`keyed::Keyed`): at most the asks held.
+    answers: Keyed<(Pending, Outcome)>,
+    /// Asks let go before their answers came, each dropped as it comes, found in one probe: at
+    /// most the asks held.
+    abandoned: std::collections::HashSet<Pending>,
     /// The asks held of each kind, and the node's bound for each.
     held: Kinds,
     bounds: Kinds,
@@ -550,6 +553,15 @@ struct Served {
     windows: crate::window::Windows,
 }
 
+/// An answer kept for its ask's job, found by its ask (`Served::answers`).
+impl<T> Key for (Pending, T) {
+    type Of = Pending;
+
+    fn key(&self) -> Pending {
+        self.0
+    }
+}
+
 impl Served {
     /// The answer to the ask of `number` came: kept for its job, or dropped where its job let go.
     fn came(&mut self, number: u64, outcome: Outcome) {
@@ -558,8 +570,7 @@ impl Served {
             Outcome::Read(_) => Pending::Read(number),
             Outcome::Chunk(_) => Pending::Chunk(number),
         };
-        if let Some(at) = self.abandoned.iter().position(|p| *p == pending) {
-            self.abandoned.swap_remove(at);
+        if self.abandoned.remove(&pending) {
             self.let_go(pending);
             return;
         }
@@ -592,8 +603,7 @@ impl Serve for Served {
     }
 
     fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
-        let at = self.answers.iter().position(|(p, _)| *p == pending)?;
-        let (_, outcome) = self.answers.swap_remove(at);
+        let (_, outcome) = self.answers.remove(pending)?;
         self.let_go(pending);
         Some(outcome)
     }
@@ -604,11 +614,10 @@ impl Serve for Served {
 
     fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
         for pending in asks {
-            if let Some(at) = self.answers.iter().position(|(p, _)| *p == pending) {
-                self.answers.swap_remove(at);
+            if self.answers.remove(pending).is_some() {
                 self.let_go(pending);
             } else {
-                self.abandoned.push(pending);
+                self.abandoned.insert(pending);
             }
         }
     }
@@ -745,8 +754,8 @@ async fn run(
     let mut host = Host::new(0, Some(gateway));
     let mut served = Served {
         gave: Vec::with_capacity(slots),
-        answers: Vec::with_capacity(slots),
-        abandoned: Vec::with_capacity(slots),
+        answers: Keyed::with_capacity(slots),
+        abandoned: std::collections::HashSet::with_capacity(slots),
         held: Kinds::default(),
         bounds: Kinds {
             commands: command_asks,
@@ -937,8 +946,8 @@ pub(super) mod tests {
     fn served(bound: usize) -> Served {
         Served {
             gave: Vec::with_capacity(4 * bound),
-            answers: Vec::with_capacity(3 * bound),
-            abandoned: Vec::with_capacity(3 * bound),
+            answers: Keyed::with_capacity(3 * bound),
+            abandoned: std::collections::HashSet::with_capacity(3 * bound),
             held: Kinds::default(),
             bounds: Kinds {
                 commands: bound,
@@ -953,6 +962,69 @@ pub(super) mod tests {
             wall: Wall::From(0),
             windows: crate::window::Windows::default(),
         }
+    }
+
+    /// A driving shard's host takes each answer by its ask in one probe of the answers come
+    /// (`Served::outcome`, `keyed::Keyed`), and an answer to an ask its job let go is found let go
+    /// in one probe of a set (`Served::came`): 2,048 chunk asks held, every fourth let go before
+    /// its answer (`Served::abandon`), then each answer comes and each kept is taken. Before, the
+    /// lists were vectors: each ask let go searched the answers come, each answer the asks let go,
+    /// and each take the answers come (`iter().position`), replayed here as the code made them.
+    #[test]
+    fn a_shards_answers_are_found_by_their_ask_with_no_scan() {
+        const HELD: usize = 2048;
+        fn search(list: &[Pending], pending: Pending) -> (Option<usize>, usize) {
+            let at = list.iter().position(|p| *p == pending);
+            (at, at.map_or(list.len(), |at| at + 1))
+        }
+        let mut shard = served(HELD);
+        let asks: Vec<Pending> = (0..HELD).map(|_| shard.ask(chunk_get()).unwrap()).collect();
+        let let_go: Vec<Pending> = asks.iter().copied().step_by(4).collect();
+        let kept: Vec<Pending> = asks
+            .iter()
+            .copied()
+            .filter(|pending| !let_go.contains(pending))
+            .collect();
+        let (mut answers, mut abandoned, mut before) = (Vec::new(), Vec::new(), 0);
+        for &pending in &let_go {
+            before += search(&answers, pending).1;
+            abandoned.push(pending);
+        }
+        for &pending in &asks {
+            let (at, visited) = search(&abandoned, pending);
+            before += visited;
+            match at {
+                Some(at) => {
+                    abandoned.swap_remove(at);
+                }
+                None => answers.push(pending),
+            }
+        }
+        for &pending in &kept {
+            let (at, visited) = search(&answers, pending);
+            before += visited;
+            answers.swap_remove(at.unwrap());
+        }
+        crate::node::keyed::tests::probes();
+        shard.abandon(let_go.iter().copied());
+        for &pending in &asks {
+            let Pending::Chunk(number) = pending else {
+                panic!("a chunk's ask")
+            };
+            shard.came(number, Outcome::Chunk(ChunkOutcome::Stored));
+        }
+        for &pending in &kept {
+            assert!(shard.outcome(pending).is_some());
+        }
+        // Each answer's coming is one probe of the asks let go, a set's.
+        let after = crate::node::keyed::tests::probes() + asks.len();
+        println!(
+            "{HELD} asks held, {} let go: {after} probes, {before} entries visited by the searches",
+            let_go.len()
+        );
+        assert_eq!(after, let_go.len() + asks.len() + kept.len());
+        assert_eq!(shard.held, Kinds::default());
+        assert_eq!(shard.answers().count(), 0);
     }
 
     /// A chunk's get, which holds nothing on the heap: an ask whose own value allocates nothing.

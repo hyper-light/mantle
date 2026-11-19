@@ -2133,12 +2133,13 @@ mod tests {
         let range = one_member();
         let log = log_in(dir.path(), &range);
         let (mut lanes, _, _) = leading(&rt, &log, &range);
-        let mut commanded = vec![super::super::Commanded {
+        let mut commanded = super::super::keyed::KeyedOn::default();
+        commanded.push(super::super::Commanded {
             origin: super::super::CommandOrigin::Own(0),
             group: GROUP,
             ask: 0,
             commands: vec![(0, 1, None)],
-        }];
+        });
         lanes
             .send(In::Propose(
                 GROUP,
@@ -2155,7 +2156,7 @@ mod tests {
             panic!("`next` gives only what it does not skip")
         };
         super::super::answer_command(&mut commanded, group, &applied);
-        assert!(commanded[0].commands[0].2.is_some());
+        assert!(commanded.get(0).unwrap().commands[0].2.is_some());
         drop(lanes);
         rt.shutdown().unwrap();
         drop(log);
@@ -2405,20 +2406,19 @@ mod tests {
         let log = log_in(dir.path(), &range);
         let (mut shards, far) = follower(&rt, &log, &range);
         assert!(!far.seen.leading);
-        let mut commanded = vec![
-            Commanded {
-                origin: CommandOrigin::Own(3),
-                group: GROUP,
-                ask: 7,
-                commands: vec![(0, 1, None)],
-            },
-            Commanded {
-                origin: CommandOrigin::Own(4),
-                group: GROUP,
-                ask: 8,
-                commands: vec![(0, 2, None)],
-            },
-        ];
+        let mut commanded = super::super::keyed::KeyedOn::default();
+        commanded.push(Commanded {
+            origin: CommandOrigin::Own(3),
+            group: GROUP,
+            ask: 7,
+            commands: vec![(0, 1, None)],
+        });
+        commanded.push(Commanded {
+            origin: CommandOrigin::Own(4),
+            group: GROUP,
+            ask: 8,
+            commands: vec![(0, 2, None)],
+        });
         let max = range.settings.max_entry_bytes;
         propose(&shards, &far, put().encode().unwrap(), max, 7).unwrap();
         let refused = |shards: &mut Vec<Lanes<Model, Stored>>| {
@@ -2815,12 +2815,13 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut commanded = vec![Commanded {
+        let mut commanded = super::super::keyed::KeyedOn::default();
+        commanded.push(Commanded {
             origin: CommandOrigin::Own(0),
             group: GROUP,
             ask: 0,
             commands: vec![(0, 1, None)],
-        }];
+        });
         let Out::Applied(group, applied) =
             next(&mut shards[0], "the command applied", deadline(), |out| {
                 !matches!(out, Out::Applied(..))
@@ -2829,7 +2830,10 @@ mod tests {
             panic!("`next` gives only what it does not skip")
         };
         answer_command(&mut commanded, group, &applied);
-        assert!(commanded[0].commands[0].2.is_some(), "the command answered");
+        assert!(
+            commanded.get(0).unwrap().commands[0].2.is_some(),
+            "the command answered"
+        );
 
         assert!(requested(Some(far.seen), GROUP, Arriving::Read) == Arriving::Read(GROUP));
         let query = Query::Current {

@@ -561,8 +561,8 @@ impl Serve for Served {
         Some(outcome)
     }
 
-    fn answered(&self, pending: Pending) -> bool {
-        self.answers.iter().any(|(p, _)| *p == pending)
+    fn answers(&self) -> impl Iterator<Item = Pending> {
+        self.answers.iter().map(|(pending, _)| *pending)
     }
 
     fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
@@ -948,7 +948,10 @@ pub(super) mod tests {
         assert!(shard.room(&chunk_get()), "its answer came and was dropped");
         assert!(shard.outcome(first).is_none());
         shard.came(1, Outcome::Chunk(ChunkOutcome::Stored));
-        assert!(shard.answered(second));
+        assert!(
+            shard.answers().eq([second]),
+            "the answer waiting, the abandoned one's dropped"
+        );
         assert!(shard.outcome(second).is_some());
         assert_eq!(shard.held, Kinds::default());
 

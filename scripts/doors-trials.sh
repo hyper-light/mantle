@@ -521,7 +521,9 @@ run_case() {
   esac
   [ "$MACHINE" = box ] && { systemctl --user stop "doors-$name.scope" 2> /dev/null || true; }
   host end >> "$RAW/$name.host"
-  stop_busy "$name" "${pids[@]}"
+  # A case with no busy loops has none to stop: bash 3.2, macOS's, takes an empty array's
+  # expansion under `set -u` for an unbound variable, which bash 4.4 does not.
+  stop_busy "$name" ${pids[@]+"${pids[@]}"}
   remove_work "$name"
   if [ "$rc" -eq 0 ]; then
     echo "completed $(($(date +%s) - began))" > "$RAW/$name.status"

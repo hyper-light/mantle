@@ -2096,6 +2096,16 @@ pub fn derive(
         Some(shards) => (shards, Kind::Stated),
         None => (RangeShards::First, Kind::Cited),
     };
+    // Those shards as the process opens the node with them (`process::serve`'s
+    // `NodeSettings::shards`): its first alone, or each of its runtime's, one a CPU
+    // (`process::shards`), one where it measured none. A peer opens it a lane for each of them that
+    // runs ranges, and each past the first that runs ranges has its two lanes to the node's
+    // (`node::lanes`, node.md §2.9): with every range on its first shard, one lane a peer and none
+    // between its shards, as `Node::spread` moves no range, whatever its runtime's shards.
+    let placed = match range_shards {
+        RangeShards::First => NonZeroUsize::MIN,
+        RangeShards::Spread => NonZeroUsize::new(measured.cores).unwrap_or(NonZeroUsize::MIN),
+    };
     // What `objects` operations at once hold beside their charges, the volumes moving `transfers`
     // at once: their asks, the transport's bounds with a native client each beside the pinned
     // peers (node.md §3.6) drawing its exchanges from a pool of as many, and each range's reads.
@@ -2122,12 +2132,8 @@ pub fn derive(
             pool: if hosts { objects } else { 0 },
             ranges,
             inflight: settings.max_inflight_msgs,
-            // A lane for each shard that runs ranges: the node's shards are its cores
-            // (`process::shards`), one where it measured none.
-            lanes: crate::node::lanes(
-                NonZeroUsize::new(measured.cores).unwrap_or(NonZeroUsize::MIN),
-                ranges,
-            ),
+            // A lane for each shard that runs ranges, of those the node places them over.
+            lanes: crate::node::lanes(placed, ranges),
             transfers,
             asked: asked.chunks,
             transport_bytes: 0,
@@ -2167,24 +2173,19 @@ pub fn derive(
             None => None,
         };
         // The shards past the first that run ranges, each with its two lanes to the node's
-        // (node.md §2.9), each lane holding the exchanges the transport admits at once.
-        let far = match NonZeroUsize::new(measured.cores) {
-            Some(shards) if shards.get() > 1 => crate::node::lanes(shards, ranges),
-            _ => 0,
+        // (node.md §2.9), each lane holding the exchanges the transport admits at once, and each
+        // running their task Critical (`node::shard::Lanes::start`): none where the node places
+        // its ranges on its first shard.
+        let far = if placed.get() > 1 {
+            crate::node::lanes(placed, ranges)
+        } else {
+            0
         };
         let lanes = crate::node::shard_lanes_bytes(limits.exchanges)
             .and_then(|pair| u64::try_from(far).ok()?.checked_mul(pair))
             .ok_or(overflow("the ranges' shards' lanes"))?;
-        // Where the node spreads its ranges, each of those shards runs their task Critical
-        // (`node::shard::Lanes::start`); none past the first runs one where it does not.
-        let ranging = match range_shards {
-            RangeShards::First => 0,
-            RangeShards::Spread => far,
-        };
         let runtime = shard_shape(listening, stated.peers.len(), range_shards)
-            .and_then(|shape| {
-                runtime_bytes(measured.cores, &shape, measured.ring, listening, ranging)
-            })
+            .and_then(|shape| runtime_bytes(measured.cores, &shape, measured.ring, listening, far))
             .and_then(|bytes| bytes.checked_add(lanes))
             .ok_or(overflow("the node's runtime"))?;
         Ok(Held {
@@ -4716,7 +4717,10 @@ mod tests {
     /// operations past them. Counting no fragment, its engines' wants were none and they took what
     /// the operations' share left, nothing there (`DeriveError::Metadata`, CI run 44420627795),
     /// and given only the extents an engine opens with its engine was fenced at its first writes
-    /// (run 44442435486). Without the cell's volume it still refuses there.
+    /// (run 44442435486). Without the cell's volume its engines still want nothing and hold only
+    /// what the operations' count leaves: there, 1,679,155 bytes an engine, a tenth of the cell's
+    /// rows, at every depth. It refused there while its floor counted lanes its ranges on its first
+    /// shard never open, which left less than the extents an engine opens with.
     #[test]
     fn a_node_with_no_volume_on_cis_macos_runner_wants_its_cells_rows() {
         let granted = || {
@@ -4765,16 +4769,21 @@ mod tests {
                 said_bytes(&derived, "gateway.objects") >= 2,
                 "depth {depth}"
             );
-            // Without its cell's volume it has nothing to estimate the rows by, and refuses there.
+            // Without its cell's volume it has nothing to estimate the rows by: its engines want
+            // nothing and hold what the operations' count leaves, short of the cell's rows, or it
+            // refuses where that is less than the extents an engine opens with.
             let mut unstated = granted();
             unstated.cell_volume = None;
-            assert!(
-                matches!(
-                    derive(unstated, &measured, &mut fresh),
-                    Err(DeriveError::Metadata { .. })
+            match derive(unstated, &measured, &mut fresh) {
+                Ok(derived) => {
+                    let left = said_bytes(&derived, "engine.metadata_bytes");
+                    assert!(left < 18_029_352, "depth {depth}: {left}");
+                }
+                Err(e) => assert!(
+                    matches!(e, DeriveError::Metadata { .. }),
+                    "depth {depth}: {e}"
                 ),
-                "depth {depth}"
-            );
+            }
         }
     }
 
@@ -4864,6 +4873,188 @@ mod tests {
             let stacks = threads(3, &[256], &[true]).unwrap() * STACK;
             assert_eq!(stacks, 269 * STACK);
             assert_eq!(said_bytes(&deep, "memory.floor.threads"), stacks);
+        }
+    }
+
+    /// A founder of the repair suite's cells (crates/mantle/tests/repair.rs `founders`, made by
+    /// `Cell::made`: five founders, each in a domain of its own with one or two volumes of 256 MiB,
+    /// the table's bounds five nodes and four volumes a volume, the four test clients pinned as
+    /// gateways, nine identities; its five founding ranges, on its first shard as unstated; S3 served
+    /// at its QUIC address) on CI's macOS arm64 runner, three cores, 7 GiB and 128 control entries a
+    /// shard, its directory and volumes on one device of queue 256. CI's founders refused to start:
+    /// one volume measured 256 deep at its threads, 7,641,718,260 bytes, and two volumes measured
+    /// shallow at their runtime, 7,610,350,228 bytes at a depth of 4. The floor counted a lane from
+    /// each peer for each of the runtime's shards past the first, and two lanes to the node's
+    /// shard from each of them, which run no range where the node keeps its ranges on its first: it
+    /// opens its transport at one lane a peer (`Node::open_on`) and moves no range past its first
+    /// (`Node::spread`). Counted at the lanes it opens, the transport's budget is the least the
+    /// node's own transport takes, which its bounds admit, and the runtime holds no lane between
+    /// shards: one operation's floor is 7,341,380,028 bytes with one volume at 256 and 7,254,623,836
+    /// with two at 4 (macOS), within the machine. Two volumes measured past 112 deep still pass it
+    /// where a pool's worker carries each transfer (macOS, Windows): 7,518,023,644 bytes at 113,
+    /// 7,863,584,860 at 256, refused at their threads, as their ranges, log and transport grow with
+    /// their transfers and the issuer's workers' stacks with the depth.
+    #[test]
+    fn a_repair_founder_on_cis_macos_runner_starts_at_the_lanes_its_ranges_open() {
+        let founder = |volumes: usize| {
+            let mut s = Stated {
+                quic: "127.0.0.1:0".parse().unwrap(),
+                plane: "127.0.0.1:0".parse().unwrap(),
+                s3: Some(crate::process::S3Stated {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    region: "us-east-1".into(),
+                    names: Vec::new(),
+                    certificate: at("/node/identity/s3.der"),
+                    key: at("/node/identity/s3.key"),
+                    access: Vec::new(),
+                }),
+                voters: vec![1, 2, 3, 4, 5],
+                enlist: Some(Enlisting {
+                    root: 0x10,
+                    domain: "rack-0".into(),
+                    max_nodes: 5,
+                    max_volumes: u32::try_from(5 * volumes * 4).unwrap(),
+                }),
+                ..stated(volumes)
+            };
+            for (_, bytes) in &mut s.volumes {
+                *bytes = VolumeBytes::Stated(256 << 20);
+            }
+            s.peers = (2..=5)
+                .map(|id| peer(id, Role::Node, "/node/identity/peers/p.der", None))
+                .chain((6..=9).map(|id| peer(id, Role::Gateway, "/node/identity/c.der", None)))
+                .collect();
+            s
+        };
+        let memory = 7u64 << 30;
+        let runner = |volumes: usize, depth: usize| {
+            let mut measured = facts(volumes);
+            measured.cores = 3;
+            measured.ring = 128;
+            measured.memory = machine(memory, None);
+            for v in &mut measured.volumes {
+                v.device.name = measured.meta.name.clone();
+                v.device.queue = Some(256);
+                v.profile.depth = depth;
+            }
+            measured
+        };
+        let classes = [
+            "objects",
+            "volumes",
+            "engines",
+            "ranges",
+            "log",
+            "transport",
+            "runtime",
+            "threads",
+        ];
+        for (volumes, depth) in [(1, 4), (1, 256), (2, 4), (2, 16)] {
+            let case = format!("{volumes} volumes, {depth} deep");
+            // The floor at one operation, what the node is refused at where it passes the
+            // allowance: a ceiling of a byte leaves the operations nothing past their first.
+            let one = match derive(
+                Stated {
+                    ceiling: Some(1),
+                    ..founder(volumes)
+                },
+                &runner(volumes, depth),
+                &mut fresh,
+            ) {
+                Err(DeriveError::Memory { floor, .. }) => floor,
+                other => panic!("{case}: {:?}", other.err()),
+            };
+            assert!(one <= memory, "{case}: {one}");
+            let derived = derive(founder(volumes), &runner(volumes, depth), &mut fresh)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            let held: Vec<(&str, u64)> = classes
+                .iter()
+                .map(|class| {
+                    (
+                        *class,
+                        said_bytes(&derived, &format!("memory.floor.{class}")),
+                    )
+                })
+                .collect();
+            eprintln!("{case}: one operation's floor {one}; at the machine {held:?}");
+            // The node's own bounds as `Node::open_on` states them from its configuration, its
+            // ranges on its first shard: a lane from each peer.
+            let config = &derived.config;
+            let gateway = config.gateway.as_ref().unwrap();
+            let opened = mantle_protocol::bounds::Stated {
+                peers: 8,
+                replicas: 4,
+                clients: gateway.clients,
+                pool: gateway.objects,
+                ranges: 5,
+                inflight: config.settings.max_inflight_msgs,
+                lanes: crate::node::lanes(NonZeroUsize::MIN, 5),
+                transfers: config.volumes.iter().map(|v| v.config.transfers()).sum(),
+                asked: config.chunk_asks,
+                transport_bytes: config.transport_bytes,
+                messages: messages().unwrap(),
+                max_head: crate::node::MAX_HEAD,
+            };
+            assert_eq!(opened.lanes, 1);
+            assert_eq!(
+                config.transport_bytes,
+                mantle_protocol::bounds::least_transport(&opened).unwrap(),
+                "{case}"
+            );
+            assert!(mantle_protocol::bounds::limits(&opened).is_ok(), "{case}");
+            // The runtime: its shards and the listener's lanes to those past the first, no lane
+            // between shards and no range's Critical task past the first.
+            let listening = u64::try_from(gateway.objects).unwrap();
+            let shape = shard_shape(Some(listening), 8, RangeShards::First).unwrap();
+            assert_eq!(
+                said_bytes(&derived, "memory.floor.runtime"),
+                runtime_bytes(3, &shape, 128, Some(listening), 0).unwrap(),
+                "{case}"
+            );
+        }
+        // Two volumes measured at the device's queue: the issuer's 257 threads' stacks where a pool
+        // carries the transfers pass the machine; Linux's kernel holds them, and it starts.
+        let deepest = derive(founder(2), &runner(2, 256), &mut fresh);
+        if cfg!(target_os = "linux") {
+            assert!(deepest.is_ok(), "{:?}", deepest.err());
+        } else {
+            assert!(
+                matches!(
+                    deepest,
+                    Err(DeriveError::Memory {
+                        class: Class::Threads,
+                        ..
+                    })
+                ),
+                "{:?}",
+                deepest.err()
+            );
+        }
+        // Spread over the shards, the same founder's ranges take a lane from each peer for each
+        // shard past the first, and two lanes to the node's shard from each.
+        let spread = derive(
+            Stated {
+                range_shards: Some(RangeShards::Spread),
+                ceiling: Some(1),
+                ..founder(1)
+            },
+            &runner(1, 4),
+            &mut fresh,
+        );
+        let first = derive(
+            Stated {
+                ceiling: Some(1),
+                ..founder(1)
+            },
+            &runner(1, 4),
+            &mut fresh,
+        );
+        match (spread, first) {
+            (
+                Err(DeriveError::Memory { floor: spread, .. }),
+                Err(DeriveError::Memory { floor: first, .. }),
+            ) => assert!(spread > first, "{spread} {first}"),
+            (spread, first) => panic!("{:?} {:?}", spread.err(), first.err()),
         }
     }
 

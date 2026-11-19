@@ -15,7 +15,9 @@
 # the container's). A batch is one machine's; DIR/plan.tsv names the machine on every row.
 #
 # DIR/bin holds the arms: mantle-A1 and mantle-A2 (one timed release build, copied twice, the A/A),
-# mantle-C (the `count-allocs` build of the same commit), hyper-quic-geo_open_loop, and COMMIT. The
+# mantle-C (the `count-allocs` build of the same commit), hyper-quic-geo_open_loop, and COMMIT; and
+# where MANTLE_ARMS_LIST names more, each one's mantle-ARM (the Lean doors plan's step 10: the final
+# build's timed and counting builds, F and FC, beside the baseline's in one batch). The
 # comparators are COMPARE's (its COMPARATORS.md), each machine's own builds (the Mac's and the
 # VM's made by scripts/compare/setup.sh, the VM's image by scripts/compare/mantle-bench.Dockerfile):
 # S3 servers through the HTTP door with mantle-A1 as the harness, secnetperf and quinn-perf beside
@@ -60,7 +62,9 @@ CONDITIONS=(quiet busy1x busy2x cpu1 cpu2 memfloor relay)
 FULL_CONDITIONS=${FULL_CONDITIONS:-"quiet"}
 MID_CONDITIONS=${MID_CONDITIONS:-"busy2x"}
 TAIL_CONDITIONS=${TAIL_CONDITIONS:-"quiet busy2x"}
-MANTLE_ARMS=(A1 A2 C)
+# mantle's arms, each `$BIN/mantle-ARM`: the baseline's three, and any MANTLE_ARMS_LIST names
+# besides (step 10's final build beside step 3's baseline, interleaved in the same Williams rows).
+read -r -a MANTLE_ARMS <<< "${MANTLE_ARMS_LIST:-A1 A2 C}"
 # The S3 comparators each machine has builds of (COMPARATORS.md); MinIO only where its full-sync
 # mode, a whole-machine sync(2) a PUT, flushes no one else's work (owner's decision, 2026-11-04).
 case $MACHINE in
@@ -147,6 +151,17 @@ williams() {
   fi
 }
 
+# The lines a command writes, each an element of the array named first: what bash 4's `mapfile -t`
+# reads, written for macOS's own bash, 3.2, which the Mac and its VM lane run this with.
+lines_into() {
+  local into=$1 line
+  shift
+  eval "$into=()"
+  while IFS= read -r line; do
+    eval "$into+=(\"\$line\")"
+  done < <("$@")
+}
+
 # The plan: each cycle gives every condition one Williams row of the S3 arms (mantle's and the
 # comparators') and one of QUIC's, and under TAIL_CONDITIONS one more row of the S3 arms on the tail
 # matrix; the conditions' order turns a place each cycle, so over the cycles each condition meets
@@ -156,8 +171,8 @@ plan() {
   local s3_arms=("${MANTLE_ARMS[@]}") s3_rows quic_rows seq=0 cycle c i cond row a matrix why k
   # shellcheck disable=SC2206
   s3_arms+=($S3_COMPARATORS)
-  mapfile -t s3_rows < <(williams ${#s3_arms[@]})
-  mapfile -t quic_rows < <(williams ${#QUIC_ARMS[@]})
+  lines_into s3_rows williams ${#s3_arms[@]}
+  lines_into quic_rows williams ${#QUIC_ARMS[@]}
   # The row a condition takes in a cycle, a tail case the row after it.
   row_of() { local rows=("${!1}"); echo "${rows[$(((i + ${2:-0} + (cycle - 1) * ${#CONDITIONS[@]}) % ${#rows[@]}))]}"; }
   {
@@ -477,12 +492,14 @@ run_case() {
   fi
   echo "case $seq $name: machine $MACHINE cpus $cpus busy $busy memory $memory deadline ${seconds}s" > "$RAW/$name.host"
   local pids
-  mapfile -t pids < <(start_busy "$busy" "$cpus" "$name")
+  lines_into pids start_busy "$busy" "$cpus" "$name"
   host start >> "$RAW/$name.host"
   began=$(date +%s)
   rc=0
-  case $kind:$arm in
-    s3:A1 | s3:A2 | s3:C | tail:A1 | tail:A2 | tail:C)
+  local mantle_arm=no
+  [[ " ${MANTLE_ARMS[*]} " == *" $arm "* ]] && mantle_arm=yes
+  case $kind:$mantle_arm in
+    s3:yes | tail:yes)
       # shellcheck disable=SC2046,SC2086
       wrapped "$name" "$cpus" "$memory" "$seconds" "$BIN/mantle-$arm" bench doors "$WORK/$name" \
         --condition "$cond" $([ "$cond" = relay ] && echo --relay) $(perf_arg) $(matrix_args "$matrix") $LOAD_ARGS \

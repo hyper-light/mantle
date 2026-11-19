@@ -1151,11 +1151,13 @@ pub(crate) struct Replies {
     /// What a get's client took of the piece being written once its room was full ([`Drain`]).
     drain: Drain,
     /// While the piece its request's body drains through waits for room in the endpoint's budget,
-    /// its client's patience (`Opening::bound_ns`): offered again at each turn, since the budget
-    /// freeing turns no node (`Endpoint::release` retries only the transport's lossless frames),
-    /// its exchange vouched for meanwhile, and the node's turn due at each beat (research/77 D1,
-    /// D2; `Node::host_due`); past it, its exchange refused `Budget`.
-    room: Option<u64>,
+    /// its client's patience (`Opening::bound_ns`) and when, on the shard's clock, its exchange's
+    /// asker was last told its work is held: offered again at each turn, since the budget freeing
+    /// turns no node (`Endpoint::release` retries only the transport's lossless frames), its
+    /// exchange vouched for half a beat apart meanwhile (`vouch_every`), and the node's turn due at
+    /// its next vouch (research/77 D1, D2; `Node::host_due`); past it, its exchange refused
+    /// `Budget`.
+    room: Option<(u64, u64)>,
     /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
     /// of its moved (`driving::Lanes::doors`), told as the node's task takes what the job gave or
     /// writes it whole, or lets go of the reply, so the job gives its next or ends; none where the
@@ -1296,9 +1298,11 @@ impl Replies {
     }
 
     /// When, on the shard's clock, the node's next turn is due for a reply that waits for room in
-    /// the endpoint's budget: at its next beat, at most its client's patience (`room`).
-    pub(super) fn room_due_ns(&self, now: u64, beat: u64) -> Option<u64> {
-        self.room.map(|bound| bound.min(now.saturating_add(beat)))
+    /// the endpoint's budget: at its next vouch, half a beat after its last, at most its client's
+    /// patience (`room`). Its room is offered again at every turn, each at most half a beat apart.
+    pub(super) fn room_due_ns(&self, beat: u64) -> Option<u64> {
+        self.room
+            .map(|(bound, vouched)| bound.min(vouched.saturating_add(vouch_every(beat))))
     }
 
     /// Wakes the driving shard its job runs on, where one does and the job has not ended: its door
@@ -1457,20 +1461,28 @@ impl Replies {
     }
 
     /// The reply held, the piece its request's body drains through refused for room in the
-    /// endpoint's budget: within its client's patience it waits, its exchange vouched for
-    /// (`Endpoint::working`) and offered again at the next turn, due at each beat; past it, its
-    /// exchange is refused `Budget`, which needs no room and its asker hears at once, as it hears a
-    /// request whose head the budget refused. A reply never ends with its exchange open and its
-    /// asker waiting on nothing, which its client gave up a period later (`Lost(Stalled)`,
+    /// endpoint's budget: within its client's patience it waits, offered again at the next turn,
+    /// and its exchange vouched for (`Endpoint::working`) at its first turn waiting and then half
+    /// a beat after its last (`vouch_every`), as a held job's (`Job::vouch`): nothing of it moves
+    /// while it waits, and a vouch at every turn said nothing more. Past it, its exchange is
+    /// refused `Budget`, which needs no room and its asker hears at once, as it hears a request
+    /// whose head the budget refused. A reply never ends with its exchange open and its asker
+    /// waiting on nothing, which its client gave up a period later (`Lost(Stalled)`,
     /// tests/put_body.rs).
-    fn wait_for_room(&mut self, to: &mut impl Exchange, now: u64) -> Wrote {
+    fn wait_for_room(&mut self, to: &mut impl Exchange, now: u64, beat: u64) -> Wrote {
         let bound = self
             .drained
             .as_ref()
             .map_or(now, |opening| opening.bound_ns);
         if now < bound {
-            self.room = Some(bound);
-            to.working();
+            let vouched = match self.room {
+                Some((_, vouched)) if now < vouched.saturating_add(vouch_every(beat)) => vouched,
+                _ => {
+                    to.working();
+                    now
+                }
+            };
+            self.room = Some((bound, vouched));
             return Wrote::Room;
         }
         self.room = None;
@@ -2765,8 +2777,30 @@ fn parked_vouch_ns(vouched_ns: Option<u64>, now: u64, beat: u64) -> u64 {
 /// it up a serve period, three beats, after it last heard (hyper-transport `Endpoint::working`,
 /// `NOTES_A_PERIOD`). Told every half beat, a held request is named in notes at most a beat and a
 /// half apart, the margin it had told at every turn, at two vouches a beat, each a flag.
-fn vouch_every(beat: u64) -> u64 {
+pub(super) fn vouch_every(beat: u64) -> u64 {
     beat.checked_div(2).unwrap_or(beat).max(1)
+}
+
+/// Tells `tell` each of `held`, the askers of work held at once, that it is held, at `now` where
+/// half a beat passed since they last were, at `vouched_ns`, or none was told since none was held
+/// ([`parked_vouch_ns`]): one call each a half beat, not one each turn. `vouched_ns` becomes `now`
+/// where any was told, and none where none is held, so the first held after none is told at its
+/// first turn and one held beside others at their next vouch, within half a beat.
+pub(super) fn vouch_held<T>(
+    vouched_ns: &mut Option<u64>,
+    (now, beat): (u64, u64),
+    held: impl IntoIterator<Item = T>,
+    mut tell: impl FnMut(T),
+) {
+    if now < parked_vouch_ns(*vouched_ns, now, beat) {
+        return;
+    }
+    let mut told = false;
+    for asker in held {
+        tell(asker);
+        told = true;
+    }
+    *vouched_ns = if told { Some(now) } else { None };
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
@@ -3598,7 +3632,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 exchange,
             };
             if room {
-                return replies.wait_for_room(&mut toward, now);
+                let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+                return replies.wait_for_room(&mut toward, now, beat);
             }
             let wrote = replies.write(&mut toward, body_read, now, moved, slowed);
             // What a get's client took of a piece once its room was full: its pace, for the
@@ -3918,8 +3953,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// answered, a body was fed at the last turn (its job takes what it was given), or a reply's
     /// exchange took more than its rounds gave (its job gives the next); and a reply that waits for
     /// the piece its request's body drains through, room in the endpoint's budget, at its next
-    /// beat, which the beat's turn asks the budget for again, since the budget freeing turns no
-    /// node.
+    /// vouch, half a beat after its last, whose turn asks the budget for again, since the budget
+    /// freeing turns no node.
     pub(super) fn host_due(&self) -> Option<u64> {
         let shard = hyper_rt::futures::now_ns();
         let looked_up = self
@@ -3938,7 +3973,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let room = self
             .replies
             .iter()
-            .filter_map(|(_, replies)| replies.room_due_ns(shard, beat))
+            .filter_map(|(_, replies)| replies.room_due_ns(beat))
             .min();
         [self.host.due(self), room].into_iter().flatten().min()
     }
@@ -10786,29 +10821,29 @@ pub(super) mod tests {
             replies.write(&mut seen, false, 5, &mut moved, &mut slowed),
             Wrote::Draining
         );
-        // The piece its body drains through refused for room (`Node::write_reply`).
-        for (turn, now) in [10, 20].into_iter().enumerate() {
-            assert_eq!(replies.wait_for_room(&mut seen, now), Wrote::Room);
-            assert_eq!(seen.working, turn + 1, "vouched for at each turn it waits");
+        // The piece its body drains through refused for room (`Node::write_reply`): vouched for
+        // at its first turn waiting and half a beat (3 of a beat of 7) after its last.
+        for (now, told) in [(10, 1), (12, 1), (20, 2), (98, 3)] {
+            assert_eq!(replies.wait_for_room(&mut seen, now, 7), Wrote::Room);
             assert_eq!(
-                replies.room_due_ns(now, 7),
-                Some(now + 7),
-                "due at its beat"
+                seen.working, told,
+                "vouched for half a beat apart, at {now}"
             );
+            let vouched = if now == 12 { 10 } else { now };
             assert_eq!(
-                replies.room_due_ns(99, 7),
-                Some(100),
-                "at most its patience"
+                replies.room_due_ns(7),
+                Some((vouched + 3).min(100)),
+                "due at its next vouch, at most its patience"
             );
         }
         assert_eq!(
-            replies.write(&mut seen, true, 30, &mut moved, &mut slowed),
+            replies.write(&mut seen, true, 99, &mut moved, &mut slowed),
             Wrote::Over
         );
         assert_eq!(seen.answered, Some((head.clone(), fields.len() as u64)));
         assert_eq!(seen.body, fields);
         assert!(seen.ended && !seen.refused);
-        assert_eq!(replies.room_due_ns(30, 7), None);
+        assert_eq!(replies.room_due_ns(7), None);
 
         // Past its patience: refused `Budget`, nothing written.
         let (mut native, mut replies) = native_door().unwrap();
@@ -10824,8 +10859,8 @@ pub(super) mod tests {
             replies.write(&mut seen, false, 50, &mut moved, &mut slowed),
             Wrote::Draining
         );
-        assert_eq!(replies.wait_for_room(&mut seen, 50), Wrote::Room);
-        assert_eq!(replies.wait_for_room(&mut seen, 100), Wrote::Over);
+        assert_eq!(replies.wait_for_room(&mut seen, 50, 7), Wrote::Room);
+        assert_eq!(replies.wait_for_room(&mut seen, 100, 7), Wrote::Over);
         assert_eq!(seen.refusal, Some(Refusal::Budget));
         assert!(seen.answered.is_none() && !seen.ended);
 
@@ -10844,7 +10879,7 @@ pub(super) mod tests {
         );
         assert_eq!(seen.answered, Some((head.clone(), fields.len() as u64 + 3)));
         assert_eq!(seen.body, fields);
-        assert_eq!(replies.room_due_ns(10, 7), None);
+        assert_eq!(replies.room_due_ns(7), None);
 
         // A reply no message holds refuses its exchange, so its asker hears it at once.
         let (mut native, mut replies) = native_door().unwrap();
@@ -10855,6 +10890,77 @@ pub(super) mod tests {
             Wrote::Over
         );
         assert_eq!(seen.refusal, Some(Refusal::FrameBound));
+    }
+
+    /// Replies whose request's body waits for room in the endpoint's budget, idle and offered room
+    /// at each of sixteen turns a beat (`Node::write_reply`): each turn told every one's asker its
+    /// work is held, one call into the transport each per turn; now each at its first turn waiting
+    /// and then half a beat after its last (`Replies::wait_for_room`), the node's turn due by its
+    /// next vouch (`Replies::room_due_ns`).
+    #[test]
+    fn a_reply_waiting_for_room_is_vouched_for_twice_a_beat_not_at_each_turn() {
+        const WAITING: usize = 16;
+        const BEATS: u64 = 3;
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        let every = vouch_every(beat);
+        let (head, fields) = Reply::status(Status::Done).encode().unwrap();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let patience = 10 * beat;
+        let mut waiting: Vec<(Native, Replies, Seen)> = (0..WAITING)
+            .map(|_| {
+                let (mut native, mut replies) = native_door().unwrap();
+                let opening = Opening {
+                    head: head.clone(),
+                    fields: Bytes::from(fields.clone()),
+                    body: 0,
+                    slowed: None,
+                    bound_ns: patience,
+                    admitted: false,
+                };
+                assert_eq!(native.offer(Told::Reply(Box::new(opening))), Sent::Taken);
+                let mut seen = Seen {
+                    credit: usize::MAX,
+                    ..Seen::default()
+                };
+                assert_eq!(
+                    replies.write(&mut seen, false, 0, &mut moved, &mut slowed),
+                    Wrote::Draining
+                );
+                (native, replies, seen)
+            })
+            .collect();
+        let mut per_turn = Vec::new();
+        let mut last = vec![None; WAITING];
+        let mut now = 1;
+        while now <= 1 + BEATS * beat {
+            let mut told = 0;
+            for (at, (_, replies, seen)) in waiting.iter_mut().enumerate() {
+                let before = seen.working;
+                assert_eq!(replies.wait_for_room(seen, now, beat), Wrote::Room);
+                if seen.working > before {
+                    if let Some(at) = last[at] {
+                        assert!(now - at <= every, "vouched {} ns after", now - at);
+                    }
+                    last[at] = Some(now);
+                    told += seen.working - before;
+                }
+                // Its node's turn is due by its next vouch, within half a beat.
+                let due = replies.room_due_ns(beat).unwrap();
+                assert!(due > now && due <= now + every, "due {due} at {now}");
+            }
+            per_turn.push(told);
+            now += beat / 16;
+        }
+        let turns = per_turn.len();
+        let told: usize = per_turn.iter().sum();
+        println!(
+            "{WAITING} waiting for room over {turns} turns: {told} vouches, {} before",
+            WAITING * turns
+        );
+        assert!(turns > 16 * usize::try_from(BEATS).unwrap());
+        // Two a beat each, the first turn's and each half beat's after.
+        assert_eq!(told, WAITING * (2 * usize::try_from(BEATS).unwrap() + 1));
+        assert_eq!(per_turn[0], WAITING, "each at its first turn waiting");
     }
 
     /// A get's piece its client's room took only in part is timed from then: once written whole,
@@ -12270,6 +12376,74 @@ pub(super) mod tests {
             2 * PARKED,
             PARKED * turns
         );
+    }
+
+    /// The peers' chunks a volume holds while their requests wait (`Storage::held`), idle: each
+    /// turn told every one's asker, one call into the transport each per turn; now all at once at
+    /// the first turn any is held, then half a beat apart (`vouch_held`), the node's next turn due
+    /// by the next vouch (`Node::wait`). A chunk held beside others is told at their next vouch,
+    /// within half a beat, and none is told once none is held.
+    #[test]
+    fn held_chunks_are_vouched_for_twice_a_beat_not_at_each_turn() {
+        const HELD: usize = 64;
+        const BEATS: u64 = 3;
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        let every = vouch_every(beat);
+        let mut held: Vec<usize> = (0..HELD).collect();
+        let mut last: Vec<Option<u64>> = vec![None; HELD + 1];
+        let mut vouched = None;
+        let mut per_turn = Vec::new();
+        let mut now = 1;
+        while now <= 1 + BEATS * beat {
+            // One more is held half way through, beside the others.
+            if now >= 1 + beat + beat / 4 && held.len() == HELD {
+                held.push(HELD);
+                last[HELD] = Some(now);
+            }
+            let mut told = 0;
+            vouch_held(&mut vouched, (now, beat), held.iter().copied(), |chunk| {
+                if let Some(at) = last[chunk] {
+                    assert!(
+                        now - at <= every,
+                        "chunk {chunk} told {} ns after",
+                        now - at
+                    );
+                }
+                last[chunk] = Some(now);
+                told += 1;
+            });
+            per_turn.push(told);
+            // The node's next turn is due at the next vouch, within half a beat (`Node::wait`).
+            let next = vouched.unwrap() + every;
+            assert!(
+                next > now && next <= now + every,
+                "next vouch {next} at {now}"
+            );
+            now += beat / 16;
+        }
+        let turns = per_turn.len();
+        let told: usize = per_turn.iter().sum();
+        let vouches = per_turn.iter().filter(|told| **told > 0).count();
+        println!(
+            "{HELD} held over {turns} turns: {told} vouches in {vouches} turns, {} before",
+            HELD * turns
+        );
+        assert!(turns > 16 * usize::try_from(BEATS).unwrap());
+        // Two vouches a beat, the first turn's and each half beat's after.
+        assert_eq!(vouches, 2 * usize::try_from(BEATS).unwrap() + 1);
+        assert_eq!(per_turn[0], HELD, "every one at the first turn held");
+        assert!(per_turn.iter().all(|told| *told == 0 || *told >= HELD));
+
+        // None held: none told, and the next held is told at its first turn.
+        vouch_held(&mut vouched, (now + every, beat), None::<usize>, |_| {
+            panic!("none held")
+        });
+        assert_eq!(vouched, None);
+        let mut told = 0;
+        vouch_held(&mut vouched, (now + every + 1, beat), Some(0), |_| {
+            told += 1
+        });
+        assert_eq!((told, vouched), (1, Some(now + every + 1)));
     }
 
     thread_local! {

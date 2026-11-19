@@ -1398,7 +1398,11 @@ targets. Each item is done when its test passes on every supported target.
    *Built (2026-11-13, 6d95f931)*: a PUT's window learned from the node's own puts by Little's law,
    a block's time from going down to recorded times the body's pace over a block's bytes, each
    smoothed with RFC 6298's gain, one block until both are measured (`crates/node/src/window.rs`;
-   node.md §2.8). A replica's chunk put no longer ends at the idle timeout (3.07 s) while the peer's
+   node.md §2.8). *Built (2026-11-18)*: a GET's window learned the same way from the node's own
+   gets, a block's time from its row asked to its plaintext opened times the pace its client takes
+   a block the node holds whole, its charge at that window, and what its range's blocks do not take
+   given back once its version is read (node.md §2.8). A replica's chunk put no longer ends at the
+   idle timeout (3.07 s) while the peer's
    device makes it durable, a write slower than that once ending the put as stalled (on
    windows-11-arm a volume's first write took up to 8.0 s before calibration saw NTFS's zeros;
    measurements/2026-10-24-first-writes-past-unwritten-space.md): the peer states
@@ -1406,8 +1410,10 @@ targets. Each item is done when its test passes on every supported target.
    (research/77 D1 and D2, on main at `17eb8032`, above), and since 2026-11-17 the node's client
    gives an object's or a chunk's exchange at least the node's serve period and at most the stock
    patience before it has measured a reply (above). *Open*: the entitled rate `min(body rate,
-   principal's fair share)`, which needs item 6; a GET's window, still one block, the floor
-   (`gateway:window` in `scripts/arbitrary-open.txt`); the hedge quantile, with hedging (gateway.md
+   principal's fair share)`, which needs item 6; a copy's get's and put's windows, still one block,
+   the floor (`gateway:window` in `scripts/arbitrary-open.txt`); a GET on the S3 door whose
+   client outpaces its reads, which times no drain while its channel never fills; the hedge
+   quantile, with hedging (gateway.md
    §3); telling held from moved in a note for an asker with no deadline (research/77); and the done
    test.
 9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,

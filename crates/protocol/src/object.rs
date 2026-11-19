@@ -927,6 +927,12 @@ impl Head {
         matches!(self.kind, PUT | UPLOAD_PART | APPEND).then(|| self.length)
     }
 
+    /// Whether the request reads an object's bytes, a GetObject, known from its head before its
+    /// fields are read.
+    pub fn reads(&self) -> bool {
+        self.kind == GET
+    }
+
     /// The request, once its fields are read.
     pub fn op(&self, fields: &[u8]) -> Result<Op, ObjectError> {
         let bad = || ObjectError::Fields(fields.len());

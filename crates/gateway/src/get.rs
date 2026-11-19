@@ -146,6 +146,8 @@ struct Reading {
     whole: Option<Box<Whole>>,
     /// Its requests in flight: it finishes only once none is, so no answer outlives it.
     inflight: usize,
+    /// When, in the caller's time, its row was asked; none where the caller told no time.
+    begun_ns: Option<u64>,
 }
 
 /// The whole chunks of a coded block read to decode it, by index: those read, those asked, and
@@ -246,6 +248,11 @@ pub struct Get {
     asked: BTreeMap<Id, Asked>,
     next_id: Id,
     outcome: Option<Result<(), GetError>>,
+    /// The caller's time, as it last told it ([`Get::tick`]); none before it first does.
+    now_ns: Option<u64>,
+    /// How long, in the caller's time, the last block read took from its row asked to its
+    /// plaintext opened, until the caller takes it ([`Get::take_read`]).
+    read_ns: Option<u64>,
 }
 
 impl Get {
@@ -281,9 +288,23 @@ impl Get {
             asked: BTreeMap::new(),
             next_id: 0,
             outcome: None,
+            now_ns: None,
+            read_ns: None,
         };
         get.guard(Self::advance)?;
         Ok(get)
+    }
+
+    /// The caller's time moved to `now_ns`: blocks begun and read from here are timed by it.
+    pub fn tick(&mut self, now_ns: u64) {
+        self.now_ns = Some(self.now_ns.map_or(now_ns, |was| was.max(now_ns)));
+    }
+
+    /// How long the last block read took, in the caller's time, from its row asked to its
+    /// plaintext opened; none where none was read since the caller last took it, or where the
+    /// caller told no time. The caller sizes the blocks a get holds being read by it.
+    pub fn take_read(&mut self) -> Option<u64> {
+        self.read_ns.take()
     }
 
     /// The next request to send, each once; `None` while every request is in flight or the
@@ -633,6 +654,7 @@ impl Get {
                 spans: Vec::new(),
                 whole: None,
                 inflight: 0,
+                begun_ns: self.now_ns,
             },
         );
         self.ask(Request::Block { block }, Asked::Block(key))
@@ -935,6 +957,9 @@ impl Get {
             }
         };
         let reading = self.reading.remove(&key).ok_or(GetError::Mismatch)?;
+        if let (Some(begun), Some(now)) = (reading.begun_ns, self.now_ns) {
+            self.read_ns = Some(now.saturating_sub(begun));
+        }
         let plain = self.plain.as_mut().ok_or(GetError::Mismatch)?;
         let segment = u64::try_from(seal::SEGMENT).map_err(|_| GetError::Overflow)?;
         let last = plain.count.checked_sub(1).ok_or(GetError::Overflow)?;

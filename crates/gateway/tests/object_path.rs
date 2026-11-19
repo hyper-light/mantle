@@ -1035,6 +1035,49 @@ fn a_put_says_its_bodys_pace_and_its_blocks_time_to_recorded() {
     assert!(one.take_committed().is_some());
 }
 
+/// A get says how long each block took from its row asked to its plaintext opened, in its caller's
+/// time, past the answers to its row and its chunk; each once, as the caller takes it; and nothing
+/// where its caller told it no time.
+#[test]
+fn a_get_says_its_blocks_time_to_read() {
+    let scheme = Scheme::Copies(2);
+    let layout = Layout::new(scheme).unwrap();
+    let len = (2 * layout.segments_per_block() * seal::SEGMENT as u64 + 1) as usize;
+    let bytes = body(len, 5);
+    let (mut cell, wrapping) = stored(scheme, &bytes, 15, 4);
+    let step = 7;
+    let mut timed = |ticks: bool| {
+        let root = Root(WrappingKey::new(wrapping.bytes()));
+        let mut get = Get::new(Some(15), len as u64, 0..len as u64, Box::new(root), 1).unwrap();
+        let (mut now, mut reads, mut out) = (0u64, Vec::new(), Vec::new());
+        loop {
+            while let Some(piece) = get.take() {
+                out.extend_from_slice(&piece);
+            }
+            if let Some(outcome) = get.outcome() {
+                outcome.clone().unwrap();
+                return (out, reads);
+            }
+            let (id, request) = get.poll().expect("a GET waits on nothing");
+            now += step;
+            if ticks {
+                get.tick(now);
+            }
+            get.answer(id, cell.serve_get(request)).unwrap();
+            reads.extend(get.take_read());
+            assert_eq!(get.take_read(), None);
+        }
+    };
+    let (out, reads) = timed(true);
+    assert!(out == bytes);
+    // Each block: its row and its copy's span read, two answers at least.
+    assert_eq!(reads.len() as u64, layout.blocks(len as u64));
+    assert!(reads.iter().all(|&ns| ns >= 2 * step), "{reads:?}");
+    let (out, reads) = timed(false);
+    assert!(out == bytes);
+    assert!(reads.is_empty());
+}
+
 /// A block the sweep released while its body still streamed in fails the PUT at its next
 /// renewal, and the file is never written.
 #[test]
@@ -2540,7 +2583,9 @@ fn a_run_takes_only_the_md5s_its_object_needs_and_only_at_its_offset() {
 /// 64 KiB segment copied out to be opened, its plaintext copied again into the block's output
 /// (146 allocations and 25,177,456 bytes for this GET; 16 and 8,396,144 then, the sealed bytes
 /// gathered once and the GET's own bookkeeping; 8,395,440 once a block's state for decoding around
-/// a failed span is held apart, allocated only where a span fails, docs/design/repair.md §3).
+/// a failed span is held apart, allocated only where a span fails, docs/design/repair.md §3;
+/// 8,395,616 once a block being read keeps when its row was asked, to time its read for the window
+/// the node learns, 16 bytes in each of the 11 slots of the B-tree's leaf, `Get::take_read`).
 #[test]
 fn a_get_copies_each_byte_it_reads_once() {
     const SIZE: usize = 8 << 20;
@@ -2580,7 +2625,7 @@ fn a_get_copies_each_byte_it_reads_once() {
     assert!(out == bytes, "the plaintext read is the object's");
     assert_eq!(
         (counts.allocations, counts.reallocations, counts.bytes),
-        (16, 0, 8_395_440),
+        (16, 0, 8_395_616),
         "{counts:?}"
     );
 }

@@ -224,11 +224,11 @@ pub fn most_charged(charges: &Charges) -> u64 {
 /// `beside`, what one more operation adds past its charge to the transport, the ranges, the
 /// listener and the runtime, [`derive`]'s difference of the node at two operations and at one:
 /// its client's connection and exchange at QUIC's windows, a range's read, its task; and the
-/// host's records of it, its job and its boxed put or get (`node::record_bytes`). A put admitted
-/// at a window it learned holds that window's blocks instead ([`Charges::write`]), at most the
-/// operations' bytes. A put's charge holds its record of each block it wrote until its file names
-/// them, which grows with the body by design, at the largest body a PUT carries
-/// (`put::most_records`), or its own (`put::records_for`).
+/// host's records of it, its job and its boxed put or get (`node::record_bytes`). A put or a get
+/// admitted at a window it learned holds that window's blocks instead ([`Charges::write`],
+/// [`Charges::read`]), at most the operations' bytes. A put's charge holds its record of each
+/// block it wrote until its file names them, which grows with the body by design, at the largest
+/// body a PUT carries (`put::most_records`), or its own (`put::records_for`).
 pub fn native(charges: &Charges, beside: u64) -> Option<u64> {
     let records = u64::try_from(crate::node::record_bytes()?).ok()?;
     charges.most().checked_add(beside)?.checked_add(records)
@@ -392,6 +392,29 @@ impl Charges {
             held = held.max(bytes.or_else(most).unwrap_or(u64::MAX));
         }
         held
+    }
+
+    /// What a get holds with `window` blocks being read at once, under the scheme that holds the
+    /// most of it: its driver's window at the largest block (`get::most_bytes`) and the block
+    /// taken to be written out. A window no layout lays out is charged past any memory.
+    pub fn read(&self, window: usize) -> u64 {
+        let mut held = 0u64;
+        for layout in &self.layouts {
+            let bytes = layout
+                .largest_block()
+                .and_then(|block| get::most_bytes(window, layout)?.checked_add(block));
+            held = held.max(bytes.unwrap_or(u64::MAX));
+        }
+        held
+    }
+
+    /// The least of the schemes' whole blocks: the most blocks a body is cut into.
+    pub fn smallest_block(&self) -> u64 {
+        self.layouts
+            .iter()
+            .filter_map(Layout::largest_block)
+            .min()
+            .unwrap_or(0)
     }
 
     /// The largest block any scheme's layout makes: the fewest blocks a body is cut into.
@@ -3035,7 +3058,10 @@ fn say_objects(
         "gateway.window",
         gateway.window,
         Kind::Derived,
-        "the floor: a window of one block (node.md §1.4)",
+        "the floor: a window of one block (node.md §1.4); a put and a get each hold the window the \
+         node learns of its own puts and gets by Little's law, a block's time times its clients' \
+         pace over a block's bytes, where the operations' bytes hold it (crate::window, node.md \
+         §2.8)",
     );
     said.add(
         "gateway.objects_bytes",
@@ -3141,7 +3167,8 @@ fn say_native(said: &mut Said, native: u64) {
          to send, a piece of its body and its records of the blocks of the largest body a PUT \
          carries (derive::Charges); what one more operation adds beside \
          it to the transport, the ranges, the listener and the runtime; and the host's records of \
-         it (derive::native)",
+         it (derive::native). A put or a get admitted at a window it learned holds that window's \
+         blocks instead (Charges::write, Charges::read), at most gateway.objects_bytes",
     );
 }
 
@@ -3957,6 +3984,33 @@ mod tests {
         let mixed = Charges::new(1, &[three, coded]).unwrap();
         assert!(mixed.of(Some(1)) >= charges.of(Some(1)));
         assert!(mixed.of(Some(1)) < mixed.most());
+    }
+
+    /// A get is charged for its window under the scheme that holds the most of it: its driver's
+    /// blocks being read at the largest block (`get::most_bytes`) and the block taken to be
+    /// written out, so what it holds at any window it learns is within its charge; at the floor's
+    /// window no more than the most an operation holds, and each block more a block's bytes more
+    /// at least. The smallest block is the most blocks a body is cut into.
+    #[test]
+    fn a_get_is_charged_for_the_blocks_its_window_holds() {
+        let copies = durability::Scheme::Copies(3);
+        let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
+        let charges = Charges::new(1, &[copies, coded]).unwrap();
+        for window in 1..=8 {
+            for scheme in [copies, coded] {
+                let layout = Layout::new(scheme).unwrap();
+                let block = layout.largest_block().unwrap();
+                let held = get::most_bytes(window, &layout).unwrap() + block;
+                assert!(charges.read(window) >= held, "{window} {scheme:?}");
+            }
+            assert!(charges.read(window + 1) - charges.read(window) >= charges.smallest_block());
+        }
+        assert!(charges.read(1) <= charges.most());
+        assert_eq!(charges.read(usize::MAX), u64::MAX);
+        let block = |scheme| Layout::new(scheme).unwrap().largest_block().unwrap();
+        assert_eq!(charges.smallest_block(), block(copies));
+        assert_eq!(charges.largest_block(), block(coded));
+        assert!(block(copies) < block(coded));
     }
 
     /// A share holds an operation of the largest blocks and as many more at the least an operation

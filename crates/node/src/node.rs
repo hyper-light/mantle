@@ -1039,9 +1039,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// which every parked request's is one of.
     parked: VecDeque<host::Parked>,
     parked_most: usize,
-    /// What the node measured of its puts' blocks and bodies, the window a put holds
-    /// (`crate::window`).
-    put_window: crate::window::Window,
+    /// What the node measured of its puts' and its gets' blocks and bodies, the windows each
+    /// holds (`crate::window`).
+    windows: crate::window::Windows,
     jobs: Vec<host::Job>,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
@@ -1516,7 +1516,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             gateway: settings.gateway.take(),
             parked: VecDeque::new(),
             parked_most: exchanges,
-            put_window: crate::window::Window::default(),
+            windows: crate::window::Windows::default(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
             repair: None,
@@ -2456,7 +2456,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             doorway.replies();
         }
         loop {
-            let (gateway, learned) = (self.gateway.as_ref(), &self.put_window);
+            let (gateway, learned) = (self.gateway.as_ref(), &self.windows);
             // A key a connection asks before its operation takes no slot of the host's: it is
             // read at once, the lookups held to the door's bound (`host::take_lookup`).
             let charge = match self

@@ -804,9 +804,12 @@ read of the source and one write per copy, inside the cell; no byte crosses to t
   inverted; a null version's, which its ID does not name, is read from the mark its write left
   under the copy's own file; a part's is the gateway's time as its body ended, which ListParts
   now states too, where it answered 1970.
-- **Its cost to the host.** A copy drives a get and a put at once, so it counts as two of the
-  host's operations at both doors, and a copy waits at the local door, or is answered
-  `503 SlowDown` at the native door, while fewer than two are free.
+- **Its cost to the host.** A copy drives a get and a put at once, so it is charged for both at
+  once (`derive::Charges::copy`): admitted at one block each, its put's of the largest body a copy
+  writes, and once its source's version is read its put holds the window the node learned of its
+  puts and its get as many blocks as that put drains while one is read, within the operations'
+  bytes (node.md §2.8). A copy waits at the local door, or is answered `503 SlowDown` at the native
+  door, while the operations' bytes do not hold it beside the others'.
 
 - **Tags.** mantle keeps no object tags yet and answers as S3 answers a directory bucket, which
   keeps only the empty tag set (89 §3.8): a version's tag set is the empty one, which

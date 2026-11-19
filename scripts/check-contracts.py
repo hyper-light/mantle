@@ -72,7 +72,7 @@ REFUSED = {
     "open": "nothing establishes it yet",
 }
 # The known open items may number at most this; it only falls, as each gains a basis.
-OPEN_CEILING = 284
+OPEN_CEILING = 282
 # A basis the rule refuses, whatever kind its row claims: each pattern and what it names.
 REFUSED_BASES = (
     (re.compile(r"\bknee\b", re.I), "a knee read off a curve"),

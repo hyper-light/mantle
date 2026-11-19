@@ -1098,9 +1098,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// which every parked request's is one of.
     parked: VecDeque<host::Parked>,
     parked_most: usize,
-    /// What the node measured of its puts' blocks and bodies, the window a put holds
-    /// (`crate::window`).
-    put_window: crate::window::Window,
+    /// What the node measured of its puts' and its gets' blocks and bodies, the windows each
+    /// holds (`crate::window`).
+    windows: crate::window::Windows,
     jobs: Vec<host::Job>,
     /// What jobs that ended asked and was not yet answered: its outcomes are dropped as they come.
     /// At most the node's asks.
@@ -1576,7 +1576,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             gateway: settings.gateway.take(),
             parked: VecDeque::new(),
             parked_most: exchanges,
-            put_window: crate::window::Window::default(),
+            windows: crate::window::Windows::default(),
             jobs: Vec::new(),
             abandoned: Vec::new(),
             repair: None,
@@ -2511,12 +2511,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// stopping node, or one that hosts no objects, answers each as it comes.
     fn take_door(&mut self) {
         // What the connections wrote of their replies since the last turn: the reply's depth's
-        // samples (`door::Replying`).
+        // samples (`door::Replying`); and what their gets' clients took once their sockets were
+        // full, their pace, for the windows the node's next gets hold (`crate::window`).
         if let Some(doorway) = self.doorway.as_mut() {
             doorway.replies();
+            if let Some((octets, ns)) = doorway.drained() {
+                self.windows.get.paced(octets, ns);
+            }
         }
         loop {
-            let (gateway, learned) = (self.gateway.as_ref(), &self.put_window);
+            let (gateway, learned) = (self.gateway.as_ref(), &self.windows);
             // A key a connection asks before its operation takes no slot of the host's: it is
             // read at once, the lookups held to the door's bound (`host::take_lookup`).
             let charge = match self

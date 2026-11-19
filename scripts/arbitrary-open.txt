@@ -194,8 +194,6 @@ crates/node/src/derive.rs HEARTBEAT_TICK
 crates/node/src/derive.rs REPAIR_HOURS
 crates/node/src/derive.rs SCRUB
 crates/node/src/derive.rs STORE_BYTES_AN_OBJECT
-crates/node/src/derive.rs gateway:scan_rows
-crates/node/src/derive.rs gateway:window
 crates/s3/src/policy/mod.rs BODY_LIMIT
 crates/s3/src/seal.rs PLAIN_SEGMENT
 crates/s3/src/seal.rs SEALED_SEGMENT

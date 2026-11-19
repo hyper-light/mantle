@@ -8,6 +8,7 @@
 //! advance the handshake.
 
 use std::io::{self, IoSlice, Read as _, Write as _};
+use std::time::Instant;
 
 use hyper_rt::RtError;
 use hyper_rt::tcp::{Shutdown, TcpStream};
@@ -24,6 +25,29 @@ pub enum IoError {
     Tls(hyper_tls::Error),
     #[error("a write the socket took none of")]
     Stalled,
+}
+
+/// What a client took of a write once the socket had no room for the rest of it: when it first had
+/// none, and the octets the socket took after, which the client made room for, so its pace with
+/// no buffer of the socket's or the client's holding it back (`crate::window`, `host::Drain`). A
+/// write the socket took whole says only that its room was there. Under TLS the octets are the
+/// plaintext the connection took into records after, the record being sent as the socket filled
+/// left out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Drained {
+    pub full: Option<Instant>,
+    pub octets: u64,
+}
+
+impl Drained {
+    /// The socket, or the connection's records, took `n` octets more.
+    fn took(&mut self, n: usize) {
+        if self.full.is_some() {
+            self.octets = self
+                .octets
+                .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+    }
 }
 
 /// A connection's transport: plain HTTP on loopback, TLS elsewhere.
@@ -65,16 +89,17 @@ impl Tls {
         })
     }
 
-    /// Sends what the connection holds of records, waiting while the socket is full. Each write the
-    /// socket is tried for is a charge of the connection's turn on its shard (`hyper_rt::coop`), as a
-    /// plain stream's write is.
-    async fn flush(&mut self) -> Result<(), IoError> {
+    /// Sends what the connection holds of records, waiting while the socket is full, `full` set to
+    /// when it first was, where it was not already. Each write the socket is tried for is a charge
+    /// of the connection's turn on its shard (`hyper_rt::coop`), as a plain stream's write is.
+    async fn flush(&mut self, full: &mut Option<Instant>) -> Result<(), IoError> {
         while self.connection.wants_write() {
             hyper_rt::coop::consume_budget().await;
             match self.connection.write_tls(&mut Socket(&self.stream)) {
                 Ok(0) => return Err(IoError::Stalled),
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    full.get_or_insert_with(Instant::now);
                     self.stream.writable().await.map_err(IoError::Socket)?;
                 }
                 Err(e) => return Err(IoError::Io(e)),
@@ -129,7 +154,7 @@ impl Io {
                     Err(e) => return Err(IoError::Io(e)),
                 }
                 // What the handshake has to say goes before more is read: the server's flight.
-                tls.flush().await?;
+                tls.flush(&mut None).await?;
                 hyper_rt::coop::consume_budget().await;
                 match tls.connection.read_tls(&mut Socket(&tls.stream)) {
                     Ok(_) => {}
@@ -141,7 +166,7 @@ impl Io {
                 }
                 if let Err(e) = tls.connection.process_new_packets(&mut tls.config) {
                     // The alert that says why goes to the client before the connection ends.
-                    let _ = tls.flush().await;
+                    let _ = tls.flush(&mut None).await;
                     return Err(IoError::Tls(e));
                 }
             },
@@ -162,9 +187,9 @@ impl Io {
                         return Err(IoError::Stalled);
                     }
                     at = at.checked_add(took).ok_or(IoError::Stalled)?;
-                    tls.flush().await?;
+                    tls.flush(&mut None).await?;
                 }
-                tls.flush().await
+                tls.flush(&mut None).await
             }
         }
     }
@@ -172,8 +197,10 @@ impl Io {
     /// Writes all of `first` and then all of `second`, a response's head and its body, in as few
     /// writes as the socket takes: one vectored write each time it is writable, so a head and the
     /// body after it go out together, neither copied into the other. Under TLS both go into the
-    /// connection's records before they are flushed.
-    pub async fn write_pair(&mut self, first: &[u8], second: &[u8]) -> Result<(), IoError> {
+    /// connection's records before they are flushed. What its client took of them once the
+    /// socket was full ([`Drained`]).
+    pub async fn write_pair(&mut self, first: &[u8], second: &[u8]) -> Result<Drained, IoError> {
+        let mut drained = Drained::default();
         match self {
             Self::Plain(stream) => {
                 let (mut a, mut b) = (first, second);
@@ -186,11 +213,17 @@ impl Io {
                     if n == 0 {
                         return Err(IoError::Stalled);
                     }
+                    let offered = a.len().saturating_add(b.len());
+                    drained.took(n);
+                    // The socket took less than it was offered: it is full, and what it takes
+                    // from here its client makes room for.
+                    if n < offered {
+                        drained.full.get_or_insert_with(Instant::now);
+                    }
                     let of_a = n.min(a.len());
                     a = a.get(of_a..).unwrap_or_default();
                     b = b.get(n.saturating_sub(of_a)..).unwrap_or_default();
                 }
-                Ok(())
             }
             Self::Tls(tls) => {
                 for bytes in [first, second] {
@@ -201,12 +234,14 @@ impl Io {
                             return Err(IoError::Stalled);
                         }
                         at = at.checked_add(took).ok_or(IoError::Stalled)?;
-                        tls.flush().await?;
+                        drained.took(took);
+                        tls.flush(&mut drained.full).await?;
                     }
                 }
-                tls.flush().await
+                tls.flush(&mut drained.full).await?;
             }
         }
+        Ok(drained)
     }
 
     /// Ends the sending half: TLS's `close_notify`, then TCP's FIN; what the client still sends
@@ -216,7 +251,7 @@ impl Io {
             Self::Plain(stream) => stream,
             Self::Tls(tls) => {
                 tls.connection.send_close_notify();
-                tls.flush().await?;
+                tls.flush(&mut None).await?;
                 &tls.stream
             }
         };

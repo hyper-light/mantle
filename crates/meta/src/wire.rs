@@ -2126,6 +2126,24 @@ pub fn least_entry_bytes() -> Result<usize, RecordError> {
     .len())
 }
 
+/// Bytes the most one row a bucket's collection removes writes (`name::Collect`): its key deleted,
+/// at the longest a row's key is (`key::largest_bytes`), and, for an upload's part, its file
+/// released, the queue's key and its holder under S3's longest bucket name and key. A collection
+/// of as many rows as the largest entry holds of these writes no more than that entry's bytes.
+pub fn largest_collected_bytes() -> Result<usize, RecordError> {
+    let holder = crate::record::Holder {
+        bucket: "b".repeat(MAX_BUCKET),
+        key: "k".repeat(MAX_KEY),
+        file: true,
+    }
+    .encode()?;
+    let released = crate::key::released(u64::MAX, u128::MAX);
+    crate::key::largest_bytes()
+        .checked_add(released.len())
+        .and_then(|bytes| bytes.checked_add(holder.len()))
+        .ok_or(RecordError::TooLarge(usize::MAX))
+}
+
 /// Bytes of the largest entry a Name, File or Block range must take: one command, the largest
 /// a gateway sends, in the session wrapping it carries. A range whose `max_entry_bytes` or log
 /// frame is smaller refuses a request S3 allows (audit §16.5). The largest is a

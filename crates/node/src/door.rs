@@ -207,12 +207,14 @@ impl Replying {
 
 /// What the node learned of its doors' queues, which the listener's connections read as they make
 /// a request's channels: the depth of a body's ([`Depth`]) and of a reply's ([`Replying`]), the
-/// host their one writer; and what the connections wrote of their replies since the host last
-/// took it, which they add to and the host alone takes (`Doorway::replies`), each an atomic that
-/// needs no lock. A sample adds its time and then its count, so the host may take its time a turn
-/// before its count: a phase may hold a turn's time more or less for each connection writing as it
-/// ends, among its 267 turns. A sum holds what the connections wrote between two of the host's
-/// turns, so it wraps only past 2^64 nanoseconds of it, centuries.
+/// host their one writer; what the connections wrote of their replies since the host last took it
+/// (`Doorway::replies`); and what their gets' clients took once their sockets were full
+/// (`Doorway::drained`); each added to by the connections and taken by the host alone, an atomic
+/// that needs no lock. A sample adds its time and then its count, so the host may take its time a
+/// turn before its count: a phase may hold a turn's time more or less for each connection writing
+/// as it ends, among its 267 turns, and a pace the time of a piece more or less for each connection
+/// writing as the host takes it. A sum holds what the connections wrote between two of the host's
+/// turns, so it wraps only past 2^64 nanoseconds or octets of it, centuries.
 #[derive(Default)]
 struct Learned {
     body: AtomicUsize,
@@ -221,6 +223,8 @@ struct Learned {
     pieces: AtomicU64,
     given_ns: AtomicU64,
     written_ns: AtomicU64,
+    drained: AtomicU64,
+    drained_ns: AtomicU64,
 }
 
 /// A piece of a reply.
@@ -350,6 +354,23 @@ impl Doorway {
         }
     }
 
+    /// Takes what the connections' gets' clients took of their replies' pieces once each socket
+    /// was full since the host last did: the octets and the time they took, summed over the pieces,
+    /// the clients' pace for the window a get holds being read (`crate::window`); none where no
+    /// piece filled its socket. The host takes it each turn, beside the replies' samples.
+    pub fn drained(&mut self) -> Option<(u64, u64)> {
+        let learned = &self.learned;
+        // The octets before the time, the order a connection adds them in turned round, as
+        // `replies` takes its counts.
+        let octets = learned.drained.swap(0, Ordering::Acquire);
+        let ns = learned.drained_ns.swap(0, Ordering::Relaxed);
+        if octets > 0 && ns > 0 {
+            Some((octets, ns))
+        } else {
+            None
+        }
+    }
+
     /// The S3 requests the listener answered `503 SlowDown`, for each cause in [`Slowed::ALL`]'s
     /// order.
     pub fn slowed(&self) -> [u64; Slowed::ALL.len()] {
@@ -424,6 +445,16 @@ impl Submitter {
             learned.given_ns.fetch_add(given_ns, Ordering::Relaxed);
             learned.turns.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// A get's client took `octets` of a piece of its reply in `ns` once the connection's socket
+    /// was full (`listener::io::Drained`): its pace, which the node's host takes at its next turn
+    /// ([`Doorway::drained`]).
+    pub fn drained(&self, octets: u64, ns: u64) {
+        let learned = &self.learned;
+        // The time before its octets (`Doorway::drained`).
+        learned.drained_ns.fetch_add(ns, Ordering::Relaxed);
+        learned.drained.fetch_add(octets, Ordering::Release);
     }
 
     /// Counts an S3 request the listener answers `503 SlowDown` for `cause`, which the node says

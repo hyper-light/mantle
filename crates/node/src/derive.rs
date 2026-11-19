@@ -158,8 +158,8 @@ pub fn probe_budget() -> Result<Duration, DeriveError> {
 /// wants ([`derive`], research/87 §4 rule D), and at most as many operations as those bytes hold at
 /// what one costs, as many as it learns its knee is within them;
 /// as many clients of the native protocol admitted at once, each with an operation it may run; S3's
-/// quota of buckets; one row each step of a bucket's attempt passes or removes, the least that
-/// moves it; HDFS's handover.
+/// quota of buckets; the rows each step of a bucket's attempt passes or removes that the largest
+/// entry's bytes hold ([`scan_rows`]); HDFS's handover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gateway {
     pub window: usize,
@@ -200,14 +200,17 @@ pub fn operations(share: u64, beside: u64, charges: &Charges, serving: Served) -
     (usize::try_from(count).unwrap_or(usize::MAX), bytes)
 }
 
-/// The operations a copy holds at once once taken, its get and its put (research/89 §3.7): a
-/// copy is charged each at the most an operation holds (`host::charged`).
+/// The drivers a copy runs at once once taken, its get of the source and its put of the copy
+/// (research/89 §3.7): a copy is charged both at once ([`Charges::copy`], `host::charged`), each
+/// at most the most an operation holds.
 pub(crate) const COPY_WEIGHT: usize = 2;
 
-/// The most bytes one operation is charged: a copy's, its get's and its put's at once, each at
-/// the most a get or a put holds ([`COPY_WEIGHT`], `host::charged`). The operations' bytes are
-/// never less, so every operation is admitted alone, and the door, which takes its requests in
-/// the order they came, never holds one that can never be taken.
+/// The most bytes one operation is charged as it is admitted: a copy's, its get's and its put's
+/// at once at the floor's window, each at most the most a get or a put holds ([`COPY_WEIGHT`];
+/// [`Charges::copy`] of the largest body a copy writes, `host::charged`). The operations' bytes
+/// are never less, so every operation is admitted alone, and the door, which takes its requests
+/// in the order they came, never holds one that can never be taken. A put, a get or a copy holds
+/// a window past the floor's only where those bytes hold it beside the others' (`host::fitting`).
 pub fn most_charged(charges: &Charges) -> u64 {
     u64::try_from(COPY_WEIGHT)
         .ok()
@@ -224,11 +227,11 @@ pub fn most_charged(charges: &Charges) -> u64 {
 /// `beside`, what one more operation adds past its charge to the transport, the ranges, the
 /// listener and the runtime, [`derive`]'s difference of the node at two operations and at one:
 /// its client's connection and exchange at QUIC's windows, a range's read, its task; and the
-/// host's records of it, its job and its boxed put or get (`node::record_bytes`). A put admitted
-/// at a window it learned holds that window's blocks instead ([`Charges::write`]), at most the
-/// operations' bytes. A put's charge holds its record of each block it wrote until its file names
-/// them, which grows with the body by design, at the largest body a PUT carries
-/// (`put::most_records`), or its own (`put::records_for`).
+/// host's records of it, its job and its boxed put or get (`node::record_bytes`). A put or a get
+/// admitted at a window it learned holds that window's blocks instead ([`Charges::write`],
+/// [`Charges::read`]), at most the operations' bytes. A put's charge holds its record of each
+/// block it wrote until its file names them, which grows with the body by design, at the largest
+/// body a PUT carries (`put::most_records`), or its own (`put::records_for`).
 pub fn native(charges: &Charges, beside: u64) -> Option<u64> {
     let records = u64::try_from(crate::node::record_bytes()?).ok()?;
     charges.most().checked_add(beside)?.checked_add(records)
@@ -282,10 +285,22 @@ pub fn gateway(objects: usize, objects_bytes: u64) -> Result<Gateway, DeriveErro
         objects_bytes,
         clients: objects,
         bucket_quota: BUCKET_QUOTA,
-        scan_rows: 1,
+        scan_rows: scan_rows()?,
         handover_ns: u64::try_from(HANDOVER.as_nanos())
             .map_err(|_| DeriveError::Overflow("the handover"))?,
     })
+}
+
+/// The rows one step of a bucket's attempt passes or removes (`coordinator::Bounds`): as many as the
+/// largest entry a range takes (`wire::largest_entry_bytes`, `range.max_entry_bytes`) holds of what
+/// one row a collection removes writes (`wire::largest_collected_bytes`), so a collection's writes
+/// are within the bytes of the largest entry a range applies, and a probe passes as many a read. At
+/// least one, the least that moves an attempt.
+pub fn scan_rows() -> Result<u32, DeriveError> {
+    let entry = wire::largest_entry_bytes()?;
+    let row = wire::largest_collected_bytes()?;
+    let rows = entry.checked_div(row).unwrap_or(0).max(1);
+    u32::try_from(rows).map_err(|_| DeriveError::Overflow("a scan's rows"))
 }
 
 /// The schemes a node's blocks may take, its operations' charges are reckoned under: those
@@ -313,8 +328,9 @@ pub fn charges(
 /// `get::most_bytes`) and the host's: a put's chunks copied to send, every chunk of every block
 /// going down, a piece of its body carried, and its records of the blocks it wrote until its file
 /// names them (`put::records_for`); a get's block taken and written out. A write is
-/// charged at its body's length, known from its head; every other operation at the most any
-/// holds, as a get's object's size is known only once its row is read.
+/// charged at its body's length, known from its head ([`Charges::write`]); a get for its window
+/// ([`Charges::read`]); a copy for its get's and its put's at once ([`Charges::copy`]); every
+/// other operation at the most any holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Charges {
     window: usize,
@@ -392,6 +408,36 @@ impl Charges {
             held = held.max(bytes.or_else(most).unwrap_or(u64::MAX));
         }
         held
+    }
+
+    /// What a get holds with `window` blocks being read at once, under the scheme that holds the
+    /// most of it: its driver's window at the largest block (`get::most_bytes`) and the block
+    /// taken to be written out. A window no layout lays out is charged past any memory.
+    pub fn read(&self, window: usize) -> u64 {
+        let mut held = 0u64;
+        for layout in &self.layouts {
+            let bytes = layout
+                .largest_block()
+                .and_then(|block| get::most_bytes(window, layout)?.checked_add(block));
+            held = held.max(bytes.unwrap_or(u64::MAX));
+        }
+        held
+    }
+
+    /// What a copy holds with `get` blocks of its source being read and `put` blocks of its copy
+    /// of `length` bytes going down at once: its get's ([`Charges::read`]) beside its put's
+    /// ([`Charges::write`]), as both run at once. A sum past a u64 saturates: past any memory.
+    pub fn copy(&self, get: usize, put: usize, length: u64) -> u64 {
+        self.read(get).saturating_add(self.write(put, length))
+    }
+
+    /// The least of the schemes' whole blocks: the most blocks a body is cut into.
+    pub fn smallest_block(&self) -> u64 {
+        self.layouts
+            .iter()
+            .filter_map(Layout::largest_block)
+            .min()
+            .unwrap_or(0)
     }
 
     /// The largest block any scheme's layout makes: the fewest blocks a body is cut into.
@@ -3035,7 +3081,10 @@ fn say_objects(
         "gateway.window",
         gateway.window,
         Kind::Derived,
-        "the floor: a window of one block (node.md §1.4)",
+        "the floor: a window of one block (node.md §1.4); a put and a get each hold the window the \
+         node learns of its own puts and gets by Little's law, a block's time times its clients' \
+         pace over a block's bytes, where the operations' bytes hold it (crate::window, node.md \
+         §2.8)",
     );
     said.add(
         "gateway.objects_bytes",
@@ -3072,8 +3121,9 @@ fn say_objects(
         "gateway.scan_rows",
         gateway.scan_rows,
         Kind::Derived,
-        "one row each step of a bucket's attempt passes or removes, the least that moves it, \
-         until deletion's throughput is measured",
+        "the rows each step of a bucket's attempt passes or removes: as many as the largest entry a \
+         range takes holds of what one row a collection removes writes, its key deleted and a \
+         part's file released (derive::scan_rows, wire::largest_collected_bytes)",
     );
     said.add(
         "gateway.handover_ns",
@@ -3141,7 +3191,8 @@ fn say_native(said: &mut Said, native: u64) {
          to send, a piece of its body and its records of the blocks of the largest body a PUT \
          carries (derive::Charges); what one more operation adds beside \
          it to the transport, the ranges, the listener and the runtime; and the host's records of \
-         it (derive::native)",
+         it (derive::native). A put or a get admitted at a window it learned holds that window's \
+         blocks instead (Charges::write, Charges::read), at most gateway.objects_bytes",
     );
 }
 
@@ -3977,6 +4028,74 @@ mod tests {
         let mixed = Charges::new(1, &[three, coded]).unwrap();
         assert!(mixed.of(Some(1)) >= charges.of(Some(1)));
         assert!(mixed.of(Some(1)) < mixed.most());
+    }
+
+    /// A step of a bucket's attempt passes or removes as many rows as the largest entry a range
+    /// takes holds of what one row a collection removes writes: more than one, and their writes
+    /// within that entry's bytes.
+    #[test]
+    fn a_buckets_step_passes_the_rows_the_largest_entry_holds() {
+        let rows = usize::try_from(scan_rows().unwrap()).unwrap();
+        let entry = wire::largest_entry_bytes().unwrap();
+        let row = wire::largest_collected_bytes().unwrap();
+        assert!(row > key::largest_bytes());
+        assert!(rows > 1, "{rows}");
+        assert!(rows * row <= entry);
+        assert!((rows + 1) * row > entry);
+        assert_eq!(gateway(1, 0).unwrap().scan_rows, scan_rows().unwrap());
+    }
+
+    /// A get is charged for its window under the scheme that holds the most of it: its driver's
+    /// blocks being read at the largest block (`get::most_bytes`) and the block taken to be
+    /// written out, so what it holds at any window it learns is within its charge; at the floor's
+    /// window no more than the most an operation holds, and each block more a block's bytes more
+    /// at least. The smallest block is the most blocks a body is cut into.
+    #[test]
+    fn a_get_is_charged_for_the_blocks_its_window_holds() {
+        let copies = durability::Scheme::Copies(3);
+        let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
+        let charges = Charges::new(1, &[copies, coded]).unwrap();
+        for window in 1..=8 {
+            for scheme in [copies, coded] {
+                let layout = Layout::new(scheme).unwrap();
+                let block = layout.largest_block().unwrap();
+                let held = get::most_bytes(window, &layout).unwrap() + block;
+                assert!(charges.read(window) >= held, "{window} {scheme:?}");
+            }
+            assert!(charges.read(window + 1) - charges.read(window) >= charges.smallest_block());
+        }
+        assert!(charges.read(1) <= charges.most());
+        assert_eq!(charges.read(usize::MAX), u64::MAX);
+        let block = |scheme| Layout::new(scheme).unwrap().largest_block().unwrap();
+        assert_eq!(charges.smallest_block(), block(copies));
+        assert_eq!(charges.largest_block(), block(coded));
+        assert!(block(copies) < block(coded));
+    }
+
+    /// A copy is charged its get and its put at once, each for its own window: its get's blocks
+    /// being read beside its put's going down of its copy's length, each block more of either
+    /// charged more. At the floor's windows and the largest body a copy writes it is within the
+    /// most one operation is charged, which the operations' bytes always hold, and a shorter copy
+    /// holds less.
+    #[test]
+    fn a_copy_is_charged_its_get_and_its_put_at_once() {
+        let copies = durability::Scheme::Copies(3);
+        let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
+        let charges = Charges::new(1, &[copies, coded]).unwrap();
+        let largest = mantle_s3::body::MAX_UPLOAD;
+        for (get, put, length) in [(1, 1, largest), (4, 2, largest), (2, 3, 1 << 20)] {
+            assert_eq!(
+                charges.copy(get, put, length),
+                charges.read(get) + charges.write(put, length)
+            );
+            assert!(charges.copy(get + 1, put, length) > charges.copy(get, put, length));
+            assert!(charges.copy(get, put + 1, largest) > charges.copy(get, put, largest));
+        }
+        let floor = charges.copy(1, 1, largest);
+        assert!(floor > charges.most());
+        assert!(floor <= most_charged(&charges));
+        assert!(charges.copy(1, 1, 1 << 20) < floor);
+        assert_eq!(charges.copy(usize::MAX, 1, largest), u64::MAX);
     }
 
     /// A share holds an operation of the largest blocks and as many more at the least an operation

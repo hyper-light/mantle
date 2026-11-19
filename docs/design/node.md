@@ -537,9 +537,9 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
 | `transport_bytes` | derived | the transport's floor: what it holds besides QUIC's windows, the receive ring's growth at its most among it (`bounds::ring_growth`), and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`) |
 | `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
-| `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor; the operations' bytes, what the memory holds past every class's floor and the indexes' and engines' wants (`gateway.objects_bytes`; research/87 §4 rule D), each operation charged what it holds at its own size (`derive::Charges`), and a ceiling of as many operations as those bytes hold at the least one holds (`gateway.objects`), within which the host admits as many as it learns its knee is (§2.8, `crate::admit`); the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals, and its file's write beside its blocks' (`put::most_commands`; gateway.md §2.2); one read each; and the node's enlistment (`derive::asks`). The memory an operation holds at its most: the larger of a put and a get of the schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
-| `memory.native` | derived | the most one native PUT or GET holds above the node's idle at `gateway.window`, the bound a body crossing the client, the host and the transport is held to (lean-doors step 5): the most an operation is charged (`derive::Charges::most`: its window of blocks at the largest block, `put::most_bytes` or `get::most_bytes`; a put's chunks copied to send for each block going down, one piece of its body, hyper-transport's `RECEIVE_CHUNK`, and its record of each block it wrote until its file names them, at the largest body a PUT or a part carries, `MAX_UPLOAD`, 5 GiB (`put::most_records`); a get's block taken), what one more operation adds beside its charge to the transport, the ranges, the listener and the runtime (the derivation's difference of the node at two operations and at one), and the host's records of it, its job and its boxed put or get (`node::record_bytes`) (`derive::native`). A put admitted at a window it learned holds that window's blocks instead (`Charges::write`), at most `gateway.objects_bytes`. A put's records (`mantle_gateway::put`'s `recorded` and `due`) grow with its body by design, a block's entry in each of two std B-trees: at most 212 bytes a block, each tree's node over the least entries every node but its root holds (`put::records_bytes`), and 1,056 for the roots; 138,008 at 5 GiB in blocks of one copy's 8,325,104 bytes, 646 of them. A put is charged its own body's (`put::records_for`, in `Charges::write`), so a node admits no more puts than it holds records for. Counted on macOS aarch64, about 146 bytes a block (`object_path.rs`'s `a_put_and_a_get_many_windows_long_hold_their_windows_bytes`, which holds each block more to the 212) |
-| `gateway.bucket_quota`, `gateway.scan_rows` | cited, derived | S3's 10,000 (research 05 §10.4); one row each step of a bucket's attempt passes or removes, the least that moves it (`coordinator::Bounds`), until deletion's throughput is measured |
+| `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor, the least a put or a get holds and still moves (§2.6's `⌈R·T/B⌉` at its least), a put and a get each holding the window the node learns of its own puts and gets, and a copy its put's that of the node's puts and its get's as many blocks as that put drains while one is read, where the operations' bytes hold it (§2.8, `crate::window`); the operations' bytes, what the memory holds past every class's floor and the indexes' and engines' wants (`gateway.objects_bytes`; research/87 §4 rule D), each operation charged what it holds at its own size (`derive::Charges`), and a ceiling of as many operations as those bytes hold at the least one holds (`gateway.objects`), within which the host admits as many as it learns its knee is (§2.8, `crate::admit`); the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals, and its file's write beside its blocks' (`put::most_commands`; gateway.md §2.2); one read each; and the node's enlistment (`derive::asks`). The memory an operation holds at its most: the larger of a put and a get of the schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
+| `memory.native` | derived | the most one native PUT or GET holds above the node's idle at `gateway.window`, the bound a body crossing the client, the host and the transport is held to (lean-doors step 5): the most an operation is charged (`derive::Charges::most`: its window of blocks at the largest block, `put::most_bytes` or `get::most_bytes`; a put's chunks copied to send for each block going down, one piece of its body, hyper-transport's `RECEIVE_CHUNK`, and its record of each block it wrote until its file names them, at the largest body a PUT or a part carries, `MAX_UPLOAD`, 5 GiB (`put::most_records`); a get's block taken), what one more operation adds beside its charge to the transport, the ranges, the listener and the runtime (the derivation's difference of the node at two operations and at one), and the host's records of it, its job and its boxed put or get (`node::record_bytes`) (`derive::native`). A put or a get admitted at a window it learned holds that window's blocks instead (`Charges::write`, `Charges::read`), at most `gateway.objects_bytes`; a get is admitted at the floor's window and takes the bytes for the window it learned once its version is read, before it holds those blocks; a copy holds its get's and its put's at once (`Charges::copy`), admitted at the floor's and fitted the same way once its source's version is read. A put's records (`mantle_gateway::put`'s `recorded` and `due`) grow with its body by design, a block's entry in each of two std B-trees: at most 212 bytes a block, each tree's node over the least entries every node but its root holds (`put::records_bytes`), and 1,056 for the roots; 138,008 at 5 GiB in blocks of one copy's 8,325,104 bytes, 646 of them. A put is charged its own body's (`put::records_for`, in `Charges::write`), so a node admits no more puts than it holds records for. Counted on macOS aarch64, about 146 bytes a block (`object_path.rs`'s `a_put_and_a_get_many_windows_long_hold_their_windows_bytes`, which holds each block more to the 212) |
+| `gateway.bucket_quota`, `gateway.scan_rows` | cited, derived | S3's 10,000 (research 05 §10.4); the rows each step of a bucket's attempt passes or removes (`coordinator::Bounds`): as many as the largest entry a range takes (`wire::largest_entry_bytes`, `range.max_entry_bytes`) holds of what one row a collection removes writes, its key deleted at the longest a row's key is and an upload's part's file released, the queue's key and its holder (`wire::largest_collected_bytes`), so a collection's writes are within the bytes of the largest entry, and a probe passes as many rows a read (`derive::scan_rows`) |
 | `gateway.handover_ns` | cited | HDFS's 60 s soft limit (research 22 §3.6), one of the bounds metadata.md §2 names for the same window, until the gateway measures research 22 §10.2's `D_b`: its retry budget for a step times a high quantile of one try, plus the clocks' offset; it bounds how long a leftover waits, not correctness |
 | `runtime.probe_budget_ms` | bound | hyper-rt's probes stop at Wilks' 59 samples (hyper-rt runtime.md §10.2), measured once by `mantle init` and kept as hyper-rt's record, reused while the machine's key matches; the budget bounds a starved host only: 59 wakes at the platform's quantum, 3 ms on Linux, 10 ms on macOS, 93.75 ms on Windows (research 64; `derive::probe_budget`) |
 
@@ -1438,9 +1438,9 @@ becomes:
   `Lost(Stalled)`, about one run in ten on ubuntu-24.04-arm, 2026-11-18; `tests/put_body.rs`).
   Every operation's charge holds a piece, a write of no bytes the least one is, so each reads its
   own; one answered at once is charged nothing and drains its body through the transport's piece
-  for its owner's reads. Every other operation is charged the most any holds, since a get's object's size
-  is known only once its row is read. A request turned away for bytes says nothing of the limit;
-  one turned away by the limit tells it its clients ask more. The data comes first (research/87
+  for its owner's reads. A get is charged for its window, and a copy for its get's and its put's at
+  once (below); every other operation the most any holds. A request turned away for bytes says
+  nothing of the limit; one turned away by the limit tells it its clients ask more. The data comes first (research/87
   §4, rule D): the memory past every class's floor is the indexes' and engines' wants first, each
   taken whole, and what the memory holds past those is the operations', with at least one at the
   most one is charged, a copy's get and put at once (`derive::most_charged`). Which of the derived
@@ -1474,16 +1474,50 @@ becomes:
   its streams once its role is known. So a client costs the node its own connections and the
   exchange it keeps, never a peer's streams, and the transport's floor grows by the same bytes a
   client (`bounds::Stated::clients`, `pool`).
-- **The blocks a put holds going down: learned.** A put's body waits while its window is full,
-  each block's chunks stored and its Block command written before the next may go. By Little's
-  law the blocks that keep the body coming at its client's pace are the time a block takes from
-  going down to recorded times the body's rate, over a block's bytes (`crate::window`). The node
-  measures both from its own puts: each block's time to recorded (`Put::take_committed`), and how
-  fast the first block of a longer body filled, which no window holds back, so it is the client's
-  pace (`Put::take_filled`); each smoothed with RFC 6298's gain of 1/8. A put is admitted with
-  that window, at least the floor's one block and no more than its body's own blocks, and charged
-  for it (`derive::Charges::write`). A get still reads a window of one block (`gateway.window`),
-  open until its own rate and its chunks' read time are measured the same way.
+- **The blocks a put holds going down and a get holds being read: learned.** A put's body waits
+  while its window is full, each block's chunks stored and its Block command written before the
+  next may go. By Little's law the blocks that keep the body coming at its client's pace are the
+  time a block takes from going down to recorded times the body's rate, over a block's bytes
+  (`crate::window`). The node measures both from its own puts: each block's time to recorded
+  (`Put::take_committed`), and how fast the first block of a longer body filled, which no window
+  holds back, so it is the client's pace (`Put::take_filled`); each smoothed with RFC 6298's gain
+  of 1/8. A put is admitted with that window, at least the floor's one block and no more than its
+  body's own blocks, and charged for it (`derive::Charges::write`). A get is the same law turned
+  round: its client waits while its window is read, and the blocks that keep the body going at the
+  client's pace are the time a block takes from its row asked to its plaintext opened times the
+  rate the client takes the body, over a block's bytes. The node measures both from its own gets:
+  each block's time to read, in the host's time (`Get::tick`, `Get::take_read`), and how fast the
+  client took a block the host held whole once the client's room for it was full, which no window
+  holds back: on a native exchange the stream's flow-control window, smaller than a block, so
+  every block's writing waits on its client (`host::Drain`); on the S3 door, whose reply's channel
+  holds whole blocks, the connection's socket, which the connection times as it writes each piece,
+  from when the socket first took less than it was offered to the piece's last octet written, and
+  tells the node through the door (`listener::io::Drained`, `door::Doorway::drained`), so a client
+  that drains faster than the reads is paced as one slower is. Timed from the reply's channel
+  instead, a block held behind the one its connection had just begun, a client faster than the
+  reads never filled the channel and its gets kept the window they were admitted with. Each is
+  smoothed with the same gain. A get's object's size is known only once its
+  row is read, so it is admitted at the floor's one block and charged for it, its window of blocks
+  at the largest block and the block taken to be written out (`derive::Charges::read`). Once its
+  version is read it widens to the window learned, no more than the blocks its range is cut into
+  at the smallest block, and the widest whose charge the operations' bytes hold beside the
+  others' (`host::reading`, `host::fitting`), taking those bytes before it holds the blocks
+  (`admit::Admission::took`). Charged the window learned at the door instead, a small get held a
+  large one's bytes until its row was read. A copy is the same law with its put as its get's
+  client. Its put holds the window the node learned of its puts, and drains that many blocks in the
+  time one takes to be recorded, so its get holds that window times a block's time to read over a
+  block's time to be recorded, no more than the blocks its span is cut into at the smallest block
+  (`Windows::copy_get`). The drain is taken from what the node learned of its puts, not timed from
+  when the put's room was full: a put faster than the reads never fills it, the blind spot the S3
+  door's gets had. A copy's put's body comes at its get's pace, not a client's, so its put gives the
+  node's puts its blocks' times to be recorded but not how fast its first block filled, which would
+  be its source's reads (`Put::take_filled`); its get gives the node's gets its blocks' times to
+  read. Its source's size is known only once its version is read, so it is admitted at the floor's
+  one block for each, charged for its get and its put at once, its put's of the largest body a copy
+  writes (`derive::Charges::copy`, `host::charged`), within the most one operation is charged. Once
+  its version is read its put's window, then its get's beside it, widen to the widest whose charge
+  the operations' bytes hold beside the others', the bytes past its admitted charge taken and those
+  its span does not need given back (`host::copy_windows`).
 - **A native request past the limit waits, as the S3 door's does.** One the host has no room for,
   or that comes behind requests already waiting, is parked with its body unread, QUIC's flow
   control holding its client's bytes, and taken in the order it came once room frees; each turn it
@@ -1491,6 +1525,11 @@ becomes:
   client's patience where it gave none, it is answered `SlowDown` (research/77 D1, D2). At most as
   many wait as the transport holds exchanges. It was answered `SlowDown` at once, which mantle's
   client took as a throttle and waited out over one to twenty seconds.
+
+Since 2026-11-18 no count in admission, batching or sessions is fixed: each above is learned from
+the node's own operations or derived from the bytes it bounds (research/87 §2). The window's one
+block, `gateway.window`, is the floor the windows are learned from, §2.6's `⌈R·T/B⌉` at its least:
+the least a put or a get holds and still moves its body.
 
 ### 2.9 A node's ranges, its log and its native door across its shards
 

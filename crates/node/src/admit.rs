@@ -164,7 +164,8 @@ impl Admission {
     }
 
     /// Whether the operations' memory holds `more` bytes beside what they hold, for one running
-    /// that takes them (a copy's put, `Host::read_fields`).
+    /// that takes them (a copy's put, `Host::read_fields`; a get's or a copy's windows once its
+    /// version is read, `host::reading`, `host::copy_windows`).
     pub(crate) fn holds(&self, more: u64) -> bool {
         self.held
             .checked_add(more)
@@ -177,8 +178,9 @@ impl Admission {
         self.held = self.held.saturating_add(more);
     }
 
-    /// Bytes [`took`](Self::took) holds are free again: the rebuild that took them ended or was let
-    /// go.
+    /// Bytes [`took`](Self::took) holds, or of a running operation's charge, are free again: the
+    /// rebuild that took them ended or was let go, or a copy's span holds less than it was
+    /// admitted at (`host::copy_windows`).
     pub(crate) fn gave(&mut self, bytes: u64) {
         self.held = self.held.saturating_sub(bytes);
     }

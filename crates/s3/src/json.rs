@@ -3,28 +3,80 @@
 //! (RFC 7493 §2) forbids a receiver to trust: an object naming one member twice, which IAM's
 //! policy grammar forbids too, and a string holding an unpaired surrogate. Numbers are kept as
 //! written, so no range or precision is lost before a caller reads one as it needs. Nesting is
-//! bounded, so a deep text is refused rather than followed down the stack; the caller bounds
-//! the text's size.
+//! bounded, so a deep text is refused; the caller bounds the text's size.
+//!
+//! A value is flat (CLAUDE.md §10): its tokens in the order the text writes them, each array's
+//! and object's opening token counting the tokens before its close. The reader makes them in
+//! one pass over the text, the writer writes them first to last, a lookup steps over a member's
+//! whole value at once, and comparing, copying and dropping a value is a loop over one `Vec`.
+//! None of them walks down the nesting with a container's work waiting on what it holds.
 
 /// The deepest nesting read: one level past the deepest document read. A bucket policy nests
 /// six levels, a statement's condition values inside its operator inside its `Condition`
 /// inside the statement inside `Statement` inside the policy (17 §3.1), and a POST policy
 /// three, a condition's operands inside the condition inside `conditions` (19 §4.2). The
 /// seventh level lets a policy's checks find an object or array where a value belongs and
-/// refuse it with S3's message for it; a deeper one is refused as JSON too deep.
+/// refuse it with S3's message for it; a deeper one is refused as JSON too deep, as RFC 8259 §9
+/// lets a reader limit "the maximum depth of nesting". The reader's record of the containers
+/// open around it holds this many and no more.
 pub const MAX_DEPTH: usize = 7;
 
-/// A JSON value.
+/// A JSON value: its tokens in the order its text writes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Value {
+pub struct Value {
+    tokens: Vec<Token>,
+}
+
+/// A value inside a document, as a reader takes it: a scalar, or an array or object whose items
+/// or members it reads in turn. It borrows the document's tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View<'a> {
     Null,
     Bool(bool),
     /// A number as written, which the grammar checked.
+    Number(&'a str),
+    String(&'a str),
+    Array(Items<'a>),
+    /// Members in the order written, each name once.
+    Object(Members<'a>),
+}
+
+/// An array's items, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Items<'a> {
+    /// The tokens between the array's `[` and its `]`.
+    tokens: &'a [Token],
+}
+
+/// An object's members, in the order written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Members<'a> {
+    /// The tokens between the object's `{` and its `}`: each member's name, then its value's.
+    tokens: &'a [Token],
+}
+
+/// One token of a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Null,
+    Bool(bool),
+    /// A number as written.
     Number(String),
     String(String),
-    Array(Vec<Value>),
-    /// Members in the order written, each name once.
-    Object(Vec<(String, Value)>),
+    /// An object member's name; its value's tokens follow it.
+    Name(String),
+    /// `[` or `{`, and the count of tokens between it and its close, so a reader steps over
+    /// the whole container at once. The count is relative, so a value's tokens are the same
+    /// wherever it sits.
+    Open(Kind, usize),
+    /// `]` or `}`.
+    Close(Kind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Array,
+    Object,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -44,20 +96,62 @@ pub enum JsonError {
 /// Reads one JSON text.
 pub fn parse(text: &[u8]) -> Result<Value, JsonError> {
     let text = std::str::from_utf8(text).map_err(|_| JsonError::Utf8)?;
-    let mut reader = Reader { text, at: 0 };
-    reader.space();
-    let value = reader.value(0)?;
-    reader.space();
-    if reader.at != text.len() {
-        return Err(JsonError::Syntax("content after the value"));
-    }
-    Ok(value)
+    let mut reader = Reader {
+        text,
+        at: 0,
+        tokens: Vec::new(),
+        open: Open {
+            containers: [(Kind::Array, 0); MAX_DEPTH],
+            depth: 0,
+        },
+    };
+    reader.document()?;
+    Ok(Value {
+        tokens: reader.tokens,
+    })
 }
 
 struct Reader<'a> {
     text: &'a str,
     /// The byte offset read to, always at a character boundary.
     at: usize,
+    /// The tokens read, in the text's order.
+    tokens: Vec<Token>,
+    open: Open,
+}
+
+/// The containers open around the reader, outermost first: each one's kind, and the index of
+/// its opening token, which counts the tokens inside once it closes. A text nests at most
+/// [`MAX_DEPTH`] levels, so the record holds that many and no more.
+struct Open {
+    containers: [(Kind, usize); MAX_DEPTH],
+    /// How many are open.
+    depth: usize,
+}
+
+impl Open {
+    /// Opens a container one level deeper, within the bound.
+    fn push(&mut self, kind: Kind, at: usize) -> Result<(), JsonError> {
+        let slot = self
+            .containers
+            .get_mut(self.depth)
+            .ok_or(JsonError::Depth)?;
+        *slot = (kind, at);
+        self.depth = self.depth.checked_add(1).ok_or(JsonError::Depth)?;
+        Ok(())
+    }
+
+    /// The innermost open container.
+    fn innermost(&self) -> Option<(Kind, usize)> {
+        self.containers.get(self.depth.checked_sub(1)?).copied()
+    }
+
+    /// Closes the innermost open container.
+    fn pop(&mut self) {
+        if let Some(depth) = self.depth.checked_sub(1) {
+            self.depth = depth;
+        }
+    }
 }
 
 impl Reader<'_> {
@@ -81,21 +175,129 @@ impl Reader<'_> {
         }
     }
 
-    fn value(&mut self, depth: usize) -> Result<Value, JsonError> {
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Value::String(self.string()?)),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            Some(b't') => self.literal("true", Value::Bool(true)),
-            Some(b'f') => self.literal("false", Value::Bool(false)),
-            Some(b'n') => self.literal("null", Value::Null),
-            Some(_) => Err(JsonError::Syntax("a character no value begins with")),
-            None => Err(JsonError::Syntax("no value")),
+    /// `JSON-text = ws value ws` (RFC 8259 §2), read in one pass: a value begins, and once one
+    /// ends, the closes after it close their containers, then the text ends or a comma begins
+    /// the next value. Every turn of either loop reads at least one byte, so both end within
+    /// the text.
+    fn document(&mut self) -> Result<(), JsonError> {
+        loop {
+            self.space();
+            if self.value()? {
+                continue;
+            }
+            loop {
+                self.space();
+                let Some((kind, _)) = self.open.innermost() else {
+                    if self.at != self.text.len() {
+                        return Err(JsonError::Syntax("content after the value"));
+                    }
+                    return Ok(());
+                };
+                match (kind, self.peek()) {
+                    (_, Some(b',')) => {
+                        self.advance(1)?;
+                        self.space();
+                        if kind == Kind::Object {
+                            self.name()?;
+                        }
+                        break;
+                    }
+                    (Kind::Array, Some(b']')) | (Kind::Object, Some(b'}')) => {
+                        self.advance(1)?;
+                        self.close()?;
+                    }
+                    (Kind::Array, _) => return Err(JsonError::Syntax("an array not closed")),
+                    (Kind::Object, _) => return Err(JsonError::Syntax("an object not closed")),
+                }
+            }
         }
     }
 
-    fn literal(&mut self, name: &str, value: Value) -> Result<Value, JsonError> {
+    /// Reads a value's first token: a whole scalar, or a container's opening. `true` when a
+    /// container opened and the first value inside it follows.
+    fn value(&mut self) -> Result<bool, JsonError> {
+        let token = match self.peek() {
+            Some(b'{') => return self.open(Kind::Object),
+            Some(b'[') => return self.open(Kind::Array),
+            Some(b'"') => Token::String(self.string()?),
+            Some(b'-' | b'0'..=b'9') => self.number()?,
+            Some(b't') => self.literal("true", Token::Bool(true))?,
+            Some(b'f') => self.literal("false", Token::Bool(false))?,
+            Some(b'n') => self.literal("null", Token::Null)?,
+            Some(_) => return Err(JsonError::Syntax("a character no value begins with")),
+            None => return Err(JsonError::Syntax("no value")),
+        };
+        self.tokens.push(token);
+        Ok(false)
+    }
+
+    /// Opens a container one level deeper, within the bound: an empty one closes at once, and
+    /// an object's first member's name is read. `true` when the first value inside follows.
+    fn open(&mut self, kind: Kind) -> Result<bool, JsonError> {
+        self.open.push(kind, self.tokens.len())?;
+        self.advance(1)?;
+        self.tokens.push(Token::Open(kind, 0));
+        self.space();
+        let close = match kind {
+            Kind::Array => b']',
+            Kind::Object => b'}',
+        };
+        if self.peek() == Some(close) {
+            self.advance(1)?;
+            self.close()?;
+            return Ok(false);
+        }
+        if kind == Kind::Object {
+            self.name()?;
+        }
+        Ok(true)
+    }
+
+    /// A member's name and the colon after it; its value follows.
+    fn name(&mut self) -> Result<(), JsonError> {
+        if self.peek() != Some(b'"') {
+            return Err(JsonError::Syntax("a member without a string name"));
+        }
+        let name = self.string()?;
+        self.tokens.push(Token::Name(name));
+        self.space();
+        if self.peek() != Some(b':') {
+            return Err(JsonError::Syntax("a member without a colon"));
+        }
+        self.advance(1)
+    }
+
+    /// Closes the innermost container, its close read: an object's names are checked distinct,
+    /// and its opening token counts the tokens inside.
+    fn close(&mut self) -> Result<(), JsonError> {
+        let nothing_open = JsonError::Syntax("a close with nothing open");
+        let (kind, at) = self.open.innermost().ok_or(nothing_open)?;
+        self.open.pop();
+        let Some((Token::Open(..), inside)) =
+            self.tokens.get(at..).and_then(<[Token]>::split_first)
+        else {
+            return Err(nothing_open);
+        };
+        let inner = inside.len();
+        if kind == Kind::Object {
+            // Names compare after escapes are replaced (RFC 8259 §8.3; RFC 7493 §2.3).
+            let mut names: Vec<&str> = Members { tokens: inside }
+                .iter()
+                .map(|(name, _)| name)
+                .collect();
+            names.sort_unstable();
+            if names.array_windows::<2>().any(|[a, b]| a == b) {
+                return Err(JsonError::Duplicate);
+            }
+        }
+        if let Some(Token::Open(_, count)) = self.tokens.get_mut(at) {
+            *count = inner;
+        }
+        self.tokens.push(Token::Close(kind));
+        Ok(())
+    }
+
+    fn literal(&mut self, name: &str, token: Token) -> Result<Token, JsonError> {
         if !self
             .text
             .get(self.at..)
@@ -104,89 +306,11 @@ impl Reader<'_> {
             return Err(JsonError::Syntax("a misspelled literal"));
         }
         self.advance(name.len())?;
-        Ok(value)
-    }
-
-    /// Enters a nested value: one level deeper, within the bound.
-    fn deeper(depth: usize) -> Result<usize, JsonError> {
-        depth
-            .checked_add(1)
-            .filter(|depth| *depth <= MAX_DEPTH)
-            .ok_or(JsonError::Depth)
-    }
-
-    fn object(&mut self, depth: usize) -> Result<Value, JsonError> {
-        let depth = Self::deeper(depth)?;
-        self.advance(1)?;
-        self.space();
-        let mut members: Vec<(String, Value)> = Vec::new();
-        if self.peek() == Some(b'}') {
-            self.advance(1)?;
-            return Ok(Value::Object(members));
-        }
-        loop {
-            if self.peek() != Some(b'"') {
-                return Err(JsonError::Syntax("a member without a string name"));
-            }
-            let name = self.string()?;
-            self.space();
-            if self.peek() != Some(b':') {
-                return Err(JsonError::Syntax("a member without a colon"));
-            }
-            self.advance(1)?;
-            self.space();
-            let value = self.value(depth)?;
-            members.push((name, value));
-            self.space();
-            match self.peek() {
-                Some(b',') => {
-                    self.advance(1)?;
-                    self.space();
-                }
-                Some(b'}') => {
-                    self.advance(1)?;
-                    break;
-                }
-                _ => return Err(JsonError::Syntax("an object not closed")),
-            }
-        }
-        // Names compare after escapes are replaced (RFC 8259 §8.3; RFC 7493 §2.3).
-        let mut names: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
-        names.sort_unstable();
-        if names.array_windows::<2>().any(|[a, b]| a == b) {
-            return Err(JsonError::Duplicate);
-        }
-        Ok(Value::Object(members))
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Value, JsonError> {
-        let depth = Self::deeper(depth)?;
-        self.advance(1)?;
-        self.space();
-        let mut items = Vec::new();
-        if self.peek() == Some(b']') {
-            self.advance(1)?;
-            return Ok(Value::Array(items));
-        }
-        loop {
-            items.push(self.value(depth)?);
-            self.space();
-            match self.peek() {
-                Some(b',') => {
-                    self.advance(1)?;
-                    self.space();
-                }
-                Some(b']') => {
-                    self.advance(1)?;
-                    return Ok(Value::Array(items));
-                }
-                _ => return Err(JsonError::Syntax("an array not closed")),
-            }
-        }
+        Ok(token)
     }
 
     /// `number = [ minus ] int [ frac ] [ exp ]` (RFC 8259 §6), kept as written.
-    fn number(&mut self) -> Result<Value, JsonError> {
+    fn number(&mut self) -> Result<Token, JsonError> {
         let start = self.at;
         if self.peek() == Some(b'-') {
             self.advance(1)?;
@@ -217,7 +341,7 @@ impl Reader<'_> {
             .text
             .get(start..self.at)
             .ok_or(JsonError::Syntax("a number"))?;
-        Ok(Value::Number(written.to_owned()))
+        Ok(Token::Number(written.to_owned()))
     }
 
     fn digits(&mut self) {
@@ -325,77 +449,201 @@ impl Reader<'_> {
 }
 
 impl Value {
+    /// The string `text`.
+    pub fn string(text: String) -> Self {
+        Self {
+            tokens: vec![Token::String(text)],
+        }
+    }
+
+    /// The value, as a reader takes it.
+    pub fn view(&self) -> View<'_> {
+        // The reader and `string` each make one value's tokens, so the first begins one.
+        split(&self.tokens).map_or(View::Null, |(view, _)| view)
+    }
+
     /// The member named `name`, if this is an object that has one.
-    pub fn member(&self, name: &str) -> Option<&Value> {
+    pub fn member(&self, name: &str) -> Option<View<'_>> {
+        self.view().member(name)
+    }
+
+    /// The value written compactly, as [`View::compact`] writes it.
+    pub fn compact(&self) -> String {
+        self.view().compact()
+    }
+}
+
+impl<'a> View<'a> {
+    /// The member named `name`, if this is an object that has one.
+    pub fn member(self, name: &str) -> Option<View<'a>> {
         match self {
-            Self::Object(members) => members
-                .iter()
-                .find(|(member, _)| member == name)
-                .map(|(_, value)| value),
+            Self::Object(members) => members.get(name),
             _ => None,
         }
     }
 
     /// The value written compactly: no white space between tokens, and in strings only what
-    /// RFC 8259 §7 requires escaped, escaped.
-    pub fn compact(&self) -> String {
+    /// RFC 8259 §7 requires escaped, escaped. Its length is counted first, so the text is
+    /// allocated once, at that length; a reservation the allocator refuses leaves it to grow as
+    /// it is written, where `String::with_capacity` would panic on a length past `isize::MAX`.
+    pub fn compact(self) -> String {
+        let mut len = Some(0_usize);
+        self.write(&mut |piece: &str| len = len.and_then(|len| len.checked_add(piece.len())));
         let mut out = String::new();
-        self.write(&mut out);
+        if let Some(len) = len {
+            out.try_reserve_exact(len).unwrap_or_default();
+        }
+        self.write(&mut |piece: &str| out.push_str(piece));
         out
     }
 
-    fn write(&self, out: &mut String) {
+    /// Writes the value's text to `out`, piece by piece.
+    fn write(self, out: &mut impl FnMut(&str)) {
         match self {
-            Self::Null => out.push_str("null"),
-            Self::Bool(true) => out.push_str("true"),
-            Self::Bool(false) => out.push_str("false"),
-            Self::Number(written) => out.push_str(written),
-            Self::String(text) => write_string(out, text),
+            Self::Null => out("null"),
+            Self::Bool(true) => out("true"),
+            Self::Bool(false) => out("false"),
+            Self::Number(written) => out(written),
+            Self::String(text) => write_string(text, out),
             Self::Array(items) => {
-                out.push('[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    item.write(out);
-                }
-                out.push(']');
+                out("[");
+                write_tokens(items.tokens, out);
+                out("]");
             }
             Self::Object(members) => {
-                out.push('{');
-                for (i, (name, value)) in members.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    write_string(out, name);
-                    out.push(':');
-                    value.write(out);
-                }
-                out.push('}');
+                out("{");
+                write_tokens(members.tokens, out);
+                out("}");
             }
         }
     }
 }
 
-fn write_string(out: &mut String, text: &str) {
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c < ' ' => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let code = u32::from(c);
-                out.push_str("\\u00");
-                for nibble in [code >> 4, code & 15] {
-                    let digit = usize::try_from(nibble).ok().and_then(|n| HEX.get(n));
-                    out.push(char::from(digit.copied().unwrap_or(b'0')));
-                }
+impl<'a> Items<'a> {
+    pub fn is_empty(self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The items in order, each a step: a container's tokens are stepped over at once.
+    pub fn iter(self) -> impl Iterator<Item = View<'a>> {
+        let mut rest = self.tokens;
+        std::iter::from_fn(move || {
+            let (item, after) = split(rest)?;
+            rest = after;
+            Some(item)
+        })
+    }
+}
+
+impl<'a> Members<'a> {
+    pub fn is_empty(self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The members in order, names and values, each a step: a value's tokens are stepped over
+    /// at once.
+    pub fn iter(self) -> impl Iterator<Item = (&'a str, View<'a>)> {
+        let mut rest = self.tokens;
+        std::iter::from_fn(move || {
+            let (Token::Name(name), after) = rest.split_first()? else {
+                return None;
+            };
+            let (value, after) = split(after)?;
+            rest = after;
+            Some((name.as_str(), value))
+        })
+    }
+
+    /// The member named `name`.
+    pub fn get(self, name: &str) -> Option<View<'a>> {
+        self.iter()
+            .find(|(member, _)| *member == name)
+            .map(|(_, value)| value)
+    }
+}
+
+/// The value whose first token begins `tokens`, and the tokens after its last: a container's
+/// opening token counts the tokens inside it, so one step passes the whole container. `None`
+/// where no value begins.
+fn split(tokens: &[Token]) -> Option<(View<'_>, &[Token])> {
+    let (first, rest) = tokens.split_first()?;
+    let view = match first {
+        Token::Null => View::Null,
+        Token::Bool(b) => View::Bool(*b),
+        Token::Number(written) => View::Number(written),
+        Token::String(text) => View::String(text),
+        Token::Open(kind, count) => {
+            let (inside, after) = rest.split_at_checked(*count)?;
+            let (Token::Close(_), after) = after.split_first()? else {
+                return None;
+            };
+            let view = match kind {
+                Kind::Array => View::Array(Items { tokens: inside }),
+                Kind::Object => View::Object(Members { tokens: inside }),
+            };
+            return Some((view, after));
+        }
+        Token::Name(_) | Token::Close(_) => return None,
+    };
+    Some((view, rest))
+}
+
+/// Writes a run of tokens first to last: a comma between two values that follow each other in
+/// a container, which the token before each says, and a colon after each name.
+fn write_tokens(tokens: &[Token], out: &mut impl FnMut(&str)) {
+    let mut after_value = false;
+    for token in tokens {
+        if after_value && !matches!(token, Token::Close(_)) {
+            out(",");
+        }
+        after_value = !matches!(token, Token::Name(_) | Token::Open(..));
+        match token {
+            Token::Null => out("null"),
+            Token::Bool(true) => out("true"),
+            Token::Bool(false) => out("false"),
+            Token::Number(written) => out(written),
+            Token::String(text) => write_string(text, out),
+            Token::Name(name) => {
+                write_string(name, out);
+                out(":");
             }
-            c => out.push(c),
+            Token::Open(Kind::Array, _) => out("["),
+            Token::Open(Kind::Object, _) => out("{"),
+            Token::Close(Kind::Array) => out("]"),
+            Token::Close(Kind::Object) => out("}"),
         }
     }
-    out.push('"');
+}
+
+/// A string, quoted, with what RFC 8259 §7 requires escaped and nothing else: `"`, `\`, and a
+/// control character as `\u00XX`.
+fn write_string(text: &str, out: &mut impl FnMut(&str)) {
+    const HEX: &str = "0123456789abcdef";
+    out("\"");
+    let mut rest = text;
+    while let Some(at) = rest.find(|c: char| c == '"' || c == '\\' || c < ' ') {
+        let Some((run, escaped)) = rest.split_at_checked(at) else {
+            break;
+        };
+        out(run);
+        let mut chars = escaped.chars();
+        match chars.next() {
+            Some('"') => out("\\\""),
+            Some('\\') => out("\\\\"),
+            Some(c) => {
+                out("\\u00");
+                let code = u32::from(c);
+                for nibble in [code >> 4, code & 15] {
+                    let digit = usize::try_from(nibble).ok().and_then(|n| HEX.get(n..=n));
+                    out(digit.unwrap_or("0"));
+                }
+            }
+            None => break,
+        }
+        rest = chars.as_str();
+    }
+    out(rest);
+    out("\"");
 }
 
 #[cfg(test)]
@@ -407,27 +655,71 @@ mod tests {
     }
 
     fn string(text: &str) -> Value {
-        Value::String(text.into())
+        Value::string(text.into())
+    }
+
+    /// Values made from their parts, as a test states what a text reads as: a container's
+    /// tokens are its parts' tokens, between its opening and its close.
+    impl Value {
+        fn null() -> Self {
+            Self {
+                tokens: vec![Token::Null],
+            }
+        }
+
+        fn bool(b: bool) -> Self {
+            Self {
+                tokens: vec![Token::Bool(b)],
+            }
+        }
+
+        fn number(written: String) -> Self {
+            Self {
+                tokens: vec![Token::Number(written)],
+            }
+        }
+
+        fn array(items: Vec<Value>) -> Self {
+            Self::container(Kind::Array, items.into_iter().map(|item| (None, item)))
+        }
+
+        fn object(members: Vec<(String, Value)>) -> Self {
+            Self::container(
+                Kind::Object,
+                members.into_iter().map(|(name, value)| (Some(name), value)),
+            )
+        }
+
+        fn container(kind: Kind, parts: impl Iterator<Item = (Option<String>, Value)>) -> Self {
+            let mut tokens = vec![Token::Open(kind, 0)];
+            for (name, value) in parts {
+                tokens.extend(name.map(Token::Name));
+                tokens.extend(value.tokens);
+            }
+            tokens[0] = Token::Open(kind, tokens.len() - 1);
+            tokens.push(Token::Close(kind));
+            Self { tokens }
+        }
     }
 
     #[test]
     fn values_read_as_written() {
-        assert_eq!(read(" null "), Ok(Value::Null));
-        assert_eq!(read("true"), Ok(Value::Bool(true)));
-        assert_eq!(read("-0.5e+10"), Ok(Value::Number("-0.5e+10".into())));
-        assert_eq!(read("1E400"), Ok(Value::Number("1E400".into())));
+        assert_eq!(read(" null "), Ok(Value::null()));
+        assert_eq!(read("true"), Ok(Value::bool(true)));
+        assert_eq!(read("-0.5e+10"), Ok(Value::number("-0.5e+10".into())));
+        assert_eq!(read("1E400"), Ok(Value::number("1E400".into())));
         assert_eq!(
             read(r#"{"a":[1,"b",{}],"c":null}"#),
-            Ok(Value::Object(vec![
+            Ok(Value::object(vec![
                 (
                     "a".into(),
-                    Value::Array(vec![
-                        Value::Number("1".into()),
+                    Value::array(vec![
+                        Value::number("1".into()),
                         string("b"),
-                        Value::Object(Vec::new())
+                        Value::object(Vec::new())
                     ])
                 ),
-                ("c".into(), Value::Null),
+                ("c".into(), Value::null()),
             ]))
         );
         assert_eq!(
@@ -501,6 +793,113 @@ mod tests {
         assert_eq!(read(&"[".repeat(100_000)), Err(JsonError::Depth));
     }
 
+    /// A text nesting `depth` levels around `1`, each level opened by the next of `openers` in
+    /// turn, with white space around every structural character when `spaced`.
+    fn nested(depth: usize, openers: &[&str], spaced: bool) -> String {
+        let (mut text, mut closes) = (String::new(), String::new());
+        for level in 0..depth {
+            let opener = openers[level % openers.len()];
+            text += opener;
+            closes.insert(0, if opener == "[" { ']' } else { '}' });
+        }
+        let text = text + "1" + &closes;
+        if !spaced {
+            return text;
+        }
+        ["[", "]", "{", "}", ":"]
+            .iter()
+            .fold(text, |text, c| text.replace(c, &format!(" {c} ")))
+    }
+
+    /// A document as deep as the bound reads, in arrays, objects and both, and its compact form
+    /// is the text without its white space, which reads back. One level deeper is refused as
+    /// too deep, before anything after the opening past the bound is read.
+    #[test]
+    fn a_document_at_the_bound_reads_and_writes() {
+        for openers in [
+            &["["][..],
+            &["{\"a\":"],
+            &["[", "{\"a\":"],
+            &["{\"a\":", "["],
+        ] {
+            let compact = nested(MAX_DEPTH, openers, false);
+            let value = read(&nested(MAX_DEPTH, openers, true)).unwrap();
+            assert_eq!(value.compact(), compact);
+            assert_eq!(read(&compact), Ok(value.clone()));
+            // Down to the innermost value, a step a level.
+            let mut inner = value.view();
+            for _ in 0..MAX_DEPTH {
+                inner = match inner {
+                    View::Array(items) => items.iter().next().unwrap(),
+                    View::Object(members) => members.get("a").unwrap(),
+                    other => panic!("{other:?}"),
+                };
+            }
+            assert_eq!(inner, View::Number("1"));
+            for spaced in [false, true] {
+                let deeper = nested(MAX_DEPTH + 1, openers, spaced);
+                assert_eq!(read(&deeper), Err(JsonError::Depth), "{deeper}");
+            }
+        }
+        assert_eq!(
+            read(&("[".repeat(MAX_DEPTH) + "x")),
+            Err(JsonError::Syntax("a character no value begins with"))
+        );
+        assert_eq!(
+            read(&("[".repeat(MAX_DEPTH + 1) + "x")),
+            Err(JsonError::Depth)
+        );
+    }
+
+    /// A lookup steps over each member's whole value: a member after a deep one, or after an
+    /// object holding a member of its name, is found as written; a name no member has, or a
+    /// lookup in a value that is no object, finds nothing.
+    #[test]
+    fn lookups_step_over_whole_values() {
+        let value =
+            read(r#"{"a":[[[[[{"d":0}]]]]],"b":{"d":1},"d":2,"e":[3,{"d":4},[],5]}"#).unwrap();
+        assert_eq!(value.member("d"), Some(View::Number("2")));
+        assert_eq!(
+            value.member("b").unwrap().member("d"),
+            Some(View::Number("1"))
+        );
+        assert_eq!(value.member("c"), None);
+        let Some(View::Array(items)) = value.member("e") else {
+            panic!("{value:?}");
+        };
+        let items: Vec<View<'_>> = items.iter().collect();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0], View::Number("3"));
+        assert_eq!(items[1].member("d"), Some(View::Number("4")));
+        assert!(matches!(items[2], View::Array(empty) if empty.is_empty()));
+        assert_eq!(items[3], View::Number("5"));
+        assert_eq!(items[0].member("d"), None);
+        assert_eq!(read("[{\"d\":1}]").unwrap().member("d"), None);
+        let View::Object(members) = value.view() else {
+            panic!("{value:?}");
+        };
+        let names: Vec<&str> = members.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["a", "b", "d", "e"]);
+    }
+
+    /// Values compare by what they hold, wherever they sit in a document, since a container
+    /// counts the tokens inside it from its own opening.
+    #[test]
+    fn values_compare_wherever_they_sit() {
+        let value = read(r#"[[1,{"a":[2]}],[1,{"a":[2]}],[1,{"a":[3]}]]"#).unwrap();
+        let View::Array(items) = value.view() else {
+            panic!("{value:?}");
+        };
+        let items: Vec<View<'_>> = items.iter().collect();
+        assert_eq!(items[0], items[1]);
+        assert_ne!(items[1], items[2]);
+        assert_eq!(items[1].compact(), r#"[1,{"a":[2]}]"#);
+        let alone = read(r#"[1,{"a":[2]}]"#).unwrap();
+        assert_eq!(alone.view(), items[0]);
+        assert_ne!(read("[1,2]"), read("[[1,2]]"));
+        assert_ne!(read(r#"{"a":1}"#), read(r#"{"b":1}"#));
+    }
+
     /// The compact form reads back as the value, and holds no white space between tokens.
     #[test]
     fn the_compact_form_reads_back() {
@@ -537,16 +936,16 @@ mod tests {
             any::<i64>().prop_map(|n| n.to_string()),
         ];
         let leaf = prop_oneof![
-            Just(Value::Null),
-            any::<bool>().prop_map(Value::Bool),
-            number.prop_map(Value::Number),
-            text.clone().prop_map(Value::String),
+            Just(Value::null()),
+            any::<bool>().prop_map(Value::bool),
+            number.prop_map(Value::number),
+            text.clone().prop_map(Value::string),
         ];
         leaf.prop_recursive(6, 64, 6, move |inner| {
             prop_oneof![
-                prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Value::array),
                 prop::collection::btree_map(text.clone(), inner, 0..6)
-                    .prop_map(|members| Value::Object(members.into_iter().collect())),
+                    .prop_map(|members| Value::object(members.into_iter().collect())),
             ]
         })
     }

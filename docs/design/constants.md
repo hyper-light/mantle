@@ -954,7 +954,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/s3/src/form.rs` `LIMIT` | derived | `CRLF.len() + MAX_PRE_DATA` | CRLF.len() + MAX_PRE_DATA. |
 | `crates/s3/src/form.rs` `MAX_BOUNDARY` | external | `70` | RFC 2046 §5.1.1: a boundary is at most 70 characters. |
 | `crates/s3/src/form.rs` `MAX_PRE_DATA` | external | `20 * 1024` | AWS POST Object docs via docs/research/19 §2.1: form data and boundaries excluding the file "cannot exceed 20KB"; the larger 1,024-byte reading is used. |
-| `crates/s3/src/json.rs` `MAX_DEPTH` | derived | `7` | One level past the deepest document read, a bucket policy at six (17 §3.1), so a check finds a container where a value belongs and refuses it with S3's message. |
+| `crates/s3/src/json.rs` `MAX_DEPTH` | derived | `7` | One level past the deepest document read, a bucket policy at six (17 §3.1), so a check finds a container where a value belongs and refuses it with S3's message; RFC 8259 §9 lets a reader limit nesting. The reader's record of the containers open around it is this long, so a deeper text is refused at its opening past the bound. |
 | `crates/s3/src/lifecycle.rs` `DAY` | derived | `86_400_000` | 86,400,000, the milliseconds in a day. |
 | `crates/s3/src/lifecycle.rs` `MAX_FILTER_SIZE` | external | `1_099_511_627_776_000` | 1000 × 2^40, the range S3 gave in its error "should be between 1 and 1099511627776000" (13 §6.9). |
 | `crates/s3/src/lifecycle.rs` `MAX_FILTER_TAGS` | derived | `Tagged::Object.limit()` | Equal to `Tagged::Object.limit()` (10), since a filter asking for more tags than an object holds matches nothing. |

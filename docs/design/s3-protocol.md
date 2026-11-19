@@ -478,11 +478,21 @@ be enforced differently from the one its author reviewed.
 - **What it refuses.** An object naming a member twice, compared after escapes are replaced,
   and a string holding an unpaired surrogate: I-JSON's rules for what a receiver may refuse
   to trust (RFC 7493 §2). Text that is not UTF-8, and a byte order mark, which begins no value.
-  Nesting past 32 levels, where a policy needs six, so a text of 100,000 brackets is refused
-  after 32 of them.
+  Nesting past seven levels (`json::MAX_DEPTH`), one past the six a bucket policy needs, as
+  RFC 8259 §9 lets a reader limit nesting, so a text of 100,000 brackets is refused at the
+  eighth.
 - **What it keeps.** Numbers as written, since the grammar bounds neither range nor precision
   and a policy compares a number only under a numeric condition. Member order, so a document
   written back compactly holds its members as sent.
+- **A value is flat** (CLAUDE.md §10): its tokens in the order the text writes them, each
+  array's and object's opening counting the tokens before its close, which is a token too.
+  The reader makes them in one pass, with the containers open around it in a record
+  `MAX_DEPTH` long, so a deeper text is refused rather than followed. The writer writes them
+  first to last, a comma or colon decided by the token before, once to count the text and once
+  into a string allocated at that count. A lookup steps over a member's whole value at once,
+  a comparison is one over the tokens, which count relatively so a value compares the same
+  wherever it sits, and dropping a value frees one `Vec` and its strings. Nothing walks down
+  the nesting with a container's work waiting on what it holds.
 - **Checked against JSONTestSuite**, vendored with its license: all 95 cases a parser must
   accept but the two of a repeated name, all 188 it must refuse, and each of the 35 left to
   the implementation answered as the rules above say. Property tests read back every value

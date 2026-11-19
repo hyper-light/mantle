@@ -431,18 +431,21 @@ enum Door {
     /// A native exchange (`mantle_protocol::object`), the operation's fields at its body's start,
     /// read from it at the job's turns; then a put's body given by the node's task ([`Feeding`]) and
     /// the reply written by the node's task ([`Replies`]), each from a bounded channel, as the S3
-    /// listener gives a local door's body and writes its reply (node.md §2.9 step 6c).
-    Native(ExchangeId, Box<Native>),
+    /// listener gives a local door's body and writes its reply (node.md §2.9 step 6c). The exchange
+    /// is the node's task's alone, none where the request was handed with its fields read (§2.9
+    /// step 6e): only hyper-transport makes an `ExchangeId`, and the job needs none, its body and
+    /// reply going through its door.
+    Native(Option<ExchangeId>, Box<Native>),
     /// The S3 listener's, in-process (`crate::door`).
     Local(Box<Local>),
 }
 
 impl Door {
     /// The native exchange the operation came in on, which its reply is written to; none for the
-    /// S3 listener's.
+    /// S3 listener's, or for a request handed with its fields read.
     fn exchange(&self) -> Option<ExchangeId> {
         match self {
-            Self::Native(exchange, _) => Some(*exchange),
+            Self::Native(exchange, _) => *exchange,
             Self::Local(_) => None,
         }
     }
@@ -2370,7 +2373,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.replies.push((exchange, replies));
         self.host.jobs.push(Job {
-            door: Door::Native(exchange, native),
+            door: Door::Native(Some(exchange), native),
             principal,
             work,
             pending: Vec::new(),
@@ -2555,8 +2558,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// come, and else into the node's task's piece (`Node::piece`) as much as is left of them.
     /// Nothing past them is read: a put's body is read by its feeding ([`Feeding`]).
     fn read_fields(&mut self, job: &mut Job) -> Result<bool, NodeError> {
-        // A local operation comes typed, never as fields to read.
-        let Door::Native(exchange, _) = &job.door else {
+        // A local operation comes typed, never as fields to read, as a native one handed with its
+        // fields read does.
+        let Door::Native(Some(exchange), _) = &job.door else {
             return Ok(true);
         };
         let exchange = *exchange;
@@ -8846,23 +8850,7 @@ mod tests {
         let (get, _, mut get_answers) = local_job(get, now, 5);
         host.jobs.push(put);
         host.jobs.push(get);
-        let mut stub = Stub {
-            answer: |ask| match ask {
-                JobAsk::Command(_, Command::Name(_)) => {
-                    Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
-                        version: "v".into(),
-                    })))
-                }
-                JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(
-                    Box::new(Read::Current(Some((1, empty_version())))),
-                )),
-                _ => panic!("an ask neither job makes"),
-            },
-            answers: Vec::new(),
-            asked: 0,
-            ended: Vec::new(),
-            abandoned: 0,
-        };
+        let mut stub = put_and_get_stub();
         let mut turns = 0;
         while !host.idle() {
             turns += 1;
@@ -8888,6 +8876,138 @@ mod tests {
                 if reply.status == Status::Done && reply.size == 0),
             "{get_answers:?}"
         );
+    }
+
+    /// A native request's job of `work`, handed with its fields read, so its door names no
+    /// exchange (node.md §2.9 step 6e), admitted at `now`, charged `charge` and placed on shard 1;
+    /// the node's task's half of its door beside it.
+    fn handed_job(work: Work, now: u64, charge: u64) -> (Job, Replies) {
+        let (native, replies) = native_door().unwrap();
+        let job = Job {
+            door: Door::Native(None, Box::new(native)),
+            principal: "o".into(),
+            work,
+            pending: Vec::new(),
+            deadline_ns: None,
+            moved_ns: now,
+            admitted_ns: Some(now),
+            charge,
+            window: 1,
+            driven: Some(1),
+            label: None,
+        };
+        (job, replies)
+    }
+
+    /// The reply an exchange was written: its head's, and the fields past it.
+    fn reply_seen(seen: &Seen) -> Reply {
+        let (head, _) = seen.answered.as_ref().unwrap();
+        let head = object::ReplyHead::decode(head).unwrap();
+        let fields = usize::try_from(head.fields()).unwrap();
+        head.reply(&seen.body[..fields]).unwrap()
+    }
+
+    /// A stub that answers a put's commit of its Name range and a get's read of its current
+    /// version, an empty one.
+    fn put_and_get_stub() -> Stub {
+        Stub {
+            answer: |ask| match ask {
+                JobAsk::Command(_, Command::Name(_)) => {
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                        version: "v".into(),
+                    })))
+                }
+                JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Current(Some((1, empty_version())))),
+                )),
+                _ => panic!("an ask neither job makes"),
+            },
+            answers: Vec::new(),
+            asked: 0,
+            ended: Vec::new(),
+            abandoned: 0,
+        }
+    }
+
+    /// A native request handed with its fields read names no exchange (node.md §2.9 step 6e): only
+    /// hyper-transport makes one, and the job needs none. Driven only through `Serve`, its put
+    /// takes its body's end from its door and is answered `Done` with the version written, and its
+    /// get is answered `Done` with no bytes, each reply written by the node's task's half of its
+    /// door as the exchange takes it; each job's half given back as it ends, and each door kept
+    /// once its reply's half is given back too.
+    #[test]
+    fn a_native_request_handed_with_its_fields_read_needs_no_exchange() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(2, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut putting = native_put(0);
+        putting.trailing = None;
+        let (mut put, mut put_replies) = handed_job(Work::Put(putting), now, 7);
+        let (body, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        assert!(body.try_send(Piece::End(Some(crc))).is_ok());
+        let Door::Native(None, native) = &mut put.door else {
+            panic!("a handed request's door names no exchange");
+        };
+        native.body = Some(Pieces {
+            pieces,
+            ended: None,
+        });
+        let get = work(
+            Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+            None,
+        );
+        let (get, mut get_replies) = handed_job(get, now, 5);
+        assert!(put.door.exchange().is_none() && get.door.exchange().is_none());
+        host.jobs.push(put);
+        host.jobs.push(get);
+        let mut stub = put_and_get_stub();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut put_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut get_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (mut put_over, mut get_over) = (false, false);
+        let mut turns = 0;
+        while !(host.idle() && put_over && get_over) {
+            turns += 1;
+            assert!(turns <= 8, "the jobs never ended");
+            host.step(&mut stub).unwrap();
+            put_over = put_over
+                || put_replies.write(&mut put_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            get_over = get_over
+                || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+        }
+        assert_eq!(stub.asked, 2, "the put's commit and the get's read");
+        stub.ended.sort();
+        assert_eq!(
+            stub.ended,
+            vec![(Some(now), 5, Some(1), 0), (Some(now), 7, Some(1), 0)]
+        );
+        let put_reply = reply_seen(&put_seen);
+        assert_eq!(
+            (put_reply.status, put_reply.version.as_str()),
+            (Status::Done, "v")
+        );
+        let get_reply = reply_seen(&get_seen);
+        assert_eq!((get_reply.status, get_reply.size), (Status::Done, 0));
+        assert!(put_seen.ended && get_seen.ended && !put_seen.refused && !get_seen.refused);
+        // Each job's half came back as it ended; each door is kept once its reply's half is.
+        assert_eq!((host.doors.kept.len(), host.doors.waiting.len()), (0, 2));
+        host.doors.give_replies(put_replies);
+        host.doors.give_replies(get_replies);
+        assert_eq!((host.doors.kept.len(), host.doors.waiting.len()), (2, 0));
+        drop(body);
     }
 
     /// A host's wait is its own jobs' alone (node.md §2.9 step 6e), so a driving shard's task can

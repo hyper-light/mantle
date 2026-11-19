@@ -10912,9 +10912,12 @@ pub(super) mod tests {
     /// their operations to their ends: the shard makes their work, its asks cross to the stub and
     /// their answers back in the lane's slots, the put takes its body's end from its door and is
     /// answered `Done` with the version written, the get is answered `Done` with no bytes, each
-    /// reply written by the test as the node's task writes it; each job's end is told with its
-    /// charge and its shard, its door's half riding it back, so the shard's host keeps no door
-    /// and the test's doors keep both. A request past the lane's room is given back.
+    /// reply written by the test as the node's task writes it, telling the shard's word (6f); each
+    /// job's end is told with its charge and its shard, its door's half riding it back, so the
+    /// shard's host keeps no door and the test's doors keep both. The get's head is written only
+    /// once the put ended, so its job waits on that word alone: a reply that tells none leaves the
+    /// shard parked with the head written, and the get never ends. A request past the lane's room
+    /// is given back.
     #[test]
     fn a_driving_shards_host_takes_a_put_and_a_get_to_their_ends_over_its_lanes() {
         let rt = two_shards(4);
@@ -10938,6 +10941,10 @@ pub(super) mod tests {
         let now = hyper_rt::futures::now_ns();
         let (put_half, mut put_replies) = doors.take().unwrap();
         let (get_half, mut get_replies) = doors.take().unwrap();
+        // Each reply carries the shard's word, as the node's task gives it to a request it hands
+        // (`Node::read_fields`): its write tells the shard as it takes an answer or writes it whole.
+        put_replies.driving = Some(lanes.doors());
+        get_replies.driving = Some(lanes.doors());
         // The put's body as the node's task gives it: empty, whole.
         let body = put_replies.body.as_ref().unwrap();
         assert!(body.try_send(Piece::End(None)).is_ok());
@@ -10998,9 +11005,15 @@ pub(super) mod tests {
             put_over = put_over
                 || put_replies.write(&mut put_seen, true, now, &mut moved, &mut slowed)
                     == Wrote::Over;
-            get_over = get_over
-                || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
-                    == Wrote::Over;
+            // The get's reply is written only once the put's end is told. Its version's answer
+            // came no later than the put's last (each answer comes in its ask's order), so by then
+            // its job gave its head at a step past which it waits for the head to be written, its
+            // own asks all answered: only the word its write tells turns the shard again.
+            if stub.ended.iter().any(|&(_, charge, _, _)| charge == 7) {
+                get_over = get_over
+                    || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                        == Wrote::Over;
+            }
             std::thread::yield_now();
         }
         stub.ended.sort();

@@ -100,6 +100,51 @@ impl Replacement {
             Next::Propose(change(&[(ConfChangeType::AddLearnerNode, self.joining)]))
         }
     }
+
+    /// The next step as the leader `leader` takes it: [`Replacement::next`], save that the leader
+    /// is never removed by its own change. Where it is the failed member, it hands its lead first
+    /// to a voter the replacement keeps that holds everything it knows committed (`caught_up`), or,
+    /// where no other voter does, has the caught-up joining member promoted alone first, adds
+    /// before removals (as [`Toward::step`] does, membership.md §6). Removed by its own change, a
+    /// leader leads a configuration without it until the change commits and then stops, and the
+    /// group waits out an election for the next (Raft dissertation §4.2.2, which prefers a
+    /// transfer, §3.10): a simulated cell of two voters replacing its leader under load went
+    /// 3.2 ms without one on one switch, through two elections, and 3 s across the planet; handed
+    /// on first, none and 0.5 s (`crates/node/tests/sim.rs`). A transfer that does not finish is
+    /// given up by the core and asked again.
+    pub fn step(
+        &self,
+        conf: &ConfState,
+        leader: u64,
+        caught_up: impl Fn(u64) -> bool,
+        known: bool,
+    ) -> Step {
+        let proposed = match self.next(conf, caught_up(self.joining), known) {
+            Next::Propose(proposed) => proposed,
+            Next::Wait => return Step::Wait,
+            Next::Done => return Step::Done,
+        };
+        let removes_leader = leader == self.failed
+            && proposed.changes.iter().any(|single| {
+                single.change_type == ConfChangeType::RemoveNode && single.node_id == leader
+            });
+        if !removes_leader {
+            return Step::Propose(proposed);
+        }
+        if let Some(heir) = conf
+            .voters
+            .iter()
+            .copied()
+            .filter(|id| *id != leader && caught_up(*id))
+            .min()
+        {
+            return Step::Transfer(heir);
+        }
+        if conf.learners.contains(&self.joining) {
+            return Step::Propose(change(&[(ConfChangeType::AddNode, self.joining)]));
+        }
+        Step::Wait
+    }
 }
 
 /// A range's configuration as the cell's members would have it (docs/design/membership.md §6): the
@@ -408,6 +453,52 @@ mod tests {
         assert!(!drops_absent(2, 1));
         assert!(!drops_absent(3, 0));
         assert!(!drops_absent(2, 2));
+    }
+
+    /// A leader that is the member replaced is never removed by its own change: it hands its
+    /// lead to a voter the replacement keeps that is caught up; with none, it has the caught-up
+    /// joining member promoted alone first; and it waits while neither is.
+    #[test]
+    fn a_replaced_leader_hands_its_lead_on_before_the_change_that_removes_it() {
+        let r = Replacement::new(2, 3).unwrap();
+        let learning = conf(&[1, 2], &[3], &[]);
+        // Its follower caught up: the lead goes to it, and no change is proposed meanwhile.
+        assert_eq!(r.step(&learning, 2, |_| true, true), Step::Transfer(1));
+        // Only the joining learner caught up: no voter to hand to, so it is promoted alone first.
+        assert_eq!(
+            step_kinds(&r.step(&learning, 2, |id| id == 3, true)),
+            [(ADD, 3)]
+        );
+        // None caught up: the leader waits.
+        assert_eq!(r.step(&learning, 2, |_| false, true), Step::Wait);
+        // Led by its follower, the replacement swaps the members in one joint change, as before.
+        assert_eq!(
+            step_kinds(&r.step(&learning, 1, |_| true, true)),
+            [(ADD, 3), (REMOVE, 2)]
+        );
+        // Both voters: the lead goes to the joining member, then the failed one is removed.
+        let both = conf(&[1, 2, 3], &[], &[]);
+        assert_eq!(r.step(&both, 2, |id| id == 3, true), Step::Transfer(3));
+        assert_eq!(step_kinds(&r.step(&both, 3, |_| true, true)), [(REMOVE, 2)]);
+        // The one voter replaced: the joining member is promoted alone first, adds before
+        // removals, and then takes the lead.
+        let alone = conf(&[2], &[3], &[]);
+        assert_eq!(step_kinds(&r.step(&alone, 2, |_| true, true)), [(ADD, 3)]);
+        assert_eq!(r.step(&alone, 2, |_| false, true), Step::Wait);
+        assert_eq!(
+            r.step(&conf(&[2, 3], &[], &[]), 2, |_| true, true),
+            Step::Transfer(3)
+        );
+        // A follower replaced, or the member replaced already gone, steps as `next` does.
+        let r = Replacement::new(1, 3).unwrap();
+        assert_eq!(
+            step_kinds(&r.step(&learning, 2, |_| true, true)),
+            [(ADD, 3), (REMOVE, 1)]
+        );
+        assert_eq!(
+            r.step(&conf(&[2, 3], &[], &[]), 2, |_| true, true),
+            Step::Done
+        );
     }
 
     #[test]

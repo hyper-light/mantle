@@ -1,6 +1,6 @@
 //! Deterministic simulation of a cell of nodes (docs/design/node.md §9.1, `support/cell.rs`):
 //! three nodes or five (odd seeds three, even seeds five), or one for a tear on a one-voter group,
-//! and three clients.
+//! or one voter or two and a spare for a change of the range's voters, and three clients.
 //!
 //! A run is its seed. The cell's paths are one of the named profiles of focal's path model (one
 //! switch, one continent, across the planet: hyper-sim's `Path::LAN`, `REGIONAL`, `GEOGRAPHIC`).
@@ -24,6 +24,8 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros
 )]
+
+use std::collections::BTreeMap;
 
 use hyper_block::sim::Fault as DeviceFault;
 use hyper_log::{Start, Tail};
@@ -882,4 +884,118 @@ fn a_frame_torn_after_its_record_lands_is_marked_and_each_group_resolves_or_wait
     }
     let one = table.iter().find(|row| row.0 == Tear::One).unwrap();
     assert_eq!(one.3, 0, "a tear on one member left a group waiting");
+}
+
+/// A range's voters change under the clients' load, each joining member a learner caught up and
+/// then a voter (membership.md §3 step 4, replica.md §6): a cell of one voter grows to two, and a
+/// cell of two replaces one of them, its leader on half the seeds. Through each change the range
+/// is without a leader no longer than a round trip of the cell's slowest path and the step the
+/// test looks at it by, no term has two leaders, the change ends, the histories are linearizable
+/// and every member the change keeps applies as far as the others. A leader replaced by its own
+/// change led a configuration without it until the change committed and then stopped, leaving
+/// its range to an election (Raft dissertation §4.2.2): two elections and 3.2 ms without a leader
+/// on one switch (seed 1, 16 one-way delays), 3 s across the planet (seed 4, 6). It hands its lead
+/// on first now (`Replacement::step`; dissertation §3.10): none and 0.5 s.
+#[test]
+fn a_range_changes_its_voters_under_load_never_leaderless_past_a_round_trip() {
+    for seed in seeds(&[1, 2, 3, 4]) {
+        // One voter grows to two: the spare's promotion alone, the member it "replaces" one the
+        // range never named.
+        changed(seed, 1, |cell, _| (cell.nodes + 1, 2));
+        // Two voters replace one with the spare: the leader on seeds 1 and 4 (and every fourth
+        // past them), a follower on the others.
+        changed(seed, 2, |_, leader| {
+            let failed = if seed % 4 < 2 { leader } else { 3 - leader };
+            (failed, 3)
+        });
+    }
+}
+
+/// A cell of `seed` of `voters` founding voters and a spare: once the clients did a quarter of
+/// their operations, the range replaces the member `change` names with the one it names to join,
+/// and the test watches the range's leaders until the clients are done.
+fn changed(seed: u64, voters: u64, change: impl Fn(&Sim, u64) -> (u64, u64)) {
+    let mut cell = Sim::with_spare(seed, voters);
+    let leader = cell.until("a founder leads", |c| {
+        let named = c.members[&1].status.map_or(0, |s| s.leader);
+        let agreed = named != 0
+            && (1..=voters).all(|id| c.members[&id].status.is_some_and(|s| s.leader == named));
+        if agreed { Some(named) } else { None }
+    });
+    cell.open_bucket();
+    let ops = (2 * (log_config().group_entries + 1)).div_ceil(CLIENTS);
+    let stops = cell.start_workload(ops);
+    cell.done_by(ops, 1);
+    let (failed, joining) = change(&cell, leader);
+    eprintln!("seed {seed}: {voters} voters, leader {leader}, {failed} replaced by {joining}");
+    cell.replace(failed, joining);
+    // What the test looks at the cell by: a round trip of its slowest path, and the step between
+    // looks.
+    let bound = 2 * cell.longest_ns() + cell.step_ns();
+    let mut leaders: BTreeMap<u64, u64> = BTreeMap::new();
+    let (mut unled_since, mut longest_unled) = (None::<u64>, 0u64);
+    cell.until("the clients' operations through the change", |c| {
+        let now = c.now_ns();
+        let mut led = false;
+        for (id, status) in c
+            .members
+            .iter()
+            .filter_map(|(id, m)| Some((*id, m.status?)))
+        {
+            if status.leader == id {
+                led = true;
+                let named = *leaders.entry(status.term).or_insert(id);
+                assert_eq!(
+                    named, id,
+                    "seed {seed}: two leaders in term {}",
+                    status.term
+                );
+            }
+        }
+        match (led, unled_since) {
+            (false, None) => unled_since = Some(now),
+            (true, Some(since)) => {
+                longest_unled = longest_unled.max(now - since);
+                unled_since = None;
+            }
+            _ => {}
+        }
+        let done = c.progress.len() == usize::try_from(CLIENTS).unwrap()
+            && c.progress.values().all(|done| *done >= ops)
+            && c.replaced.contains(&(failed, joining));
+        if done { Some(()) } else { None }
+    });
+    drop(stops);
+    cell.until("every client's part", |c| {
+        if c.parts.len() == usize::try_from(CLIENTS).unwrap() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    eprintln!(
+        "seed {seed}: {voters} voters, longest without a leader {longest_unled} ns, bound {bound} ns"
+    );
+    assert!(
+        longest_unled <= bound,
+        "seed {seed}: {voters} voters, {failed} replaced by {joining} with {leader} leading: \
+         {longest_unled} ns without a leader, past {bound} ns"
+    );
+    let parts: Vec<(u64, Part)> = std::mem::take(&mut cell.parts).into_iter().collect();
+    check_histories(parts.iter().flat_map(|(_, part)| part.iter().cloned()));
+    // Every member the change keeps applies as far as the others; the one it removed is sent
+    // nothing past its removal.
+    cell.until("every member kept applies as far as the others", |c| {
+        let mut applied = c
+            .members
+            .iter()
+            .filter(|(id, _)| **id != failed)
+            .map(|(_, m)| m.status.map(|s| s.applied));
+        let first = applied.next()??;
+        if first > 0 && applied.all(|a| a == Some(first)) {
+            Some(())
+        } else {
+            None
+        }
+    });
 }

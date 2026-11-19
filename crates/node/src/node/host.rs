@@ -512,7 +512,9 @@ struct Putting {
     trailer: Vec<u8>,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
-    /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
+    /// Body bytes read and not yet taken by the driver, in the piece of its body its admission
+    /// charged it for, which a native put's body is read into (`read_piece`); and the body's bytes
+    /// taken so far.
     carry: Vec<u8>,
     taken: u64,
     /// The driver's requests not yet asked: the node held as many asks as it keeps.
@@ -1306,7 +1308,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(_) => {
                 admitted_ns = Some(now);
                 let block = self.open_block(&op);
-                let mut made = work(op, Vec::new(), block);
+                let mut made = work(op, block);
                 if let Work::Deletes(deleting) = &mut made {
                     deleting.deny(&denied);
                 }
@@ -1609,8 +1611,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.reply_job(at, reply)
     }
 
-    /// A job's fields read from its body's start, a piece at a time; once whole, the work they
-    /// name, the bytes read past them the start of a put's body.
+    /// A job's fields read from its body's start; once whole, the work they name.
+    ///
+    /// They are read into the job's own memory, never a piece of the endpoint's budget, which
+    /// other traffic may hold past its client's patience (`read_piece`): into their buffer, made
+    /// at their length as the job was admitted, while none of them has come, and else into a piece
+    /// of what is left of them, at most the piece its admission charged it for. Nothing past them
+    /// is read: a put reads its body into its own piece.
     fn read_fields(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
@@ -1625,15 +1632,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let wanted = usize::try_from(head.fields()).unwrap_or(usize::MAX);
         let endpoint = self.driver.endpoint();
         while fields.len() < wanted {
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(false);
+            let first = fields.is_empty();
+            let room = if first {
+                wanted
+            } else {
+                wanted
+                    .saturating_sub(fields.len())
+                    .min(hyper_transport::RECEIVE_CHUNK)
             };
+            let buffer = if first {
+                std::mem::take(fields)
+            } else {
+                Vec::with_capacity(room)
+            };
+            let mut piece =
+                hyper_transport::Reservation::new(u64::try_from(room).unwrap_or(u64::MAX), buffer);
             let got = endpoint.read_body(exchange, &mut piece);
-            fields.extend_from_slice(piece.bytes());
+            let read = piece.into_buffer();
             self.moved = self
                 .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
+                .saturating_add(u64::try_from(read.len()).unwrap_or(u64::MAX));
+            if first {
+                *fields = read;
+            } else {
+                fields.extend_from_slice(&read);
+            }
             match got {
                 Ok(0) if fields.len() < wanted => return Ok(false),
                 Ok(_) => {}
@@ -1641,7 +1664,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Err(_) => return Ok(true),
             }
         }
-        let carry = fields.split_off(wanted.min(fields.len()));
         let op = head.op(fields);
         let admitted = job.charge;
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
@@ -1674,7 +1696,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         job.charge = job.charge.saturating_add(more);
                     }
                     job.label = Some(labels::host(&op));
-                    work(op, carry, block)
+                    work(op, block)
                 }
             };
         }
@@ -2736,15 +2758,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if putting.taken < putting.length && !put.wants_body() {
                 return Ok(());
             }
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(());
-            };
-            let got = endpoint.read_body(exchange, &mut piece);
-            putting.carry.extend_from_slice(piece.bytes());
+            // Into the put's own piece, emptied above: read whenever its driver wants bytes and
+            // its client has sent them, whatever other traffic holds of the endpoint's budget.
+            let got = super::read_piece(endpoint, exchange, &mut putting.carry);
             self.moved = self
                 .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
+                .saturating_add(u64::try_from(putting.carry.len()).unwrap_or(u64::MAX));
             match got {
                 Ok(0) if putting.carry.is_empty() => return Ok(()),
                 Ok(_) => {}
@@ -4667,18 +4686,33 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(false);
         };
         let endpoint = self.driver.endpoint();
-        loop {
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(false);
+        // A body read whole, as a put's that ended is, needs no piece: its reply goes now. One
+        // admitted drains into a piece of its own, which its admission charged it for
+        // (`read_piece`); one answered at once holds no charge, and reads through the endpoint's
+        // one piece for its owner's reads (`bounds::messages`).
+        let mut own = job.admitted_ns.map(|_| Vec::new());
+        while !endpoint.body_complete(exchange) {
+            let got = match own.as_mut() {
+                Some(piece) => {
+                    piece.clear();
+                    super::read_piece(endpoint, exchange, piece)
+                }
+                None => {
+                    let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                        return Ok(false);
+                    };
+                    let got = endpoint.read_body(exchange, &mut piece);
+                    endpoint.release(piece);
+                    got
+                }
             };
-            let got = endpoint.read_body(exchange, &mut piece);
-            self.moved = self
-                .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
             match got {
                 Ok(0) => break,
-                Ok(_) => {}
+                Ok(read) => {
+                    self.moved = self
+                        .moved
+                        .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                }
                 // Its asker is gone: nothing to answer.
                 Err(_) => return Ok(true),
             }
@@ -4899,9 +4933,9 @@ fn directory() -> Vec<Descriptor> {
     }]
 }
 
-/// The work an operation's request names, the bytes read past its fields the start of a put's
-/// body; a native upload's Open cuts its runs in `block`'s whole blocks (`Host::open_block`).
-fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
+/// The work an operation's request names; a native upload's Open cuts its runs in `block`'s whole
+/// blocks (`Host::open_block`).
+fn work(op: Op, block: Option<u64>) -> Work {
     // Metadata past S3's 2 KB, or that no HTTP field could carry, is refused before anything is
     // written (research/89 §1.4): judged once, its refusal taken in its place below.
     let metadata = match &op {
@@ -4968,7 +5002,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             trailer: Vec::new(),
             put: None,
             taken: 0,
-            carry,
+            carry: Vec::new(),
             waiting: VecDeque::new(),
             run: None,
             metadata,
@@ -5067,7 +5101,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             trailer: Vec::new(),
             put: None,
             taken: 0,
-            carry,
+            carry: Vec::new(),
             waiting: VecDeque::new(),
             run: None,
             metadata: Vec::new(),
@@ -5171,7 +5205,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             trailer: Vec::new(),
             put: None,
             taken: 0,
-            carry,
+            carry: Vec::new(),
             waiting: VecDeque::new(),
             run: Some(Appending {
                 offset,
@@ -6021,10 +6055,10 @@ mod tests {
             trailing: None,
         };
         assert_eq!(
-            refused(&work(part(name::MAX_PART + 1), Vec::new(), None)),
+            refused(&work(part(name::MAX_PART + 1), None)),
             Some(Status::EntityTooLarge)
         );
-        assert_eq!(refused(&work(part(name::MAX_PART), Vec::new(), None)), None);
+        assert_eq!(refused(&work(part(name::MAX_PART), None)), None);
         let put = Op::Put {
             bucket: "b".into(),
             key: "k".into(),
@@ -6036,10 +6070,7 @@ mod tests {
             trailing: None,
             metadata: Vec::new(),
         };
-        assert_eq!(
-            refused(&work(put, Vec::new(), None)),
-            Some(Status::EntityTooLarge)
-        );
+        assert_eq!(refused(&work(put, None)), Some(Status::EntityTooLarge));
         // A checksum in the fields and a trailer's both.
         let twice = Op::Put {
             bucket: "b".into(),
@@ -6055,10 +6086,7 @@ mod tests {
             trailing: Some(checksum::Algorithm::Crc32),
             metadata: Vec::new(),
         };
-        assert_eq!(
-            refused(&work(twice, Vec::new(), None)),
-            Some(Status::InvalidRequest)
-        );
+        assert_eq!(refused(&work(twice, None)), Some(Status::InvalidRequest));
         let create = |algorithm, full| Op::CreateUpload {
             bucket: "b".into(),
             key: "k".into(),
@@ -6074,7 +6102,7 @@ mod tests {
             (Algorithm::Crc32c, true, true),
             (Algorithm::Crc32c, false, true),
         ] {
-            let status = refused(&work(create(algorithm, full), Vec::new(), None));
+            let status = refused(&work(create(algorithm, full), None));
             assert_eq!(
                 status,
                 if ok {
@@ -6100,15 +6128,11 @@ mod tests {
             version: Some(version.into()),
         };
         for named in ["null", "0123456789ABC"] {
-            assert_eq!(
-                refused(&work(get(named), Vec::new(), None)),
-                None,
-                "{named}"
-            );
+            assert_eq!(refused(&work(get(named), None)), None, "{named}");
         }
         for invalid in ["", "nul", "0123456789AB", "0123456789ABCD", "0123456789ABU"] {
             assert_eq!(
-                refused(&work(get(invalid), Vec::new(), None)),
+                refused(&work(get(invalid), None)),
                 Some(Status::InvalidVersion),
                 "{invalid:?}"
             );
@@ -6120,10 +6144,7 @@ mod tests {
             headers: Headers::default(),
             version: Some("not one".into()),
         };
-        assert_eq!(
-            refused(&work(delete, Vec::new(), None)),
-            Some(Status::InvalidVersion)
-        );
+        assert_eq!(refused(&work(delete, None)), Some(Status::InvalidVersion));
         let put = |metadata: Metadata| Op::Put {
             bucket: "b".into(),
             key: "k".into(),
@@ -6139,18 +6160,18 @@ mod tests {
             "x-amz-meta-k".to_owned(),
             "v".repeat(mantle_s3::metadata::MAX_USER - 1),
         )];
-        assert_eq!(refused(&work(put(at), Vec::new(), None)), None);
+        assert_eq!(refused(&work(put(at), None)), None);
         let past = vec![(
             "x-amz-meta-k".to_owned(),
             "v".repeat(mantle_s3::metadata::MAX_USER),
         )];
         assert_eq!(
-            refused(&work(put(past), Vec::new(), None)),
+            refused(&work(put(past), None)),
             Some(Status::MetadataTooLarge)
         );
         let control = vec![("x-amz-meta-k".to_owned(), "a\nb".to_owned())];
         assert_eq!(
-            refused(&work(put(control), Vec::new(), None)),
+            refused(&work(put(control), None)),
             Some(Status::InvalidArgument)
         );
         let source = mantle_s3::copy::Source {
@@ -6167,10 +6188,7 @@ mod tests {
             source: source.clone(),
             conditions: Headers::default(),
         }));
-        assert_eq!(
-            refused(&work(part, Vec::new(), None)),
-            Some(Status::InvalidArgument)
-        );
+        assert_eq!(refused(&work(part, None)), Some(Status::InvalidArgument));
         let copy = Op::Copy(Box::new(object::Copy {
             bucket: "b".into(),
             key: "k2".into(),
@@ -6186,10 +6204,7 @@ mod tests {
             checksum: None,
         }));
         assert_eq!(weight(&copy), 2);
-        assert_eq!(
-            refused(&work(copy, Vec::new(), None)),
-            Some(Status::InvalidVersion)
-        );
+        assert_eq!(refused(&work(copy, None)), Some(Status::InvalidVersion));
         assert_eq!(weight(&get("null")), 1);
     }
 }

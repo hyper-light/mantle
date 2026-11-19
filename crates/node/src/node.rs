@@ -803,6 +803,27 @@ struct Commanded {
 /// The piece a body is read in: the transport's own receive chunk.
 const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
+/// Reads the next bytes of `exchange`'s body, at most a piece, into `piece`, empty: how many. The
+/// piece is the operation's own, the one its admission charged it for (`derive::Charges`, node.md
+/// §2.8), its buffer kept from read to read: hyper-transport reads a body into any reservation its
+/// owner's accountant granted, mantle's admission among them (its `budget` module). A piece of the
+/// endpoint's budget, which every connection's windows, receive chunks, heads and frames share,
+/// could be refused while an operation's body waited on no ask of its own: it was then neither
+/// read nor vouched for, and the budget freeing woke nothing, so its client gave it up a period
+/// later (`Lost(Stalled)`, tests/put_body.rs).
+pub fn read_piece(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    piece: &mut Vec<u8>,
+) -> Result<usize, Refusal> {
+    let mut buffer = std::mem::take(piece);
+    buffer.reserve_exact(hyper_transport::RECEIVE_CHUNK);
+    let mut into = hyper_transport::Reservation::new(PIECE, buffer);
+    let got = endpoint.read_body(exchange, &mut into);
+    *piece = into.into_buffer();
+    got
+}
+
 /// The parts of a node a plane message or a Raft frame steps, borrowed apart from the plane and its
 /// socket, so a message is taken where its datagram was opened (`Node::drain_plane`).
 struct Taking<'a, E: Engine + 'static, L: NodeLog> {

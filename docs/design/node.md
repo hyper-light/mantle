@@ -1427,7 +1427,17 @@ becomes:
   length, which its head states before its fields are read: its first segment and first block,
   the largest of its own, each chunk of a block copied to send, and a piece of its body, under
   the scheme that holds the most of it (`put::bytes_for`); the driver reserves its segment at the
-  same length. Every other operation is charged the most any holds, since a get's object's size
+  same length. That piece is the one its body is read into: the host reads a native put's body,
+  and an admitted operation's fields and what it drains of a body, into memory of the
+  operation's own that its charge holds (`node::read_piece`), never a piece of the transport's
+  budget, which every connection's windows, receive chunks, heads and frames share (§3.3). A body
+  read a piece of that budget at a time waited, while other traffic held it, on no ask of its own:
+  the host held nothing of it, so vouched for nothing, and the budget freeing woke nothing; its
+  client, judging the exchange once a period, gave it up (the node suite's 20 MiB put
+  `Lost(Stalled)`, about one run in ten on ubuntu-24.04-arm, 2026-11-18; `tests/put_body.rs`).
+  Every operation's charge holds a piece, a write of no bytes the least one is, so each reads its
+  own; one answered at once is charged nothing and drains its body through the transport's piece
+  for its owner's reads. Every other operation is charged the most any holds, since a get's object's size
   is known only once its row is read. A request turned away for bytes says nothing of the limit;
   one turned away by the limit tells it its clients ask more. The data comes first (research/87
   §4, rule D): the memory past every class's floor is the indexes' and engines' wants first, each
@@ -2142,8 +2152,9 @@ window never deadlocks and bytes read never pile up ahead of a busy disk (audit 
 
 *As built (2026-10-21).* The transport's bytes are one budget that QUIC's buffering and the
 messages share: a connection's receive window and the receive chunks datagrams are cut from are
-both charged to it, as are every message's head, every lane frame, and the piece a body is read
-into. Reading what QUIC buffered is what frees it, so the buffering is sized within the budget
+both charged to it, as are every message's head, every lane frame, and the piece a peer's body
+is read into (an object operation's body is read into the piece its admission charged it for,
+§2.8). Reading what QUIC buffered is what frees it, so the buffering is sized within the budget
 less what the messages hold at once at most (`bounds::limits`): every exchange's head both ways,
 one body piece, and for a node that keeps appends out a lane's window of frames out to each node
 its ranges replicate to and one frame in from each peer; a peer's two connections' windows (each with the class reserve its first window carries)

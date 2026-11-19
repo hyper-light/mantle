@@ -3,8 +3,8 @@
 //! CLOCK_MONOTONIC (the clock `perf record -k CLOCK_MONOTONIC` and the harness stamp with), so a
 //! slow request's time is attributed to the stage it waited in. Compiled only with this crate's
 //! `diag-trace` feature (mantle's `diag-trace`), so the default build has none of it; on only where
-//! `MANTLE_DIAG_TRACE` names a directory; written there at each `counts` answer
-//! (`trace-<pid>-<n>.txt`).
+//! `MANTLE_DIAG_TRACE` names a directory; written there at each `counts` answer, or each beat by a
+//! process that writes it as it goes ([`write_as_it_goes`]) (`trace-<pid>-<n>.txt`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -159,6 +159,32 @@ pub fn op_key(id: u64, op: &mantle_protocol::object::Op) {
         _ => ("Other", "-"),
     };
     key(id, what, k);
+}
+
+/// Writes the trace as the process goes, a window labelled `label` each beat, on a thread of its
+/// own: for a process no harness asks `counts` of, which may end at any moment and writes nothing
+/// as it ends, as the node suite's `mantle node`s, each killed with SIGKILL as a power cut takes it
+/// (crates/mantle/tests/node.rs). The beat is a third of the serve period
+/// (`mantle_protocol::bounds::idle_timeout`), the beat a node's notes vouch for its work at
+/// (hyper-transport's `Endpoint::working`): a client cuts an exchange `Stalled` only once it moved
+/// nothing for a serve period at the least, and the suite kills its nodes after that, so by the
+/// kill every event of the stall but its last beat's is written. Nothing where the trace is off.
+pub fn write_as_it_goes(label: String) -> std::io::Result<()> {
+    if !on() {
+        return Ok(());
+    }
+    let beat = mantle_protocol::bounds::idle_timeout() / 3;
+    std::thread::Builder::new()
+        .name("diag-trace".to_owned())
+        .spawn(move || {
+            loop {
+                // The thread is the trace's alone, so its wait holds up no worker; woken early,
+                // it writes the window early.
+                std::thread::park_timeout(beat);
+                dump(&label);
+            }
+        })
+        .map(drop)
 }
 
 /// Writes the window's events and keys and begins the next.

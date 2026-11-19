@@ -1071,6 +1071,15 @@ fn main() -> ExitCode {
     // lock on standard output for it.
     match &cli.command {
         Command::Node { config } => {
+            // DIAGNOSTIC (diag-doors): a node is asked no `counts` and its suite kills it with
+            // SIGKILL, so it writes its trace as it goes, each window labelled with its
+            // configuration, which names its cell's directory and its own.
+            #[cfg(feature = "diag-trace")]
+            if let Err(e) =
+                mantle_node::diag_trace::write_as_it_goes(format!("node:{}", config.display()))
+            {
+                return exit(Err(format!("the stall trace's writer: {e}")));
+            }
             return exit(mantle_node::process::run(config).map_err(|e| e.to_string()));
         }
         Command::Serve { config, leave } => {

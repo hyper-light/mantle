@@ -3250,7 +3250,7 @@ pub(crate) fn objects(
     tell: Sender<Heard>,
 ) -> Vec<ObjectOutcome> {
     let id = settings.id;
-    client_runtime(settings.nodes.len() + 1)
+    let outcomes = client_runtime(settings.nodes.len() + 1)
         .block_on(async move {
             let mut client = Client::open(settings).await.unwrap();
             for (node, quic) in bound {
@@ -3258,7 +3258,23 @@ pub(crate) fn objects(
             }
             let mut outcomes = Vec::with_capacity(ops.len());
             for (done, (node, op, data)) in (1..).zip(ops) {
-                match client.object(node, &op, &data, u64::MAX).await {
+                // DIAGNOSTIC (diag-doors): the ask on the stall trace, its key, its send with the
+                // node it goes through, and its end, 1 where it came to no reply, else 0.
+                #[cfg(feature = "diag-trace")]
+                let did = mantle_node::diag_trace::id();
+                #[cfg(feature = "diag-trace")]
+                {
+                    mantle_node::diag_trace::op_key(did, &op);
+                    mantle_node::diag_trace::ev(did, mantle_node::diag_trace::C_SEND, node);
+                }
+                let asked = client.object(node, &op, &data, u64::MAX).await;
+                #[cfg(feature = "diag-trace")]
+                mantle_node::diag_trace::ev(
+                    did,
+                    mantle_node::diag_trace::C_DONE,
+                    u64::from(!matches!(asked, Ok(ObjectOutcome::Replied { .. }))),
+                );
+                match asked {
                     Ok(outcome) => outcomes.push(outcome),
                     Err(error) => {
                         let why = format!("object operation {done} through node {node}: {error}");
@@ -3270,7 +3286,12 @@ pub(crate) fn objects(
             }
             outcomes
         })
-        .unwrap()
+        .unwrap();
+    // DIAGNOSTIC (diag-doors): the test's process is asked no `counts`: its clients' window is
+    // written as these asks end, before the test judges them.
+    #[cfg(feature = "diag-trace")]
+    mantle_node::diag_trace::dump("objects");
+    outcomes
 }
 
 /// The reader: `reads` in turn through a client of its own, each a query of a range's group with

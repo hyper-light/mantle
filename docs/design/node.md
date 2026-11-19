@@ -390,14 +390,26 @@ measures the second, and derives the rest by these rules:
   against 34,319 and 17,557,473 on macOS aarch64, the datagrams it carries cut from chunks, not
   copied. Every operation's windows hold a chunk, its client's connections' and its pool's, so
   each operation more costs them: on macOS a ladder founder's 32 GiB volume on a 96 GiB host of 32
-  cores runs 58,965 operations where 71,522 ran at QUIC's initial window (36ad012b), the 16 GiB
-  host 10,414 where 13,764, and a founder on CI's 7 GiB runner measuring four deep 27 where 31,
-  the transport 9.47 GB and 1.67 GB past its floor on the first two (`derive::tests`). On Linux
-  each operation also holds its client's train in a receive's batch, which takes a train from
-  each peer and client at once (recvmmsg(2) with `UDP_GRO`): a 64 KiB buffer of the transport's
-  receive ring and of the plane's socket and its messages' headers, 133,520 bytes
-  (`bounds::ring_growth`, hyper-rt `Io::held_bound`), so the first two run 54,591 and 9,264
-  where macOS runs 59,412 and 10,396 (c1589e30). Where what remains past the capacity
+  cores ran 58,965 operations where 71,522 ran at QUIC's initial window (36ad012b), the 16 GiB
+  host 10,414 where 13,764, and a founder on CI's 7 GiB runner measuring four deep 27 where 31.
+  On Linux each operation also holds its client's train in a receive's batch while the batch
+  has room for it: a receive takes a train from each peer and client at once (recvmmsg(2) with
+  `UDP_GRO`), within `UIO_MAXIOV`'s 1,024 (`bounds::io`), into a 64 KiB buffer of the
+  transport's receive ring, and the plane's socket holds a buffer for it too, with their
+  messages' headers: 133,520 bytes an operation more than on macOS below the batch's cap
+  (`bounds::ring_growth`, hyper-rt `Io::held_bound`), so CI's founder runs 219 where macOS runs
+  235 (c1589e30). Past the cap an operation adds no train on either platform, and what the
+  operations hold beside their charges is counted at their count (`derive::operations`), so
+  each byte charged is one the node holds: the first two run 62,502 and 10,999 on macOS and
+  62,354 and 10,860 on Linux, on macOS the transport 10.04 GB and 1.77 GB past its floor, and
+  every engine's metadata its want (`derive::tests`). Each operation had been charged the
+  difference from one operation to two, so each past the cap was charged a train no batch holds,
+  the plane socket's outbound slot, 65,592 bytes, and on Linux the ring's and the socket's
+  buffers and headers too, 197,752, and each past a range's `pending_reads` its reads' state:
+  the first two ran 59,412 and 10,396 on macOS and 54,591 and 9,264 on Linux (c1589e30), and
+  4.42 GB and 0.61 GB on macOS, 11.10 GB and 1.63 GB on Linux, charged and never held, went to
+  the engines' metadata, which no want took. CI's founder, whose 235 operations and eight peers
+  make 243 trains, within the cap, runs as many as before. Where what remains past the capacity
   wants and the operations served holds less than their connections' growth, the operations are
   those served, and each share's window is past the initial one by the part over the shares
   (`bounds::limits`): CI's founder measuring 64 or 256 deep runs ten at the floor. What no
@@ -453,9 +465,9 @@ measures the second, and derives the rest by these rules:
   `process::runtime` sizes them), at 11,875
   bytes, 206 a task slot, 84 a timer, 397 a readiness waiter and 16 a slot of its waiters' table,
   four slots a waiter, the bound of hyper-rt's power of two at or past twice them, so the runtime
-  grows by the same bytes with each connection and the operations' count, which charges each
-  operation the difference from one to two, never passes the floor where a table doubles (CI run
-  44286448798: charged at the power of two, a joiner of three shards at 7 GiB counted a floor
+  grows by the same bytes with each connection and the operations' count never passes the floor
+  where a table doubles (CI run 44286448798: charged at the power of two, while the count charged
+  each operation the difference from one to two, a joiner of three shards at 7 GiB counted a floor
   190,464 bytes past its allowance, three tables grown from 128 slots to 4,096), and 64 a control
   entry, as many as the host's
   calibration gives a shard (the `ring` basis line); the classes a shard's queue makes as a task
@@ -3075,7 +3087,7 @@ a performance want in rule D's order (§1.4): after the capacity wants and the o
 node serves, whole for the connections those operations open while what remains holds it; then
 each operation more costs its client's windows at a chunk, so every operation's windows hold a
 chunk and its datagrams land without a copy, at fewer operations for it (10,414 where 13,764 at
-the initial window on a 16 GiB host, macOS; §1.4 gives Linux's).
+the initial window on a 16 GiB host at 36ad012b, macOS; §1.4 gives today's and Linux's).
 Windows past a chunk at a path's bandwidth-delay product wait on the transport: its ceiling is
 fixed when the endpoint is made (`Limits::window_ceiling`), before any round trip is measured, so
 a ceiling past a chunk would be a guess at the path, and a share past the one the budget funds

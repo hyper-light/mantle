@@ -1610,8 +1610,18 @@ impl Branch {
         if !self.filter.may_contain(hash) {
             return Ok(None);
         }
-        // The leaf by the index, from memory: the one page read, parsed where the store holds
-        // it, only the value copied out; within a group cut short, the index pages read first.
+        self.get_passed(store, key, value)
+    }
+
+    /// [`Self::get_hashed`] of a key the filter has passed: the leaf by the index, from memory,
+    /// the one page read, parsed where the store holds it, only the value copied out; within a
+    /// group cut short, the index pages read first.
+    pub(crate) fn get_passed<F: BlockFile>(
+        &self,
+        store: &mut Store<F>,
+        key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<Option<Op>, Error> {
         let address = match self.leaf_in(key)? {
             Some(page) => self.page_address(store, u64::from(page))?,
             None => self.descend_from_root(store, key)?,
@@ -1619,38 +1629,22 @@ impl Branch {
         store.with_page(address, |page| point::read_value(page, key, value))
     }
 
-    /// The attached owner's point lookup, retaining its one resolved leaf across each
-    /// completion wait. The borrowed cursor returns its owners if the future is canceled.
-    pub(crate) async fn get_hashed_async<F: BlockFile>(
+    /// [`Self::get_passed`] through the attached owner's demand reads, retaining its one
+    /// resolved leaf across each completion wait. The borrowed cursor returns its owners if the
+    /// future is canceled.
+    pub(crate) async fn get_passed_async<F: BlockFile>(
         &self,
         store: &mut Store<F>,
         key: &[u8],
-        hash: u64,
         value: &mut Vec<u8>,
     ) -> Result<Option<Op>, Error> {
-        let Some(read) = self.prepare_get(store, key, hash)? else {
-            return Ok(None);
-        };
+        let read = self.prepare_leaf(store, key)?;
         let mut point = point::BorrowedPoint::new(read, store);
         point.read(key, value).await
     }
 
-    /// Starts one candidate branch's lookup. A rejected filter has no device work or cursor;
-    /// the caller retains its candidate/probe position rather than restarting the lookup.
-    pub(crate) fn prepare_get<F: BlockFile>(
-        &self,
-        store: &mut Store<F>,
-        key: &[u8],
-        hash: u64,
-    ) -> Result<Option<point::PointRead>, Error> {
-        if !self.filter.may_contain(hash) {
-            return Ok(None);
-        }
-        self.prepare_leaf(store, key).map(Some)
-    }
-
-    /// The read of the leaf `key` falls in, its filter not asked: [`Self::prepare_get`] once
-    /// the filter passes it.
+    /// The read of the leaf `key` falls in, its filter not asked: [`Self::get_passed_async`]'s,
+    /// once the filter passes it.
     pub(crate) fn prepare_leaf<F: BlockFile>(
         &self,
         store: &mut Store<F>,

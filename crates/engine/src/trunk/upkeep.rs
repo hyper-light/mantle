@@ -379,6 +379,7 @@ impl Trunk {
             self.held = self.held.saturating_add(entries);
             if self.takes_parts(&p)? {
                 self.stats.parted_entries = self.stats.parted_entries.saturating_add(entries);
+                self.stats.packings_parted = self.stats.packings_parted.saturating_add(1);
                 // The branches stay in the tree as written: their pages cached where they were
                 // written, as a compaction's are.
                 if let Some(kept) = p.kept {
@@ -397,6 +398,7 @@ impl Trunk {
                 if let Some(kept) = p.kept {
                     store.unlend_pages(*kept);
                 }
+                self.stats.packings_inflight = self.stats.packings_inflight.saturating_add(1);
                 self.push_inflight(root, super::InFlight::packed(p.cuts, p.parts))?;
             }
         }

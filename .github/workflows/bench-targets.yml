@@ -1,0 +1,95 @@
+name: bench-targets
+# The engine's fills, gets and seeks on every supported target, a build beside the one measured on
+# 2026-11-05 and 2026-11-06 (docs/measurements/2026-11-06-targets.md, which could not reach
+# Windows): whether the performance steps 1 and 2 accepted holds on each target. A branch under
+# targets/ is measured at its tip (B) against BASELINE (A), both built on the runner with the
+# toolchain both pin, then run in interleaved rounds (A B, then B A), so drift on the runner falls
+# on both arms. The bench and its arguments are that record's: the product path sized to the
+# machine, each case's values checked against the fill's oracle and its reopened store verified key
+# by key; 16-byte keys, 100-byte values, seed 301, one client. 10M keys: a hosted runner holds
+# them (its memory, under 16 GiB, would not hold 100M's 12-13 GB of rows). Every run's output is
+# kept as an artifact.
+on:
+  push:
+    branches: ["targets/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  # e118c09d: the commit 2026-11-06-targets.md measured, CI green on every target at bc7354bf.
+  BASELINE: e118c09d070674eca6a9459dda320e5b46813271
+  KEYS: "10000000"
+  ROUNDS: "6"
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04, python: python3 }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, python: python3 }
+          - { name: macos-aarch64, runner: macos-15, python: python3 }
+          - { name: windows-x86_64, runner: windows-2025, python: python }
+          - { name: windows-aarch64, runner: windows-11-arm, python: python }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build both arms' bench
+        run: |
+          mkdir -p ab/bin
+          build() {
+            cargo bench -p mantle-engine --bench ranges --no-run --locked --message-format=json \
+              | ${{ matrix.python }} -c '
+          import json, sys
+          for line in sys.stdin:
+              m = json.loads(line)
+              if m.get("reason") == "compiler-artifact" and m.get("executable") and "bench" in m["target"]["kind"]:
+                  print(m["executable"])' > "ab/exe-$1"
+            exe=$(cat "ab/exe-$1")
+            ext=""
+            case "$exe" in *.exe) ext=".exe" ;; esac
+            cp "$exe" "ab/bin/ranges-$1$ext"
+          }
+          build B
+          git checkout -q "$BASELINE"
+          build A
+          git checkout -q -
+          git log --format='%H %s' -1 "$BASELINE" > ab/revisions.txt
+          git log --format='%H %s' -1 HEAD >> ab/revisions.txt
+          ${{ matrix.python }} -c '
+          import hashlib, pathlib
+          for p in sorted(pathlib.Path("ab/bin").iterdir()):
+              print(hashlib.sha256(p.read_bytes()).hexdigest(), p.name)' > ab/SHA256
+      - name: Interleaved rounds
+        run: |
+          ext=""
+          [ -f ab/bin/ranges-A.exe ] && ext=".exe"
+          for r in $(seq "$ROUNDS"); do
+            for arm in $( [ $((r % 2)) -eq 1 ] && echo "A B" || echo "B A" ); do
+              dir="ab/r$r-$arm"; mkdir -p "$dir"; db=$(mktemp -d)
+              echo "start $(date -u +%FT%TZ)" > "$dir/host.txt"
+              "ab/bin/ranges-$arm$ext" "$db" "$KEYS" 1 1000000 256 16 1000000 10 \
+                --rocks-seed=301 --shard-client --segments --machine-memory > "$dir/raw.txt" 2>&1
+              echo "exit $? end $(date -u +%FT%TZ)" >> "$dir/host.txt"
+              rm -rf "$db"
+            done
+          done
+          for d in ab/r*-*; do
+            printf "%-8s %s fill %s get %s seek %s\n" "$(basename "$d")" "$(grep -o 'exit [0-9]*' "$d/host.txt")" \
+              "$(awk '/^fillrandom [0-9]/{print $3}' "$d/raw.txt")" \
+              "$(awk '/^readrandom [0-9]/{print $3}' "$d/raw.txt")" \
+              "$(awk '/^seekrandom [0-9]/{print $3}' "$d/raw.txt")"
+          done | tee ab/SUMMARY.txt
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bench-targets-${{ matrix.name }}
+          path: ab/

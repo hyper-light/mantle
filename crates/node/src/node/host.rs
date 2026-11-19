@@ -400,7 +400,7 @@ impl Door {
 /// A native job's ends of its exchange's channels (node.md §2.9 step 6c): a put's body as the
 /// node's task gives it, and its reply as the job gives it, which the node's task writes, with what
 /// the two share beside it ([`Handed`]). The job touches nothing of the node's but these: the bytes
-/// it moves it counts here, which the host's step takes as a value (`Node::step_host`).
+/// it moves it counts here, which the host's step takes as a value (`Host::turn_job`).
 struct Native {
     /// A put's body, once its fields named one.
     body: Option<Pieces>,
@@ -2909,9 +2909,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// When the host next needs a turn: at once when what an operation, or one ended, asked is
-    /// answered, as one answered after the host's step in a turn (a read this node's own member
-    /// answers) waits on no event; else a put's renewal coming due.
     /// When the host next needs a turn: at once when what an operation, or one ended, asked is
     /// answered, as one answered after the host's step in a turn (a read this node's own member
     /// answers) waits on no event; else a put's renewal coming due.

@@ -1230,6 +1230,19 @@ sets it before it wakes the task, and the wait takes it first, turning the node 
 came since the last wait looked. A wake spent between turns is kept, from any source, and each
 turns the node once.
 
+A range shard's task (`shard::run`) keeps the same flag. Its ranges' logs answer a write, a
+compaction's write and a member's catch-up read through the task's waker wrapped in `node::Woken`,
+and the turn takes the flag as it begins, before it looks at any source, and the wait takes it
+first. Without it, a wake that came while the task waited for room in its lane to the node
+(`given.send`) ended that wait and not the one for its next turn, which looks for its ranges' write
+answers alone, and a page read for a lagging member slept in hand until the range's next deadline.
+The runtime's channels cannot set the flag: a message into the shard and room in its lane to the
+node wake the task by its word, which hyper-rt takes from the runtime's own waker as the task polls
+the channel, not through a waker the shard holds. That loses nothing, since each is a state its
+channel keeps rather than an edge: the wait polls its receive before its other arms, so a message
+that came is taken whatever woke the task, and room is what the waiting send takes as it is polled
+again.
+
 A turn remakes nothing it keeps (research/71, step 5). The transport's events it takes, the
 replicas it drives with what each drive said, and the Raft messages they give each keep their
 storage across turns, emptied as they are handled, and the ranges' groups are looked up where the

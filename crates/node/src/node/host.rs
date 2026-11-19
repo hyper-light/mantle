@@ -5090,7 +5090,8 @@ impl Host {
             // and their bytes are counted in its door. Its fields are read before its put is made,
             // which takes its body.
             // A piece taken frees the storage the node's task reads the next into, so a job on a
-            // driving shard turns it.
+            // driving shard turns it: once `take_body` returns, every piece it took let go, as the
+            // node's task reads the next only into storage no piece holds (`Feeding::free`).
             Door::Native(_, native) => {
                 let Native {
                     body,
@@ -5099,11 +5100,12 @@ impl Host {
                     node,
                     ..
                 } = &mut **native;
-                take_body(body, Some(&handed.cut), putting, moved, |_| {
-                    if let Some(node) = node {
-                        node.wake_by_ref();
-                    }
-                })
+                let mut took = false;
+                let fed = take_body(body, Some(&handed.cut), putting, moved, |_| took = true);
+                if took && let Some(node) = node {
+                    node.wake_by_ref();
+                }
+                fed
             }
         };
         match fed {
@@ -8835,6 +8837,65 @@ pub(super) mod tests {
         ));
     }
 
+    /// The node's task's waker as a put's job on a driving shard holds it, the job's feeding with
+    /// it: at each wake, whether the feeding may read the next piece then (`Feeding::free`).
+    struct Freeing {
+        feeding: std::sync::Mutex<Feeding>,
+        free: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl std::task::Wake for Freeing {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            let free = self.feeding.lock().unwrap().free();
+            self.free.lock().unwrap().push(free);
+        }
+    }
+
+    /// A put's job on a driving shard wakes the node's task for a piece of its body it took only
+    /// once it let go of it (node.md §2.9 step 6f): the node's task reads the next into the
+    /// piece's storage, once no piece holds it (`Feeding::free`), so a wake while the job held it
+    /// would turn the node's task to find nothing to read, its next piece waiting on another word.
+    #[test]
+    fn a_driving_shards_put_wakes_the_node_once_it_let_go_of_a_piece() {
+        let (object, _) = native_body(2 * piece_len());
+        let putting = native_put(object.len() as u64);
+        let (length, trailing) = (putting.length, putting.trailing);
+        let (mut job, mut replies) = handed_job(Work::Put(putting), 0, 0);
+        let Door::Native(_, native) = &mut job.door else {
+            panic!("a native door");
+        };
+        let handed = std::sync::Arc::clone(&native.handed);
+        let feeding = feed(
+            (length, trailing),
+            replies.body.take().unwrap(),
+            handed,
+            None,
+        );
+        let freeing = std::sync::Arc::new(Freeing {
+            feeding: std::sync::Mutex::new(feeding),
+            free: std::sync::Mutex::new(Vec::new()),
+        });
+        native.node = Some(std::task::Waker::from(std::sync::Arc::clone(&freeing)));
+        let mut moved = 0;
+        assert_eq!(
+            freeing
+                .feeding
+                .lock()
+                .unwrap()
+                .give(&object[..piece_len()], &mut moved),
+            Ok(Fed::Moved)
+        );
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        host.jobs.push(job);
+        host.step(&mut Stub::chunks()).unwrap();
+        let free = freeing.free.lock().unwrap();
+        assert_eq!(free.first(), Some(&true), "woken while it held the piece");
+    }
+
     /// A native put's stream that stops or is reset ends its job as it did when the job read the
     /// stream: refused `IncompleteBody`, told on its channel or by its channel's end, the node's
     /// task gone with the exchange (`Node::job_lost`). A job that lets go of its body has the rest
@@ -10912,9 +10973,12 @@ pub(super) mod tests {
     /// their operations to their ends: the shard makes their work, its asks cross to the stub and
     /// their answers back in the lane's slots, the put takes its body's end from its door and is
     /// answered `Done` with the version written, the get is answered `Done` with no bytes, each
-    /// reply written by the test as the node's task writes it; each job's end is told with its
-    /// charge and its shard, its door's half riding it back, so the shard's host keeps no door
-    /// and the test's doors keep both. A request past the lane's room is given back.
+    /// reply written by the test as the node's task writes it, telling the shard's word (6f); each
+    /// job's end is told with its charge and its shard, its door's half riding it back, so the
+    /// shard's host keeps no door and the test's doors keep both. The get's head is written only
+    /// once the put ended, so its job waits on that word alone: a reply that tells none leaves the
+    /// shard parked with the head written, and the get never ends. A request past the lane's room
+    /// is given back.
     #[test]
     fn a_driving_shards_host_takes_a_put_and_a_get_to_their_ends_over_its_lanes() {
         let rt = two_shards(4);
@@ -10938,6 +11002,10 @@ pub(super) mod tests {
         let now = hyper_rt::futures::now_ns();
         let (put_half, mut put_replies) = doors.take().unwrap();
         let (get_half, mut get_replies) = doors.take().unwrap();
+        // Each reply carries the shard's word, as the node's task gives it to a request it hands
+        // (`Node::read_fields`): its write tells the shard as it takes an answer or writes it whole.
+        put_replies.driving = Some(lanes.doors());
+        get_replies.driving = Some(lanes.doors());
         // The put's body as the node's task gives it: empty, whole.
         let body = put_replies.body.as_ref().unwrap();
         assert!(body.try_send(Piece::End(None)).is_ok());
@@ -10998,9 +11066,15 @@ pub(super) mod tests {
             put_over = put_over
                 || put_replies.write(&mut put_seen, true, now, &mut moved, &mut slowed)
                     == Wrote::Over;
-            get_over = get_over
-                || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
-                    == Wrote::Over;
+            // The get's reply is written only once the put's end is told. Its version's answer
+            // came no later than the put's last (each answer comes in its ask's order), so by then
+            // its job gave its head at a step past which it waits for the head to be written, its
+            // own asks all answered: only the word its write tells turns the shard again.
+            if stub.ended.iter().any(|&(_, charge, _, _)| charge == 7) {
+                get_over = get_over
+                    || get_replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                        == Wrote::Over;
+            }
             std::thread::yield_now();
         }
         stub.ended.sort();

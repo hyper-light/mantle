@@ -173,6 +173,47 @@ fn a_one_row_lookup_reads_and_compares_nothing_past_its_row() {
     assert_eq!((paged.allocations, alone.allocations), (0, 0));
 }
 
+/// A lookup charges its path's pivots the rent their extra sources cost it, and prices a
+/// pivot's consolidation only where that rent can pay for it: a pivot charged no rent, or paid
+/// already at its sources' shape, sums no bundle again.
+#[test]
+fn a_lookup_prices_only_the_consolidations_its_rent_can_pay() {
+    let mut db = ShardDb::create(
+        sim(11),
+        STORE,
+        16 * 1024,
+        TrunkConfig {
+            fanout: 4,
+            leaf_entries: 512,
+        },
+    )
+    .unwrap();
+    let n = 20_000u64;
+    for i in 0..n {
+        db.put(&version(i, u64::MAX - i), b"v").unwrap();
+    }
+    let (height, _, _) = db.shape().unwrap();
+    assert!(height > 1, "a trunk of one level");
+    let ranges: Vec<(Vec<u8>, Vec<u8>)> = (0..2_000u64)
+        .map(|j| (j * 7_919) % n)
+        .map(|i| (version(i, 0), upload(i)))
+        .collect();
+    let mut rows = Rows::new();
+    let (_, t0, _) = db.stats();
+    for (from, to) in &ranges {
+        rows.clear();
+        db.scan_rows(from, Some(to), 1, &mut rows).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+    let (_, t1, _) = db.stats();
+    // A lookup's path is a pivot a level, each charged.
+    let charged = (t1.scan_segments - t0.scan_segments) * height as u64;
+    let priced = t1.charges_priced - t0.charges_priced;
+    let paid = (t1.paid_leaves + t1.paid_index) - (t0.paid_leaves + t0.paid_index);
+    eprintln!("charged {charged} priced {priced} paid {paid}");
+    assert!(priced < charged, "priced {priced} of {charged} charged");
+}
+
 type Oracle = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn key_of(k: u16) -> Vec<u8> {

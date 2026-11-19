@@ -474,6 +474,9 @@ enum Order {
     Learn(u64, SocketAddr, SocketAddr),
     /// Lose power: give back the log and the engines as they stand.
     Crash,
+    /// Replace the first with the second in the range (`Node::replace`): a first the range never
+    /// named makes it the second's promotion alone, a learner first and a voter once caught up.
+    Replace(u64, u64),
 }
 
 /// What a task tells the test.
@@ -499,6 +502,8 @@ enum Report {
     Told(Told),
     /// A workload client's part of the history, once it ended.
     Part(u64, Part),
+    /// A replacement a node's member ended while it led: the member replaced and the one joined.
+    Replaced(u64, u64),
 }
 
 /// A node's task: opens the node on its log, reports where it listens, then turns it, each turn
@@ -554,6 +559,12 @@ async fn run_node(
                     return;
                 }
             }
+            Either::Second(Ok(Order::Replace(failed, joining))) => {
+                if let Err(error) = node.replace(GROUP, failed, joining) {
+                    let _ = reports.send(Report::Failed(id, error.to_string()));
+                    return;
+                }
+            }
             Either::Second(Ok(Order::Crash)) => {
                 let _ = match node.close().await {
                     Ok((log, engines)) => reports.send(Report::Crashed(id, log, engines)),
@@ -563,6 +574,14 @@ async fn run_node(
             }
             // The test is done.
             Either::Second(Err(_)) => return,
+        }
+        for (_, replaced) in node.take_replaced() {
+            if reports
+                .send(Report::Replaced(replaced.failed(), replaced.joining()))
+                .is_err()
+            {
+                return;
+            }
         }
         let status = node.status(GROUP);
         if status != told
@@ -612,6 +631,9 @@ pub struct Sim {
     rt: SimRuntime,
     seed: u64,
     pub nodes: u64,
+    /// The range's founding voters, nodes 1 to `voters`: a node past them is a spare, whose
+    /// member learns its configuration from the leader that adds it (membership.md §3 step 1).
+    voters: u64,
     pki: Pki,
     pub members: BTreeMap<u64, Member>,
     /// The clients' shards, by id.
@@ -627,7 +649,7 @@ pub struct Sim {
     /// The longest a datagram may take on any of the cell's paths now: a round trip of it is the
     /// least the cell may go without moving.
     longest_ns: u64,
-    progress: BTreeMap<u64, u64>,
+    pub progress: BTreeMap<u64, u64>,
     patience: BTreeMap<u64, Duration>,
     pub parts: BTreeMap<u64, Part>,
     opened: Option<Result<Vec<Answer>, String>>,
@@ -635,6 +657,8 @@ pub struct Sim {
     learns: Vec<mpsc::Sender<(u64, SocketAddr)>>,
     /// When something last moved, on the virtual clock.
     moved_at: u64,
+    /// Each replacement a node's member ended while it led, in the order reported.
+    pub replaced: Vec<(u64, u64)>,
     /// The node starts so far, each drawing its endpoint's seed afresh.
     starts: u64,
     /// The transport budget each node holds, from its statement.
@@ -677,6 +701,31 @@ impl Sim {
 
     /// The cell of `seed` of `nodes`, its range under `settings` and its nodes' logs under `log`.
     fn of(seed: u64, nodes: u64, settings: Settings, log: LogConfig, budget: Budget) -> Self {
+        Self::spared(seed, nodes, nodes, settings, log, budget)
+    }
+
+    /// The cell of `seed` of `voters` founding voters and one spare past them, which runs from the
+    /// start and votes on nothing until a replacement adds it (`Sim::replace`).
+    pub fn with_spare(seed: u64, voters: u64) -> Self {
+        Self::spared(
+            seed,
+            voters,
+            voters + 1,
+            SETTINGS,
+            log_config(),
+            bounds::least_transport,
+        )
+    }
+
+    /// The cell of `seed` of `nodes`, its range's founding voters nodes 1 to `voters`.
+    fn spared(
+        seed: u64,
+        voters: u64,
+        nodes: u64,
+        settings: Settings,
+        log: LogConfig,
+        budget: Budget,
+    ) -> Self {
         let shards = usize::try_from(nodes + CLIENTS + 1).unwrap();
         let mut rt = SimRuntime::new(
             &RuntimeConfig {
@@ -731,6 +780,7 @@ impl Sim {
             rt,
             seed,
             nodes,
+            voters,
             pki,
             members,
             client_shards,
@@ -748,6 +798,7 @@ impl Sim {
             asked: None,
             learns: Vec::new(),
             moved_at: 0,
+            replaced: Vec::new(),
             starts: 0,
             budget,
         };
@@ -804,7 +855,7 @@ impl Sim {
                 .into_iter()
                 .map(|(group, engine)| Hosted {
                     group,
-                    range: range(self.nodes, self.settings),
+                    range: range(self.voters, self.settings),
                     engine,
                 })
                 .collect(),
@@ -880,6 +931,19 @@ impl Sim {
             .unwrap_or_default()
     }
 
+    /// Tells every running node to replace `failed` with `joining` in the range: whichever leads,
+    /// now or next, takes it up from the configuration it finds (`Node::replace`).
+    pub fn replace(&mut self, failed: u64, joining: u64) {
+        for member in self.members.values() {
+            if let Some(orders) = &member.orders {
+                orders
+                    .try_send(Order::Replace(failed, joining))
+                    .map_err(|_| "a node's orders are full")
+                    .unwrap();
+            }
+        }
+    }
+
     /// Cuts node `id` off from every other node, both ways, or joins it to them again.
     pub fn isolate(&mut self, id: u64, cut: bool) {
         let path = if cut {
@@ -948,6 +1012,16 @@ impl Sim {
     }
 
     /// The simulated clock now.
+    /// The longest a datagram may take on any of the cell's paths now.
+    pub fn longest_ns(&self) -> u64 {
+        self.longest_ns
+    }
+
+    /// The finest step anything between nodes moves in: the step [`Sim::until`] runs the cell by.
+    pub fn step_ns(&self) -> u64 {
+        self.step_ns
+    }
+
     pub fn now_ns(&self) -> u64 {
         self.rt.now_ns()
     }
@@ -1085,6 +1159,7 @@ impl Sim {
                 Report::Told(Told::Failed(id, why)) => {
                     panic!("seed {}: client {id} failed: {why}", self.seed)
                 }
+                Report::Replaced(failed, joining) => self.replaced.push((failed, joining)),
                 Report::Part(id, part) => {
                     self.parts.insert(id, part);
                 }

@@ -38,7 +38,7 @@ use mantle_meta::record::{BlockHeader, ChunkPlace};
 use mantle_meta::root::{self, Fact};
 use mantle_protocol::bounds;
 use mantle_protocol::classes::{self, NodeClasses};
-use mantle_range::membership::{Next, Replacement, Step, Toward};
+use mantle_range::membership::{Replacement, Step, Toward};
 use mantle_range::{Applied, ConfState, LogStore, RangeMachine};
 
 use super::NodeError;
@@ -511,16 +511,18 @@ pub(crate) fn step_replacement<E: Engine + 'static, S: LogStore>(
     let Some(shell) = owner.get_mut(handle) else {
         return false;
     };
-    if !shell.is_leader() {
+    // A hand-over under way is waited out: the next leader takes the replacement up.
+    if !shell.is_leader() || shell.core().raft.lead_transferee().is_some() {
         return false;
     }
-    let next = replacement.next(
+    let step = replacement.step(
         shell.configuration(),
-        shell.caught_up(replacement.joining()),
+        shell.id(),
+        |member| shell.caught_up(member),
         shell.configuration_known(),
     );
-    match next {
-        Next::Propose(change) => {
+    match step {
+        Step::Propose(change) => {
             if !shell.core().raft.has_pending_conf() {
                 // A change the core refuses (its leader stepping down, its log full) is proposed
                 // again at a later turn.
@@ -529,8 +531,15 @@ pub(crate) fn step_replacement<E: Engine + 'static, S: LogStore>(
             }
             false
         }
-        Next::Wait => false,
-        Next::Done => true,
+        // The leader is the member replaced: its lead goes first (`Replacement::step`), and a
+        // transfer the core refuses or gives up is asked again at a later turn.
+        Step::Transfer(to) => {
+            let _ = shell.transfer(to);
+            owner.schedule(handle);
+            false
+        }
+        Step::Wait => false,
+        Step::Done => true,
     }
 }
 

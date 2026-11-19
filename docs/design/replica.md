@@ -642,6 +642,17 @@ loses with its leadership, is proposed again, and one already applied never is:
    old half had lost two of its three members, so they could elect no one. Once every voter
    knows, losing any one member leaves voters that elect under the final configuration.
 
+The leader is never removed by its own change (`Replacement::step`, as `Toward::step` keeps the
+rule for membership.md §6). Where the member replaced is the one leading, it hands its lead first
+to a voter the replacement keeps that holds everything it knows committed (Diss §3.10), or, with
+no such voter, has the caught-up joining member promoted alone first, adds before removals; the
+next leader runs the swap. Removed by its own change, a leader leads a configuration that omits
+it until the change commits and then steps down (Diss §4.2.2), and the group waits out an
+election: a simulated cell of two voters replacing its leader under the clients' load went
+3.2 ms without a leader on one switch, through two elections, and 3 s across the planet; handed on
+first, none and 0.5 s (`crates/node/tests/sim.rs`,
+`a_range_changes_its_voters_under_load_never_leaderless_past_a_round_trip`, seeds 1 and 4).
+
 A member whose group its log found damaged is rebuilt the same way on its own device
 (`Replica::rebuild`): the group's records are removed, which is all the log takes of a
 damaged group, a member under a new identity opens there from a new engine, and the leader

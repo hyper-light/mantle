@@ -2456,9 +2456,14 @@ less than a datagram moved, or after the peer had the whole request and a period
    is answered at once, its volume fenced, and is held no more. A device that stalls is waited on as
    long as the client would wait, and one that never answers is given up then (the owner's choice of
    2026-11-01, research/77 D2, as Quiver reviewed it). A chunk
-   refused for want of room, a volume's `Busy` or the transport's `Budget`, is asked again of the
-   same volume once a chunk is answered or a volume answers a put, not sent on and the block left
-   `Unplaced`; and at each beat it waits, at most once a beat (`Node::step_host`), on either door:
+   refused for want of room, a volume's `Busy` or a bound of the transport's reached for now (as
+   its error.rs defines them: `Budget`, `Exchanges`, `LaneFull`, `Lanes`, `Events`,
+   `ReceiveBuffer`, the admission's `Pending`, `Identities`, `Connections` and `Busy`, and
+   `Unsent`), or `Stalled`, whose chunk the volume answers as done when the same key and bytes are
+   put again (§5.2), is asked again of the same volume once a chunk is answered or a volume answers
+   a put, not sent on and the block left `Unplaced` (`host::taken` classes each outcome; a
+   refusal for room is no movement of the job's work, so its patience still ends it); and at each
+   beat it waits, at most once a beat (`Node::step_host`), on either door:
    a peer's volume whose queue other writes or its cleaner hold, as a filling volume's is, tells
    the asker nothing when it frees room, and with no other chunk of the node out nothing asked it
    again before the client's patience. The S3 door's put, due only at that patience, then sat

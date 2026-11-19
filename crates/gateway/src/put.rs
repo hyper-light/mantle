@@ -88,6 +88,9 @@ pub enum Answer {
     /// No room for the chunk now, at the volume's writer queue or in the transport toward it: it
     /// is asked again of the same volume once room frees ([`Put::room`], research/77 D2).
     Busy,
+    /// No volume takes the chunk as it was sent: the node may not send it, or sent it so that
+    /// every volume refuses it alike. The PUT cannot go on.
+    Failed,
     Block(block::Outcome),
     File(file::Outcome),
     Name(name::Outcome),
@@ -113,6 +116,10 @@ pub enum PutError {
     /// cell is out of space, which outlasts any client's retries (node.md §4.4).
     #[error("every volume offered a chunk of block {0:032x} is full")]
     Full(u128),
+    /// A chunk of the block no volume takes as it was sent ([`Answer::Failed`]): asking the next
+    /// volume would be refused alike, so the PUT ends at once.
+    #[error("no volume takes a chunk of block {0:032x} as it was sent")]
+    Unsendable(u128),
     /// The sweep released a block before its file was written: a renewal came too late.
     #[error("block {0:032x} was released before its file was written")]
     Released(u128),
@@ -976,6 +983,10 @@ impl Put {
             (Asked::Chunk(index, i), Answer::Busy) => {
                 self.roomless.push((index, i));
                 Ok(())
+            }
+            (Asked::Chunk(index, _), Answer::Failed) => {
+                let going = self.going.get(&index).ok_or(PutError::Mismatch)?;
+                Err(PutError::Unsendable(going.id))
             }
             (
                 Asked::Block { index, asked_ns },

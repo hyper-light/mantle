@@ -210,6 +210,15 @@ impl Job {
         })
     }
 
+    /// One of its own asks answered at `now`: its work moved, unless a chunk of it was refused for
+    /// want of room ([`Taken::Room`]), which moves nothing; else a put asked again at each beat and
+    /// refused again would never reach its client's patience (research/77 D2).
+    fn answered(&mut self, outcome: &Outcome, now: u64) {
+        if !matches!(outcome, Outcome::Chunk(chunk) if taken(chunk) == Taken::Room) {
+            self.moved_ns = now;
+        }
+    }
+
     /// Whether the operation still works toward its reply, rather than giving one or reading the
     /// fields that say what it is.
     fn working(&self) -> bool {
@@ -1919,13 +1928,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // for want of room is asked again then (research/77 D2), and not at its own refusal,
         // which would ask it again each turn while the room stays taken.
         let freed = std::mem::take(&mut self.room_freed)
-            || self.chunks_done.iter().any(|(_, outcome)| {
-                !matches!(
-                    outcome,
-                    ChunkOutcome::Refused(chunk::Status::Busy)
-                        | ChunkOutcome::Lost(Refusal::Budget)
-                )
-            });
+            || self
+                .chunks_done
+                .iter()
+                .any(|(_, outcome)| taken(outcome) != Taken::Room);
         for at in 0..self.jobs.len() {
             self.take_answers(at)?;
         }
@@ -2113,9 +2119,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(());
         };
-        // One of its own asks answered: the job's work moved.
         let moved = hyper_rt::futures::now_ns();
-        job.moved_ns = moved;
+        job.answered(&outcome, moved);
         let principal = job.principal.clone();
         match &mut job.work {
             Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_) => {}
@@ -5863,21 +5868,118 @@ pub(super) fn chunk_moved(jobs: &mut [Job], ask: u64) {
 /// A put's driver's answer for what its request came to.
 fn put_answer(outcome: Outcome) -> put::Answer {
     match outcome {
-        Outcome::Chunk(ChunkOutcome::Stored) => put::Answer::Stored,
-        Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Full)) => {
-            put::Answer::Refused { full: true }
-        }
-        // No room now, at the volume's writer queue or in the transport toward it: asked again
-        // once room frees, within the client's patience (research/77 D2).
-        Outcome::Chunk(
-            ChunkOutcome::Refused(chunk::Status::Busy) | ChunkOutcome::Lost(Refusal::Budget),
-        ) => put::Answer::Busy,
-        Outcome::Chunk(_) => put::Answer::Refused { full: false },
+        Outcome::Chunk(chunk) => match taken(&chunk) {
+            Taken::Stored => put::Answer::Stored,
+            Taken::Room => put::Answer::Busy,
+            Taken::Refused => put::Answer::Refused { full: false },
+            Taken::Full => put::Answer::Refused { full: true },
+            Taken::Failed => put::Answer::Failed,
+        },
         Outcome::Command(CommandOutcome::Answered(Answer::Block(o))) => put::Answer::Block(o),
         Outcome::Command(CommandOutcome::Answered(Answer::File(o))) => put::Answer::File(o),
         Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => put::Answer::Name(o),
         // Any other: the driver takes it as the wrong kind and fails the put.
-        _ => put::Answer::Refused { full: false },
+        _ => put::Answer::Failed,
+    }
+}
+
+/// Where a chunk's put goes next, by what its outcome means ([`taken`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Taken {
+    /// Durable on its volume.
+    Stored,
+    /// No room for it now, at its volume or in the transport toward it: the volume takes it once
+    /// room frees, so it is asked of the same volume again then, within its client's patience
+    /// (research/77 D2), and its refusal is no movement of its work.
+    Room,
+    /// This volume does not take it, and another may: the next volume offered is asked.
+    Refused,
+    /// The volume has no room, and cleaning can make none.
+    Full,
+    /// No volume takes it as it was sent: the put cannot go on.
+    Failed,
+}
+
+/// What a chunk put's outcome means for where the chunk goes next: each of the volume's statuses
+/// (`chunk::Status`) and each of the transport's refusals (`Refusal`, as
+/// vendor/hyper-transport/src/error.rs defines them) is classed in one arm of its class, with no
+/// catch-all, so a status or a refusal added does not compile until it is classed.
+///
+/// A put asked again of a volume that may already hold it is safe: a chunk's key is its block's id,
+/// its epoch and its index (`put::chunk_key`), and the volume's writer answers a whole chunk's put
+/// (`Volume::put_checked_waking`: offset 0, sealed) under a key it holds, with the same length,
+/// CRC-32C and bytes, as done without writing it again, and refuses other bytes under it `Exists`
+/// (`mantle_chunk`'s writer, `validate`; audit B05; node.md §5.2).
+pub(super) fn taken(outcome: &ChunkOutcome) -> Taken {
+    match outcome {
+        ChunkOutcome::Stored => Taken::Stored,
+        // A get's bytes answering a put: the node crossed its asks, which no volume mends.
+        ChunkOutcome::Read(_) => Taken::Failed,
+        ChunkOutcome::Refused(status) => match status {
+            // A put's own word, wrapped as a refusal only for a get (`Node::chunk_replied`): the
+            // node crossed its asks, and nothing says the chunk is durable.
+            chunk::Status::Stored => Taken::Failed,
+            // The volume's writer queue holds all it takes: a write ending makes room.
+            chunk::Status::Busy => Taken::Room,
+            chunk::Status::Full => Taken::Full,
+            // This volume, not the chunk: fenced after a device error, closing, not held by the
+            // node asked, the bytes changed on the way to it, past what its records hold, its own
+            // records damaged, other bytes under the key, its head or its reply undecoded, failed
+            // otherwise, or a get's status answering a put.
+            chunk::Status::Fenced
+            | chunk::Status::Closed
+            | chunk::Status::NoVolume
+            | chunk::Status::Checksum
+            | chunk::Status::TooLarge
+            | chunk::Status::Corrupt
+            | chunk::Status::Exists
+            | chunk::Status::Malformed
+            | chunk::Status::Failed
+            | chunk::Status::Read
+            | chunk::Status::NotFound
+            | chunk::Status::Range => Taken::Refused,
+        },
+        ChunkOutcome::Lost(refusal) => match refusal {
+            // A bound reached for now, here or at the peer, none of it the volume's: the budget
+            // cannot fund the bytes; the exchange table, a lane's queue, the lanes, the owner's
+            // unpolled events or the socket's receive queue at their bound; the handshakes, the
+            // identities or the connections at theirs, or the identity's every connection busy,
+            // while a connection is made (a peer full, not gone: `Event::Unreachable`). `Unsent`:
+            // it waited a period for a stream its peer did not grant, nothing sent, as a peer
+            // granting streams as wanted holds requests back while it is busy. `Stalled`: a period
+            // moved less than a datagram, its peer too busy to take it, and what reached the
+            // volume is answered as done when asked again (above).
+            Refusal::Budget
+            | Refusal::Exchanges
+            | Refusal::LaneFull
+            | Refusal::Lanes
+            | Refusal::Events
+            | Refusal::ReceiveBuffer
+            | Refusal::Pending
+            | Refusal::Identities
+            | Refusal::Connections
+            | Refusal::Busy
+            | Refusal::Unsent
+            | Refusal::Stalled => Taken::Room,
+            // This peer, not the chunk: not the one the directory names, no connection up to it,
+            // its connection closed or the exchange ended unanswered, the bytes damaged on the way,
+            // its connection's QUIC refused, or a refusal this side does not know.
+            Refusal::Identity
+            | Refusal::NotConnected
+            | Refusal::Closed
+            | Refusal::UnknownExchange
+            | Refusal::Corrupt
+            | Refusal::Quic
+            | Refusal::Unknown => Taken::Refused,
+            // Of this node or the message, alike at every volume: its role may not send a chunk's
+            // put, the message is past its class's frame bound, the node broke the exchange's
+            // order, its exchange identifiers ran out, or the exchange's settings are invalid.
+            Refusal::Kind
+            | Refusal::FrameBound
+            | Refusal::Order
+            | Refusal::Exhausted
+            | Refusal::Configuration => Taken::Failed,
+        },
     }
 }
 
@@ -5907,7 +6009,12 @@ fn complete_answer(outcome: Outcome) -> Option<complete::Answer> {
 fn get_answer(outcome: Outcome) -> get::Answer {
     match outcome {
         Outcome::Chunk(ChunkOutcome::Read(bytes)) => get::Answer::Chunk(Bytes::from(bytes)),
-        Outcome::Chunk(_) => get::Answer::Unreadable,
+        // No bytes from this place, for any cause, room's among them: the get reads another place
+        // that holds them, as a volume whose reads are full asks of itself (`chunk::Status::Busy`,
+        // node.md §5.4), and nothing takes the copy for lost.
+        Outcome::Chunk(ChunkOutcome::Stored | ChunkOutcome::Refused(_) | ChunkOutcome::Lost(_)) => {
+            get::Answer::Unreadable
+        }
         Outcome::Read(ReadOutcome::Read(read)) => match *read {
             Read::Header(header) => get::Answer::Header(header),
             Read::Extents(extents) => get::Answer::Extents(extents),
@@ -6543,12 +6650,9 @@ mod tests {
         assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
     }
 
-    /// An S3 put whose chunks every volume refused for want of room is due at its beat, as a
-    /// native one is, so the node turns to offer them room again (`Node::step_host`): it was due
-    /// only at its client's patience, and nothing turned the node when a peer's volume freed room,
-    /// so the fill suite's S3 put sat quiet (CI run 44454089741, linux-x86_64).
-    #[test]
-    fn an_s3_put_waiting_for_room_is_due_at_its_beat() {
+    /// A one-byte put of three copies, `offered` volumes offered its block (`0..offered`), and its
+    /// chunks asked: each one's request, volume and key.
+    fn put_of_copies(offered: u128) -> (Put, Vec<(u64, u128, mantle_chunk::ChunkKey)>) {
         let commit = Commit::Object(name::Put {
             bucket: "b".into(),
             incarnation: 1,
@@ -6602,16 +6706,23 @@ mod tests {
         let put::Request::Place { width, .. } = place else {
             panic!("{place:?}");
         };
-        let volumes = (0..u128::try_from(width).unwrap()).collect();
-        put.answer(id, put::Answer::Volumes(volumes)).unwrap();
-        let chunks: Vec<_> = std::iter::from_fn(|| put.poll()).collect();
-        for (id, _) in chunks {
-            put.answer(id, put::Answer::Busy).unwrap();
-        }
-        assert!(put.waits_for_room());
+        assert_eq!(width, 3);
+        put.answer(id, put::Answer::Volumes((0..offered).collect()))
+            .unwrap();
+        let chunks = std::iter::from_fn(|| put.poll())
+            .map(|(id, request)| match request {
+                put::Request::Chunk { volume, key, .. } => (id, volume, key),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        (put, chunks)
+    }
+
+    /// An S3 put's job, its driver `put`, its work last moved at 1.
+    fn put_job(put: Put) -> Job {
         let (_body, body) = hyper_rt::sync::channel(1).unwrap();
         let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
-        let job = Job {
+        Job {
             door: Door::Local(Box::new(Local {
                 body,
                 reply,
@@ -6645,9 +6756,169 @@ mod tests {
             window: 1,
             label: None,
             room_to_reply: false,
-        };
+        }
+    }
+
+    /// An S3 put whose chunks every volume refused for want of room is due at its beat, as a
+    /// native one is, so the node turns to offer them room again (`Node::step_host`): it was due
+    /// only at its client's patience, and nothing turned the node when a peer's volume freed room,
+    /// so the fill suite's S3 put sat quiet (CI run 44454089741, linux-x86_64).
+    #[test]
+    fn an_s3_put_waiting_for_room_is_due_at_its_beat() {
+        let (mut put, chunks) = put_of_copies(3);
+        for (id, _, _) in chunks {
+            put.answer(id, put::Answer::Busy).unwrap();
+        }
+        assert!(put.waits_for_room());
+        let job = put_job(put);
         assert!(job.held() && job.waits_for_room());
         assert_eq!(job.due_ns(5, 2), Some(7), "the S3 door's put, at its beat");
+    }
+
+    /// Every outcome that says no room now, at the volume or in the transport toward it, here or at
+    /// its peer (vendor/hyper-transport/src/error.rs).
+    fn room_refusals() -> Vec<ChunkOutcome> {
+        let transport = [
+            Refusal::Budget,
+            Refusal::Exchanges,
+            Refusal::LaneFull,
+            Refusal::Lanes,
+            Refusal::Events,
+            Refusal::ReceiveBuffer,
+            Refusal::Pending,
+            Refusal::Identities,
+            Refusal::Connections,
+            Refusal::Busy,
+            Refusal::Unsent,
+            Refusal::Stalled,
+        ];
+        std::iter::once(ChunkOutcome::Refused(chunk::Status::Busy))
+            .chain(transport.map(ChunkOutcome::Lost))
+            .collect()
+    }
+
+    /// A chunk the transport refused for want of room, as one its volume refused `Busy`, waits for
+    /// room and is asked of the same volume again, its put neither sent on nor failed: in a cell of
+    /// three, whose block's chunks take every volume, the transport's backpressure sent it to the
+    /// next volume offered, of which there was none, and failed the put `Unplaced`, `503 SlowDown`
+    /// (a Mac Studio's cell of three at 2,048 clients). A stalled exchange may have reached its
+    /// volume, which answers the same key and bytes put again as done, so it too is asked again
+    /// of the same volume, with the same key.
+    #[test]
+    fn a_chunk_refused_for_room_waits_and_is_asked_of_its_volume_again() {
+        for outcome in room_refusals() {
+            let (mut put, chunks) = put_of_copies(3);
+            let (id, volume, key) = chunks[0];
+            let answered = put.answer(id, put_answer(Outcome::Chunk(outcome.clone())));
+            assert_eq!(answered, Ok(()), "{outcome:?}");
+            assert!(put.outcome().is_none(), "{outcome:?} ended the put");
+            assert!(put.waits_for_room(), "{outcome:?}");
+            assert!(put.poll().is_none(), "{outcome:?} sent the chunk on");
+            put.room().unwrap();
+            match put.poll() {
+                Some((
+                    _,
+                    put::Request::Chunk {
+                        volume: v, key: k, ..
+                    },
+                )) => {
+                    assert_eq!((v, k), (volume, key), "{outcome:?}");
+                }
+                other => panic!("{outcome:?}: {other:?}"),
+            }
+            assert!(!put.waits_for_room(), "{outcome:?}");
+        }
+    }
+
+    /// A volume that cannot take the chunk (fenced, closing, not on the node asked, its records
+    /// damaged, the bytes changed on the way, its node unreachable or its connection closed) and a
+    /// full one still send it on to the next volume offered, and a block left none still fails
+    /// `Unplaced` or `Full`; a chunk no volume takes as it was sent (this node's role may not send
+    /// it, past its class's frame bound, its exchange out of order, the node's exchange identifiers
+    /// spent, its settings invalid, or its asks crossed) fails the put at once.
+    #[test]
+    fn a_full_or_refusing_volume_sends_a_chunk_on_and_an_unsendable_one_fails_the_put() {
+        let refusing = [
+            ChunkOutcome::Refused(chunk::Status::Fenced),
+            ChunkOutcome::Refused(chunk::Status::Closed),
+            ChunkOutcome::Refused(chunk::Status::NoVolume),
+            ChunkOutcome::Refused(chunk::Status::Corrupt),
+            ChunkOutcome::Refused(chunk::Status::Checksum),
+            ChunkOutcome::Refused(chunk::Status::Failed),
+            ChunkOutcome::Lost(Refusal::NotConnected),
+            ChunkOutcome::Lost(Refusal::Closed),
+            ChunkOutcome::Lost(Refusal::Corrupt),
+            ChunkOutcome::Lost(Refusal::Unknown),
+            ChunkOutcome::Refused(chunk::Status::Full),
+        ];
+        for outcome in refusing {
+            let full = outcome == ChunkOutcome::Refused(chunk::Status::Full);
+            let (mut put, chunks) = put_of_copies(4);
+            let (id, volume, key) = chunks[0];
+            put.answer(id, put_answer(Outcome::Chunk(outcome.clone())))
+                .unwrap();
+            assert!(!put.waits_for_room(), "{outcome:?}");
+            match put.poll() {
+                Some((
+                    _,
+                    put::Request::Chunk {
+                        volume: v, key: k, ..
+                    },
+                )) => {
+                    assert_eq!((v, k), (3, key), "{outcome:?}");
+                    assert_ne!(v, volume);
+                }
+                other => panic!("{outcome:?}: {other:?}"),
+            }
+            let (mut put, chunks) = put_of_copies(3);
+            let failed = put.answer(chunks[0].0, put_answer(Outcome::Chunk(outcome.clone())));
+            if full {
+                assert!(matches!(failed, Err(PutError::Full(_))), "{failed:?}");
+            } else {
+                assert!(
+                    matches!(failed, Err(PutError::Unplaced(_))),
+                    "{outcome:?}: {failed:?}"
+                );
+            }
+        }
+        let unsendable = [
+            ChunkOutcome::Lost(Refusal::Kind),
+            ChunkOutcome::Lost(Refusal::FrameBound),
+            ChunkOutcome::Lost(Refusal::Order),
+            ChunkOutcome::Lost(Refusal::Exhausted),
+            ChunkOutcome::Lost(Refusal::Configuration),
+            ChunkOutcome::Read(Vec::new()),
+            ChunkOutcome::Refused(chunk::Status::Stored),
+        ];
+        for outcome in unsendable {
+            let (mut put, chunks) = put_of_copies(4);
+            let failed = put.answer(chunks[0].0, put_answer(Outcome::Chunk(outcome.clone())));
+            assert!(
+                matches!(failed, Err(PutError::Unsendable(_))),
+                "{outcome:?}: {failed:?}"
+            );
+            assert!(put.poll().is_none(), "{outcome:?} sent the chunk on");
+        }
+    }
+
+    /// A put whose chunk is refused for want of room at each beat still ends at its client's
+    /// patience, its refusals no movement of its work, and `bound_jobs` answers it `SlowDown` for
+    /// its patience, not `Unplaced`; an ask answered otherwise is its work moving. Counted as
+    /// movement, each refusal began its patience again, and a put whose room never came waited on.
+    #[test]
+    fn a_put_refused_for_room_at_each_beat_ends_at_its_clients_patience() {
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let (mut put, chunks) = put_of_copies(3);
+        put.answer(chunks[0].0, put::Answer::Busy).unwrap();
+        let mut job = put_job(put);
+        for outcome in room_refusals() {
+            job.answered(&Outcome::Chunk(outcome.clone()), patience);
+            assert_eq!(job.bounded(patience), Bounded::Held, "{outcome:?}");
+            assert_eq!(job.bounded(patience + 1), Bounded::SlowDown, "{outcome:?}");
+        }
+        assert!(job.held() && job.waits_for_room());
+        job.answered(&Outcome::Chunk(ChunkOutcome::Stored), patience);
+        assert_eq!(job.bounded(patience + 1), Bounded::Held);
     }
 
     fn refused(work: &Work) -> Option<Status> {

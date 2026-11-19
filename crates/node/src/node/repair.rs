@@ -33,11 +33,10 @@ use mantle_meta::record::VolumeStanding;
 use mantle_meta::root::{self, Fact, Seen};
 use mantle_meta::wire::{Answer as RangeAnswer, Command};
 
-use super::host::Pending;
+use super::host::{Pending, Taken, taken};
 use super::shard::{self, BlockRead, BlockRows};
 use super::{ChunkOutcome, Node, NodeError, NodeLog, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, Wait};
-use crate::chunk;
 use crate::place;
 
 /// What the service has done and where it stands, as `mantle node` says it (`repair` lines).
@@ -1087,14 +1086,30 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 }
 
 /// A chunk's outcome as a repairer takes it: a read's bytes, or none; a put's storing, or its
-/// refusal, a volume's `Full` told apart.
+/// refusal, a volume's `Full` told apart, each put's outcome by its class ([`taken`]).
 fn chunk_answer(outcome: ChunkOutcome, get: bool) -> Answer {
-    match (outcome, get) {
-        (ChunkOutcome::Read(bytes), true) => Answer::Chunk(Bytes::from(bytes)),
-        (_, true) => Answer::Unreadable,
-        (ChunkOutcome::Stored, false) => Answer::Stored,
-        (ChunkOutcome::Refused(chunk::Status::Full), false) => Answer::Refused { full: true },
-        (_, false) => Answer::Refused { full: false },
+    if get {
+        return match outcome {
+            ChunkOutcome::Read(bytes) => Answer::Chunk(Bytes::from(bytes)),
+            // No bytes from this place, for any cause, room's among them: the repairer reads
+            // another source, as a get reads another place, and takes no copy for lost.
+            ChunkOutcome::Stored | ChunkOutcome::Refused(_) | ChunkOutcome::Lost(_) => {
+                Answer::Unreadable
+            }
+        };
+    }
+    match taken(&outcome) {
+        Taken::Stored => Answer::Stored,
+        Taken::Refused => Answer::Refused { full: false },
+        Taken::Full => Answer::Refused { full: true },
+        // No room now: a repair has no client whose patience would bound a wait, and holds the
+        // operations' memory it took from the host's admission meanwhile (`Running::charge`),
+        // which the host's own puts wait on. It yields: the next volume offered is asked, and a
+        // repair left none ends and its block is planned again at the next pass.
+        Taken::Room => Answer::Refused { full: false },
+        // No volume takes it as it was sent: each offered refuses it alike, the repair ends, and
+        // its block is planned again at the next pass.
+        Taken::Failed => Answer::Refused { full: false },
     }
 }
 
@@ -1103,5 +1118,56 @@ fn command_answer(outcome: CommandOutcome) -> Answer {
     match outcome {
         CommandOutcome::Answered(RangeAnswer::Block(outcome)) => Answer::Block(outcome),
         _ => Answer::Block(block::Outcome::Conflict),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper_transport::Refusal;
+
+    use super::*;
+    use crate::chunk;
+
+    /// A repair's put takes each class of outcome as the host's put does, but yields to room: no
+    /// room now asks the next volume offered rather than waiting, as a refusal does, and a full
+    /// volume is told apart. A read's every outcome but its bytes, room's among them, is no bytes
+    /// from that place, and another source is read.
+    #[test]
+    fn a_repairs_chunk_outcomes_are_taken_by_their_class() {
+        assert_eq!(chunk_answer(ChunkOutcome::Stored, false), Answer::Stored);
+        assert_eq!(
+            chunk_answer(ChunkOutcome::Refused(chunk::Status::Full), false),
+            Answer::Refused { full: true }
+        );
+        for outcome in [
+            ChunkOutcome::Refused(chunk::Status::Busy),
+            ChunkOutcome::Lost(Refusal::Unsent),
+            ChunkOutcome::Lost(Refusal::Stalled),
+            ChunkOutcome::Refused(chunk::Status::Fenced),
+            ChunkOutcome::Lost(Refusal::Closed),
+            ChunkOutcome::Lost(Refusal::FrameBound),
+        ] {
+            assert_eq!(
+                chunk_answer(outcome.clone(), false),
+                Answer::Refused { full: false },
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(
+            chunk_answer(ChunkOutcome::Read(vec![7]), true),
+            Answer::Chunk(Bytes::from(vec![7]))
+        );
+        for outcome in [
+            ChunkOutcome::Refused(chunk::Status::Busy),
+            ChunkOutcome::Lost(Refusal::Budget),
+            ChunkOutcome::Refused(chunk::Status::NotFound),
+            ChunkOutcome::Stored,
+        ] {
+            assert_eq!(
+                chunk_answer(outcome.clone(), true),
+                Answer::Unreadable,
+                "{outcome:?}"
+            );
+        }
     }
 }

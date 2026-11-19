@@ -806,6 +806,16 @@ impl Connection {
         buf: &mut Vec<u8>,
         tx: &mut TransmitState,
     ) -> Fill {
+        // A handshake space without keys has nothing to send, its close included
+        // (`space_can_send`): it is passed before the 1-RTT packet's room is predicted, which asks
+        // the Data space's key for its tag through a trait object, for each space at every
+        // transmission. With the two handshake spaces passed so, `fill_step` went from 16.0% to
+        // 7.8% of the transmit side (macOS `sample` of hyper-transport's `benches/transmit.rs`,
+        // 2026-11-19)
+        if space_id != SpaceId::Data && self.spaces.get(space_id).crypto.is_none() {
+            return Fill::NextSpace;
+        }
+
         // Number of bytes available for frames if this is a 1-RTT packet. We're guaranteed to
         // be able to send an individual frame at least this large in the next 1-RTT
         // packet. This could be generalized to support every space, but it's only needed to

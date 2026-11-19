@@ -1050,6 +1050,14 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// Whether a body moved at the last turn's feeding (`Node::feed_bodies`): the next turn is due
     /// at once, for its job to take what it was given.
     fed: bool,
+    /// The exchange's half of each native reply, written to its exchange from its job's channel
+    /// (node.md §2.9 step 6c, `host::Replies`): one a native request the host took, each ended
+    /// with its exchange or once its reply is written whole, so at most the exchanges the
+    /// transport holds at once.
+    replies: Vec<(ExchangeId, host::Replies)>,
+    /// Whether a reply's rounds ran out at the last turn's writing (`Node::write_replies`) with its
+    /// exchange taking more: the next turn is due at once, for its job to give the next piece.
+    replied: bool,
     /// The native requests the host admitted running on each of the node's shards, the count the
     /// rule places each on (node.md §2.9 step 6, `node::drivers`): over the one shard the node's
     /// task drives every request on, so each is placed on the first, where it runs.
@@ -1531,6 +1539,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             jobs: Vec::new(),
             feeding: Vec::new(),
             fed: false,
+            replies: Vec::new(),
+            replied: false,
             drivers: drivers::Drivers::over(NonZeroUsize::MIN),
             abandoned: Vec::new(),
             repair: None,
@@ -2431,6 +2441,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.take_parked();
         self.step_host()?;
         self.feed_bodies();
+        self.write_replies()?;
         self.observe_presence()?;
         self.step_repair()?;
         self.step_asks(now)?;
@@ -3026,8 +3037,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.read_exchange(exchange)
             }
-            // A job's body is read, and its bytes written, at the host's turn.
-            Event::BodyReady { exchange } if self.job_on(exchange).is_some() => Ok(()),
+            // A job's body is read, and its reply written, at the host's turn.
+            Event::BodyReady { exchange } if self.hosts(exchange) => Ok(()),
             Event::BodyReady { exchange } => self.read_exchange(exchange),
             Event::Reply { exchange, body } => {
                 if self.chunks_out.iter().any(|c| c.exchange == exchange) {
@@ -3074,7 +3085,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.keep_pool();
                 Ok(())
             }
-            Event::Writable { exchange } if self.job_on(exchange).is_some() => Ok(()),
+            Event::Writable { exchange } if self.hosts(exchange) => Ok(()),
             Event::Writable { exchange } => {
                 self.write_exchange(exchange);
                 Ok(())

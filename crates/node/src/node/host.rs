@@ -13,9 +13,10 @@
 //! write's at the Name range's commit (05 §2).
 //!
 //! A put's body comes on a bounded channel as its door gives it, a native exchange's by the node's
-//! task (node.md §2.9 step 6c), only as fast as the driver takes it, a piece at a time, and a get's
-//! bytes are taken from its driver only as fast as the exchange takes them, so what an operation
-//! holds is its driver's window of blocks and a piece or two. The operations the host runs at once
+//! task (node.md §2.9 step 6c), only as fast as the driver takes it, a piece at a time, and a reply
+//! goes on a bounded channel its door writes from, a native exchange's by the node's task, a get's
+//! bytes taken from its driver only as fast as the door takes them, so what an operation holds is
+//! its driver's window of blocks and a piece or two. The operations the host runs at once
 //! are bounded (`GatewaySettings::objects`); one past them is answered `SlowDown`.
 
 use std::collections::VecDeque;
@@ -223,7 +224,7 @@ impl Job {
         }
         let bound = self.bound_ns();
         Some(match self.door {
-            Door::Exchange(_) | Door::Fed(..) => bound.min(now.saturating_add(beat)),
+            Door::Native(..) => bound.min(now.saturating_add(beat)),
             Door::Local(_) => bound,
         })
     }
@@ -233,16 +234,20 @@ impl Job {
     fn working(&self) -> bool {
         !matches!(
             self.work,
-            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_)
+            Work::Fields(..) | Work::Draining(_) | Work::Answering(_)
         )
     }
 }
 
 /// What the host keeps of one native put or get beside its charge, by design: its job, and the
-/// work it boxes, a put's or a get's whichever is larger, its driver inline in it
-/// (`derive::native`).
+/// work it boxes, a put's or a get's whichever is larger, its driver inline in it; and its reply's
+/// door, the job's end and the node's task's, and what the two share (`derive::native`).
 pub(crate) fn record_bytes() -> Option<usize> {
-    size_of::<Job>().checked_add(size_of::<Putting>().max(size_of::<Getting>()))
+    size_of::<Job>()
+        .checked_add(size_of::<Putting>().max(size_of::<Getting>()))?
+        .checked_add(size_of::<Native>())?
+        .checked_add(size_of::<(ExchangeId, Replies)>())?
+        .checked_add(size_of::<Handed>())
 }
 
 /// What a held job's bound makes of it at a turn (research/77 D2).
@@ -258,12 +263,11 @@ enum Bounded {
 
 /// Where a job's operation came in: its body is read and its reply written there.
 enum Door {
-    /// A native exchange, the operation's fields at its body's start (`mantle_protocol::object`).
-    Exchange(ExchangeId),
-    /// A native exchange whose fields were read and whose put's body the node's task gives from
-    /// it ([`Feeding`], node.md §2.9 step 6c), as the S3 listener gives a local door's: the job
-    /// takes its pieces from the channel and writes its reply to the exchange.
-    Fed(ExchangeId, Box<Pieces>),
+    /// A native exchange (`mantle_protocol::object`), the operation's fields at its body's start,
+    /// read from it at the job's turns; then a put's body given by the node's task ([`Feeding`]) and
+    /// the reply written by the node's task ([`Replies`]), each from a bounded channel, as the S3
+    /// listener gives a local door's body and writes its reply (node.md §2.9 step 6c).
+    Native(ExchangeId, Box<Native>),
     /// The S3 listener's, in-process (`crate::door`).
     Local(Box<Local>),
 }
@@ -273,9 +277,407 @@ impl Door {
     /// S3 listener's.
     fn exchange(&self) -> Option<ExchangeId> {
         match self {
-            Self::Exchange(exchange) | Self::Fed(exchange, _) => Some(*exchange),
+            Self::Native(exchange, _) => Some(*exchange),
             Self::Local(_) => None,
         }
+    }
+}
+
+/// A native job's ends of its exchange's channels (node.md §2.9 step 6c): a put's body as the
+/// node's task gives it, and its reply as the job gives it, which the node's task writes, with what
+/// the two share beside it ([`Handed`]). The job touches nothing of the node's but these: the bytes
+/// it moves it counts here, which the host's step takes as a value (`Node::step_host`).
+struct Native {
+    /// A put's body, once its fields named one.
+    body: Option<Pieces>,
+    reply: Sender<Told>,
+    /// Answers the reply's channel had no room for, sent before any other, in order. A piece is
+    /// given only once the last is written whole, so these are at most the reply's end behind its
+    /// last piece.
+    pending: VecDeque<Told>,
+    handed: std::sync::Arc<Handed>,
+    /// Bytes of its body taken and of its reply given since the host's step last took them.
+    moved: u64,
+}
+
+/// What a native job tells the node's task to write to its exchange, in order, as an S3 job tells
+/// its connection (`door::Answer`): its reply's head and the fields that open its body, then a
+/// get's pieces and its end.
+enum Told {
+    /// A reply with no bytes past its fields, written once the request's body is read whole and
+    /// dropped, so the exchange ends whole (`Arriving::Redirect`'s reason), and the exchange ended
+    /// once its fields are written.
+    Reply(Box<Opening>),
+    /// A get's reply, held until its driver had the range's first bytes: its head now, its pieces
+    /// to follow.
+    Head(Box<Opening>),
+    /// A get's bytes, in order, as its driver gave them.
+    Bytes(Bytes),
+    /// Every byte given and written: the exchange ends.
+    End,
+    /// The get's driver failed past its head: the exchange ends unfinished, which its asker hears
+    /// as the exchange refused, not as bytes it could take for the object's.
+    Failed,
+}
+
+/// A reply's head and the fields that open its body (`Reply::encode`), the job's work; the bytes of
+/// the body past the fields, a get's range and none for any other reply, which the head's body
+/// length counts (`Endpoint::reply`); and the cause of a `SlowDown`, which the node counts as the
+/// reply goes, as the listener counts the S3 door's.
+struct Opening {
+    head: Vec<u8>,
+    fields: Bytes,
+    body: u64,
+    slowed: Option<door::Slowed>,
+}
+
+/// What a native job and the node's task share of its reply beside its channel, each an atomic that
+/// needs no lock, as the S3 door's connections tell the host what they wrote (`door::Learned`): the
+/// fields and pieces the job gave that the node's task has yet to write whole, past which the job
+/// gives none, so a get holds one piece taken from its driver, as it held one while its job wrote
+/// its exchange (`derive::Charges`: "a get's block taken and written out"); and whether its work is
+/// held, which the node's task tells the exchange's asker (`Endpoint::working`, research/77 D1).
+/// And whether the node's task let go of the reply, its exchange ended or refused, so a job waiting
+/// for what it gave to be written ends.
+#[derive(Default)]
+struct Handed {
+    unwritten: std::sync::atomic::AtomicUsize,
+    held: std::sync::atomic::AtomicBool,
+    gone: std::sync::atomic::AtomicBool,
+}
+
+impl Native {
+    /// Sends what waits, in order: whether the door takes more now.
+    fn flush(&mut self) -> Sent {
+        flush(&self.reply, &mut self.pending)
+    }
+
+    /// Sends `told` after what waits, or holds it behind them.
+    fn offer(&mut self, told: Told) -> Sent {
+        self.pending.push_back(told);
+        self.flush()
+    }
+
+    /// Gives fields or a piece the node's task writes: counted unwritten until it is written whole.
+    fn give(&mut self, told: Told) -> Sent {
+        self.handed
+            .unwritten
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.offer(told)
+    }
+
+    /// Whether every field and piece it gave is written whole, and nothing waits: the next may be
+    /// taken from its driver.
+    fn written(&self) -> bool {
+        self.pending.is_empty()
+            && self
+                .handed
+                .unwritten
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+    }
+
+    /// Whether the node's task let go of its reply: nothing it gives will be written.
+    fn gone(&self) -> bool {
+        self.handed.gone.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Says its work is held: the node's task vouches for it at its next write.
+    fn held(&self) {
+        self.handed
+            .held
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// What a get's door takes its bytes from: its driver (`Get`), or a test's.
+trait Source {
+    /// The next of its bytes, in order, once ready.
+    fn take(&mut self) -> Option<Bytes>;
+    /// Whether it ended whole, once it ended.
+    fn ended(&self) -> Option<bool>;
+}
+
+impl Source for Get {
+    fn take(&mut self) -> Option<Bytes> {
+        Get::take(self)
+    }
+
+    fn ended(&self) -> Option<bool> {
+        self.outcome().map(Result::is_ok)
+    }
+}
+
+/// What became of a native get's turn at its door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gave {
+    /// It waits: for the node's task to write what it gave, or for its driver.
+    Waits,
+    /// Its end is given, or its door is gone.
+    Over,
+    /// Its end waits for room on the channel.
+    Ending,
+}
+
+/// A native get's bytes given to its door from `source`, `written` of its `total` given so far: a
+/// piece only once the node's task wrote the last whole (`Native::written`), so the get holds one
+/// piece past its driver's window, as when its job wrote its exchange, and the node's task asks for
+/// the next within its turn while the exchange takes more (`Node::write_replies`); then its end, or
+/// its failure past its head, once every piece ready was given.
+fn give_native(
+    native: &mut Native,
+    source: &mut impl Source,
+    written: &mut u64,
+    total: u64,
+) -> Gave {
+    match native.flush() {
+        Sent::Taken if native.gone() => return Gave::Over,
+        Sent::Taken => {}
+        Sent::Held => return Gave::Waits,
+        Sent::Gone => return Gave::Over,
+    }
+    if !native.written() {
+        return Gave::Waits;
+    }
+    if let Some(bytes) = source.take() {
+        let took = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        *written = written.saturating_add(took);
+        native.moved = native.moved.saturating_add(took);
+        return match native.give(Told::Bytes(bytes)) {
+            Sent::Gone => Gave::Over,
+            Sent::Taken | Sent::Held => Gave::Waits,
+        };
+    }
+    let last = match source.ended() {
+        Some(true) if *written >= total => Told::End,
+        // The driver failed past the reply's head: the exchange ends unfinished.
+        Some(false) => Told::Failed,
+        _ => return Gave::Waits,
+    };
+    match native.offer(last) {
+        Sent::Held => Gave::Ending,
+        Sent::Taken | Sent::Gone => Gave::Over,
+    }
+}
+
+/// A native exchange's door, made as the host takes its request: the job's ends, and the node's
+/// task's ([`Replies`]); none where the reply's channel cannot be made.
+fn native_door() -> Option<(Native, Replies)> {
+    let (reply, told) = hyper_rt::sync::channel(door::Replying::FIRST_ANSWERS).ok()?;
+    let handed = std::sync::Arc::new(Handed::default());
+    Some((
+        Native {
+            body: None,
+            reply,
+            pending: VecDeque::new(),
+            handed: std::sync::Arc::clone(&handed),
+            moved: 0,
+        },
+        Replies {
+            told,
+            handed,
+            drained: None,
+            out: None,
+        },
+    ))
+}
+
+/// A native job's reply as the node's task writes it to the exchange (node.md §2.9 step 6c), the
+/// exchange's half of what the S3 listener does for a local door's reply: each answer taken from
+/// the job's channel in order and written, a reply's head with its body's length
+/// (`Endpoint::reply`), then its fields and a get's pieces as the job gave them
+/// (`Endpoint::write_body_bytes`, no copy), then its end; a reply with no bytes past its fields
+/// written once the request's body is read whole, after its feeding (`Node::feed_body`); and the
+/// job's word that its work is held passed to the exchange's asker. The channel holds one
+/// answer, the least that moves a reply (`door::Replying::FIRST_ANSWERS`), and the job gives a
+/// piece only once the last is written whole ([`Handed`]), so a full exchange holds the job, and
+/// the client, whose stream's flow control it is, holds both.
+pub(crate) struct Replies {
+    told: ChannelReceiver<Told>,
+    handed: std::sync::Arc<Handed>,
+    /// A reply taken that waits for the request's body to be read whole.
+    drained: Option<Box<Opening>>,
+    /// Bytes taken and not yet written whole, and what follows once they are.
+    out: Option<(Bytes, After)>,
+}
+
+/// What follows bytes of a reply written whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum After {
+    /// A get's fields, before its pieces.
+    Fields,
+    /// A get's piece, which its job counted moved as it gave it.
+    Piece,
+    /// A reply's fields, its last bytes: the exchange ends.
+    End,
+}
+
+/// What became of a native reply the node's task wrote at a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrote {
+    /// Nothing more now: the exchange takes no more, or the job gave nothing more.
+    Still,
+    /// Everything given is written whole and the exchange takes more: its job may give the next.
+    More,
+    /// A reply waits for the request's body, read whole and dropped.
+    Draining,
+    /// The exchange ended, or was refused, or its job let go with nothing more to write.
+    Over,
+}
+
+/// The exchange a native reply is written to: the node's endpoint, or a test's.
+trait Exchange {
+    /// Answers with `head` and a body of `body` bytes; false where the exchange is gone.
+    fn reply(&mut self, head: &[u8], body: u64) -> bool;
+    /// Writes `bytes` as they are, kept by reference: how many it took, none where it is gone.
+    fn write(&mut self, bytes: &Bytes) -> Option<usize>;
+    fn end(&mut self);
+    /// Ends it unfinished.
+    fn refuse(&mut self);
+    /// Tells its asker the work for it is held.
+    fn working(&mut self);
+}
+
+/// A native exchange on the node's endpoint.
+struct Toward<'a> {
+    endpoint: &'a mut hyper_transport::Endpoint<
+        mantle_protocol::classes::NodeClasses,
+        hyper_transport::Fixed,
+        crate::directory::Peers,
+    >,
+    exchange: ExchangeId,
+}
+
+impl Exchange for Toward<'_> {
+    fn reply(&mut self, head: &[u8], body: u64) -> bool {
+        self.endpoint.reply(self.exchange, head, Some(body)).is_ok()
+    }
+
+    fn write(&mut self, bytes: &Bytes) -> Option<usize> {
+        self.endpoint.write_body_bytes(self.exchange, bytes).ok()
+    }
+
+    fn end(&mut self) {
+        self.endpoint.end(self.exchange);
+    }
+
+    fn refuse(&mut self) {
+        self.endpoint
+            .refuse_exchange(self.exchange, Refusal::Closed);
+    }
+
+    fn working(&mut self) {
+        self.endpoint.working(self.exchange);
+    }
+}
+
+impl Drop for Replies {
+    /// Tells the job its reply is let go of, so one waiting for what it gave to be written ends.
+    fn drop(&mut self) {
+        self.handed
+            .gone
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Replies {
+    /// Whether a reply waits for the request's body.
+    fn draining(&self) -> bool {
+        self.drained.is_some()
+    }
+
+    /// Writes what the job gave, in order, as far as `to` takes it, the request's body read whole
+    /// where `body_read`: the fields' bytes counted `moved`, and a `SlowDown` counted in `slowed`
+    /// for its cause as it goes. Each pass writes an answer whole or ends, and the job gives the
+    /// next only once the last is written whole, so a pass takes at most the channel's one answer
+    /// and the end behind it.
+    fn write(
+        &mut self,
+        to: &mut impl Exchange,
+        body_read: bool,
+        moved: &mut u64,
+        slowed: &mut [u64],
+    ) -> Wrote {
+        if self
+            .handed
+            .held
+            .swap(false, std::sync::atomic::Ordering::Acquire)
+        {
+            to.working();
+        }
+        let mut whole = false;
+        // The answer held, the channel's one, and the end behind it.
+        for _ in 0..door::Replying::FIRST_ANSWERS.saturating_add(2) {
+            if let Some(opening) = self.drained.take() {
+                if !body_read {
+                    self.drained = Some(opening);
+                    return Wrote::Draining;
+                }
+                let length = u64::try_from(opening.fields.len()).unwrap_or(u64::MAX);
+                if !to.reply(&opening.head, length) {
+                    return Wrote::Over;
+                }
+                if let Some(count) = opening
+                    .slowed
+                    .and_then(|cause| slowed.get_mut(cause.index()))
+                {
+                    *count = count.saturating_add(1);
+                }
+                self.out = Some((opening.fields, After::End));
+            }
+            if let Some((bytes, then)) = self.out.take() {
+                if !bytes.is_empty() {
+                    let Some(took) = to.write(&bytes) else {
+                        to.refuse();
+                        return Wrote::Over;
+                    };
+                    if then != After::Piece {
+                        *moved = moved.saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
+                    }
+                    if took < bytes.len() {
+                        self.out = Some((bytes.slice(took..), then));
+                        return Wrote::Still;
+                    }
+                }
+                if then == After::End {
+                    to.end();
+                    return Wrote::Over;
+                }
+                self.handed
+                    .unwritten
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                whole = true;
+            }
+            match self.told.try_recv() {
+                Ok(Some(Told::Reply(opening))) => self.drained = Some(opening),
+                Ok(Some(Told::Head(opening))) => {
+                    let Opening {
+                        head, fields, body, ..
+                    } = *opening;
+                    let length = u64::try_from(fields.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(body);
+                    if !to.reply(&head, length) {
+                        return Wrote::Over;
+                    }
+                    self.out = Some((fields, After::Fields));
+                }
+                Ok(Some(Told::Bytes(bytes))) => self.out = Some((bytes, After::Piece)),
+                Ok(Some(Told::End)) => {
+                    to.end();
+                    return Wrote::Over;
+                }
+                Ok(Some(Told::Failed)) => {
+                    to.refuse();
+                    return Wrote::Over;
+                }
+                Ok(None) if whole => return Wrote::More,
+                Ok(None) => return Wrote::Still,
+                // The job let go with nothing more to write: the exchange is left as it left it.
+                Err(_) => return Wrote::Over,
+            }
+        }
+        Wrote::Still
     }
 }
 
@@ -495,20 +897,25 @@ enum Sent {
     Gone,
 }
 
+/// Sends what waits on `reply`, in order: whether it takes more now.
+fn flush<T>(reply: &Sender<T>, pending: &mut VecDeque<T>) -> Sent {
+    while let Some(answer) = pending.pop_front() {
+        match reply.try_send(answer) {
+            Ok(()) => {}
+            Err(SyncError::Full(answer)) => {
+                pending.push_front(answer);
+                return Sent::Held;
+            }
+            Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => return Sent::Gone,
+        }
+    }
+    Sent::Taken
+}
+
 impl Local {
     /// Sends what waits, in order: whether the door takes more now.
     fn flush(&mut self) -> Sent {
-        while let Some(answer) = self.pending.pop_front() {
-            match self.reply.try_send(answer) {
-                Ok(()) => {}
-                Err(SyncError::Full(answer)) => {
-                    self.pending.push_front(answer);
-                    return Sent::Held;
-                }
-                Err(SyncError::Closed(_) | SyncError::NotOnShardThread(_)) => return Sent::Gone,
-            }
-        }
-        Sent::Taken
+        flush(&self.reply, &mut self.pending)
     }
 
     /// Sends `answer` after what waits, or holds it behind them.
@@ -521,13 +928,12 @@ impl Local {
 enum Work {
     /// The request's fields being read from its body's start: the head, the fields so far.
     Fields(Head, Vec<u8>),
-    /// A request refused or done: what is left of its body read and dropped, then the reply, so
-    /// the exchange ends whole (`Arriving::Redirect`'s reason). Boxed: a reply is many times any
-    /// other job's state.
+    /// A request refused or done: its reply, which goes once what is left of its body is read and
+    /// dropped, so the exchange ends whole (`Arriving::Redirect`'s reason). Boxed: a reply is many
+    /// times any other job's state.
     Draining(Box<Reply>),
-    /// A reply's head sent: the fields that open its body, and how much of them is written.
-    Replying(Vec<u8>, usize),
-    /// A local operation's last answers going out, in order: its reply and its end, or its end.
+    /// An operation's last answers going out, in order: a local one's its reply and its end, or
+    /// its end; a native one's wait in its door.
     Answering(VecDeque<door::Answer>),
     /// CreateBucket or DeleteBucket, through the bucket's coordinator.
     Bucket(Box<Coordinating>),
@@ -786,9 +1192,7 @@ struct Getting {
     /// cannot be read before any byte goes is answered with a typed refusal rather than a reply
     /// begun and cut (docs/design/repair.md §6); none once sent.
     held: Option<Box<Reply>>,
-    /// Plaintext taken from the driver and not yet written to the exchange.
-    out: Option<(Bytes, usize)>,
-    /// Bytes of the reply's body written so far, and the body's length.
+    /// Bytes of the range given to the door so far, and the range's length.
     written: u64,
     total: u64,
     waiting: VecDeque<(u64, get::Request)>,
@@ -1540,6 +1944,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .refuse_exchange(exchange, Refusal::Identity);
             return;
         };
+        // Its reply goes on a channel the node's task writes from (node.md §2.9 step 6c): one that
+        // cannot be made leaves nothing to reply on, so the exchange is refused, as an owner past
+        // what it holds refuses one, which its asker asks again after.
+        let Some((native, replies)) = native_door() else {
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::Budget);
+            return;
+        };
         let mut admitted_ns = None;
         let mut driven = None;
         let work = match (head, self.gateway.as_ref(), slowed) {
@@ -1567,8 +1980,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         {
             admission.admitted(charge);
         }
+        self.replies.push((exchange, replies));
         self.jobs.push(Job {
-            door: Door::Exchange(exchange),
+            door: Door::Native(exchange, Box::new(native)),
             principal,
             work,
             pending: Vec::new(),
@@ -1917,9 +2331,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return Ok(true);
         };
         // A local operation comes typed, never as fields to read.
-        let Door::Exchange(exchange) = job.door else {
+        let Door::Native(exchange, _) = &job.door else {
             return Ok(true);
         };
+        let exchange = *exchange;
         let Work::Fields(head, fields) = &mut job.work else {
             return Ok(false);
         };
@@ -1978,10 +2393,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     work(op, carry, block)
                 }
             };
-            if let Work::Put(putting) = &mut job.work {
+            if let (Work::Put(putting), Door::Native(_, native)) = (&mut job.work, &mut job.door) {
                 match feed(putting) {
                     Ok((feeding, pieces)) => {
-                        job.door = Door::Fed(exchange, Box::new(pieces));
+                        native.body = Some(pieces);
                         self.feeding.push((exchange, feeding));
                     }
                     Err(reply) => job.work = Work::Draining(reply),
@@ -2094,38 +2509,152 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let mut slowest: Option<(u64, &'static Label)> = None;
         let mut at = 0;
         while at < self.jobs.len() {
-            // Bytes of its own body read or of its reply written are its work moving, as its
-            // asks answered are.
-            let before = self.moved;
-            let label = self.jobs.get(at).and_then(|job| job.label);
-            let began = hyper_rt::futures::now_ns();
-            let over = self.step_job(at)?;
-            let held = hyper_rt::futures::now_ns().saturating_sub(began);
-            if let Some(label) = label
-                && slowest.is_none_or(|(most, _)| held >= most)
-            {
-                slowest = Some((held, label));
-            }
-            if self.moved != before
-                && let Some(job) = self.jobs.get_mut(at)
-            {
-                job.moved_ns = hyper_rt::futures::now_ns();
-            }
-            if over {
-                // What it still waits on is let go: an ended get's chunks still out, say.
-                let job = self.jobs.swap_remove(at);
-                self.ended(job.admitted_ns, job.charge);
-                if let Some(shard) = job.driven {
-                    self.drivers.ended(shard);
-                }
-                self.abandoned
-                    .extend(job.pending.into_iter().map(|(pending, _)| pending));
-            } else {
+            if !self.turn_job(at, &mut slowest)? {
                 at = at.saturating_add(1);
             }
         }
         labels::set(slowest.map(|(_, label)| label));
         Ok(())
+    }
+
+    /// Job `at`'s step at a turn, the longest step's time and label kept in `slowest`; whether it
+    /// is over, and so let go. Bytes of its own body taken or of its reply given are its work
+    /// moving, as its asks answered are: a native job counts them in its door, taken here as a
+    /// value into the node's count (node.md §2.9 step 6c).
+    fn turn_job(
+        &mut self,
+        at: usize,
+        slowest: &mut Option<(u64, &'static Label)>,
+    ) -> Result<bool, NodeError> {
+        let before = self.moved;
+        let label = self.jobs.get(at).and_then(|job| job.label);
+        let began = hyper_rt::futures::now_ns();
+        let over = self.step_job(at)?;
+        let held = hyper_rt::futures::now_ns().saturating_sub(began);
+        if let Some(label) = label
+            && slowest.is_none_or(|(most, _)| held >= most)
+        {
+            *slowest = Some((held, label));
+        }
+        if let Some(Job {
+            door: Door::Native(_, native),
+            ..
+        }) = self.jobs.get_mut(at)
+        {
+            self.moved = self.moved.saturating_add(std::mem::take(&mut native.moved));
+        }
+        if self.moved != before
+            && let Some(job) = self.jobs.get_mut(at)
+        {
+            job.moved_ns = hyper_rt::futures::now_ns();
+        }
+        if over {
+            // What it still waits on is let go: an ended get's chunks still out, say.
+            let job = self.jobs.swap_remove(at);
+            self.ended(job.admitted_ns, job.charge);
+            if let Some(shard) = job.driven {
+                self.drivers.ended(shard);
+            }
+            self.abandoned
+                .extend(job.pending.into_iter().map(|(pending, _)| pending));
+        }
+        Ok(over)
+    }
+
+    /// The node's task's half of each native reply (node.md §2.9 step 6c): what its job gave
+    /// written to its exchange as far as the exchange takes it, after the host's step and the
+    /// bodies' feeding at each turn ([`Replies`]). A get's job gives a piece only once the last is
+    /// written whole, so where one is and the exchange takes more, its job gives the next within
+    /// the turn: as many of its pieces go in a turn as the exchange takes, as when its job wrote
+    /// them, at most a window's (`GatewaySettings::window`, the blocks its driver holds read at
+    /// once) and the end past them. One whose rounds ran out makes the next turn due at once. One
+    /// over, ended, refused or let go, is let go.
+    pub(super) fn write_replies(&mut self) -> Result<(), NodeError> {
+        self.replied = false;
+        let rounds = self
+            .gateway
+            .as_ref()
+            .map_or(0, |gateway| gateway.window)
+            .saturating_add(2);
+        let mut at = 0;
+        while at < self.replies.len() {
+            let mut left = rounds;
+            let over = loop {
+                match self.write_reply(at) {
+                    Wrote::Over => break true,
+                    Wrote::Still | Wrote::Draining => break false,
+                    Wrote::More => {
+                        left = left.saturating_sub(1);
+                        if left == 0 {
+                            self.replied = true;
+                            break false;
+                        }
+                        let exchange = self.replies.get(at).map(|(exchange, _)| *exchange);
+                        let job = self
+                            .jobs
+                            .iter()
+                            .position(|job| exchange.is_some() && job.door.exchange() == exchange);
+                        // A job that ended gave all it will: the next write finds its channel
+                        // ended.
+                        if let Some(job) = job {
+                            self.turn_job(job, &mut None)?;
+                        }
+                    }
+                }
+            };
+            if over {
+                self.replies.swap_remove(at);
+            } else {
+                at = at.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// One native reply written as far as its exchange takes it: a reply with no bytes past its
+    /// fields once the request's body is read whole and dropped, after its feeding, as `drain_job`
+    /// wrote one; what else its job gave as it comes.
+    fn write_reply(&mut self, at: usize) -> Wrote {
+        let Some(exchange) = self.replies.get(at).map(|(exchange, _)| *exchange) else {
+            return Wrote::Over;
+        };
+        let mut body_read = false;
+        // A reply taken, then its body read: the second pass writes it.
+        for _ in 0..2 {
+            if self.replies.get(at).is_some_and(|(_, r)| r.draining()) {
+                // A body the node's task reads for the job is read and dropped there.
+                if self.feeding.iter().any(|(fed, _)| *fed == exchange) {
+                    return Wrote::Still;
+                }
+                if self.drop_body(exchange) == Fed::Still {
+                    return Wrote::Still;
+                }
+                // Its asker is gone: nothing to answer.
+                if !self.driver.endpoint().body_complete(exchange) {
+                    return Wrote::Over;
+                }
+                body_read = true;
+            }
+            let Self {
+                replies,
+                driver,
+                moved,
+                slowed,
+                ..
+            } = self;
+            let Some((_, replies)) = replies.get_mut(at) else {
+                return Wrote::Over;
+            };
+            let mut toward = Toward {
+                endpoint: driver.endpoint(),
+                exchange,
+            };
+            match replies.write(&mut toward, body_read, moved, slowed) {
+                Wrote::Draining => {}
+                wrote => return wrote,
+            }
+        }
+        Wrote::Draining
     }
 
     /// The exchange's half of each native put's body (node.md §2.9 step 6c): read from its exchange
@@ -2301,9 +2830,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
             match job.bounded(now) {
                 Bounded::SlowDown => self.slow_job(at, door::Slowed::Patience)?,
+                // The job says so on its door, and the node's task tells its exchange's asker
+                // (`Replies::write`).
                 Bounded::Held => {
-                    if let Some(exchange) = job.door.exchange() {
-                        self.driver.endpoint().working(exchange);
+                    if let Door::Native(_, native) = &job.door {
+                        native.held();
                     }
                 }
                 Bounded::Unvouched => {}
@@ -2320,8 +2851,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match job.work {
             Work::Fields(..) => self.read_fields(at),
             Work::Draining(_) => self.drain_job(at),
-            Work::Replying(..) => self.write_fields(at),
-            Work::Answering(_) => self.answer_local(at),
+            Work::Answering(_) => self.answer_door(at),
             Work::Bucket(_) => self.step_bucket(at),
             Work::Put(_) => self.step_put(at),
             Work::Get(_) => self.step_get(at),
@@ -2385,7 +2915,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         job.moved_ns = hyper_rt::futures::now_ns();
         let principal = job.principal.clone();
         match &mut job.work {
-            Work::Fields(..) | Work::Draining(_) | Work::Replying(..) | Work::Answering(_) => {}
+            Work::Fields(..) | Work::Draining(_) | Work::Answering(_) => {}
             // A native upload opened: its ID, and its progress, every run but the last as long
             // as the plan made it.
             Work::Command(commanding) if matches!(commanding.then, Then::Open { .. }) => {
@@ -3117,10 +3647,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 })
             }
-            // A native put's pieces come as its exchange delivers them, at no connection's pace.
-            Door::Fed(_, body) => take_body(body, putting, moved, |_| {}),
-            // A native request's fields are read before its put is made, which takes its body.
-            Door::Exchange(_) => Ok(()),
+            // A native put's pieces come as its exchange delivers them, at no connection's pace,
+            // and their bytes are counted in its door. Its fields are read before its put is made,
+            // which takes its body.
+            Door::Native(_, native) => {
+                let Native { body, moved, .. } = &mut **native;
+                match body.as_mut() {
+                    Some(body) => take_body(body, putting, moved, |_| {}),
+                    None => Ok(()),
+                }
+            }
         };
         match fed {
             Ok(()) => Ok(()),
@@ -3369,36 +3905,30 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(reply) = getting.held.take() else {
             return Ok(None);
         };
-        let length = getting.total;
-        let exchange = match door {
-            Door::Exchange(exchange) | Door::Fed(exchange, _) => *exchange,
-            // The reply goes first, its bytes after it as the driver gives them.
-            Door::Local(local) => {
-                if local.offer(door::Answer::Head(reply)) == Sent::Gone {
+        // The reply goes first, its bytes after it as the driver gives them.
+        let sent = match door {
+            Door::Local(local) => local.offer(door::Answer::Head(reply)),
+            // Natively its fields open the body, ahead of the range's bytes, which the head's
+            // length counts as the node's task writes it.
+            Door::Native(_, native) => {
+                let Ok((head, fields)) = reply.encode() else {
                     self.fail_job(at, Status::Failed)?;
                     return Ok(Some(false));
-                }
-                return Ok(None);
+                };
+                native.give(Told::Head(Box::new(Opening {
+                    head,
+                    fields: Bytes::from(fields),
+                    body: getting.total,
+                    slowed: None,
+                })))
             }
         };
-        let Ok((head, fields)) = reply.encode() else {
+        if sent == Sent::Gone {
+            // Its asker is gone: the job ends with its exchange.
             self.fail_job(at, Status::Failed)?;
             return Ok(Some(false));
-        };
-        // The fields open the body, ahead of the range's bytes.
-        let total = u64::try_from(fields.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(length);
-        getting.total = total;
-        getting.out = Some((Bytes::from(fields), 0));
-        match self.driver.endpoint().reply(exchange, &head, Some(total)) {
-            Ok(()) => Ok(None),
-            // Its asker is gone: the job ends with its exchange.
-            Err(_) => {
-                self.fail_job(at, Status::Failed)?;
-                Ok(Some(false))
-            }
         }
+        Ok(None)
     }
 
     /// A get's or head's turn: its current version read first; then a get's driver's requests
@@ -3465,9 +3995,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(false)
     }
 
-    /// Writes a get's bytes as far as its exchange takes them, taking more from the driver as the
-    /// last is written; whether the get is over: every byte written, or its driver or exchange
-    /// failed, which ends the exchange unfinished.
+    /// Gives a get's bytes to its door as far as it takes them, taking more from the driver as the
+    /// last is taken, then its end; whether the get is over: every byte given and its end, or its
+    /// driver failed, which ends the exchange unfinished, or its door is gone.
     fn write_get(&mut self, at: usize) -> Result<bool, NodeError> {
         if let Some(over) = self.send_held(at)? {
             return Ok(over);
@@ -3481,8 +4011,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(get) = getting.get.as_mut() else {
             return Ok(false);
         };
-        let exchange = match &mut job.door {
-            Door::Exchange(exchange) | Door::Fed(exchange, _) => *exchange,
+        match &mut job.door {
+            Door::Native(_, native) => {
+                match give_native(native, get, &mut getting.written, getting.total) {
+                    Gave::Waits => Ok(false),
+                    Gave::Over => Ok(true),
+                    Gave::Ending => {
+                        // The last answer waits for room: the job sends it before it ends.
+                        job.work = Work::Answering(VecDeque::new());
+                        Ok(false)
+                    }
+                }
+            }
             Door::Local(local) => {
                 // Every piece this turn sends carries the turn, the one held from the last turn's
                 // among them: the node learns the reply's depth from the time between turns its
@@ -3522,51 +4062,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     job.work = Work::Answering(VecDeque::new());
                     return Ok(false);
                 }
-                return Ok(true);
-            }
-        };
-        let endpoint = self.driver.endpoint();
-        loop {
-            if getting.out.is_none() {
-                getting.out = get.take().map(|bytes| (bytes, 0));
-            }
-            let Some((bytes, written)) = getting.out.as_mut() else {
-                break;
-            };
-            let Some(rest) = bytes.get(*written..) else {
-                getting.out = None;
-                continue;
-            };
-            if rest.is_empty() {
-                getting.out = None;
-                continue;
-            }
-            match endpoint.write_body(exchange, rest) {
-                Ok(0) => return Ok(false),
-                Ok(took) => {
-                    let took_bytes = u64::try_from(took).unwrap_or(u64::MAX);
-                    *written = written.saturating_add(took);
-                    getting.written = getting.written.saturating_add(took_bytes);
-                    self.moved = self.moved.saturating_add(took_bytes);
-                }
-                Err(_) => {
-                    endpoint.refuse_exchange(exchange, Refusal::Closed);
-                    return Ok(true);
-                }
-            }
-        }
-        match get.outcome() {
-            Some(Ok(())) if getting.written >= getting.total => {
-                endpoint.end(exchange);
                 Ok(true)
             }
-            // The driver failed past the reply's head: the exchange ends unfinished, which its
-            // asker hears as the exchange refused, not as bytes it could take for the object's.
-            Some(Err(_)) => {
-                endpoint.refuse_exchange(exchange, Refusal::Closed);
-                Ok(true)
-            }
-            _ => Ok(false),
         }
     }
 
@@ -4879,7 +5376,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         match self.jobs.get(at).map(|job| &job.work) {
             None => Ok(true),
             Some(Work::Draining(_)) => self.drain_job(at),
-            Some(Work::Answering(_)) => self.answer_local(at),
+            Some(Work::Answering(_)) => self.answer_door(at),
             Some(_) => Ok(false),
         }
     }
@@ -4905,137 +5402,75 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.abandoned = abandoned;
     }
 
-    /// A draining job's turn: its body read to its end and dropped, then its reply; whether it is
-    /// over.
+    /// A draining job's turn: its reply given to its door, which goes once what is left of its
+    /// body is read and dropped; whether it is over: the reply given, or its door gone.
     fn drain_job(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let exchange = match job.door {
-            Door::Exchange(exchange) => exchange,
-            // A put's body the node's task gives from the exchange: let go of, so the node's task
-            // reads and drops the rest (`Node::feed_body`).
-            Door::Fed(exchange, _) => {
-                job.door = Door::Exchange(exchange);
-                exchange
+        let Work::Draining(reply) =
+            std::mem::replace(&mut job.work, Work::Answering(VecDeque::new()))
+        else {
+            return Ok(false);
+        };
+        match &mut job.door {
+            // A put's body the node's task gives from the exchange is let go of, so the node's
+            // task reads and drops the rest (`Node::feed_body`); the reply goes after it, the body
+            // whole (`Node::write_reply`). A native request answered `SlowDown` is counted for its
+            // cause as it goes, as the listener counts the S3 door's.
+            Door::Native(_, native) => {
+                native.body = None;
+                let Ok((head, fields)) = reply.encode() else {
+                    return Ok(true);
+                };
+                let opening = Opening {
+                    head,
+                    fields: Bytes::from(fields),
+                    body: 0,
+                    slowed: reply.slowed,
+                };
+                Ok(native.offer(Told::Reply(Box::new(opening))) != Sent::Held)
             }
             // What is left of the body is the listener's to read or drop (node.md §4.5): the reply
             // and its end go now.
             Door::Local(_) => {
-                let Work::Draining(reply) =
-                    std::mem::replace(&mut job.work, Work::Answering(VecDeque::new()))
-                else {
-                    return Ok(false);
-                };
                 // A reply slowed for a cause says it (`door::Slowed`); any other, its head.
                 let head = match reply.slowed {
                     Some(cause) => door::Answer::Slowed(cause),
                     None => door::Answer::Head(reply),
                 };
                 job.work = Work::Answering(VecDeque::from([head, door::Answer::End]));
-                return self.answer_local(at);
-            }
-        };
-        let Work::Draining(reply) = &job.work else {
-            return Ok(false);
-        };
-        // A body the node's task reads for the job is read and dropped there: the reply goes once
-        // it is let go, the body whole.
-        if self.feeding.iter().any(|(fed, _)| *fed == exchange) {
-            return Ok(false);
-        }
-        let endpoint = self.driver.endpoint();
-        loop {
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(false);
-            };
-            let got = endpoint.read_body(exchange, &mut piece);
-            self.moved = self
-                .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
-            match got {
-                Ok(0) => break,
-                Ok(_) => {}
-                // Its asker is gone: nothing to answer.
-                Err(_) => return Ok(true),
+                self.answer_door(at)
             }
         }
-        if !endpoint.body_complete(exchange) && endpoint.head(exchange).is_some() {
-            let mut empty = hyper_transport::Reservation::default();
-            let _ = endpoint.read_body(exchange, &mut empty);
-            if !endpoint.body_complete(exchange) {
-                return Ok(false);
-            }
-        }
-        let Ok((head, fields)) = reply.encode() else {
-            return Ok(true);
-        };
-        let slowed = reply.slowed;
-        let length = u64::try_from(fields.len()).unwrap_or(u64::MAX);
-        if endpoint.reply(exchange, &head, Some(length)).is_err() {
-            return Ok(true);
-        }
-        // A native request answered `SlowDown`, counted for its cause as it goes: the node says
-        // the counts in its lines, as the listener counts the S3 door's.
-        if let Some(count) = slowed.and_then(|cause| self.slowed.get_mut(cause.index())) {
-            *count = count.saturating_add(1);
-        }
-        if let Some(job) = self.jobs.get_mut(at) {
-            job.work = Work::Replying(fields, 0);
-        }
-        self.write_fields(at)
     }
 
-    /// A reply's fields written as far as its exchange takes them; once all are, the exchange
-    /// ends.
-    fn write_fields(&mut self, at: usize) -> Result<bool, NodeError> {
+    /// A job's last answers sent as far as its door's channel takes them; whether it is over:
+    /// every one sent, or the door gone.
+    fn answer_door(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
         };
-        let Some(exchange) = job.door.exchange() else {
+        let Work::Answering(answers) = &mut job.work else {
             return Ok(true);
         };
-        let Work::Replying(fields, written) = &mut job.work else {
-            return Ok(false);
-        };
-        let endpoint = self.driver.endpoint();
-        while let Some(rest) = fields.get(*written..)
-            && !rest.is_empty()
-        {
-            match endpoint.write_body(exchange, rest) {
-                Ok(0) => return Ok(false),
-                Ok(took) => {
-                    *written = written.saturating_add(took);
-                    self.moved = self
-                        .moved
-                        .saturating_add(u64::try_from(took).unwrap_or(u64::MAX));
-                }
-                Err(_) => return Ok(true),
+        let sent = match &mut job.door {
+            Door::Local(local) => {
+                local.pending.extend(answers.drain(..));
+                local.flush()
             }
-        }
-        endpoint.end(exchange);
-        Ok(true)
+            Door::Native(_, native) => native.flush(),
+        };
+        Ok(sent != Sent::Held)
     }
 
-    /// A local job's last answers sent as far as its channel takes them; whether it is over: every
-    /// one sent, or the connection gone.
-    fn answer_local(&mut self, at: usize) -> Result<bool, NodeError> {
-        let Some(job) = self.jobs.get_mut(at) else {
-            return Ok(true);
-        };
-        let (Door::Local(local), Work::Answering(answers)) = (&mut job.door, &mut job.work) else {
-            return Ok(true);
-        };
-        local.pending.extend(answers.drain(..));
-        Ok(local.flush() != Sent::Held)
-    }
-
-    /// The jobs whose exchange is `exchange`, for an event on it.
-    pub(super) fn job_on(&self, exchange: ExchangeId) -> Option<usize> {
+    /// Whether the host holds `exchange`, for an event on it: a job's, or a reply its node's task
+    /// writes.
+    pub(super) fn hosts(&self, exchange: ExchangeId) -> bool {
         self.jobs
             .iter()
-            .position(|j| j.door.exchange() == Some(exchange))
+            .any(|j| j.door.exchange() == Some(exchange))
+            || self.replies.iter().any(|(e, _)| *e == exchange)
     }
 
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
@@ -5050,6 +5485,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let now = hyper_rt::futures::now_ns();
         self.parked.retain(|p| p.exchange != exchange);
         self.feeding.retain(|(fed, _)| *fed != exchange);
+        self.replies.retain(|(replied, _)| *replied != exchange);
         jobs.retain_mut(|j| {
             if j.door.exchange() != Some(exchange) {
                 return true;
@@ -5139,8 +5575,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .iter()
             .filter_map(|l| l.ask)
             .any(|ask| self.reads_done.iter().any(|(a, _)| *a == ask));
-        // A body the node's task fed at the last turn: its job takes what it was given.
-        if self.fed || looked_up || pending.any(answered) {
+        // A body the node's task fed at the last turn: its job takes what it was given; and a
+        // reply whose exchange took more than its rounds gave: its job gives the next.
+        if self.fed || self.replied || looked_up || pending.any(answered) {
             return Some(shard);
         }
         let wall = self.wall.now_ns();
@@ -5834,7 +6271,6 @@ fn getting(
         head,
         get: None,
         held: None,
-        out: None,
         written: 0,
         total: 0,
         waiting: VecDeque::new(),
@@ -6690,6 +7126,474 @@ mod tests {
             (after.allocations, after.reallocations)
         );
         assert_eq!((after.allocations, after.reallocations), (0, 0));
+    }
+
+    /// A native exchange as a test sees it: the head and body length it was answered with, the
+    /// bytes written to it and where each write's bytes lay, its end or refusal, and its asker told
+    /// the work is held; taking `credit` bytes of body a turn, as its stream's flow control would.
+    #[derive(Default)]
+    struct Seen {
+        answered: Option<(Vec<u8>, u64)>,
+        body: Vec<u8>,
+        writes: Vec<*const u8>,
+        ended: bool,
+        refused: bool,
+        working: usize,
+        credit: usize,
+        gone: bool,
+    }
+
+    impl Exchange for Seen {
+        fn reply(&mut self, head: &[u8], body: u64) -> bool {
+            assert!(self.answered.is_none(), "answered twice");
+            self.answered = Some((head.to_vec(), body));
+            !self.gone
+        }
+
+        fn write(&mut self, bytes: &Bytes) -> Option<usize> {
+            if self.gone {
+                return None;
+            }
+            assert!(self.answered.is_some(), "a body before its head");
+            let took = bytes.len().min(self.credit);
+            self.credit -= took;
+            self.body.extend_from_slice(&bytes[..took]);
+            self.writes.push(bytes.as_ptr());
+            Some(took)
+        }
+
+        fn end(&mut self) {
+            self.ended = true;
+        }
+
+        fn refuse(&mut self) {
+            self.refused = true;
+        }
+
+        fn working(&mut self) {
+            self.working += 1;
+        }
+    }
+
+    /// A get's driver as a test gives it: its pieces, in order, then whether it ended whole.
+    struct Pieced {
+        pieces: VecDeque<Bytes>,
+        whole: Option<bool>,
+    }
+
+    impl Source for Pieced {
+        fn take(&mut self) -> Option<Bytes> {
+            self.pieces.pop_front()
+        }
+
+        fn ended(&self) -> Option<bool> {
+            if self.pieces.is_empty() {
+                self.whole
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The pieces of a get of `count` pieces of `len` bytes each, each its own storage.
+    fn pieces(count: usize, len: usize) -> VecDeque<Bytes> {
+        (0..count)
+            .map(|p| {
+                Bytes::from(
+                    (0..len)
+                        .map(|i| u8::try_from((p * 31 + i * 7) % 251).unwrap())
+                        .collect::<Vec<u8>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// A native get's reply opened with `fields`, its range `total` bytes, given as `send_held`
+    /// gives it.
+    fn open_get(native: &mut Native, fields: &[u8], total: u64) {
+        let opening = Opening {
+            head: b"head".to_vec(),
+            fields: Bytes::copy_from_slice(fields),
+            body: total,
+            slowed: None,
+        };
+        assert_eq!(native.give(Told::Head(Box::new(opening))), Sent::Taken);
+    }
+
+    /// A node's turn for a native get, as `Node::step_host` and `Node::write_replies` run one: the
+    /// job's step, then the node's task's write, the job giving the next piece within the turn
+    /// while the exchange takes more, at most `rounds` times. The job's turn's end and whether the
+    /// reply is over.
+    fn get_turn(
+        native: &mut Native,
+        replies: &mut Replies,
+        source: &mut Pieced,
+        (written, total): (&mut u64, u64),
+        seen: &mut Seen,
+        rounds: usize,
+    ) -> (Gave, bool) {
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut gave = give_native(native, source, written, total);
+        for _ in 0..rounds {
+            match replies.write(seen, false, &mut moved, &mut slowed) {
+                Wrote::Over => return (gave, true),
+                Wrote::Still | Wrote::Draining => return (gave, false),
+                Wrote::More => gave = give_native(native, source, written, total),
+            }
+        }
+        (gave, false)
+    }
+
+    /// A native get's reply, given by its job on its channel and written by the node's task, reaches
+    /// its exchange whole and in order: its head with the body's length, fields and range both, its
+    /// fields, each piece, then its end; as many pieces a turn as the exchange takes, as when its job
+    /// wrote its exchange. A reply with no bytes past its fields waits for the request's body, then
+    /// goes whole and ends the exchange, a `SlowDown` counted for its cause.
+    #[test]
+    fn a_native_gets_reply_reaches_its_exchange_whole_and_in_order() {
+        let fields = b"the reply's fields";
+        let given = pieces(5, 3 * piece_len() + 17);
+        let total: u64 = given.iter().map(|p| p.len() as u64).sum();
+        let expected: Vec<u8> = fields
+            .iter()
+            .copied()
+            .chain(given.iter().flat_map(|p| p.iter().copied()))
+            .collect();
+        // An exchange that takes 5,000 bytes a turn: the reply goes in as many turns as that takes.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, fields, total);
+        let mut seen = Seen::default();
+        let mut written = 0;
+        let mut turns = 0;
+        loop {
+            turns += 1;
+            seen.credit = 5_000;
+            let (_, over) = get_turn(
+                &mut native,
+                &mut replies,
+                &mut source,
+                (&mut written, total),
+                &mut seen,
+                given.len() + 2,
+            );
+            if over {
+                break;
+            }
+            assert!(turns < 1_000);
+        }
+        assert_eq!(
+            seen.answered,
+            Some((b"head".to_vec(), fields.len() as u64 + total))
+        );
+        assert_eq!(seen.body, expected);
+        assert!(seen.ended && !seen.refused);
+        assert_eq!(turns, expected.len().div_ceil(5_000));
+        assert_eq!(native.moved, total, "the job counts the range's bytes");
+        // An exchange that takes everything: the whole reply in one turn, its end with it.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, fields, total);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut written = 0;
+        let (gave, over) = get_turn(
+            &mut native,
+            &mut replies,
+            &mut source,
+            (&mut written, total),
+            &mut seen,
+            given.len() + 2,
+        );
+        assert_eq!((gave, over), (Gave::Over, true));
+        assert_eq!(seen.body, expected);
+        assert!(seen.ended);
+        // A driver that fails past the head: the exchange ends unfinished.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: pieces(1, 10),
+            whole: Some(false),
+        };
+        open_get(&mut native, fields, 100);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (_, over) = get_turn(
+            &mut native,
+            &mut replies,
+            &mut source,
+            (&mut 0, 100),
+            &mut seen,
+            4,
+        );
+        assert!(over && seen.refused && !seen.ended);
+        assert_eq!(seen.body.len(), fields.len() + 10);
+        // A `SlowDown` waits for the request's body, then goes whole, counted for its cause.
+        let (mut native, mut replies) = native_door().unwrap();
+        let (head, reply_fields) = Reply::slowed(door::Slowed::Queued).encode().unwrap();
+        let opening = Opening {
+            head: head.clone(),
+            fields: Bytes::from(reply_fields.clone()),
+            body: 0,
+            slowed: Some(door::Slowed::Queued),
+        };
+        assert_eq!(native.offer(Told::Reply(Box::new(opening))), Sent::Taken);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Draining
+        );
+        assert!(seen.answered.is_none());
+        assert_eq!(
+            replies.write(&mut seen, true, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert_eq!(seen.answered, Some((head, reply_fields.len() as u64)));
+        assert_eq!(seen.body, reply_fields);
+        assert!(seen.ended);
+        assert_eq!(moved, reply_fields.len() as u64);
+        assert_eq!(slowed[door::Slowed::Queued.index()], 1);
+    }
+
+    /// A reply's channel holds one answer: while the node's task has not written what its job gave,
+    /// the job takes nothing more from its driver, and an answer past the channel's room waits in
+    /// its door, in order, until the node's task took the one before; nothing grows.
+    #[test]
+    fn a_full_reply_channel_holds_the_job() {
+        let (mut native, mut replies) = native_door().unwrap();
+        let given = pieces(3, piece_len());
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, b"fields", 3 * piece_len() as u64);
+        // Its fields not yet written: the job takes no piece.
+        let mut written = 0;
+        let total = 3 * piece_len() as u64;
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(source.pieces.len(), 3);
+        // An exchange that takes nothing: the fields wait in the node's task, the job holds.
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                give_native(&mut native, &mut source, &mut written, total),
+                Gave::Waits
+            );
+        }
+        assert_eq!(source.pieces.len(), 3);
+        assert!(native.pending.is_empty());
+        // Room for the fields and half a piece: one piece taken, and no other while it is unwritten.
+        seen.credit = b"fields".len() + piece_len() / 2;
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(source.pieces.len(), 2);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(source.pieces.len(), 2);
+        // An answer past the channel's one waits in the door, in order, and goes once the node's
+        // task took the one before.
+        let (mut native, mut replies) = native_door().unwrap();
+        assert_eq!(
+            native.offer(Told::Bytes(Bytes::from_static(b"a"))),
+            Sent::Taken
+        );
+        assert_eq!(native.offer(Told::End), Sent::Held);
+        assert_eq!(native.pending.len(), 1);
+        assert_eq!(native.flush(), Sent::Held);
+        assert!(matches!(replies.told.try_recv(), Ok(Some(Told::Bytes(_)))));
+        assert_eq!(native.flush(), Sent::Taken);
+        assert!(matches!(replies.told.try_recv(), Ok(Some(Told::End))));
+    }
+
+    /// A job whose work is held says so on its door, and the node's task tells its exchange's asker
+    /// at its next write, once for each time the job said it (research/77 D1).
+    #[test]
+    fn a_held_job_is_vouched_for_through_the_nodes_task() {
+        let (native, mut replies) = native_door().unwrap();
+        let mut seen = Seen::default();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(seen.working, 0);
+        native.held();
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(seen.working, 1);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Still
+        );
+        assert_eq!(seen.working, 1, "said once, vouched once");
+        native.held();
+        native.held();
+        replies.write(&mut seen, false, &mut moved, &mut slowed);
+        assert_eq!(seen.working, 2);
+    }
+
+    /// A stopped stream ends the job and its reply: an exchange gone as its reply is written is
+    /// refused and let go by the node's task, and a job whose exchange's half was let go (refused,
+    /// or ended unanswered, `Node::job_lost`) finds its door gone and ends. A job that let go with
+    /// nothing given leaves its exchange's half nothing to write.
+    #[test]
+    fn a_stopped_stream_ends_the_job_and_its_reply() {
+        let given = pieces(2, piece_len());
+        // The exchange is gone as a piece is written.
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given.clone(),
+            whole: Some(true),
+        };
+        open_get(&mut native, b"fields", 2 * piece_len() as u64);
+        let mut seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut written = 0;
+        let total = 2 * piece_len() as u64;
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        seen.gone = true;
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.refused && !seen.ended);
+        // The node's task lets go of it: the job's next answer finds its door gone.
+        drop(replies);
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Over
+        );
+        // An exchange gone before its head is written.
+        let (mut native, mut replies) = native_door().unwrap();
+        open_get(&mut native, b"fields", 1);
+        let mut seen = Seen {
+            gone: true,
+            ..Seen::default()
+        };
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        // A job that let go with nothing more given: nothing to write.
+        let (native, mut replies) = native_door().unwrap();
+        drop(native);
+        let mut seen = Seen::default();
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.answered.is_none() && !seen.ended && !seen.refused);
+    }
+
+    /// A native get's pieces reach its exchange as its driver gave them, each write's bytes the
+    /// piece's own storage (`Endpoint::write_body_bytes` keeps them by reference): no piece is
+    /// copied on its way, where the job's own write copied each into QUIC's buffer
+    /// (`Endpoint::write_body`); and past the first piece the way asks the allocator for nothing.
+    #[test]
+    fn a_native_replys_pieces_reach_the_exchange_uncopied() {
+        const PIECES: usize = 64;
+        let given = pieces(PIECES, piece_len());
+        let storage: Vec<*const u8> = given.iter().map(|p| p.as_ptr()).collect();
+        let (mut native, mut replies) = native_door().unwrap();
+        let mut source = Pieced {
+            pieces: given,
+            whole: Some(true),
+        };
+        let total = (PIECES * piece_len()) as u64;
+        open_get(&mut native, b"", total);
+        let mut seen = Seen {
+            body: Vec::with_capacity(PIECES * piece_len()),
+            writes: Vec::with_capacity(PIECES + 1),
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut written = 0;
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        // The first piece: what the channel and the door's queue set up once.
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Waits
+        );
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::More
+        );
+        hyper_measure::alloc::begin();
+        for _ in 1..PIECES {
+            assert_eq!(
+                give_native(&mut native, &mut source, &mut written, total),
+                Gave::Waits
+            );
+            assert_eq!(
+                replies.write(&mut seen, false, &mut moved, &mut slowed),
+                Wrote::More
+            );
+        }
+        let counts = hyper_measure::alloc::end();
+        assert_eq!((counts.allocations, counts.reallocations), (0, 0));
+        assert_eq!(
+            seen.writes, storage,
+            "each write is the piece's own storage"
+        );
+        assert_eq!(seen.body.len(), PIECES * piece_len());
+        assert_eq!(
+            give_native(&mut native, &mut source, &mut written, total),
+            Gave::Over
+        );
+        assert_eq!(
+            replies.write(&mut seen, false, &mut moved, &mut slowed),
+            Wrote::Over
+        );
+        assert!(seen.ended);
     }
 
     fn refused(work: &Work) -> Option<Status> {

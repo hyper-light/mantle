@@ -1574,6 +1574,7 @@ the node already states, and each refusal typed (CLAUDE.md §2):
 | Log updates | a range's shard, to the log's owner | hyper-log's bounded owner channel | `LogError::Busy`: the range waits for room (§2.2's stall) |
 | Native requests | the endpoint, to a driving shard | the exchanges the transport admits (§2.8's pool) | parked, then `SlowDown` at the client's deadline (§2.8) |
 | Chunk puts and gets | a driving shard, to the endpoint | `chunk_asks` | refused, as `Node::put_chunk` refuses now |
+| A native reply | a job, to the endpoint's shard | one answer, the least that moves a reply (`door::Replying::FIRST_ANSWERS`), a get's piece given only once the last is written whole (6c) | held in the job's door, its client held by its stream's flow control |
 
 A shard that ends takes its ranges with it, which nothing else holds, so the node stops and its
 next start recovers them from the log (§1.7), as it stops for a lost task now.
@@ -2067,9 +2068,78 @@ ends the job `IncompleteBody`, and a job that let go has the rest dropped; and 6
 first ask the allocator for nothing, as the job's own read of them asked nothing (0 and 0
 allocations, 0 and 0 reallocations), each a view of the one storage. No node test runs the object
 host (each opens its nodes with no gateway), so the native suite (`crates/mantle/tests/native.rs`)
-is the end-to-end test, and the ladder its measure. Left, 6c's second half: the reply, which the
-node's task writes from a channel at the depth a reply needs (`door::Replying`), and with it the
-drain and the exchange's end.
+is the end-to-end test, and the ladder its measure. Left then, 6c's second half: the reply, the
+drain and the exchange's end (below).
+
+*As built (2026-11-18), step 6's third part, its second half: a native reply as the S3 door's*
+(6c, `crates/node/src/node/host.rs`). Every native request the host takes gets its door as it is
+taken (`host::native_door`, in `start_object`): the job's ends (`host::Native`) and the node's
+task's (`host::Replies`, held in `Node::replies`). The job gives its reply on a bounded channel as
+an S3 job gives its connection `door::Answer`s (`host::Told`): a reply with no bytes past its fields
+(`Told::Reply`, every refusal and every operation's end but a get's), its head and fields encoded
+by the job (`Reply::encode`) with its `SlowDown`'s cause; a get's held reply (`Told::Head`, from
+`send_held`), its head carrying the range's length (`getting.total`); a get's pieces as its driver
+gave them (`Told::Bytes`); and its end (`End`, or `Failed` past its head). The node's task writes
+them, after the host's step and the bodies' feeding at each turn (`Node::write_replies`): a
+`Told::Reply` once the body's feeding ended and the rest of the body is read whole and dropped
+(`drop_body`), as `drain_job` read it, then `Endpoint::reply` with the fields' length, the
+`SlowDown` counted for its cause as it goes, the fields, and the exchange's end; a get's head with
+the fields' length and the range's, then its fields and each piece by `Endpoint::write_body_bytes`,
+kept by QUIC by reference, then `end` or, for `Failed`, the exchange refused. `drain_job`,
+`write_get` and `send_held` give to the door and write nothing; `write_fields` and `Work::Replying`
+are gone. Vouching goes the same way: a held job says so on its door (`Native::held`), and the node's
+task tells the exchange's asker at its next write (`Endpoint::working`). The bytes a native job moves
+(its body's pieces taken, its range's pieces given) it counts in its door, and the host's step takes
+them as a value into `Node::moved` (`Node::turn_job`), so a native job touches nothing of the node's
+but its door; the fields the node's task writes and the body it drops it counts itself. The S3
+door's depth is sampled only by S3 jobs, which run on the node's task (§4.1), as before.
+
+Bounds. The channel holds one answer, the least that moves a reply (`door::Replying::FIRST_ANSWERS`),
+and a job gives its fields or a piece only once the node's task wrote the last whole: the two share
+the count of what is given and unwritten (`host::Handed`, atomics, as `door::Learned` is shared with
+the S3 connections), so a get holds one piece taken from its driver past its window, the one
+`derive::Charges` counts ("a get's block taken and written out"), as when its job wrote its
+exchange; a deeper channel at the learned reply depth would hold pieces past that charge. An answer
+the channel has no room for waits in the job's door (`Native::pending`), at most its end behind its
+last piece, so a full exchange holds the job, and the client, whose stream's flow control it is,
+holds both: nothing grows. `Node::replies` holds one a native request the host took, each let go
+with its exchange (`job_lost`), or once its reply is written whole or refused, so at most the
+exchanges the transport holds; one the node's task lets go tells its job (`Handed`'s `gone`), which
+ends. The node's stop waits for every reply written as for every job ended (`step_stop`). A job's
+reply channel that cannot be made refuses its exchange `Budget`.
+
+Copies. None added: a get's piece reaches `write_body_bytes` as its driver gave it, where the job's
+own write copied it into QUIC's buffer (`write_body`), so a piece is copied once fewer; a reply's
+fields are moved into `Bytes`, not copied.
+
+Pace. A get's pieces do not go one a turn: a piece is given only once the last is written whole, so
+where one is written whole and its exchange takes more, the node's task asks the job for the next
+within the same turn (`Wrote::More`, `Node::write_replies`), as many as the exchange takes, at most
+a window's (`GatewaySettings::window`, the pieces the driver holds read at once) and its fields and
+end past them, a turn whose rounds ran out making the next due at once (`Node::replied`, `host_due`).
+So a large get takes the turns its job's own writes took: each turn writes what its driver has ready
+as far as the stream's credit goes, the stream's window at most (`stream_window_ceiling`, about
+2.3 MB), and its end in the turn its last byte is written. A reply with no bytes past its fields goes
+in the turn its job ends, as `drain_job` wrote it; the job now ends as it gives it, as an S3 job ends
+as its answers are taken, the drain and the write the node's task's.
+
+Tested (`node::host`): a native get's reply reaches its exchange whole and in order, its head's
+length the fields' and the range's, in the turns its exchange's credit takes (5,000 bytes a turn: the
+reply's bytes over 5,000), and in one turn where the exchange takes everything; a driver failing past
+the head refuses the exchange; a `SlowDown` waits for the request's body, then goes whole, counted
+for its cause; a full reply channel holds the job, which takes no piece from its driver while one is
+unwritten, and an answer past the channel's room waits in its door in order; a held job is vouched
+for through the node's task, once each time it says so; a stopped stream refuses the exchange and
+ends the job, and a job that let go leaves nothing to write; and 63 pieces past the first reach the
+exchange each in its own storage, asking the allocator for nothing (0 allocations, 0 reallocations).
+The host and node unit tests pass unchanged. No node test runs the object host, so the native suite
+(`crates/mantle/tests/native.rs`) is the end-to-end test, and the ladder its measure.
+
+What 6d needs first: the host's step (`step_host`, `turn_job`) and its jobs move into `host::Host`
+with their own counts (`moved`, `slowed` by cause, both now applied as values), its asks served by
+the node as 6b made them; `Node::write_replies`' ask for a get's next piece becomes the node's task
+stepping the host's reply step for one job, and `read_fields`, still a job's step that reads its
+exchange, becomes the node's task's before the job is made (6f), as `drop_body` already is.
 
 ## 3. Transport
 

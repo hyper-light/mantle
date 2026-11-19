@@ -3575,11 +3575,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Door::Native(_, native) = &mut job.door else {
             return Ok(false);
         };
-        let mut replies = self
-            .replies
-            .iter_mut()
-            .find(|(replied, _)| *replied == exchange)
-            .map(|(_, replies)| replies);
+        let mut replies = self.replies.get_mut(exchange).map(|(_, replies)| replies);
         if handing && let Some(replies) = replies.as_mut() {
             native.node = Some(self.waker.clone());
             replies.driving = driving;
@@ -3709,17 +3705,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     request.driven = Some(0);
                 }
                 request.half.node = None;
-                let door = self
-                    .replies
-                    .iter_mut()
-                    .filter(|(replied, _)| Some(*replied) == exchange)
+                let door = exchange
+                    .and_then(|exchange| self.replies.get_mut(exchange))
                     .map(|(_, replies)| &mut replies.driving);
                 let fed = self
                     .feeding
                     .iter_mut()
                     .filter(|(fed, _)| Some(*fed) == exchange)
                     .map(|(_, feeding)| &mut feeding.driving);
-                for driving in door.chain(fed) {
+                for driving in door.into_iter().chain(fed) {
                     *driving = None;
                 }
                 self.host.take_handed(request, exchange);
@@ -3816,7 +3810,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         }
                         let job = self
                             .replies
-                            .get(at)
+                            .at(at)
                             .and_then(|(exchange, _)| self.host.job_of(*exchange));
                         // A job that ended gave all it will: the next write finds its channel
                         // ended.
@@ -3829,7 +3823,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             };
             if over {
-                let (exchange, mut replies) = self.replies.swap_remove(at);
+                let Some((exchange, mut replies)) = self.replies.take(at) else {
+                    break;
+                };
                 for (_, feeding) in self.feeding.extract_if(.., |(fed, _)| *fed == exchange) {
                     replies.body = Some(feeding.let_go());
                 }
@@ -3845,7 +3841,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// no bytes past its fields once the request's body is read whole and dropped, after its
     /// feeding, as `drain_job` wrote one; what else its job gave as it comes.
     fn write_reply(&mut self, at: usize, now: u64) -> Wrote {
-        let Some(exchange) = self.replies.get(at).map(|(exchange, _)| *exchange) else {
+        let Some(exchange) = self.replies.at(at).map(|(exchange, _)| *exchange) else {
             return Wrote::Over;
         };
         let mut body_read = false;
@@ -3854,7 +3850,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let mut room = false;
             let draining = self
                 .replies
-                .get(at)
+                .at(at)
                 .filter(|(_, replies)| replies.draining())
                 .map(|(_, replies)| replies.admitted());
             if let Some(admitted) = draining {
@@ -3880,7 +3876,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 windows,
                 ..
             } = self;
-            let Some((_, replies)) = replies.get_mut(at) else {
+            let Some((_, replies)) = replies.at_mut(at) else {
                 return Wrote::Over;
             };
             let mut toward = Toward {
@@ -3924,11 +3920,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     self.fed = true;
                     let (exchange, feeding) = self.feeding.swap_remove(at);
                     let sender = feeding.let_go();
-                    if let Some((_, replies)) = self
-                        .replies
-                        .iter_mut()
-                        .find(|(replied, _)| *replied == exchange)
-                    {
+                    if let Some((_, replies)) = self.replies.get_mut(exchange) {
                         replies.body = Some(sender);
                     }
                 }
@@ -4084,7 +4076,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Whether the host holds `exchange`, for an event on it: a job's, or a reply its node's task
     /// writes.
     pub(super) fn hosts(&self, exchange: ExchangeId) -> bool {
-        self.host.job_of(exchange).is_some() || self.replies.iter().any(|(e, _)| *e == exchange)
+        self.host.job_of(exchange).is_some() || self.replies.contains(exchange)
     }
 
     /// An exchange of a job ended unanswered: the job ends, what it waits on let go.
@@ -4106,8 +4098,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .iter()
             .position(|(fed, _)| *fed == exchange)
             .map(|at| feeding.swap_remove(at).1.let_go());
-        // Each door's halves given back, kept for the next request, its body's sender with it.
-        for (_, mut lost) in replies.extract_if(.., |(replied, _)| *replied == exchange) {
+        // Its door's halves given back, kept for the next request, its body's sender with it.
+        if let Some((_, mut lost)) = replies.remove(exchange) {
             if let Some(sender) = lent.take() {
                 lost.body = Some(sender);
             }

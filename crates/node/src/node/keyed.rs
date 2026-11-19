@@ -1,11 +1,14 @@
 //! Lists the node's task finds an entry of by a key it holds: its exchanges' bodies going out and
-//! coming in and its chunk asks out, each found by its exchange at every transport event on it,
-//! with thousands in flight on a loaded node. Each entry's slot is kept in a hash map in step with
-//! the list as an entry is pushed and swap-removed, as the host keeps its jobs' (`host::Slots`), so
-//! an event finds its entry in one probe rather than a search of every entry.
+//! coming in, its chunk asks out and its native replies' halves, each found by its exchange at
+//! every transport event on it, with thousands in flight on a loaded node. Each entry's slot is
+//! kept in a hash map in step with the list as an entry is pushed and swap-removed, as the host
+//! keeps its jobs' (`host::Slots`), so an event finds its entry in one probe rather than a search
+//! of every entry.
 
 use std::collections::HashMap;
 use std::hash::Hash;
+
+use hyper_transport::ExchangeId;
 
 /// What an entry of a [`Keyed`] list is found by: one key an entry, no two entries of a list
 /// holding the same.
@@ -21,6 +24,15 @@ impl<T> Key for (u64, T) {
     type Of = u64;
 
     fn key(&self) -> u64 {
+        self.0
+    }
+}
+
+/// What the node's task holds for an exchange, found by it (`Node::replies`, a native reply's half).
+impl<T> Key for (ExchangeId, T) {
+    type Of = ExchangeId;
+
+    fn key(&self) -> ExchangeId {
         self.0
     }
 }
@@ -48,7 +60,6 @@ impl<T: Key> Keyed<T> {
         self.entries.len()
     }
 
-    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -56,6 +67,17 @@ impl<T: Key> Keyed<T> {
     /// Its entries, in no order a caller may rely on: a removal moves the last into its slot.
     pub(super) fn iter(&self) -> std::slice::Iter<'_, T> {
         self.entries.iter()
+    }
+
+    /// The entry at slot `at`, for a walk of every entry that removes some as it goes
+    /// ([`Keyed::take`]): its slots are `0..len`, a removal moving the last into the slot taken.
+    pub(super) fn at(&self, at: usize) -> Option<&T> {
+        self.entries.get(at)
+    }
+
+    /// The entry at slot `at`, to change all but its key, which its slot is kept by.
+    pub(super) fn at_mut(&mut self, at: usize) -> Option<&mut T> {
+        self.entries.get_mut(at)
     }
 
     /// The slot of the entry holding `key`.
@@ -104,7 +126,7 @@ impl<T: Key> Keyed<T> {
     }
 
     /// The entry at `at` taken out, the last moved into its slot and re-pointed.
-    fn take(&mut self, at: usize) -> Option<T> {
+    pub(super) fn take(&mut self, at: usize) -> Option<T> {
         if at >= self.entries.len() {
             return None;
         }
@@ -216,10 +238,10 @@ pub(super) mod tests {
 
     /// The entries a search of the list visits for `key`, as the node's task searched it before
     /// (`iter().position`): each one up to the one holding it, or every one where none does.
-    fn searched(keyed: &Keyed<Entry>, key: u64) -> usize {
+    fn searched<T: Key>(keyed: &Keyed<T>, key: T::Of) -> usize {
         keyed
             .iter()
-            .position(|entry| entry.0 == key)
+            .position(|entry| entry.key() == key)
             .map_or(keyed.len(), |at| at + 1)
     }
 
@@ -332,5 +354,60 @@ pub(super) mod tests {
         );
         assert_eq!(visited, 2 * usize::try_from(ANSWERED).unwrap());
         assert!(done.is_empty());
+    }
+
+    /// The node's task's events on exchanges, each asking whether the host holds it (`Node::hosts`):
+    /// its job's slot (`Host::job_of`, a probe of its own), then, where no job holds it, its native
+    /// reply's half in a probe of the replies' slots (`Node::replies`). 2,048 native requests in
+    /// flight, every third ended as `write_replies` and `job_lost` end one; then a `BodyReady` and
+    /// a `Writable` on each of 2,048 chunk asks out, which no reply holds, and on each native
+    /// request left, its job ended and its reply writing; then each request's own lookups: its
+    /// fields read (`read_fields`), its body fed whole (`feed_bodies`), and its exchange lost
+    /// (`job_lost`, whose `extract_if` read every reply). Before, each searched the replies.
+    #[test]
+    fn a_replys_half_is_found_by_its_exchange_with_no_scan() {
+        const IN_FLIGHT: u64 = 2048;
+        let mut replies: Keyed<(u64, ())> = Keyed::default();
+        for exchange in 0..IN_FLIGHT {
+            assert!(replies.push((exchange, ())).is_none());
+        }
+        for exchange in (0..IN_FLIGHT).filter(|exchange| exchange % 3 == 0) {
+            assert!(replies.remove(exchange).is_some());
+        }
+        let native: Vec<u64> = replies.iter().map(|(exchange, _)| *exchange).collect();
+        let chunks: Vec<u64> = (IN_FLIGHT..2 * IN_FLIGHT).collect();
+        let (mut before, mut after) = ([0; 2], [0; 2]);
+        probes();
+        for &exchange in chunks.iter().chain(&native) {
+            before[0] += 2 * searched(&replies, exchange);
+            let held = exchange < IN_FLIGHT;
+            assert_eq!(replies.contains(exchange), held, "BodyReady");
+            assert_eq!(replies.contains(exchange), held, "Writable");
+        }
+        after[0] = probes();
+        for &exchange in &native {
+            before[1] += 2 * searched(&replies, exchange) + replies.len();
+            assert!(replies.get_mut(exchange).is_some(), "its fields read");
+            assert!(replies.get_mut(exchange).is_some(), "its body fed whole");
+            assert!(replies.remove(exchange).is_some(), "its exchange lost");
+        }
+        after[1] = probes();
+        println!(
+            "{} native requests in flight, {} chunk asks out: BodyReady and Writable {} probes ({} \
+             visited by the searches), each request's own lookups {} ({})",
+            native.len(),
+            chunks.len(),
+            after[0],
+            before[0],
+            after[1],
+            before[1]
+        );
+        assert_eq!(
+            after[0],
+            2 * (chunks.len() + native.len()),
+            "a probe an event"
+        );
+        assert_eq!(after[1], 3 * native.len(), "a probe a lookup");
+        assert!(replies.is_empty());
     }
 }

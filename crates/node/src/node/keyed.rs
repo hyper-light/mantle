@@ -751,6 +751,134 @@ impl<K: Copy + Eq + Hash> Marked<K> {
     }
 }
 
+/// A [`Keyed`] list with the set of its entries something made ready ([`Marked`]), each marked at
+/// every event that can let it move and visited at the next turn, where a walk of every entry
+/// visited thousands that could not move (`Node::write_replies`, `Node::feed_bodies`). An entry
+/// is marked as it is pushed, since nothing looked at it yet, and its mark let go with it. A turn
+/// takes the marks to visit ([`Readied::begin_visits`]), so an entry marked again while it is
+/// visited is visited at the next turn, not again in this one. Bound: its owner's, each entry's key
+/// marked once and taken to visit once a turn.
+pub(super) struct Readied<T: Key> {
+    entries: Keyed<T>,
+    ready: Marked<T::Of>,
+    /// The marks a turn took to visit, the next last; and the one visited now.
+    visits: Vec<T::Of>,
+    visiting: Option<T::Of>,
+}
+
+impl<T: Key> Default for Readied<T> {
+    /// None, which allocates nothing (`Keyed::default`, `Marked::default`, `Vec::new`).
+    fn default() -> Self {
+        Self {
+            entries: Keyed::default(),
+            ready: Marked::default(),
+            visits: Vec::new(),
+            visiting: None,
+        }
+    }
+}
+
+impl<T: Key> Readied<T> {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Its entries, in no order a caller may rely on, as [`Keyed::iter`].
+    pub(super) fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.entries.iter()
+    }
+
+    pub(super) fn at(&self, at: usize) -> Option<&T> {
+        self.entries.at(at)
+    }
+
+    pub(super) fn at_mut(&mut self, at: usize) -> Option<&mut T> {
+        self.entries.at_mut(at)
+    }
+
+    pub(super) fn slot(&self, key: T::Of) -> Option<usize> {
+        self.entries.slot(key)
+    }
+
+    pub(super) fn contains(&self, key: T::Of) -> bool {
+        self.entries.contains(key)
+    }
+
+    pub(super) fn get_mut(&mut self, key: T::Of) -> Option<&mut T> {
+        self.entries.get_mut(key)
+    }
+
+    /// Holds `entry`, last, marked, as [`Keyed::push`].
+    pub(super) fn push(&mut self, entry: T) -> Option<T> {
+        let key = entry.key();
+        let displaced = self.entries.push(entry);
+        self.ready.insert(key);
+        #[cfg(test)]
+        self.audit();
+        displaced
+    }
+
+    /// The entry at `at` taken out, its mark with it, as [`Keyed::take`]. A key taken to visit is
+    /// passed over as its visit comes ([`Readied::next_visit`]).
+    pub(super) fn take(&mut self, at: usize) -> Option<T> {
+        let entry = self.entries.take(at)?;
+        self.ready.remove(entry.key());
+        if self.visiting == Some(entry.key()) {
+            self.visiting = None;
+        }
+        #[cfg(test)]
+        self.audit();
+        Some(entry)
+    }
+
+    /// Marks the entry holding `key`, where one does: whether it was not marked.
+    pub(super) fn mark(&mut self, key: T::Of) -> bool {
+        if !self.entries.contains(key) {
+            return false;
+        }
+        let marked = self.ready.insert(key);
+        #[cfg(test)]
+        self.audit();
+        marked
+    }
+
+    /// Marks every entry: a walk of each, for a word that names none (`host::Marks`, a mark
+    /// the node's marks had no room for).
+    pub(super) fn mark_all(&mut self) {
+        for entry in self.entries.iter() {
+            self.ready.insert(entry.key());
+        }
+        #[cfg(test)]
+        self.audit();
+    }
+
+    /// The marks taken to visit at a turn, the set left empty for what marks entries meanwhile:
+    /// how many.
+    pub(super) fn begin_visits(&mut self) -> usize {
+        self.visits.clear();
+        self.visits.extend_from_slice(self.ready.keys());
+        self.ready.clear();
+        self.visiting = None;
+        self.visits.len()
+    }
+
+    /// The next entry to visit of those taken, still held: none once each was.
+    pub(super) fn next_visit(&mut self) -> Option<T::Of> {
+        self.visiting = None;
+        while let Some(key) = self.visits.pop() {
+            if self.entries.contains(key) {
+                self.visiting = Some(key);
+                return Some(key);
+            }
+        }
+        None
+    }
+}
+
 /// Entries in the order they came, each found by its key in one probe of the map of their places:
 /// a queue whose order its owner depends on (`Node::parked`, taken first come first), which a
 /// swap-remove would break, and whose entries leave from anywhere as their exchanges end. Each
@@ -856,7 +984,7 @@ impl<T: Key> Extend<T> for Keyed<T> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{Key, Keyed, KeyedOn, Marked, On, Queued, Waiting, Waits};
+    use super::{Key, Keyed, KeyedOn, Marked, On, Queued, Readied, Waiting, Waits};
 
     thread_local! {
         /// The probes this thread made of a keyed list's slots ([`Keyed::slot`]).
@@ -919,6 +1047,28 @@ pub(super) mod tests {
             }
             let held: usize = self.classes.values().map(Marked::len).sum();
             assert_eq!(held, classed, "a class holding an entry gone or of another");
+        }
+    }
+
+    impl<T: Key> Readied<T> {
+        /// The oracle, after each change: its slots exact (`Keyed::audit`), its marks' (`Marked::audit`),
+        /// and each key marked, taken to visit or visited one an entry holds.
+        pub(in crate::node) fn audit(&self) {
+            self.entries.audit();
+            self.ready.audit();
+            for key in self.ready.keys().iter().chain(self.visiting.iter()) {
+                assert!(self.entries.contains(*key), "{key:?} marked, held by none");
+            }
+        }
+
+        /// Whether the entry holding `key` is marked, taken to visit at this turn, or visited now:
+        /// what its owner's audit asks of an entry that could move (`host::Writes::audit`).
+        pub(in crate::node) fn covered(&self, key: T::Of) -> bool {
+            self.ready.contains(key) || self.visiting == Some(key) || self.visits.contains(&key)
+        }
+
+        pub(in crate::node) fn marked(&self) -> usize {
+            self.ready.len()
         }
     }
 

@@ -1618,24 +1618,26 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
      The node's task keeps the exchange: its vouching (`Endpoint::working`) and its end
      (`Node::job_lost`).
    - *6d, a host of its own* (`host::Job` and the host's `impl Node`; `Node`'s `jobs`,
-     `abandoned`, `gateway`, `table`, `moved`, `slowed`): the jobs and what they hold move from
-     `Node` into a `host::Host` that the node's task holds and steps, its asks (6b) served by the
-     node and its doors (6c) channels, so a shard past the first can hold one. Admission, parking
-     and the put window stay the node's, one authority for its bottleneck (§2.5), told of each
-     job's end. The largest part, which may land as two: the state, then the steps.
+     `abandoned`, `gateway`, `moved`, `slowed`): the jobs and what they hold move from `Node` into
+     a `host::Host` that the node's task holds and steps, its asks (6b) served by the node, its
+     doors (6c) channels and its puts placed by the volume table the node last read
+     (`Node::table`, `host::Table`), so a shard past the first can hold one. Admission, parking and
+     the put window stay the node's, one authority for its bottleneck (§2.5), told of each job's
+     end. The largest part, which may land as two: the state, then the steps.
    - *6e, a driving shard's task and its lanes* (a module beside `node::shard`, made as
      `shard::Lanes` is): a task on a shard past the first holding a `Host`, started through that
      shard's control queue as the listener's takers are, Normal as the S3 connections beside it.
      Into it, each request handed, its operation and its door's ends, at most the exchanges the
-     transport admits at once (`parked_most`), each request handed holding one. Out of it, its
-     jobs' asks, the host holding each kind to the node's bound for it (`command_asks`,
-     `read_asks`, `chunk_asks`) and refusing one past it `Asks`, asked again at the job's next
-     turn, each with a slot for its answer made as it is asked (`hyper_rt::sync::oneshot`), so the
-     answer cannot be refused; the node's task answers `Asks` in the slot of one it has no room for
-     now, its other asks holding the room (the table above). And each job's end. Production starts
-     none. Tested on a two-shard runtime: a request handed is driven there, its asks served by the
-     node's task, its end given back; a full lane refuses, typed; a shard whose task ended stops
-     the node, `NodeError::ShardEnded`.
+     transport admits at once (`parked_most`), each request handed holding one; and each volume
+     table the node reads, the latest superseding the rest, as a far root range's rows reach the
+     node (`Out::Rows`). Out of it, its jobs' asks, the host holding each kind to the node's bound
+     for it (`command_asks`, `read_asks`, `chunk_asks`) and refusing one past it `Asks`, asked again
+     at the job's next turn, each with a slot for its answer made as it is asked
+     (`hyper_rt::sync::oneshot`), so the answer cannot be refused; the node's task answers `Asks` in
+     the slot of one it has no room for now, its other asks holding the room (the table above). And
+     each job's end. Production starts none. Tested on a two-shard runtime: a request handed is
+     driven there, its asks served by the node's task, its end given back; a full lane refuses,
+     typed; a shard whose task ended stops the node, `NodeError::ShardEnded`.
    - *6f, requests placed by the rule* (`host::start_object`, `Node::spread`, `process::serve`,
      `derive::shard_shape`, `node::shard_lanes_bytes`): each native request admitted, its fields
      read, is handed to the shard 6a's rule picks among those `NodeSettings::shards` names past the
@@ -1985,6 +1987,19 @@ the first stays within one request of every other, from one shard to nine and on
 forty; an end where none runs counts nothing; and a count past a `usize`'s is refused, nothing
 placed. The host places and gives back inside a `Node`, which no unit test builds; the native
 suite (`crates/mantle/tests/native.rs`) runs both end to end.
+
+*As built (2026-11-18), step 6's check: what a driving shard is handed may cross threads.* What
+6b to 6f hand between the endpoint's shard and a shard that drives native requests is `Send`: a
+request's operation (`object::Op`), and its door's request, pieces and answers (`door::Request`,
+`Piece`, `Answer`), as the S3 listener already hands them across; a job's asks, a range's command
+(`wire::Command`) or read (`read::Query`) and a chunk's bytes (`Bytes`) and key (`ChunkKey`); their
+outcomes (`CommandOutcome`, `ReadOutcome`, `ChunkOutcome`); and the volume table puts are placed by
+(`host::Table`). The gateway's settings, its root keys among them (`GatewaySettings`), are `Sync`
+too, so every shard's host may share one;
+`node::tests::a_native_requests_work_may_cross_to_the_shard_that_drives_it` holds this at compile
+time. A job's drivers (`Put`, `Get`, the bucket's `Coordinator`) need not cross: a request is
+handed over once its fields are read, before its work is made (6c, 6f), so they are made on the
+shard that drives them. So step 6 needs no change in hyper-raft for what crosses.
 
 ## 3. Transport
 

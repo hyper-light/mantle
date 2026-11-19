@@ -5560,6 +5560,31 @@ mod tests {
         shared::<Log<DeviceFile>>();
     }
 
+    /// What step 6 hands between the endpoint's shard and a shard that drives native requests
+    /// (node.md §2.9) may cross threads: a request's operation, and its door's request, pieces and
+    /// answers as the S3 listener hands them over now; a job's asks (a range's command or read, a
+    /// chunk's bytes and key) and their outcomes; and the volume table its puts are placed by. The
+    /// gateway's settings, keys among them, may be shared by every shard's host.
+    #[test]
+    fn a_native_requests_work_may_cross_to_the_shard_that_drives_it() {
+        fn moves<T: Send>() {}
+        fn shared<T: Sync>() {}
+        moves::<object::Op>();
+        moves::<crate::door::Request>();
+        moves::<crate::door::Piece>();
+        moves::<crate::door::Answer>();
+        moves::<Command>();
+        moves::<Query>();
+        moves::<Bytes>();
+        moves::<ChunkKey>();
+        moves::<CommandOutcome>();
+        moves::<ReadOutcome>();
+        moves::<ChunkOutcome>();
+        moves::<host::Table>();
+        moves::<GatewaySettings>();
+        shared::<GatewaySettings>();
+    }
+
     #[test]
     fn a_chunk_is_waited_on_at_most_the_stock_patience() {
         let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();

@@ -63,5 +63,10 @@ harness = false
 name = "transmit"
 harness = false
 
+[[bench]]
+# An owner's vouch beside its connection's other open exchanges (docs/benchmarks.md).
+name = "vouch"
+harness = false
+
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
 [workspace]

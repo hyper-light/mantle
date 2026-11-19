@@ -289,6 +289,15 @@ impl<K> Table<K> {
         }
     }
 
+    /// Sets whether exchange `id`'s owner vouched for it since its connection's last note
+    /// (`Endpoint::working`), returning what it was: bookkeeping that neither its share, its visits
+    /// nor its deadline depend on, so it is not a touch.
+    pub(crate) fn set_vouch(&mut self, id: u64, vouch: bool) -> bool {
+        self.arena
+            .get_mut(id)
+            .is_some_and(|exchange| std::mem::replace(&mut exchange.vouch, vouch))
+    }
+
     /// The exchanges of connection `key` whose wait is due at `now`, settled, in the order they
     /// were made, appended to `into`. The heap walk stops below any entry not yet due, so it costs
     /// the due entries and the entries bordering them, not the connection's exchanges.
@@ -504,6 +513,12 @@ impl<K> Table<K> {
     #[cfg(feature = "oracle")]
     pub(crate) fn settled(&self) -> u64 {
         self.settled
+    }
+
+    /// The exchanges touched since the sums were last settled.
+    #[cfg(feature = "oracle")]
+    pub(crate) fn touched(&self) -> usize {
+        self.touched.len()
     }
 }
 

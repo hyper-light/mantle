@@ -63,6 +63,12 @@ pub enum Answer {
     /// This place cannot give the bytes: its volume failed, is fenced or closing, or does not
     /// hold them whole and verified, or its peer is gone. Another place that holds them is read.
     Unreadable,
+    /// This place holds no such chunk: its volume holds none under the key, its node no such
+    /// volume, or the volume table no such volume. Another place that holds the bytes is read, as
+    /// for [`Answer::Unreadable`]; and where none of the block's places gives it, the block's row
+    /// is read again, once, as its chunks may have left these places since the GET read it
+    /// (repair's moves, a drained volume retired: docs/design/repair.md §3–4, membership.md §4).
+    Absent,
     /// The reading node's failure detectors suspect this place's node, or it announced its stop:
     /// the read was not sent, or ended as the suspicion came. Its node may still be up and hold
     /// the bytes, as a loaded host's detectors suspect a peer that is only slow (gateway.md §3):
@@ -172,10 +178,25 @@ struct Reading {
     /// Once a place answers [`Answer::Suspected`]: the places its node's suspicion kept from it,
     /// held apart as `whole` is, so a block none of whose places is suspected holds none of it.
     suspicion: Option<Box<Suspicion>>,
-    /// Its requests in flight: it finishes only once none is, so no answer outlives it.
-    inflight: usize,
+    /// Its requests in flight: it finishes only once none is, so no answer outlives it. At most
+    /// the chunk reads a block holds out at once ([`most_chunks`]) and its row's read.
+    inflight: u32,
+    /// Whether its row may name places its chunks have left, and whether it was read again.
+    stale: Stale,
     /// When, in the caller's time, its row was asked; none where the caller told no time.
     begun_ns: Option<u64>,
+}
+
+/// Whether a block's row may be stale: no place of it answered [`Answer::Absent`]; one did, so
+/// the chunks may have moved since the row was read; or the row was read again for that, which
+/// a GET does once a block, so a place absent from the row read again is unreadable. A byte
+/// beside `inflight`, a `u32` for it: a block's state is no larger, and a GET none of whose
+/// places is absent allocates nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stale {
+    No,
+    Maybe,
+    Reread,
 }
 
 /// The whole chunks of a coded block read to decode it, by index: those read, those asked, and
@@ -237,6 +258,9 @@ enum Asked {
     Span(u64, usize),
     /// A whole chunk of a block, read from the place at this position of its places.
     Whole(u64, usize),
+    /// A chunk read of a block asked from its row before the block read it again
+    /// ([`Get::reread`]): its answer is taken and let go, and once the last is, the row is read.
+    Dropped(u64),
 }
 
 /// The most chunk gets a get holds out at once with `window` blocks being read under `scheme`:
@@ -400,7 +424,8 @@ impl Get {
                     | Asked::Part { .. }
                     | Asked::PartExtent
                     | Asked::Extents
-                    | Asked::Block(_) => return Err(GetError::Mismatch),
+                    | Asked::Block(_)
+                    | Asked::Dropped(_) => return Err(GetError::Mismatch),
                 }
             }
             Ok(())
@@ -471,7 +496,10 @@ impl Get {
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or(GetError::Overflow)?;
         match asked {
-            Asked::Block(key) | Asked::Span(key, _) | Asked::Whole(key, _) => {
+            Asked::Block(key)
+            | Asked::Span(key, _)
+            | Asked::Whole(key, _)
+            | Asked::Dropped(key) => {
                 let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
                 reading.inflight = reading.inflight.checked_add(1).ok_or(GetError::Overflow)?;
             }
@@ -548,7 +576,11 @@ impl Get {
     }
 
     fn answered(&mut self, asked: Asked, answer: Answer) -> Result<(), GetError> {
-        if let Asked::Block(key) | Asked::Span(key, _) | Asked::Whole(key, _) = asked {
+        if let Asked::Block(key)
+        | Asked::Span(key, _)
+        | Asked::Whole(key, _)
+        | Asked::Dropped(key) = asked
+        {
             let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
             reading.inflight = reading.inflight.checked_sub(1).ok_or(GetError::Mismatch)?;
         } else {
@@ -564,6 +596,10 @@ impl Get {
             (Asked::Block(key), Answer::Block(row)) => self.block_row(key, row),
             (Asked::Span(key, i), Answer::Chunk(bytes)) => self.span(key, i, Some(bytes)),
             (Asked::Span(key, i), Answer::Unreadable) => self.span(key, i, None),
+            (Asked::Span(key, i), Answer::Absent) => {
+                self.absent(key)?;
+                self.span(key, i, None)
+            }
             (Asked::Span(key, i), Answer::Suspected) => {
                 let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
                 let at = reading.spans.get(i).ok_or(GetError::Mismatch)?.chunk;
@@ -575,6 +611,10 @@ impl Get {
             }
             (Asked::Whole(key, c), Answer::Chunk(bytes)) => self.whole(key, c, Some(bytes)),
             (Asked::Whole(key, c), Answer::Unreadable) => self.whole(key, c, None),
+            (Asked::Whole(key, c), Answer::Absent) => {
+                self.absent(key)?;
+                self.whole(key, c, None)
+            }
             (Asked::Whole(key, c), Answer::Suspected) => {
                 let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
                 reading
@@ -590,8 +630,54 @@ impl Get {
                 let reading = self.reading.get(&key).ok_or(GetError::Mismatch)?;
                 Err(GetError::Unsendable(reading.block))
             }
+            // A read of the row the block reads again: what it gave is let go, and the row is
+            // read once no other is out.
+            (Asked::Dropped(key), _) => {
+                let reading = self.reading.get(&key).ok_or(GetError::Mismatch)?;
+                if reading.inflight > 0 {
+                    return Ok(());
+                }
+                let block = reading.block;
+                self.ask(Request::Block { block }, Asked::Block(key))
+            }
             _ => Err(GetError::Mismatch),
         }
+    }
+
+    /// A place of block `key` answered [`Answer::Absent`]: its row may name places its chunks
+    /// have left, unless it was read again already.
+    fn absent(&mut self, key: u64) -> Result<(), GetError> {
+        let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
+        if reading.stale == Stale::No {
+            reading.stale = Stale::Maybe;
+        }
+        Ok(())
+    }
+
+    /// Block `key` cannot be read from its row's places, and one of them answered that it holds
+    /// none of its chunk: its row is read again, once, from the Block range as of now, and the
+    /// block read afresh from the places it names (`block_row`). Its chunks may have left the
+    /// places the GET read since: repair moved them, and the volume they left, drained, was
+    /// retired from the table or its copy deleted (docs/design/repair.md §3–4, membership.md §4).
+    /// Before a place the detectors' suspicion kept from the block is asked past it, a wait on a
+    /// node that may be gone, the cheaper read of where the block is now is made. Its reads still
+    /// out are let go of as they answer, and the row is read once the last has, so the block holds
+    /// out no more reads than [`most_chunks`] counts; those waiting for room are asked no more.
+    fn reread(&mut self, key: u64) -> Result<(), GetError> {
+        for asked in self.asked.values_mut() {
+            if matches!(*asked, Asked::Span(k, _) | Asked::Whole(k, _) if k == key) {
+                *asked = Asked::Dropped(key);
+            }
+        }
+        self.roomless
+            .retain(|asked| !matches!(asked, Asked::Span(k, _) | Asked::Whole(k, _) if *k == key));
+        let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
+        reading.stale = Stale::Reread;
+        if reading.inflight > 0 {
+            return Ok(());
+        }
+        let block = reading.block;
+        self.ask(Request::Block { block }, Asked::Block(key))
     }
 
     /// A chunk read of block `key` refused for want of room: no copy is lost and no other place
@@ -788,6 +874,7 @@ impl Get {
                 whole: None,
                 suspicion: None,
                 inflight: 0,
+                stale: Stale::No,
                 begun_ns: self.now_ns,
             },
         );
@@ -801,7 +888,15 @@ impl Get {
         row: Option<(BlockHeader, Vec<ChunkPlace>)>,
     ) -> Result<(), GetError> {
         let reading = self.reading.get_mut(&key).ok_or(GetError::Mismatch)?;
-        let (header, places) = row.ok_or(GetError::Inconsistent("a file's block is gone"))?;
+        let (header, places) = match row {
+            Some(row) => row,
+            // Gone since the GET first read it: the block was released under the GET, its object
+            // deleted meanwhile, as its chunks were; no row is damaged.
+            None if reading.stale == Stale::Reread => {
+                return Err(GetError::Unreadable(reading.block));
+            }
+            None => return Err(GetError::Inconsistent("a file's block is gone")),
+        };
         let len = reading
             .stored
             .end
@@ -861,6 +956,10 @@ impl Get {
         }
         let count = spans.len();
         reading.spans = spans;
+        // A row read again ([`Get::reread`]) is read afresh: what the places of the one before
+        // answered names positions in it.
+        reading.whole = None;
+        reading.suspicion = None;
         reading.row = Some((header, places));
         for i in 0..count {
             self.ask_span(key, i)?;
@@ -922,6 +1021,11 @@ impl Get {
                     !span.tried.contains(&c)
                         && (data == 1 || places.get(c).is_some_and(|p| p.key.index == index))
                 });
+                // A copy none of whose places is left untried, one of them absent, is read from
+                // its row read again; a code's chunk is decoded first ([`Get::ask_wholes`]).
+                if next.is_none() && data == 1 && reading.stale == Stale::Maybe {
+                    return self.reread(key);
+                }
                 // A copy none of whose places is left untried is read from one the detectors'
                 // suspicion alone kept it from, past the suspicion, before the block is given up.
                 let next = next.or_else(|| {
@@ -990,6 +1094,13 @@ impl Get {
             })
             .take(short)
             .collect();
+        // Short with every chunk left untried asked, a place absent: the block is read from its
+        // row read again ([`Get::reread`]).
+        if have.checked_add(next.len()).ok_or(GetError::Overflow)? < needed
+            && reading.stale == Stale::Maybe
+        {
+            return self.reread(key);
+        }
         // Still short, a chunk none of whose places is left untried is read from one the
         // detectors' suspicion alone kept it from, past the suspicion, one place a chunk.
         let mut pressing: Vec<(usize, usize)> = Vec::new();
@@ -1240,6 +1351,25 @@ mod tests {
     /// volumes 1, 2 and 3, and a GET of all of it holding one block, asked as far as its chunk
     /// reads: the GET, its chunks' bytes by place, and the chunk reads it asked.
     fn reading(scheme: Scheme, plain: &[u8]) -> (Get, Vec<Vec<u8>>, Vec<(Id, Request)>) {
+        let Begun {
+            get, chunks, asked, ..
+        } = reading_row(scheme, plain);
+        (get, chunks, asked)
+    }
+
+    /// A block's header and its chunks' places, as its row gives them.
+    type Row = (BlockHeader, Vec<ChunkPlace>);
+
+    /// A GET asked as far as its chunk reads ([`reading`]), and the block's row it read.
+    struct Begun {
+        get: Get,
+        chunks: Vec<Vec<u8>>,
+        asked: Vec<(Id, Request)>,
+        row: Row,
+    }
+
+    /// As [`reading`], and the block's row the GET read.
+    fn reading_row(scheme: Scheme, plain: &[u8]) -> Begun {
         let wrapping = WrappingKey::generate().unwrap();
         let data = DataKey::generate().unwrap();
         let mut sealed = plain.to_vec();
@@ -1270,7 +1400,7 @@ mod tests {
                 (header, code.encode(&sealed).unwrap())
             }
         };
-        let places = (0..chunks.len())
+        let places: Vec<ChunkPlace> = (0..chunks.len())
             .map(|i| ChunkPlace {
                 volume: i as u128 + 1,
                 key: ChunkKey {
@@ -1305,14 +1435,19 @@ mod tests {
         let answers = [
             Answer::Header(Some(file)),
             Answer::Extents(vec![(0, extent)]),
-            Answer::Block(Some((header, places))),
+            Answer::Block(Some((header, places.clone()))),
         ];
         for answer in answers {
             let (id, _) = get.poll().unwrap();
             get.answer(id, answer).unwrap();
         }
         let asked = std::iter::from_fn(|| get.poll()).collect();
-        (get, chunks, asked)
+        Begun {
+            get,
+            chunks,
+            asked,
+            row: (header, places),
+        }
     }
 
     /// The bytes a chunk read asks of `chunks`, its places' bytes.
@@ -1536,6 +1671,214 @@ mod tests {
             assert_eq!(outcome, Err(GetError::Unreadable(BLOCK)), "{scheme:?}");
             assert!(pressed.len() <= 1, "{scheme:?}: {pressed:?}");
         }
+    }
+
+    /// Answers each read `asked`, and each the GET asks after, first in first out, until it ends:
+    /// a chunk read of volumes 1 to 3 by `old`, the block's row by `row`, and one of a volume past
+    /// them from `chunks` at the place 10 before it. The GET's plaintext and outcome, and the
+    /// block's rows it read.
+    fn read_out_moving(
+        get: &mut Get,
+        chunks: &[Vec<u8>],
+        asked: Vec<(Id, Request)>,
+        old: Answer,
+        row: &Row,
+    ) -> (Vec<u8>, Result<(), GetError>, usize) {
+        let scheme = match row.0.data {
+            1 => Scheme::Copies(row.1.len()),
+            data => Scheme::Rs(Code::new(data.into(), row.0.parity.into()).unwrap()),
+        };
+        let most = most_chunks(1, scheme).unwrap();
+        let mut asked = VecDeque::from(asked);
+        let (mut out, mut rows) = (Vec::new(), 0);
+        while let Some((id, request)) = asked.pop_front() {
+            let answer = match request {
+                Request::Block { block } => {
+                    assert_eq!(block, BLOCK);
+                    rows += 1;
+                    Answer::Block(Some(row.clone()))
+                }
+                Request::Chunk { volume, .. } if volume <= 3 => old.clone(),
+                Request::Chunk {
+                    volume,
+                    key,
+                    offset,
+                    len,
+                    ..
+                } => {
+                    let chunk = &chunks[volume as usize - 11];
+                    assert_eq!(key, row.1[volume as usize - 11].key);
+                    Answer::Chunk(Bytes::copy_from_slice(
+                        &chunk[offset as usize..(offset + len) as usize],
+                    ))
+                }
+                other => panic!("{other:?}"),
+            };
+            if get.answer(id, answer).is_err() {
+                break;
+            }
+            asked.extend(std::iter::from_fn(|| get.poll()));
+            let out_now = asked
+                .iter()
+                .filter(|(_, r)| matches!(r, Request::Chunk { .. }))
+                .count();
+            assert!(out_now <= most, "{out_now} chunk reads out, {most} at most");
+            while let Some(bytes) = get.take() {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        assert!(get.poll().is_none() && get.roomless.is_empty());
+        let outcome = get.outcome().cloned().expect("the GET ended");
+        (out, outcome, rows)
+    }
+
+    /// A block whose places answer that they hold none of its chunks, repair having moved them
+    /// after the GET read its row (each on volume 10 past its old one), is read from its row read
+    /// again, once, before the GET gives it up: its plaintext exact, a code's reads of the old row
+    /// still out when the row was read again let go of as they answer. It gave the block up
+    /// `Unreadable`, `503 SlowDown`, every chunk of it safe on another volume.
+    #[test]
+    fn a_block_its_places_hold_none_of_is_read_from_its_row_read_again_once() {
+        let plain = b"moved by repair after the GET read its row".to_vec();
+        for scheme in schemes() {
+            let Begun {
+                mut get,
+                chunks,
+                asked,
+                row: (header, places),
+            } = reading_row(scheme, &plain);
+            let moved = places
+                .iter()
+                .map(|p| ChunkPlace {
+                    volume: p.volume + 10,
+                    key: p.key,
+                })
+                .collect();
+            let row = (header, moved);
+            let (out, outcome, rows) =
+                read_out_moving(&mut get, &chunks, asked, Answer::Absent, &row);
+            assert_eq!(outcome, Ok(()), "{scheme:?}");
+            assert_eq!(out, plain, "{scheme:?}");
+            assert_eq!(rows, 1, "{scheme:?}");
+        }
+    }
+
+    /// A block truly gone, its row read again naming the places that hold none of it, or no
+    /// longer there, ends the GET `Unreadable` once those are asked again: its row is read again
+    /// once at most. A chunk that fails its checksum at every place (`Unreadable`, the volume
+    /// reporting it for repair) is a corruption, no stale row: the GET ends `Unreadable` as
+    /// before, its row read once.
+    #[test]
+    fn a_block_gone_ends_unreadable_and_a_corrupt_one_reads_no_row_again() {
+        for scheme in schemes() {
+            let Begun {
+                mut get,
+                chunks,
+                asked,
+                row,
+            } = reading_row(scheme, b"held nowhere now");
+            let (_, outcome, rows) =
+                read_out_moving(&mut get, &chunks, asked, Answer::Absent, &row);
+            assert_eq!(outcome, Err(GetError::Unreadable(BLOCK)), "{scheme:?}");
+            assert_eq!(rows, 1, "{scheme:?}");
+
+            let Begun {
+                mut get,
+                chunks,
+                asked,
+                row,
+            } = reading_row(scheme, b"corrupt everywhere");
+            let (_, outcome, rows) =
+                read_out_moving(&mut get, &chunks, asked, Answer::Unreadable, &row);
+            assert_eq!(outcome, Err(GetError::Unreadable(BLOCK)), "{scheme:?}");
+            assert_eq!(rows, 0, "{scheme:?}");
+        }
+        // A row gone when read again: the block released under the GET, no row damaged.
+        let (mut get, _, asked) = reading(Scheme::Copies(3), b"released meanwhile");
+        let mut id = asked[0].0;
+        let row = loop {
+            get.answer(id, Answer::Absent).unwrap();
+            let (next, request) = get.poll().unwrap();
+            if matches!(request, Request::Block { .. }) {
+                break next;
+            }
+            id = next;
+        };
+        let gone = get.answer(row, Answer::Block(None));
+        assert_eq!(gone, Err(GetError::Unreadable(BLOCK)));
+    }
+
+    /// A copy absent from one place and only on a place the detectors suspect is read from its
+    /// row read again before the suspected place is asked past the suspicion, a wait on a node
+    /// that may be gone: the row read again gives a place up.
+    #[test]
+    fn a_row_is_read_again_before_a_suspected_place_is_asked_past_the_suspicion() {
+        let plain = b"moved off a place while another is suspected".to_vec();
+        let Begun {
+            mut get,
+            chunks,
+            mut asked,
+            row: (header, places),
+        } = reading_row(Scheme::Copies(2), &plain);
+        // Volume 1 suspected, volume 2's copy moved to volume 12.
+        let (id, _) = asked.remove(0);
+        get.answer(id, Answer::Suspected).unwrap();
+        let (id, request) = get.poll().unwrap();
+        assert!(matches!(
+            request,
+            Request::Chunk {
+                volume: 2,
+                past_suspicion: false,
+                ..
+            }
+        ));
+        get.answer(id, Answer::Absent).unwrap();
+        let (id, request) = get.poll().unwrap();
+        assert_eq!(
+            request,
+            Request::Block { block: BLOCK },
+            "the row is read again before volume 1 is asked past the suspicion"
+        );
+        let moved = vec![
+            places[0],
+            ChunkPlace {
+                volume: 12,
+                key: places[1].key,
+            },
+        ];
+        get.answer(id, Answer::Block(Some((header, moved))))
+            .unwrap();
+        let (id, request) = get.poll().unwrap();
+        assert!(matches!(
+            request,
+            Request::Chunk {
+                volume: 1,
+                past_suspicion: false,
+                ..
+            }
+        ));
+        get.answer(id, Answer::Suspected).unwrap();
+        let (id, request) = get.poll().unwrap();
+        assert!(
+            matches!(request, Request::Chunk { volume: 12, .. }),
+            "{request:?}"
+        );
+        get.answer(
+            id,
+            served(
+                &chunks,
+                &Request::Chunk {
+                    volume: 2,
+                    key: places[1].key,
+                    offset: 0,
+                    len: chunks[1].len() as u64,
+                    past_suspicion: false,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(get.take().as_deref(), Some(&plain[..]));
+        assert_eq!(get.outcome(), Some(&Ok(())));
     }
 
     /// A read no volume serves as it was asked ends the GET at once, `Unsendable`: another place

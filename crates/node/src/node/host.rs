@@ -6649,10 +6649,12 @@ impl Host {
                     return Ok(None);
                 };
                 let Some(holder) = holder else {
-                    // A volume the table no longer holds: another copy is read, or the driver
-                    // ends with its outcome.
+                    // A volume the table no longer holds, retired once no block named it: the
+                    // driver's row of the block may predate its chunk's move, and another place
+                    // is read, or the row read again (`get::Answer::Absent`), or the driver ends
+                    // with its outcome.
                     if let Some(get) = self.get_of(at) {
-                        let _ = get.answer(id, get::Answer::Unreadable);
+                        let _ = get.answer(id, get::Answer::Absent);
                     }
                     return Ok(None);
                 };
@@ -8991,6 +8993,13 @@ fn get_answer(outcome: Outcome) -> get::Answer {
         // Its peer suspected: another place is read first, and this one past the suspicion only
         // where the block cannot be read without it.
         Outcome::Chunk(ChunkOutcome::Suspected) => get::Answer::Suspected,
+        // The volume holds no such chunk, or the node asked no such volume: the driver's row of
+        // the block may predate a move of its chunk (repair.md §3–4), so another place is read,
+        // or the row read again where none gives the block. A chunk that fails its checksum is
+        // `Corrupt`, no move: the volume reports it for repair, and it is unreadable below.
+        Outcome::Chunk(ChunkOutcome::Refused(
+            chunk::Status::NotFound | chunk::Status::NoVolume,
+        )) => get::Answer::Absent,
         // Every other outcome by its class ([`taken`]), as a put's is.
         Outcome::Chunk(chunk) => match taken(&chunk) {
             // No room for the read now, at the volume's reads or in the transport toward it, or
@@ -11925,6 +11934,47 @@ pub(super) mod tests {
         );
     }
 
+    /// A copy whose place holds no such chunk, or whose node holds no such volume, is read from
+    /// another place, and where none gives it, from the block's row read again, once: repair may
+    /// have moved it after the get read the row, and the volume it left, drained, been retired
+    /// or its copy deleted (repair.md §3–4). Answered unreadable, the get ended `Unreadable`,
+    /// `503 SlowDown`, the copy safe on another volume. A chunk that fails its checksum at every
+    /// place is a corruption, which its volume reports for repair, and no stale row: no row is
+    /// read again, and the get ends `Unreadable` as before.
+    #[test]
+    fn a_get_reads_its_blocks_row_again_only_where_a_place_holds_no_such_chunk() {
+        for absent in [chunk::Status::NotFound, chunk::Status::NoVolume] {
+            let answer = || get_answer(Outcome::Chunk(ChunkOutcome::Refused(absent)));
+            assert_eq!(answer(), get::Answer::Absent);
+            let (mut get, mut id, _) = get_of_copies();
+            for volume in [2, 3] {
+                get.answer(id, answer()).unwrap();
+                let (next, request) = get.poll().unwrap();
+                assert!(
+                    matches!(request, get::Request::Chunk { volume: v, .. } if v == volume),
+                    "{absent:?}: {request:?}"
+                );
+                id = next;
+            }
+            get.answer(id, answer()).unwrap();
+            let (_, request) = get.poll().unwrap();
+            assert_eq!(request, get::Request::Block { block: 9 }, "{absent:?}");
+            assert_eq!(get.outcome(), None, "{absent:?}");
+        }
+        let corrupt = || {
+            get_answer(Outcome::Chunk(ChunkOutcome::Refused(
+                chunk::Status::Corrupt,
+            )))
+        };
+        let (mut get, mut id, _) = get_of_copies();
+        for _ in 0..2 {
+            get.answer(id, corrupt()).unwrap();
+            id = get.poll().unwrap().0;
+        }
+        assert_eq!(get.answer(id, corrupt()), Err(GetError::Unreadable(9)));
+        assert!(get.poll().is_none());
+    }
+
     /// A copy whose node the detectors suspect is read after every other place, and, every other
     /// unreadable, asked again past the suspicion, once, its bytes then the get's: a detector's
     /// mistake, which a loaded host makes, never fails the read of a block a node still up holds.
@@ -11952,11 +12002,11 @@ pub(super) mod tests {
                 // The place answers past the suspicion: its bytes end the read.
                 break;
             }
+            // Fenced, unreadable without being absent: a place absent has the row read again
+            // first (`a_get_reads_its_blocks_row_again_only_where_a_place_holds_no_such_chunk`).
             get.answer(
                 id,
-                get_answer(Outcome::Chunk(ChunkOutcome::Refused(
-                    chunk::Status::NotFound,
-                ))),
+                get_answer(Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Fenced))),
             )
             .unwrap();
         }

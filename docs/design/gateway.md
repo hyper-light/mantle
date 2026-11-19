@@ -553,6 +553,22 @@ the one copy its scheme gave it (`Copies(1)`, the only candidate one domain fits
 rule moves a chunk of a block holding two in one domain, repair.md §4, and a single copy has none
 to move), so every read of one through another node has no other place.
 
+*Amended (2026-11-19), a stale row.* A GET reads a block's row once, and repair may move the
+block's chunks before it asks them: the place a chunk left dropped from the row, its volume drained
+and retired from the table (`Forget`, membership.md §8), or its copy deleted (repair.md §3–4). That
+volume then answers that it holds no such chunk (`NotFound`), its node that it holds no such volume
+(`NoVolume`), or the reading node's table that there is none: `Answer::Absent`. Another place of
+the row is read, as for any unreadable one; where none gives the block, its row is read again, once
+a block a GET, by ReadIndex as of now, and the block read afresh from the places it names, before a
+place the detectors suspect is asked past the suspicion, the longer wait. Its reads still out are
+let go of as they answer and the row asked once the last has, so a block holds out no more chunk
+reads than `most_chunks` counts. A block the row read again cannot give fails `Unreadable` as
+before; a chunk failing its checksum (`Corrupt`) is no stale row, and its volume reports it for
+repair. Seen in reading the code, not in a run: the GET never read the row again, and failed
+`Unreadable`, `503 SlowDown`, every chunk of the block safe on another volume (`object_path.rs`'s
+`a_get_whose_blocks_chunks_moved_after_it_read_their_row_reads_them_where_they_are`, a leaving
+node's volumes drained under a GET).
+
 **Checked** (`crates/gateway/tests/object_path.rs`): objects under copies and codes read back
 whole and in ranges across segment and block boundaries, with requests answered in either
 order, and any range of generated objects; a chunk a volume cannot read is read from another

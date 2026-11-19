@@ -169,7 +169,8 @@ impl Cell {
     }
 
     /// What the cell answers a GET's request: rows read as a range reads them, and chunk
-    /// bytes from volumes that fail those in `unreadable`.
+    /// bytes from volumes that fail those in `unreadable`, a chunk on no volume of the cell, or
+    /// on none the cell holds, absent.
     fn serve_get(&mut self, request: get::Request) -> get::Answer {
         let kind = match &request {
             get::Request::Header { .. } => "header",
@@ -202,7 +203,8 @@ impl Cell {
                     Some(b) if offset + len <= b.len() as u64 => {
                         get::Answer::Chunk(b.slice(offset as usize..(offset + len) as usize))
                     }
-                    _ => get::Answer::Unreadable,
+                    Some(_) => get::Answer::Unreadable,
+                    None => get::Answer::Absent,
                 }
             }
         }
@@ -1499,6 +1501,114 @@ fn bytes_that_are_not_the_blocks_fail_the_get() {
     // With the first data chunk unreadable, the block is decoded from the tampered one.
     cell.unreadable.insert(places[0].volume);
     assert_eq!(span(&mut cell), Err(GetError::Corrupt(b)));
+}
+
+/// A GET of `len` bytes of object `file` in `cell`, holding one block, answered until it asks its
+/// first chunk reads: the GET, and those reads, which name the places its block's row gave then.
+fn get_to_its_chunks(
+    cell: &mut Cell,
+    file: u128,
+    len: usize,
+    wrapping: &WrappingKey,
+) -> (Get, Vec<(get::Id, get::Request)>) {
+    let root = Root(WrappingKey::new(wrapping.bytes()));
+    let mut get = Get::new(Some(file), len as u64, 0..len as u64, Box::new(root), 1).unwrap();
+    let mut chunks = Vec::new();
+    while chunks.is_empty() {
+        let (id, request) = get.poll().expect("the GET asks on");
+        if matches!(request, get::Request::Chunk { .. }) {
+            chunks.push((id, request));
+        } else {
+            let answer = cell.serve_get(request);
+            get.answer(id, answer).unwrap();
+        }
+    }
+    chunks.extend(std::iter::from_fn(|| get.poll()));
+    (get, chunks)
+}
+
+/// Answers `asked` and every read the GET asks after until it ends: its plaintext, or how it
+/// failed.
+fn answer_out(
+    cell: &mut Cell,
+    get: &mut Get,
+    asked: Vec<(get::Id, get::Request)>,
+) -> Result<Vec<u8>, GetError> {
+    let mut asked = VecDeque::from(asked);
+    let mut out = Vec::new();
+    loop {
+        while let Some(bytes) = get.take() {
+            out.extend_from_slice(&bytes);
+        }
+        if let Some(outcome) = get.outcome() {
+            return outcome.clone().map(|()| out);
+        }
+        asked.extend(std::iter::from_fn(|| get.poll()));
+        let (id, request) = asked.pop_front().expect("a GET waits on nothing");
+        let answer = cell.serve_get(request);
+        get.answer(id, answer)?;
+    }
+}
+
+/// Repair moves each chunk of every block of `file` from its volume to the one `width` past it,
+/// as a leaving node's volumes are drained (membership.md §4 step 4): the chunk written there, the
+/// Block range's `Move` applied, and the volume it left, drained, retired from the table with
+/// its chunks.
+fn drain_each_volume(cell: &mut Cell, file: u128, width: u128) {
+    let mut drained = BTreeSet::new();
+    for (_, extent) in file::extents(&mut cell.files, file, 0, 10_000).unwrap() {
+        let Target::Block(b) = extent.target else {
+            panic!("a PUT's file names blocks");
+        };
+        let (_, places) = block::read(&mut cell.blocks, b).unwrap().unwrap();
+        for place in places {
+            let to = place.volume + width;
+            let bytes = cell.volumes[&place.volume][&place.key].clone();
+            cell.volumes.entry(to).or_default().insert(place.key, bytes);
+            let moved = block::Command::Move {
+                chunk: place.key,
+                from: place.volume,
+                to,
+            };
+            assert_eq!(cell.block(moved), block::Outcome::Moved);
+            drained.insert(place.volume);
+        }
+    }
+    for volume in drained {
+        cell.volumes.remove(&volume);
+    }
+}
+
+/// A GET that read a block's row before repair moved its chunks asks volumes since drained and
+/// dropped from the table, which hold none of them: it reads the block's row again, once, and
+/// reads the chunks where they are now. It never read the row again, and failed `Unreadable`,
+/// `503 SlowDown`, while every chunk of the block was safe on another volume.
+#[test]
+fn a_get_whose_blocks_chunks_moved_after_it_read_their_row_reads_them_where_they_are() {
+    let len = 300_000usize;
+    for scheme in [
+        Scheme::Copies(1),
+        Scheme::Copies(3),
+        Scheme::Rs(Code::new(2, 1).unwrap()),
+    ] {
+        let width = scheme.width() as u128;
+        let bytes = body(len, 23);
+        let (mut cell, wrapping) = stored(scheme, &bytes, 190, width);
+        let (mut get, asked) = get_to_its_chunks(&mut cell, 190, len, &wrapping);
+        drain_each_volume(&mut cell, 190, width);
+        let blocks = cell.gets["block"];
+        let got = answer_out(&mut cell, &mut get, asked);
+        assert!(
+            got.as_deref() == Ok(&bytes[..]),
+            "{scheme:?}: {:?}",
+            got.err()
+        );
+        assert_eq!(
+            cell.gets["block"],
+            blocks + 1,
+            "{scheme:?}: the block's row is read again once"
+        );
+    }
 }
 
 /// An object of parts reads by its parts' plaintext: a part of 5 MiB and one byte and a last of

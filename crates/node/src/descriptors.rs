@@ -109,14 +109,14 @@ fn ceiling() -> Result<u64, DescriptorError> {
     }
 }
 
-#[cfg(test)]
+// Windows has no limit to raise or read but its constant: the tests are Unix's.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// A soft limit below the most the process may take is raised to it, the hard limit or, on
     /// macOS, `kern.maxfilesperproc` where that is smaller, and read back so. The test lowers its
     /// own soft limit by one first, so the raise has something to do, and leaves it raised.
-    #[cfg(unix)]
     #[test]
     fn the_soft_limit_is_raised_to_the_most_the_process_may_take() {
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};

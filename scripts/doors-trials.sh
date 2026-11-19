@@ -476,6 +476,10 @@ run_case() {
     return 0
   fi
   mkdir -p "$WORK"
+  # A case run again after its runner stopped mid-case finds the data that run left, and its cell
+  # refuses to be made over it (`File exists`, the box's quiet A1 and C-tail, the Mac's quiet A1):
+  # its data is removed before it starts, as after it ends.
+  remove_work "$name"
   cpus=$(cpus_of "$cond")
   busy=$(busy_of "$cond")
   memory=$S3_MEMORY

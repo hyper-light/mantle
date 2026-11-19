@@ -213,3 +213,178 @@ fn an_engine_with_workers_writes_no_page_on_its_shard_while_it_applies() {
     assert!(applying > 0, "the shard wrote no page applying inline");
     assert_eq!(elsewhere, 0);
 }
+
+/// The entries a follower applied before a snapshot, the rows of the image it installs, and the
+/// image's index: the clear and the puts rotate the page-sized memtable over a hundred times.
+const APPLIED: u64 = 1_100;
+const IMAGE: u64 = 2_000;
+const INDEX: u64 = APPLIED + 500;
+
+/// The store of the node suite's cells (crates/mantle/tests/support/cell.rs): pages and memtables
+/// of 4 KiB, extents of four pages, 256 extents.
+const CELL: Config = Config {
+    max_extents: 256,
+    ..CONFIG
+};
+/// The rows of an image the cell's store holds through its install on the shard alone, with
+/// room to spare: 180 of its 256 extents at the most. With its worker, before each job's grant
+/// waited for room, the install fenced at the store's limit.
+const CELL_IMAGE: u64 = 6_000;
+
+/// A follower's engine in a store of `config`, opened as the node opens it (`process::engine`)
+/// with `workers` workers on a shard that may wait, applies `APPLIED` entries with a checkpoint
+/// every `CHECKPOINT`, then installs a leader's snapshot as `RangeMachine::install` does: every
+/// row cleared and the image's put, then persisted. The install's and persist's result, with
+/// the engine's own error where it fenced (`Stored::fault`), and the store's path in a directory
+/// kept until the result is read.
+fn install_on_a_shard(
+    image: Vec<(Vec<u8>, Vec<u8>)>,
+    config: Config,
+    workers: usize,
+) -> (Result<(), String>, tempfile::TempDir, std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.store");
+        mantle_engine::store::permit_blocking();
+        let writes = Arc::new(Writes {
+            shard: std::thread::current().id(),
+            on_shard: AtomicU64::new(0),
+            elsewhere: AtomicU64::new(0),
+        });
+        let (at, counts) = (path.clone(), Arc::clone(&writes));
+        let persisted = shard()
+            .block_on(async move {
+                let mut e =
+                    Stored::create(counted(&at, true, &counts), config, config.page_size, TRUNK)
+                        .unwrap();
+                if workers > 0 {
+                    let (again, worker_counts) = (at.clone(), Arc::clone(&counts));
+                    e.set_workers(move || Ok(counted(&again, false, &worker_counts)), workers)
+                        .unwrap();
+                }
+                for i in 0..APPLIED {
+                    let (k, v) = row(i);
+                    e.apply(i + 1, vec![Write::Put(k, v)]).unwrap();
+                    if (i + 1) % CHECKPOINT == 0 {
+                        e.persist().unwrap();
+                    }
+                }
+                let persisted = e
+                    .install(INDEX, image)
+                    .and_then(|()| e.persist())
+                    .map_err(|error| format!("{error}: the engine's {:?}", e.fault()));
+                if persisted.is_ok() {
+                    assert_eq!((e.applied(), e.durable()), (INDEX, INDEX));
+                }
+                persisted
+            })
+            .unwrap();
+        (persisted, dir, path)
+    })
+    .join()
+    .unwrap()
+}
+
+/// The image's rows: the entries' keys and as many more, each value of the image's own.
+fn image() -> Vec<(Vec<u8>, Vec<u8>)> {
+    image_of(IMAGE)
+}
+
+/// An image of `rows` rows, keyed as the entries are, each value of the image's own.
+fn image_of(rows: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..rows)
+        .map(|i| {
+            let (k, _) = row(i);
+            (k, vec![2; 120])
+        })
+        .collect()
+}
+
+/// The extents the store at `path` grew to: its file's length in extents of `config`, since the
+/// store grows its file by its writes and reuses a freed extent before it grows.
+fn extents_of(path: &Path, config: Config) -> u64 {
+    let extent = u64::try_from(config.page_size).unwrap() * u64::from(config.extent_pages);
+    std::fs::metadata(path).unwrap().len().div_ceil(extent)
+}
+
+/// A snapshot installed over applied entries on a shard with its worker persists: the persist
+/// that a node's follower failed with "the engine failed to persist a snapshot" once its engines
+/// had workers (CI run 44527895012) returns durable at the image's index.
+#[test]
+fn an_image_installed_on_a_shard_with_workers_persists() {
+    let (persisted, _dir, _) = install_on_a_shard(image(), CONFIG, ENGINE_WORKERS);
+    persisted.unwrap();
+}
+
+/// The store opened again after the install stands at the image's index and holds the image's
+/// rows, every one, and none of the entries' own values.
+#[test]
+fn a_store_opened_after_an_install_holds_every_row_of_the_image() {
+    let (persisted, _dir, path) = install_on_a_shard(image(), CONFIG, ENGINE_WORKERS);
+    persisted.unwrap();
+    std::thread::spawn(move || {
+        mantle_engine::store::permit_blocking();
+        let writes = Arc::new(Writes {
+            shard: std::thread::current().id(),
+            on_shard: AtomicU64::new(0),
+            elsewhere: AtomicU64::new(0),
+        });
+        shard()
+            .block_on(async move {
+                let mut e = Stored::open(
+                    counted(&path, false, &writes),
+                    CONFIG,
+                    CONFIG.page_size,
+                    TRUNK,
+                )
+                .unwrap();
+                assert_eq!((e.applied(), e.durable()), (INDEX, INDEX));
+                assert_eq!(e.image().unwrap(), image());
+            })
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+}
+
+/// An install the cell's store holds on the shard alone holds with its worker too: the node
+/// suite's followers fenced installing a snapshot, "LimitExceeded { what: \"extents of a
+/// store\", limit: 256 }", once their engines had workers. Each job's grant, sized to what it
+/// reads, went out whatever the store held, and stayed whole until its pass applied (ten
+/// compactions holding 130 extents for the few they wrote); and packings cut at the root's
+/// pivots grew its bundles past every bound while their flush waited (194 branches of an extent
+/// each). Here the shard alone grows the store to `alone` extents; with its worker the same
+/// install persists, and the store opened again stands at the image's index with every row.
+#[test]
+fn an_install_the_store_holds_on_the_shard_alone_it_holds_with_a_worker() {
+    let (persisted, _alone_dir, path) = install_on_a_shard(image_of(CELL_IMAGE), CELL, 0);
+    persisted.unwrap();
+    let alone = extents_of(&path, CELL);
+    let (persisted, _dir, path) = install_on_a_shard(image_of(CELL_IMAGE), CELL, ENGINE_WORKERS);
+    if let Err(error) = persisted {
+        panic!(
+            "with its worker the install fenced where the shard alone took {alone} of {} \
+             extents: {error}",
+            CELL.max_extents
+        );
+    }
+    std::thread::spawn(move || {
+        mantle_engine::store::permit_blocking();
+        let writes = Arc::new(Writes {
+            shard: std::thread::current().id(),
+            on_shard: AtomicU64::new(0),
+            elsewhere: AtomicU64::new(0),
+        });
+        shard()
+            .block_on(async move {
+                let mut e =
+                    Stored::open(counted(&path, false, &writes), CELL, CELL.page_size, TRUNK)
+                        .unwrap();
+                assert_eq!((e.applied(), e.durable()), (INDEX, INDEX));
+                assert_eq!(e.image().unwrap(), image_of(CELL_IMAGE));
+            })
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+}

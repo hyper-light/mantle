@@ -51,6 +51,9 @@ pub struct Stored<F: BlockFile> {
     /// A get's value and a scan's rows: the engine's buffers, kept across calls.
     value: Vec<u8>,
     rows: EngineRows,
+    /// The engine's own error that fenced it, the first: an [`EngineError::Fenced`] says only
+    /// that one did, and its owner reports this one ([`Self::fault`]).
+    fault: Option<mantle_engine::Error>,
 }
 
 impl<F: BlockFile + 'static> Stored<F> {
@@ -85,7 +88,13 @@ impl<F: BlockFile + 'static> Stored<F> {
             checkpoints: 0,
             value: Vec::new(),
             rows: EngineRows::new(),
+            fault: None,
         }
+    }
+
+    /// The engine's own error that fenced it, the first, if one has.
+    pub fn fault(&self) -> Option<&mantle_engine::Error> {
+        self.fault.as_ref()
     }
 
     /// Runs the engine's packings and compactions on at most `most` maintenance workers, each
@@ -130,31 +139,38 @@ impl<F: BlockFile + 'static> Stored<F> {
         self.rows.clear();
         self.db
             .scan_rows(from, to, usize::MAX, &mut self.rows)
-            .map_err(fenced)?;
+            .map_err(|e| fenced(&mut self.fault, e))?;
         Ok(())
     }
 
     /// Deletes every row of `[from, to)` (to the end with no `to`).
     fn clear(&mut self, from: &[u8], to: Option<&[u8]>) -> Result<(), EngineError> {
         self.scan_all(from, to)?;
-        let Self { db, rows, .. } = self;
+        let Self {
+            db, rows, fault, ..
+        } = self;
         for (key, _) in rows.iter() {
-            db.delete(key).map_err(fenced)?;
+            db.delete(key).map_err(|e| fenced(fault, e))?;
         }
         Ok(())
     }
 }
 
 /// An engine that failed a read, a write or a flush: nothing more is applied until the range
-/// recovers from its checkpoint and the log, or from its peers.
-fn fenced(_: mantle_engine::Error) -> EngineError {
+/// recovers from its checkpoint and the log, or from its peers. Its error is kept in `fault`
+/// unless one is already, the first being the cause.
+fn fenced(fault: &mut Option<mantle_engine::Error>, e: mantle_engine::Error) -> EngineError {
+    fault.get_or_insert(e);
     EngineError::Fenced
 }
 
 impl<F: BlockFile + 'static> Rows for Stored<F> {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         self.value.clear();
-        let found = self.db.get(key, &mut self.value).map_err(fenced)?;
+        let found = self
+            .db
+            .get(key, &mut self.value)
+            .map_err(|e| fenced(&mut self.fault, e))?;
         // The value's buffer goes with the answer, not a copy of it.
         Ok(found.then(|| std::mem::take(&mut self.value)))
     }
@@ -167,7 +183,7 @@ impl<F: BlockFile + 'static> Rows for Stored<F> {
         // The row alone: no continuation is found past it.
         self.db
             .scan_rows(from, Some(to), 1, &mut self.rows)
-            .map_err(fenced)?;
+            .map_err(|e| fenced(&mut self.fault, e))?;
         Ok(self.rows.get(0).map(|(k, v)| (k.to_vec(), v.to_vec())))
     }
 
@@ -180,8 +196,8 @@ impl<F: BlockFile + 'static> Rows for Stored<F> {
         }
         for write in &writes {
             match write {
-                Write::Put(k, v) => self.db.put(k, v).map_err(fenced)?,
-                Write::Delete(k) => self.db.delete(k).map_err(fenced)?,
+                Write::Put(k, v) => self.db.put(k, v).map_err(|e| fenced(&mut self.fault, e))?,
+                Write::Delete(k) => self.db.delete(k).map_err(|e| fenced(&mut self.fault, e))?,
                 Write::Clear(from, to) => {
                     if from < to {
                         self.clear(from, Some(to))?;
@@ -206,7 +222,9 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
 
     fn persist(&mut self) -> Result<(), EngineError> {
         if self.unpersisted {
-            self.db.checkpoint(self.applied).map_err(fenced)?;
+            self.db
+                .checkpoint(self.applied)
+                .map_err(|e| fenced(&mut self.fault, e))?;
             self.durable = self.applied;
             self.unpersisted = false;
             self.checkpoints = self.checkpoints.saturating_add(1);
@@ -235,7 +253,7 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
     fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
         self.clear(&[], None)?;
         for (k, v) in &rows {
-            self.db.put(k, v).map_err(fenced)?;
+            self.db.put(k, v).map_err(|e| fenced(&mut self.fault, e))?;
         }
         self.applied = index;
         self.unpersisted = true;

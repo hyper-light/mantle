@@ -626,10 +626,15 @@ counted budget; no task waits on another node's:
 - **Incorporation** moves pending branches into the root's in-flight list whenever the root takes
   no structural change. A packing on a worker ends a branch at each of the root's pivot keys
   as they were when it was handed out, and where the root's pivots are still those and no pivot
-  taking a branch has an in-flight bundle, a compaction out or a child to split, each branch
+  taking a branch has an in-flight bundle, a compaction out, a child to split or a bundle past
+  `fanout` whose child takes no flush, each branch
   becomes its pivot's newest bundle branch as it is: that pivot's compaction would have had it
   alone for input and written it again, 78.8M of the 374.0M entries a 100M fill wrote, all in
-  the fill (2026-10-15; research/57 §7). Such a packing keeps its pages in room lent by the
+  the fill (2026-10-15; research/57 §7). A bundle whose flush waits takes none: it plans no
+  compaction and moves nothing down until its child takes the flush, so branches placed in it
+  grew it a branch and an extent a packing while the root's in-flight list, the stall's bound,
+  stayed empty (an install on one worker: a root bundle of 194 branches filled a range's store of
+  256 extents, 2026-11-19, mantle-node `tests/engine_workers.rs`); they go in flight instead. Such a packing keeps its pages in room lent by the
   shard's cache, adopted with its branches when they are placed and given back when they go in
   flight, so a placed branch is cached where it was written, as a compaction's is. One that goes
   in flight keeps its cuts, and a read or a compaction of a range takes only the parts whose

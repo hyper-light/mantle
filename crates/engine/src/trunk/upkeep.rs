@@ -411,6 +411,14 @@ impl Trunk {
     /// then have had that branch alone for input and written its entries again, unchanged, as the
     /// pivot's newest bundle branch: 78.8M of the 374.0M entries a 100M fill wrote (research/57
     /// §7). Otherwise the branches enter as one in-flight bundle and are compacted.
+    ///
+    /// Nor does a pivot whose bundle waits for its child ([`Self::waits_for_child`]): it flushes
+    /// nothing and plans no compaction until the child takes a flush, so parts taken into it
+    /// would grow it by a branch, and an extent, every packing, past every bound, while the
+    /// root's in-flight list stays empty and [`Self::has_room`] never holds a rotation. In an
+    /// in-flight bundle they wait as an inline packing's branch does. A range's install on one
+    /// worker grew a root bundle so to 194 branches and filled its store of 256 extents
+    /// (mantle-node tests/engine_workers.rs).
     fn takes_parts(&self, p: &super::Pending) -> Result<bool, Error> {
         let node = self.node(self.root)?;
         if node.leaf
@@ -425,6 +433,7 @@ impl Trunk {
             if node.inflight.len() > pivot.start
                 || self.compacting(self.root, &pivot.key)
                 || self.held(pivot)?
+                || self.waits_for_child(pivot)?
             {
                 return Ok(false);
             }
@@ -1433,6 +1442,9 @@ impl Trunk {
         let wait = self.wait != Wait::No;
         let admit = self.admit();
         let root = self.root;
+        // Whether a job is out or done: its result gives back the grant it did not write as it is
+        // taken, and its task frees its inputs as it applies.
+        let mut others = self.tasks.iter().any(|t| t.run.out() || t.run.done());
         // Two passes, the root's jobs first: they free room for pending branches.
         for roots in [true, false] {
             for at in 0..self.tasks.len() {
@@ -1507,6 +1519,38 @@ impl Trunk {
                         continue;
                     }
                 }
+                if store.capacity() < asked {
+                    // The store's extents hold no grant this size beside those held: its limit
+                    // is reached, and the grant is sized to what the job reads, more than it
+                    // writes. It waits while a job out or done may give extents back; with none,
+                    // the shard runs it, taking extents as it writes them, as it did without
+                    // workers. A grant so never takes room the store lacks, and the store is
+                    // refused only where what it holds fills it, as without workers.
+                    if others {
+                        continue;
+                    }
+                    let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
+                        continue;
+                    };
+                    let Task {
+                        from,
+                        end,
+                        drop_tombstones,
+                        per,
+                        ..
+                    } = *task;
+                    let t = self.tasks.get_mut(at).ok_or(corrupt())?;
+                    let node = self.nodes.get(t.node).ok_or(corrupt())?;
+                    let inline = Compaction::prepare(
+                        task_inputs(node, &t.what)?,
+                        from,
+                        end,
+                        drop_tombstones,
+                        per,
+                    );
+                    t.run = Running::Inline(Box::new(inline));
+                    continue;
+                }
                 let given = store.grant(needed)?;
                 let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
                     continue;
@@ -1539,7 +1583,10 @@ impl Trunk {
                     }
                 };
                 match sent {
-                    Ok(ticket) => *state = State::Out(ticket),
+                    Ok(ticket) => {
+                        *state = State::Out(ticket);
+                        others = true;
+                    }
                     Err(job) => {
                         let job = *job;
                         if let Some(kept) = job.keep {
@@ -1599,8 +1646,20 @@ impl Trunk {
                     Ok(mut out),
                 ) => {
                     grant.extend_from_slice(&back.topped);
+                    // The grant it did not write goes back now, not when the task applies: a
+                    // pass applies its tasks once every job of it is back, and a grant is sized
+                    // to what a job reads, so ten such jobs held 130 extents in a store of 256
+                    // for the few they wrote (mantle-node tests/engine_workers.rs). Done, a task
+                    // holds what it wrote, as one finished on the shard does. A refused return
+                    // changes no count, and the extents stay the task's to give back as it applies.
+                    let given_back = store.grant_back(&out.unused);
+                    if given_back.is_ok() {
+                        grant.retain(|held| !out.unused.contains(held));
+                        out.unused.clear();
+                    }
                     out.kept = back.kept;
                     *state = State::Done(out);
+                    given_back?;
                 }
                 (task, result) => {
                     if let Some(kept) = back.kept {

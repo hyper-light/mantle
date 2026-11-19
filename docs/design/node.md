@@ -161,6 +161,26 @@ them runs none, its engines packing and compacting on its shard as before. *Open
 every engine on the node, a job carrying its engine's file; and the checkpoint's own synchronous
 work on the shard, below (§6.2).
 
+*As built (2026-11-19), the workers' extents.* A job takes its extents from the store's before it
+goes out, a grant sized to what it reads, more than it writes. Given workers, the node suite's
+followers fenced installing a snapshot, the engine's own error `LimitExceeded { what: "extents of
+a store", limit: 256 }` twelve times in four runs: an install into the cells' store (256 extents
+of four 4 KiB pages, 4 KiB memtables) that the shard alone grew to 180 extents filled it with
+one worker. Ten compactions done but not yet applied held their whole grants, 130 extents for
+the few they wrote, since a pass applies its tasks once all are back; and packings cut at the
+root's pivots went into a bundle whose flush waited, 194 branches of an extent each. Now a
+result gives back what it did not write as it is taken; a packing's branches go in flight where
+their pivot's flush waits (engine-structure.md, Incorporation); and a packing or a compaction
+goes out only where the store holds its grant beside what is held: else it waits while another
+job may give extents back, and with none the shard runs it, taking extents as it writes them,
+as without workers (`Trunk::dispatch_tasks`, `ShardDb::sort_off`, `ShardDb::hand_off_sorted`). The same install with its
+worker then took 180 extents (`tests/engine_workers.rs`). So the store's size reserves nothing
+for jobs in flight (`derive::engine`'s `engine.max_extents`, unchanged): a job never takes room
+the store lacks. Reaching the limit is still the engine's refusal only where what the store
+holds fills it, as without workers. *Open:* `STORE_BYTES_AN_OBJECT` was measured before the
+workers (2026-10-31); the workers' layout is not the shard's, within a few extents of 256 either
+way near the limit, and the transfer harness measures it again with them.
+
 *As built (2026-11-17).* The node runs on hyper-rt's multi-shard `Runtime`, a shard for each CPU
 the process runs at once (hyper-rt `Facts::cpus_at_once`; `process::runtime`), its task launched
 on the first shard and the runtime shut down at its end (`process::run_on_first_shard`). That

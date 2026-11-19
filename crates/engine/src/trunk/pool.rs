@@ -1089,6 +1089,11 @@ impl Pool {
         if waiting { self.most } else { self.want }
     }
 
+    /// Whether a worker has a job out: its result is still to come.
+    pub(crate) fn busy(&self) -> bool {
+        self.held() > 0
+    }
+
     /// Workers with a job out whose result is not taken yet.
     fn held(&self) -> usize {
         self.workers

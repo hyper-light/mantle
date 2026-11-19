@@ -3695,7 +3695,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let mut messages = std::mem::take(&mut self.sending);
         let answered_from = self.applied.len();
         let mut served: Vec<(u128, Vec<u8>)> = Vec::new();
-        let mut fenced: Option<hyper_durable::ReplicaError> = None;
+        let mut fenced: Option<(Handle, hyper_durable::ReplicaError)> = None;
         let ranges = &self.ranges;
         let applied = &mut self.applied;
         self.owner.turn(now, &mut self.out, |handle, outcome, out| {
@@ -3715,7 +3715,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             match outcome {
                 Ok(d) => driven.push((handle, d)),
                 Err(e) => {
-                    fenced.get_or_insert(e);
+                    fenced.get_or_insert((handle, e));
                 }
             }
         });
@@ -3747,9 +3747,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.sending = messages;
         // A fenced range stops the node for now: reopening it from its log or its peers, with the
-        // others serving on, is the node's to build (node.md §6.2).
-        if let Some(e) = fenced {
-            return Err(NodeError::Range(e.into()));
+        // others serving on, is the node's to build (node.md §6.2). It is reported with the error
+        // its machine met and its engine's own (`shard::refused`).
+        if let Some((handle, e)) = fenced {
+            return Err(shard::refused(&self.owner, handle, e));
         }
         if !served.is_empty() {
             self.serve_reads(served)?;

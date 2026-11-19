@@ -2553,8 +2553,8 @@ fn read_file(path: &Path) -> Result<Vec<u8>, ProcessError> {
 
 /// Range `group`'s engine in the node's directory, holding `layer`'s rows: opened at its last
 /// checkpoint when its store is there, created when not, a Name range founded with its first rows
-/// (its descriptor, spanning every key); its page cache as many of its pages as
-/// `engine.cache_bytes` hold.
+/// (its descriptor, spanning every key), with no page cache: `engine.cache_bytes` is no share of
+/// the node's memory, the most a cache holds once it is lent bytes no operation holds.
 pub(crate) fn engine(
     config: &ProcessConfig,
     group: u128,
@@ -2568,29 +2568,13 @@ pub(crate) fn engine(
     let align = mantle_disk::probe::identify(&config.dir).transfer_alignment();
     let file = DeviceFile::open(&path, fresh, CachingRequest::Buffered, align)
         .map_err(|e| ProcessError::Engine(e.to_string()))?;
-    let pages = u64::try_from(config.store.page_size)
-        .ok()
-        .and_then(|page| config.cache_bytes.checked_div(page))
-        .and_then(|pages| usize::try_from(pages).ok())
-        .ok_or_else(|| {
-            ProcessError::Value(
-                "engine.cache_bytes",
-                format!(
-                    "{} bytes in pages of {} bytes, a count this platform does not hold",
-                    config.cache_bytes, config.store.page_size
-                ),
-            )
-        })?;
     let engine = |e: mantle_engine::Error| ProcessError::Engine(e.to_string());
     if !fresh {
-        let mut stored = Stored::open(file, config.store, config.memtable_bytes, config.trunk)
-            .map_err(engine)?;
-        stored.set_cache(pages);
-        return Ok(stored);
+        return Stored::open(file, config.store, config.memtable_bytes, config.trunk)
+            .map_err(engine);
     }
     let mut stored =
         Stored::create(file, config.store, config.memtable_bytes, config.trunk).map_err(engine)?;
-    stored.set_cache(pages);
     let founded = |e: mantle_meta::engine::EngineError| ProcessError::Engine(e.to_string());
     if layer == Layer::Name {
         let first = name::first(1).map_err(|e| ProcessError::Engine(e.to_string()))?;

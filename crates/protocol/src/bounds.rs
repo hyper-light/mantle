@@ -246,8 +246,13 @@ pub fn chunked_transport(stated: &Stated) -> Result<u64, Unfit> {
     transport_at(stated, chunk)
 }
 
-/// What the transport holds for `stated` besides QUIC's windows, and each share at `window`.
-fn transport_at(stated: &Stated, window: u64) -> Result<u64, Unfit> {
+/// The bytes the node's transport holds for `stated` (its `transport_bytes` aside) with each
+/// share at `window`: what it holds besides QUIC's windows ([`held`]) and a share each for a
+/// peer's two connections' windows and its pool of chunks ([`buffering`]), so its windows'
+/// ceiling is `window`. Below [`least_transport`]'s window, QUIC's initial one, [`limits`]
+/// refuses it; at [`chunked_transport`]'s, a receive chunk, each pool holds a chunk; between, a
+/// window grows past its first and its datagrams are copied.
+pub fn transport_at(stated: &Stated, window: u64) -> Result<u64, Unfit> {
     let shape = shape(stated)?;
     let (held, shares) = held(stated, &shape)?;
     shares

@@ -984,8 +984,8 @@ pub fn engine_wants_for(engine: &Engine, objects: u64) -> Option<u64> {
         .checked_mul(mantle_engine::shard_db::measured_per_extent(&engine.store)?)
 }
 
-/// What `engine`'s page cache takes for `objects` objects, its want in [`shares`] beside its
-/// resident metadata's: every page of the extents their rows take, the estimate its metadata's
+/// What `engine`'s page cache takes for `objects` objects, a performance want past the capacity
+/// wants and the operations the node serves ([`derive`], research/87 §4 rule D): every page of the extents their rows take, the estimate its metadata's
 /// want counts ([`engine_wants_for`]), at its store's page size, a cached page holding a page's
 /// verified payload (`mantle_engine::store::cache`). The store's bytes an object are its file's
 /// length at the most it held ([`STORE_BYTES_AN_OBJECT`]), so they count its pages as filled and
@@ -1568,7 +1568,7 @@ pub fn allowance(stated: Option<u64>, memory: &MemoryFacts) -> Result<u64, Deriv
 /// its configuration lets it hold, counted in their order; refused at the class whose bytes take
 /// the count past the allowance, the whole floor named beside it ([`DeriveError::Memory`]). What
 /// remains is each volume's index's and each engine's resident metadata's and page cache's
-/// ([`shares`]).
+/// ([`shares`], [`derive`]'s order).
 pub fn floor(classes: &[(Class, u64)], allowance: u64) -> Result<u64, DeriveError> {
     let total = classes
         .iter()
@@ -1592,10 +1592,11 @@ pub fn floor(classes: &[(Class, u64)], allowance: u64) -> Result<u64, DeriveErro
         .ok_or(DeriveError::Overflow("the floor"))
 }
 
-/// What remains past the floor, shared by each volume's index and each engine's resident metadata
-/// and page cache: each takes what it wants for the objects the cell's volumes hold (`wants`), and
-/// when less remains than all of them want, each the same part of its want, so the indexes and the
-/// engines fill together.
+/// What `remaining` bytes give `wants`: each its want while they hold them all, and when less
+/// remains than all of them want, each the same part of its want, so they fill together: the
+/// capacity wants, each volume's index and each engine's resident metadata, from what remains past
+/// the floor; the performance wants, each engine's page cache and the transport's growth, from
+/// what remains past those and the operations the node serves ([`derive`]).
 pub fn shares(remaining: u64, wants: &[u64]) -> Result<Vec<u64>, DeriveError> {
     let overflow = || DeriveError::Overflow("the floor's shares");
     let total = wants
@@ -1971,13 +1972,19 @@ fn layer_name(layer: Layer) -> &'static str {
 /// - the transport at its floor (`bounds::least_transport`), for the peers, ranges, transfers and
 ///   messages the node opens with as `Node::open_on` states them;
 /// - the floor, class by class, within the allowance ([`allowance`], [`floor`]), and what remains
-///   shared by each volume's index and each engine's resident metadata and page cache
-///   ([`shares`]), each wanting what the objects the cell's volumes hold take of it
-///   ([`index_wants`], [`cell_blocks`], [`engine_wants_for`], [`engine_cache_wants_for`]) and the
-///   engines' metadata what no want takes, up to their devices' shares: a volume's fragments and
-///   an engine's extents as many as their shares hold ([`volume`], [`engine_within`]), an engine
-///   never fewer than its store holds, which it would not open below (`Store::open`), and an
-///   engine's cache the pages its share holds.
+///   in rule D's order (research/87 §4): (1) the capacity wants, each volume's index and each
+///   engine's resident metadata, whole while what remains holds them, each the same part of its
+///   want when less does ([`shares`], [`index_wants`], [`cell_blocks`], [`engine_wants_for`]);
+///   (2) the operations the node serves at least ([`served`]); (3) the performance wants, each
+///   engine's page cache ([`engine_cache_wants_for`]) and the transport's growth past its floor
+///   to a receive chunk each share for the connections those operations open
+///   (`bounds::chunked_transport`), sharing what remains past (1) and (2) in proportion to their
+///   wants; (4) as many operations more as what remains past those holds, each with its client's
+///   windows at the transport's ([`operations`]). What no want takes goes to the engines'
+///   metadata, up to their devices' shares: a volume's fragments and an engine's extents as many
+///   as their shares hold ([`volume`], [`engine_within`]), an engine never fewer than its store
+///   holds, which it would not open below (`Store::open`), and an engine's cache the pages its
+///   share holds.
 ///
 /// `stores` reads range `group`'s store as it stands, its superblocks read at the page a new store
 /// would take or the one they name (`Store::shape`): none before its first start.
@@ -2141,7 +2148,12 @@ pub fn derive(
     }
     let (made, held_extents) = founded(made, &shapes, share, &rules, measured.meta.align)?;
 
-    // The transport at its floor, for what the node opens with (`Node::open_on`).
+    // The transport at its floor, for what the node opens with (`Node::open_on`): each share of its
+    // windows at QUIC's initial window (`bounds::least_transport`); at its want past it, a receive
+    // chunk (`bounds::chunked_transport`).
+    let initial = hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM);
+    let chunk_window =
+        u64::try_from(hyper_transport::RECEIVE_CHUNK).map_err(|_| overflow("a receive chunk"))?;
     let hosted: Vec<Hosted<()>> = stated
         .ranges
         .iter()
@@ -2172,8 +2184,9 @@ pub fn derive(
     };
     // What `objects` operations at once hold beside their charges, the volumes moving `transfers`
     // at once: their asks, the transport's bounds with a native client each beside the pinned
-    // peers (node.md §3.6) drawing its exchanges from a pool of as many, and each range's reads.
-    let held_at = |objects: usize, transfers: usize| -> Result<Held, DeriveError> {
+    // peers (node.md §3.6) drawing its exchanges from a pool of as many, each share of its windows
+    // at `window` (`bounds::transport_at`), and each range's reads.
+    let held_at = |objects: usize, transfers: usize, window: u64| -> Result<Held, DeriveError> {
         let gateway = gateway(objects, 0)?;
         let asked = if hosts {
             asks(&gateway, &schemes)?
@@ -2208,7 +2221,7 @@ pub fn derive(
             messages,
             max_head: crate::node::MAX_HEAD,
         };
-        let transport_bytes = mantle_protocol::bounds::least_transport(&bounds)
+        let transport_bytes = mantle_protocol::bounds::transport_at(&bounds, window)
             .map_err(|e| DeriveError::Bounds(e.to_string()))?;
         bounds.transport_bytes = transport_bytes;
         let limits = mantle_protocol::bounds::limits(&bounds)
@@ -2270,7 +2283,7 @@ pub fn derive(
             runtime,
         })
     };
-    let held_by = |objects: usize| held_at(objects, transfers);
+    let held_by = |objects: usize, window: u64| held_at(objects, transfers, window);
     // The floor, class by class.
     let engines_bytes = mantle_engine::shard_db::bounded_bytes(
         &StoreConfig {
@@ -2362,7 +2375,7 @@ pub fn derive(
             0
         };
         classes_of(
-            &held_at(served, deep.transfers)?,
+            &held_at(served, deep.transfers, initial)?,
             served_bytes,
             deep.bytes,
             stacks(deep_threads).ok_or(overflow("the threads' stacks"))?,
@@ -2386,54 +2399,128 @@ pub fn derive(
     let held_objects = cell_blocks(counted, spread)?;
     let engine_want =
         engine_wants_for(&made, held_objects).ok_or(overflow("an engine's metadata"))?;
-    // And each engine's page cache the pages of those rows, a data want as theirs is (research/87
-    // §4, rule D): with no cache, every page a get or a lookup needs was a read from the device on
-    // the node's busy shard, 100 pages for 100 repeated gets of 1,100 rows and none with a cache.
+    // Each engine's page cache wants the pages of those rows: with no cache, every page a get or a
+    // lookup needs was a read from the device on the node's busy shard, 100 pages for 100 repeated
+    // gets of 1,100 rows and none with a cache.
     let cache_want =
         engine_cache_wants_for(&made, held_objects).ok_or(overflow("an engine's cache"))?;
-    let with_metadata = stated
-        .volumes
-        .len()
-        .checked_add(ranges)
-        .ok_or(overflow("the floor's shares"))?;
-    let mut all = wants;
-    all.resize(with_metadata, engine_want);
-    all.resize(
-        with_metadata
+    // The capacity wants (research/87 §4, rule D, the data first): each volume's index and each
+    // engine's resident metadata, what bounds the objects the node holds.
+    let mut capacity = wants;
+    capacity.resize(
+        stated
+            .volumes
+            .len()
             .checked_add(ranges)
             .ok_or(overflow("the floor's shares"))?,
-        cache_want,
+        engine_want,
     );
-    let wanted = all
+    let wanted = capacity
         .iter()
         .try_fold(0u64, |sum, &want| sum.checked_add(want))
         .ok_or(overflow("the wants"))?;
+    // The need holds the capacity wants and the operations the node serves at least: a node given
+    // it starts with every capacity want whole, and the performance wants take what a larger
+    // allowance leaves.
     say_need(&mut said, need(&deepest_floor, wanted)?);
-    // The operations' share holds as many operations as it holds at what one costs: its charge,
-    // and what one more adds to the transport and the ranges, the model's own difference.
-    let (objects, objects_bytes, native) = if hosts {
-        let total = |held: &Held| {
-            held.bounds
-                .transport_bytes
-                .checked_add(held.beside)?
-                .checked_add(held.ranges_bytes)?
-                .checked_add(held.listener)?
-                .checked_add(held.runtime)
-        };
-        let one = held_by(1)?;
-        let two = held_by(2)?;
-        let each = total(&two)
+    // The bytes of every class at `held` with `objects_bytes` for the operations.
+    let floor_at = |held: &Held, objects_bytes: u64| -> Result<u64, DeriveError> {
+        classes_at(held, objects_bytes)?
+            .iter()
+            .try_fold(0u64, |sum, &(_, bytes)| sum.checked_add(bytes))
+            .ok_or(overflow("the floor"))
+    };
+    // What the transport, the ranges, the listener and the runtime hold at `held`.
+    let total = |held: &Held| {
+        held.bounds
+            .transport_bytes
+            .checked_add(held.beside)?
+            .checked_add(held.ranges_bytes)?
+            .checked_add(held.listener)?
+            .checked_add(held.runtime)
+    };
+    // What one more operation adds to the transport and the ranges with each share of the
+    // transport's windows at `window`, the model's own difference, and the floor with one
+    // operation at the most one is charged.
+    let one_at = |window: u64| -> Result<(u64, u64), DeriveError> {
+        let one = held_by(1, window)?;
+        let each = total(&held_by(2, window)?)
             .zip(total(&one))
             .and_then(|(two, one)| two.checked_sub(one))
             .ok_or(overflow("an operation's state"))?;
-        // The data first (research/87 §4, rule D): the floor with one operation at the most one
-        // is charged, and the indexes' and engines' wants beside it; what the memory holds past
-        // both is the operations', with the one, its state and its charge.
-        let floor_one = classes_at(&one, first)?
-            .iter()
-            .try_fold(0u64, |sum, &(_, bytes)| sum.checked_add(bytes))
-            .ok_or(overflow("the floor"))?;
-        let slack = allowed.saturating_sub(floor_one).saturating_sub(wanted);
+        Ok((each, floor_at(&one, first)?))
+    };
+    // Rule D's order (research/87 §4): (1) the capacity wants, whole while the memory past the
+    // floor holds them; (2) the operations the node serves at least ([`served`]), the one the
+    // floor holds and the rest at what each adds; (3) the performance wants, each engine's page
+    // cache and the transport's growth past its floor to a receive chunk each share for the
+    // connections those operations open, sharing what remains in proportion to their wants
+    // ([`shares`]); (4) as many operations more as what remains then holds.
+    let (each, floor_one) = if hosts { one_at(initial)? } else { (0, 0) };
+    let base = if hosts {
+        floor_one
+    } else {
+        floor_at(&held_by(0, initial)?, 0)?
+    };
+    let serves = if hosts {
+        usize::try_from(serving.operations).map_err(|_| overflow("a stock client"))?
+    } else {
+        0
+    };
+    let served_past = if hosts {
+        let most = most_charged(&charges);
+        serving
+            .bytes
+            .max(most)
+            .checked_sub(most)
+            .zip(serving.operations.checked_sub(1))
+            .and_then(|(bytes, more)| bytes.checked_add(more.checked_mul(each)?))
+            .ok_or(overflow("the operations served"))?
+    } else {
+        0
+    };
+    let performance_room = allowed
+        .saturating_sub(base)
+        .saturating_sub(wanted)
+        .saturating_sub(served_past);
+    // The transport's growth for the connections the served operations open, each share from
+    // QUIC's initial window to a receive chunk: its windows and the pool's chunks in its budget,
+    // and what QUIC keeps to send beside it, at most a peer's window.
+    let growth = total(&held_at(serves, transfers, chunk_window)?)
+        .zip(total(&held_at(serves, transfers, initial)?))
+        .and_then(|(chunks, floor)| chunks.checked_sub(floor))
+        .ok_or(overflow("the transport's growth"))?;
+    let mut performance = vec![cache_want; ranges];
+    performance.push(growth);
+    let performance_parts = shares(performance_room, &performance)?;
+    let (cache_parts, transport_part) = performance_parts
+        .split_last()
+        .map(|(transport, caches)| (caches, *transport))
+        .ok_or(overflow("the performance wants"))?;
+    let cache = cache_parts.iter().copied().min().unwrap_or(0);
+    // The transport's part as a window: each share past QUIC's initial window by the same part of
+    // a chunk's growth as its part is of its want.
+    let window = chunk_window
+        .checked_sub(initial)
+        .and_then(|grows| u128::from(grows).checked_mul(u128::from(transport_part)))
+        .and_then(|grown| grown.checked_div(u128::from(growth)))
+        .and_then(|grown| u64::try_from(grown).ok())
+        .and_then(|grown| initial.checked_add(grown))
+        .ok_or(overflow("the transport's window"))?
+        .min(chunk_window);
+    let caches = u64::try_from(ranges)
+        .ok()
+        .and_then(|ranges| ranges.checked_mul(cache))
+        .ok_or(overflow("the engines' caches"))?;
+    let (objects, objects_bytes, native) = if hosts {
+        // (4): what the memory holds past the floor, the capacity wants and the caches' parts is
+        // the operations', with the one, its state and its charge, each operation adding its
+        // client's windows at the transport's.
+        let (each, floor_one) = one_at(window)?;
+        let slack = allowed
+            .saturating_sub(floor_one)
+            .saturating_sub(wanted)
+            .saturating_sub(caches);
         let share = most_charged(&charges)
             .checked_add(each)
             .and_then(|share| share.checked_add(slack))
@@ -2452,8 +2539,14 @@ pub fn derive(
         ranges_bytes,
         listener,
         runtime,
-    } = held_by(objects)?;
+    } = held_by(objects, window)?;
     let transport_bytes = bounds.transport_bytes;
+    let transport_floor = mantle_protocol::bounds::least_transport(&bounds)
+        .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    let transport_want = mantle_protocol::bounds::chunked_transport(&bounds)
+        .ok()
+        .and_then(|chunks| chunks.checked_sub(transport_floor))
+        .ok_or(overflow("the transport's want"))?;
     let objects_bytes = if hosts {
         crate::derive::objects(&gateway, &schemes)?
     } else {
@@ -2494,21 +2587,28 @@ pub fn derive(
         remaining,
     );
 
-    let parts = shares(remaining, &all)?;
-    let (indexes, engines) = parts.split_at(stated.volumes.len());
-    let (metadata, caches) = engines
-        .split_at_checked(ranges)
-        .ok_or(overflow("the floor's shares"))?;
-    let cache = caches.iter().copied().min().unwrap_or(0);
-    // What no want takes goes to the engines' metadata, each up to what its device's share holds:
-    // the rows no volume bounds, an empty object's, a delete marker's, an upload's in progress.
+    // (1): the capacity wants, each whole while what remains holds them all, else each the same
+    // part of its want.
+    let parts = shares(remaining, &capacity)?;
+    let (indexes, metadata) = parts.split_at(stated.volumes.len());
     let taken = parts
         .iter()
         .try_fold(0u64, |sum, &part| sum.checked_add(part))
         .ok_or(overflow("the floor's shares"))?;
+    let left = remaining.saturating_sub(taken);
+    // (3): each cache its part, within what the capacity wants leave.
+    let cache = u64::try_from(ranges)
+        .ok()
+        .and_then(|ranges| left.checked_div(ranges))
+        .map_or(0, |each| each.min(cache));
+    // What no want takes goes to the engines' metadata, each up to what its device's share holds:
+    // the rows no volume bounds, an empty object's, a delete marker's, an upload's in progress.
     let spare = u64::try_from(ranges)
         .ok()
-        .and_then(|ranges| remaining.checked_sub(taken)?.checked_div(ranges))
+        .and_then(|ranges| {
+            left.checked_sub(ranges.checked_mul(cache)?)?
+                .checked_div(ranges)
+        })
         .unwrap_or(0);
     let most = engine_wants(&made).ok_or(overflow("an engine's metadata"))?;
     let metadata = metadata
@@ -2567,15 +2667,7 @@ pub fn derive(
     );
     let config = log_config;
     say_log(&mut said, &config);
-    said.add(
-        "transport_bytes",
-        transport_bytes,
-        Kind::Derived,
-        "the transport's floor: what it holds besides QUIC's windows, the connections' state at \
-         the most connections it holds (bounds::connections_state) and the receive ring's growth \
-         at its most (bounds::ring_growth) among it, and each share at QUIC's initial window, for \
-         the node's peers, ranges, transfers and messages (bounds::least_transport)",
-    );
+    say_transport(&mut said, transport_bytes, transport_floor, transport_want);
     // In whole milliseconds, as the key states it, rounded up: a bound on a starved host only.
     let budget_ms = u64::try_from(probe_budget()?.as_nanos().div_ceil(1_000_000))
         .map_err(|_| overflow("the probe budget"))?;
@@ -2768,10 +2860,11 @@ fn deepest(facts: &VolumeFacts) -> Profile {
     }
 }
 
-/// What a node needs to be given to hold its floor and every want whole: `floor_at_deepest`, its
-/// floor class by class at the most its devices can be measured to take ([`deepest`]), and
-/// `wanted`, every volume's index's and engine's metadata's and cache's want together
-/// ([`shares`]).
+/// What a node needs to be given to hold its floor and every capacity want whole:
+/// `floor_at_deepest`, its floor class by class at the most its devices can be measured to take
+/// ([`deepest`]) with the operations it serves ([`served`]), and `wanted`, every volume's index's
+/// and engine's metadata's want together ([`shares`]). The performance wants, the engines' caches
+/// and the transport's growth, take what a larger allowance leaves past it ([`derive`]).
 pub fn need(floor_at_deepest: &[(Class, u64)], wanted: u64) -> Result<u64, DeriveError> {
     floor_at_deepest
         .iter()
@@ -3255,7 +3348,9 @@ fn say_need(said: &mut Said, need: u64) {
          devices can be measured to take, each one's queue (derive::deepest), with as many \
          operations as one stock client asks of its S3 endpoint at once (listener::STOCK_CLIENT; \
          the first alone with no endpoint), and every volume's index and engine's resident \
-         metadata and page cache whole for the objects the cell's volumes hold (derive::need)",
+         metadata whole for the objects the cell's volumes hold, the capacity wants; the engines' \
+         page caches and the transport's growth take what a larger allowance leaves \
+         (derive::need; research/87 §4 rule D)",
     );
 }
 
@@ -3323,9 +3418,11 @@ fn say_floor(
         "memory.remaining",
         remaining,
         Kind::Derived,
-        "the allowance past the floor: each volume's index and each engine's resident metadata \
-         and page cache, in proportion to what each wants for the objects the cell's volumes \
-         hold, what no want takes the engines' metadata's (derive::shares)",
+        "the allowance past the floor, in rule D's order (research/87 §4): each volume's index and \
+         each engine's resident metadata, whole while it holds them, each the same part of its \
+         want when it does not; the operations the node serves; each engine's page cache and the \
+         transport's growth, in proportion to their wants; the operations past those; what no \
+         want takes the engines' metadata's (derive::derive, derive::shares)",
     );
 }
 
@@ -3493,10 +3590,10 @@ fn say_engine(
         metadata,
         Kind::Derived,
         "each range's share of what remains of memory past the floor, for its engine's resident \
-         metadata: the extents its rows of engine.objects take, in proportion with each index's \
-         and each engine's cache's want when less remains (derive::engine_wants_for, \
-         derive::shares), and what no want takes, up to what its share of the node directory's \
-         device holds",
+         metadata: the extents its rows of engine.objects take, a capacity want, whole while what \
+         remains holds it, in proportion with each index's want when less remains \
+         (derive::engine_wants_for, derive::shares), and what no want takes, up to what its share \
+         of the node directory's device holds",
     );
     said.add(
         "engine.max_extents",
@@ -3518,9 +3615,10 @@ fn say_engine(
         "each range's share of what remains of memory past the floor, for its engine's page \
          cache of verified pages, engine.cache_bytes over engine.page_size of them \
          (ShardDb::set_cache): every page of the extents its rows of engine.objects take, with \
-         which a get or a lookup reads each page from the device once, in proportion with the \
-         indexes' and the engines' metadata's wants when less remains \
-         (derive::engine_cache_wants_for, derive::shares; research/87 §4 rule D)",
+         which a get or a lookup reads each page from the device once; a performance want, past \
+         the capacity wants and the operations the node serves, in proportion with the \
+         transport's growth when less remains (derive::engine_cache_wants_for, derive::shares; \
+         research/87 §4 rule D)",
     );
     said.add(
         "engine.memtable_bytes",
@@ -3541,6 +3639,42 @@ fn say_engine(
         Kind::Derived,
         "every row one memtable gives a leaf, the most a memtable holds being rows of the \
          shortest key and no value (mantle_meta::key::least_bytes)",
+    );
+}
+
+/// The transport's budget, `bytes`: its `floor` and the part of its `want` past it that what
+/// remains past the capacity wants and the operations served gives it ([`derive`]).
+fn say_transport(said: &mut Said, bytes: u64, floor: u64, want: u64) {
+    said.add(
+        "transport.floor",
+        floor,
+        Kind::Derived,
+        "what the transport holds besides QUIC's windows, the connections' state at the most \
+         connections it holds (bounds::connections_state) and the receive ring's growth at its \
+         most (bounds::ring_growth) among it, and each share at QUIC's initial window, 12,000 \
+         bytes, below a receive chunk, so each datagram it receives is copied into a buffer of \
+         its own, for the node's peers, ranges, transfers and messages (bounds::least_transport)",
+    );
+    said.add(
+        "transport.want",
+        want,
+        Kind::Derived,
+        "past its floor, each share at a receive chunk, 65,527 bytes: each connection's window \
+         grows to a chunk as hyper-transport's auto-tuning finds its path wants it (RFC 9000 §4; \
+         Chromium QUIC's QuicFlowController) and each peer's pool holds a chunk for it, so a \
+         datagram is cut from a chunk, not copied (bounds::chunked_transport); a performance \
+         want, past the capacity wants and the operations the node serves, in proportion with \
+         the engines' page caches when less remains (research/87 §4 rule D)",
+    );
+    said.add(
+        "transport_bytes",
+        bytes,
+        Kind::Derived,
+        "the transport's budget: transport.floor, and past it the part of transport.want what \
+         remains past the capacity wants and the operations the node serves gives the \
+         transport's growth, each share's window past QUIC's initial window by that part of a \
+         chunk's, and each operation past those its client's windows at it (derive::derive, \
+         bounds::transport_at)",
     );
 }
 
@@ -4034,6 +4168,142 @@ mod tests {
                 mantle_protocol::bounds::limits(&short).is_err(),
                 "{peers} peers"
             );
+        }
+    }
+
+    /// The S3 endpoint a test node states.
+    fn s3() -> Option<crate::process::S3Stated> {
+        Some(crate::process::S3Stated {
+            listen: "127.0.0.1:7480".parse().unwrap(),
+            region: "us-east-1".into(),
+            names: Vec::new(),
+            certificate: at("/node/s3/cert.der"),
+            key: at("/node/s3/key.der"),
+            access: Vec::new(),
+        })
+    }
+
+    /// The transport's budget `derived` says: its floor, its want past it, and what it is given.
+    fn transport(derived: &Derived) -> (u64, u64, u64) {
+        let bytes = said_bytes(derived, "transport_bytes");
+        assert_eq!(bytes, derived.config.transport_bytes);
+        (
+            said_bytes(derived, "transport.floor"),
+            said_bytes(derived, "transport.want"),
+            bytes,
+        )
+    }
+
+    /// A founder of the ladder's cell (three founders, each a 32 GiB volume and its S3 endpoint)
+    /// on the Mac Studio's 96 GiB and 32 cores gives its transport its want past its floor: each
+    /// share at a receive chunk, a connection's window ceiling and each peer's pool of chunks, so
+    /// a datagram it receives is cut from a chunk where at its floor's windows, QUIC's initial
+    /// window of 12,000 bytes, each was copied into a buffer of its own. Its operations, each
+    /// costing its client's windows at a chunk, still number at least what a stock client asks at
+    /// once.
+    #[test]
+    fn a_node_with_memory_to_spare_gives_each_window_a_receive_chunk() {
+        let mut founder = Stated {
+            s3: s3(),
+            ..stated(1)
+        };
+        founder.volumes[0].1 = VolumeBytes::Stated(32 << 30);
+        let mut measured = facts(1);
+        measured.memory = machine(96 << 30, None);
+        measured.cores = 32;
+        let derived = derive(founder, &measured, &mut fresh).unwrap();
+        let (floor, want, bytes) = transport(&derived);
+        let clients = said_bytes(&derived, "gateway.clients");
+        // Its two nodes and its gateway, and its clients: each two connections' windows and a
+        // pool, each a chunk past QUIC's initial window.
+        let shares = (3 + clients) * 3;
+        let chunk = u64::try_from(hyper_transport::RECEIVE_CHUNK).unwrap();
+        let initial = hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM);
+        eprintln!(
+            "96 GiB, 32 cores: transport.floor {floor}, transport.want {want}, transport_bytes \
+             {bytes}, gateway.clients {clients}, gateway.objects {}, memory.remaining {}",
+            said_bytes(&derived, "gateway.objects"),
+            said_bytes(&derived, "memory.remaining"),
+        );
+        assert_eq!(want, shares * (chunk - initial));
+        assert_eq!(bytes, floor + want);
+        assert!(said_bytes(&derived, "gateway.objects") >= crate::listener::STOCK_CLIENT);
+    }
+
+    /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
+    /// as they were before the caches were wants: a founder of the membership suite's cell holds
+    /// its index's 23,068,852 bytes and each engine's metadata's 18,029,352 at every depth its
+    /// device may measure, and a node of it granted with no volume of its own its engines'
+    /// metadata, each with the ten operations a stock client asks at once. The engines' caches and
+    /// the transport's growth share what remains past those, each the same part of its want: none
+    /// for the founder at 64 and 256 deep, whose transport stays at its floor.
+    #[test]
+    fn on_cis_macos_runner_the_capacity_wants_stand_and_the_performance_wants_share_the_rest() {
+        let member = |volume: bool| {
+            let mut s = Stated {
+                s3: s3(),
+                enlist: Some(Enlisting {
+                    root: 0x10,
+                    domain: "d1".into(),
+                    max_nodes: 5,
+                    max_volumes: 5,
+                }),
+                ..stated(1)
+            };
+            if volume {
+                s.volumes[0].1 = VolumeBytes::Stated(256 << 20);
+            } else {
+                s.volumes.clear();
+                s.cell_volume = Some(256 << 20);
+            }
+            s.peers.retain(|p| p.role == Role::Node);
+            for id in 6..=9 {
+                s.peers
+                    .push(peer(id, Role::Gateway, "/node/identity/c.der", None));
+            }
+            s
+        };
+        for depth in [4, 64, 256] {
+            for volume in [true, false] {
+                let mut measured = deep(256, depth);
+                measured.cores = 3;
+                measured.memory = machine(7 << 30, None);
+                if !volume {
+                    measured.volumes.clear();
+                }
+                let derived = derive(member(volume), &measured, &mut fresh)
+                    .unwrap_or_else(|e| panic!("depth {depth}, volume {volume}: {e}"));
+                let (floor, want, bytes) = transport(&derived);
+                let cache = said_bytes(&derived, "engine.cache_bytes");
+                let cache_want = cache_wanted(&derived, said_bytes(&derived, "engine.objects"));
+                eprintln!(
+                    "7 GiB, depth {depth}, volume {volume}: transport_bytes {bytes}, {} of its \
+                     want {want}, engine.cache_bytes {cache} of {cache_want}, gateway.objects {}",
+                    bytes - floor,
+                    said_bytes(&derived, "gateway.objects")
+                );
+                if volume {
+                    assert_eq!(said_bytes(&derived, "volume.1.index_bytes"), 23_068_852);
+                }
+                assert_eq!(said_bytes(&derived, "engine.metadata_bytes"), 18_029_352);
+                assert_eq!(
+                    said_bytes(&derived, "gateway.objects"),
+                    crate::listener::STOCK_CLIENT,
+                    "depth {depth}, volume {volume}"
+                );
+                // The same part of each want, each rounded down.
+                let (cache_part, transport_part) = (
+                    u128::from(cache) * u128::from(want),
+                    u128::from(bytes - floor) * u128::from(cache_want),
+                );
+                assert!(
+                    cache_part.abs_diff(transport_part) <= u128::from(cache_want) * 3 * 70,
+                    "depth {depth}, volume {volume}"
+                );
+                if volume && depth > 4 {
+                    assert_eq!((cache, bytes), (0, floor), "depth {depth}");
+                }
+            }
         }
     }
 
@@ -5033,20 +5303,7 @@ mod tests {
             let per_extent =
                 mantle_engine::shard_db::measured_per_extent(&derived.config.store).unwrap();
             let metadata = said_bytes(&derived, "engine.metadata_bytes");
-            let cache = said_bytes(&derived, "engine.cache_bytes");
-            eprintln!(
-                "depth {depth}: engine.metadata_bytes {metadata}, engine.cache_bytes {cache}, \
-                 gateway.objects {}, memory.remaining {}",
-                said_bytes(&derived, "gateway.objects"),
-                said_bytes(&derived, "memory.remaining"),
-            );
             assert!(metadata >= per_extent * OPENS_WITH, "depth {depth}");
-            // Its caches take their whole want beside them, every page of the cell's rows.
-            assert_eq!(
-                cache,
-                cache_wanted(&derived, said_bytes(&derived, "engine.objects")),
-                "depth {depth}"
-            );
             assert!(metadata >= 18_029_352, "depth {depth}: {metadata}");
             assert!(
                 said_bytes(&derived, "gateway.objects") >= 2,
@@ -5170,9 +5427,9 @@ mod tests {
 
     /// What a node needs (`memory.need`) is its floor at the most its device can be measured to
     /// take, its queue, and its wants whole: the same whatever depth calibration measured; given
-    /// it, a node measured at any depth up to the queue holds its index's and its engines' caches'
-    /// whole wants, and its engines' metadata at least what they hold at the deepest; given a byte
-    /// less at the deepest, each share falls short of its want.
+    /// it, a node measured at any depth up to the queue holds its index's whole want, and its
+    /// engines at least what they hold at the deepest; given a byte less at the deepest, a share
+    /// falls short of its want.
     #[test]
     fn a_node_given_its_need_holds_every_want_whatever_its_device_measures() {
         let need = said_bytes(
@@ -5184,13 +5441,13 @@ mod tests {
                 ceiling: Some(ceiling),
                 ..stated(1)
             };
-            derive(stated, &roomy(deep(316, depth)), &mut fresh).unwrap()
+            derive(stated, &deep(316, depth), &mut fresh).unwrap()
         };
-        // A machine whose memory holds every floor and want: each takes its want whole.
-        let whole = derive(stated(1), &roomy(deep(316, 316)), &mut fresh).unwrap();
-        let index_want = said_bytes(&whole, "volume.1.index_bytes");
-        let cache_want = cache_wanted(&whole, said_bytes(&whole, "engine.objects"));
-        assert_eq!(said_bytes(&whole, "engine.cache_bytes"), cache_want);
+        // The machine's 16 GiB past every floor: each index takes its want whole.
+        let index_want = said_bytes(
+            &derive(stated(1), &deep(316, 316), &mut fresh).unwrap(),
+            "volume.1.index_bytes",
+        );
         let at_deepest = given(need, 316);
         for depth in [1, 4, 64, 316] {
             let derived = given(need, depth);
@@ -5199,11 +5456,6 @@ mod tests {
                 said_bytes(&derived, "volume.1.index_bytes"),
                 index_want,
                 "the index's want whole at depth {depth}"
-            );
-            assert_eq!(
-                said_bytes(&derived, "engine.cache_bytes"),
-                cache_want,
-                "each engine's cache's want whole at depth {depth}"
             );
             assert!(
                 said_bytes(&derived, "engine.metadata_bytes")
@@ -5215,10 +5467,6 @@ mod tests {
         assert!(
             said_bytes(&short, "volume.1.index_bytes") < index_want,
             "a byte short of the need, the index's share falls short of its want"
-        );
-        assert!(
-            said_bytes(&short, "engine.cache_bytes") < cache_want,
-            "a byte short of the need, each cache's share falls short of its want"
         );
     }
 
@@ -5250,11 +5498,11 @@ mod tests {
             "memory.need",
         );
         let index_want = said_bytes(
-            &derive(s3(None), &roomy(deep(316, 316)), &mut fresh).unwrap(),
+            &derive(s3(None), &deep(316, 316), &mut fresh).unwrap(),
             "volume.1.index_bytes",
         );
         let stock = crate::listener::STOCK_CLIENT;
-        let given = derive(s3(Some(need)), &roomy(deep(316, 316)), &mut fresh).unwrap();
+        let given = derive(s3(Some(need)), &deep(316, 316), &mut fresh).unwrap();
         assert!(said_bytes(&given, "gateway.objects") >= stock);
         assert_eq!(said_bytes(&given, "volume.1.index_bytes"), index_want);
         // The charges the node's process reckons from its file (`process::gateway_settings`).
@@ -5279,7 +5527,7 @@ mod tests {
             assert_eq!(admission.admits(part), Ok(()), "part {n} of {stock}");
             admission.admitted(part);
         }
-        let short = derive(s3(Some(need - 1)), &roomy(deep(316, 316)), &mut fresh).unwrap();
+        let short = derive(s3(Some(need - 1)), &deep(316, 316), &mut fresh).unwrap();
         assert_eq!(said_bytes(&short, "volume.1.index_bytes"), index_want);
     }
 
@@ -5361,7 +5609,7 @@ mod tests {
     /// beside an 8 TB file system, 2026-10-30).
     #[test]
     fn each_index_takes_its_whole_want_beside_a_file_system_of_any_size() {
-        let mut measured = roomy(facts(1));
+        let mut measured = facts(1);
         measured.meta.bytes = Some(8 << 40);
         let derived = derive(stated(1), &measured, &mut fresh).unwrap();
         let bytes = |key: &str| -> u64 {
@@ -5378,13 +5626,8 @@ mod tests {
             index_wants(align, 8 << 30).unwrap()
         );
         assert_eq!(derived.config.volumes[0].config.max_fragments, fragments);
-        // Each engine's cache takes its whole want, every page of its rows.
-        assert_eq!(
-            bytes("engine.cache_bytes"),
-            cache_wanted(&derived, fragments)
-        );
-        // The engines' metadata take the rest, each its want and an equal part of what no want
-        // took.
+        // The engines take the rest, each its metadata's want and its cache's part, and an equal
+        // part of what no want took.
         let given = bytes("volume.1.index_bytes")
             + 5 * bytes("engine.metadata_bytes")
             + 5 * bytes("engine.cache_bytes");
@@ -5392,37 +5635,63 @@ mod tests {
         assert!(given <= remaining && remaining - given < 5);
     }
 
-    /// Each engine's page cache is a data want beside its metadata's and the indexes'
-    /// (research/87 §4 rule D): on a host whose memory holds every want, its whole want, every page
-    /// of the cell's rows; on one that holds less, the same part of its want as the index takes of
-    /// its own, and the operations no more than on the larger host. The cache is no class of the
-    /// floor: the classes the operations do not size are the same on either host.
+    /// The performance wants come after the capacity wants and the operations the node serves
+    /// (research/87 §4 rule D's order): on a host whose memory holds every want, each engine's
+    /// cache takes its whole want, every page of the cell's rows, and the transport its growth to
+    /// a receive chunk each share; on a 16 GiB host the index and the engines' metadata still take
+    /// their whole wants, and the caches and the transport's growth share what remains past them
+    /// and the operation served, each the same part of its want; the operations no more than on
+    /// the larger host. The cache is no class of the floor: the classes the operations and the
+    /// transport do not size are the same on either host.
     #[test]
-    fn an_engines_cache_takes_its_want_whole_or_the_part_every_want_takes() {
+    fn the_caches_and_the_transport_share_what_the_capacity_wants_and_the_served_leave() {
         let roomy = derive(stated(1), &roomy(facts(1)), &mut fresh).unwrap();
         let small = derive(stated(1), &facts(1), &mut fresh).unwrap();
         let objects = said_bytes(&roomy, "engine.objects");
         let want = cache_wanted(&roomy, objects);
         assert_eq!(said_bytes(&roomy, "engine.cache_bytes"), want);
         assert_eq!(roomy.config.cache_bytes, want);
-        let index_want = said_bytes(&roomy, "volume.1.index_bytes");
-        let index = said_bytes(&small, "volume.1.index_bytes");
+        let (floor, growth, bytes) = transport(&roomy);
+        assert_eq!(bytes, floor + growth, "the transport's want whole");
+        assert_eq!(
+            said_bytes(&small, "volume.1.index_bytes"),
+            said_bytes(&roomy, "volume.1.index_bytes"),
+            "the index's want whole"
+        );
+        let metadata = {
+            let config = &small.config;
+            let engine = Engine {
+                store: config.store,
+                memtable_bytes: config.memtable_bytes,
+                trunk: config.trunk,
+            };
+            engine_wants_for(&engine, objects).unwrap()
+        };
+        assert!(
+            said_bytes(&small, "engine.metadata_bytes") >= metadata,
+            "each engine's metadata's want whole"
+        );
         let cache = said_bytes(&small, "engine.cache_bytes");
+        let (floor, growth, bytes) = transport(&small);
         eprintln!(
-            "16 GiB: cache {cache} of {want}, index {index} of {index_want}, operations {} of {}",
+            "16 GiB: cache {cache} of {want}, the transport's growth {} of {growth}, operations \
+             {} of {}",
+            bytes - floor,
             said_bytes(&small, "gateway.objects"),
             said_bytes(&roomy, "gateway.objects")
         );
         assert_eq!(small.config.cache_bytes, cache);
-        assert!(cache < want && index < index_want, "{cache} {index}");
-        // The same part of each want, each part rounded down, the cache's to its store's extents.
-        let part = u128::from(index) * u128::from(want) / u128::from(index_want);
-        let part = u64::try_from(part).unwrap();
-        let store = &small.config.store;
-        let extent = u64::try_from(store.page_size).unwrap() * u64::from(store.extent_pages);
+        assert!(cache < want && bytes - floor < growth, "{cache} {bytes}");
+        // The same part of each want, each part rounded down: the cache's in bytes, the
+        // transport's in each share's window.
+        let (cache_part, transport_part) = (
+            u128::from(cache) * u128::from(growth),
+            u128::from(bytes - floor) * u128::from(want),
+        );
         assert!(
-            cache.abs_diff(part) <= extent + want / index_want + 1,
-            "{cache} against {part}, its part at the index's"
+            cache_part.abs_diff(transport_part) <= u128::from(want) * 3 * 70,
+            "{cache} of {want} against {} of {growth}",
+            bytes - floor
         );
         assert!(said_bytes(&small, "gateway.objects") <= said_bytes(&roomy, "gateway.objects"));
         for class in ["volumes", "engines", "log", "threads"] {

@@ -334,6 +334,31 @@ indexes' and engines' wants beside it, each taken whole, and what the memory hol
 the operations', with the one (`derive::derive`). D gives the engines' spare, what no want takes,
 to the operations instead. Rules A and B are built as variants beside it and measured as §4 asks.
 
+**Rule D's order with performance wants (2026-11-19).** Two wants are not capacity: each
+engine's page cache (every page of the rows its metadata's want counts, so a get or a lookup reads
+a page from the device once) and the transport's growth past its floor (each share at a receive
+chunk, so a datagram is cut from a chunk, not copied). Neither bounds the objects the node holds;
+each makes an operation cheaper. Taken as data wants beside the indexes' and the metadata's, the
+caches' (2.2 times the volumes' bytes for five engines) pulled them below their wants on a 16 GiB
+host and on CI's 7 GiB runner, and raised the need four times. So the order the branch derives,
+the coordinator's of 2026-11-19, is: (1) the capacity wants, the indexes' and the engines'
+metadata's, each whole while what remains holds them, each the same part of its want when less
+remains; (2) the operations the node serves at least (`derive::served`); (3) the performance wants,
+the caches and the transport's growth, sharing what remains past (1) and (2) in proportion to
+their wants; (4) as many operations more as what remains past those holds, D's "operations take
+what is left". The need counts (1) and (2). Derived (`derive::tests`, macOS aarch64; before the
+caches were wants, with them beside the data's, and in this order):
+
+| host | index | each engine's metadata | each cache | operations | transport |
+|---|---|---|---|---|---|
+| 96 GiB, 32 cores, a 32 GiB volume, S3 | 2.95 GB; 2.95 GB; 2.95 GB | 2.46 GB; 1.50 GB; 1.48 GB | none; 15.4 GB; 15.4 GB | 71,525; 10,024; 8,183 | floor; floor; floor and its want, 1.31 GB |
+| 16 GiB, an 8 GiB volume | 738 MB; 469 MB; 738 MB | 513 MB; 220 MB; 346 MB | none; 2.45 GB; 2.27 GB | 13,765; 1; 1 | floor; floor; 59% of its growth |
+| CI's 7 GiB, a founder at depth 256 | 23.1 MB; 5.0 MB; 23.1 MB | 18.0 MB; 3.9 MB; 18.0 MB | none; 43.8 MB; none | 10; 1; 10 | floor in each |
+| CI's 7 GiB, a granted node at any depth | none | 18.0 MB in each | none; 201 MB; 120 MB | 720; 10; 10 | floor; floor; 60% of its growth |
+
+The third step takes what the operations past the served took before: CI's granted node runs a
+stock client's ten operations where it ran 720, and a founder measured 4 deep ten where it ran 35.
+
 ## 5. What remains unknown
 
 - Whether `N*` learned from mixed sizes holds for the large ones. Each operation holds at most the

@@ -66,7 +66,7 @@ use crate::frame;
 use crate::layout::Layout;
 use crate::read::{Query, Read};
 use crate::storage::{Done, Origin, Storage};
-use keyed::{Key, Keyed, KeyedOn, On, Queued, Waiting, Waits};
+use keyed::{Key, Keyed, KeyedOn, Marked, On, Queued, Waiting, Waits};
 use mantle_protocol::bounds::{self, Stated};
 use mantle_protocol::classes::{self, Bounds, Kind, NodeClasses, Role};
 use mantle_protocol::object;
@@ -803,6 +803,11 @@ impl On for Commanded {
             CommandOrigin::Own(_) => None,
         }
     }
+
+    /// Its range's group, whose leadership it waits on (`Node::reply_commands`).
+    fn class(&self) -> Option<u128> {
+        Some(self.group)
+    }
 }
 
 /// And each of its commands, until answered, by its range's group and its session and serial,
@@ -846,6 +851,11 @@ impl On for Reading {
             ReadOrigin::Exchange(exchange) => Some(exchange),
             ReadOrigin::Own(_) => None,
         }
+    }
+
+    /// Its range's group, whose leadership it waits on (`Node::reply_commands`).
+    fn class(&self) -> Option<u128> {
+        Some(self.group)
     }
 }
 
@@ -1275,9 +1285,19 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// the transport admits as exchanges. Each found by its own number, and a peer's by the
     /// exchange it came on (`keyed::KeyedOn`), as its exchange ends, in one probe; each command
     /// waiting by its group, session and serial (`keyed::Waiting`), as its range applies its
-    /// answer, in one probe; each turn's replies walk them all, in no order a reply depends on.
+    /// answer, in one probe; a command answered whole by its mark, and each of a group's by the
+    /// group, so a turn's replies visit those answered and those of a range that stopped leading,
+    /// in no order a reply depends on: each reply is its own exchange's (`Node::reply_commands`).
     commanded: Waiting<Commanded>,
     reading: KeyedOn<Reading>,
+    /// The groups whose leadership may have moved since the last turn's replies, each to be read
+    /// once there: a range the node's drive drove (only a drive steps a replica here, a message
+    /// stepped in schedules its range for the turn's drive) and a far range whose shard showed it
+    /// again (`shard::Out::Seen`). Bound: the ranges the node hosts, each once.
+    checks: Marked<u128>,
+    /// The commands answered whole a turn's replies take, in the order they were answered, its
+    /// storage kept across turns. Bound: the commands held.
+    replying: Vec<u64>,
     /// The id the next read's context carries.
     next_read: u64,
     /// The ask the next proposal is given, which a far range's refusal of it names.
@@ -1491,8 +1511,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The written-off nodes' requests this node holds, at most `command_asks`
     /// (`enrollments`), and the highest issuer's grant its own re-grants spent, which the root
     /// range's rows may not yet hold. Each request found by its own exchange, and one forwarded to
-    /// the leader by its forward's (`keyed::KeyedOn`), as either ends, in one probe; each turn's
-    /// step walks them all.
+    /// the leader by its forward's (`keyed::KeyedOn`), as either ends, and a node's own by its old
+    /// identity, as a second of its comes, in one probe; each turn's step walks them all, none
+    /// but while written-off nodes enroll, and one own request of each at most.
     enrollments: KeyedOn<enrollments::Enrollment>,
     issuer_spent: u64,
     /// The members whose reach names a host the process looks up, not yet taken
@@ -1811,6 +1832,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             receiving: Keyed::default(),
             commanded: Waiting::default(),
             reading: KeyedOn::default(),
+            checks: Marked::default(),
+            replying: Vec::new(),
             next_read: 0,
             next_ask: 0,
             inbox: Vec::new(),
@@ -2196,6 +2219,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             shard::Out::Seen(group, seen) => {
                 if let Some(far) = self.far.iter_mut().find(|far| far.group == group) {
                     far.seen = seen;
+                    self.checks.insert(group);
                 }
             }
             shard::Out::Served(group, id, served) => {
@@ -3770,6 +3794,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if let Some(slot) = self.ranges.iter().position(|k| k.handle == handle)
                 && let Some(kept) = self.ranges.get_mut(slot)
             {
+                self.checks.insert(kept.group);
                 if let Some(old) = kept.wake.take() {
                     self.deadlines.remove(&(old, slot));
                 }
@@ -3801,6 +3826,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 answer_command(&mut self.commanded, *group, applied);
             }
             self.reply_commands()?;
+        } else {
+            // Nothing waits on a range's leadership: the groups to read again go with it.
+            self.checks.clear();
         }
         self.compact_if_stalled(now)
     }
@@ -5710,69 +5738,86 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Replies to each command whose every answer came, and sends a command whose range this
     /// node no longer leads to the leader it knows: its entry may yet apply, and asking again
-    /// returns the answers its sessions keep.
+    /// returns the answers its sessions keep. What it visits is what moved since the last turn's:
+    /// each group the turn's drive drove or a far range's shard showed again, read once
+    /// (`Node::checks`), whose commands and reads it takes where the node leads it no longer, and
+    /// each command marked answered whole (`Waiting::answered_into`), not every command and read
+    /// held.
     fn reply_commands(&mut self) -> Result<(), NodeError> {
-        let mut at = 0;
-        while let Some(c) = self.commanded.at(at) {
-            let answered = c.commands.iter().all(|(_, _, a)| a.is_some());
-            let led = self.is_leader(c.group);
-            if !answered && led {
-                at = at.saturating_add(1);
+        while let Some(group) = self.checks.pop() {
+            let waits =
+                self.commanded.of_class(group).is_some() || self.reading.of_class(group).is_some();
+            if !waits || self.is_leader(group) {
                 continue;
             }
-            let Some(c) = self.commanded.take(at) else {
-                break;
-            };
-            let exchange = match c.origin {
-                CommandOrigin::Exchange(exchange) => exchange,
-                // One this node asked itself: its own entry answered, or asked again of the leader
-                // there is now, its serials the same.
-                CommandOrigin::Own(id) => {
-                    if let Some(asking) = self.asking.iter_mut().find(|a| a.group == c.group) {
-                        if answered {
-                            let answers =
-                                c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
-                            asking.answered_entry(id, answers, &mut self.commands_done);
-                        } else if let Some(out) = asking.out_mut(id)
-                            && out.via == Via::Local
-                        {
-                            out.via = Via::Unasked;
-                        }
+            while let Some(ask) = self.commanded.of_class(group) {
+                let Some(c) = self.commanded.remove(ask) else {
+                    break;
+                };
+                self.reply_command(c)?;
+            }
+            // A read whose range this node no longer leads may never be confirmed here.
+            while let Some(id) = self.reading.of_class(group) {
+                let Some(r) = self.reading.remove(id) else {
+                    break;
+                };
+                match r.origin {
+                    ReadOrigin::Exchange(exchange) => self.redirect(exchange, r.group)?,
+                    // This node's own: asked again of the leader there is now.
+                    ReadOrigin::Own(ask) => {
+                        self.reads_out.change(ask, |out| out.via = Via::Unasked);
                     }
-                    continue;
                 }
-            };
-            if !answered {
-                self.redirect(exchange, c.group)?;
-                continue;
             }
-            let answers: Vec<Answer> = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
-            let Ok(body) = command::encode_answers(&answers) else {
-                self.answer_status(exchange, command::Status::TooLarge, self.id)?;
-                continue;
-            };
-            self.reply_body(exchange, body)?;
         }
-        // A read whose range this node no longer leads may never be confirmed here.
-        let mut at = 0;
-        while let Some(r) = self.reading.at(at) {
-            let led = self.is_leader(r.group);
-            if led {
-                at = at.saturating_add(1);
+        // The commands answered whole, replied in the order their answers came: taken out of
+        // the marks first, as replying each unmarks it.
+        let mut replying = std::mem::take(&mut self.replying);
+        self.commanded.answered_into(&mut replying);
+        let mut replied = Ok(());
+        for ask in replying.drain(..) {
+            let Some(c) = self.commanded.remove(ask) else {
                 continue;
-            }
-            let Some(r) = self.reading.take(at) else {
+            };
+            replied = self.reply_command(c);
+            if replied.is_err() {
                 break;
-            };
-            match r.origin {
-                ReadOrigin::Exchange(exchange) => self.redirect(exchange, r.group)?,
-                // This node's own: asked again of the leader there is now.
-                ReadOrigin::Own(ask) => {
-                    self.reads_out.change(ask, |out| out.via = Via::Unasked);
-                }
             }
         }
-        Ok(())
+        self.replying = replying;
+        replied
+    }
+
+    /// Replies to command `c`, taken out: its answers where every one came, else, its range led
+    /// no longer here, sent to the leader the node knows.
+    fn reply_command(&mut self, c: Commanded) -> Result<(), NodeError> {
+        let answered = c.commands.iter().all(|(_, _, a)| a.is_some());
+        let exchange = match c.origin {
+            CommandOrigin::Exchange(exchange) => exchange,
+            // One this node asked itself: its own entry answered, or asked again of the leader
+            // there is now, its serials the same.
+            CommandOrigin::Own(id) => {
+                if let Some(asking) = self.asking.iter_mut().find(|a| a.group == c.group) {
+                    if answered {
+                        let answers = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
+                        asking.answered_entry(id, answers, &mut self.commands_done);
+                    } else if let Some(out) = asking.out_mut(id)
+                        && out.via == Via::Local
+                    {
+                        out.via = Via::Unasked;
+                    }
+                }
+                return Ok(());
+            }
+        };
+        if !answered {
+            return self.redirect(exchange, c.group);
+        }
+        let answers: Vec<Answer> = c.commands.into_iter().filter_map(|(_, _, a)| a).collect();
+        let Ok(body) = command::encode_answers(&answers) else {
+            return self.answer_status(exchange, command::Status::TooLarge, self.id);
+        };
+        self.reply_body(exchange, body)
     }
 
     /// Seals what the plane queued and sends it, each peer's datagram to its plane's address.

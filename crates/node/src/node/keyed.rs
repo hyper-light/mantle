@@ -170,23 +170,38 @@ pub(super) trait On: Key {
     type By: Copy + Eq + Hash + std::fmt::Debug;
 
     fn on(&self) -> Option<Self::By>;
+
+    /// What its list's owner finds a set of entries by, many an entry of: a command's and a read's
+    /// range group, let go a group at a time as the range stops leading (`Node::commanded`,
+    /// `Node::reading`), and a written-off node's own request's old identity, of which one is held
+    /// at a time (`Node::enrollments`). None for the other lists, and an entry of none.
+    fn class(&self) -> Option<u128> {
+        None
+    }
 }
 
 /// A [`Keyed`] list whose entries are also found by a second key while each holds one, in one
-/// probe of `by`, the entry's own key there: kept in step as an entry is pushed, changed and
-/// removed, a change made only through [`KeyedOn::change`] or [`KeyedOn::change_at`], which read
-/// its second key before and after. Bound: one `by` an entry, so at most its entries'.
+/// probe of `by`, the entry's own key there, and by their class, where they name one, in one probe
+/// of `classes`: kept in step as an entry is pushed, changed and removed, a change made only
+/// through [`KeyedOn::change`] or [`KeyedOn::change_at`], which read its second key and class
+/// before and after. Bound: one `by` an entry, so at most its entries'; a class held while an entry
+/// names it, its set put aside once it empties for the next class to take, so a class that comes
+/// again takes no allocation: sets held and aside at most the most entries held at once.
 pub(super) struct KeyedOn<T: On> {
     keyed: Keyed<T>,
     by: HashMap<T::By, T::Of>,
+    classes: HashMap<u128, Marked<T::Of>>,
+    aside: Vec<Marked<T::Of>>,
 }
 
 impl<T: On> Default for KeyedOn<T> {
-    /// None, which allocates nothing (`Keyed::default`, `HashMap::new`).
+    /// None, which allocates nothing (`Keyed::default`, `HashMap::new`, `Vec::new`).
     fn default() -> Self {
         Self {
             keyed: Keyed::default(),
             by: HashMap::new(),
+            classes: HashMap::new(),
+            aside: Vec::new(),
         }
     }
 }
@@ -221,48 +236,66 @@ impl<T: On> KeyedOn<T> {
         self.by.get(&by).copied()
     }
 
+    /// The key of an entry of `class`, the last its set holds: none once none is held. One probe
+    /// of the classes, so taking each out in turn visits that class's entries alone.
+    pub(super) fn of_class(&self, class: u128) -> Option<T::Of> {
+        #[cfg(test)]
+        tests::PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
+        self.classes.get(&class).and_then(Marked::last)
+    }
+
     /// Holds `entry`, last, as [`Keyed::push`]: an entry it displaces given back, its second key
-    /// let go.
+    /// and class let go.
     pub(super) fn push(&mut self, entry: T) -> Option<T> {
-        let (key, on) = (entry.key(), entry.on());
+        let (key, on, class) = (entry.key(), entry.on(), entry.class());
         let displaced = self.keyed.push(entry);
-        if let Some(by) = displaced.as_ref().and_then(On::on) {
-            self.by.remove(&by);
+        if let Some(gone) = &displaced {
+            if let Some(by) = gone.on() {
+                self.by.remove(&by);
+            }
+            self.classed(key, gone.class(), None);
         }
         if let Some(by) = on {
             self.by.insert(by, key);
         }
+        self.classed(key, None, class);
         #[cfg(test)]
         self.audit();
         displaced
     }
 
-    /// The entry holding `key` changed by `change`, all but its key, its second key kept.
+    /// The entry holding `key` changed by `change`, all but its key, its second key and class
+    /// kept.
     pub(super) fn change<R>(&mut self, key: T::Of, change: impl FnOnce(&mut T) -> R) -> Option<R> {
         let entry = self.keyed.get_mut(key)?;
-        let before = entry.on();
+        let before = (entry.on(), entry.class());
         let changed = change(entry);
-        let after = entry.on();
+        let after = (entry.on(), entry.class());
         self.moved(key, before, after);
         Some(changed)
     }
 
-    /// The entry at slot `at` changed by `change`, all but its key, its second key kept.
+    /// The entry at slot `at` changed by `change`, all but its key, its second key and class kept.
     pub(super) fn change_at<R>(
         &mut self,
         at: usize,
         change: impl FnOnce(&mut T) -> R,
     ) -> Option<R> {
         let entry = self.keyed.at_mut(at)?;
-        let (key, before) = (entry.key(), entry.on());
+        let (key, before) = (entry.key(), (entry.on(), entry.class()));
         let changed = change(entry);
-        let after = entry.on();
+        let after = (entry.on(), entry.class());
         self.moved(key, before, after);
         Some(changed)
     }
 
-    /// The entry holding `key` went from second key `before` to `after`.
-    fn moved(&mut self, key: T::Of, before: Option<T::By>, after: Option<T::By>) {
+    /// The entry holding `key` went from second key and class `before` to `after`.
+    fn moved(
+        &mut self,
+        key: T::Of,
+        (before, was): (Option<T::By>, Option<u128>),
+        (after, is): (Option<T::By>, Option<u128>),
+    ) {
         if before != after {
             if let Some(by) = before {
                 self.by.remove(&by);
@@ -271,8 +304,36 @@ impl<T: On> KeyedOn<T> {
                 self.by.insert(by, key);
             }
         }
+        self.classed(key, was, is);
         #[cfg(test)]
         self.audit();
+    }
+
+    /// The entry holding `key` went from class `was` to `is`: a class whose set empties let go,
+    /// its set put aside, and a class that comes takes one put aside where one is.
+    fn classed(&mut self, key: T::Of, was: Option<u128>, is: Option<u128>) {
+        if was == is {
+            return;
+        }
+        if let Some(class) = was
+            && let Some(held) = self.classes.get_mut(&class)
+        {
+            held.remove(key);
+            if held.is_empty()
+                && let Some(empty) = self.classes.remove(&class)
+            {
+                self.aside.push(empty);
+            }
+        }
+        if let Some(class) = is {
+            let held = match self.classes.entry(class) {
+                std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(self.aside.pop().unwrap_or_default())
+                }
+            };
+            held.insert(key);
+        }
     }
 
     /// The entry holding `key` taken out, as [`Keyed::remove`], its second key let go.
@@ -307,6 +368,7 @@ impl<T: On> KeyedOn<T> {
         if let Some(by) = entry.on() {
             self.by.remove(&by);
         }
+        self.classed(entry.key(), entry.class(), None);
         #[cfg(test)]
         self.audit();
     }
@@ -329,13 +391,15 @@ pub(super) trait Waits: Key<Of: Ord> + On {
 }
 
 /// A [`KeyedOn`] list whose entries' parts are each also found by what they wait on, while they
-/// wait, in one probe of `waiting` ([`Waiting::first`]): kept in step as an entry is pushed and
+/// wait, in one probe of `waiting` ([`Waiting::first`]), and whose entries none of whose parts
+/// waits are marked `answered` ([`Waiting::answered`]): kept in step as an entry is pushed and
 /// removed, and as a part changes, which it does only through [`Waiting::change_part`], which
 /// reads what the part waits on before and after and hands the change that part alone. Bound:
-/// one waiter a part waiting, so at most the entries' parts.
+/// one waiter a part waiting, so at most the entries' parts; one mark an entry.
 pub(super) struct Waiting<T: Waits> {
     on: KeyedOn<T>,
     waiting: HashMap<T::For, Waiters<T::Of>>,
+    answered: Marked<T::Of>,
 }
 
 /// The parts waiting on one thing, each by its entry's key and its place there: the least first,
@@ -347,11 +411,12 @@ struct Waiters<K> {
 }
 
 impl<T: Waits> Default for Waiting<T> {
-    /// None, which allocates nothing (`KeyedOn::default`, `HashMap::new`).
+    /// None, which allocates nothing (`KeyedOn::default`, `HashMap::new`, `Marked::default`).
     fn default() -> Self {
         Self {
             on: KeyedOn::default(),
             waiting: HashMap::new(),
+            answered: Marked::default(),
         }
     }
 }
@@ -372,6 +437,7 @@ impl<T: Waits> Waiting<T> {
     }
 
     /// The entry at slot `at`, as [`Keyed::at`].
+    #[cfg(test)]
     pub(super) fn at(&self, at: usize) -> Option<&T> {
         self.on.at(at)
     }
@@ -385,6 +451,17 @@ impl<T: Waits> Waiting<T> {
         self.on.on(by)
     }
 
+    /// The key of an entry of `class`, as [`KeyedOn::of_class`].
+    pub(super) fn of_class(&self, class: u128) -> Option<T::Of> {
+        self.on.of_class(class)
+    }
+
+    /// The keys of the entries none of whose parts waits, added to `out` in the order they were
+    /// marked, the first answered first: no other entry read.
+    pub(super) fn answered_into(&self, out: &mut Vec<T::Of>) {
+        out.extend_from_slice(self.answered.keys());
+    }
+
     /// The part waiting on `waits` that an answer to it reaches first: its entry's key and its
     /// place there, the least of any waiting on it.
     pub(super) fn first(&self, waits: T::For) -> Option<(T::Of, usize)> {
@@ -394,12 +471,14 @@ impl<T: Waits> Waiting<T> {
     }
 
     /// Holds `entry`, last, as [`KeyedOn::push`], each part of it waiting found by what it waits
-    /// on: an entry it displaces given back, its parts let go.
+    /// on, and it marked answered where none does: an entry it displaces given back, its parts
+    /// and its mark let go.
     pub(super) fn push(&mut self, entry: T) -> Option<T> {
         let key = entry.key();
         let displaced = self.on.push(entry);
         if let Some(gone) = &displaced {
             went(&mut self.waiting, gone);
+            self.answered.remove(key);
         }
         // The entry pushed is the last, or in the slot of the one it displaced.
         let keyed = &self.on.keyed;
@@ -407,8 +486,10 @@ impl<T: Waits> Waiting<T> {
             None => keyed.entries.last(),
             Some(_) => keyed.slots.get(&key).and_then(|&at| keyed.entries.get(at)),
         };
-        if let Some(held) = held {
-            came(&mut self.waiting, held);
+        if let Some(held) = held
+            && !came(&mut self.waiting, held)
+        {
+            self.answered.insert(key);
         }
         #[cfg(test)]
         self.audit();
@@ -416,20 +497,31 @@ impl<T: Waits> Waiting<T> {
     }
 
     /// Part `place` of the entry holding `key` changed by `change`, that part alone, what it
-    /// waits on kept.
+    /// waits on kept, and the entry marked answered once none of its parts waits, unmarked once
+    /// one waits again.
     pub(super) fn change_part<R>(
         &mut self,
         key: T::Of,
         place: usize,
         change: impl FnOnce(&mut T::Part) -> R,
     ) -> Option<R> {
-        let (before, changed, after) = self
+        let (before, changed, after, other) = self
             .on
             .change(key, |entry| {
                 let before = entry.parts().get(place).and_then(|part| entry.waits(part));
                 let changed = change(entry.parts_mut().get_mut(place)?);
                 let after = entry.parts().get(place).and_then(|part| entry.waits(part));
-                Some((before, changed, after))
+                // Where this part stopped waiting, whether another still does: a walk of the
+                // entry's parts from its last, which its answers reach last (an entry's commands
+                // apply in its order), so it stops at the first it reads but at the last answer.
+                let other = before.is_some()
+                    && after.is_none()
+                    && entry
+                        .parts()
+                        .iter()
+                        .rev()
+                        .any(|part| entry.waits(part).is_some());
+                Some((before, changed, after, other))
             })
             .flatten()?;
         if before != after {
@@ -440,24 +532,35 @@ impl<T: Waits> Waiting<T> {
                 wait(&mut self.waiting, waits, (key, place));
             }
         }
+        match (before, after) {
+            (Some(_), None) if !other => {
+                self.answered.insert(key);
+            }
+            (None, Some(_)) => {
+                self.answered.remove(key);
+            }
+            _ => {}
+        }
         #[cfg(test)]
         self.audit();
         Some(changed)
     }
 
-    /// The entry holding `key` taken out, as [`KeyedOn::remove`], its parts let go.
+    /// The entry holding `key` taken out, as [`KeyedOn::remove`], its parts and its mark let go.
     pub(super) fn remove(&mut self, key: T::Of) -> Option<T> {
         let entry = self.on.remove(key)?;
         went(&mut self.waiting, &entry);
+        self.answered.remove(key);
         #[cfg(test)]
         self.audit();
         Some(entry)
     }
 
-    /// The entry at slot `at` taken out, as [`KeyedOn::take`], its parts let go.
+    /// The entry at slot `at` taken out, as [`KeyedOn::take`], its parts and its mark let go.
     pub(super) fn take(&mut self, at: usize) -> Option<T> {
         let entry = self.on.take(at)?;
         went(&mut self.waiting, &entry);
+        self.answered.remove(entry.key());
         #[cfg(test)]
         self.audit();
         Some(entry)
@@ -479,14 +582,17 @@ impl<T: Waits> Waiting<T> {
 }
 
 /// Each part of `entry` that waits found by what it waits on: a walk of its parts, at most an
-/// entry's.
-fn came<T: Waits>(waiting: &mut HashMap<T::For, Waiters<T::Of>>, entry: &T) {
+/// entry's. Whether any part waits.
+fn came<T: Waits>(waiting: &mut HashMap<T::For, Waiters<T::Of>>, entry: &T) -> bool {
     let key = entry.key();
+    let mut any = false;
     for (place, part) in entry.parts().iter().enumerate() {
         if let Some(waits) = entry.waits(part) {
             wait(waiting, waits, (key, place));
+            any = true;
         }
     }
+    any
 }
 
 /// Each part of `entry` that waits let go: a walk of its parts, at most an entry's.
@@ -553,6 +659,95 @@ fn unwait<F: Eq + Hash, K: Ord + Copy>(
         if waiters.first == waiter {
             waiters.first = other;
         }
+    }
+}
+
+/// Keys marked once each, in a vector, each found in one probe of the map of their slots, kept in
+/// step as each is marked and let go as [`Keyed`] keeps its entries': the set of a list's entries
+/// something made ready, read last first, in no order a caller may rely on. Bound: its owner's,
+/// each key once.
+pub(super) struct Marked<K> {
+    keys: Vec<K>,
+    slots: HashMap<K, usize>,
+}
+
+impl<K> Default for Marked<K> {
+    /// None, which allocates nothing (`Vec::new`, `HashMap::new`).
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            slots: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Copy + Eq + Hash> Marked<K> {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, key: K) -> bool {
+        self.slots.contains_key(&key)
+    }
+
+    /// The key marked last of those held.
+    pub(super) fn last(&self) -> Option<K> {
+        self.keys.last().copied()
+    }
+
+    /// The keys held, in the order they were marked but where a key let go moved the last into
+    /// its slot.
+    pub(super) fn keys(&self) -> &[K] {
+        &self.keys
+    }
+
+    /// Marks `key`, last, where it is not already: whether it was not.
+    pub(super) fn insert(&mut self, key: K) -> bool {
+        if self.slots.contains_key(&key) {
+            return false;
+        }
+        self.slots.insert(key, self.keys.len());
+        self.keys.push(key);
+        #[cfg(test)]
+        self.audit();
+        true
+    }
+
+    /// `key` let go, the last moved into its slot and re-pointed: whether it was marked.
+    pub(super) fn remove(&mut self, key: K) -> bool {
+        let Some(at) = self.slots.remove(&key) else {
+            return false;
+        };
+        if at < self.keys.len() {
+            self.keys.swap_remove(at);
+            if let Some(&moved) = self.keys.get(at) {
+                self.slots.insert(moved, at);
+            }
+        }
+        #[cfg(test)]
+        self.audit();
+        true
+    }
+
+    /// The key marked last taken out.
+    pub(super) fn pop(&mut self) -> Option<K> {
+        let key = self.keys.pop()?;
+        self.slots.remove(&key);
+        #[cfg(test)]
+        self.audit();
+        Some(key)
+    }
+
+    /// Every key let go, the storage kept.
+    pub(super) fn clear(&mut self) {
+        self.keys.clear();
+        self.slots.clear();
     }
 }
 
@@ -661,7 +856,7 @@ impl<T: Key> Extend<T> for Keyed<T> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{Key, Keyed, KeyedOn, On, Queued, Waiting, Waits};
+    use super::{Key, Keyed, KeyedOn, Marked, On, Queued, Waiting, Waits};
 
     thread_local! {
         /// The probes this thread made of a keyed list's slots ([`Keyed::slot`]).
@@ -707,6 +902,38 @@ pub(super) mod tests {
                 on,
                 "a second key no entry holds, or two entries holding one"
             );
+            let mut classed = 0;
+            for entry in self.keyed.iter() {
+                if let Some(class) = entry.class() {
+                    let held = self.classes.get(&class).expect("each class held");
+                    assert!(held.contains(entry.key()), "{class:x}: {:?}", entry.key());
+                    classed += 1;
+                }
+            }
+            for held in self.classes.values() {
+                held.audit();
+                assert!(!held.is_empty(), "a class held that no entry names");
+            }
+            for aside in &self.aside {
+                assert!(aside.is_empty(), "a set put aside holding a key");
+            }
+            let held: usize = self.classes.values().map(Marked::len).sum();
+            assert_eq!(held, classed, "a class holding an entry gone or of another");
+        }
+    }
+
+    impl<K: Copy + Eq + std::hash::Hash> Marked<K> {
+        /// The oracle, after each change: its slots agree with a full recount, each key at its own
+        /// slot, and no other key held.
+        pub(in crate::node) fn audit(&self) {
+            for (at, key) in self.keys.iter().enumerate() {
+                assert_eq!(self.slots.get(key), Some(&at), "each key at its own slot");
+            }
+            assert_eq!(
+                self.slots.len(),
+                self.keys.len(),
+                "a key's slot no key holds, or one key marked twice"
+            );
         }
     }
 
@@ -739,6 +966,19 @@ pub(super) mod tests {
                 .map(|waiters| 1 + waiters.more.len())
                 .sum();
             assert_eq!(held, parts_waiting, "a waiter held that waits no longer");
+            self.answered.audit();
+            let mut answered = 0;
+            for entry in self.on.iter() {
+                let waits = entry.parts().iter().any(|part| entry.waits(part).is_some());
+                assert_eq!(
+                    self.answered.contains(entry.key()),
+                    !waits,
+                    "{:?}: marked answered exactly when none of its parts waits",
+                    entry.key()
+                );
+                answered += usize::from(!waits);
+            }
+            assert_eq!(self.answered.len(), answered, "a mark no entry holds");
         }
     }
 
@@ -1167,6 +1407,10 @@ pub(super) mod tests {
         fn on(&self) -> Option<u64> {
             self.on
         }
+
+        fn class(&self) -> Option<u128> {
+            Some(self.group)
+        }
     }
 
     impl Waits for Asked {
@@ -1311,6 +1555,193 @@ pub(super) mod tests {
         );
         assert_eq!(after, 2 * answered, "two probes an answer");
         assert_eq!(commanded.len(), usize::try_from(IN_FLIGHT).unwrap());
+    }
+
+    /// Marks, a mark made twice, removals from every slot and pops keep the slots exact (the audit
+    /// after each change), and each key is marked once.
+    #[test]
+    fn a_marked_sets_slots_follow_each_mark_and_removal() {
+        let mut marked = Marked::default();
+        for key in 0..64_u64 {
+            assert!(marked.insert(key));
+        }
+        assert!(!marked.insert(5), "marked once");
+        assert!(marked.remove(0) && marked.remove(62) && marked.remove(63));
+        assert!(!marked.remove(0), "gone");
+        // 63 moved into 0's slot, then 61, the last, into 63's.
+        assert_eq!(marked.pop(), Some(60), "the last held");
+        assert!(marked.insert(0));
+        assert_eq!(marked.last(), Some(0));
+        assert_eq!(marked.len(), 61);
+        marked.clear();
+        assert_eq!((marked.len(), marked.pop()), (0, None));
+    }
+
+    /// The node's replies to the commands it proposed (`Node::reply_commands`), each turn
+    /// visiting the commands answered whole (`Waiting::answered_into`), first answered first, each
+    /// group the turn drove read
+    /// once (`Node::checks`), and a group's commands through the group (`KeyedOn::of_class`) once
+    /// the node leads it no longer: 2,048 puts in flight over four ranges, each an entry of three
+    /// commands; at each of 8 turns the 64 oldest answered whole and replied, another proposed
+    /// in each one's place and every range driven; then one range stops leading. Before, each turn
+    /// walked every command held, reading each one's answers and its range's leadership, and a
+    /// range that stopped leading was found by that walk.
+    #[test]
+    fn a_turns_replies_visit_what_moved_not_every_command() {
+        const IN_FLIGHT: u64 = 2048;
+        const GROUPS: u64 = 4;
+        const ANSWERED: u64 = 64;
+        const TURNS: u64 = 8;
+        let group = |ask: u64| u128::from(ask % GROUPS);
+        let put = |ask: u64| {
+            asked(
+                ask,
+                Some(10_000 + ask),
+                group(ask),
+                &[(ask, 1), (ask, 2), (ask, 3)],
+            )
+        };
+        let mut commanded = Waiting::default();
+        for ask in 0..IN_FLIGHT {
+            commanded.push(put(ask));
+        }
+        let mut checks = Marked::default();
+        let (mut oldest, mut next) = (0, IN_FLIGHT);
+        let (mut before, mut after, mut read) = (0, 0, 0);
+        for _ in 0..TURNS {
+            for ask in oldest..oldest + ANSWERED {
+                for serial in 1..=3 {
+                    let (key, place) = commanded.first((group(ask), ask, serial)).unwrap();
+                    commanded.change_part(key, place, |c| c.2 = Some(serial));
+                }
+            }
+            oldest += ANSWERED;
+            for driven in 0..GROUPS {
+                checks.insert(u128::from(driven));
+            }
+            before += commanded.len();
+            // Each group driven read once: led still, none of its commands visited.
+            while let Some(driven) = checks.pop() {
+                assert!(commanded.of_class(driven).is_some());
+                read += 1;
+            }
+            let mut replied = 0;
+            let mut replying = Vec::new();
+            commanded.answered_into(&mut replying);
+            for ask in replying.drain(..) {
+                let entry = commanded.remove(ask).unwrap();
+                assert!(entry.commands.iter().all(|c| c.2.is_some()), "{ask}");
+                assert_eq!(ask, oldest - ANSWERED + replied, "the first answered first");
+                replied += 1;
+            }
+            assert_eq!(replied, ANSWERED);
+            after += replied;
+            for _ in 0..ANSWERED {
+                commanded.push(put(next));
+                next += 1;
+            }
+        }
+        println!(
+            "{IN_FLIGHT} puts in flight over {GROUPS} ranges, {ANSWERED} answered a turn: {after} \
+             commands visited over {TURNS} turns and {read} groups read ({before} visited before)"
+        );
+        assert_eq!(before, usize::try_from(TURNS * IN_FLIGHT).unwrap());
+        assert_eq!(after, TURNS * ANSWERED, "the commands answered alone");
+        assert_eq!(read, TURNS * GROUPS, "each range driven read once a turn");
+        // Range 1 stops leading: its commands alone are taken, through the group.
+        let lost = 1;
+        let mut taken = 0;
+        while let Some(ask) = commanded.of_class(lost) {
+            assert_eq!(commanded.remove(ask).map(|c| c.group), Some(lost));
+            taken += 1;
+        }
+        assert_eq!(
+            taken,
+            IN_FLIGHT / GROUPS,
+            "the lost range's commands, not every one"
+        );
+        assert!(commanded.iter().all(|c| c.group != lost));
+        let mut replying = Vec::new();
+        commanded.answered_into(&mut replying);
+        assert!(replying.is_empty());
+        commanded.audit();
+    }
+
+    /// A written-off node's request, by its own exchange, its old identity's class where it is the
+    /// node's own and not a member's forward (`enrollments::Enrollment`).
+    struct Request(u64, u64, bool);
+
+    impl Key for Request {
+        type Of = u64;
+
+        fn key(&self) -> u64 {
+            self.0
+        }
+    }
+
+    impl On for Request {
+        type By = u64;
+
+        fn on(&self) -> Option<u64> {
+            None
+        }
+
+        fn class(&self) -> Option<u128> {
+            (!self.2).then(|| u128::from(self.1))
+        }
+    }
+
+    /// A new request's check for a second of one node's (`Node::enrollment_read`), found by its
+    /// old identity in one probe of the classes (`KeyedOn::of_class`): 1,024 requests held, every
+    /// other one a member's forward, which no check finds; then 1,024 new ones checked, half a
+    /// second of a node's held. Each answered request lets its class go, its set put aside for the
+    /// next class, so as many come and go as are held and no set more is made. Before, each check
+    /// walked every request held.
+    #[test]
+    fn a_second_request_of_one_node_is_found_with_no_scan() {
+        const HELD: u64 = 1024;
+        let mut enrollments = KeyedOn::default();
+        for exchange in 0..HELD {
+            enrollments.push(Request(exchange, 50_000 + exchange, exchange % 2 == 1));
+        }
+        let sets = enrollments.classes.len() + enrollments.aside.len();
+        let (mut before, mut seconds) = (0, 0);
+        probes();
+        for old in 0..HELD {
+            // A second of each node held, or one no request names.
+            let asked = if old % 2 == 0 {
+                50_000 + old
+            } else {
+                90_000 + old
+            };
+            before += enrollments.len();
+            seconds += usize::from(enrollments.of_class(u128::from(asked)).is_some());
+        }
+        let after = probes();
+        assert_eq!(
+            seconds,
+            usize::try_from(HELD / 2).unwrap(),
+            "each node's own held"
+        );
+        assert_eq!(after, usize::try_from(HELD).unwrap(), "one probe a check");
+        // Answered and taken out, a new node's request in each one's place.
+        for exchange in 0..HELD {
+            assert!(enrollments.remove(exchange).is_some());
+            enrollments.push(Request(
+                HELD + exchange,
+                70_000 + exchange,
+                exchange % 2 == 1,
+            ));
+        }
+        assert_eq!(
+            enrollments.classes.len() + enrollments.aside.len(),
+            sets,
+            "each class gone put its set aside for the next"
+        );
+        println!(
+            "{HELD} requests held: {HELD} checks, {after} probes ({before} requests visited before)"
+        );
+        enrollments.audit();
     }
 
     /// A lost exchange (`Event::Refused`, a forward's bytes refused) lets go of the written-off

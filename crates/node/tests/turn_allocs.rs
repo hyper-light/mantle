@@ -196,13 +196,18 @@ fn serving(make: fn(u64) -> Sim, seed: u64, ops: u64) -> alloc::Counts {
 /// came on, a map each (`keyed::KeyedOn`), whose first tables are made at the first read a peer
 /// asks, which the clients' run is: the cell's warm-up asks none. Reallocations 2,055. On Linux
 /// 34,397, this Mac's and the 51, derived as before: CI run 44547229268's linux-aarch64 crates
-/// leg counted the chunked windows' run at 5fbd5059 51 above this Mac's.
+/// leg counted the chunked windows' run at 5fbd5059 51 above this Mac's. 4 more since a turn's
+/// replies to commands visit the commands answered and the groups that moved (`keyed::Marked`,
+/// `KeyedOn::of_class`): the reads peers ask, found by their range's group as well, make that
+/// index's first tables at the first read a peer asks, which the clients' run is, as 9ec351b7's
+/// maps did. Made once: the clients' runs of 40, 80 and 160 operations each count 4 more than the
+/// tree before, at the floor's windows and at a chunk's, reallocations the same. On Linux 34,401.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_397
+        34_401
     } else {
-        34_346
+        34_350
     };
     let counts = serving(Sim::new, 1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");
@@ -223,13 +228,14 @@ fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
 /// 33,143 since the 27 the floor's run names (05c14470's 22, 39ca69bd's 3, 9ec351b7's 2), the
 /// same sites made once here, reallocations 2,052. On Linux 33,194: CI run 44547229268's
 /// linux-aarch64 crates leg counted 40,729 at 5fbd5059, with the cell's status reports boxed,
-/// where this Mac counted 40,678, the 51 above it.
+/// where this Mac counted 40,678, the 51 above it. 33,147 since the reads' index by group, the 4
+/// the floor's run names; on Linux 33,198.
 #[test]
 fn a_cell_serving_writes_at_chunked_windows_copies_fewer_datagrams() {
     const CHUNKED: u64 = if cfg!(target_os = "linux") {
-        33_194
+        33_198
     } else {
-        33_143
+        33_147
     };
     let floor = serving(Sim::new, 1, 40);
     let chunked = serving(Sim::chunked, 1, 40);

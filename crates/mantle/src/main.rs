@@ -675,10 +675,17 @@ enum BenchCommand {
         /// step judged in rounds, ending three steps after the last that grew.
         #[arg(long, value_parser = bench_doors::load_arg, default_value = "open:100")]
         load: bench_doors::Load,
-        /// Logical clients at most, each a task on one thread holding one connection: open loop's
-        /// clients, and the closed ladder's top.
+        /// Logical clients at most, each a task holding one connection: open loop's clients, and
+        /// the closed ladder's top. The HTTP door's run on one thread, the native door's spread
+        /// evenly over --client-threads.
         #[arg(long)]
         clients: Option<usize>,
+        /// The threads the native door's clients are spread over, this program's own and driver
+        /// threads beside it, at most the cores it runs on at once: by default those cores less one
+        /// for each of the cell's three servers' first shards, which run each node's task, ranges,
+        /// log, transport and doors.
+        #[arg(long)]
+        client_threads: Option<usize>,
         /// Operations a phase's step asks at most: open loop's step 368 by default, a p99's
         /// samples; a closed step as many as its rounds ask (measurement.md §5) by default.
         #[arg(long)]
@@ -1439,6 +1446,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         relay,
         range_shards,
         native_shards,
+        client_threads,
     } = command
     else {
         return Err("not mantle bench doors".to_owned());
@@ -1497,6 +1505,7 @@ fn doors_options(command: BenchCommand) -> Result<bench_doors::Options, String> 
         relay,
         range_shards,
         native_shards,
+        client_threads,
     })
 }
 

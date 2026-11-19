@@ -350,9 +350,24 @@ stock clients stay the correctness suite.
   threads its process runs as the OS counts them, neither growing with clients or objects; each
   server's faults, CPU and footprint read by pid; `perf stat` on the box; aws-lc's own heap seen
   through the footprint (70 [3][4]).
-- **Load**: open loop with Poisson arrivals by default and a closed ladder doubling while
-  throughput grows up to the node's connection budget; an HTTP connection carries one request at a
-  time; the generator reports its CPU and lateness (§10; 70 [6]). Each closed step is a point in
+- **Load**: open loop with Poisson arrivals by default and a closed ladder doubling while throughput
+  grows up to the node's connection budget; an HTTP connection carries one request at a time; the
+  generator reports its CPU and lateness (§10; 70 [6]). The native door's clients are spread evenly
+  over the harness's thread and the driver threads beside it, each thread a runtime of its own: on
+  one thread its 2,048 clients were the bottleneck, the box's probes (`--sizes 1 --objects 0 --kinds
+  PUT,GET --load open:12000 --clients 2048 --ops 20000 --perf`) holding that thread at about 89% of
+  its core for 5,500 GETs a second, 158 µs of its CPU an operation, while the servers' instructions
+  an operation halved between two builds and the rate did not move. The threads are the cores the
+  process runs on at once (hyper-rt `Facts::cpus_at_once`, as each server counts its shards) less
+  one for each server's first shard, which runs its node's task, ranges, log, transport and doors
+  under every placement (node.md §2.9), at least one and at most the clients, or as
+  `--client-threads` states within the cores; the run's second line says how many and why. Every
+  thread's clients take their operations from the phase's one schedule, in order, each operation's
+  intended start the arrival process's, and count into its one tally and rounds, read on the host's
+  shard clock alike on every thread; each thread's own CPU, allocations and wire are summed into the
+  phase's line, its harness peak the threads' peaks summed, the most they could have held at once.
+  The HTTP door's clients stay on the harness's thread, 25 to 29 µs of its CPU an operation at
+  11,800 GETs a second in the same probes. Each closed step is a point in
   rounds as §5 judges one (`Policy::STANDARD`): a round is §5a's count of operations at the step's
   clients, consecutive in one stream, the first (the clients' ramp) not kept, and the step ends
   once its rounds are enough. A step grows only where its median's interval lies wholly above the

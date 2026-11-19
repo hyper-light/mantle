@@ -44,8 +44,12 @@
 //! over the
 //! phase, above what they held as it began, is given per request, over the most requests the
 //! harness had out at once, and per connection, over the connections the phase held. Logical
-//! clients are tasks on one hyper-rt shard, each holding one connection and the buffers its
-//! operations work in ([`Logical`]), an HTTP connection carrying one request at a time; open loop,
+//! clients are tasks on hyper-rt shards, a shard a thread, each holding one connection and the
+//! buffers its operations work in ([`Logical`]), an HTTP connection carrying one request at a time:
+//! the HTTP door's on the harness's own thread, the native door's spread evenly over it and the
+//! driver threads beside it ([`client_threads`], [`share`]), every thread's clients taking their
+//! operations from the phase's one schedule and counting them into its one tally ([`Shared`]), and
+//! each thread's own CPU, allocations and wire summed into the phase's ([`Driven`]); open loop,
 //! their requests arrive as a Poisson process and each waits for a free client; closed, a ladder
 //! of clients doubles while throughput grows, up to `--clients`, each step judged in rounds as a
 //! benchmark point is (measurement.md §5, [`ROUNDS`]) and its growth told by their intervals, the
@@ -78,7 +82,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel as watch_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, channel as watch_channel, sync_channel,
+};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use hyper_measure::alloc::{self, Counts};
@@ -244,7 +252,7 @@ fn doing(what: &'static str) -> impl Fn(std::io::Error) -> Error {
 /// (`transfer::cell`'s founders, `mantle serve` each; [`Perf`]).
 const CHILD_PIPES: u64 = 2;
 
-/// The files the harness holds at once beside its clients, one at a time from its one thread: what
+/// The files the harness holds at once beside its clients, one at a time from its own thread: what
 /// it reads between steps (a server's usage, its own threads and faults), each read whole and
 /// closed. A native client's identity is issued in memory and holds none ([`Bench::settings`]).
 const FILE_AT_ONCE: u64 = 1;
@@ -253,23 +261,25 @@ const FILE_AT_ONCE: u64 = 1;
 /// which sends on to the node (`relay::links_on`).
 const LINK_SOCKETS: u64 = 2;
 
-/// The descriptors the harness holds at its most with `clients` logical clients through each door,
-/// on its own cell (`cell`) or an endpoint's, under `--perf` and `--relay`, refused past `limit`,
-/// the process's (`mantle_node::descriptors`): standard input, output and error; its runtime's
-/// shard; a file at a time ([`FILE_AT_ONCE`]); each founder's pipes; a native client's sockets for each client through the native door
+/// The descriptors the harness holds at its most with `clients` logical clients through each door
+/// on `threads` threads, on its own cell (`cell`) or an endpoint's, under `--perf` and `--relay`,
+/// refused past `limit`, the process's (`mantle_node::descriptors`): standard input, output and
+/// error; each thread's runtime's shard ([`client_threads`]); a file at a time ([`FILE_AT_ONCE`]);
+/// each founder's pipes; a native client's sockets for each client through the native door
 /// (`mantle_client::sockets`), which no node admits more of than its descriptors hold
 /// (`mantle_node::derive`), and an HTTP client's connection for each through the HTTP door and each
 /// of the slope's beside them, which a node past its connections answers `503 SlowDown`; perf's
 /// pipes; and the relay's shard and a link to each founder for each client the harness holds
 /// ([`run`]'s `most`).
 fn descriptors_fit(
-    clients: usize,
+    (clients, threads): (usize, usize),
     (cell, perf, relay): (bool, bool, bool),
     limit: u64,
 ) -> Result<u64, Error> {
     let over = || failed("the harness's descriptors, past what this machine addresses");
     let count = |n: usize| u64::try_from(n).map_err(|_| over());
     let shard = mantle_node::derive::shard_descriptors();
+    let shards = count(threads)?.checked_mul(shard).ok_or_else(over)?;
     let native = if cell {
         count(mantle_client::sockets(cell::FOUNDERS).map_err(failed)?)?
     } else {
@@ -282,7 +292,7 @@ fn descriptors_fit(
         .and_then(|n| n.checked_add(1))
         .ok_or_else(over)?;
     let mut need = mantle_node::derive::STDIO_DESCRIPTORS
-        .checked_add(shard)
+        .checked_add(shards)
         .and_then(|n| n.checked_add(FILE_AT_ONCE))
         .and_then(|n| n.checked_add(held.checked_mul(native)?))
         .and_then(|n| n.checked_add(http))
@@ -319,6 +329,42 @@ fn descriptors_fit(
         });
     }
     Ok(need)
+}
+
+/// The threads the native door's clients run on, the harness's own and the driver threads beside
+/// it, for `clients` clients at most on a machine that runs `cores` of this process's threads at
+/// once (hyper-rt `Facts::cpus_at_once`: its affinity and its cgroup's quota, as each server counts
+/// the shards it runs, `mantle_node::process`'s `shards`): as many as `--client-threads` states,
+/// refused at none or past `cores`, a thread driving at most a core; else `cores` less a core for
+/// each of the cell's servers, whose first shard runs its node's task, ranges, log, transport and
+/// doors under every placement (node.md §2.9), so the generator takes the cores the servers' busiest
+/// shards leave. At least one, and no more than `clients`, as a thread with no client drives none.
+fn client_threads(stated: Option<usize>, cores: usize, clients: usize) -> Result<usize, Error> {
+    let threads = match stated {
+        Some(0) => return Err(failed("--client-threads 0: the clients need a thread")),
+        Some(n) if n > cores => {
+            return Err(failed(format!(
+                "--client-threads {n}: past the {cores} cores this process runs on at once"
+            )));
+        }
+        Some(n) => n,
+        None => cores.saturating_sub(cell::FOUNDERS),
+    };
+    Ok(threads.min(clients).max(1))
+}
+
+/// Thread `k`'s share of `clients` spread over `threads`: each the same, and the first
+/// `clients % threads` one more, so no two differ by more than a client and the harness's own
+/// thread, the first, holds a phase of one client; none for a thread past `threads`.
+fn share(clients: usize, threads: usize, k: usize) -> Result<usize, Error> {
+    if k >= threads {
+        return Ok(0);
+    }
+    let even = clients
+        .checked_div(threads)
+        .ok_or_else(|| failed("clients spread over no thread"))?;
+    let over = clients.checked_rem(threads).unwrap_or(0);
+    Ok(even.saturating_add(usize::from(k < over)))
 }
 
 /// How requests arrive.
@@ -379,6 +425,9 @@ pub struct Options {
     /// The shards each server of the cell drives its native requests on (`native_shards`, node.md
     /// §2.9 step 6f).
     pub native_shards: NativeShards,
+    /// The threads the native door's clients run on (`--client-threads`); without it, derived from
+    /// the machine's cores ([`client_threads`]).
+    pub client_threads: Option<usize>,
 }
 
 /// An S3 server this program did not start (`--endpoint`): the HTTP door's phases, controls and
@@ -600,20 +649,36 @@ enum Keys {
     Set { count: u64, own: Door },
 }
 
-/// A phase's shared facts, which its tasks read.
+/// A phase's shared facts, which its tasks read, on every thread its clients run on.
 struct Work {
     door: Door,
     kind: Kind,
     keys: Keys,
-    generator: Rc<Generator>,
+    generator: Arc<Generator>,
     /// The MD5 of each of the phase's first [`ETAGS`] objects' bytes.
-    etags: Rc<Vec<[u8; 16]>>,
+    etags: Arc<Vec<[u8; 16]>>,
     /// A size's multipart uploads: each one's ID and its one part's ETag, by index.
-    uploads: Rc<RefCell<Vec<Upload>>>,
-    oracle: Rc<RefCell<Oracle>>,
-    listing: Rc<RefCell<Paging>>,
+    uploads: Arc<Mutex<Vec<Upload>>>,
+    oracle: Arc<Mutex<Oracle>>,
+    listing: Arc<Mutex<Paging>>,
     /// The times the phase's operations were asked again.
-    again: std::cell::Cell<u64>,
+    again: AtomicU64,
+}
+
+/// `value` behind a lock shared between threads, the lock taken once as it is made: std's lock on
+/// macOS allocates its pthread mutex at its first lock (64 bytes, counted by the unit tests'
+/// allocator), so an operation that locks it after allocates nothing.
+fn lock_of<T>(value: T) -> Arc<Mutex<T>> {
+    let lock = Arc::new(Mutex::new(value));
+    drop(lock.lock());
+    lock
+}
+
+/// `mutex`, locked: one a thread unwound holding is poisoned, a typed failure (CLAUDE.md §1).
+fn locked<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, Error> {
+    mutex
+        .lock()
+        .map_err(|_| failed("a lock a thread unwound holding"))
 }
 
 /// A listing's place: where its next page starts, whether it ended, the keys it listed, of them
@@ -645,9 +710,9 @@ enum Next {
 
 /// What a size's phases share: the ETags their objects' bytes give, and their uploads.
 type Common<'a> = (
-    &'a Rc<Vec<[u8; 16]>>,
-    &'a Rc<RefCell<Vec<Upload>>>,
-    &'a Rc<RefCell<Oracle>>,
+    &'a Arc<Vec<[u8; 16]>>,
+    &'a Arc<Mutex<Vec<Upload>>>,
+    &'a Arc<Mutex<Oracle>>,
 );
 
 #[derive(Clone, Default)]
@@ -1346,15 +1411,80 @@ impl Schedule {
     }
 }
 
-/// What a phase's tasks share: its schedule, its tally, the requests out now and, for a closed
-/// step, its rounds.
+/// What a phase's tasks share, on every thread they run on: its schedule, its tally, the requests
+/// out now and, for a closed step, its rounds. Each is the phase's one, so an operation's index and
+/// intended start, the most out at once, a round's end and a kind's first failure are what they
+/// are on one thread; a task holds it only between its awaits.
 struct Shared {
     schedule: Schedule,
     tally: Tally,
     out: usize,
-    error: Option<Error>,
-    done: Vec<Logical>,
     rounds: Option<Rounds>,
+}
+
+/// The clock a phase's schedule, rounds and latencies are read on: the host's shard clock
+/// (hyper-rt `machine::clock::shard_clock_ns`), alike on every thread, where a runtime's `now_ns`
+/// counts from its own driver's epoch and two runtimes' readings do not compare.
+fn clock() -> u64 {
+    hyper_rt::machine::clock::shard_clock_ns()
+}
+
+/// A phase's shared state ([`Shared`]), its operations `from..end` asked as `load` gives them from
+/// now, a closed step's in rounds of `round` operations.
+fn shared(
+    load: Load,
+    seed: u64,
+    (from, end): (u64, u64),
+    round: Option<u64>,
+) -> Result<Arc<Mutex<Shared>>, Error> {
+    harness(|| {
+        Ok(lock_of(Shared {
+            rounds: round.map(|size| Rounds::new(size, clock())),
+            schedule: Schedule::new(load, seed, (from, end), clock())?,
+            tally: Tally {
+                latency: Histogram::new(),
+                lateness: Histogram::new(),
+                ops: 0,
+                failed: 0,
+                refused: 0,
+                differed: 0,
+                unanswered: 0,
+                skipped: 0,
+                most: 0,
+                threads: 0,
+                first: [None, None, None],
+            },
+            out: 0,
+        }))
+    })
+}
+
+/// A phase's tally and its rounds' rates once every thread's clients are done with it.
+fn finished(shared: Arc<Mutex<Shared>>) -> Result<(Tally, Vec<f64>), Error> {
+    let shared = Arc::try_unwrap(shared)
+        .map_err(|_| failed("a client outlived its phase"))?
+        .into_inner()
+        .map_err(|_| failed("a lock a thread unwound holding"))?;
+    Ok((
+        shared.tally,
+        shared.rounds.map(|r| r.rates).unwrap_or_default(),
+    ))
+}
+
+/// Ends the phase on every thread: its schedule asks no more, and each client ends with the
+/// operation it has out, on its own bounds. A lock a thread unwound holding is left as it is: every
+/// client's next take fails on it, which ends the phase as well.
+fn halt(shared: &Mutex<Shared>) {
+    if let Ok(mut shared) = shared.lock() {
+        shared.schedule.stop();
+    }
+}
+
+/// What one thread's clients of a phase keep apart from the other threads': themselves once done,
+/// and the harness's first error among them.
+struct Local {
+    done: Vec<Logical>,
+    error: Option<Error>,
 }
 
 /// A closed step's rounds as its operations complete (measurement.md §5a): each round `size`
@@ -1504,43 +1634,53 @@ impl Ask for Work {
 }
 
 /// One client's part of a phase: operations taken from the schedule until it ends, each at its
-/// intended start, its latency from then.
-async fn client<A: Ask>(mut logical: Logical, work: Rc<A>, shared: Rc<RefCell<Shared>>) {
-    loop {
-        let taken = harness(|| shared.borrow_mut().schedule.take(now_ns()));
+/// intended start, its latency from then. A failure of the harness's ends the phase on every
+/// thread ([`halt`]) and is kept with this thread's clients.
+async fn client<A: Ask>(
+    mut logical: Logical,
+    work: Arc<A>,
+    shared: Arc<Mutex<Shared>>,
+    local: Rc<RefCell<Local>>,
+) {
+    let error = loop {
+        let taken = harness(|| locked(&shared)?.schedule.take(clock()));
         let (j, intended) = match taken {
             Ok(Some(taken)) => taken,
-            Ok(None) => break,
-            Err(e) => {
-                shared.borrow_mut().error = Some(e);
-                break;
-            }
+            Ok(None) => break None,
+            Err(e) => break Some(e),
         };
-        let now = now_ns();
+        let now = clock();
         if intended > now && sleep(intended.saturating_sub(now)).await.is_err() {
-            shared.borrow_mut().error = Some(failed("a runtime timer"));
-            break;
+            break Some(failed("a runtime timer"));
         }
-        let started = now_ns();
+        let started = clock();
         let busiest = harness(|| {
-            let mut shared = shared.borrow_mut();
+            let mut shared = locked(&shared)?;
             shared.out = shared.out.saturating_add(1);
             let busiest = shared.out > shared.tally.most;
             shared.tally.most = shared.tally.most.max(shared.out);
-            busiest
+            Ok::<_, Error>(busiest)
         });
+        let busiest = match busiest {
+            Ok(busiest) => busiest,
+            Err(e) => break Some(e),
+        };
         if busiest {
             let threads = threads_now();
-            harness(|| {
-                let tally = &mut shared.borrow_mut().tally;
+            let kept = harness(|| {
+                let tally = &mut locked(&shared)?.tally;
                 tally.threads = tally.threads.max(threads);
+                Ok::<_, Error>(())
             });
+            if let Err(e) = kept {
+                break Some(e);
+            }
         }
         let came = work.ask(&mut logical, j).await;
-        let took = now_ns().saturating_sub(intended);
-        let ended = now_ns();
-        let stop = harness(|| {
-            let mut shared = shared.borrow_mut();
+        let took = clock().saturating_sub(intended);
+        let ended = clock();
+        let counted = harness(|| {
+            let mut shared = locked(&shared)?;
             let shared = &mut *shared;
             shared.out = shared.out.saturating_sub(1);
             // A closed step's round ends with its operations, an operation not asked counting in
@@ -1570,105 +1710,103 @@ async fn client<A: Ask>(mut logical: Logical, work: Rc<A>, shared: Rc<RefCell<Sh
                 tally.lateness.record(started.saturating_sub(intended));
             }
             match came {
-                Ok(Came::Done) => false,
-                Ok(Came::Skipped) => {
-                    tally.skipped = tally.skipped.saturating_add(1);
-                    false
-                }
+                Ok(Came::Done) => {}
+                Ok(Came::Skipped) => tally.skipped = tally.skipped.saturating_add(1),
                 Ok(Came::Failed(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.keep_first(Failure::Check, why);
-                    false
                 }
                 Ok(Came::Differed(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.differed = tally.differed.saturating_add(1);
                     tally.keep_first(Failure::Check, why);
-                    false
                 }
                 Ok(Came::Refused(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.refused = tally.refused.saturating_add(1);
                     tally.keep_first(Failure::Refusal, why);
-                    false
                 }
                 Ok(Came::Unanswered(why) | Came::Lost(why)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.unanswered = tally.unanswered.saturating_add(1);
                     tally.keep_first(Failure::Unanswered, why);
-                    false
                 }
                 // Settled into `Unanswered` before it is tallied (`Work::settled`): counted so.
                 Ok(Came::Slowed(_)) => {
                     tally.failed = tally.failed.saturating_add(1);
                     tally.unanswered = tally.unanswered.saturating_add(1);
-                    false
                 }
-                Err(e) => {
-                    shared.error = Some(e);
-                    true
-                }
+                Err(e) => return Err(e),
             }
+            Ok(())
         });
-        if stop {
-            break;
+        if let Err(e) = counted {
+            break Some(e);
         }
+    };
+    if error.is_some() {
+        halt(&shared);
     }
-    harness(|| shared.borrow_mut().done.push(logical));
+    harness(|| {
+        let mut local = local.borrow_mut();
+        local.done.push(logical);
+        if let Some(e) = error {
+            local.error.get_or_insert(e);
+        }
+    });
 }
 
-/// A phase's operations `from..end` on `clients`, a task each, a closed step's in rounds of
-/// `round` operations until they are enough or one goes unanswered: the clients back, the tally
-/// and the rounds' rates.
+/// This thread's part of a phase: its `clients`, a task each, taking operations from the phase's
+/// schedule beside every other thread's until it ends, a closed step's once its rounds are enough
+/// or one goes unanswered ([`client`]); the clients back. A failure here ends the phase on every
+/// thread ([`halt`]).
 async fn phase<A: Ask + 'static>(
     clients: Vec<Logical>,
-    work: Rc<A>,
-    schedule: (Load, u64, u64, u64),
-    round: Option<u64>,
-) -> Result<(Vec<Logical>, Tally, Vec<f64>), Error> {
-    let (load, seed, from, end) = schedule;
+    work: Arc<A>,
+    shared: Arc<Mutex<Shared>>,
+) -> Result<Vec<Logical>, Error> {
+    let ran = clients_of(clients, work, &shared).await;
+    if ran.is_err() {
+        halt(&shared);
+    }
+    ran
+}
+
+/// [`phase`]'s clients run, each a task.
+async fn clients_of<A: Ask + 'static>(
+    clients: Vec<Logical>,
+    work: Arc<A>,
+    shared: &Arc<Mutex<Shared>>,
+) -> Result<Vec<Logical>, Error> {
     let count = clients.len();
-    let shared = harness(|| {
-        Ok::<_, Error>(Rc::new(RefCell::new(Shared {
-            rounds: round.map(|size| Rounds::new(size, now_ns())),
-            schedule: Schedule::new(load, seed, (from, end), now_ns())?,
-            tally: Tally {
-                latency: Histogram::new(),
-                lateness: Histogram::new(),
-                ops: 0,
-                failed: 0,
-                refused: 0,
-                differed: 0,
-                unanswered: 0,
-                skipped: 0,
-                most: 0,
-                threads: 0,
-                first: [None, None, None],
-            },
-            out: 0,
-            error: None,
+    let local = harness(|| {
+        Rc::new(RefCell::new(Local {
             done: Vec::with_capacity(count),
-        })))
-    })?;
+            error: None,
+        }))
+    });
     // The clients' tasks are the harness's machinery, set aside as its own work.
     let mut tasks = harness(|| TaskSet::new(count)).map_err(|e| failed(format!("{e:?}")))?;
     for logical in clients {
-        harness(|| tasks.spawn(client(logical, Rc::clone(&work), Rc::clone(&shared))))
-            .map_err(|e| failed(format!("{e:?}")))?;
+        harness(|| {
+            tasks.spawn(client(
+                logical,
+                Arc::clone(&work),
+                Arc::clone(shared),
+                Rc::clone(&local),
+            ))
+        })
+        .map_err(|e| failed(format!("{e:?}")))?;
     }
     while let Some((_, ended)) = tasks.join_next().await {
         ended.map_err(|e| failed(format!("a client's task: {e:?}")))?;
     }
-    let shared = Rc::try_unwrap(shared)
+    let local = Rc::try_unwrap(local)
         .map_err(|_| failed("a client outlived its phase"))?
         .into_inner();
-    match shared.error {
+    match local.error {
         Some(e) => Err(e),
-        None => Ok((
-            shared.done,
-            shared.tally,
-            shared.rounds.map(|r| r.rates).unwrap_or_default(),
-        )),
+        None => Ok(local.done),
     }
 }
 
@@ -1686,7 +1824,7 @@ impl Work {
                     None => j,
                 };
                 let reads = matches!(self.kind, Kind::Get | Kind::Range | Kind::Head);
-                if reads && !self.oracle.borrow().has(i) {
+                if reads && !locked(&self.oracle)?.has(i) {
                     return Ok(None);
                 }
                 write_sized(into, self.door, (*size, *kind, i))?;
@@ -1700,7 +1838,7 @@ impl Work {
                 if i >= *count {
                     return Err(failed("a set's index past its set"));
                 }
-                if *own != self.door && !self.oracle.borrow().has(i) {
+                if *own != self.door && !locked(&self.oracle)?.has(i) {
                     return Ok(None);
                 }
                 let sizes = self.generator.object("sizes").map_err(failed)?;
@@ -1751,7 +1889,7 @@ impl Work {
         // An object put is acknowledged where its phase keeps a record of them: a set's, and the
         // put of a size whose objects its reads read.
         if matches!(came, Came::Done) && matches!(self.kind, Kind::Put | Kind::Stream) {
-            harness(|| self.oracle.borrow_mut().set(i));
+            harness(|| locked(&self.oracle).map(|mut oracle| oracle.set(i)))?;
         }
         Ok(self.settled(came, again))
     }
@@ -1766,7 +1904,7 @@ impl Work {
             return Ok(false);
         }
         *again = again.saturating_add(1);
-        harness(|| self.again.set(self.again.get().saturating_add(1)));
+        self.again.fetch_add(1, Ordering::Relaxed);
         if matches!(came, Came::Slowed(_)) {
             let cap = SLOWED_BASE_NS
                 .saturating_mul(
@@ -1813,23 +1951,25 @@ impl Work {
         (third.min(last), last)
     }
 
-    fn upload(&self, i: u64) -> Option<Upload> {
-        let i = usize::try_from(i).ok()?;
-        self.uploads
-            .borrow()
+    fn upload(&self, i: u64) -> Result<Option<Upload>, Error> {
+        let Ok(i) = usize::try_from(i) else {
+            return Ok(None);
+        };
+        Ok(locked(&self.uploads)?
             .get(i)
             .cloned()
-            .filter(|u| !u.id.is_empty())
+            .filter(|u| !u.id.is_empty()))
     }
 
-    fn uploaded(&self, i: u64, upload: Upload) {
+    fn uploaded(&self, i: u64, upload: Upload) -> Result<(), Error> {
         harness(|| {
             if let Ok(i) = usize::try_from(i)
-                && let Some(slot) = self.uploads.borrow_mut().get_mut(i)
+                && let Some(slot) = locked(&self.uploads)?.get_mut(i)
             {
                 *slot = upload;
             }
-        });
+            Ok(())
+        })
     }
 
     /// Whether an answer's ETag is the one object `i`'s bytes give, where the phase knows it.
@@ -2039,12 +2179,12 @@ impl Work {
                             id: reply.upload,
                             part: None,
                         },
-                    );
+                    )?;
                     Came::Done
                 }
             }
             Kind::Part => {
-                let Some(upload) = self.upload(i) else {
+                let Some(upload) = self.upload(i)? else {
                     return Ok(Came::Skipped);
                 };
                 let op = Op::UploadPart {
@@ -2076,12 +2216,12 @@ impl Work {
                             id: upload.id,
                             part: Some(reply.etag),
                         },
-                    );
+                    )?;
                     came
                 }
             }
             Kind::Parts => {
-                let Some(upload) = self.upload(i) else {
+                let Some(upload) = self.upload(i)? else {
                     return Ok(Came::Skipped);
                 };
                 if upload.part.is_none() {
@@ -2114,7 +2254,7 @@ impl Work {
                 let Some(Upload {
                     id: upload,
                     part: Some(part),
-                }) = self.upload(i)
+                }) = self.upload(i)?
                 else {
                     return Ok(Came::Skipped);
                 };
@@ -2137,7 +2277,7 @@ impl Work {
                 }
             }
             Kind::Abort => {
-                let Some(upload) = self.upload(i) else {
+                let Some(upload) = self.upload(i)? else {
                     return Ok(Came::Skipped);
                 };
                 let reply = match answered(
@@ -2199,7 +2339,7 @@ impl Work {
         let mut dropped = Kept(Vec::new());
         Ok(match self.kind {
             Kind::Put | Kind::Part => {
-                let query = match (self.kind, self.upload(i)) {
+                let query = match (self.kind, self.upload(i)?) {
                     (Kind::Part, Some(upload)) => format!(
                         "partNumber=1&uploadId={}",
                         sigv4::uri_encode(upload.id.as_bytes(), true)
@@ -2225,14 +2365,14 @@ impl Work {
                     refused(&answer, &dropped)
                 } else if self.kind == Kind::Part {
                     let came = self.etag_ok(i, &etag, false)?;
-                    if let Some(upload) = self.upload(i) {
+                    if let Some(upload) = self.upload(i)? {
                         self.uploaded(
                             i,
                             Upload {
                                 id: upload.id,
                                 part: Some(etag),
                             },
-                        );
+                        )?;
                     }
                     came
                 } else {
@@ -2308,7 +2448,7 @@ impl Work {
                 }
             }
             Kind::Delete | Kind::Abort => {
-                let query = match (self.kind, self.upload(i)) {
+                let query = match (self.kind, self.upload(i)?) {
                     (Kind::Abort, Some(upload)) => {
                         format!("uploadId={}", sigv4::uri_encode(upload.id.as_bytes(), true))
                     }
@@ -2336,14 +2476,14 @@ impl Work {
                                 id: id.to_owned(),
                                 part: None,
                             },
-                        );
+                        )?;
                         Came::Done
                     }
                     _ => refused(&answer, &kept),
                 }
             }
             Kind::Parts => {
-                let Some(upload) = self.upload(i) else {
+                let Some(upload) = self.upload(i)? else {
                     return Ok(Came::Skipped);
                 };
                 if upload.part.is_none() {
@@ -2366,7 +2506,7 @@ impl Work {
                 let Some(Upload {
                     id: upload,
                     part: Some(part),
-                }) = self.upload(i)
+                }) = self.upload(i)?
                 else {
                     return Ok(Came::Skipped);
                 };
@@ -2412,9 +2552,9 @@ impl Work {
             return Ok(Came::Failed("a listing of no set".into()));
         };
         let (start, last) = harness(|| {
-            let mut listing = self.listing.borrow_mut();
-            ((!listing.ended).then(|| listing.next.take()), listing.last)
-        });
+            let mut listing = locked(&self.listing)?;
+            Ok::<_, Error>(((!listing.ended).then(|| listing.next.take()), listing.last))
+        })?;
         let Some(start) = start else {
             return Ok(Came::Done);
         };
@@ -2425,24 +2565,24 @@ impl Work {
         {
             Ok(page) => page,
             Err(came) => {
-                harness(|| self.listing.borrow_mut().next = start);
+                harness(|| locked(&self.listing).map(|mut listing| listing.next = start))?;
                 return Ok(came);
             }
         };
         let (ended, listed, seen, acknowledged) = harness(|| {
-            let mut listing = self.listing.borrow_mut();
+            let mut listing = locked(&self.listing)?;
             listing.listed = listing.listed.saturating_add(page.keys);
             listing.acknowledged = listing.acknowledged.saturating_add(page.acknowledged);
             listing.last = page.last;
             listing.ended = next.is_none();
             listing.next = next;
-            (
+            Ok::<_, Error>((
                 listing.ended,
                 listing.listed,
                 listing.acknowledged,
-                self.oracle.borrow().acknowledged(),
-            )
-        });
+                locked(&self.oracle)?.acknowledged(),
+            ))
+        })?;
         Ok(if let Some(wrong) = page.wrong {
             Came::Failed(wrong)
         } else if ended && seen != acknowledged {
@@ -2455,8 +2595,8 @@ impl Work {
     }
 
     /// Counts `key`, listed under the set's `prefix`, into `page` ([`set_key`]): the page's first
-    /// key that is wrong is kept, and each right one counted acknowledged or not.
-    fn tally(&self, page: &mut Page, prefix: &str, key: &str, count: u64) {
+    /// key that is wrong is kept, and each right one counted acknowledged or not by `oracle`.
+    fn tally(oracle: &Oracle, page: &mut Page, prefix: &str, key: &str, count: u64) {
         page.keys = page.keys.saturating_add(1);
         if page.wrong.is_some() {
             return;
@@ -2464,7 +2604,7 @@ impl Work {
         match set_key(prefix, key, count, page.last) {
             Ok(i) => {
                 page.last = Some(i);
-                if self.oracle.borrow().has(i) {
+                if oracle.has(i) {
                     page.acknowledged = page.acknowledged.saturating_add(1);
                 }
             }
@@ -2508,10 +2648,12 @@ impl Work {
                 Ok(match reply.listing {
                     Some(Listing::Keys(page)) => {
                         harness(|| {
+                            let oracle = locked(&self.oracle)?;
                             for listed in &page.contents {
-                                self.tally(&mut tallied, prefix, &listed.key, count);
+                                Self::tally(&oracle, &mut tallied, prefix, &listed.key, count);
                             }
-                        });
+                            Ok::<_, Error>(())
+                        })?;
                         Ok((
                             tallied,
                             if page.truncated {
@@ -2563,10 +2705,12 @@ impl Work {
                     })
                     .flatten();
                 harness(|| {
+                    let oracle = locked(&self.oracle)?;
                     for key in keys(&text) {
-                        self.tally(&mut tallied, prefix, key, count);
+                        Self::tally(&oracle, &mut tallied, prefix, key, count);
                     }
-                });
+                    Ok::<_, Error>(())
+                })?;
                 Ok(Ok((tallied, next)))
             }
         }
@@ -2624,11 +2768,223 @@ fn decimal(v: u64, into: &mut [u8; 20]) -> Option<&[u8]> {
     into.get(..room.checked_sub(left)?)
 }
 
+/// What one thread's part of a phase came to of its own: the CPU its thread spent, every allocation
+/// it made and those set aside as the harness's own (`alloc::read_aside`; the allocator counts per
+/// thread), and what its clients' connections moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Driven {
+    cpu_ns: u64,
+    total: Counts,
+    aside: Counts,
+    wire: Wire,
+}
+
+impl Driven {
+    /// Two threads' parts of one phase as one: each count summed. A thread's peak live bytes is
+    /// its own most, and threads need not hold their most at once, so the sum is the most they
+    /// could have held together, an upper bound, as the servers' peaks are summed ([`Bench::line`]).
+    fn and(self, other: Self) -> Self {
+        let counts = |a: Counts, b: Counts| Counts {
+            allocations: a.allocations.saturating_add(b.allocations),
+            reallocations: a.reallocations.saturating_add(b.reallocations),
+            moved: a.moved.saturating_add(b.moved),
+            frees: a.frees.saturating_add(b.frees),
+            bytes: a.bytes.saturating_add(b.bytes),
+            live: a.live.saturating_add(b.live),
+            peak: a.peak.saturating_add(b.peak),
+        };
+        Self {
+            cpu_ns: self.cpu_ns.saturating_add(other.cpu_ns),
+            total: counts(self.total, other.total),
+            aside: counts(self.aside, other.aside),
+            wire: Wire {
+                bytes: self.wire.bytes.saturating_add(other.wire.bytes),
+                datagrams: self.wire.datagrams.saturating_add(other.wire.datagrams),
+            },
+        }
+    }
+}
+
+/// What `after`'s connections moved since `before`, which the same connections moved at a phase's
+/// start.
+fn wire_since(before: Wire, after: Wire) -> Wire {
+    Wire {
+        bytes: after.bytes.saturating_sub(before.bytes),
+        datagrams: after.datagrams.saturating_sub(before.datagrams),
+    }
+}
+
+/// What the harness asks of a driver thread, one at a time, each answered before the next is sent,
+/// so nothing queues between the threads.
+enum Order {
+    /// Open a native client for each of these settings, each answered a first request
+    /// ([`Opening::open`]), and hold it.
+    Open(Vec<Settings>),
+    /// Run a phase's `work` on this many of the clients held, beside every other thread's, from
+    /// the phase's `shared` schedule into its tally ([`phase`]).
+    Phase {
+        work: Arc<Work>,
+        shared: Arc<Mutex<Shared>>,
+        clients: usize,
+    },
+    /// Drop every client held, on the runtime, so each tells its node it closed.
+    Release,
+}
+
+/// A driver thread as the harness holds it: where its orders go and its answers come from, and
+/// the native clients it holds between phases.
+struct Driver {
+    orders: SyncSender<Order>,
+    answers: Receiver<Result<Driven, Error>>,
+    held: usize,
+}
+
+impl Driver {
+    fn send(&self, order: Order) -> Result<(), Error> {
+        self.orders
+            .send(order)
+            .map_err(|_| failed("a driver thread ended before its order"))
+    }
+
+    /// Its answer to the order sent last: a thread whose end went without one ended.
+    fn answer(&self) -> Result<Driven, Error> {
+        self.answers
+            .recv()
+            .map_err(|_| failed("a driver thread ended before its answer"))?
+    }
+}
+
+/// Starts driver thread `k` in `scope` for `conns` native clients at most and waits for it to say
+/// its runtime is built: the thread to join and how the harness reaches it.
+fn start_driver<'scope>(
+    scope: &'scope Scope<'scope, '_>,
+    k: usize,
+    conns: usize,
+) -> Result<(Driver, ScopedJoinHandle<'scope, ()>), Error> {
+    // Neither way holds a message: an order waits for the thread to take it, and an answer for the
+    // harness to.
+    let (orders, taken) = sync_channel::<Order>(0);
+    let (said, answers) = sync_channel::<Result<Driven, Error>>(0);
+    let thread = std::thread::Builder::new()
+        .name(format!("doors-driver-{k}"))
+        .spawn_scoped(scope, move || drive(&taken, &said, conns))
+        .map_err(doing("starting a driver thread"))?;
+    let driver = Driver {
+        orders,
+        answers,
+        held: 0,
+    };
+    match driver.answer() {
+        Ok(_) => Ok((driver, thread)),
+        Err(e) => {
+            drop(driver);
+            thread
+                .join()
+                .map_err(|_| failed("a driver thread ended unwound"))?;
+            Err(e)
+        }
+    }
+}
+
+/// A driver thread's life: builds its runtime for `conns` native clients and says so, then does
+/// each order as it comes and answers it, until the harness drops its end of `orders`; then drops
+/// the clients it holds on its runtime, so each tells its node it closed.
+fn drive(orders: &Receiver<Order>, answers: &SyncSender<Result<Driven, Error>>, conns: usize) {
+    let mut rt = match runtime(conns) {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = answers.send(Err(e));
+            return;
+        }
+    };
+    if answers.send(Ok(Driven::default())).is_err() {
+        return;
+    }
+    let mut held: Vec<Logical> = Vec::with_capacity(conns);
+    while let Ok(order) = orders.recv() {
+        let answer = match order {
+            Order::Open(settings) => open_held(&mut rt, &mut held, settings),
+            Order::Phase {
+                work,
+                shared,
+                clients,
+            } => drive_phase(&mut rt, &mut held, (work, shared), clients),
+            Order::Release => {
+                let all = std::mem::take(&mut held);
+                rt.block_on(async move { drop(all) })
+                    .map(|()| Driven::default())
+                    .map_err(|e| failed(format!("{e:?}")))
+            }
+        };
+        if answers.send(answer).is_err() {
+            break;
+        }
+    }
+    let all = std::mem::take(&mut held);
+    let _ = rt.block_on(async move { drop(all) });
+}
+
+/// A native client opened on `rt` for each of `settings`, in turn, each held.
+fn open_held(
+    rt: &mut LocalRuntime,
+    held: &mut Vec<Logical>,
+    settings: Vec<Settings>,
+) -> Result<Driven, Error> {
+    for settings in settings {
+        let (conn, _) = rt
+            .block_on(Opening::Native(settings).open())
+            .map_err(|e| failed(format!("{e:?}")))??;
+        held.push(Logical::new(conn));
+    }
+    Ok(Driven::default())
+}
+
+/// A phase's `work` on `clients` of the clients `held` on `rt`, its schedule and tally `shared`
+/// with the other threads': what this thread's part came to of its own, the clients held again.
+fn drive_phase(
+    rt: &mut LocalRuntime,
+    held: &mut Vec<Logical>,
+    (work, shared): (Arc<Work>, Arc<Mutex<Shared>>),
+    clients: usize,
+) -> Result<Driven, Error> {
+    let Some(at) = held.len().checked_sub(clients) else {
+        halt(&shared);
+        return Err(failed(format!(
+            "a driver thread asked for {clients} clients, holding {}",
+            held.len()
+        )));
+    };
+    let mine = held.split_off(at);
+    let before = wired(&mine);
+    let cpu = drive::cpu();
+    alloc::begin();
+    let ran = rt.block_on(phase(mine, work, Arc::clone(&shared)));
+    let total = alloc::end();
+    let aside = alloc::read_aside();
+    let cpu_ns = u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
+    // The runtime itself failed: the phase's other threads stop as they would at a client's failure.
+    if ran.is_err() {
+        halt(&shared);
+    }
+    let back = ran.map_err(|e| failed(format!("{e:?}")))??;
+    let wire = wire_since(before, wired(&back));
+    held.extend(back);
+    Ok(Driven {
+        cpu_ns,
+        total,
+        aside,
+        wire,
+    })
+}
+
 /// The cell, its doors, and the connections each door holds between phases.
 struct Bench<'o> {
     options: &'o Options,
     /// The harness's process's pauses ([`Watch`]).
     watch: &'o Watch,
+    /// The driver threads beside this one the native door's clients are spread over
+    /// ([`client_threads`]), dropped first, so each drops its clients while their nodes still run.
+    drivers: Vec<Driver>,
     /// The cell this program runs, none against an `--endpoint`.
     cell: Option<Cell>,
     rt: LocalRuntime,
@@ -2639,8 +2995,8 @@ struct Bench<'o> {
     authority: Option<crate::init::Authority>,
     listeners: Vec<SocketAddr>,
     signer: Rc<Signer>,
-    generator: Rc<Generator>,
-    /// Each door's clients between the steps that use them.
+    generator: Arc<Generator>,
+    /// Each door's clients this thread holds between the steps that use them.
     pools: [Vec<Logical>; 2],
     /// The native clients the cell admits at once: each node's `gateway.clients` identities.
     native_most: usize,
@@ -3040,8 +3396,37 @@ impl<'o> Bench<'o> {
         }
     }
 
-    /// `want` clients of `door` held, more opened as needed, each answered a first request.
+    /// The threads `door`'s clients are spread over: the native door's over this one and its
+    /// driver threads, the HTTP door's on this one.
+    fn threads(&self, door: Door) -> usize {
+        match door {
+            Door::Native => self.drivers.len().saturating_add(1),
+            Door::Http => 1,
+        }
+    }
+
+    /// `want` clients of `door` held, spread over its threads ([`share`]), more opened as needed,
+    /// each answered a first request: this thread's share, each driver thread holding its own,
+    /// which it opens on its own runtime beside this thread's.
     fn hold(&mut self, door: Door, want: usize) -> Result<Vec<Logical>, Error> {
+        let threads = self.threads(door);
+        let mine = share(want, threads, 0)?;
+        let asked = self.open_drivers(door, want, threads)?;
+        let held = self.hold_here(door, mine);
+        // Every driver asked answers before any failure is said, so none is left opening.
+        let answered = self.answered(&asked);
+        let held = held?;
+        answered?;
+        for &(k, lack) in &asked {
+            if let Some(driver) = self.drivers.get_mut(k) {
+                driver.held = driver.held.saturating_add(lack);
+            }
+        }
+        Ok(held)
+    }
+
+    /// `want` of `door`'s clients this thread holds, more opened as needed.
+    fn hold_here(&mut self, door: Door, want: usize) -> Result<Vec<Logical>, Error> {
         let pool = self
             .pools
             .get_mut(door.at())
@@ -3056,6 +3441,92 @@ impl<'o> Bench<'o> {
             held.extend(opened.into_iter().map(|(logical, _)| logical));
         }
         Ok(held)
+    }
+
+    /// Asks each driver thread whose share of `want` of `door`'s clients over `threads` it does
+    /// not hold to open what it lacks, each client's identity issued here and its first node the
+    /// next in turn, as [`Bench::open`] turns them: the drivers asked and what each lacked.
+    fn open_drivers(
+        &mut self,
+        door: Door,
+        want: usize,
+        threads: usize,
+    ) -> Result<Vec<(usize, usize)>, Error> {
+        if door != Door::Native {
+            return Ok(Vec::new());
+        }
+        let mut asked = Vec::with_capacity(self.drivers.len());
+        let mut first = usize::try_from(self.opened.first().copied().unwrap_or(0)).unwrap_or(0);
+        for k in 0..self.drivers.len() {
+            let held = self.drivers.get(k).map_or(0, |driver| driver.held);
+            let lack = share(want, threads, k.saturating_add(1))?.saturating_sub(held);
+            if lack == 0 {
+                continue;
+            }
+            let issued = (0..lack).map(|n| {
+                let at = first
+                    .saturating_add(n)
+                    .checked_rem(cell::FOUNDERS)
+                    .unwrap_or(0);
+                harness(|| self.settings(at))
+            });
+            let settings = issued.collect::<Result<Vec<_>, Error>>();
+            let sent = settings.and_then(|settings| match self.drivers.get(k) {
+                Some(driver) => driver.send(Order::Open(settings)),
+                None => Err(failed("no such driver thread")),
+            });
+            if let Err(e) = sent {
+                let _ = self.answered(&asked);
+                return Err(e);
+            }
+            first = first.saturating_add(lack);
+            if let Some(count) = self.opened.first_mut() {
+                *count = count.saturating_add(u64::try_from(lack).unwrap_or(u64::MAX));
+            }
+            asked.push((k, lack));
+        }
+        Ok(asked)
+    }
+
+    /// The answers of the drivers `asked`, each waited for: the first failure among them.
+    fn answered(&self, asked: &[(usize, usize)]) -> Result<Vec<Driven>, Error> {
+        let mut driven = Vec::with_capacity(asked.len());
+        let mut failure = None;
+        for &(k, _) in asked {
+            match self.drivers.get(k).map(Driver::answer) {
+                Some(Ok(part)) => driven.push(part),
+                Some(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                None => {
+                    failure.get_or_insert(failed("no such driver thread"));
+                }
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(driven),
+        }
+    }
+
+    /// Every driver thread's clients dropped on its own runtime.
+    fn release_drivers(&mut self) -> Result<(), Error> {
+        let mut asked = Vec::with_capacity(self.drivers.len());
+        for (k, driver) in self.drivers.iter().enumerate() {
+            if driver.held == 0 {
+                continue;
+            }
+            if let Err(e) = driver.send(Order::Release) {
+                let _ = self.answered(&asked);
+                return Err(e);
+            }
+            asked.push((k, driver.held));
+        }
+        self.answered(&asked)?;
+        for driver in &mut self.drivers {
+            driver.held = 0;
+        }
+        Ok(())
     }
 
     /// `n` clients of `door` opened in turn, each answered a first request (a HEAD of a key never
@@ -3144,7 +3615,7 @@ impl<'o> Bench<'o> {
     fn step(
         &mut self,
         out: &mut impl Write,
-        work: &Rc<Work>,
+        work: &Arc<Work>,
         (size, clients): (&str, usize),
         (from, end, in_rounds): (u64, u64, bool),
     ) -> Result<(u64, Stepped, u64), Error> {
@@ -3152,6 +3623,7 @@ impl<'o> Bench<'o> {
             (true, Load::Closed) => Some(round_ops(clients)?),
             _ => None,
         };
+        let threads = self.threads(work.door);
         let held = self.hold(work.door, clients)?;
         let wire_before = wired(&held);
         let opened_before = reopened(&held);
@@ -3170,27 +3642,46 @@ impl<'o> Bench<'o> {
         let cpu = drive::cpu();
         self.watch.take();
         alloc::begin();
-        let ran = self.rt.block_on(phase(
-            held,
-            Rc::clone(work),
-            (self.options.load, seed, from, end),
-            round,
-        ));
+        // The phase's one schedule and tally, which every thread's clients share from here.
+        let shared = match shared(self.options.load, seed, (from, end), round) {
+            Ok(shared) => shared,
+            Err(e) => {
+                alloc::end();
+                if let Some(pool) = self.pools.get_mut(work.door.at()) {
+                    pool.extend(held);
+                }
+                return Err(e);
+            }
+        };
+        // Each driver thread's share runs beside this thread's, every share counted on its own
+        // thread ([`Driven`]).
+        let (asked, ordered) = self.order_phase(work, &shared, (clients, threads));
+        let ran = self
+            .rt
+            .block_on(phase(held, Arc::clone(work), Arc::clone(&shared)));
         let total = alloc::end();
-        let paused = self.watch.take();
         let aside = alloc::read_aside();
-        let generator_ns =
-            u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
+        if !matches!(ran, Ok(Ok(_))) {
+            halt(&shared);
+        }
+        // Every driver asked answers before any failure is said, so no thread is left running.
+        let parts = self.answered(&asked);
+        let paused = self.watch.take();
+        let cpu_ns = u64::try_from(drive::cpu().saturating_sub(cpu).as_nanos()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let perf = perf.map(Perf::end).transpose()?;
-        let (held, tally, rates) = ran.map_err(|e| failed(format!("{e:?}")))??;
+        let held = ran.map_err(|e| failed(format!("{e:?}")))??;
+        ordered?;
+        let own = Driven {
+            cpu_ns,
+            total,
+            aside,
+            wire: wire_since(wire_before, wired(&held)),
+        };
+        let driven = parts?.into_iter().fold(own, Driven::and);
+        let (tally, rates) = finished(shared)?;
         let judged = round.map(|_| harness(|| rounds::judge(&rates)));
         let after = self.servers()?;
-        let wire_after = wired(&held);
-        let wire = Wire {
-            bytes: wire_after.bytes.saturating_sub(wire_before.bytes),
-            datagrams: wire_after.datagrams.saturating_sub(wire_before.datagrams),
-        };
         let reopened = reopened(&held).saturating_sub(opened_before);
         if let Some(count) = self.opened.get_mut(work.door.at()) {
             *count = count.saturating_add(reopened);
@@ -3215,7 +3706,7 @@ impl<'o> Bench<'o> {
         }
         self.threads = self.threads.max(tally.threads);
         if self.counting {
-            self.harness_peak = self.harness_peak.max(aside.peak);
+            self.harness_peak = self.harness_peak.max(driven.aside.peak);
         }
         let measured = Measured {
             door: work.door,
@@ -3224,10 +3715,12 @@ impl<'o> Bench<'o> {
             clients,
             elapsed_ns,
             tally,
-            harness: self.counting.then(|| (total.less(&aside), aside)),
-            generator_ns,
-            wire,
-            again: work.again.replace(0),
+            harness: self
+                .counting
+                .then(|| (driven.total.less(&driven.aside), driven.aside)),
+            generator_ns: driven.cpu_ns,
+            wire: driven.wire,
+            again: work.again.swap(0, Ordering::Relaxed),
             perf,
             excluded,
             judged: judged.as_ref(),
@@ -3249,6 +3742,41 @@ impl<'o> Bench<'o> {
                 .unwrap_or(point),
             unanswered,
         ))
+    }
+
+    /// Orders each driver thread to run its share of `clients` over `threads` ([`share`]) of
+    /// `work`'s phase from `shared`: the drivers ordered and their shares, and whether every one
+    /// with a share was; a driver not ordered ends the phase on every thread ([`halt`]).
+    fn order_phase(
+        &self,
+        work: &Arc<Work>,
+        shared: &Arc<Mutex<Shared>>,
+        (clients, threads): (usize, usize),
+    ) -> (Vec<(usize, usize)>, Result<(), Error>) {
+        let mut asked = Vec::with_capacity(self.drivers.len());
+        for (k, driver) in self.drivers.iter().enumerate() {
+            let sent = share(clients, threads, k.saturating_add(1)).and_then(|mine| {
+                if mine > 0 {
+                    harness(|| {
+                        driver.send(Order::Phase {
+                            work: Arc::clone(work),
+                            shared: Arc::clone(shared),
+                            clients: mine,
+                        })
+                    })?;
+                }
+                Ok(mine)
+            });
+            match sent {
+                Ok(0) => {}
+                Ok(mine) => asked.push((k, mine)),
+                Err(e) => {
+                    halt(shared);
+                    return (asked, Err(e));
+                }
+            }
+        }
+        (asked, Ok(()))
     }
 
     fn line(
@@ -3479,7 +4007,7 @@ impl<'o> Bench<'o> {
     fn ladder(
         &mut self,
         out: &mut impl Write,
-        work: &Rc<Work>,
+        work: &Arc<Work>,
         size: &str,
         (from, n, end, finish): (u64, u64, u64, bool),
     ) -> Result<u64, Error> {
@@ -3580,12 +4108,12 @@ impl<'o> Bench<'o> {
             door,
             kind,
             keys,
-            generator: Rc::clone(&self.generator),
-            etags: Rc::new(Vec::new()),
-            uploads: Rc::new(RefCell::new(Vec::new())),
-            oracle: Rc::new(RefCell::new(Oracle::new(0).map_err(failed)?)),
-            listing: Rc::new(RefCell::new(Paging::default())),
-            again: std::cell::Cell::new(0),
+            generator: Arc::clone(&self.generator),
+            etags: Arc::new(Vec::new()),
+            uploads: lock_of(Vec::new()),
+            oracle: lock_of(Oracle::new(0).map_err(failed)?),
+            listing: lock_of(Paging::default()),
+            again: AtomicU64::new(0),
         })
     }
 
@@ -3596,7 +4124,7 @@ impl<'o> Bench<'o> {
         door: Door,
         (size, kind): (u64, char),
         count: u64,
-    ) -> Result<Rc<Vec<[u8; 16]>>, Error> {
+    ) -> Result<Arc<Vec<[u8; 16]>>, Error> {
         let mut piece = vec![0u8; mantle_client::PIECE];
         let etags: Result<Vec<_>, Error> = (0..count.min(ETAGS))
             .map(|i| {
@@ -3607,7 +4135,7 @@ impl<'o> Bench<'o> {
                 md5(&object, size, &mut piece)
             })
             .collect();
-        Ok(Rc::new(etags?))
+        Ok(Arc::new(etags?))
     }
 
     /// A size's phase of `kind` through `door` on `keys`, its ETags and uploads shared with the
@@ -3622,10 +4150,10 @@ impl<'o> Bench<'o> {
         if !self.options.kinds.is_empty() && !self.options.kinds.contains(&kind) {
             return Ok(0);
         }
-        let work = Rc::new(Work {
-            etags: Rc::clone(shared.0),
-            uploads: Rc::clone(shared.1),
-            oracle: Rc::clone(shared.2),
+        let work = Arc::new(Work {
+            etags: Arc::clone(shared.0),
+            uploads: Arc::clone(shared.1),
+            oracle: Arc::clone(shared.2),
             ..self.work(door, kind, keys)?
         });
         self.ladder(out, &work, name, (from, n, end, false))
@@ -3663,16 +4191,16 @@ impl<'o> Bench<'o> {
         let etags = if whole {
             self.etags(door, (size, 'p'), n)?
         } else {
-            Rc::new(Vec::new())
+            Arc::new(Vec::new())
         };
-        let uploads = Rc::new(RefCell::new(Vec::new()));
+        let uploads = lock_of(Vec::new());
         // The most objects a phase's steps make: one step open loop; closed, a ladder's steps, its
         // clients doubling up to the door's, each asking what its rounds may within `n`.
         let most = self.ladder_most(door, n)?;
         // The objects the reads read whose puts were acknowledged, a bit each, which the put that
         // made them keeps and the reads ask of; every other phase keeps none.
-        let put = Rc::new(RefCell::new(Oracle::new(most).map_err(failed)?));
-        let none = Rc::new(RefCell::new(Oracle::new(0).map_err(failed)?));
+        let put = lock_of(Oracle::new(most).map_err(failed)?);
+        let none = lock_of(Oracle::new(0).map_err(failed)?);
         let keyed = |kind: char, made: Option<u64>| Keys::Sized { size, kind, made };
         let phase = |kind: Kind, keys: Keys| (door, kind, keys);
         let mut made = 0;
@@ -3704,9 +4232,7 @@ impl<'o> Bench<'o> {
         if whole {
             let parts = self.etags(door, (size, 'm'), n)?;
             // A slot for each upload a ladder of creates may make, each create filling its own.
-            uploads
-                .borrow_mut()
-                .resize(usize::try_from(most).map_err(failed)?, Upload::default());
+            locked(&uploads)?.resize(usize::try_from(most).map_err(failed)?, Upload::default());
             let shared = (&parts, &uploads, &none);
             let created = self.sized_phase(
                 out,
@@ -3754,7 +4280,7 @@ impl<'o> Bench<'o> {
     /// time, reads the other's half back where acknowledged, and deletes its own.
     fn set(&mut self, out: &mut impl Write, count: u64) -> Result<(), Error> {
         let name = format!("set{count}");
-        let oracle = Rc::new(RefCell::new(Oracle::new(count).map_err(failed)?));
+        let oracle = lock_of(Oracle::new(count).map_err(failed)?);
         // A door reads the other's half where both run; alone, its own.
         let both = self.doors().len() > 1;
         let other = |door: Door| {
@@ -3772,8 +4298,8 @@ impl<'o> Bench<'o> {
         ] {
             for &door in self.doors() {
                 let own = if crossed && both { other(door) } else { door };
-                let work = Rc::new(Work {
-                    oracle: Rc::clone(&oracle),
+                let work = Arc::new(Work {
+                    oracle: Arc::clone(&oracle),
                     ..self.work(door, kind, Keys::Set { count, own })?
                 });
                 if kind == Kind::List {
@@ -3871,7 +4397,8 @@ impl Opening {
     }
 }
 
-/// The runtime the harness's clients run on, one shard on this thread: a task for each of
+/// The runtime a thread's clients run on, one shard on the calling thread, the harness's own or a
+/// driver thread's ([`drive`]): a task for each of
 /// `conns` clients and the phase's own, a timer for each client's wait for its intended start and
 /// two for a native client's waits or one for an HTTP connection's ([`patient`]), and the sockets
 /// of as many native clients.
@@ -3937,10 +4464,16 @@ pub fn counts_line() -> String {
 /// Runs every phase of `options` against a cell of three made under its directory: whether every
 /// check was exact and each control was caught.
 pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
+    // The threads the native door's clients run on; one against an endpoint, which has none.
+    let cores = Facts::query().cpus_at_once().max(1);
+    let threads = match options.endpoint {
+        None => client_threads(options.client_threads, cores, options.clients)?,
+        Some(_) => 1,
+    };
     // Its clients and its cell fit the process's descriptors, or the run is refused before it
     // starts, never ended by an `EMFILE` part way.
     descriptors_fit(
-        options.clients,
+        (options.clients, threads),
         (options.endpoint.is_none(), options.perf, options.relay),
         mantle_node::descriptors::limit().map_err(failed)?,
     )?;
@@ -3971,6 +4504,19 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         }
     )
     .map_err(doing("writing output"))?;
+    if options.endpoint.is_none() {
+        let how = match options.client_threads {
+            Some(_) => format!("as --client-threads states, of {cores} cores"),
+            None => format!(
+                "the {cores} cores this process runs on at once less one for each of the cell's {} \
+                 servers' first shards, at most its {} clients",
+                cell::FOUNDERS,
+                options.clients
+            ),
+        };
+        writeln!(out, "doors native client threads {threads}: {how}")
+            .map_err(doing("writing output"))?;
+    }
     let (cell, listeners, signer) = match &options.endpoint {
         Some(endpoint) => {
             writeln!(
@@ -4015,12 +4561,51 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             .name("doors-watch".to_owned())
             .spawn_scoped(scope, move || watching.run(&ended))
             .map_err(doing("starting the harness's watch"))?;
-        let ran = run(out, options, &watch, (cell, listeners, signer, counting));
+        // The driver threads beside this one, each built for the most clients a share holds, the
+        // first's; all start, or the run is refused with the drivers started ended.
+        let conns = share(options.clients, threads, 0)?;
+        let mut drivers = Vec::with_capacity(threads.saturating_sub(1));
+        let mut threads_started = Vec::with_capacity(threads.saturating_sub(1));
+        let mut started = Ok(());
+        for k in 1..threads {
+            match start_driver(scope, k, conns) {
+                Ok((driver, thread)) => {
+                    drivers.push(driver);
+                    threads_started.push(thread);
+                }
+                Err(e) => {
+                    started = Err(e);
+                    break;
+                }
+            }
+        }
+        let ran = match started {
+            Ok(()) => run(
+                out,
+                options,
+                &watch,
+                (cell, listeners, signer, counting),
+                drivers,
+            ),
+            Err(e) => {
+                drop(drivers);
+                Err(e)
+            }
+        };
+        // Each driver's orders ended with `run`'s drivers: each thread drops its clients and ends.
+        let mut joined = Ok(());
+        for thread in threads_started {
+            if thread.join().is_err() {
+                joined = Err(failed("a driver thread ended unwound"));
+            }
+        }
         drop(end);
         watching
             .join()
             .map_err(|_| failed("the harness's watch ended unwound"))?;
-        ran
+        let ran = ran?;
+        joined?;
+        Ok(ran)
     })
 }
 
@@ -4031,6 +4616,7 @@ fn run(
     options: &Options,
     watch: &Watch,
     (cell, listeners, signer, counting): (Option<Cell>, Vec<SocketAddr>, Signer, bool),
+    drivers: Vec<Driver>,
 ) -> Result<bool, Error> {
     let most = options
         .clients
@@ -4085,13 +4671,14 @@ fn run(
     let mut bench = Bench {
         options,
         watch,
+        drivers,
         listeners,
         cell,
         rt: runtime(most)?,
         relay,
         authority,
         signer: Rc::new(signer),
-        generator: Rc::new(Generator::new(options.seed).map_err(failed)?),
+        generator: Arc::new(Generator::new(options.seed).map_err(failed)?),
         pools: [Vec::new(), Vec::new()],
         native_most,
         opened: [0, 0],
@@ -4223,14 +4810,14 @@ impl Bench<'_> {
     fn controls(&mut self, out: &mut impl Write, door: Door) -> Result<u32, Error> {
         let mut held = self.hold(door, 1)?;
         let logical = held.pop().ok_or_else(|| failed("no connection"))?;
-        let generator = Rc::clone(&self.generator);
+        let generator = Arc::clone(&self.generator);
         let mut piece = vec![0u8; mantle_client::PIECE];
         let other = md5(
             &generator.object(&control_key(door, 'b')).map_err(failed)?,
             CONTROL,
             &mut piece,
         )?;
-        let work = Rc::new(self.work(
+        let work = Arc::new(self.work(
             door,
             Kind::Put,
             Keys::Sized {
@@ -4354,6 +4941,9 @@ impl Bench<'_> {
             .map(std::mem::take)
             .unwrap_or_default();
         self.release(held)?;
+        if door == Door::Native {
+            self.release_drivers()?;
+        }
         // The native door's points: a client on each node, and the S3 door's higher point within
         // what the cell admits, which the nodes derive from their memory and may be thousands, past
         // the clients this harness's runtime holds.
@@ -4711,29 +5301,32 @@ mod tests {
     /// The harness's clients and its cell fit the process's descriptors or the run is refused
     /// before it starts, typed, naming the clients, what they need and the limit: 2,048 clients
     /// past a soft limit of 1,024, as systemd gives a user's service, are refused; the need grows
-    /// with each client by a native client's sockets and an HTTP connection, and the relay and perf
-    /// add theirs.
+    /// with each client by a native client's sockets and an HTTP connection, with each thread the
+    /// clients run on by its runtime's shard, and the relay and perf add theirs.
     #[test]
     fn the_harness_refuses_clients_past_the_descriptor_limit() {
-        let need =
-            |clients, perf, relay| descriptors_fit(clients, (true, perf, relay), u64::MAX).unwrap();
+        let need = |clients, perf, relay| {
+            descriptors_fit((clients, 1), (true, perf, relay), u64::MAX).unwrap()
+        };
         let native = u64::try_from(mantle_client::sockets(cell::FOUNDERS).unwrap()).unwrap();
         assert_eq!(need(2, false, false) - need(1, false, false), native + 1);
         assert_eq!(need(1, true, false) - need(1, false, false), CHILD_PIPES);
         let shard = mantle_node::derive::shard_descriptors();
+        let threaded = descriptors_fit((16, 4), (true, false, false), u64::MAX).unwrap();
+        assert_eq!(threaded - need(16, false, false), 3 * shard);
         // A client through each door, the slope's and one: `run`'s `most` at one client.
         let sets = 2 + u64::try_from(SLOPE_HIGH).unwrap() + 1;
         assert_eq!(
             need(1, false, true) - need(1, false, false),
             shard + sets * u64::try_from(cell::FOUNDERS).unwrap() * LINK_SOCKETS
         );
-        let endpoint = descriptors_fit(1, (false, false, false), u64::MAX).unwrap();
+        let endpoint = descriptors_fit((1, 1), (false, false, false), u64::MAX).unwrap();
         assert!(
             endpoint < need(1, false, false),
             "an endpoint has no native door or cell"
         );
 
-        match descriptors_fit(2_048, (true, false, false), 1_024) {
+        match descriptors_fit((2_048, 1), (true, false, false), 1_024) {
             Err(Error::Descriptors {
                 clients,
                 need: needed,
@@ -4755,8 +5348,11 @@ mod tests {
             other => panic!("2,048 clients under 1,024 descriptors: {other:?}"),
         }
         let at = need(16, false, false);
-        assert_eq!(descriptors_fit(16, (true, false, false), at).unwrap(), at);
-        assert!(descriptors_fit(16, (true, false, false), at - 1).is_err());
+        assert_eq!(
+            descriptors_fit((16, 1), (true, false, false), at).unwrap(),
+            at
+        );
+        assert!(descriptors_fit((16, 1), (true, false, false), at - 1).is_err());
     }
 
     /// A seed and a name make the same bytes each time, and another name other bytes: what every
@@ -4815,7 +5411,7 @@ mod tests {
     #[test]
     fn an_operations_own_work_allocates_nothing() {
         assert!(alloc::installed(), "the unit tests count allocations");
-        let generator = Rc::new(Generator::new(9).unwrap());
+        let generator = Arc::new(Generator::new(9).unwrap());
         let mut oracle = Oracle::new(100_000).unwrap();
         for i in 0..100_000 {
             oracle.set(i);
@@ -4825,12 +5421,12 @@ mod tests {
             door: Door::Native,
             kind: Kind::Get,
             keys,
-            generator: Rc::clone(&generator),
-            etags: Rc::new(Vec::new()),
-            uploads: Rc::new(RefCell::new(Vec::new())),
-            oracle: Rc::new(RefCell::new(oracle.clone())),
-            listing: Rc::new(RefCell::new(Paging::default())),
-            again: std::cell::Cell::new(0),
+            generator: Arc::clone(&generator),
+            etags: Arc::new(Vec::new()),
+            uploads: lock_of(Vec::new()),
+            oracle: lock_of(oracle.clone()),
+            listing: lock_of(Paging::default()),
+            again: AtomicU64::new(0),
         };
         let sized = work(Keys::Sized {
             size: 1_000,
@@ -5025,18 +5621,18 @@ mod tests {
         let never = 50;
         let most = step_ops(clients).unwrap();
         let mut rt = runtime(clients).unwrap();
-        let work = Rc::new(Unanswering { never });
-        let schedule = (Load::Closed, 1, 0, most);
+        let work = Arc::new(Unanswering { never });
         let round = Some(round_ops(clients).unwrap());
-        let (back, tally, rates) = rt
+        let state = shared(Load::Closed, 1, (0, most), round).unwrap();
+        let back = rt
             .block_on(phase(
                 idle_clients(clients),
-                Rc::clone(&work),
-                schedule,
-                round,
+                Arc::clone(&work),
+                Arc::clone(&state),
             ))
             .unwrap()
             .unwrap();
+        let (tally, rates) = finished(state).unwrap();
         assert_eq!(back.len(), clients);
         assert_eq!((tally.unanswered, tally.failed), (1, 1));
         let others = u64::try_from(clients - 1).unwrap();
@@ -5048,12 +5644,207 @@ mod tests {
         assert!(rates.len() < ROUNDS.min);
         let first = tally.first[Failure::Unanswered.at()].as_deref();
         assert_eq!(first, Some("never answered"));
-        let (back, tally, _) = rt
-            .block_on(phase(back, work, schedule, None))
+        let state = shared(Load::Closed, 1, (0, most), None).unwrap();
+        let back = rt
+            .block_on(phase(back, work, Arc::clone(&state)))
             .unwrap()
             .unwrap();
+        let (tally, _) = finished(state).unwrap();
         assert_eq!(back.len(), clients);
         assert_eq!((tally.ops, tally.unanswered), (most, 1));
+    }
+
+    /// Simulated operations that note each index asked, each answered after a turn of the runtime
+    /// but the `never`-th: unanswered, or where `fails`, a failure of the harness's own.
+    struct Noting {
+        never: u64,
+        fails: bool,
+        asked: Mutex<Vec<u64>>,
+    }
+
+    impl Ask for Noting {
+        async fn ask(&self, _: &mut Logical, j: u64) -> Result<Came, Error> {
+            self.asked.lock().unwrap().push(j);
+            hyper_rt::futures::yield_now().await;
+            match (j == self.never, self.fails) {
+                (false, _) => Ok(Came::Done),
+                (true, false) => Ok(Came::Unanswered("never answered".to_owned())),
+                (true, true) => Err(failed("the harness failed")),
+            }
+        }
+    }
+
+    /// `work`'s phase from `state` on four clients on this thread and three on another, each
+    /// thread's runtime its own, as the native door's clients run beside the driver threads: what
+    /// each thread's part came to.
+    fn on_two_threads(
+        work: &Arc<Noting>,
+        state: &Arc<Mutex<Shared>>,
+    ) -> (Result<usize, Error>, Result<usize, Error>) {
+        std::thread::scope(|scope| {
+            let there = scope.spawn(|| {
+                let mut rt = runtime(3).unwrap();
+                rt.block_on(phase(idle_clients(3), Arc::clone(work), Arc::clone(state)))
+                    .unwrap()
+                    .map(|back| back.len())
+            });
+            let mut rt = runtime(4).unwrap();
+            let here = rt
+                .block_on(phase(idle_clients(4), Arc::clone(work), Arc::clone(state)))
+                .unwrap()
+                .map(|back| back.len());
+            (here, there.join().unwrap())
+        })
+    }
+
+    /// A phase whose clients run on two threads takes its operations from its one schedule and
+    /// counts them into its one tally: each operation is asked once, on one thread or the other,
+    /// and every client comes back to its own thread. One thread's unanswered operation ends a
+    /// closed step on both, and one thread's failure of the harness's ends the phase on the other,
+    /// whose clients come back, so neither thread is left running.
+    #[test]
+    fn a_phase_spread_over_threads_asks_each_operation_once_and_ends_on_all() {
+        let noting = |never, fails| {
+            Arc::new(Noting {
+                never,
+                fails,
+                asked: Mutex::new(Vec::new()),
+            })
+        };
+        let ops = 2_000u64;
+        let work = noting(u64::MAX, false);
+        let state = shared(Load::Closed, 1, (0, ops), None).unwrap();
+        let (here, there) = on_two_threads(&work, &state);
+        assert_eq!((here.unwrap(), there.unwrap()), (4, 3));
+        let (tally, _) = finished(state).unwrap();
+        assert_eq!((tally.ops, tally.failed), (ops, 0));
+        assert!((1..=7).contains(&tally.most), "{}", tally.most);
+        let mut asked = work.asked.lock().unwrap().clone();
+        asked.sort_unstable();
+        assert_eq!(asked, (0..ops).collect::<Vec<_>>());
+
+        let most = step_ops(7).unwrap();
+        let work = noting(50, false);
+        let state = shared(Load::Closed, 1, (0, most), Some(round_ops(7).unwrap())).unwrap();
+        let (here, there) = on_two_threads(&work, &state);
+        assert_eq!((here.unwrap(), there.unwrap()), (4, 3));
+        let (tally, _) = finished(state).unwrap();
+        assert_eq!((tally.unanswered, tally.failed), (1, 1));
+        assert!(tally.ops < most, "{} of {most}", tally.ops);
+
+        let work = noting(50, true);
+        let state = shared(Load::Closed, 1, (0, most), None).unwrap();
+        let (here, there) = on_two_threads(&work, &state);
+        let failed = [&here, &there].iter().filter(|part| part.is_err()).count();
+        assert_eq!(failed, 1, "{here:?} {there:?}");
+        assert!(matches!((here, there), (Ok(4), _) | (_, Ok(3))));
+        let (tally, _) = finished(state).unwrap();
+        assert!(tally.ops < most, "{} of {most}", tally.ops);
+    }
+
+    /// A door's clients spread over its threads evenly: every client is one thread's, no two
+    /// threads' shares differ by more than one, the first threads take what does not divide, a
+    /// phase of one client runs on the harness's own thread, and a thread past the count takes
+    /// none.
+    #[test]
+    fn a_doors_clients_spread_evenly_over_its_threads() {
+        for threads in 1..=13 {
+            for clients in [1usize, 2, 3, 7, 12, 13, 100, 2_048] {
+                let shares: Vec<usize> = (0..threads)
+                    .map(|k| share(clients, threads, k).unwrap())
+                    .collect();
+                assert_eq!(shares.iter().sum::<usize>(), clients);
+                let (least, most) = (shares.iter().min().unwrap(), shares.iter().max().unwrap());
+                assert!(most - least <= 1, "{clients} over {threads}: {shares:?}");
+                assert!(shares.windows(2).all(|w| w[0] >= w[1]), "{shares:?}");
+                assert_eq!(share(clients, threads, threads).unwrap(), 0);
+            }
+        }
+        assert_eq!(share(1, 13, 0).unwrap(), 1);
+        assert_eq!(share(1, 13, 1).unwrap(), 0);
+        assert_eq!(
+            (0..13)
+                .map(|k| share(2_048, 13, k).unwrap())
+                .collect::<Vec<_>>(),
+            [
+                158, 158, 158, 158, 158, 158, 158, 157, 157, 157, 157, 157, 157
+            ]
+        );
+        assert!(share(4, 0, 0).is_ok_and(|n| n == 0));
+    }
+
+    /// The native door's threads are the cores the process runs on at once less one for each of
+    /// the cell's servers, at least one and at most the clients; `--client-threads` states a count
+    /// within the cores, and none or one past them is refused.
+    #[test]
+    fn the_client_threads_are_the_cores_the_servers_leave() {
+        let founders = cell::FOUNDERS;
+        assert_eq!(client_threads(None, 16, 2_048).unwrap(), 16 - founders);
+        assert_eq!(client_threads(None, 8, 2_048).unwrap(), 8 - founders);
+        assert_eq!(client_threads(None, 16, 2).unwrap(), 2);
+        assert_eq!(client_threads(None, founders, 2_048).unwrap(), 1);
+        assert_eq!(client_threads(None, 1, 2_048).unwrap(), 1);
+        assert_eq!(client_threads(Some(4), 16, 2_048).unwrap(), 4);
+        assert_eq!(client_threads(Some(16), 16, 2_048).unwrap(), 16);
+        assert_eq!(client_threads(Some(8), 16, 3).unwrap(), 3);
+        assert!(client_threads(Some(0), 16, 2_048).is_err());
+        assert!(client_threads(Some(17), 16, 2_048).is_err());
+    }
+
+    /// Each thread's part of a phase merges into the phase's one line: the CPU its threads spent,
+    /// what each allocated for the doors and set aside as the harness's, and what their clients'
+    /// connections moved, each summed, so `generator_cpu_ns/op`, `client_allocs/op`,
+    /// `client_bytes/op` and `wire_bytes/op` are the bench's own over all of its threads. The
+    /// harness's peak is the threads' peaks summed, the most they could have held at once.
+    #[test]
+    fn each_threads_part_of_a_phase_merges_into_its_line() {
+        let counts = |allocations: u64, bytes: u64, peak: i64| Counts {
+            allocations,
+            reallocations: allocations / 2,
+            moved: allocations / 4,
+            frees: allocations,
+            bytes,
+            live: 0,
+            peak,
+        };
+        let part = |cpu_ns, total: Counts, aside: Counts, bytes, datagrams| Driven {
+            cpu_ns,
+            total,
+            aside,
+            wire: Wire { bytes, datagrams },
+        };
+        let parts = [
+            part(
+                158_000,
+                counts(40, 4_000, 900),
+                counts(8, 800, 700),
+                1_000,
+                4,
+            ),
+            part(150_000, counts(36, 3_600, 800), counts(6, 600, 500), 900, 3),
+            part(1_000, counts(0, 0, 0), counts(0, 0, 0), 0, 0),
+        ];
+        let merged = parts.iter().copied().fold(Driven::default(), Driven::and);
+        assert_eq!(merged.cpu_ns, 309_000);
+        let doors = merged.total.less(&merged.aside);
+        assert_eq!((doors.allocations, doors.bytes), (62, 6_200));
+        let each: u64 = parts
+            .iter()
+            .map(|p| p.total.less(&p.aside).allocations)
+            .sum();
+        assert_eq!(doors.allocations, each);
+        assert_eq!((merged.aside.allocations, merged.aside.peak), (14, 1_200));
+        assert_eq!(
+            merged.wire,
+            Wire {
+                bytes: 1_900,
+                datagrams: 7
+            }
+        );
+        assert_eq!(parts[0].and(Driven::default()), parts[0]);
+        // As the line divides them by the phase's operations, here 20.
+        assert_eq!(per(Some(merged.cpu_ns as f64), 20), "15450.0");
+        assert_eq!(per(Some(doors.allocations as f64), 20), "3.1");
     }
 
     /// A step whose rounds kept none is judged by none, so it falls back to its one throughput.

@@ -516,13 +516,15 @@ pub struct TrunkStats {
     pub merge_units: u64,
     pub merge_ns: u64,
     /// Scans made through the trunk, the leaf segments they visited, the sources those segments
-    /// listed, and of them those passed over by their range filters and those opened: what a
-    /// seek reads its way through (filled in by the shard, `ShardDb::stats`).
+    /// listed, of them those passed over by their range filters and those opened, and the keys
+    /// their merges compared: what a seek reads its way through (filled in by the shard,
+    /// `ShardDb::stats`).
     pub scans: u64,
     pub scan_segments: u64,
     pub scan_sources: u64,
     pub scan_skipped: u64,
     pub scan_opened: u64,
+    pub scan_compared: u64,
     /// Entries written by pivots' compactions, and by leaves' settles by what asked for them:
     /// seeks' rent, more than `fanout` branches, more than `leaf_entries` entries.
     pub pivot_entries: u64,

@@ -126,8 +126,9 @@ impl<F: BlockFile + 'static> Rows for Stored<F> {
             return Ok(None);
         }
         self.rows.clear();
+        // The row alone: no continuation is found past it.
         self.db
-            .scan(from, Some(to), 1, &mut self.rows, &mut self.next)
+            .scan_rows(from, Some(to), 1, &mut self.rows)
             .map_err(fenced)?;
         Ok(self.rows.get(0).map(|(k, v)| (k.to_vec(), v.to_vec())))
     }

@@ -1,0 +1,62 @@
+name: bench-syscalls
+# What the engine's post-fill flush issues on Linux at each of three builds (bench-bisect run
+# 44439551008: 1.2-1.4 s at e6bf5002, 8.4-9.2 s at b95e5ff4, which merged shared-fds): the ranges
+# bench at 10M under strace -f -c, counting each flush and write call and the time in them, then
+# once more without it for the time alone, the three builds in turn on one hosted runner.
+on:
+  push:
+    branches: ["syscalls/**"]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  count:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust and strace
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          sudo apt-get install -y --no-install-recommends strace
+      - name: Build each build's bench
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          for point in e6bf50021c63148eb87dadf9a981f29083572900 b95e5ff4f291654a5681aeef6be27d86e1595012 29e42e9d55c8f85d431b23ac441474986e359261; do
+            git checkout -q "$point"
+            cargo bench -p mantle-engine --bench ranges --no-run --locked --message-format=json \
+              | python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              m = json.loads(line)
+              if m.get("reason") == "compiler-artifact" and m.get("executable") and "bench" in m["target"]["kind"]:
+                  print(m["executable"])' > exe
+            cp "$(cat exe)" "$RUNNER_TEMP/bin/ranges-${point:0:8}"
+          done
+      - name: Counted, then timed
+        run: |
+          mkdir -p out
+          for point in e6bf5002 b95e5ff4 29e42e9d; do
+            db=$(mktemp -d)
+            strace -f -c -o "out/strace-$point.txt" -e trace=fdatasync,fsync,pwrite64,pwritev,pwritev2,io_submit \
+              "$RUNNER_TEMP/bin/ranges-$point" "$db" 10000000 1 1000000 256 16 1000000 10 \
+              --rocks-seed=301 --shard-client --segments --machine-memory > "out/raw-strace-$point.txt" 2>&1
+            rm -rf "$db"
+          done
+          for r in 1 2; do
+            for point in e6bf5002 b95e5ff4 29e42e9d; do
+              db=$(mktemp -d)
+              "$RUNNER_TEMP/bin/ranges-$point" "$db" 10000000 1 1000000 256 16 1000000 10 \
+                --rocks-seed=301 --shard-client --segments --machine-memory > "out/raw-$r-$point.txt" 2>&1
+              echo "$point r$r fill $(awk '/^fillrandom [0-9]/{print $3}' out/raw-$r-$point.txt) postfillflush $(awk '/^postfillflush elapsed/{print $3}' out/raw-$r-$point.txt)" | tee -a out/summary.txt
+              rm -rf "$db"
+            done
+          done
+          for point in e6bf5002 b95e5ff4 29e42e9d; do echo "== $point"; cat "out/strace-$point.txt"; done | tee -a out/summary.txt
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: bench-syscalls
+          path: out/

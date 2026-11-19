@@ -213,3 +213,111 @@ fn an_engine_with_workers_writes_no_page_on_its_shard_while_it_applies() {
     assert!(applying > 0, "the shard wrote no page applying inline");
     assert_eq!(elsewhere, 0);
 }
+
+/// The entries a follower applied before a snapshot, the rows of the image it installs, and the
+/// image's index: the clear and the puts rotate the page-sized memtable over a hundred times.
+const APPLIED: u64 = 1_100;
+const IMAGE: u64 = 2_000;
+const INDEX: u64 = APPLIED + 500;
+
+/// A follower's engine, opened as the node opens it (`process::engine`) with its worker on a
+/// shard that may wait, applies `APPLIED` entries with a checkpoint every `CHECKPOINT`, then
+/// installs a leader's snapshot as `RangeMachine::install` does: every row cleared and the
+/// image's put, then persisted. The persist's result, with the engine's own error where it
+/// fenced (`Stored::fault`), and the store's path in a directory kept until the result is read.
+fn install_on_a_shard(
+    image: Vec<(Vec<u8>, Vec<u8>)>,
+) -> (Result<(), String>, tempfile::TempDir, std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.store");
+        mantle_engine::store::permit_blocking();
+        let writes = Arc::new(Writes {
+            shard: std::thread::current().id(),
+            on_shard: AtomicU64::new(0),
+            elsewhere: AtomicU64::new(0),
+        });
+        let (at, counts) = (path.clone(), Arc::clone(&writes));
+        let persisted = shard()
+            .block_on(async move {
+                let mut e =
+                    Stored::create(counted(&at, true, &counts), CONFIG, CONFIG.page_size, TRUNK)
+                        .unwrap();
+                let (again, worker_counts) = (at.clone(), Arc::clone(&counts));
+                e.set_workers(
+                    move || Ok(counted(&again, false, &worker_counts)),
+                    ENGINE_WORKERS,
+                )
+                .unwrap();
+                for i in 0..APPLIED {
+                    let (k, v) = row(i);
+                    e.apply(i + 1, vec![Write::Put(k, v)]).unwrap();
+                    if (i + 1) % CHECKPOINT == 0 {
+                        e.persist().unwrap();
+                    }
+                }
+                e.install(INDEX, image).unwrap();
+                let persisted = e
+                    .persist()
+                    .map_err(|error| format!("{error}: the engine's {:?}", e.fault()));
+                if persisted.is_ok() {
+                    assert_eq!((e.applied(), e.durable()), (INDEX, INDEX));
+                }
+                persisted
+            })
+            .unwrap();
+        (persisted, dir, path)
+    })
+    .join()
+    .unwrap()
+}
+
+/// The image's rows: the entries' keys and as many more, each value of the image's own.
+fn image() -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..IMAGE)
+        .map(|i| {
+            let (k, _) = row(i);
+            (k, vec![2; 120])
+        })
+        .collect()
+}
+
+/// A snapshot installed over applied entries on a shard with its worker persists: the persist
+/// that a node's follower failed with "the engine failed to persist a snapshot" once its engines
+/// had workers (CI run 44527895012) returns durable at the image's index.
+#[test]
+fn an_image_installed_on_a_shard_with_workers_persists() {
+    let (persisted, _dir, _) = install_on_a_shard(image());
+    persisted.unwrap();
+}
+
+/// The store opened again after the install stands at the image's index and holds the image's
+/// rows, every one, and none of the entries' own values.
+#[test]
+fn a_store_opened_after_an_install_holds_every_row_of_the_image() {
+    let (persisted, _dir, path) = install_on_a_shard(image());
+    persisted.unwrap();
+    std::thread::spawn(move || {
+        mantle_engine::store::permit_blocking();
+        let writes = Arc::new(Writes {
+            shard: std::thread::current().id(),
+            on_shard: AtomicU64::new(0),
+            elsewhere: AtomicU64::new(0),
+        });
+        shard()
+            .block_on(async move {
+                let mut e = Stored::open(
+                    counted(&path, false, &writes),
+                    CONFIG,
+                    CONFIG.page_size,
+                    TRUNK,
+                )
+                .unwrap();
+                assert_eq!((e.applied(), e.durable()), (INDEX, INDEX));
+                assert_eq!(e.image().unwrap(), image());
+            })
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+}

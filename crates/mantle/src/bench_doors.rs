@@ -90,7 +90,10 @@ use hyper_rt::futures::{now_ns, sleep};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
 use hyper_rt::tcp::TcpStream;
-use mantle_client::{Client, Native, Rewind, Settings, Sink, Source, TRAILER, Wire};
+use mantle_client::{
+    CertificateDer, Client, Credentials, Native, PrivateKeyDer, PrivatePkcs8KeyDer, Rewind,
+    Settings, Sink, Source, TRAILER, Wire,
+};
 use mantle_disk::histogram::Histogram;
 use mantle_disk::rounds::{self, Judgment, Policy};
 use mantle_http::write::Length;
@@ -241,10 +244,9 @@ fn doing(what: &'static str) -> impl Fn(std::io::Error) -> Error {
 /// (`transfer::cell`'s founders, `mantle serve` each; [`Perf`]).
 const CHILD_PIPES: u64 = 2;
 
-/// The files the harness holds at once beside its clients, one at a time from its one thread: a
-/// native client's identity, which `mantle init client` writes a file at a time as the client opens
-/// (`files::write`: the temporary, closed before the rename, then its directory), and what it reads
-/// between steps (a server's usage, its own threads and faults), each read whole and closed.
+/// The files the harness holds at once beside its clients, one at a time from its one thread: what
+/// it reads between steps (a server's usage, its own threads and faults), each read whole and
+/// closed. A native client's identity is issued in memory and holds none ([`Bench::settings`]).
 const FILE_AT_ONCE: u64 = 1;
 
 /// The sockets one of the relay's links holds: its front, which the client sends to, and its back,
@@ -2632,7 +2634,9 @@ struct Bench<'o> {
     rt: LocalRuntime,
     /// The relay condition's path the native clients dial through, when `--relay` asks for it.
     relay: Option<crate::relay::Relay>,
-    client_dir: PathBuf,
+    /// The cell's authority, read once, which issues each native client its identity in memory
+    /// ([`Bench::settings`]); none against an `--endpoint`.
+    authority: Option<crate::init::Authority>,
     listeners: Vec<SocketAddr>,
     signer: Rc<Signer>,
     generator: Rc<Generator>,
@@ -3066,20 +3070,10 @@ impl<'o> Bench<'o> {
         for k in 0..n {
             let at = first.saturating_add(k).checked_rem(spread).unwrap_or(0);
             let conn = match door {
-                Door::Native => {
-                    // An identity of its own: a node holds two connections of one identity at most
-                    // (`mantle_protocol::bounds::CONNECTIONS_PER_PEER`), and each logical client is
-                    // a client of its own, as agents are.
-                    let number = self.opened.first().copied().unwrap_or(0);
-                    let dir = self.options.dir.join("clients").join(number.to_string());
-                    let settings = harness(|| {
-                        crate::init::client(&mut Vec::new(), &dir, self.cell()?.out()).map_err(
-                            |e| failed(format!("making a native client's identity: {e}")),
-                        )?;
-                        self.settings(&dir, at)
-                    })?;
-                    Opening::Native(settings)
-                }
+                // An identity of its own: a node holds two connections of one identity at most
+                // (`mantle_protocol::bounds::CONNECTIONS_PER_PEER`), and each logical client is a
+                // client of its own, as agents are.
+                Door::Native => Opening::Native(harness(|| self.settings(at))?),
                 Door::Http => {
                     let listener = *self
                         .listeners
@@ -3100,10 +3094,21 @@ impl<'o> Bench<'o> {
         Ok(made)
     }
 
-    /// The settings of the native client `mantle init client` made in `dir`, asking node `first`
-    /// first, its key read from the client's directory.
-    fn settings(&self, dir: &Path, first: usize) -> Result<Settings, Error> {
-        let configured = crate::client::configured(dir).map_err(failed)?;
+    /// A native client's settings, asking node `first` first: an identity of its own, issued now
+    /// under the cell's authority and held in memory (`init::Authority::issue_client`; 2,048 took
+    /// 95 ms in a release build on an M5 Max, 2026-11-19). The client lives for this run alone, so
+    /// nothing of it is written: `mantle init client` writes an identity for a client to keep, each
+    /// file flushed in full, and writing one for each client held a run of 2,048 on macOS minutes
+    /// before its first measured request, the harness's thread 59% in `F_FULLFSYNC` (sampled at
+    /// 1254391d).
+    fn settings(&self, first: usize) -> Result<Settings, Error> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or_else(|| failed("the native door needs a cell"))?;
+        let (id, certificate, key) = authority
+            .issue_client()
+            .map_err(|e| failed(format!("issuing a native client's identity: {e}")))?;
         let cell = self.cell()?;
         // Under the relay condition each client dials the nodes at a link set of its own, and
         // knows no name to look a node up by again, which would reach it past the relay.
@@ -3120,9 +3125,13 @@ impl<'o> Bench<'o> {
             }
         };
         Ok(Settings {
-            id: configured.id,
+            id,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            credentials: configured.credentials,
+            credentials: Credentials {
+                chain: vec![CertificateDer::from(certificate)],
+                key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.pkcs8().to_vec())),
+                roots: vec![CertificateDer::from(authority.certificate.clone())],
+            },
             transport_bytes: mantle_client::least_transport(nodes.len()).map_err(failed)?,
             nodes,
             names,
@@ -3962,7 +3971,6 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         }
     )
     .map_err(doing("writing output"))?;
-    let client_dir = options.dir.join("client");
     let (cell, listeners, signer) = match &options.endpoint {
         Some(endpoint) => {
             writeln!(
@@ -3985,7 +3993,6 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             // Every range led before the first phase, so no phase measures the cell's first
             // elections.
             cell.led().map_err(failed)?;
-            crate::init::client(&mut Vec::new(), &client_dir, cell.out()).map_err(failed)?;
             let s3 = cell.s3();
             let region = s3
                 .first()
@@ -4008,12 +4015,7 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
             .name("doors-watch".to_owned())
             .spawn_scoped(scope, move || watching.run(&ended))
             .map_err(doing("starting the harness's watch"))?;
-        let ran = run(
-            out,
-            options,
-            &watch,
-            (cell, listeners, signer, client_dir, counting),
-        );
+        let ran = run(out, options, &watch, (cell, listeners, signer, counting));
         drop(end);
         watching
             .join()
@@ -4028,13 +4030,7 @@ fn run(
     out: &mut impl Write,
     options: &Options,
     watch: &Watch,
-    (cell, listeners, signer, client_dir, counting): (
-        Option<Cell>,
-        Vec<SocketAddr>,
-        Signer,
-        PathBuf,
-        bool,
-    ),
+    (cell, listeners, signer, counting): (Option<Cell>, Vec<SocketAddr>, Signer, bool),
 ) -> Result<bool, Error> {
     let most = options
         .clients
@@ -4049,6 +4045,11 @@ fn run(
         out,
         "doors native clients at most {native_most}: each node admits gateway.clients identities at once"
     ).map_err(doing("writing output"))?;
+    let authority = cell
+        .as_ref()
+        .map(|cell| crate::init::Authority::read(cell.out()))
+        .transpose()
+        .map_err(failed)?;
     // The relay condition: a link set for each client the harness holds at most, each direction
     // holding what one client's transport may have unacknowledged or unread.
     let relay = match (options.relay, &cell) {
@@ -4061,8 +4062,13 @@ fn run(
         (true, Some(cell)) => {
             let nodes = cell.quic();
             let held = mantle_client::least_transport(nodes.len()).map_err(failed)?;
-            let relay = crate::relay::Relay::start(&client_dir, &nodes, most, (held, options.seed))
-                .map_err(|e| failed(e.to_string()))?;
+            let relay = crate::relay::Relay::start(
+                &options.dir.join("relay"),
+                &nodes,
+                most,
+                (held, options.seed),
+            )
+            .map_err(|e| failed(e.to_string()))?;
             writeln!(
                 out,
                 "doors relay one_way_ns {} jitter_ns {} loss {}/{} in runs of {}/{} link_sets {most} held_bytes {held}",
@@ -4083,7 +4089,7 @@ fn run(
         cell,
         rt: runtime(most)?,
         relay,
-        client_dir,
+        authority,
         signer: Rc::new(signer),
         generator: Rc::new(Generator::new(options.seed).map_err(failed)?),
         pools: [Vec::new(), Vec::new()],
@@ -4190,7 +4196,7 @@ impl Bench<'_> {
                 (status, text) => Err(failed(format!("the bucket: HTTP {status} {text}"))),
             };
         }
-        let settings = self.settings(&self.client_dir, 0)?;
+        let settings = self.settings(0)?;
         let made = self
             .rt
             .block_on(async move {

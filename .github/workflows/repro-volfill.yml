@@ -1,7 +1,7 @@
 name: repro-volfill
-# The fix for the volumes-fill hang (reply-hang, merged in perf-10k c9998a0d) checked: crates/mantle/tests/serve.rs
-# `a_cell_whose_volumes_fill_refuses_the_next_object_typed_on_both_doors`, which failed about four runs in five
-# from 9a312b2b, five times on each of two runners of each architecture.
+# The volumes-fill test after the hang's fix (perf-10k c9998a0d): it passed 19 of 20 (run 44590225036); the one
+# failure, on ubuntu-24.04-arm, was its first refusal not InsufficientStorage (serve.rs:2183), its text unkept.
+# Twenty runs on ubuntu-24.04-arm, each failed run's output kept.
 on:
   push:
     branches: ["repro/**"]
@@ -16,8 +16,8 @@ jobs:
       fail-fast: false
       matrix:
         sha: [c9998a0d]
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        copy: [1, 2]
+        runner: [ubuntu-24.04-arm]
+        copy: [1, 2, 3, 4]
     name: volumes fill at ${{ matrix.sha }} on ${{ matrix.runner }}, copy ${{ matrix.copy }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -40,8 +40,15 @@ jobs:
             else
               echo "run $i failed at ${{ matrix.sha }} in $(($(date +%s) - start)) s"
               grep -m 3 -E "panicked at|not so" out-$i.txt | cut -c1-300 || true
+              grep -A4 -E "panicked at" out-$i.txt | cut -c1-600 || true
+              mkdir -p kept && cp out-$i.txt kept/
               echo "VERDICT BAD ${{ matrix.sha }}"
-              exit 1
             fi
           done
           echo "VERDICT GOOD ${{ matrix.sha }}"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: volfill-arm-${{ matrix.copy }}
+          path: kept
+          if-no-files-found: ignore

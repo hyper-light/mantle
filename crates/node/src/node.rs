@@ -1535,7 +1535,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             pooled: gateway
                 .as_ref()
                 .map_or(0, |g| if g.clients > 0 { g.objects } else { 0 }),
-            host: host::Host::new(exchanges, gateway.clone()),
+            // A door kept for each operation the host runs at most, as the memory floor counts
+            // one an operation (`host::record_bytes`), and never past the exchanges the transport
+            // holds, each door out being one's.
+            host: host::Host::new(
+                exchanges.min(gateway.as_ref().map_or(0, |g| g.objects)),
+                gateway.clone(),
+            ),
             gateway,
             parked: VecDeque::new(),
             parked_most: exchanges,

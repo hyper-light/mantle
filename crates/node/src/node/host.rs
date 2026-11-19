@@ -313,8 +313,9 @@ pub(crate) trait Serve {
 }
 
 impl Host {
-    /// A host with no jobs, keeping at most `doors` native doors for its next requests: the
-    /// exchanges the transport holds at once; its jobs run by `gateway`.
+    /// A host with no jobs, keeping at most `doors` native doors for its next requests: one an
+    /// operation it runs at once, within the exchanges the transport holds; its jobs run by
+    /// `gateway`.
     pub(super) fn new(doors: usize, gateway: Option<std::sync::Arc<GatewaySettings>>) -> Self {
         Self {
             jobs: Vec::new(),
@@ -349,14 +350,18 @@ impl Host {
 }
 
 /// What the host keeps of one native put or get beside its charge, by design: its job, and the
-/// work it boxes, a put's or a get's whichever is larger, its driver inline in it; and its reply's
-/// door, the job's end and the node's task's, and what the two share (`derive::native`).
+/// work it boxes, a put's or a get's whichever is larger, its driver inline in it; its reply's
+/// door, the job's end and the node's task's, and what the two share; and a door kept for a next
+/// request, the host keeping at most one an operation (`Doors`, at most `objects`) (node.md §2.9
+/// step 6d; `derive::native`).
 pub(crate) fn record_bytes() -> Option<usize> {
+    let door = size_of::<Native>().checked_add(size_of::<Handed>())?;
     size_of::<Job>()
         .checked_add(size_of::<Putting>().max(size_of::<Getting>()))?
-        .checked_add(size_of::<Native>())?
+        .checked_add(door)?
         .checked_add(size_of::<(ExchangeId, Replies)>())?
-        .checked_add(size_of::<Handed>())
+        .checked_add(door)?
+        .checked_add(size_of::<(Box<Native>, Replies)>())
 }
 
 /// What a held job's bound makes of it at a turn (research/77 D2).
@@ -606,8 +611,10 @@ fn native_door() -> Option<(Native, Replies)> {
 /// emptied of what its job gave and the node's task never took, its shared words cleared, and kept.
 /// A half given back first waits for the other, which is then still out, a job's or a reply the
 /// node's task writes, each of a request the node holds. Bound: the doors kept, at most `most`,
-/// the exchanges the transport holds at once (the node's `parked_most`), as each door out is of an
-/// exchange the node holds; one given back past them is let go.
+/// the operations the host runs at once (`GatewaySettings::objects`), one an operation, as the
+/// memory floor counts them (`record_bytes`), and never past the exchanges the transport holds at
+/// once (the node's `parked_most`), as each door out is of an exchange the node holds; one given
+/// back past them is let go.
 #[derive(Default)]
 struct Doors {
     kept: Vec<(Box<Native>, Replies)>,
@@ -8310,5 +8317,254 @@ mod tests {
             Some(Status::InvalidVersion)
         );
         assert_eq!(weight(&get("null")), 1);
+    }
+
+    /// A node as a test serves the host it lends out (`Serve`, node.md §2.9 step 6d): each ask
+    /// answered by `answer` and its outcome given at the host's next turn, and each job's end kept,
+    /// with how many asks it let go. It holds no volume table, and reads no fields: its jobs come
+    /// typed through the S3 door.
+    struct Stub {
+        answer: fn(&JobAsk) -> Outcome,
+        answers: Vec<(Pending, Outcome)>,
+        asked: u64,
+        ended: Vec<(Option<u64>, u64, Option<usize>, usize)>,
+        abandoned: usize,
+    }
+
+    impl Serve for Stub {
+        fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+            let pending = match &ask {
+                JobAsk::Command(..) => Pending::Command(self.asked),
+                JobAsk::Read(..) => Pending::Read(self.asked),
+                JobAsk::Put { .. } | JobAsk::Get { .. } => Pending::Chunk(self.asked),
+            };
+            self.asked += 1;
+            self.answers.push((pending, (self.answer)(&ask)));
+            Ok(pending)
+        }
+
+        fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
+            let at = self.answers.iter().position(|(p, _)| *p == pending)?;
+            Some(self.answers.swap_remove(at).1)
+        }
+
+        fn abandon(&mut self, asks: impl IntoIterator<Item = Pending>) {
+            self.abandoned += asks.into_iter().count();
+        }
+
+        fn table(&mut self) -> Result<&Table, NodeError> {
+            Err(NodeError::Bounds("a stub holds no volume table".into()))
+        }
+
+        fn group_of(&self, _: Layer) -> Option<u128> {
+            Some(1)
+        }
+
+        fn ranges(&self) -> usize {
+            1
+        }
+
+        fn command_room(&self) -> bool {
+            true
+        }
+
+        fn command_asks(&self) -> usize {
+            1
+        }
+
+        fn wall_ns(&self) -> u64 {
+            0
+        }
+
+        fn freed(&mut self) -> bool {
+            false
+        }
+
+        fn moved(&self) -> u64 {
+            0
+        }
+
+        fn read_fields(&mut self, _: &mut Job) -> Result<bool, NodeError> {
+            panic!("a local door's work comes typed")
+        }
+
+        fn took(&mut self, _: door::Paced) {}
+
+        fn committed(&mut self, _: u64) {}
+
+        fn filled(&mut self, _: u64, _: u64) {}
+
+        fn job_ended(
+            &mut self,
+            admitted_ns: Option<u64>,
+            charge: u64,
+            driven: Option<usize>,
+            asks: impl IntoIterator<Item = Pending>,
+        ) {
+            self.ended
+                .push((admitted_ns, charge, driven, asks.into_iter().count()));
+        }
+    }
+
+    /// An object's version of no bytes, as its Name range holds it.
+    fn empty_version() -> Version {
+        Version {
+            marker: false,
+            null: false,
+            modified_ns: 0,
+            etag: "\"e\"".into(),
+            size: 0,
+            checksum: None,
+            file: None,
+            owner: "o".into(),
+            headers: Vec::new(),
+            retention: None,
+            legal_hold: None,
+            listing: None,
+        }
+    }
+
+    /// A job of `work` through the S3 door, admitted at `now` and charged `charge`: its door's
+    /// body's sender and its reply's receiver beside it.
+    fn local_job(
+        work: Work,
+        now: u64,
+        charge: u64,
+    ) -> (Job, Sender<Piece>, ChannelReceiver<door::Answer>) {
+        let (body_in, pieces) = hyper_rt::sync::channel(2).unwrap();
+        let (reply, answers) = hyper_rt::sync::channel(4).unwrap();
+        let job = Job {
+            door: Door::Local(Box::new(Local {
+                body: Pieces {
+                    pieces,
+                    ended: None,
+                },
+                reply,
+                pending: VecDeque::new(),
+                ready: false,
+            })),
+            principal: "o".into(),
+            work,
+            pending: Vec::new(),
+            deadline_ns: None,
+            moved_ns: now,
+            admitted_ns: Some(now),
+            charge,
+            window: 1,
+            driven: None,
+            label: None,
+        };
+        (job, body_in, answers)
+    }
+
+    /// Every answer a door's reply channel holds, in order.
+    fn answered(answers: &mut ChannelReceiver<door::Answer>) -> Vec<door::Answer> {
+        let mut taken = Vec::new();
+        while let Ok(Some(answer)) = answers.try_recv() {
+            taken.push(answer);
+        }
+        taken
+    }
+
+    /// A host driven only through its interface (node.md §2.9 step 6d), by a stub of the node that
+    /// answers each ask at the host's next turn, steps a put and a get to their ends: the put of an
+    /// empty object takes its body's end from its door, asks its Name range to commit it, and is
+    /// answered `Done` with the version the range wrote; the get reads its current version, an
+    /// empty one, makes its driver over it and is answered `Done` with no bytes; and each job's end
+    /// is told with its admission's charge, its shard and no ask let go.
+    #[test]
+    fn a_host_driven_only_through_its_interface_steps_a_put_and_a_get_to_their_ends() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(2, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut putting = native_put(0, Vec::new());
+        putting.trailing = None;
+        let (mut put, body, mut put_answers) = local_job(Work::Put(putting), now, 7);
+        put.driven = Some(1);
+        // The put's body as the S3 door ends it: whole, its trailer's checksum the empty body's.
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        assert!(body.try_send(Piece::End(Some(crc))).is_ok());
+        let get = work(
+            Op::Get {
+                bucket: "b".into(),
+                key: "k".into(),
+                headers: Headers::default(),
+                version: None,
+            },
+            Vec::new(),
+            None,
+        );
+        let (get, _, mut get_answers) = local_job(get, now, 5);
+        host.jobs.push(put);
+        host.jobs.push(get);
+        let mut stub = Stub {
+            answer: |ask| match ask {
+                JobAsk::Command(_, Command::Name(_)) => {
+                    Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                        version: "v".into(),
+                    })))
+                }
+                JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Current(Some((1, empty_version())))),
+                )),
+                _ => panic!("an ask neither job makes"),
+            },
+            answers: Vec::new(),
+            asked: 0,
+            ended: Vec::new(),
+            abandoned: 0,
+        };
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 8, "the jobs never ended");
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(stub.asked, 2, "the put's commit and the get's read");
+        assert!(stub.answers.is_empty() && stub.abandoned == 0);
+        stub.ended.sort();
+        assert_eq!(
+            stub.ended,
+            vec![(Some(now), 5, None, 0), (Some(now), 7, Some(1), 0)]
+        );
+        let put_answers = answered(&mut put_answers);
+        assert!(
+            matches!(put_answers.as_slice(), [door::Answer::Ready, door::Answer::Head(reply), door::Answer::End]
+                if reply.status == Status::Done && reply.version == "v" && reply.size == 0),
+            "{put_answers:?}"
+        );
+        let get_answers = answered(&mut get_answers);
+        assert!(
+            matches!(get_answers.as_slice(), [door::Answer::Head(reply), door::Answer::End]
+                if reply.status == Status::Done && reply.size == 0),
+            "{get_answers:?}"
+        );
+    }
+
+    /// The node lends its host out for each turn (`Node::lend`) and takes it back: the host taken
+    /// leaves its default in its place, which asks the allocator for nothing, and the host given
+    /// back keeps its jobs, its doors and its gateway's settings.
+    #[test]
+    fn a_hosts_lend_asks_the_allocator_for_nothing() {
+        let gateway = std::sync::Arc::new(scheming_gateway());
+        let mut held = Host::new(2, Some(std::sync::Arc::clone(&gateway)));
+        let (native, replies) = held.doors.take().unwrap();
+        held.doors.keep(native, replies);
+        let (job, _, _) = local_job(Work::Draining(Box::new(Reply::status(Status::Done))), 0, 0);
+        held.jobs.push(job);
+        hyper_measure::alloc::begin();
+        let mut lent = std::mem::take(&mut held);
+        assert!(held.idle() && held.gateway.is_none());
+        lent.moved = 1;
+        held = lent;
+        let counts = hyper_measure::alloc::end();
+        assert_eq!((counts.allocations, counts.reallocations), (0, 0));
+        assert_eq!(
+            (held.jobs.len(), held.doors.kept.len(), held.moved),
+            (1, 1, 1)
+        );
+        assert!(
+            held.gateway
+                .is_some_and(|g| std::sync::Arc::ptr_eq(&g, &gateway))
+        );
     }
 }

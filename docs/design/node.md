@@ -2187,6 +2187,58 @@ of `Node` for its turn (`std::mem::take`, allocating nothing) and hands it back;
 for a get's next piece steps one job of the host; and a job's fields (`Work::Fields`, `read_fields`)
 are read by the node's task, served as one of those asks until 6f reads them before the job is made.
 
+*As built (2026-11-18), step 6's fourth part, its second half: the steps* (6d,
+`crates/node/src/node/host.rs`). The job steps (`Host::step`, `turn_job` and every job's step:
+its asks, its answers, its reply given to its door and its end) are `impl Host`'s, each generic
+over one interface, `host::Serve`, which the node implements and a test's stub implements too: a
+job's ask and its outcome (`ask`, `outcome`, as 6b made them), the asks a job let go (`abandon`),
+the volume table (`table`), the ranges' groups and their count (`group_of`, `ranges`), the room
+and bound for commands (`command_room`, `command_asks`), the wall clock (`wall_ns`), whether room
+at a volume or in the transport was freed (`freed`), the node's own count of bytes moved
+(`moved`), a native job's fields read from its exchange (`read_fields`, the node's task's until 6f
+reads them before the job is made), the S3 door's pacing samples (`took`), the put window's
+samples (`committed`, `filled`), and each job's end with its admission's charge, its shard and the
+asks it let go (`job_ended`), by which the admission learns its latency, the stream pool is sized
+again and the rule's count is given back. The node's task lends the host out for its step
+(`Node::lend`): `std::mem::take` leaves the default host in its place, which holds nothing and
+allocates nothing, and the host is put back whatever the step came to, an error among them; the
+node drops the outcomes of asks whose jobs ended and steps the S3 door's key lookups first, as
+before. `write_replies`' ask for a get's next piece steps that one job through the same lend. The
+gateway's settings are one `Arc` made with the node and shared with its host, not made per turn.
+The node keeps admission, parking, the put window, the rule's count, the key lookups, the asks'
+outcomes and `abandoned`, which repair shares, each exchange's fields read, body fed and reply
+written, and `host_due`, `hosts` and `job_lost`, which read the host between its turns.
+
+The doors kept (6d's first half) are at most one an operation the host runs at once
+(`GatewaySettings::objects`), within the exchanges the transport holds (`parked_most`), and the
+memory floor's records of a native operation (`host::record_bytes`, `derive::native`) count one
+door kept beside the operation's own: its place in the host's keep, its job's half boxed and what
+its halves share. A put's body channel (`host::Pieces`, `Feeding`) is still made for each put:
+pooling it changes `take_body` and `Feeding::send`, which upload-stall's body reading rewrites
+(`43357e2d`, a body read into the piece its admission charged), not merged here; it is pooled once
+that merge lands.
+
+Tested (`node::host`): the host and node unit tests pass unchanged; a host driven only through
+`Serve`, by a stub that answers each ask at the host's next turn, steps a put and a get to their
+ends: the put of an empty object takes its body's end from its door, asks its Name range to commit
+it and is answered `Done` with the version written, the get reads its current version, an empty
+one, makes its driver over it and is answered `Done`, and each job's end is told with its charge,
+its shard and no ask let go; and the lend asks the allocator for nothing (0 allocations, 0
+reallocations), the host given back with its jobs, its doors and its gateway. The stub drives the
+S3 door's jobs, whose steps are a native job's: a native door's exchange (`ExchangeId`) is made
+only inside hyper-transport.
+
+What 6e needs first: the host's wait split from the node's (`Node::host_due` reads the host's
+answered asks, its puts' renewals and its held jobs' bounds beside the node's lookups, feedings and
+replies), so a shard's task waits on its host's alone; and a `Serve` of the driving shard's over
+its lanes, each ask sent with its slot (`hyper_rt::sync::oneshot`) and its outcome taken from it,
+the host holding each kind to the node's bound for it, the latest volume table handed in held for
+`table`, the ranges' groups handed with the task's start (a range's layer and group do not change
+in a process), `read_fields` refused (a request is handed with its fields read, 6f), `took` none
+(the S3 door's jobs stay on the first shard), and `freed`, `committed`, `filled` and `job_ended`
+each a lane message, as is a chunk's piece moving a job's work (`Host::chunk_moved`), which the
+node's task sees on its transport.
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

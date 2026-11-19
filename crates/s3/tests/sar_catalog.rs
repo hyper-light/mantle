@@ -11,20 +11,20 @@
 
 use std::path::Path;
 
-use mantle_s3::json::{self, Value};
+use mantle_s3::json::{self, Value, View};
 use mantle_s3::policy::{KeyType, Kind, catalog};
 
-fn text(value: &Value) -> &str {
+fn text(value: View<'_>) -> &str {
     match value {
-        Value::String(text) => text,
+        View::String(text) => text,
         other => panic!("not a string: {other:?}"),
     }
 }
 
-fn list(value: Option<&Value>) -> &[Value] {
+fn list(value: Option<View<'_>>) -> Vec<View<'_>> {
     match value {
-        Some(Value::Array(items)) => items,
-        None => &[],
+        Some(View::Array(items)) => items.iter().collect(),
+        None => Vec::new(),
         other => panic!("not a list: {other:?}"),
     }
 }
@@ -44,7 +44,7 @@ fn the_catalog_is_the_references() {
     for action in list(document.member("Actions")) {
         let mut keys: Vec<String> = list(action.member("ActionConditionKeys"))
             .iter()
-            .map(|key| text(key).to_owned())
+            .map(|key| text(*key).to_owned())
             .filter(|key| key.starts_with("s3:"))
             .collect();
         keys.sort();
@@ -89,7 +89,7 @@ fn the_catalog_is_the_references() {
         .iter()
         .filter_map(|key| {
             let name = text(key.member("Name").unwrap());
-            let kind = match text(&list(key.member("Types"))[0]) {
+            let kind = match text(list(key.member("Types"))[0]) {
                 "ARN" => KeyType::Arn,
                 "ArrayOfString" => KeyType::ArrayOfString,
                 "Bool" => KeyType::Bool,

@@ -17,7 +17,7 @@ mod evaluate;
 
 pub use evaluate::{Request, Requester, Verdict, authorize, permits, principal_keys, user_arn};
 
-use crate::json::{self, Value};
+use crate::json::{self, View};
 
 /// "Bucket policies are limited to 20 KB in size", measured on the document normalized: S3
 /// answered "Normalized policy document exceeds the maximum allowed size of 20480 bytes"
@@ -475,7 +475,7 @@ pub fn parse(body: &[u8], bucket: &str) -> Result<Policy, PolicyError> {
     if document.compact().len() > MAX_SIZE {
         return Err(PolicyError::TooLarge);
     }
-    checked(&document, Grammar::Bucket(bucket))
+    checked(document.view(), Grammar::Bucket(bucket))
 }
 
 /// A principal's identity policy (research/91 §3), read and checked as IAM checks a user's inline
@@ -498,36 +498,36 @@ pub fn identity(document: &[u8]) -> Result<(Policy, String), PolicyError> {
     if compact.chars().count() > IDENTITY_CHARS {
         return Err(PolicyError::IdentityTooLarge);
     }
-    Ok((checked(&parsed, Grammar::Identity)?, compact))
+    Ok((checked(parsed.view(), Grammar::Identity)?, compact))
 }
 
 /// A parsed document's members and statements, checked as `grammar` says.
-fn checked(document: &Value, grammar: Grammar<'_>) -> Result<Policy, PolicyError> {
-    let Value::Object(members) = document else {
+fn checked(document: View<'_>, grammar: Grammar<'_>) -> Result<Policy, PolicyError> {
+    let View::Object(members) = document else {
         return Err(PolicyError::NotJson);
     };
     let (mut variables, mut statement) = (false, None);
-    for (name, value) in members {
-        match name.as_str() {
+    for (name, value) in members.iter() {
+        match name {
             "Version" => {
                 variables = match value {
-                    Value::String(version) if version == "2012-10-17" => true,
-                    Value::String(version) if version == "2008-10-17" => false,
+                    View::String("2012-10-17") => true,
+                    View::String("2008-10-17") => false,
                     _ => return Err(PolicyError::Version),
                 };
             }
-            "Id" if matches!(value, Value::String(_)) => {}
+            "Id" if matches!(value, View::String(_)) => {}
             "Statement" => statement = Some(value),
             _ => return Err(PolicyError::Syntax),
         }
     }
     let statements = match statement.ok_or(PolicyError::MissingStatement)? {
-        Value::Array(items) if items.is_empty() => return Err(PolicyError::EmptyStatement),
-        Value::Array(items) => items
+        View::Array(items) if items.is_empty() => return Err(PolicyError::EmptyStatement),
+        View::Array(items) => items
             .iter()
             .map(|item| self::statement(item, grammar))
             .collect::<Result<Vec<_>, _>>()?,
-        single @ Value::Object(_) => vec![self::statement(single, grammar)?],
+        single @ View::Object(_) => vec![self::statement(single, grammar)?],
         _ => return Err(PolicyError::Syntax),
     };
     Ok(Policy {
@@ -542,7 +542,7 @@ fn checked(document: &Value, grammar: Grammar<'_>) -> Result<Policy, PolicyError
 /// when it was set. A kept policy that does not read is the record's corruption.
 pub fn kept(compact: &str) -> Result<Policy, PolicyError> {
     let parsed = json::parse(compact.as_bytes()).map_err(|_| PolicyError::InvalidJson)?;
-    checked(&parsed, Grammar::Identity)
+    checked(parsed.view(), Grammar::Identity)
 }
 
 impl Policy {
@@ -612,15 +612,15 @@ fn fixes(condition: &Condition) -> bool {
 /// Principal, Effect, Action and Resource required (17 §3.1); an identity policy's names no
 /// principal, "You cannot use the `Principal` element in an identity-based policy" (research/91
 /// §3).
-fn statement(value: &Value, grammar: Grammar<'_>) -> Result<Statement, PolicyError> {
-    let Value::Object(members) = value else {
+fn statement(value: View<'_>, grammar: Grammar<'_>) -> Result<Statement, PolicyError> {
+    let View::Object(members) = value else {
         return Err(PolicyError::Syntax);
     };
     let (mut effect, mut principal, mut action, mut resource, mut condition) =
         (None, None, None, None, None);
-    for (name, value) in members {
-        let (field, not) = match name.as_str() {
-            "Sid" if matches!(value, Value::String(_)) => continue,
+    for (name, value) in members.iter() {
+        let (field, not) = match name {
+            "Sid" if matches!(value, View::String(_)) => continue,
             "Effect" => (&mut effect, false),
             "Principal" => (&mut principal, false),
             "NotPrincipal" => (&mut principal, true),
@@ -636,9 +636,9 @@ fn statement(value: &Value, grammar: Grammar<'_>) -> Result<Statement, PolicyErr
         }
     }
     let allow = match effect.ok_or(PolicyError::MissingEffect)?.0 {
-        Value::String(effect) if effect == "Allow" => true,
-        Value::String(effect) if effect == "Deny" => false,
-        Value::String(effect) => return Err(PolicyError::Effect(effect.clone())),
+        View::String("Allow") => true,
+        View::String("Deny") => false,
+        View::String(effect) => return Err(PolicyError::Effect(effect.to_owned())),
         _ => return Err(PolicyError::Syntax),
     };
     let principals = match (grammar, principal) {
@@ -718,13 +718,13 @@ fn statement(value: &Value, grammar: Grammar<'_>) -> Result<Statement, PolicyErr
 
 /// An element's value: a string, or an array of them, "If the element takes an array ... but
 /// only one value is included, the brackets are optional" (17 §3.1).
-fn strings(value: &Value) -> Result<Vec<String>, PolicyError> {
+fn strings(value: View<'_>) -> Result<Vec<String>, PolicyError> {
     match value {
-        Value::String(text) => Ok(vec![text.clone()]),
-        Value::Array(items) => items
+        View::String(text) => Ok(vec![text.to_owned()]),
+        View::Array(items) => items
             .iter()
             .map(|item| match item {
-                Value::String(text) => Ok(text.clone()),
+                View::String(text) => Ok(text.to_owned()),
                 _ => Err(PolicyError::Syntax),
             })
             .collect(),
@@ -734,22 +734,22 @@ fn strings(value: &Value) -> Result<Vec<String>, PolicyError> {
 
 /// A `Principal`: `"*"`, or a map of `AWS`, `CanonicalUser` and `Service` to one value or a
 /// list (17 §3.1, §6).
-fn principals(value: &Value) -> Result<Principals, PolicyError> {
+fn principals(value: View<'_>) -> Result<Principals, PolicyError> {
     let mut principals = Principals::default();
     let members = match value {
-        Value::String(everyone) if everyone == "*" => {
+        View::String("*") => {
             principals.everyone = true;
             return Ok(principals);
         }
-        Value::Object(members) if !members.is_empty() => members,
+        View::Object(members) if !members.is_empty() => members,
         _ => return Err(PolicyError::Principal),
     };
-    for (name, value) in members {
+    for (name, value) in members.iter() {
         let listed = strings(value).map_err(|_| PolicyError::Principal)?;
         if listed.is_empty() || listed.iter().any(String::is_empty) {
             return Err(PolicyError::Principal);
         }
-        match name.as_str() {
+        match name {
             "AWS" if listed == ["*"] => principals.everyone = true,
             "AWS" => {
                 for named in &listed {
@@ -850,18 +850,18 @@ fn reaches(pattern: &str, kind: Kind) -> bool {
 
 /// A statement's `Condition`: operators, each a map of keys to values (17 §3.3). `named` is
 /// every action the statement can apply to.
-fn conditions(value: &Value, named: &[&Action]) -> Result<Vec<Condition>, PolicyError> {
-    let Value::Object(operators) = value else {
+fn conditions(value: View<'_>, named: &[&Action]) -> Result<Vec<Condition>, PolicyError> {
+    let View::Object(operators) = value else {
         return Err(PolicyError::Syntax);
     };
     let mut conditions = Vec::new();
-    for (written, keys) in operators {
+    for (written, keys) in operators.iter() {
         let (operator, set, if_exists) = Operator::from_type(written)
-            .ok_or_else(|| PolicyError::ConditionType(written.clone()))?;
-        let Value::Object(keys) = keys else {
+            .ok_or_else(|| PolicyError::ConditionType(written.to_owned()))?;
+        let View::Object(keys) = keys else {
             return Err(PolicyError::Syntax);
         };
-        for (key, values) in keys {
+        for (key, values) in keys.iter() {
             let key = key.to_ascii_lowercase();
             check_key(&key, named)?;
             let values = condition_values(values)?;
@@ -920,17 +920,17 @@ fn same_key(known: &str, key: &str) -> bool {
 
 /// A condition's values: strings, or numbers and booleans, for which "Quotation marks are
 /// optional" (17 §3.1), one or a list of them.
-fn condition_values(value: &Value) -> Result<Vec<String>, PolicyError> {
-    let one = |value: &Value| match value {
-        Value::String(text) => Ok(text.clone()),
-        Value::Number(written) => Ok(written.clone()),
-        Value::Bool(true) => Ok("true".to_owned()),
-        Value::Bool(false) => Ok("false".to_owned()),
+fn condition_values(value: View<'_>) -> Result<Vec<String>, PolicyError> {
+    let one = |value: View<'_>| match value {
+        View::String(text) => Ok(text.to_owned()),
+        View::Number(written) => Ok(written.to_owned()),
+        View::Bool(true) => Ok("true".to_owned()),
+        View::Bool(false) => Ok("false".to_owned()),
         _ => Err(PolicyError::Syntax),
     };
     match value {
-        Value::Array(items) if items.is_empty() => Err(PolicyError::Syntax),
-        Value::Array(items) => items.iter().map(one).collect(),
+        View::Array(items) if items.is_empty() => Err(PolicyError::Syntax),
+        View::Array(items) => items.iter().map(one).collect(),
         single => Ok(vec![one(single)?]),
     }
 }

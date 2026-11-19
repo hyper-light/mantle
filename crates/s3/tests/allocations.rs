@@ -1,7 +1,8 @@
 //! What the S3 door's own work allocates per request, counted exactly: a signature checked with
 //! its canonical request hashed as it is formed and its string to sign in one buffer at its
 //! length; an aws-chunked body decoded in place, each chunk's signature checked with no buffer of
-//! its own; a listing's document one buffer at its length, nothing a key.
+//! its own; a listing's document one buffer at its length, nothing a key; a JSON value's compact
+//! form one string at its length.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -303,4 +304,48 @@ fn a_requests_metadata_copies_only_the_fields_a_version_keeps() {
     // The list, and each kept field's name and value.
     assert_eq!(few_made, (1 + 2 * 2, 0));
     assert_eq!(many_made, few_made);
+}
+
+/// A JSON value's compact form is counted, then written into one string at that length: a bucket
+/// policy whose strings hold what RFC 8259 §7 escapes, a line feed among them, whose `\u000a`
+/// is longer than its `\n` in the text; a document as deep as `json::MAX_DEPTH`; a string of
+/// control characters alone; and a value inside a document.
+#[test]
+fn a_json_values_compact_form_is_one_string_at_its_length() {
+    use mantle_s3::json::{self, MAX_DEPTH};
+    let policy = br#" { "Version" : "2012-10-17" , "Statement" : [ { "Effect" : "Allow" ,
+        "Principal" : "*" , "Action" : [ "s3:GetObject" , "s3:PutObject" ] ,
+        "Resource" : "arn:aws:s3:::bucket/\"quoted\"\\line\nend\u0001" ,
+        "Condition" : { "NumericLessThan" : { "s3:max-keys" : [ 10 , 1.5e3 , true , null ] } } } ] } "#;
+    let (mut deepest, mut closes) = (String::new(), String::new());
+    for level in 0..MAX_DEPTH {
+        let (open, close) = if level % 2 == 0 {
+            ("[", "]")
+        } else {
+            ("{\"a\":", "}")
+        };
+        deepest += open;
+        closes.insert_str(0, close);
+    }
+    let deepest = deepest + "\"\\u001f\"" + &closes;
+    let texts: [&[u8]; 4] = [policy, deepest.as_bytes(), br#""\n\t\u0000\"\\""#, b"{}"];
+    for text in texts {
+        let value = json::parse(text).unwrap();
+        let (compact, made) = counted(|| value.compact());
+        assert_eq!(
+            (made, compact.capacity()),
+            ((1, 0), compact.len()),
+            "{compact}"
+        );
+        assert_eq!(json::parse(compact.as_bytes()), Ok(value));
+    }
+    let value = json::parse(policy).unwrap();
+    let statement = value.member("Statement").unwrap();
+    let (compact, made) = counted(|| statement.compact());
+    assert_eq!(
+        (made, compact.capacity()),
+        ((1, 0), compact.len()),
+        "{compact}"
+    );
+    assert!(compact.starts_with("[{\"Effect\":\"Allow\","), "{compact}");
 }

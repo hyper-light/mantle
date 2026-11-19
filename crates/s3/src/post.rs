@@ -14,7 +14,7 @@ use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 
 use crate::crypto::{self, CryptoError};
 use crate::form::Form;
-use crate::json::{self, Value};
+use crate::json::{self, Items, Value, View};
 use crate::route::MAX_KEY;
 use crate::sigv4::{self, AuthError};
 use crate::time;
@@ -448,7 +448,7 @@ enum Test<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source<'a> {
     Simple { name: &'a str, value: &'a str },
-    List(&'a [Value]),
+    List(Items<'a>),
 }
 
 /// A bound of `content-length-range`: a number, or a string holding one (19 §8.1).
@@ -474,12 +474,12 @@ impl<'a> Policy<'a> {
     /// answered a member of another name "Unexpected", naming it in lowercase, before asking
     /// for either (19 §13).
     fn read(document: &'a Value) -> Result<Self, PostError> {
-        let Value::Object(members) = document else {
+        let View::Object(members) = document.view() else {
             return Err(PostError::Policy("Invalid JSON.".to_owned()));
         };
         if let Some((name, _)) = members
             .iter()
-            .find(|(name, _)| name != "expiration" && name != "conditions")
+            .find(|(name, _)| *name != "expiration" && *name != "conditions")
         {
             return Err(PostError::Policy(format!(
                 "Unexpected: '{}'",
@@ -488,7 +488,7 @@ impl<'a> Policy<'a> {
         }
         let expiration = match document.member("expiration") {
             None => return Err(PostError::Policy("Policy missing expiration.".to_owned())),
-            Some(Value::String(text)) => expiration(text).ok_or_else(|| {
+            Some(View::String(text)) => expiration(text).ok_or_else(|| {
                 PostError::Policy(format!("Invalid 'expiration' value: '{text}'"))
             })?,
             Some(other) => {
@@ -500,7 +500,7 @@ impl<'a> Policy<'a> {
         };
         let conditions = match document.member("conditions") {
             None => return Err(PostError::Policy("Policy missing conditions.".to_owned())),
-            Some(Value::Array(items)) => items
+            Some(View::Array(items)) => items
                 .iter()
                 .map(Condition::read)
                 .collect::<Result<_, _>>()?,
@@ -543,19 +543,20 @@ impl<'a> Condition<'a> {
     /// is recorded (19 §8.2, §13), and versitygw's wording of S3's where none is: JSON's `null`,
     /// and a value of another type where a string or a whole size belongs, S3 answered as
     /// "Invalid JSON.", as it did `{"success_action_redirect": null}` and a bound of `512.0`.
-    fn read(value: &'a Value) -> Result<Self, PostError> {
+    fn read(value: View<'a>) -> Result<Self, PostError> {
         let policy = |message: &str| PostError::Policy(message.to_owned());
         let invalid_json = || policy("Invalid JSON.");
         match value {
-            Value::Object(members) => {
-                let [(name, value)] = members.as_slice() else {
+            View::Object(members) => {
+                let mut each = members.iter();
+                let (Some((name, value)), None) = (each.next(), each.next()) else {
                     return Err(policy(
                         "Invalid Simple-Condition: Simple-Conditions must have exactly one property specified.",
                     ));
                 };
                 let value = match value {
-                    Value::String(value) => value,
-                    Value::Null => return Err(invalid_json()),
+                    View::String(value) => value,
+                    View::Null => return Err(invalid_json()),
                     _ => {
                         return Err(policy("Invalid Simple-Condition: value must be a string."));
                     }
@@ -568,14 +569,17 @@ impl<'a> Condition<'a> {
                     source: Source::Simple { name, value },
                 })
             }
-            Value::Array(items) => {
-                let Some(Value::String(operator)) = items.first() else {
+            View::Array(items) => {
+                let mut each = items.iter();
+                let Some(View::String(operator)) = each.next() else {
                     return Err(policy("Invalid Condition: missing operation identifier."));
                 };
                 let arity =
                     || PostError::Policy(format!("Invalid {operator}: wrong number of arguments."));
+                // The two operands after the operator, and whether a third follows them.
+                let operands = (each.next(), each.next(), each.next());
                 let test = if operator.eq_ignore_ascii_case("content-length-range") {
-                    let [_, min, max] = items.as_slice() else {
+                    let (Some(min), Some(max), None) = operands else {
                         return Err(arity());
                     };
                     Test::Range {
@@ -585,10 +589,10 @@ impl<'a> Condition<'a> {
                 } else if operator.eq_ignore_ascii_case("eq")
                     || operator.eq_ignore_ascii_case("starts-with")
                 {
-                    let [_, name, operand] = items.as_slice() else {
+                    let (Some(name), Some(operand), None) = operands else {
                         return Err(arity());
                     };
-                    let (Value::String(name), Value::String(operand)) = (name, operand) else {
+                    let (View::String(name), View::String(operand)) = (name, operand) else {
                         return Err(invalid_json());
                     };
                     // A name without `$` names no field, and the condition fails (19 §8.1).
@@ -669,11 +673,11 @@ impl Source<'_> {
     fn written(self) -> String {
         let items: Vec<String> = match self {
             Self::Simple { name, value } => vec![
-                Value::String("eq".to_owned()).compact(),
-                Value::String(format!("${name}")).compact(),
-                Value::String(value.to_owned()).compact(),
+                Value::string("eq".to_owned()).compact(),
+                Value::string(format!("${name}")).compact(),
+                Value::string(value.to_owned()).compact(),
             ],
-            Self::List(items) => items.iter().map(Value::compact).collect(),
+            Self::List(items) => items.iter().map(View::compact).collect(),
         };
         format!("[{}]", items.join(", "))
     }
@@ -684,10 +688,10 @@ impl Bound {
     /// anything else that is not one, a size below zero among them, which s3-tests expects
     /// refused (19 §7 item 30). A string is read as S3 was recorded reading `"5"`, and one
     /// holding no size fails the condition, as `"test"` did (19 §8.1).
-    fn read(value: &Value) -> Result<Self, PostError> {
+    fn read(value: View<'_>) -> Result<Self, PostError> {
         let invalid = || PostError::Policy("Invalid JSON.".to_owned());
         match value {
-            Value::Number(written) => {
+            View::Number(written) => {
                 let digits = written.strip_prefix('-').unwrap_or(written);
                 let size = digits
                     .bytes()
@@ -700,7 +704,7 @@ impl Bound {
                 }
                 Ok(Self::Size(size))
             }
-            Value::String(text) => Ok(
+            View::String(text) => Ok(
                 if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
                     text.parse().map_or(Self::Unreadable, Self::Size)
                 } else {

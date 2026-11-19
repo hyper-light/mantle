@@ -153,13 +153,15 @@ pub(crate) enum JobAsk {
         remaining_ns: u64,
     },
     /// `len` bytes from `offset` of `key`'s chunk on `volume`, which `at` holds, within the job's
-    /// `remaining_ns`.
+    /// `remaining_ns`; asked of `at` even while the detectors suspect it where `past_suspicion`
+    /// (`get::Request::Chunk`).
     Get {
         at: PeerId,
         volume: u128,
         key: mantle_chunk::ChunkKey,
         span: (u64, u64),
         remaining_ns: u64,
+        past_suspicion: bool,
     },
 }
 
@@ -3559,8 +3561,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 key,
                 span,
                 remaining_ns,
+                past_suspicion: false,
             } => self
                 .get_chunk(at, volume, key, span, remaining_ns)
+                .map(Pending::Chunk),
+            JobAsk::Get {
+                at,
+                volume,
+                key,
+                span,
+                remaining_ns,
+                past_suspicion: true,
+            } => self
+                .get_chunk_past_suspicion(at, volume, key, span, remaining_ns)
                 .map(Pending::Chunk),
         }
     }
@@ -6629,6 +6642,7 @@ impl Host {
                 key,
                 offset,
                 len,
+                past_suspicion,
             } => {
                 let Ok(holder) = node.table().map(|t| t.node_of(*volume)) else {
                     self.fail_job(node, at, Status::Failed)?;
@@ -6649,6 +6663,7 @@ impl Host {
                     key: *key,
                     span: (*offset, *len),
                     remaining_ns: remaining,
+                    past_suspicion: *past_suspicion,
                 })
             }
         };
@@ -8872,6 +8887,8 @@ pub(super) enum Taken {
 pub(super) fn taken(outcome: &ChunkOutcome) -> Taken {
     match outcome {
         ChunkOutcome::Stored => Taken::Stored,
+        // A get its peer's suspicion kept from it: this place gives nothing now, another may.
+        ChunkOutcome::Suspected => Taken::Refused,
         // A get's bytes answering a put: the node crossed its asks, which no volume mends.
         ChunkOutcome::Read(_) => Taken::Failed,
         ChunkOutcome::Refused(status) => match status {
@@ -8971,6 +8988,9 @@ fn get_answer(outcome: Outcome) -> get::Answer {
         // A put's word from a volume answering a read (`Node::chunk_replied`): that place answers
         // no read, and another may.
         Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Stored)) => get::Answer::Unreadable,
+        // Its peer suspected: another place is read first, and this one past the suspicion only
+        // where the block cannot be read without it.
+        Outcome::Chunk(ChunkOutcome::Suspected) => get::Answer::Suspected,
         // Every other outcome by its class ([`taken`]), as a put's is.
         Outcome::Chunk(chunk) => match taken(&chunk) {
             // No room for the read now, at the volume's reads or in the transport toward it, or
@@ -11869,6 +11889,7 @@ pub(super) mod tests {
             ChunkOutcome::Lost(Refusal::Corrupt),
             ChunkOutcome::Lost(Refusal::Quic),
             ChunkOutcome::Lost(Refusal::Unknown),
+            ChunkOutcome::Suspected,
         ];
         for outcome in elsewhere {
             let (mut get, id, request) = get_of_copies();
@@ -11902,6 +11923,53 @@ pub(super) mod tests {
             get_answer(Outcome::Chunk(ChunkOutcome::Read(vec![7]))),
             get::Answer::Chunk(Bytes::from(vec![7]))
         );
+    }
+
+    /// A copy whose node the detectors suspect is read after every other place, and, every other
+    /// unreadable, asked again past the suspicion, once, its bytes then the get's: a detector's
+    /// mistake, which a loaded host makes, never fails the read of a block a node still up holds.
+    /// Answered lost at once, a block whose only copy a suspected founder held ended
+    /// `Unreadable`, `503 SlowDown`, read through the node that had just joined its cell.
+    #[test]
+    fn a_suspected_copy_is_read_past_the_suspicion_once_no_other_reads() {
+        let (mut get, id, first) = get_of_copies();
+        get.answer(id, get_answer(Outcome::Chunk(ChunkOutcome::Suspected)))
+            .unwrap();
+        let mut asked = vec![first];
+        let mut past = Vec::new();
+        while let Some((id, request)) = get.poll() {
+            let get::Request::Chunk {
+                volume,
+                past_suspicion,
+                ..
+            } = request
+            else {
+                panic!("{request:?}");
+            };
+            asked.push(request.clone());
+            if past_suspicion {
+                past.push(volume);
+                // The place answers past the suspicion: its bytes end the read.
+                break;
+            }
+            get.answer(
+                id,
+                get_answer(Outcome::Chunk(ChunkOutcome::Refused(
+                    chunk::Status::NotFound,
+                ))),
+            )
+            .unwrap();
+        }
+        let volumes: Vec<u128> = asked
+            .iter()
+            .filter_map(|r| match r {
+                get::Request::Chunk { volume, .. } => Some(*volume),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(volumes, vec![1, 2, 3, 1], "{asked:?}");
+        assert_eq!(past, vec![1]);
+        assert_eq!(get.outcome(), None);
     }
 
     /// A get whose chunk read waits for room is held, due at its beat on either door so the node

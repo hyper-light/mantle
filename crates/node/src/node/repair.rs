@@ -1103,9 +1103,10 @@ fn chunk_answer(outcome: ChunkOutcome, get: bool) -> Answer {
             ChunkOutcome::Read(bytes) => Answer::Chunk(Bytes::from(bytes)),
             // No bytes from this place, for any cause, room's among them: the repairer reads
             // another source, as a get reads another place, and takes no copy for lost.
-            ChunkOutcome::Stored | ChunkOutcome::Refused(_) | ChunkOutcome::Lost(_) => {
-                Answer::Unreadable
-            }
+            ChunkOutcome::Stored
+            | ChunkOutcome::Refused(_)
+            | ChunkOutcome::Lost(_)
+            | ChunkOutcome::Suspected => Answer::Unreadable,
         };
     }
     match taken(&outcome) {

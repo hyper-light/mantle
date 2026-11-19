@@ -4447,6 +4447,25 @@ This ordering is checked on the model engine in simulation today. It is proven f
 production engine by real-process kill and corruption tests on real file systems, including a
 full disk during compaction and during a snapshot (audit §5.3; §9.2).
 
+*What flushes while a node serves only reads (2026-11-19).* A node's `counts` answer says each
+cause's flushes since it opened (`process::flush_counts`), and `mantle bench doors` says each
+one's growth over every phase: the log's frames, flushes, confirmations written on their own and
+slots filled ahead (hyper-log's `LogStats`); the liveness stream's writes; the ranges' writes by
+what they carried, entries, a hard state alone, the commit alone, a new start; the engines'
+checkpoints and their stores' flushes; and the puts the chunk volumes took (`node::FlushCauses`).
+As built, a range that only serves reads writes nothing: a read is confirmed by a round of
+heartbeats, the range writes its commit alone after no quiet period (`mantle_range`'s `QUIET`),
+and its engine checkpoints only when a compaction asks, which the node asks only when the log
+refuses a write for room (above). A checkpoint flushes the store twice, its map and then the
+superblock naming it, and nothing else does: a compaction's output is written unflushed and made
+durable by the checkpoint that first names it, and a checkpoint with nothing applied since
+flushes nothing (`a_group_serving_only_reads_writes_nothing_to_its_logs`,
+`its_store_flushes_only_at_a_checkpoint_and_twice_there`). What remains of a read-only node's log
+flushes is the liveness stream's proof: an empty update each heartbeat interval in which nothing
+else became durable (hyper-liveness's flush-proof mode, `Liveness::set_disk_apart` off), a lone
+frame that costs its flush and its confirmation's (raft-log.md §6). Fewer would take the owner's
+decision on that mode or on confirming a frame that holds only empty updates (durability.md §7.5).
+
 ### 6.3 Snapshots over QUIC
 
 A snapshot is the engine's checkpoint at an applied index: its files, hard-linked, listed with

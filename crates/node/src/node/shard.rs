@@ -548,6 +548,8 @@ pub(crate) struct Seen {
     pub(crate) stalled: bool,
     pub(crate) in_flight: usize,
     pub(crate) writes: hyper_durable::Writes,
+    /// The engine's checkpoints and its device's flushes since it opened (`Engine::checkpoints`).
+    pub(crate) checkpoints: (u64, u64),
     pub(crate) fenced: bool,
     /// Whether the member is marked: its log may lack entries it acknowledged (`Replica::mark`).
     pub(crate) uncertain: bool,
@@ -574,6 +576,7 @@ impl Seen {
             stalled: replica.is_stalled(),
             in_flight: replica.in_flight(),
             writes: replica.writes(),
+            checkpoints: replica.machine().engine().checkpoints(),
             fenced: replica.fenced().is_some(),
             uncertain: replica.mark().is_some(),
             reads_held: raft.reads_held(),

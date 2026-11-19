@@ -965,6 +965,113 @@ fn a_write_refused_for_room_waits_until_the_group_compacts() {
     assert_eq!(replica.applied(), applied + 2);
 }
 
+/// Each member's log as it stands: its frames, the flushes they and their confirmations made, and
+/// the confirmations written on their own (hyper-log's `LogStats`).
+fn flushed(nodes: &[Node]) -> Vec<(u64, u64, u64)> {
+    nodes
+        .iter()
+        .map(|n| {
+            let stats = n.log.stats(None).unwrap();
+            (stats.frames, stats.flushes, stats.confirmations)
+        })
+        .collect()
+}
+
+/// What a group's members write while it serves only reads, counted: under a burst, every entry
+/// costs each member a frame and its flush, and a confirmation where no frame followed at once
+/// (raft-log.md §6), a flush of its own on a device that cannot write it durable alone; once the burst is applied, reads confirmed by their rounds of heartbeats
+/// make no write on any member, so no frame and no flush, as long as they go on; a compaction
+/// then costs the frame of its new start and its confirmation, and its engine's checkpoint the
+/// engine's own (`Stored`'s count, `its_store_flushes_only_at_a_checkpoint_and_twice_there`);
+/// and after it, reads flush nothing again. The range writes its commit alone after no quiet
+/// period (`QUIET`), so nothing is owed once the burst stops.
+#[test]
+fn a_group_serving_only_reads_writes_nothing_to_its_logs() {
+    const BURST: u64 = 24;
+    const READS: u64 = 48;
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, id)).collect();
+    let mut answers = Vec::new();
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    assert!(nodes[0].replica.is_leader());
+    let elected = flushed(&nodes);
+    for serial in 0..BURST {
+        nodes[0].replica.propose(&registration(serial)).unwrap();
+        settle(&mut nodes, &mut answers);
+    }
+    let burst = flushed(&nodes);
+    for (id, (before, after)) in elected.iter().zip(&burst).enumerate() {
+        let frames = after.0 - before.0;
+        let flushes = after.1 - before.1;
+        let confirmations = after.2 - before.2;
+        println!(
+            "member {}: a burst of {BURST} entries took {frames} frames, {flushes} flushes, \
+             {confirmations} of them confirmations: {:.2} flushes an entry",
+            id + 1,
+            flushes as f64 / BURST as f64
+        );
+        // Settled one by one, each entry is a frame of its own on every member, confirmed alone:
+        // the simulated device writes a confirmation durable on its own, where a device that
+        // cannot flushes it (`LogStats::durable_writes`).
+        assert_eq!((frames, confirmations), (BURST, BURST), "member {}", id + 1);
+        assert!(flushes >= frames, "member {}", id + 1);
+    }
+    let mut confirmed = 0;
+    let mut read = |nodes: &mut Vec<Node>, from: u64| {
+        for i in from..from + READS {
+            nodes[0]
+                .replica
+                .read_index(i.to_le_bytes().to_vec())
+                .unwrap();
+            let mut wire: VecDeque<Message> = VecDeque::new();
+            for _ in 0..1_000 {
+                for n in nodes.iter_mut() {
+                    let (out, _) = drive(&mut n.replica, true);
+                    if n.replica.id() == 1 {
+                        confirmed += out.reads.len();
+                    }
+                    wire.extend(out.messages);
+                }
+                let Some(m) = wire.pop_front() else {
+                    break;
+                };
+                let to = usize::try_from(m.to).unwrap() - 1;
+                let _ = nodes[to].replica.step(m);
+            }
+        }
+    };
+    read(&mut nodes, 0);
+    assert_eq!(flushed(&nodes), burst, "reads alone wrote to a log");
+    // A compaction is the one write a quiet group makes, and only when asked.
+    let compacted = nodes
+        .iter_mut()
+        .map(|n| n.replica.compact(0, 0, Waker::noop()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(compacted, vec![true; 3]);
+    settle(&mut nodes, &mut answers);
+    let after = flushed(&nodes);
+    for (id, (before, after)) in burst.iter().zip(&after).enumerate() {
+        assert_eq!(
+            (after.0 - before.0, after.2 - before.2),
+            (1, 1),
+            "member {}: a compaction's start is one frame, confirmed alone",
+            id + 1
+        );
+        assert!(after.1 > before.1, "member {}: its frame flushed", id + 1);
+    }
+    read(&mut nodes, READS);
+    assert_eq!(
+        flushed(&nodes),
+        after,
+        "reads after a compaction wrote to a log"
+    );
+    assert_eq!(
+        confirmed,
+        usize::try_from(2 * READS).unwrap(),
+        "every read confirmed"
+    );
+}
+
 /// A member refuses settings its log cannot hold to: an entry of the range's largest must fit
 /// one frame, and a write of the range's largest must fit the group's bounds.
 #[test]

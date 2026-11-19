@@ -3085,6 +3085,36 @@ fn lane_columns(before: &[Counted], after: &[Counted]) -> String {
     )
 }
 
+/// A phase line's columns of what made the servers' devices flush, each every server's growth over
+/// the phase summed ([`grown`]), counts rather than shares of the operations, since a phase of reads
+/// flushes for causes no operation asked: the logs' frames and flushes, their confirmations written
+/// on their own and slots filled ahead; then what the nodes submitted (`mantle_node::node::
+/// FlushCauses`): the liveness streams' writes, the ranges' writes by what they carried, the
+/// engines' checkpoints and their stores' flushes, and the puts the chunk volumes took. A dash
+/// where a server answered none (an endpoint's).
+fn flush_columns(before: &[Counted], after: &[Counted]) -> String {
+    let grew = |f: fn(&Counted) -> Option<u64>| {
+        grown(before, after, f).map_or_else(|| "-".to_owned(), |n| format!("{n:.0}"))
+    };
+    format!(
+        " log_frames {} log_flushes {} log_confirmations {} log_fills {} liveness_writes {} \
+         entry_writes {} hard_state_writes {} commit_writes {} start_writes {} checkpoints {} \
+         engine_syncs {} chunk_puts {}",
+        grew(|c| c.frames),
+        grew(|c| c.flushes),
+        grew(|c| c.confirmations),
+        grew(|c| c.fills),
+        grew(|c| c.liveness_writes),
+        grew(|c| c.entry_writes),
+        grew(|c| c.hard_state_writes),
+        grew(|c| c.commit_writes),
+        grew(|c| c.start_writes),
+        grew(|c| c.checkpoints),
+        grew(|c| c.engine_syncs),
+        grew(|c| c.chunk_puts),
+    )
+}
+
 /// What a server's table of what held its shard counted over a phase for one spawn site and label
 /// (`Counted::slow`): the growth of its entry from the server's answer at the phase's start to its
 /// answer at the end, and the phase's longest poll where it passed every one before the phase (the
@@ -3827,7 +3857,7 @@ impl<'o> Bench<'o> {
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
              client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {}{} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
-             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}{}{}",
+             latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}{}{}{}",
             self.named(m.door),
             m.kind.name(),
             m.size,
@@ -3890,6 +3920,7 @@ impl<'o> Bench<'o> {
             t.failed,
             write_path(&before.counts, &after.counts, ops),
             lane_columns(&before.counts, &after.counts),
+            flush_columns(&before.counts, &after.counts),
             slow_columns(slow.as_deref(), ops),
             stall_column(stalled.as_deref()),
         ).map_err(doing("writing output"))?;
@@ -5981,6 +6012,42 @@ mod tests {
             write_path(&pids, &pids, 40),
             " commands/entry - updates/frame - log_frames/op - log_flushes/op - log_wait_p50_us - \
              log_wait_p99_us - log_wait_max_us -"
+        );
+    }
+
+    /// A phase's flush columns are each server's growth over it, summed, counts and not shares of
+    /// its operations; a dash where a server answered none.
+    #[test]
+    fn a_phases_flush_causes_are_each_servers_growth_summed() {
+        let at = |frames, liveness, checkpoints| Counted {
+            frames: Some(frames),
+            flushes: Some(frames * 2),
+            confirmations: Some(frames),
+            fills: Some(0),
+            liveness_writes: Some(liveness),
+            entry_writes: Some(0),
+            hard_state_writes: Some(1),
+            commit_writes: Some(0),
+            start_writes: Some(checkpoints),
+            checkpoints: Some(checkpoints),
+            engine_syncs: Some(checkpoints * 2),
+            chunk_puts: Some(5),
+            ..Counted::default()
+        };
+        let before = [at(1, 1, 0), at(10, 8, 2), at(0, 0, 0)];
+        let after = [at(4, 4, 1), at(30, 28, 2), at(5, 5, 0)];
+        assert_eq!(
+            flush_columns(&before, &after),
+            " log_frames 28 log_flushes 56 log_confirmations 28 log_fills 0 liveness_writes 28 \
+             entry_writes 0 hard_state_writes 0 commit_writes 0 start_writes 1 checkpoints 1 \
+             engine_syncs 2 chunk_puts 0"
+        );
+        let pids: [Counted; 3] = std::array::from_fn(|_| Counted::default());
+        assert_eq!(
+            flush_columns(&pids, &pids),
+            " log_frames - log_flushes - log_confirmations - log_fills - liveness_writes - \
+             entry_writes - hard_state_writes - commit_writes - start_writes - checkpoints - \
+             engine_syncs - chunk_puts -"
         );
     }
 

@@ -111,6 +111,20 @@ pub struct Counted {
     pub far_refused_proposals: Option<u64>,
     pub far_refused_reads: Option<u64>,
     pub stream_held: Option<u64>,
+    /// What made the node's devices flush (`mantle_node::process::flush_counts`): the log's
+    /// confirmations written on their own and its slots filled ahead, the liveness stream's
+    /// writes, the ranges' writes by what they carried, the engines' checkpoints and their stores'
+    /// flushes, and the puts its chunk volumes took.
+    pub confirmations: Option<u64>,
+    pub fills: Option<u64>,
+    pub liveness_writes: Option<u64>,
+    pub entry_writes: Option<u64>,
+    pub hard_state_writes: Option<u64>,
+    pub commit_writes: Option<u64>,
+    pub start_writes: Option<u64>,
+    pub checkpoints: Option<u64>,
+    pub engine_syncs: Option<u64>,
+    pub chunk_puts: Option<u64>,
     pub slow: Option<Vec<Slow>>,
     pub stalls: Option<Vec<Option<u64>>>,
 }
@@ -224,6 +238,16 @@ impl Counted {
                 "far_refused_proposals" => counted.far_refused_proposals = unsigned(),
                 "far_refused_reads" => counted.far_refused_reads = unsigned(),
                 "stream_held" => counted.stream_held = unsigned(),
+                "confirmations" => counted.confirmations = unsigned(),
+                "fills" => counted.fills = unsigned(),
+                "liveness_writes" => counted.liveness_writes = unsigned(),
+                "entry_writes" => counted.entry_writes = unsigned(),
+                "hard_state_writes" => counted.hard_state_writes = unsigned(),
+                "commit_writes" => counted.commit_writes = unsigned(),
+                "start_writes" => counted.start_writes = unsigned(),
+                "checkpoints" => counted.checkpoints = unsigned(),
+                "engine_syncs" => counted.engine_syncs = unsigned(),
+                "chunk_puts" => counted.chunk_puts = unsigned(),
                 _ => {}
             }
         }
@@ -855,6 +879,51 @@ mod tests {
             panic!("a counts answer not read");
         };
         assert_eq!((c.lane_full_step, c.stream_held), (None, None));
+    }
+
+    /// What made a node's devices flush, as the node says it in its `counts` answer
+    /// (`mantle_node::process::flush_counts`), is read back cause by cause.
+    #[test]
+    fn a_counts_answers_flush_causes_are_read_back() {
+        let mut line = "counts uncounted frames 1".to_owned();
+        let causes = mantle_node::node::FlushCauses {
+            liveness: 3,
+            entries: 4,
+            hard_states: 5,
+            commits: 6,
+            starts: 7,
+            checkpoints: 8,
+            engine_syncs: 16,
+            chunk_puts: 9,
+        };
+        mantle_node::process::flush_counts(&mut line, (1, 2), &causes).unwrap();
+        let Some(Said::Counts(c)) = said(&line) else {
+            panic!("a counts answer not read: {line}");
+        };
+        assert_eq!(
+            (
+                c.confirmations,
+                c.fills,
+                c.liveness_writes,
+                c.entry_writes,
+                c.hard_state_writes
+            ),
+            (Some(1), Some(2), Some(3), Some(4), Some(5))
+        );
+        assert_eq!(
+            (
+                c.commit_writes,
+                c.start_writes,
+                c.checkpoints,
+                c.engine_syncs,
+                c.chunk_puts
+            ),
+            (Some(6), Some(7), Some(8), Some(16), Some(9))
+        );
+        let Some(Said::Counts(c)) = said("counts uncounted frames 1") else {
+            panic!("a counts answer not read");
+        };
+        assert_eq!((c.confirmations, c.chunk_puts), (None, None));
     }
 
     /// The stalls on each of a node's shards, as the node says them in its `counts` answer

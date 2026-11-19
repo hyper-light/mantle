@@ -1199,6 +1199,12 @@ impl<F: BlockFile> Store<F> {
         self.io.read_wait_ns
     }
 
+    /// The store's flushes since it was opened ([`IoStats::syncs`]), without the rest of
+    /// [`Self::io_stats`].
+    pub fn syncs(&self) -> u64 {
+        self.io.syncs
+    }
+
     /// The store's I/O since it was opened.
     pub fn io_stats(&self) -> IoStats {
         let (cache_hits, cache_misses) = self.cache.as_ref().map_or((0, 0), cache::Cache::stats);

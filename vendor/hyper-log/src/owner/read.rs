@@ -85,6 +85,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         out.updates = self.schedule.updates;
         out.bytes = tally.bytes;
         out.flushes = tally.flushes;
+        out.confirmations = tally.confirmations;
         out.durable_writes = tally.durable_writes;
         out.durable_fallbacks = tally.durable_fallbacks;
         out.flushed_confirmations = tally.flushed_confirmations;

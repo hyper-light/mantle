@@ -1536,43 +1536,68 @@ pub fn operation_descriptors(listening: bool) -> Option<u64> {
     }
 }
 
-/// The cell's nodes and the gateways a node pins, from its `peers` lines, its `seeds` and its
-/// cell's bound on nodes where it states one: the nodes its lines name and itself, or the bound
-/// where more; the transport's peers are the nodes but itself and the gateways. `None` past a
-/// `usize`.
+/// The other nodes a node's lines name, each once however many lines name it and `own` apart: the
+/// nodes its `peer` lines pin and its seeds. A rejoined founder keeps the `peer` lines naming its
+/// fellow founders and seeds the members its cell's answer names (`rejoin::seed`), the same nodes:
+/// counted a line each, its cell was 8 nodes and 12 identities where its founders derive 5 and 9,
+/// its ranges ran 25 appends out and 12 sessions where its cell's run 19 and 9, its transport was
+/// stated for seven nodes where it keeps four, and its floor on CI's 7 GiB macOS runner was
+/// 9,631,763,940 bytes, refused at its log (gates run 44547229268). Every count of a cell's nodes
+/// takes this one, the derivation's ([`cell_lines`]) and the node's as it opens
+/// (`NodeSettings::stated`), so they agree.
+pub fn nodes_named(own: u64, ids: impl IntoIterator<Item = u64>) -> usize {
+    let mut ids: Vec<u64> = ids.into_iter().filter(|id| *id != own).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len()
+}
+
+/// The cell's nodes and the gateways node `own` pins, from its `peers` lines, its `seeds` and its
+/// cell's bound on nodes where it states one: itself and the nodes its lines name, each once
+/// ([`nodes_named`]), or the bound where more; the transport's peers are the nodes but itself and
+/// the gateways, and the cell's identities, which every member derives its ranges' settings and
+/// rules from ([`cell`]), are the nodes and the gateways. `None` past a `usize`.
 pub fn cell_lines(
+    own: u64,
     peers: &[PeerLine],
-    seeds: usize,
+    seeds: &[crate::process::SeedLine],
     enlist: Option<&Enlisting>,
 ) -> Option<(usize, usize)> {
-    let node_lines = peers
-        .iter()
-        .filter(|p| p.role == Role::Node)
-        .count()
-        .checked_add(seeds)?
-        .checked_add(1)?;
+    let named = nodes_named(
+        own,
+        peers
+            .iter()
+            .filter(|p| p.role == Role::Node)
+            .map(|p| p.id)
+            .chain(seeds.iter().map(|s| s.id)),
+    );
     let cell_nodes = enlist
         .and_then(|e| usize::try_from(e.max_nodes).ok())
         .unwrap_or(0)
-        .max(node_lines);
+        .max(named.checked_add(1)?);
     let gateway_lines = peers.iter().filter(|p| p.role != Role::Node).count();
     Some((cell_nodes, gateway_lines))
 }
 
-/// Whether a node of `shards` shards, `volumes` volumes, `ranges` ranges and the peers its `peers`
-/// lines, `seeds` and `enlist` make ([`cell_lines`]), serving S3 or not (`listening`), holds its
+/// Whether node `own` of `shards` shards, `volumes` volumes, `ranges` ranges and the peers its
+/// `peers` lines, `seeds` and `enlist` make ([`cell_lines`]), serving S3 or not (`listening`), holds its
 /// `operations` within `limit` descriptors: the descriptors it holds at its most, or the refusal
 /// naming them. `mantle node` runs the numbers it is told, so its start checks them here, as
 /// `mantle serve` derives none past them ([`derive`]).
 pub fn within_descriptors(
     limit: u64,
     (shards, volumes, ranges): (usize, usize, usize),
-    (peers, seeds, enlist): (&[PeerLine], usize, Option<&Enlisting>),
+    (own, peers, seeds, enlist): (
+        u64,
+        &[PeerLine],
+        &[crate::process::SeedLine],
+        Option<&Enlisting>,
+    ),
     listening: bool,
     operations: usize,
 ) -> Result<u64, DeriveError> {
     let overflow = DeriveError::Overflow("the node's descriptors");
-    let (cell_nodes, gateway_lines) = cell_lines(peers, seeds, enlist).ok_or(overflow)?;
+    let (cell_nodes, gateway_lines) = cell_lines(own, peers, seeds, enlist).ok_or(overflow)?;
     let transport_peers = cell_nodes
         .saturating_sub(1)
         .checked_add(gateway_lines)
@@ -2402,11 +2427,15 @@ fn derive_with(
          stores and any volume on its device",
     );
 
-    // The cell's identities: its nodes, as many as it states it holds where it states it, else this
-    // one and the nodes its lines name, and the gateways it pins (docs/design/membership.md §9).
-    let (cell_nodes, gateway_lines) =
-        cell_lines(&stated.peers, stated.seeds.len(), stated.enlist.as_ref())
-            .ok_or(overflow("the cell's nodes"))?;
+    // The cell's identities: its nodes, itself and those its lines name, each once, or as many as
+    // it states it holds where more, and the gateways it pins (docs/design/membership.md §9).
+    let (cell_nodes, gateway_lines) = cell_lines(
+        stated.id,
+        &stated.peers,
+        &stated.seeds,
+        stated.enlist.as_ref(),
+    )
+    .ok_or(overflow("the cell's nodes"))?;
     let identities = cell_nodes
         .checked_add(gateway_lines)
         .and_then(|n| u64::try_from(n).ok())
@@ -6593,7 +6622,7 @@ mod tests {
             within_descriptors(
                 1_024,
                 (measured.cores, s3.volumes.len(), s3.ranges.len()),
-                (&s3.peers, s3.seeds.len(), s3.enlist.as_ref()),
+                (s3.id, &s3.peers, &s3.seeds, s3.enlist.as_ref()),
                 true,
                 operations,
             )
@@ -7174,5 +7203,163 @@ mod tests {
             derive(stated(0), &small, &mut fresh),
             Err(DeriveError::Unsized)
         ));
+    }
+
+    /// A founder of the repair suite's cell written off and rejoined (crates/mantle/tests/repair.rs
+    /// `a_node_stated_gone_is_written_off_and_refused_and_a_joiner_takes_new_blocks`): its
+    /// configuration keeps the `peer` lines naming its four fellow founders, and its switch to its
+    /// new id adds a `seed` line for each of the three members serving when the cell granted it
+    /// (`rejoin::seed`), the same nodes. On CI's macOS arm64 runner, three cores, 7 GiB and 64
+    /// control entries a shard, its two volumes measured 16 deep, its cell counted a line each was
+    /// 8 nodes and 12 identities where its founders derive 5 and 9: its ranges ran 25 appends out
+    /// and 12 sessions where its cell's run 19 and 9, its transport was stated for seven nodes
+    /// where it keeps four, and its floor was 9,631,763,940 bytes, refused at its log, CI's exactly
+    /// (gates run 44547229268): its ranges 5,383,077,955 bytes, its log 2,827,482,214 and its
+    /// transport 974,293,070, where a founder's are 4,102,904,425, 2,177,077,666 and 562,407,499.
+    /// Each node counted once ([`nodes_named`]), by derive and by the node as it opens its
+    /// transport (`NodeSettings::stated`), it derives its founders' settings, rules and transport,
+    /// and its floor is theirs, 7,289,300,291 bytes at one operation, 226,892,477 within the
+    /// machine: it starts.
+    #[test]
+    fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
+        let founder = || {
+            let mut s = Stated {
+                quic: "127.0.0.1:0".parse().unwrap(),
+                plane: "127.0.0.1:0".parse().unwrap(),
+                s3: s3(),
+                voters: vec![1, 2, 3, 4, 5],
+                enlist: Some(Enlisting {
+                    root: 0x10,
+                    domain: "rack-0".into(),
+                    max_nodes: 5,
+                    max_volumes: 40,
+                }),
+                ..stated(2)
+            };
+            for (_, bytes) in &mut s.volumes {
+                *bytes = VolumeBytes::Stated(256 << 20);
+            }
+            s.peers = (2..=5)
+                .map(|id| peer(id, Role::Node, "/node/identity/peers/p.der", None))
+                .chain((6..=9).map(|id| peer(id, Role::Gateway, "/node/identity/c.der", None)))
+                .collect();
+            s
+        };
+        // Written off as node 1 and granted 11, its seeds the three members that kept running.
+        let rejoined = || Stated {
+            id: 11,
+            seeds: (2..=4)
+                .map(|id| crate::process::SeedLine { id, at: None })
+                .collect(),
+            ..founder()
+        };
+        // Its lines name its four fellow founders, three of them twice: five nodes, as its
+        // founders count theirs, and four gateways.
+        let (f, r) = (founder(), rejoined());
+        let counted = |s: &Stated| cell_lines(s.id, &s.peers, &s.seeds, s.enlist.as_ref());
+        assert_eq!(counted(&r), Some((5, 4)));
+        assert_eq!(counted(&r), counted(&f));
+        // Where it starts, it derives its founders' settings and rules, and states and holds their
+        // transport and log.
+        let (f, r) = (
+            derive(f, &facts(2), &mut fresh).unwrap(),
+            derive(r, &facts(2), &mut fresh).unwrap(),
+        );
+        assert_eq!(r.config.settings, f.config.settings);
+        assert_eq!(r.config.settings.max_inflight_msgs, 19);
+        assert_eq!(r.config.rules, f.config.rules);
+        for key in ["transport_bytes", "transport.floor", "memory.floor.log"] {
+            assert_eq!(said_bytes(&r, key), said_bytes(&f, key), "{key}");
+        }
+        let runner = || {
+            let mut measured = facts(2);
+            measured.cores = 3;
+            measured.ring = 64;
+            measured.memory = machine(7 << 30, None);
+            for v in &mut measured.volumes {
+                v.device.name = measured.meta.name.clone();
+                v.device.queue = Some(256);
+                v.profile.depth = 16;
+            }
+            measured
+        };
+        // The floor at one operation: a ceiling of a byte leaves the operations nothing past it.
+        let one = |stated: Stated| match derive(
+            Stated {
+                ceiling: Some(1),
+                ..stated
+            },
+            &runner(),
+            &mut fresh,
+        ) {
+            Err(DeriveError::Memory { floor, .. }) => floor,
+            other => panic!("{:?}", other.err()),
+        };
+        let (founded, again) = (one(founder()), one(rejoined()));
+        eprintln!("7 GiB, 16 deep: a founder's floor {founded}, the rejoined node's {again}");
+        assert_eq!(again, founded);
+        // Linux's, by derive's model and not measured here: the issuer's 16 workers' stacks fewer
+        // (33,554,432 bytes), the kernel holding its transfers, and about 133 KB more for each
+        // train past the first a receive takes, its eight peers' and its operation's client's
+        // ([`runs`]).
+        assert!(
+            runs(7_255_000_000..7_260_000_000, 7_289_300_291..7_289_300_292).contains(&founded),
+            "{founded}"
+        );
+        // It starts on the runner, every class of its floor its founders'.
+        let (f, r) = (
+            derive(founder(), &runner(), &mut fresh).unwrap(),
+            derive(rejoined(), &runner(), &mut fresh)
+                .unwrap_or_else(|e| panic!("the rejoined node on 7 GiB: {e}")),
+        );
+        for class in [
+            "objects",
+            "volumes",
+            "engines",
+            "ranges",
+            "log",
+            "transport",
+            "runtime",
+            "threads",
+        ] {
+            let key = format!("memory.floor.{class}");
+            assert_eq!(said_bytes(&r, &key), said_bytes(&f, &key), "{key}");
+        }
+        assert_eq!(said_bytes(&r, "memory.need"), said_bytes(&f, "memory.need"));
+    }
+
+    /// A node a `peer` line and a `seed` line both name is one node of its cell and one peer its
+    /// transport is stated for, by derive and by the node as it opens, which count with
+    /// [`nodes_named`] alike (`NodeSettings::stated`); a seed no peer line names is one more, and
+    /// a line naming the node itself none. A configuration whose peer lines and seeds name the
+    /// same nodes states the same transport, and derives the same settings, as its peer lines
+    /// alone.
+    #[test]
+    fn a_node_its_peer_lines_and_seeds_both_name_is_one_peer_of_its_transport() {
+        assert_eq!(nodes_named(1, [2, 3, 4, 5, 2, 3, 4]), 4);
+        assert_eq!(nodes_named(1, [2, 3, 4, 5, 6]), 5);
+        assert_eq!(nodes_named(1, [1, 2]), 1);
+        assert_eq!(nodes_named(1, std::iter::empty()), 0);
+        let seeded = |ids: &[u64]| Stated {
+            seeds: ids
+                .iter()
+                .map(|&id| crate::process::SeedLine { id, at: None })
+                .collect(),
+            ..stated(1)
+        };
+        let counted = |s: &Stated| cell_lines(s.id, &s.peers, &s.seeds, s.enlist.as_ref());
+        // Its peer lines name nodes 2 and 3 in a cell of three, and pin a gateway.
+        assert_eq!(counted(&seeded(&[])), Some((3, 1)));
+        assert_eq!(counted(&seeded(&[2, 3])), Some((3, 1)));
+        assert_eq!(counted(&seeded(&[2, 3, 4])), Some((4, 1)));
+        let (alone, twice) = (
+            derive(seeded(&[]), &facts(1), &mut fresh).unwrap(),
+            derive(seeded(&[2, 3]), &facts(1), &mut fresh).unwrap(),
+        );
+        for key in ["transport_bytes", "transport.floor", "transport.want"] {
+            assert_eq!(said_bytes(&twice, key), said_bytes(&alone, key), "{key}");
+        }
+        assert_eq!(twice.config.settings, alone.config.settings);
+        assert_eq!(twice.config.rules, alone.config.rules);
     }
 }

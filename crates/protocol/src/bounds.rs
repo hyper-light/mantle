@@ -350,15 +350,16 @@ fn messages(
         .ok_or_else(unfit)
 }
 
-/// What QUIC buffers for peers, within the transport's bytes less the messages' (node.md §3.3): a
-/// connection's receive window, at most the ceiling returned, and the receive chunks datagrams are
-/// cut from, at most the count returned. Both are charged to the transport's budget, which the
-/// messages share, so they are sized to leave the messages' bytes free: reading what QUIC buffered
-/// is what frees it, and a read refused for the bytes the buffering holds never comes (CI run
-/// 39694528095: a client's receive chunks held its whole budget, and the piece a 1 MiB reply is
-/// read into was refused). Each peer holds at most two connections' windows, each with the class
-/// reserve its first window carries, and a full window of its unread data packed into whole
-/// chunks; each handshake admission lets wait holds a first window.
+/// What QUIC buffers for peers, within the transport's bytes less the messages' and the receive
+/// ring's growth (node.md §3.3): a connection's receive window, at most the ceiling returned, and
+/// the receive chunks datagrams are cut from, at most the count returned. Both are charged to the
+/// transport's budget, which the messages and the ring share, so they are sized to leave those
+/// bytes free: reading what QUIC buffered is what frees it, and a read refused for the bytes the
+/// buffering holds never comes (CI run 39694528095: a client's receive chunks held its whole
+/// budget, and the piece a 1 MiB reply is read into was refused). Each peer holds at most two
+/// connections' windows, each with the class reserve its first window carries, and a full window
+/// of its unread data packed into whole chunks; each handshake admission lets wait holds a first
+/// window.
 fn buffering(stated: &Stated, shape: &Shape) -> Result<(u64, usize), Unfit> {
     let unfit = || Unfit("the transport's bytes, less the messages', hold no window");
     let (held, shares) = held(stated, shape)?;
@@ -379,8 +380,9 @@ fn buffering(stated: &Stated, shape: &Shape) -> Result<(u64, usize), Unfit> {
 
 /// What the transport's bytes hold besides QUIC's windows, and the shares the rest is cut into
 /// ([`buffering`]): the messages' bytes, each connection's reserve and each waiting handshake's
-/// first window with its reserve; and a share each for a peer's two connections' windows and
-/// its pool of chunks.
+/// first window with its reserve, and the driver's receive ring at its most past the buffer it is
+/// made with ([`ring_growth`]); and a share each for a peer's two connections' windows and its
+/// pool of chunks.
 fn held(stated: &Stated, shape: &Shape) -> Result<(u64, u64), Unfit> {
     let unfit = || Unfit("the transport's bytes, less the messages', hold no window");
     let peers = u64::try_from(shape.peers).map_err(|_| unfit())?;
@@ -394,8 +396,12 @@ fn held(stated: &Stated, shape: &Shape) -> Result<(u64, u64), Unfit> {
             r.checked_add(peers.checked_mul(first)?)
         })
         .ok_or_else(unfit)?;
+    // The ring's growth, which its driver charges to the budget as the ring grows, held apart at
+    // its most: grown, it takes no room a window, a head or a piece was sized for. Uncounted, on
+    // Linux it took the heads' room, the likely cause of finished jobs' reply heads refused there.
     let held = messages(stated, shape.exchanges, shape.max_head, shape.lane_window)?
         .checked_add(fixed)
+        .and_then(|held| held.checked_add(ring_growth(stated).ok()?))
         .ok_or_else(unfit)?;
     // A share each for a peer's two connections' windows and its pool of chunks.
     let shares = connections.checked_add(peers).ok_or_else(unfit)?;
@@ -454,7 +460,8 @@ pub const CERTIFICATE_COMPRESSION_BYTES: u64 = 722_238;
 ///   (hyper-rt-transport's `least_bytes`), a lent socket for each connection where the platform
 ///   gives a connection one of its own, receiving into that ring (`Batched::lent_bytes`), and a
 ///   node's plane's at what hyper-rt states one holds (`Io::held_bound`). The ring grows past one
-///   buffer only within the transport's budget, which charges it.
+///   buffer only within the transport's budget, which charges it and is sized to hold it at its
+///   most ([`ring_growth`]).
 ///
 /// QUIC's datagrams are none: no node or client sends them, and no endpoint offers to take them
 /// (hyper-transport's `Limits::transport`; hyper-quic's default took up to 1,250,000 bytes of them a
@@ -508,6 +515,23 @@ pub fn io(stated: &Stated) -> Io {
             .saturating_add(stated.clients)
             .clamp(1, MAX_BATCH),
     }
+}
+
+/// The most the driver's receive ring grows past the buffer it is made with, bytes, as the
+/// platform's driver grows it, which it charges to the transport's budget (hyper-rt-transport's
+/// `Driver::size_ring`, through `Endpoint::reserve_own`) and the budget's sizing holds apart
+/// ([`held`]). On Linux a receive call takes up to a batch of messages (`recvmmsg(2)`), each a
+/// datagram train the kernel coalesced into one buffer of up to 64 KiB (`UDP_GRO`, udp(7);
+/// `RECEIVE_BYTES`), and the ring holds a buffer for each message its drains took, up to the
+/// batch ([`io`]): a train from each peer and client, within `UIO_MAXIOV`. Elsewhere a call takes
+/// one datagram, and the ring holds one buffer and never grows (hyper-rt's `Ring::bytes_for`).
+pub fn ring_growth(stated: &Stated) -> Result<u64, Unfit> {
+    let io = io(stated);
+    let most = hyper_rt::udp::Ring::bytes_for(io, io.batch);
+    let first = hyper_rt::udp::Ring::bytes_for(io, 1);
+    most.checked_sub(first)
+        .and_then(|grown| u64::try_from(grown).ok())
+        .ok_or(Unfit("the receive ring"))
 }
 
 #[cfg(test)]
@@ -733,7 +757,8 @@ mod tests {
                 limits.lane_window,
             )
             .unwrap();
-            let held = messages + buffered(&stated, &limits);
+            // The receive ring at its most is held apart beside them.
+            let held = messages + buffered(&stated, &limits) + ring_growth(&stated).unwrap();
             assert!(held <= stated.transport_bytes, "{stated:?}: {held}");
             // Nothing is left over but what whole windows and whole chunks cannot use.
             let peers = stated.peers.max(1) as u64;
@@ -846,5 +871,58 @@ mod tests {
             ..stated()
         };
         assert_eq!(io(&crowd).batch, MAX_BATCH);
+    }
+
+    /// The driver's receive ring at its most, as the platform's driver grows it (on Linux a
+    /// 64 KiB buffer for each message of a batch, a train from each peer and client within
+    /// `UIO_MAXIOV`; one buffer elsewhere), is held apart from every class's room: the messages,
+    /// the reserves, the windows at their ceiling and the receive chunks leave it whole, at the
+    /// floor and past it, and the floor counts it. Uncounted, on Linux a grown ring took the room
+    /// a finished job's reply head was sized for, and its client gave the upload up `Stalled`.
+    #[test]
+    fn the_budget_holds_the_receive_ring_at_its_most_beside_every_class() {
+        let reserve = class_reserve(<NodeClasses as Classes>::RANKS - 1);
+        for (peers, clients) in [(1, 0), (2, 0), (9, 0), (2, 64), (2, 1_000), (2, 5_000)] {
+            let at = |transport_bytes| Stated {
+                peers,
+                clients,
+                pool: clients,
+                transport_bytes,
+                ..stated()
+            };
+            let batch = io(&at(0)).batch;
+            let buffers = if cfg!(target_os = "linux") { batch } else { 1 };
+            let ring = ring_growth(&at(0)).unwrap();
+            assert_eq!(
+                ring,
+                (buffers as u64 - 1) * hyper_rt_transport::RECEIVE_BYTES as u64,
+                "{peers} peers, {clients} clients"
+            );
+            let least = least_transport(&at(0)).unwrap();
+            for transport_bytes in [least, 8 * least] {
+                let stated = at(transport_bytes);
+                let shape = shape(&stated).unwrap();
+                let limits = limits(&stated).unwrap();
+                let messages =
+                    messages(&stated, shape.exchanges, shape.max_head, shape.lane_window).unwrap();
+                let (connections, identities) = (shape.connections as u64, shape.peers as u64);
+                let fixed =
+                    connections * reserve + identities * (initial_window(MIN_DATAGRAM) + reserve);
+                let (held, shares) = held(&stated, &shape).unwrap();
+                assert_eq!(held, messages + fixed + ring, "the ring is held apart");
+                // Every class at its most: each connection's window at the ceiling, each peer's
+                // receive chunks, the messages, the reserves and the ring.
+                let windows = connections * limits.window_ceiling
+                    + limits.receive_chunks as u64 * RECEIVE_CHUNK as u64;
+                assert!(
+                    held + windows <= transport_bytes,
+                    "{peers} peers, {clients} clients: {} past {transport_bytes}",
+                    held + windows
+                );
+                if transport_bytes == least {
+                    assert_eq!(least, held + shares * initial_window(MIN_DATAGRAM));
+                }
+            }
+        }
     }
 }

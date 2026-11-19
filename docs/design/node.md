@@ -255,8 +255,9 @@ measures the second, and derives the rest by these rules:
   data's wants (§2.8), a window of one block, an append out to a follower for each entry a range
   can hold uncommitted (`derive::in_flight`, §2.8), an entry of the range's largest in each append and each
   apply, one chunk ask to each node a block's width needs, the transport funding each peer's
-  windows at QUIC's initial window beside the messages' room and each connection's reserve
-  (`bounds::least_transport`); a receive chunk past them spares a datagram its copy, which its
+  windows at QUIC's initial window beside the messages' room, each connection's reserve and the
+  receive ring at its most past its first buffer (`bounds::least_transport`, `bounds::ring_growth`,
+  §3.3); a receive chunk past them spares a datagram its copy, which its
   connection's window already charges, and waits for its knee. The node's allowance is the
   stated ceiling, else the limit the OS sets for the process (hyper-rt's `MemoryFacts::limit`:
   cgroup v2's `memory.max`, a job's limit, `RLIMIT_AS`), else physical memory, a ceiling past what
@@ -534,7 +535,7 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
-| `transport_bytes` | derived | the transport's floor: what it holds besides QUIC's windows, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`) |
+| `transport_bytes` | derived | the transport's floor: what it holds besides QUIC's windows, the receive ring's growth at its most among it (`bounds::ring_growth`), and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`) |
 | `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
 | `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor; the operations' bytes, what the memory holds past every class's floor and the indexes' and engines' wants (`gateway.objects_bytes`; research/87 §4 rule D), each operation charged what it holds at its own size (`derive::Charges`), and a ceiling of as many operations as those bytes hold at the least one holds (`gateway.objects`), within which the host admits as many as it learns its knee is (§2.8, `crate::admit`); the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals, and its file's write beside its blocks' (`put::most_commands`; gateway.md §2.2); one read each; and the node's enlistment (`derive::asks`). The memory an operation holds at its most: the larger of a put and a get of the schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
 | `memory.native` | derived | the most one native PUT or GET holds above the node's idle at `gateway.window`, the bound a body crossing the client, the host and the transport is held to (lean-doors step 5): the most an operation is charged (`derive::Charges::most`: its window of blocks at the largest block, `put::most_bytes` or `get::most_bytes`; a put's chunks copied to send for each block going down, one piece of its body, hyper-transport's `RECEIVE_CHUNK`, and its record of each block it wrote until its file names them, at the largest body a PUT or a part carries, `MAX_UPLOAD`, 5 GiB (`put::most_records`); a get's block taken), what one more operation adds beside its charge to the transport, the ranges, the listener and the runtime (the derivation's difference of the node at two operations and at one), and the host's records of it, its job and its boxed put or get (`node::record_bytes`) (`derive::native`). A put admitted at a window it learned holds that window's blocks instead (`Charges::write`), at most `gateway.objects_bytes`. A put's records (`mantle_gateway::put`'s `recorded` and `due`) grow with its body by design, a block's entry in each of two std B-trees: at most 212 bytes a block, each tree's node over the least entries every node but its root holds (`put::records_bytes`), and 1,056 for the roots; 138,008 at 5 GiB in blocks of one copy's 8,325,104 bytes, 646 of them. A put is charged its own body's (`put::records_for`, in `Charges::write`), so a node admits no more puts than it holds records for. Counted on macOS aarch64, about 146 bytes a block (`object_path.rs`'s `a_put_and_a_get_many_windows_long_hold_their_windows_bytes`, which holds each block more to the 212) |
@@ -1427,7 +1428,17 @@ becomes:
   length, which its head states before its fields are read: its first segment and first block,
   the largest of its own, each chunk of a block copied to send, and a piece of its body, under
   the scheme that holds the most of it (`put::bytes_for`); the driver reserves its segment at the
-  same length. Every other operation is charged the most any holds, since a get's object's size
+  same length. That piece is the one its body is read into: the host reads a native put's body,
+  and an admitted operation's fields and what it drains of a body, into memory of the
+  operation's own that its charge holds (`node::read_piece`), never a piece of the transport's
+  budget, which every connection's windows, receive chunks, heads and frames share (§3.3). A body
+  read a piece of that budget at a time waited, while other traffic held it, on no ask of its own:
+  the host held nothing of it, so vouched for nothing, and the budget freeing woke nothing; its
+  client, judging the exchange once a period, gave it up (the node suite's 20 MiB put
+  `Lost(Stalled)`, about one run in ten on ubuntu-24.04-arm, 2026-11-18; `tests/put_body.rs`).
+  Every operation's charge holds a piece, a write of no bytes the least one is, so each reads its
+  own; one answered at once is charged nothing and drains its body through the transport's piece
+  for its owner's reads. Every other operation is charged the most any holds, since a get's object's size
   is known only once its row is read. A request turned away for bytes says nothing of the limit;
   one turned away by the limit tells it its clients ask more. The data comes first (research/87
   §4, rule D): the memory past every class's floor is the indexes' and engines' wants first, each
@@ -2142,8 +2153,9 @@ window never deadlocks and bytes read never pile up ahead of a busy disk (audit 
 
 *As built (2026-10-21).* The transport's bytes are one budget that QUIC's buffering and the
 messages share: a connection's receive window and the receive chunks datagrams are cut from are
-both charged to it, as are every message's head, every lane frame, and the piece a body is read
-into. Reading what QUIC buffered is what frees it, so the buffering is sized within the budget
+both charged to it, as are every message's head, every lane frame, and the piece a peer's body
+is read into (an object operation's body is read into the piece its admission charged it for,
+§2.8). Reading what QUIC buffered is what frees it, so the buffering is sized within the budget
 less what the messages hold at once at most (`bounds::limits`): every exchange's head both ways,
 one body piece, and for a node that keeps appends out a lane's window of frames out to each node
 its ranges replicate to and one frame in from each peer; a peer's two connections' windows (each with the class reserve its first window carries)
@@ -2151,6 +2163,28 @@ and its full window of unread data packed into whole chunks share the rest, and 
 leaves no window is refused at start. Before, the windows and the chunks were each sized from the
 whole budget: on macos-aarch64 a gateway's three connections grew their windows to the budget's
 whole and the piece a 1 MiB reply is read into was refused (CI run 39694528095).
+
+The driver's receive ring is held apart in the same way (`bounds::ring_growth`, 2026-11-18). On
+Linux a receive call takes up to a batch of messages (`recvmmsg(2)`), each a datagram train the
+kernel coalesced into one buffer of up to 64 KiB (`UDP_GRO`, udp(7)), and the ring grows to a
+buffer for each message its drains took, up to the batch: one train from each peer and client the
+node serves, within `UIO_MAXIOV` (`bounds::io`); elsewhere a call takes one datagram and the ring
+is one buffer that never grows. The driver charges what the ring grows by to the budget
+(hyper-rt-transport's `Driver::size_ring`), and the budget's sizing did not count it, so on Linux
+a grown ring took room the heads and the owner's piece were sized for: the likely reason uploads
+given up `Lost(Stalled)`, a finished job's reply head refused, were Linux's alone (CI's
+ubuntu-24.04 runners, 2026-11-18). The budget's sizing now
+holds the ring's most, `(batch − 1) × 64 KiB` on Linux and none elsewhere, beside the messages,
+so the floor counts it.
+
+A reply's head the budget refuses waits for room (`node::reply_head`, 2026-11-18): the endpoint
+takes a reply's head from the budget, and a finished job whose head it refused had ended there,
+its exchange left open with nothing more to come, so its client gave it up a period later
+(`Lost(Stalled)`, `tests/put_body.rs`). The job is held instead, as one whose ask is out is:
+vouched for and offered its head again at each beat within its client's patience, the piece a
+refusal's body drains through waiting so too, and past that patience its exchange is refused
+`Budget`, which needs no room and its asker hears at once (`host`'s `wait_to_reply`, research/77
+D1, D2). A job never ends with its exchange open.
 
 Bulk work is lowest, but it has a floor. A cell must rebuild its largest failure domain within
 the time its durability target allows, so repair needs at least `D/T` of bandwidth for lost
@@ -2364,7 +2398,11 @@ less than a datagram moved, or after the peer had the whole request and a period
    2026-11-01, research/77 D2, as Quiver reviewed it). A chunk
    refused for want of room, a volume's `Busy` or the transport's `Budget`, is asked again of the
    same volume once a chunk is answered or a volume answers a put, not sent on and the block left
-   `Unplaced`. So a get paused between blocks while a peer reads its chunk is not cut, nor a run
+   `Unplaced`; and at each beat it waits, at most once a beat (`Node::step_host`), on either door:
+   a peer's volume whose queue other writes or its cleaner hold, as a filling volume's is, tells
+   the asker nothing when it frees room, and with no other chunk of the node out nothing asked it
+   again before the client's patience. The S3 door's put, due only at that patience, then sat
+   quiet with nothing to turn the node (the serve suite's fill, CI run 44454089741). So a get paused between blocks while a peer reads its chunk is not cut, nor a run
    whose copies take their peers longer to receive than its client's period (CI's busy runner,
    2026-10-31: sending a run's 8.3 MB copy took up to 7.5 s, and vouched for as its bytes went the
    cut runs went from 100 to 1 in 24 rounds, measurements/2026-10-29-a-node-cut-while-it-works.md),

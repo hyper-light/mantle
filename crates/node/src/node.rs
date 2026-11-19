@@ -803,6 +803,62 @@ struct Commanded {
 /// The piece a body is read in: the transport's own receive chunk.
 const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
+/// Reads the next bytes of `exchange`'s body, at most a piece, into `piece`, empty: how many. The
+/// piece is the operation's own, the one its admission charged it for (`derive::Charges`, node.md
+/// §2.8), its buffer kept from read to read: hyper-transport reads a body into any reservation its
+/// owner's accountant granted, mantle's admission among them (its `budget` module). A piece of the
+/// endpoint's budget, which every connection's windows, receive chunks, heads and frames share,
+/// could be refused while an operation's body waited on no ask of its own: it was then neither
+/// read nor vouched for, and the budget freeing woke nothing, so its client gave it up a period
+/// later (`Lost(Stalled)`, tests/put_body.rs).
+pub fn read_piece(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    piece: &mut Vec<u8>,
+) -> Result<usize, Refusal> {
+    let mut buffer = std::mem::take(piece);
+    buffer.reserve_exact(hyper_transport::RECEIVE_CHUNK);
+    let mut into = hyper_transport::Reservation::new(PIECE, buffer);
+    let got = endpoint.read_body(exchange, &mut into);
+    *piece = into.into_buffer();
+    got
+}
+
+/// What became of a reply's head offered to its exchange ([`reply_head`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replied {
+    /// It went; its body, if it has one, follows.
+    Sent,
+    /// The endpoint's budget has no room for it now: the exchange stays open, untouched, for its
+    /// owner to offer the head again, the job held meanwhile (`host`'s `Job::room_to_reply`).
+    WaitsForRoom,
+    /// The exchange is over: its asker gone, or the head refused for a cause no wait mends, which
+    /// the exchange is refused with, so its asker hears it at once.
+    Ended,
+}
+
+/// Offers `head` as the reply on `exchange`, with a body of `body` bytes to follow. The endpoint
+/// takes the head's room from its budget (hyper-transport's `Core::message`), which every
+/// connection's windows, receive chunks, heads and frames share, and refuses it `Budget` while
+/// that is held: a reply refused so is not lost, it waits for room ([`Replied::WaitsForRoom`]).
+/// Taken as the exchange's end, a job ended with its exchange open and its asker waiting on
+/// nothing, and its client gave it up a period later (`Lost(Stalled)`, tests/put_body.rs).
+pub fn reply_head(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    head: &[u8],
+    body: Option<u64>,
+) -> Replied {
+    match endpoint.reply(exchange, head, body) {
+        Ok(()) => Replied::Sent,
+        Err(Refusal::Budget) => Replied::WaitsForRoom,
+        Err(refusal) => {
+            endpoint.refuse_exchange(exchange, refusal);
+            Replied::Ended
+        }
+    }
+}
+
 /// The parts of a node a plane message or a Raft frame steps, borrowed apart from the plane and its
 /// socket, so a message is taken where its datagram was opened (`Node::drain_plane`).
 struct Taking<'a, E: Engine + 'static, L: NodeLog> {
@@ -998,6 +1054,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     stored: Vec<Done>,
     /// Whether a volume answered a put since the host last offered its puts room.
     room_freed: bool,
+    /// When, on the shard's clock, the host last offered its puts room, or last had none waiting
+    /// for it: a put whose chunk waits for room is offered it again a beat after (`step_host`).
+    room_offered_ns: u64,
     /// The chunk puts and gets this node asked of its peers and not yet answered; at most
     /// `chunk_asks` of them.
     chunks_out: Vec<ChunkOut>,
@@ -1486,6 +1545,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             storage: std::mem::take(&mut settings.storage),
             stored: Vec::new(),
             room_freed: false,
+            room_offered_ns: 0,
             chunks_out: Vec::new(),
             chunk_asks: settings.chunk_asks,
             next_chunk: 0,

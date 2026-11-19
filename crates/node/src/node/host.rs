@@ -141,6 +141,12 @@ pub(crate) struct Job {
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
     label: Option<&'static Label>,
+    /// Whether its reply waits for room in the endpoint's budget, which refused its head or the
+    /// piece the body before it drains through (`node::reply_head`): offered again at each turn,
+    /// the job held meanwhile, vouched for and due at each beat within its client's patience
+    /// (research/77 D1, D2), and past it its exchange refused `Budget`, which its asker hears at
+    /// once (`Node::wait_to_reply`). A job never ends without its reply.
+    room_to_reply: bool,
 }
 
 impl Job {
@@ -157,12 +163,16 @@ impl Job {
     /// Whether its work is held, by a peer or a device: an ask of its own out, or a chunk waiting
     /// for room at a volume or in the transport toward it.
     fn held(&self) -> bool {
-        !self.pending.is_empty()
-            || match &self.work {
-                Work::Put(putting) => putting.put.as_ref().is_some_and(Put::waits_for_room),
-                Work::Copy(copying) => copying.put.as_ref().is_some_and(Put::waits_for_room),
-                _ => false,
-            }
+        !self.pending.is_empty() || self.waits_for_room()
+    }
+
+    /// Whether a chunk of its put waits for room at a volume or in the transport toward it.
+    fn waits_for_room(&self) -> bool {
+        match &self.work {
+            Work::Put(putting) => putting.put.as_ref().is_some_and(Put::waits_for_room),
+            Work::Copy(copying) => copying.put.as_ref().is_some_and(Put::waits_for_room),
+            _ => false,
+        }
     }
 
     /// What to do while its work is held: vouch within its patience, answer a refusal past it,
@@ -181,15 +191,18 @@ impl Job {
 
     /// Its next bound or working beat, while its own work is held. A get whose reply began
     /// and whose patience passed is vouched for no more and needs no beat; a get still reading
-    /// its version must wake at the bound even through the local S3 door.
+    /// its version must wake at the bound even through the local S3 door. A put whose chunk waits
+    /// for room is due at the beat on either door: no answer of its own comes to turn the node
+    /// when a peer's volume frees room, so the node offers it room again then
+    /// (`Node::step_host`).
     fn due_ns(&self, now: u64, beat: u64) -> Option<u64> {
         if self.bounded(now) == Bounded::Unvouched {
             return None;
         }
         let bound = self.bound_ns();
         Some(match self.door {
-            Door::Exchange(_) => bound.min(now.saturating_add(beat)),
-            Door::Local(_) => bound,
+            Door::Local(_) if !self.waits_for_room() => bound,
+            Door::Exchange(_) | Door::Local(_) => bound.min(now.saturating_add(beat)),
         })
     }
 
@@ -512,7 +525,9 @@ struct Putting {
     trailer: Vec<u8>,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
-    /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
+    /// Body bytes read and not yet taken by the driver, in the piece of its body its admission
+    /// charged it for, which a native put's body is read into (`read_piece`); and the body's bytes
+    /// taken so far.
     carry: Vec<u8>,
     taken: u64,
     /// The driver's requests not yet asked: the node held as many asks as it keeps.
@@ -1278,6 +1293,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label: None,
+            room_to_reply: false,
         });
     }
 
@@ -1306,7 +1322,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Some(_) => {
                 admitted_ns = Some(now);
                 let block = self.open_block(&op);
-                let mut made = work(op, Vec::new(), block);
+                let mut made = work(op, block);
                 if let Work::Deletes(deleting) = &mut made {
                     deleting.deny(&denied);
                 }
@@ -1337,6 +1353,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             charge,
             window,
             label,
+            room_to_reply: false,
         });
     }
 
@@ -1609,8 +1626,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.reply_job(at, reply)
     }
 
-    /// A job's fields read from its body's start, a piece at a time; once whole, the work they
-    /// name, the bytes read past them the start of a put's body.
+    /// A job's fields read from its body's start; once whole, the work they name.
+    ///
+    /// They are read into the job's own memory, never a piece of the endpoint's budget, which
+    /// other traffic may hold past its client's patience (`read_piece`): into their buffer, made
+    /// at their length as the job was admitted, while none of them has come, and else into a piece
+    /// of what is left of them, at most the piece its admission charged it for. Nothing past them
+    /// is read: a put reads its body into its own piece.
     fn read_fields(&mut self, at: usize) -> Result<bool, NodeError> {
         let Some(job) = self.jobs.get_mut(at) else {
             return Ok(true);
@@ -1625,15 +1647,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let wanted = usize::try_from(head.fields()).unwrap_or(usize::MAX);
         let endpoint = self.driver.endpoint();
         while fields.len() < wanted {
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(false);
+            let first = fields.is_empty();
+            let room = if first {
+                wanted
+            } else {
+                wanted
+                    .saturating_sub(fields.len())
+                    .min(hyper_transport::RECEIVE_CHUNK)
             };
+            let buffer = if first {
+                std::mem::take(fields)
+            } else {
+                Vec::with_capacity(room)
+            };
+            let mut piece =
+                hyper_transport::Reservation::new(u64::try_from(room).unwrap_or(u64::MAX), buffer);
             let got = endpoint.read_body(exchange, &mut piece);
-            fields.extend_from_slice(piece.bytes());
+            let read = piece.into_buffer();
             self.moved = self
                 .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
+                .saturating_add(u64::try_from(read.len()).unwrap_or(u64::MAX));
+            if first {
+                *fields = read;
+            } else {
+                fields.extend_from_slice(&read);
+            }
             match got {
                 Ok(0) if fields.len() < wanted => return Ok(false),
                 Ok(_) => {}
@@ -1641,7 +1679,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Err(_) => return Ok(true),
             }
         }
-        let carry = fields.split_off(wanted.min(fields.len()));
         let op = head.op(fields);
         let admitted = job.charge;
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
@@ -1674,7 +1711,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         job.charge = job.charge.saturating_add(more);
                     }
                     job.label = Some(labels::host(&op));
-                    work(op, carry, block)
+                    work(op, block)
                 }
             };
         }
@@ -1776,8 +1813,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         for at in 0..self.jobs.len() {
             self.take_answers(at)?;
         }
-        if freed {
+        // A chunk refused for room at a peer's volume hears nothing when that volume frees room
+        // (its queue held by others' writes or by its cleaner, as a filling volume's is), and with
+        // no other chunk of this node answered nothing offered it room again before its client's
+        // patience: it is offered room again at each beat it waits, a probe timeout, as a held
+        // job is vouched for (research/77 D2), at most once a beat.
+        let now = hyper_rt::futures::now_ns();
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let waiting = self.jobs.iter().any(Job::waits_for_room);
+        let due = waiting && now >= self.room_offered_ns.saturating_add(beat);
+        if freed || due {
             self.offer_room()?;
+        }
+        if freed || due || !waiting {
+            self.room_offered_ns = now;
         }
         self.bound_jobs()?;
         // The step that held the turn longest, and its operation's label.
@@ -1841,13 +1890,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// it asked, its client gone or going; one within it tells its asker its work is held. A get
     /// replied before its body: its asks, chunk reads, are given up by its transport once their
     /// peers say nothing, and it ends unfinished as a get does. An operation waiting on its client,
-    /// for its body or room to write its reply, is the transport's to judge.
+    /// for its body or room to write its reply, is the transport's to judge. One whose reply's head
+    /// waits for room in the endpoint's budget is held by the node, and vouched for within its
+    /// client's patience; past it, its turn refuses its exchange (`wait_to_reply`).
     fn bound_jobs(&mut self) -> Result<(), NodeError> {
         let now = hyper_rt::futures::now_ns();
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get(at) else {
                 continue;
             };
+            if job.room_to_reply {
+                if job.bounded(now) == Bounded::Held
+                    && let Door::Exchange(exchange) = job.door
+                {
+                    self.driver.endpoint().working(exchange);
+                }
+                continue;
+            }
             if !job.working() || !job.held() {
                 continue;
             }
@@ -2736,15 +2795,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if putting.taken < putting.length && !put.wants_body() {
                 return Ok(());
             }
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(());
-            };
-            let got = endpoint.read_body(exchange, &mut piece);
-            putting.carry.extend_from_slice(piece.bytes());
+            // Into the put's own piece, emptied above: read whenever its driver wants bytes and
+            // its client has sent them, whatever other traffic holds of the endpoint's budget.
+            let got = super::read_piece(endpoint, exchange, &mut putting.carry);
             self.moved = self
                 .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
+                .saturating_add(u64::try_from(putting.carry.len()).unwrap_or(u64::MAX));
             match got {
                 Ok(0) if putting.carry.is_empty() => return Ok(()),
                 Ok(_) => {}
@@ -3050,6 +3106,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Get(getting),
             door,
+            room_to_reply,
             ..
         }) = self.jobs.get_mut(at)
         else {
@@ -3093,15 +3150,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let total = u64::try_from(fields.len())
             .unwrap_or(u64::MAX)
             .saturating_add(length);
-        getting.total = total;
-        getting.out = Some((Bytes::from(fields), 0));
-        match self.driver.endpoint().reply(exchange, &head, Some(total)) {
-            Ok(()) => Ok(None),
-            // Its asker is gone: the job ends with its exchange.
-            Err(_) => {
-                self.fail_job(at, Status::Failed)?;
-                Ok(Some(false))
+        match super::reply_head(self.driver.endpoint(), exchange, &head, Some(total)) {
+            super::Replied::Sent => {
+                getting.total = total;
+                getting.out = Some((Bytes::from(fields), 0));
+                *room_to_reply = false;
+                Ok(None)
             }
+            // Held as it was, its head offered again at the job's next turn.
+            super::Replied::WaitsForRoom => {
+                getting.held = Some(reply);
+                self.wait_to_reply(at, exchange).map(Some)
+            }
+            // Its asker is gone, or told why: the job ends with its exchange.
+            super::Replied::Ended => Ok(Some(true)),
         }
     }
 
@@ -4663,22 +4725,40 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return self.answer_local(at);
             }
         };
+        // Whether it still waits for room is this turn's to say.
+        job.room_to_reply = false;
         let Work::Draining(reply) = &job.work else {
             return Ok(false);
         };
         let endpoint = self.driver.endpoint();
-        loop {
-            let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
-                return Ok(false);
+        // A body read whole, as a put's that ended is, needs no piece: its reply goes now. One
+        // admitted drains into a piece of its own, which its admission charged it for
+        // (`read_piece`); one answered at once holds no charge, and reads through the endpoint's
+        // one piece for its owner's reads (`bounds::messages`), which waits for room as its
+        // reply's head does.
+        let mut own = job.admitted_ns.map(|_| Vec::new());
+        while !endpoint.body_complete(exchange) {
+            let got = match own.as_mut() {
+                Some(piece) => {
+                    piece.clear();
+                    super::read_piece(endpoint, exchange, piece)
+                }
+                None => {
+                    let Ok(mut piece) = endpoint.reserve(Class::Transfer, PIECE) else {
+                        return self.wait_to_reply(at, exchange);
+                    };
+                    let got = endpoint.read_body(exchange, &mut piece);
+                    endpoint.release(piece);
+                    got
+                }
             };
-            let got = endpoint.read_body(exchange, &mut piece);
-            self.moved = self
-                .moved
-                .saturating_add(u64::try_from(piece.bytes().len()).unwrap_or(u64::MAX));
-            endpoint.release(piece);
             match got {
                 Ok(0) => break,
-                Ok(_) => {}
+                Ok(read) => {
+                    self.moved = self
+                        .moved
+                        .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                }
                 // Its asker is gone: nothing to answer.
                 Err(_) => return Ok(true),
             }
@@ -4690,13 +4770,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(false);
             }
         }
+        // A reply no message holds, a field past its bound, is refused as its exchange's end: its
+        // asker hears it at once rather than a period's silence.
         let Ok((head, fields)) = reply.encode() else {
+            endpoint.refuse_exchange(exchange, Refusal::FrameBound);
             return Ok(true);
         };
         let slowed = reply.slowed;
         let length = u64::try_from(fields.len()).unwrap_or(u64::MAX);
-        if endpoint.reply(exchange, &head, Some(length)).is_err() {
-            return Ok(true);
+        match super::reply_head(endpoint, exchange, &head, Some(length)) {
+            super::Replied::Sent => {}
+            super::Replied::WaitsForRoom => return self.wait_to_reply(at, exchange),
+            super::Replied::Ended => return Ok(true),
         }
         // A native request answered `SlowDown`, counted for its cause as it goes: the node says
         // the counts in its lines, as the listener counts the S3 door's.
@@ -4707,6 +4792,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             job.work = Work::Replying(fields, 0);
         }
         self.write_fields(at)
+    }
+
+    /// Job `at`'s reply on `exchange` waits for room in the endpoint's budget, which refused its
+    /// head or the piece its body drains through; whether it is over. Within its client's
+    /// patience it is held: vouched for and due at each beat (`bound_jobs`, `host_due`), and
+    /// offered again at each turn, since nothing tells the node when the budget frees (its
+    /// `release` retries only the transport's lossless frames). Past it, its exchange is refused
+    /// `Budget`, which needs no room and its asker hears at once, as it hears a request whose
+    /// head the budget refused: a job never ends with its exchange open and its asker waiting on
+    /// nothing, which its client gave up a period later (`Lost(Stalled)`).
+    fn wait_to_reply(&mut self, at: usize, exchange: ExchangeId) -> Result<bool, NodeError> {
+        let now = hyper_rt::futures::now_ns();
+        let Some(job) = self.jobs.get_mut(at) else {
+            return Ok(true);
+        };
+        if job.bounded(now) == Bounded::Held {
+            job.room_to_reply = true;
+            return Ok(false);
+        }
+        self.driver
+            .endpoint()
+            .refuse_exchange(exchange, Refusal::Budget);
+        Ok(true)
     }
 
     /// A reply's fields written as far as its exchange takes them; once all are, the exchange
@@ -4876,12 +4984,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .map(|due| shard.saturating_add(due.saturating_sub(wall)));
         // Each operation at work is ended at its client's patience, and one whose asks are held
         // says so each beat, a probe timeout, the transport's notes' beat of a third of the serve
-        // period (research/77 D2).
+        // period (research/77 D2); so is one whose reply waits for room, which the beat's turn
+        // offers its head again, since the budget freeing turns no node.
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
         let bound = self
             .jobs
             .iter()
-            .filter(|j| j.working() && j.held())
+            .filter(|j| (j.working() && j.held()) || j.room_to_reply)
             .filter_map(|j| j.due_ns(shard, beat))
             .min();
         [renewal, bound].into_iter().flatten().min()
@@ -4899,9 +5008,9 @@ fn directory() -> Vec<Descriptor> {
     }]
 }
 
-/// The work an operation's request names, the bytes read past its fields the start of a put's
-/// body; a native upload's Open cuts its runs in `block`'s whole blocks (`Host::open_block`).
-fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
+/// The work an operation's request names; a native upload's Open cuts its runs in `block`'s whole
+/// blocks (`Host::open_block`).
+fn work(op: Op, block: Option<u64>) -> Work {
     // Metadata past S3's 2 KB, or that no HTTP field could carry, is refused before anything is
     // written (research/89 §1.4): judged once, its refusal taken in its place below.
     let metadata = match &op {
@@ -4968,7 +5077,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             trailer: Vec::new(),
             put: None,
             taken: 0,
-            carry,
+            carry: Vec::new(),
             waiting: VecDeque::new(),
             run: None,
             metadata,
@@ -5067,7 +5176,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             trailer: Vec::new(),
             put: None,
             taken: 0,
-            carry,
+            carry: Vec::new(),
             waiting: VecDeque::new(),
             run: None,
             metadata: Vec::new(),
@@ -5171,7 +5280,7 @@ fn work(op: Op, carry: Vec<u8>, block: Option<u64>) -> Work {
             trailer: Vec::new(),
             put: None,
             taken: 0,
-            carry,
+            carry: Vec::new(),
             waiting: VecDeque::new(),
             run: Some(Appending {
                 offset,
@@ -5966,6 +6075,7 @@ mod tests {
             charge: 0,
             window: 1,
             label: None,
+            room_to_reply: false,
         };
         assert!(job.held());
         assert_eq!(job.bounded(9), Bounded::Held);
@@ -5997,6 +6107,113 @@ mod tests {
         assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
     }
 
+    /// An S3 put whose chunks every volume refused for want of room is due at its beat, as a
+    /// native one is, so the node turns to offer them room again (`Node::step_host`): it was due
+    /// only at its client's patience, and nothing turned the node when a peer's volume freed room,
+    /// so the fill suite's S3 put sat quiet (CI run 44454089741, linux-x86_64).
+    #[test]
+    fn an_s3_put_waiting_for_room_is_due_at_its_beat() {
+        let commit = Commit::Object(name::Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: "k".into(),
+            versioning: Versioning::Unversioned,
+            preconditions: Preconditions::default(),
+            at_ns: 0,
+            ordered_ns: None,
+            version: Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: String::new(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".into(),
+                headers: Vec::new(),
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            },
+            default: None,
+            id: 0,
+            deadline_ns: 0,
+        });
+        let data = DataKey::generate().unwrap();
+        let bytes = data.wrap(&WrappingKey::generate().unwrap()).unwrap();
+        let keys = Keys {
+            file: 7,
+            data,
+            wrapped: WrappedKey {
+                by: Wrapper::Root(1),
+                bytes,
+            },
+        };
+        let body = Body {
+            length: 1,
+            checksum: None,
+            content_md5: false,
+        };
+        let holding = Holding {
+            handover_ns: 1,
+            window: 1,
+        };
+        let layout = Layout::new(durability::Scheme::Copies(3)).unwrap();
+        let mut put = Put::new(commit, body, keys, layout, holding, Box::new(Random), 0).unwrap();
+        assert_eq!(put.feed(b"x").unwrap(), 1);
+        put.end(&Expected::default()).unwrap();
+        let (id, place) = put.poll().unwrap();
+        let put::Request::Place { width, .. } = place else {
+            panic!("{place:?}");
+        };
+        let volumes = (0..u128::try_from(width).unwrap()).collect();
+        put.answer(id, put::Answer::Volumes(volumes)).unwrap();
+        let chunks: Vec<_> = std::iter::from_fn(|| put.poll()).collect();
+        for (id, _) in chunks {
+            put.answer(id, put::Answer::Busy).unwrap();
+        }
+        assert!(put.waits_for_room());
+        let (_body, body) = hyper_rt::sync::channel(1).unwrap();
+        let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
+        let job = Job {
+            door: Door::Local(Box::new(Local {
+                body,
+                reply,
+                ended: None,
+                pending: VecDeque::new(),
+                ready: false,
+            })),
+            principal: "client".into(),
+            work: Work::Put(Box::new(Putting {
+                bucket: "b".into(),
+                key: "k".into(),
+                part: None,
+                id: 1,
+                length: 1,
+                preconditions: Preconditions::default(),
+                expected: Expected::default(),
+                trailing: None,
+                trailer: Vec::new(),
+                put: Some(put),
+                carry: Vec::new(),
+                taken: 1,
+                waiting: VecDeque::new(),
+                run: None,
+                metadata: Vec::new(),
+            })),
+            pending: Vec::new(),
+            deadline_ns: None,
+            moved_ns: 1,
+            admitted_ns: Some(1),
+            charge: 0,
+            window: 1,
+            label: None,
+            room_to_reply: false,
+        };
+        assert!(job.held() && job.waits_for_room());
+        assert_eq!(job.due_ns(5, 2), Some(7), "the S3 door's put, at its beat");
+    }
+
     fn refused(work: &Work) -> Option<Status> {
         match work {
             Work::Draining(reply) => Some(reply.status),
@@ -6021,10 +6238,10 @@ mod tests {
             trailing: None,
         };
         assert_eq!(
-            refused(&work(part(name::MAX_PART + 1), Vec::new(), None)),
+            refused(&work(part(name::MAX_PART + 1), None)),
             Some(Status::EntityTooLarge)
         );
-        assert_eq!(refused(&work(part(name::MAX_PART), Vec::new(), None)), None);
+        assert_eq!(refused(&work(part(name::MAX_PART), None)), None);
         let put = Op::Put {
             bucket: "b".into(),
             key: "k".into(),
@@ -6036,10 +6253,7 @@ mod tests {
             trailing: None,
             metadata: Vec::new(),
         };
-        assert_eq!(
-            refused(&work(put, Vec::new(), None)),
-            Some(Status::EntityTooLarge)
-        );
+        assert_eq!(refused(&work(put, None)), Some(Status::EntityTooLarge));
         // A checksum in the fields and a trailer's both.
         let twice = Op::Put {
             bucket: "b".into(),
@@ -6055,10 +6269,7 @@ mod tests {
             trailing: Some(checksum::Algorithm::Crc32),
             metadata: Vec::new(),
         };
-        assert_eq!(
-            refused(&work(twice, Vec::new(), None)),
-            Some(Status::InvalidRequest)
-        );
+        assert_eq!(refused(&work(twice, None)), Some(Status::InvalidRequest));
         let create = |algorithm, full| Op::CreateUpload {
             bucket: "b".into(),
             key: "k".into(),
@@ -6074,7 +6285,7 @@ mod tests {
             (Algorithm::Crc32c, true, true),
             (Algorithm::Crc32c, false, true),
         ] {
-            let status = refused(&work(create(algorithm, full), Vec::new(), None));
+            let status = refused(&work(create(algorithm, full), None));
             assert_eq!(
                 status,
                 if ok {
@@ -6100,15 +6311,11 @@ mod tests {
             version: Some(version.into()),
         };
         for named in ["null", "0123456789ABC"] {
-            assert_eq!(
-                refused(&work(get(named), Vec::new(), None)),
-                None,
-                "{named}"
-            );
+            assert_eq!(refused(&work(get(named), None)), None, "{named}");
         }
         for invalid in ["", "nul", "0123456789AB", "0123456789ABCD", "0123456789ABU"] {
             assert_eq!(
-                refused(&work(get(invalid), Vec::new(), None)),
+                refused(&work(get(invalid), None)),
                 Some(Status::InvalidVersion),
                 "{invalid:?}"
             );
@@ -6120,10 +6327,7 @@ mod tests {
             headers: Headers::default(),
             version: Some("not one".into()),
         };
-        assert_eq!(
-            refused(&work(delete, Vec::new(), None)),
-            Some(Status::InvalidVersion)
-        );
+        assert_eq!(refused(&work(delete, None)), Some(Status::InvalidVersion));
         let put = |metadata: Metadata| Op::Put {
             bucket: "b".into(),
             key: "k".into(),
@@ -6139,18 +6343,18 @@ mod tests {
             "x-amz-meta-k".to_owned(),
             "v".repeat(mantle_s3::metadata::MAX_USER - 1),
         )];
-        assert_eq!(refused(&work(put(at), Vec::new(), None)), None);
+        assert_eq!(refused(&work(put(at), None)), None);
         let past = vec![(
             "x-amz-meta-k".to_owned(),
             "v".repeat(mantle_s3::metadata::MAX_USER),
         )];
         assert_eq!(
-            refused(&work(put(past), Vec::new(), None)),
+            refused(&work(put(past), None)),
             Some(Status::MetadataTooLarge)
         );
         let control = vec![("x-amz-meta-k".to_owned(), "a\nb".to_owned())];
         assert_eq!(
-            refused(&work(put(control), Vec::new(), None)),
+            refused(&work(put(control), None)),
             Some(Status::InvalidArgument)
         );
         let source = mantle_s3::copy::Source {
@@ -6167,10 +6371,7 @@ mod tests {
             source: source.clone(),
             conditions: Headers::default(),
         }));
-        assert_eq!(
-            refused(&work(part, Vec::new(), None)),
-            Some(Status::InvalidArgument)
-        );
+        assert_eq!(refused(&work(part, None)), Some(Status::InvalidArgument));
         let copy = Op::Copy(Box::new(object::Copy {
             bucket: "b".into(),
             key: "k2".into(),
@@ -6186,10 +6387,7 @@ mod tests {
             checksum: None,
         }));
         assert_eq!(weight(&copy), 2);
-        assert_eq!(
-            refused(&work(copy, Vec::new(), None)),
-            Some(Status::InvalidVersion)
-        );
+        assert_eq!(refused(&work(copy, None)), Some(Status::InvalidVersion));
         assert_eq!(weight(&get("null")), 1);
     }
 }

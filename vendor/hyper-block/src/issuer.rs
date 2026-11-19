@@ -67,11 +67,28 @@ use crate::threads::{self, Reservation};
 
 #[cfg(target_os = "linux")]
 mod kernel;
+#[cfg(test)]
+mod stack;
 
 /// The queue assumed of a device the OS cannot describe: Native Command Queuing's 32 commands,
 /// the shallowest queue of a command-queuing interface (Serial ATA Revision 2.6, §13.6.2;
 /// AHCI 1.3.1 §1.1), which calibration's ladder then measures (mantle CLAUDE.md §5).
 pub const UNDESCRIBED_QUEUE_DEPTH: usize = 32;
+
+/// The stack each pool worker is spawned with, where Rust's default is 2 MiB. Measured
+/// (`issuer::stack`'s test): each path a worker runs, in a process of its own, at stacks halved
+/// toward a fault on the guard page beneath: a direct file's write, read and full flush, a
+/// transfer's typed errors, a file attached and detached, a segmented file's and the simulated
+/// device's transfers, and a file's write and flush that unwind, the panic hook printing a
+/// symbolized backtrace on the worker under every `RUST_BACKTRACE`. On macOS aarch64 (Rust
+/// 1.98.1) a release build runs every path on 16 KiB, the least stack the platform gives a
+/// thread, and a debug build every path but unwinding, which faults there and runs on 32 KiB.
+/// That, as much again (a caller's file's own frames, and platforms whose frames run larger),
+/// with what Windows keeps of a stack beside a path, std's 20 KiB guarantee for its overflow
+/// handler (`SetThreadStackGuarantee`) and a guard page ("Thread Stack Size"), is 88 KiB, rounded
+/// up to the 64 KiB allocation granularity Windows reserves address space in. The test holds
+/// every platform it runs on to twice its deepest path. mantle: vendor/UPSTREAM.md.
+pub const WORKER_STACK: usize = 128 << 10;
 
 /// The transfers a device's issuer keeps in flight: the smaller of the queue the OS reports
 /// (`UNDESCRIBED_QUEUE_DEPTH` when it reports none) and the depth calibration measured
@@ -446,12 +463,24 @@ impl Issuer {
     /// [`Self::start`] for submitters that together keep up to `batches` out
     /// ([`Self::attach_deep`]). Its declared cold inbox shape is retained; each attachment's
     /// own batch lane admits its configured credits without waiting on that shared inbox.
-    /// Native completion and exit receipts have their own bounded worker lanes.
+    /// Native completion and exit receipts have their own bounded worker lanes. Each worker's
+    /// stack is [`WORKER_STACK`].
+    pub fn start_for(path: &Path, depth: usize, batches: usize) -> Result<Self, DiskError> {
+        Self::start_pool(path, depth, batches, WORKER_STACK)
+    }
+
+    /// [`Self::start_for`] with each worker's stack `stack` bytes: [`WORKER_STACK`], or a size its
+    /// measurement tries.
     #[allow(
         clippy::disallowed_methods,
         reason = "the issuer's bounded device workers: hyper-block runs its device's I/O (clippy.toml's file rule names it)"
     )]
-    pub fn start_for(path: &Path, depth: usize, batches: usize) -> Result<Self, DiskError> {
+    fn start_pool(
+        path: &Path,
+        depth: usize,
+        batches: usize,
+        stack: usize,
+    ) -> Result<Self, DiskError> {
         blocking_call_allowed(path, "issuer startup inside a runtime task")?;
         if depth == 0 {
             return Err(invalid(path, "an issuer needs a depth of one at least"));
@@ -487,7 +516,7 @@ impl Issuer {
         let device = path.to_path_buf();
         let thread = Builder::new()
             .name("hyper-issuer".into())
-            .spawn(move || run(&device, inbox, workers, &ready, &mut pending))
+            .spawn(move || run(&device, inbox, (workers, stack), &ready, &mut pending))
             .map_err(|source| DiskError::Io {
                 op: "start a device issuer",
                 path: path.to_path_buf(),
@@ -532,11 +561,13 @@ impl Issuer {
     /// The threads [`Self::start_device`] of `depth` runs: on Linux one, its own, whatever the
     /// depth; elsewhere that one and the pool's `depth` workers. None past what a count holds.
     pub fn device_threads(depth: usize) -> Option<usize> {
-        if cfg!(target_os = "linux") {
-            Some(1)
-        } else {
-            depth.checked_add(1)
-        }
+        Self::device_workers(depth).checked_add(1)
+    }
+
+    /// The workers among [`Self::device_threads`], each on a stack of [`WORKER_STACK`] bytes: on
+    /// Linux none, the kernel holding the transfers; elsewhere one for each of `depth`.
+    pub fn device_workers(depth: usize) -> usize {
+        if cfg!(target_os = "linux") { 0 } else { depth }
     }
 
     /// [`Self::start_device`] for submitters that together keep up to `batches` out
@@ -1297,19 +1328,19 @@ impl Drop for Attached {
     }
 }
 
-/// The issuer's thread: starts the workers in its own scope, reports whether all started, then
-/// dispatches until stopped.
+/// The issuer's thread: starts the workers in its own scope, `workers` of them on stacks of
+/// `stack` bytes, reports whether all started, then dispatches until stopped.
 fn run(
     path: &Path,
     inbox: Receiver<Event>,
-    workers: usize,
+    (workers, stack): (usize, usize),
     ready: &SyncSender<Result<(), DiskError>>,
     submission_pending: &mut ChannelReceiver<()>,
 ) {
     std::thread::scope(|scope| {
         // Coalesced yes/no native-report notification: one pending inspection.
         let (native_pending, completed) = sync_channel(1);
-        let started = start_workers(scope, path, workers, &native_pending);
+        let started = start_workers(scope, path, (workers, stack), &native_pending);
         let mut handles = started.native;
         let mut dispatch = Dispatch::new(Lanes::Pool(started.assignments), path);
         // A foreign panic payload can itself panic on Drop. Retain it until every
@@ -1388,7 +1419,7 @@ struct StartedWorkers<'scope> {
 fn start_workers<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     path: &Path,
-    workers: usize,
+    (workers, stack): (usize, usize),
     pending: &SyncSender<()>,
 ) -> StartedWorkers<'scope> {
     let mut started = StartedWorkers {
@@ -1397,7 +1428,7 @@ fn start_workers<'scope, 'env>(
         result: Ok(()),
     };
     for _ in 0..workers {
-        match start_worker(scope, pending) {
+        match start_worker(scope, stack, pending) {
             Ok((assignment, worker)) => {
                 started.assignments.push(assignment);
                 started.native.push(worker);
@@ -1415,8 +1446,11 @@ fn start_workers<'scope, 'env>(
     started
 }
 
+/// One worker, on a stack of `stack` bytes: std's spawn maps it with the platform's guard page
+/// beneath, so a worker that passed it would fault there rather than write past it.
 fn start_worker<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
+    stack: usize,
     pending: &SyncSender<()>,
 ) -> Result<(SyncSender<Task>, NativeWorker<'scope>), std::io::Error> {
     let (tasks, assigned) = sync_channel(1);
@@ -1428,6 +1462,7 @@ fn start_worker<'scope, 'env>(
     };
     let handle = Builder::new()
         .name("hyper-io".into())
+        .stack_size(stack)
         .spawn_scoped(scope, move || {
             let mut ended = WorkerEnded {
                 publisher: &publisher,

@@ -8,7 +8,7 @@ use std::time::Duration;
 use hyper_rt_transport::{Io, MAX_BATCH};
 use hyper_transport::{
     Acknowledgement, AdmissionLimits, AskQueue, Classes, Limits, MIN_DATAGRAM, RECEIVE_CHUNK,
-    StreamCredit, class_reserve, frame_grant, initial_window,
+    StreamCredit, class_reserve, frame_grant, initial_window, state_charge_for,
 };
 
 use crate::classes::{Bounds, NodeClasses};
@@ -380,9 +380,9 @@ fn buffering(stated: &Stated, shape: &Shape) -> Result<(u64, usize), Unfit> {
 
 /// What the transport's bytes hold besides QUIC's windows, and the shares the rest is cut into
 /// ([`buffering`]): the messages' bytes, each connection's reserve and each waiting handshake's
-/// first window with its reserve, and the driver's receive ring at its most past the buffer it is
-/// made with ([`ring_growth`]); and a share each for a peer's two connections' windows and its
-/// pool of chunks.
+/// first window with its reserve, the connections' state ([`connections_state`]), and the
+/// driver's receive ring at its most past the buffer it is made with ([`ring_growth`]); and a
+/// share each for a peer's two connections' windows and its pool of chunks.
 fn held(stated: &Stated, shape: &Shape) -> Result<(u64, u64), Unfit> {
     let unfit = || Unfit("the transport's bytes, less the messages', hold no window");
     let peers = u64::try_from(shape.peers).map_err(|_| unfit())?;
@@ -399,8 +399,10 @@ fn held(stated: &Stated, shape: &Shape) -> Result<(u64, u64), Unfit> {
     // The ring's growth, which its driver charges to the budget as the ring grows, held apart at
     // its most: grown, it takes no room a window, a head or a piece was sized for. Uncounted, on
     // Linux it took the heads' room, the likely cause of finished jobs' reply heads refused there.
+    // So is the connections' state, which the endpoint charges as each connection is made.
     let held = messages(stated, shape.exchanges, shape.max_head, shape.lane_window)?
         .checked_add(fixed)
+        .and_then(|held| held.checked_add(connections_state(stated).ok()?))
         .and_then(|held| held.checked_add(ring_growth(stated).ok()?))
         .ok_or_else(unfit)?;
     // A share each for a peer's two connections' windows and its pool of chunks.
@@ -532,6 +534,27 @@ pub fn ring_growth(stated: &Stated) -> Result<u64, Unfit> {
     most.checked_sub(first)
         .and_then(|grown| u64::try_from(grown).ok())
         .ok_or(Unfit("the receive ring"))
+}
+
+/// The most the endpoint charges its connections' state, bytes, which it reserves from the
+/// transport's budget as each connection is made, a dial or an accepted handshake, and the
+/// budget's sizing holds apart ([`held`]): each connection at hyper-transport's `state_charge`,
+/// its own structures and its exchange tables at the streams a connection takes, the least the
+/// endpoint charges one and all it charges before its owner observes what its connections hold
+/// (`Endpoint::observe`, which no node or client calls); at the most connections the endpoint
+/// holds at once, those its admission holds and the handshakes it lets wait beside them
+/// (`AdmissionLimits`'s `connections` and `pending`, the count hyper-transport's
+/// `Endpoint::receive_demand` takes). Uncounted, a node's 64 clients took about 1.3 MB of the room
+/// its heads and frames were sized for.
+pub fn connections_state(stated: &Stated) -> Result<u64, Unfit> {
+    let shape = shape(stated)?;
+    let each = state_charge_for::<NodeClasses>(shape.streams);
+    shape
+        .connections
+        .checked_add(shape.peers)
+        .and_then(|held| u64::try_from(held).ok())
+        .and_then(|held| held.checked_mul(each))
+        .ok_or(Unfit("the connections' state"))
 }
 
 #[cfg(test)]
@@ -757,8 +780,11 @@ mod tests {
                 limits.lane_window,
             )
             .unwrap();
-            // The receive ring at its most is held apart beside them.
-            let held = messages + buffered(&stated, &limits) + ring_growth(&stated).unwrap();
+            // The connections' state and the receive ring at its most are held apart beside them.
+            let held = messages
+                + buffered(&stated, &limits)
+                + connections_state(&stated).unwrap()
+                + ring_growth(&stated).unwrap();
             assert!(held <= stated.transport_bytes, "{stated:?}: {held}");
             // Nothing is left over but what whole windows and whole chunks cannot use.
             let peers = stated.peers.max(1) as u64;
@@ -908,8 +934,13 @@ mod tests {
                 let (connections, identities) = (shape.connections as u64, shape.peers as u64);
                 let fixed =
                     connections * reserve + identities * (initial_window(MIN_DATAGRAM) + reserve);
+                let state = connections_state(&stated).unwrap();
                 let (held, shares) = held(&stated, &shape).unwrap();
-                assert_eq!(held, messages + fixed + ring, "the ring is held apart");
+                assert_eq!(
+                    held,
+                    messages + fixed + state + ring,
+                    "the ring is held apart"
+                );
                 // Every class at its most: each connection's window at the ceiling, each peer's
                 // receive chunks, the messages, the reserves and the ring.
                 let windows = connections * limits.window_ceiling
@@ -923,6 +954,76 @@ mod tests {
                     assert_eq!(least, held + shares * initial_window(MIN_DATAGRAM));
                 }
             }
+        }
+    }
+
+    /// The connections' state, which the endpoint charges as each connection is made, a dial or
+    /// an accepted handshake (hyper-transport's `state_charge`, all it charges one before an
+    /// observation, which no node or client makes), is held apart from every class's room at the
+    /// most connections the endpoint holds at once: those its admission holds and the handshakes
+    /// it lets wait beside them. The messages, the reserves, the windows at their ceiling, the
+    /// receive chunks and the ring leave it whole, at the floor and past it; the floor counts it,
+    /// and a budget that leaves it less is refused. Uncounted, a node of 64 clients gave its
+    /// connections about 1.3 MB of the room its heads and frames were sized for.
+    #[test]
+    fn the_budget_holds_the_connections_state_at_its_most_beside_every_class() {
+        let reserve = class_reserve(<NodeClasses as Classes>::RANKS - 1);
+        for (peers, clients) in [(1, 0), (2, 0), (9, 0), (2, 64), (2, 1_000), (2, 5_000)] {
+            let at = |transport_bytes| Stated {
+                peers,
+                clients,
+                pool: clients,
+                transport_bytes,
+                ..stated()
+            };
+            let least = least_transport(&at(0)).unwrap();
+            let state = connections_state(&at(0)).unwrap();
+            // Each connection admission holds and each handshake it lets wait, at what the
+            // endpoint charges a connection's state under these limits.
+            let floor = limits(&at(least)).unwrap();
+            let most = (floor.admission.connections + floor.admission.pending) as u64;
+            let identities = (peers.max(1) + clients) as u64;
+            assert_eq!(most, identities * (CONNECTIONS_PER_PEER as u64 + 1));
+            let each = hyper_transport::state_charge::<NodeClasses>(&floor);
+            assert_eq!(
+                hyper_transport::connection_charge::<NodeClasses>(&floor),
+                initial_window(MIN_DATAGRAM) + reserve + each,
+                "the state is what a connection is charged past its first window"
+            );
+            assert_eq!(state, most * each, "{peers} peers, {clients} clients");
+            for transport_bytes in [least, 8 * least] {
+                let stated = at(transport_bytes);
+                let shape = shape(&stated).unwrap();
+                let limits = limits(&stated).unwrap();
+                let messages =
+                    messages(&stated, shape.exchanges, shape.max_head, shape.lane_window).unwrap();
+                let (connections, identities) = (shape.connections as u64, shape.peers as u64);
+                let fixed =
+                    connections * reserve + identities * (initial_window(MIN_DATAGRAM) + reserve);
+                let ring = ring_growth(&stated).unwrap();
+                let (held, shares) = held(&stated, &shape).unwrap();
+                assert_eq!(
+                    held,
+                    messages + fixed + state + ring,
+                    "the connections' state is held apart"
+                );
+                // Every class at its most beside it: each connection's window at the ceiling,
+                // each peer's receive chunks, the messages, the reserves, the ring and the state.
+                let windows = connections * limits.window_ceiling
+                    + limits.receive_chunks as u64 * RECEIVE_CHUNK as u64;
+                assert!(
+                    held + windows <= transport_bytes,
+                    "{peers} peers, {clients} clients: {} past {transport_bytes}",
+                    held + windows
+                );
+                if transport_bytes == least {
+                    assert_eq!(least, held + shares * initial_window(MIN_DATAGRAM));
+                }
+            }
+            assert!(
+                limits(&at(least - state)).is_err(),
+                "{peers} peers, {clients} clients: a budget the state short is refused"
+            );
         }
     }
 }

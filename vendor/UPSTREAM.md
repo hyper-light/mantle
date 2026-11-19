@@ -587,13 +587,15 @@ residency epochs) are hyper-raft's now, at `17920a7` and `55d923e`.
 
 ### Local changes
 
-`hyper-transport` carries the change below, made here against the rule above for the stall it
-closes, to go to hyper-raft's `main` as it stands (it is not there yet). Its sources carry `mantle:`
-comments that point here; a snapshot taken before hyper-raft has it applies it again.
+`hyper-transport` carries the changes below, made here against the rule above for the stall and
+the sizing they close, to go to hyper-raft's `main` as they stand (they are not there yet). Its
+sources carry `mantle:` comments that point here; a snapshot taken before hyper-raft has them
+applies them again.
 
 | Where | Change | Why |
 |---|---|---|
 | `src/endpoint.rs` (`Core::admit_prefix`, `Core::reply`, `Core::prefix`, `Endpoint::reply`), `src/exchange.rs` (`Outgoing::message`), `tests/exchange.rs`, `ORIGIN.md` | A peer's exchange takes, with its request's head, the room its reply's prefix and head take at their longest, `frame_grant(max_head)`: both or neither, a request the budget cannot fund both for refused `Budget` as it arrives, which its asker hears at once. The room is the exchange's outgoing message until the reply fills it, asking the budget for nothing, so a reply within its class's bounds is never refused `Budget`; it is given back once the reply's head is written (`Core::flush`), or at the exchange's end however it ends (`Core::finish_exchange`: its owner's end or refusal, its stream reset or stopped, its connection lost). Tests: `a_reply_given_once_the_budget_is_full_is_sent`, red before it (the reply refused `Budget`), and `each_end_gives_a_peers_exchange_its_reply_room_back` (answered, with and without a body; refused and ended unanswered by its owner; its request reset and its reply stopped by its asker; its connection lost), each leaving the budget's messages where they were before the request. | A reply's head was reserved as the reply was given, after other exchanges' bodies, windows and frames could have filled the budget; an owner that took that refusal as the exchange's end left it open, its asker waiting a whole period on nothing (mantle's uploads given up `Lost(Stalled)`; docs/design/node.md §3.3). An owner whose budget counts every exchange's head both ways, as mantle's does (`bounds::messages`), holds no more than it states. |
+| `src/endpoint.rs`, `src/lib.rs` | `state_charge_for::<C>(streams_per_connection)`, which `state_charge` now calls: a connection's state charge under limits whose connections take that many streams, the one bound it depends on. | An owner sizing its budget before its limits are whole counts its connections' state at what the endpoint charges each (mantle's `bounds::connections_state`, docs/design/node.md §3.3). |
 
 Verified on macOS aarch64 (2026-11-18): hyper-transport's unit tests and its `body_bytes`,
 `certificates`, `datagrams`, `e2e`, `exchange`, `responses`, `room` and `tls` suites, run from the

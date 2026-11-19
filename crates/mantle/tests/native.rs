@@ -1492,8 +1492,8 @@ fn a_copy_killed_at_a_run_boundary_or_mid_run_resumes_and_a_changed_source_is_re
 }
 
 /// Two nodes of three SIGKILLed while a copy's third run streams through the first: the ranges
-/// have lost their quorum, so the cell commits nothing more, and the copy ends `SlowDown`, its
-/// journal keeping the upload and the cell its two runs, read once the nodes are back. (One node of three gone, the cell writes
+/// have lost their quorum, so the cell commits nothing more, and the copy ends `SlowDown`, its cause
+/// said, its journal keeping the upload and the cell its two runs, read once the nodes are back. (One node of three gone, the cell writes
 /// around it, new blocks taking the scheme the two left meet the target with: docs/design/repair.md
 /// §5.) Once the nodes are back, their volumes enlisted and every range caught up on them, the copy
 /// run again resumes from the cell's offset, no committed run sent again, its object the bytes
@@ -1520,8 +1520,9 @@ fn a_copy_through_a_node_killed_mid_run_resumes_from_the_cells_offset_once_it_is
     }
     copying.write(&mut cell, &object[2 * run + run / 2..]);
     let (done, out, said) = copying.finish(&mut cell);
+    // The CLI says a SlowDown's cause after it (`mantle: the upload: SlowDown: ...`, a4ff472f).
     assert!(
-        !done && said.iter().any(|l| l.ends_with("the upload: SlowDown")),
+        !done && said.iter().any(|l| l.contains("the upload: SlowDown: ")),
         "{out}{said:?}"
     );
     // Back on ports of their own (node.md §1.7): their peers and the client are told where, their

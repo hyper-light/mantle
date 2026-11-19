@@ -45,11 +45,9 @@ pub struct Stored<F: BlockFile> {
     /// Whether anything was applied or installed since the last checkpoint: an image installed
     /// at the index the engine stands at, a range's founding rows at 0, changes it all the same.
     unpersisted: bool,
-    /// A get's value, a scan's rows and its continuation: the engine's buffers, kept across
-    /// calls.
+    /// A get's value and a scan's rows: the engine's buffers, kept across calls.
     value: Vec<u8>,
     rows: EngineRows,
-    next: Vec<u8>,
 }
 
 impl<F: BlockFile + 'static> Stored<F> {
@@ -83,7 +81,6 @@ impl<F: BlockFile + 'static> Stored<F> {
             unpersisted: false,
             value: Vec::new(),
             rows: EngineRows::new(),
-            next: Vec::new(),
         }
     }
 
@@ -91,7 +88,7 @@ impl<F: BlockFile + 'static> Stored<F> {
     fn scan_all(&mut self, from: &[u8], to: Option<&[u8]>) -> Result<(), EngineError> {
         self.rows.clear();
         self.db
-            .scan(from, to, usize::MAX, &mut self.rows, &mut self.next)
+            .scan_rows(from, to, usize::MAX, &mut self.rows)
             .map_err(fenced)?;
         Ok(())
     }
@@ -126,8 +123,9 @@ impl<F: BlockFile + 'static> Rows for Stored<F> {
             return Ok(None);
         }
         self.rows.clear();
+        // The row alone: no continuation is found past it.
         self.db
-            .scan(from, Some(to), 1, &mut self.rows, &mut self.next)
+            .scan_rows(from, Some(to), 1, &mut self.rows)
             .map_err(fenced)?;
         Ok(self.rows.get(0).map(|(k, v)| (k.to_vec(), v.to_vec())))
     }

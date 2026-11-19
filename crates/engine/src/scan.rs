@@ -69,8 +69,12 @@ pub struct ScanMerge<'a> {
     /// Sources passed over at open by their range filters, and sources opened.
     skipped: u64,
     opened: u64,
-    /// The nanoseconds each source of the last open took to open, in the sources' order, none
-    /// for one passed over: what a seek's extra sources cost it, measured.
+    /// Keys compared choosing and moving heads: a head's against the least so far or the end,
+    /// and a head's against the key the merge moves past.
+    compared: u64,
+    /// The nanoseconds each source of the last open took to open, its seek from its filter's
+    /// pass, in the sources' order, none for one passed over: what a seek's extra sources cost
+    /// it, measured.
     open_ns: Vec<u64>,
 }
 
@@ -102,7 +106,6 @@ impl<'a> ScanMerge<'a> {
         }
         self.open_ns.clear();
         for s in sources {
-            let t = timed.then(std::time::Instant::now);
             if filter && end.is_some() {
                 let scratch = &mut self.scratch;
                 let held = match *s {
@@ -114,6 +117,8 @@ impl<'a> ScanMerge<'a> {
                     continue;
                 }
             }
+            // Only a source opened is timed: one passed over reads no clock.
+            let t = timed.then(std::time::Instant::now);
             self.opened = self.opened.saturating_add(1);
             let head = match *s {
                 Source::Branch(b) => Head::Branch(b.seek(store, from)?, b),
@@ -144,7 +149,6 @@ impl<'a> ScanMerge<'a> {
         }
         self.open_ns.clear();
         for s in sources {
-            let t = timed.then(std::time::Instant::now);
             if filter && end.is_some() {
                 let scratch = &mut self.scratch;
                 let held = match *s {
@@ -156,6 +160,8 @@ impl<'a> ScanMerge<'a> {
                     continue;
                 }
             }
+            // Only a source opened is timed: one passed over reads no clock.
+            let t = timed.then(std::time::Instant::now);
             self.opened = self.opened.saturating_add(1);
             let head = match *s {
                 Source::Branch(b) => Head::Branch(RunCursor::new(store)?, b),
@@ -189,6 +195,7 @@ impl<'a> ScanMerge<'a> {
             scratch: self.scratch,
             skipped: 0,
             opened: 0,
+            compared: 0,
             open_ns: self.open_ns,
         }
     }
@@ -198,9 +205,10 @@ impl<'a> ScanMerge<'a> {
         &self.open_ns
     }
 
-    /// Sources passed over by their range filters, and sources opened, since the merge was made.
-    pub fn counts(&self) -> (u64, u64) {
-        (self.skipped, self.opened)
+    /// Sources passed over by their range filters, sources opened, and keys compared, since the
+    /// merge was made.
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (self.skipped, self.opened, self.compared)
     }
 
     /// Gives every head's pages and span back to `store`.
@@ -214,16 +222,28 @@ impl<'a> ScanMerge<'a> {
     /// The head at the least key before the end, the newest of those tied.
     fn pick(&mut self) {
         let mut best: Option<(usize, &[u8])> = None;
+        let mut compared = 0u64;
         for (i, h) in self.heads.iter().enumerate() {
             let Some(k) = h.key() else { continue };
             // Strictly less only: an equal key keeps the earlier, newer head.
-            if best.is_none_or(|(_, b)| k < b) {
+            let less = match best {
+                None => true,
+                Some((_, b)) => {
+                    compared = compared.saturating_add(1);
+                    k < b
+                }
+            };
+            if less {
                 best = Some((i, k));
             }
+        }
+        if self.bounded && best.is_some() {
+            compared = compared.saturating_add(1);
         }
         self.current = best
             .filter(|&(_, k)| !self.bounded || k < self.end.as_slice())
             .map(|(i, _)| i);
+        self.compared = self.compared.saturating_add(compared);
     }
 
     /// The current entry: key, operation, value; none past the end.
@@ -239,13 +259,16 @@ impl<'a> ScanMerge<'a> {
     /// one source. Nothing is decided by comparing sources, so the run leaves the merge where the
     /// caller's step would have, the entry it stopped at current. A 10M seek spent 43 ns a row
     /// after its placing, most of it in the shard's merge of one source with memtables holding
-    /// nothing before the segment's end (research/61 §3).
+    /// nothing before the segment's end (research/61 §3). Without `past_last`, the run stops on
+    /// its `rows`-th row, the source not moved past it: a page that needs no continuation reads
+    /// nothing after its last row.
     pub fn push_run<F: BlockFile>(
         &mut self,
         store: &mut Store<F>,
         rows: usize,
         before: Option<&[u8]>,
         out: &mut crate::rows::Rows,
+        past_last: bool,
     ) -> Result<Option<usize>, Error> {
         let mut pushed = 0usize;
         let [head] = self.heads.as_mut_slice() else {
@@ -256,20 +279,30 @@ impl<'a> ScanMerge<'a> {
         } else {
             None
         };
+        let mut compared = 0u64;
         // At most a step an entry the source holds: each step moves the cursor on or ends it.
         while pushed < rows {
             let Some(key) = head.key() else {
                 break;
             };
+            compared = compared
+                .saturating_add(u64::from(end.is_some()))
+                .saturating_add(u64::from(before.is_some()));
             if end.is_some_and(|e| key >= e) || before.is_some_and(|b| key >= b) {
                 break;
             }
             if head.op() == Op::Put {
                 out.push(key, head.value());
                 pushed = pushed.saturating_add(1);
+                if pushed == rows && !past_last {
+                    // The source has not moved: its entry stays current.
+                    self.compared = self.compared.saturating_add(compared);
+                    return Ok(Some(pushed));
+                }
             }
             head.next(store)?;
         }
+        self.compared = self.compared.saturating_add(compared);
         self.pick();
         Ok(Some(pushed))
     }
@@ -298,6 +331,9 @@ impl<'a> ScanMerge<'a> {
                 h.next(store)?;
             }
         }
+        self.compared = self
+            .compared
+            .saturating_add(u64::try_from(self.heads.len()).unwrap_or(u64::MAX));
         self.pick();
         Ok(())
     }
@@ -325,6 +361,9 @@ impl<'a> ScanMerge<'a> {
                 h.next_async(store).await?;
             }
         }
+        self.compared = self
+            .compared
+            .saturating_add(u64::try_from(self.heads.len()).unwrap_or(u64::MAX));
         self.pick();
         Ok(())
     }
@@ -377,8 +416,8 @@ impl<'s, 'a, F: BlockFile> BorrowedScanMerge<'s, 'a, F> {
         self.merge.as_ref().map_or(&[], ScanMerge::open_ns)
     }
 
-    pub(crate) fn counts(&self) -> (u64, u64) {
-        self.merge.as_ref().map_or((0, 0), ScanMerge::counts)
+    pub(crate) fn counts(&self) -> (u64, u64, u64) {
+        self.merge.as_ref().map_or((0, 0, 0), ScanMerge::counts)
     }
 
     pub(crate) fn close(&mut self) {

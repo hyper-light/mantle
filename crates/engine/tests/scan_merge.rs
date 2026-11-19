@@ -262,17 +262,45 @@ fn a_run_of_one_source_pushes_its_puts_to_each_bound_and_refuses_two() {
         .unwrap();
     let mut rows = mantle_engine::rows::Rows::new();
     assert_eq!(
-        merge.push_run(&mut store, 7, None, &mut rows).unwrap(),
+        merge
+            .push_run(&mut store, 7, None, &mut rows, true)
+            .unwrap(),
         Some(7)
     );
     let want: Vec<_> = puts(b"k/0010", b"k/9999").into_iter().take(7).collect();
     assert_eq!(rows_of(&rows), want);
     let next = merge.entry().expect("an entry past the budget").0.to_vec();
     assert!(next.as_slice() > want.last().unwrap().0.as_slice());
+    // The same budget for a page with no continuation: the same seven, the source left on the
+    // seventh.
+    let mut again = ScanMerge::new();
+    again
+        .open(
+            &mut store,
+            &[Source::Branch(&branch)],
+            b"k/0010",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+    let mut rows = mantle_engine::rows::Rows::new();
+    assert_eq!(
+        again
+            .push_run(&mut store, 7, None, &mut rows, false)
+            .unwrap(),
+        Some(7)
+    );
+    assert_eq!(rows_of(&rows), want);
+    assert_eq!(
+        again.entry().map(|(k, _, _)| k.to_vec()),
+        Some(want.last().unwrap().0.clone())
+    );
+    again.close(&mut store);
     // A memtable bound at k/0050: every put before it, the entry at the bound current.
     let mut rows = mantle_engine::rows::Rows::new();
     let pushed = merge
-        .push_run(&mut store, 1000, Some(b"k/0050"), &mut rows)
+        .push_run(&mut store, 1000, Some(b"k/0050"), &mut rows, true)
         .unwrap();
     let want = puts(&next, b"k/0050");
     assert_eq!(pushed, Some(want.len()));
@@ -293,7 +321,9 @@ fn a_run_of_one_source_pushes_its_puts_to_each_bound_and_refuses_two() {
         )
         .unwrap();
     let mut rows = mantle_engine::rows::Rows::new();
-    let pushed = merge.push_run(&mut store, 1000, None, &mut rows).unwrap();
+    let pushed = merge
+        .push_run(&mut store, 1000, None, &mut rows, true)
+        .unwrap();
     let want = puts(b"k/0100", b"k/0120");
     assert_eq!(pushed, Some(want.len()));
     assert_eq!(rows_of(&rows), want);
@@ -311,7 +341,9 @@ fn a_run_of_one_source_pushes_its_puts_to_each_bound_and_refuses_two() {
         .unwrap();
     let mut rows = mantle_engine::rows::Rows::new();
     assert_eq!(
-        merge.push_run(&mut store, 1000, None, &mut rows).unwrap(),
+        merge
+            .push_run(&mut store, 1000, None, &mut rows, true)
+            .unwrap(),
         Some(0)
     );
     assert!(rows.iter().next().is_none());
@@ -334,7 +366,9 @@ fn a_run_of_one_source_pushes_its_puts_to_each_bound_and_refuses_two() {
     let before = merge.entry().map(|(k, _, _)| k.to_vec());
     let mut rows = mantle_engine::rows::Rows::new();
     assert_eq!(
-        merge.push_run(&mut store, 1000, None, &mut rows).unwrap(),
+        merge
+            .push_run(&mut store, 1000, None, &mut rows, true)
+            .unwrap(),
         None
     );
     assert!(rows.iter().next().is_none());

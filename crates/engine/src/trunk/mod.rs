@@ -516,13 +516,15 @@ pub struct TrunkStats {
     pub merge_units: u64,
     pub merge_ns: u64,
     /// Scans made through the trunk, the leaf segments they visited, the sources those segments
-    /// listed, and of them those passed over by their range filters and those opened: what a
-    /// seek reads its way through (filled in by the shard, `ShardDb::stats`).
+    /// listed, of them those passed over by their range filters and those opened, and the keys
+    /// their merges compared: what a seek reads its way through (filled in by the shard,
+    /// `ShardDb::stats`).
     pub scans: u64,
     pub scan_segments: u64,
     pub scan_sources: u64,
     pub scan_skipped: u64,
     pub scan_opened: u64,
+    pub scan_compared: u64,
     /// Entries written by pivots' compactions, and by leaves' settles by what asked for them:
     /// seeks' rent, more than `fanout` branches, more than `leaf_entries` entries.
     pub pivot_entries: u64,
@@ -554,6 +556,8 @@ pub struct TrunkStats {
     /// comes from.
     pub charged_leaf_sources: u64,
     pub charged_index_sources: u64,
+    /// Consolidations seeks' charges priced, each a pivot's bundles summed.
+    pub charges_priced: u64,
     pub paid_leaves: u64,
     pub paid_index: u64,
     pub paid_below: u64,
@@ -1287,13 +1291,28 @@ impl Trunk {
         };
         let idle = self.pool.as_ref().map_or(1, Pool::idle);
         for &(ref step, rent) in path {
-            let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
-            let price = wall_price(
-                entries
-                    .saturating_mul(key_ns)
-                    .saturating_add(pages_own.saturating_mul(page_ns)),
-                idle,
-            );
+            let shape = (step.sources, step.newest);
+            // Only rent toward a consolidation not yet paid at the sources' shape is weighed
+            // against its price: a pivot charged none, or paid already, sums no bundle.
+            let unpaid = |p: &Pivot| p.seek.shape != shape || !p.seek.paid;
+            let priced = rent > 0
+                && self
+                    .nodes
+                    .get(step.node)
+                    .and_then(|n| n.pivots.get(step.pivot))
+                    .is_some_and(unpaid);
+            let price = if priced {
+                let (entries, pages_own) = self.bundle_size(step, pages.extent_pages);
+                self.stats.charges_priced = self.stats.charges_priced.saturating_add(1);
+                Some(wall_price(
+                    entries
+                        .saturating_mul(key_ns)
+                        .saturating_add(pages_own.saturating_mul(page_ns)),
+                    idle,
+                ))
+            } else {
+                None
+            };
             let Some(pivot) = self
                 .nodes
                 .get_mut(step.node)
@@ -1301,7 +1320,6 @@ impl Trunk {
             else {
                 continue;
             };
-            let shape = (step.sources, step.newest);
             if pivot.seek.shape != shape {
                 // The sources changed since the rent was paid: it priced another consolidation.
                 if pivot.seek.paid {
@@ -1316,7 +1334,7 @@ impl Trunk {
                 continue;
             }
             pivot.seek.ns = pivot.seek.ns.saturating_add(rent);
-            if !pivot.seek.paid && pivot.seek.ns >= price {
+            if !pivot.seek.paid && price.is_some_and(|price| pivot.seek.ns >= price) {
                 pivot.seek.paid = true;
                 self.paid = self.paid.saturating_add(1);
                 let counted = if step.leaf {

@@ -483,9 +483,11 @@ pub struct ShardDb<F: BlockFile> {
     scan_passed: Vec<crate::trunk::Passed>,
     scan_charges: Vec<(crate::trunk::Passed, u64)>,
     scan_merge: ScanMerge<'static>,
-    /// Trunk sources scans passed over by their range filters, and sources they opened.
+    /// Trunk sources scans passed over by their range filters, sources they opened, and keys
+    /// their merges compared.
     scan_skipped: u64,
     scan_opened: u64,
+    scan_compared: u64,
     /// Writes applied and gets made while a budget counts them, scans apart: an idle step looks
     /// for operations since the last one by them ([`Self::look_when_idle`]), and the made count
     /// as of the last idle step.
@@ -939,6 +941,7 @@ impl<F: BlockFile> ShardDb<F> {
             scan_merge: ScanMerge::new(),
             scan_skipped: 0,
             scan_opened: 0,
+            scan_compared: 0,
             ops: 0,
             idle_ops: 0,
             scans: 0,
@@ -2805,27 +2808,56 @@ impl<F: BlockFile> ShardDb<F> {
         out: &mut Rows,
         next: &mut Vec<u8>,
     ) -> Result<bool, Error> {
-        let more = self.scan_inner(from, end, limit, out, next);
+        let more = self.scan_inner(from, end, limit, out, Some(next));
+        self.after_scan();
+        more
+    }
+
+    /// [`Self::scan`]'s rows for a caller that pages no further: up to `limit` rows of `[from,
+    /// end)` appended to `out`, the same rows `scan` gives; true when the page filled. With no
+    /// continuation to find, the merge stops on the `limit`-th row: no source moves past it, so
+    /// none reads its next entry or page, no key is compared after it, and no segment past the
+    /// row's is opened. A lookup of a key's newest row (mantle-meta's `name::current`, a
+    /// one-row page) so reads nothing past the row it returns.
+    pub fn scan_rows(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+    ) -> Result<bool, Error> {
+        let filled = self.scan_inner(from, end, limit, out, None);
+        self.after_scan();
+        filled
+    }
+
+    fn after_scan(&mut self) {
         self.look_when_due();
         // A scan may have read pages into the cache: the kept memtables give way before it
         // returns.
         if self.kept_crowded() {
             self.fit_kept(false);
         }
-        more
     }
 
+    /// A page of `[from, end)` into `out`; with `next`, the key to continue from, found past the
+    /// page's last row, and without, the merge stopping on that row.
     fn scan_inner(
         &mut self,
         from: &[u8],
         end: Option<&[u8]>,
         limit: usize,
         out: &mut Rows,
-        next: &mut Vec<u8>,
+        mut next: Option<&mut Vec<u8>>,
     ) -> Result<bool, Error> {
-        next.clear();
+        let pages = next.is_some();
+        if let Some(n) = next.as_mut() {
+            n.clear();
+        }
         if limit == 0 {
-            next.extend_from_slice(from);
+            if let Some(n) = next.as_mut() {
+                n.extend_from_slice(from);
+            }
             return Ok(true);
         }
         // A walk of a memtable sees its sorted runs: what arrived since the last scan is sorted
@@ -2948,9 +2980,12 @@ impl<F: BlockFile> ShardDb<F> {
             // end pushes nothing and must not end the scan. A merge of several sources takes the
             // step below.
             if taken < limit && tree.is_some_and(|t| mem_least.is_none_or(|m| t < m)) {
-                match merge.push_run(store, limit.saturating_sub(taken), mem_least, out) {
+                match merge.push_run(store, limit.saturating_sub(taken), mem_least, out, pages) {
                     Ok(Some(n)) => {
                         taken = taken.saturating_add(n);
+                        if !pages && taken == limit {
+                            break Ok(true);
+                        }
                         continue;
                     }
                     Ok(None) => {}
@@ -2964,16 +2999,22 @@ impl<F: BlockFile> ShardDb<F> {
             key.clear();
             key.extend_from_slice(least);
             if taken == limit {
-                next.extend_from_slice(key);
+                if let Some(n) = next.as_mut() {
+                    n.extend_from_slice(key);
+                }
                 break Ok(true);
             }
-            // The newest source holding the key decides; every source holding it moves past it.
+            // The newest source holding the key decides; every source holding it moves past it,
+            // unless the row it gave fills a page with no continuation, which ends there.
             let mut decided = false;
             if active.key() == Some(key.as_slice()) {
                 decided = true;
                 if active.op == Op::Put {
                     out.push(key, &active.value);
                     taken = taken.saturating_add(1);
+                    if !pages && taken == limit {
+                        break Ok(true);
+                    }
                 }
                 if let Err(error) = active.advance(&self.mem) {
                     break Err(error);
@@ -2987,6 +3028,9 @@ impl<F: BlockFile> ShardDb<F> {
                     if c.op == Op::Put {
                         out.push(key, &c.value);
                         taken = taken.saturating_add(1);
+                        if !pages && taken == limit {
+                            break Ok(true);
+                        }
                     }
                 }
                 if let Err(error) = c.advance(&p.mem) {
@@ -3002,6 +3046,9 @@ impl<F: BlockFile> ShardDb<F> {
                     if c.op == Op::Put {
                         out.push(key, &c.value);
                         taken = taken.saturating_add(1);
+                        if !pages && taken == limit {
+                            break 'walk Ok(true);
+                        }
                     }
                 }
                 if let Err(error) = c.advance(&f.mem) {
@@ -3014,6 +3061,9 @@ impl<F: BlockFile> ShardDb<F> {
                 if !decided && op == Op::Put {
                     out.push(key, v);
                     taken = taken.saturating_add(1);
+                    if !pages && taken == limit {
+                        break Ok(true);
+                    }
                 }
                 if let Err(error) = merge.next(store) {
                     break Err(error);
@@ -3027,11 +3077,12 @@ impl<F: BlockFile> ShardDb<F> {
                 return Err(error);
             }
         };
-        let (skipped, opened) = merge.counts();
+        let (skipped, opened, compared) = merge.counts();
         self.scan_merge = merge.recycle(store);
         self.scan_sources = reuse(sources);
         self.scan_skipped = self.scan_skipped.saturating_add(skipped);
         self.scan_opened = self.scan_opened.saturating_add(opened);
+        self.scan_compared = self.scan_compared.saturating_add(compared);
         self.scan_active = active;
         if let Some(c) = packing {
             self.scan_packing = c;
@@ -3252,11 +3303,12 @@ impl<F: BlockFile> ShardDb<F> {
                 merge.next().await?;
             }
         };
-        let (skipped, opened) = merge.counts();
+        let (skipped, opened, compared) = merge.counts();
         drop(merge);
         self.scan_sources = reuse(sources);
         self.scan_skipped = self.scan_skipped.saturating_add(skipped);
         self.scan_opened = self.scan_opened.saturating_add(opened);
+        self.scan_compared = self.scan_compared.saturating_add(compared);
         self.scan_active = active;
         if let Some(c) = packing {
             self.scan_packing = c;
@@ -5241,6 +5293,7 @@ impl<F: BlockFile> ShardDb<F> {
         trunk.scan_sources = self.scan_listed;
         trunk.scan_skipped = self.scan_skipped;
         trunk.scan_opened = self.scan_opened;
+        trunk.scan_compared = self.scan_compared;
         (flush, trunk, self.store.io_stats())
     }
 

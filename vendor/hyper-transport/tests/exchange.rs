@@ -364,6 +364,87 @@ fn a_class_reserve_keeps_control_moving_under_bulk_load() {
     );
 }
 
+/// Exchanges waiting for credit are passed over, not visited, by every pass while their class may
+/// take none (`Core::next_visit`), and each moves once credit comes back: bulk bodies the peer does
+/// not read spend the connection's credit, then requests are asked, each holding a stream, and
+/// frames are queued on every lane, the requests' heads and the frames waiting on the credit the
+/// bulk bodies took. The oracle checks at every pass that each one passed over would have written
+/// nothing (`Core::check_passed`), and that the visit lists and the lanes' unsent sums are their
+/// folds; released, every exchange completes, none refused.
+#[test]
+fn exchanges_waiting_for_credit_are_passed_over_and_move_once_it_comes_back() {
+    const REQUESTS: u8 = 40;
+    let pair = Pair::new();
+    let mut wide = limits();
+    wide.exchanges = 64;
+    wide.streams_per_connection = 64;
+    let mut net = connected::<Mantle, Mantle>(&pair, wide, 256 << 20);
+    let (mut asker, mut server) = (Asker::new(), Server::new());
+    server.hold_bulk = true;
+    let now = net.now;
+    for seed in 0..2 {
+        asker
+            .ask(
+                &mut net.a,
+                now,
+                2,
+                (Kind::Snapshot, Class::Bulk),
+                seed,
+                Some(4 << 20),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+    }
+    for _ in 0..50 {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+    }
+    for seed in 0..REQUESTS {
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Get, Class::Request),
+                seed,
+                Some(4 << 10),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+    }
+    let frame = [7u8; 64];
+    for lane in 0..wide.lanes_per_peer {
+        for _ in 0..8 {
+            net.a.send_frame(2, lane, Kind::Get, &frame).unwrap();
+        }
+    }
+    for _ in 0..50 {
+        net.exchange();
+        asker.drive(&mut net.a);
+        server.serve(&mut net.b);
+    }
+    let waiting = asker
+        .asked
+        .iter()
+        .filter(|asked| !asked.done && asked.written == 0)
+        .count();
+    assert!(
+        waiting > usize::from(REQUESTS) / 2,
+        "most requests wait for credit: {waiting} of {REQUESTS}"
+    );
+    assert_eq!(net.a.oracle_mismatches(), 0);
+    server.hold_bulk = false;
+    run(&mut net, &mut asker, &mut server);
+    assert!(
+        asker
+            .asked
+            .iter()
+            .all(|asked| asked.refused.is_none() && asked.read == asked.body),
+        "every exchange completes once credit comes back"
+    );
+}
+
 /// The frame bound is checked from the prefix, before any byte of the body: a receiver whose
 /// bound is below the sender's refuses, and the sender hears which bound.
 #[test]

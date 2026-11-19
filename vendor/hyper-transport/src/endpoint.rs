@@ -493,6 +493,8 @@ struct Conn<R> {
     /// exchange that waited for it through a window that saw it end is given a window afresh.
     unread_ended: Option<Instant>,
     lanes_out: Vec<LaneOut>,
+    /// What `lanes_out` holds unsent, by rank, kept as its frames are queued, written and dropped.
+    unsent: crate::lane::Unsent,
     lanes_in: Vec<LaneIn>,
     /// Its notes to the peer, of the exchanges it serves whose owners are at work ([`NOTES_LANE`]).
     notes: NotesOut,
@@ -2409,6 +2411,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             unread: 0,
             unread_ended: None,
             lanes_out: Vec::new(),
+            unsent: crate::lane::Unsent::default(),
             notes: NotesOut::default(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
@@ -2903,7 +2906,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     .position(|lane| lane.stream == Some(id))
                 {
                     let mut lane = conn.lanes_out.remove(at);
-                    for (_, frame) in lane.queue.drain(..) {
+                    let mut written = lane.written;
+                    for (rank, frame) in lane.queue.drain(..) {
+                        let unsent = frame.bytes().len().saturating_sub(written);
+                        conn.unsent.sub(rank, unsent);
+                        written = 0;
                         self.budget.release(frame);
                     }
                 }
@@ -3158,6 +3165,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.budget.release(frame);
             }
         }
+        conn.unsent.clear();
         let peer = conn.peer.map(|(peer, _)| peer);
         let key = conn.key;
         for lane in conn.lanes_in.drain(..) {
@@ -3202,7 +3210,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             counted: crate::tally::Counted::default(),
             touched: false,
             order: 0,
-            active: false,
+            active: None,
             at: 0,
             deadline: None,
             connection: key,
@@ -3625,7 +3633,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             counted: crate::tally::Counted::default(),
             touched: false,
             order: 0,
-            active: false,
+            active: None,
             at: 0,
             deadline: None,
             connection: key,
@@ -3764,22 +3772,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         owed
     }
 
-    /// With the oracle on, counts a visit set differing from the exchanges of `conn` that
-    /// `visits` picks, in the order they were made.
+    /// With the oracle on, counts visit lists differing from the exchanges of `conn` that `visits`
+    /// picks, each in the list `slot` names, in the order they were made.
     #[cfg(feature = "oracle")]
-    fn check_visits(&mut self, conn: &Conn<C::Role>, visited: &[u64]) {
+    fn check_visits(&mut self, conn: &Conn<C::Role>) {
         if !self.oracle {
             return;
         }
-        let mut expected: Vec<(u64, u64)> = conn
+        let ranks = self.exchanges.ranks();
+        let mut expected: Vec<(u64, u64, usize)> = conn
             .exchanges
             .iter()
             .filter_map(|id| self.exchanges.get(*id).map(|exchange| (exchange, *id)))
             .filter(|(exchange, _)| crate::tally::visits(exchange))
-            .map(|(exchange, id)| (exchange.order, id))
+            .map(|(exchange, id)| (exchange.order, id, crate::tally::slot(exchange, ranks)))
             .collect();
         expected.sort_unstable();
-        if !expected.iter().map(|(_, id)| id).eq(visited.iter()) {
+        if expected != self.exchanges.listed(conn.key) {
             self.mismatches = self.mismatches.saturating_add(1);
         }
     }
@@ -3871,23 +3880,28 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     sum.saturating_add(exchange.out.pending())
                 })
         });
-        conn.lanes_out
-            .iter()
-            .flat_map(|lane| {
-                let written = lane.written;
-                lane.queue
-                    .iter()
-                    .enumerate()
-                    .map(move |(at, (front, frame))| {
-                        let unsent = if at == 0 {
-                            frame.bytes().len().saturating_sub(written)
-                        } else {
-                            frame.bytes().len()
-                        };
-                        if *front < rank { length(unsent) } else { 0 }
-                    })
-            })
-            .fold(exchanges, u64::saturating_add)
+        let lanes = conn.unsent.above(rank);
+        #[cfg(feature = "oracle")]
+        self.check(lanes, |_| {
+            conn.lanes_out
+                .iter()
+                .flat_map(|lane| {
+                    let written = lane.written;
+                    lane.queue
+                        .iter()
+                        .enumerate()
+                        .map(move |(at, (front, frame))| {
+                            let unsent = if at == 0 {
+                                frame.bytes().len().saturating_sub(written)
+                            } else {
+                                frame.bytes().len()
+                            };
+                            if *front < rank { length(unsent) } else { 0 }
+                        })
+                })
+                .fold(0, u64::saturating_add)
+        });
+        exchanges.saturating_add(lanes)
     }
 
     /// The credit a class of `rank` may take on `conn` now: what QUIC would take, less the reserve
@@ -4255,30 +4269,37 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.share.pooled && !conn.share.wanting && conn.quic.peer_streams_blocked(Dir::Bi) {
             self.pool.wants(&mut conn.share, conn.key, conn.serial);
         }
-        let mut ids = std::mem::take(&mut self.ids);
-        ids.clear();
-        // Only the exchanges `start` or `wake` can move (src/tally.rs `visits`), in the order they
-        // were made: for every other, both do nothing.
-        self.exchanges.active(conn.key, &mut ids);
         #[cfg(feature = "oracle")]
-        self.check_visits(conn, &ids);
-        // Streams are given in that order: once one is refused, every later one would be.
+        self.check_visits(conn);
+        // Only the exchanges `start` or `wake` can move (src/tally.rs `visits`), in the order they
+        // were made: for every other, both do nothing. Streams are given in that order: once one
+        // is refused, every later one would be. mantle: one that holds a stream moves only by the
+        // credit its class may take, so while its class may take none it is passed over without a
+        // visit, which would write nothing and wake no one (`Core::next_visit`; vendor/UPSTREAM.md).
         let mut streams_left = true;
-        for id in &ids {
+        let mut after = None;
+        // Bounded: each turn visits an exchange made after the last one visited, so there are no
+        // more turns than exchanges.
+        for _ in 0..=self.exchanges.len() {
+            let Some((order, id)) = self.next_visit(conn, after, streams_left) else {
+                break;
+            };
+            after = Some(order);
             let queued = |core: &Self| {
                 core.exchanges
-                    .get(*id)
+                    .get(id)
                     .is_some_and(|exchange| exchange.stream.is_none())
             };
             if !streams_left && queued(self) {
                 continue;
             }
-            self.start(conn, *id);
+            self.start(conn, id);
             if queued(self) {
                 streams_left = false;
             }
-            self.wake(conn, *id);
+            self.wake(conn, id);
         }
+        let mut ids = std::mem::take(&mut self.ids);
         ids.clear();
         // Only the exchanges whose wait is due, from the connection's deadline heap, in the order
         // they were made: `judge` does nothing for any other.
@@ -4292,6 +4313,102 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         self.flush_notes(now, conn);
         self.flush_lanes(conn);
         self.tune(now, conn);
+    }
+
+    /// The next exchange of `conn` a progress pass visits, as (order, id), after the one made at
+    /// `after`: the first made of those its visit lists hold that can move now. One queued for a
+    /// stream can while `streams` (none was refused yet); one holding a stream of a class that may
+    /// take credit can (`allowed`); one holding a stream of a class that may take none cannot, its
+    /// head or trailer taking nothing and its owner told nothing, and is passed over (mantle,
+    /// 2026-11-19: a pass visited each, so every call on a connection cost what its exchanges
+    /// waiting for credit numbered). What each list's first is costs a binary search of it, so a
+    /// step costs the classes, not the exchanges waiting.
+    fn next_visit(
+        &mut self,
+        conn: &mut Conn<C::Role>,
+        after: Option<u64>,
+        streams: bool,
+    ) -> Option<(u64, u64)> {
+        let key = conn.key;
+        let mut next = streams
+            .then(|| self.exchanges.listed_after(key, 0, after))
+            .flatten();
+        let earlier =
+            |next: Option<(u64, u64)>, found: (u64, u64)| next.is_none_or(|next| found < next);
+        #[cfg(feature = "oracle")]
+        let mut spent = Vec::new();
+        for rank in 0..C::RANKS {
+            let slot = usize::from(rank).saturating_add(1);
+            if let Some(found) = self.exchanges.listed_after(key, slot, after)
+                && earlier(next, found)
+            {
+                let credit = self.allowed(conn, rank) > 0;
+                if credit {
+                    next = Some(found);
+                }
+                #[cfg(feature = "oracle")]
+                if !credit && self.oracle {
+                    spent.push(rank);
+                }
+            }
+        }
+        let past = usize::from(C::RANKS).saturating_add(1);
+        if let Some(found) = self.exchanges.listed_after(key, past, after)
+            && earlier(next, found)
+        {
+            next = Some(found);
+        }
+        #[cfg(feature = "oracle")]
+        for rank in spent {
+            self.check_passed(conn, rank, after, next.map(|(order, _)| order));
+        }
+        next
+    }
+
+    /// With the oracle on, counts an exchange of `conn`'s list of `rank` that a pass passed over,
+    /// made after `after` and before `until`, whose visit would not have waited on its class's
+    /// credit: one with no stream to write to, or whose head or trailer had no byte left to write.
+    #[cfg(feature = "oracle")]
+    fn check_passed(
+        &mut self,
+        conn: &Conn<C::Role>,
+        rank: u8,
+        after: Option<u64>,
+        until: Option<u64>,
+    ) {
+        if !self.oracle {
+            return;
+        }
+        let slot = usize::from(rank).saturating_add(1);
+        let waits = |exchange: &Exchange<C::Class>| {
+            exchange.stream.is_some()
+                && match exchange.out.state {
+                    Out::Head => exchange
+                        .out
+                        .message
+                        .as_ref()
+                        .is_some_and(|message| exchange.out.written < message.bytes().len()),
+                    Out::Trailer => exchange.out.trailer_written < crate::frame::TRAILER_BYTES,
+                    Out::Nothing | Out::Body | Out::Finished => true,
+                }
+        };
+        let moved = self
+            .exchanges
+            .listed(conn.key)
+            .into_iter()
+            .filter(|(order, _, at)| {
+                *at == slot
+                    && after.is_none_or(|after| *order > after)
+                    && until.is_none_or(|until| *order < until)
+            })
+            .any(|(_, id, _)| {
+                self.exchanges
+                    .get(id)
+                    .is_none_or(|exchange| !waits(exchange))
+            });
+        if moved {
+            self.mismatches = self.mismatches.saturating_add(1);
+        }
     }
 
     /// Exchange `id`'s owner is at work on it ([`Endpoint::working`]): the next note names it, if it
@@ -4780,6 +4897,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 .unwrap_or(&[]),
         );
         if let Some(out) = conn.lanes_out.get_mut(at) {
+            conn.unsent.add(C::rank(class), bytes.bytes().len());
             out.queue.push_back((C::rank(class), bytes));
         }
         self.flush_lane(conn, at);
@@ -4892,6 +5010,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             let Pushed::Took(took) = push(&mut conn.quic, stream, rest, allowed) else {
                 return;
             };
+            conn.unsent.sub(rank, took.min(whole));
             if took < whole {
                 out.written = out.written.saturating_add(took);
                 return;

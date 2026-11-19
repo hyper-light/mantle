@@ -552,6 +552,12 @@ pub(crate) struct Native {
     handed: std::sync::Arc<Handed>,
     /// Bytes of its body taken and of its reply given since the host's step last took them.
     moved: u64,
+    /// The node's task's waker while the job runs on a driving shard (node.md §2.9 step 6f),
+    /// woken as the job gives its door anything the node's task acts on: an answer to write, its
+    /// work held, its body let go of, or a piece of its body taken, the next to be read. None
+    /// where the node's task runs the job, which steps it in its own turn. A hyper-rt waker is a
+    /// word its clone copies, so holding it costs nothing.
+    node: Option<std::task::Waker>,
 }
 
 /// What a native job tells the node's task to write to its exchange, in order, as an S3 job tells
@@ -626,7 +632,12 @@ impl Native {
         if self.gone() {
             return Sent::Gone;
         }
-        flush(&self.reply, &mut self.pending)
+        let waiting = self.pending.len();
+        let sent = flush(&self.reply, &mut self.pending);
+        if self.pending.len() < waiting {
+            self.wake_node();
+        }
+        sent
     }
 
     /// Sends `told` after what waits, or holds it behind them.
@@ -664,6 +675,22 @@ impl Native {
         self.handed
             .held
             .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_node();
+    }
+
+    /// Lets go of its body: the node's task reads and drops the rest.
+    fn drop_body(&self) {
+        self.handed
+            .dropped
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_node();
+    }
+
+    /// Turns the node's task where the job runs on a driving shard, after what it gave its door.
+    fn wake_node(&self) {
+        if let Some(node) = &self.node {
+            node.wake_by_ref();
+        }
     }
 }
 
@@ -753,6 +780,7 @@ fn native_door() -> Option<(Native, Replies)> {
             pending: VecDeque::new(),
             handed: std::sync::Arc::clone(&handed),
             moved: 0,
+            node: None,
         },
         Replies {
             told,
@@ -762,6 +790,7 @@ fn native_door() -> Option<(Native, Replies)> {
             head: None,
             out: None,
             room: None,
+            driving: None,
         },
     ))
 }
@@ -837,6 +866,7 @@ impl Doors {
             .handed
             .gone
             .store(true, std::sync::atomic::Ordering::Release);
+        replies.wake_job();
         self.give(Half::Replies(replies));
     }
 
@@ -875,10 +905,12 @@ impl Doors {
         native.body.ended = None;
         native.pending.clear();
         native.moved = 0;
+        native.node = None;
         replies.drained = None;
         replies.head = None;
         replies.out = None;
         replies.room = None;
+        replies.driving = None;
         let handed = &native.handed;
         handed
             .unwritten
@@ -938,6 +970,11 @@ pub(crate) struct Replies {
     /// lossless frames), its exchange vouched for meanwhile, and the node's turn due at each beat
     /// (research/77 D1, D2; `Node::host_due`); past it, its exchange refused `Budget`.
     room: Option<u64>,
+    /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
+    /// of its moved (`driving::Lanes::doors`), told as the node's task takes what the job gave or
+    /// writes it whole, or lets go of the reply, so the job gives its next or ends; none where the
+    /// node's task runs the job, which it steps in its own turn.
+    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
 }
 
 /// What follows bytes of a reply written whole.
@@ -1017,6 +1054,7 @@ impl Drop for Replies {
         self.handed
             .gone
             .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_job();
     }
 }
 
@@ -1040,12 +1078,18 @@ impl Replies {
         self.room.map(|bound| bound.min(now.saturating_add(beat)))
     }
 
-    /// Writes what the job gave, in order, as far as `to` takes it, the request's body read whole
-    /// where `body_read`: the fields' bytes counted `moved`, and a `SlowDown` counted in `slowed`
-    /// for its cause as it goes. Each pass writes an answer whole or ends, and the job gives the
-    /// next only once the last is written whole, so a pass takes at most the channel's one answer
-    /// and the end behind it. A head the endpoint's budget has no room for is held and offered
-    /// again at the next turn, at `now` (`wait_for_room`).
+    /// Wakes the driving shard its job runs on, where one does and the job has not ended: its door
+    /// moved.
+    fn wake_job(&self) {
+        if let Some(driving) = &self.driving
+            && !self.handed.ended.load(std::sync::atomic::Ordering::Acquire)
+        {
+            driving.notify_one();
+        }
+    }
+
+    /// Writes what the job gave, as [`Replies::write_told`] does, and wakes the driving shard its
+    /// job runs on where an answer was taken or written whole: the job gives the next only then.
     fn write(
         &mut self,
         to: &mut impl Exchange,
@@ -1053,6 +1097,29 @@ impl Replies {
         now: u64,
         moved: &mut u64,
         slowed: &mut [u64],
+    ) -> Wrote {
+        let mut took = false;
+        let wrote = self.write_told(to, (body_read, now), moved, slowed, &mut took);
+        if took {
+            self.wake_job();
+        }
+        wrote
+    }
+
+    /// Writes what the job gave, in order, as far as `to` takes it, the request's body read whole
+    /// where `body_read`: the fields' bytes counted `moved`, and a `SlowDown` counted in `slowed`
+    /// for its cause as it goes. Each pass writes an answer whole or ends, and the job gives the
+    /// next only once the last is written whole, so a pass takes at most the channel's one answer
+    /// and the end behind it. A head the endpoint's budget has no room for is held and offered
+    /// again at the next turn, at `now` (`wait_for_room`). Whether an answer was taken from the
+    /// job's channel or written whole it says in `took`.
+    fn write_told(
+        &mut self,
+        to: &mut impl Exchange,
+        (body_read, now): (bool, u64),
+        moved: &mut u64,
+        slowed: &mut [u64],
+        took: &mut bool,
     ) -> Wrote {
         if self
             .handed
@@ -1114,10 +1181,13 @@ impl Replies {
                     .unwritten
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 whole = true;
+                *took = true;
             }
             // Read before the channel, so what the job gave before it let go is taken first.
             let ended = self.handed.ended.load(std::sync::atomic::Ordering::Acquire);
-            match self.told.try_recv() {
+            let told = self.told.try_recv();
+            *took |= matches!(told, Ok(Some(_)));
+            match told {
                 Ok(Some(Told::Reply(opening))) => self.drained = Some(opening),
                 Ok(Some(Told::Head(opening))) => {
                     if let Some(wrote) = self.open(to, opening, now) {
@@ -1245,6 +1315,10 @@ pub(crate) struct Feeding {
     /// Whether the job let go of the body: the rest is read and dropped, so its exchange ends whole
     /// for its reply.
     dropping: bool,
+    /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
+    /// of its moved, told as a piece or the end is given or the feeding is let go, so the job takes
+    /// it; its door's (`Replies::driving`).
+    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
 }
 
 /// What became of a body the node's task fed at a turn.
@@ -1343,7 +1417,10 @@ impl Feeding {
             return Fed::Moved;
         }
         match self.pieces.try_send(piece) {
-            Ok(()) => Fed::Moved,
+            Ok(()) => {
+                self.wake_job();
+                Fed::Moved
+            }
             Err(SyncError::Full(piece)) => {
                 self.held = Some(piece);
                 Fed::Still
@@ -1370,7 +1447,15 @@ impl Feeding {
         self.handed
             .cut
             .store(true, std::sync::atomic::Ordering::Release);
+        self.wake_job();
         self.pieces
+    }
+
+    /// Wakes the driving shard its job runs on, where one does: its body moved.
+    fn wake_job(&self) {
+        if let Some(driving) = &self.driving {
+            driving.notify_one();
+        }
     }
 
     /// Gives what the channel had no room for, first: whether it went, and whether it was the end.
@@ -1405,11 +1490,13 @@ fn body_of(op: &Op) -> Option<(u64, Option<checksum::Algorithm>)> {
 /// §2.9 step 6c): of its object's length and its trailer's algorithm, from its first byte on its
 /// door's channel of one piece, the least that moves a body (`door::Depth::FIRST`), `pieces` the
 /// sender its door lent and `handed` what its door's halves share, from the feeding, which the node's task keeps, to its door's receiver, which the
-/// put's job takes from, the trailer's value past the object's bytes the feeding's.
+/// put's job takes from, the trailer's value past the object's bytes the feeding's; `driving` the
+/// word of the driving shard its job runs on, none where the node's task runs it.
 fn feed(
     (length, trailing): (u64, Option<checksum::Algorithm>),
     pieces: Sender<Piece>,
     handed: std::sync::Arc<Handed>,
+    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
 ) -> Feeding {
     let width = trailing.map_or(0, checksum::Algorithm::width);
     Feeding {
@@ -1422,6 +1509,7 @@ fn feed(
         trailer: Vec::new(),
         empty: length == 0 && width == 0,
         dropping: false,
+        driving,
     }
 }
 
@@ -2789,11 +2877,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .as_ref()
                 .is_some_and(|admission| !admission.holds(more));
         // A request placed on a shard a driving task runs on is handed there with its operation
-        // (node.md §2.9 step 6e), the shard making its work; production holds no driving lanes
-        // until 6f, so every request is made into work here.
-        let driving = job
-            .driven
-            .is_some_and(|shard| self.driving.iter().any(|lanes| lanes.shard() == shard));
+        // (node.md §2.9 step 6e), the shard making its work; its door carries that shard's word
+        // and the node's task's waker, each side waking the other as it moves the door (6f).
+        let driving = job.driven.and_then(|shard| {
+            self.driving
+                .iter()
+                .find(|lanes| lanes.shard() == shard)
+                .map(super::driving::Lanes::doors)
+        });
         job.work = match op {
             Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             Ok(_) if crowded => Work::Draining(Box::new(Reply::slowed(door::Slowed::Crowded))),
@@ -2805,7 +2896,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     job.charge = job.charge.saturating_add(more);
                 }
                 job.label = Some(labels::host(&op));
-                if driving {
+                if driving.is_some() {
                     Work::Handing(Box::new((op, block)))
                 } else {
                     work(op, block)
@@ -2814,21 +2905,31 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         // The put's body comes on its door's channel, its sender lent to the feeding: one whose door
         // lent it already, which no put's does, is answered as one whose channel cannot be made.
-        let body = match &job.work {
-            Work::Put(putting) => Some((putting.length, putting.trailing)),
-            Work::Handing(handing) => body_of(&handing.0),
-            _ => None,
+        let (body, handing) = match &job.work {
+            Work::Put(putting) => (Some((putting.length, putting.trailing)), false),
+            Work::Handing(handing) => (body_of(&handing.0), true),
+            _ => (None, false),
         };
-        if let (Some(body), Door::Native(_, native)) = (body, &job.door) {
-            let lent = self
-                .replies
-                .iter_mut()
-                .find(|(replied, _)| *replied == exchange)
-                .and_then(|(_, replies)| replies.body.take());
+        let Door::Native(_, native) = &mut job.door else {
+            return Ok(false);
+        };
+        let mut replies = self
+            .replies
+            .iter_mut()
+            .find(|(replied, _)| *replied == exchange)
+            .map(|(_, replies)| replies);
+        if handing && let Some(replies) = replies.as_mut() {
+            native.node = Some(self.waker.clone());
+            replies.driving = driving;
+        }
+        if let Some(body) = body {
+            let lent =
+                replies.and_then(|replies| Some((replies.body.take()?, replies.driving.clone())));
             match lent {
-                Some(pieces) => {
+                Some((pieces, driving)) => {
                     let handed = std::sync::Arc::clone(&native.handed);
-                    self.feeding.push((exchange, feed(body, pieces, handed)));
+                    self.feeding
+                        .push((exchange, feed(body, pieces, handed, driving)));
                 }
                 None => job.work = Work::Draining(Box::new(Reply::slowed(door::Slowed::Door))),
             }
@@ -2927,7 +3028,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some(lanes) => lanes.hand(request),
                 None => Some(request),
             };
-            if let Some(request) = refused {
+            // Run here: its door wakes no shard, as the node's task steps its job in its turn.
+            if let Some(mut request) = refused {
+                request.half.node = None;
+                let door = self
+                    .replies
+                    .iter_mut()
+                    .filter(|(replied, _)| Some(*replied) == exchange)
+                    .map(|(_, replies)| &mut replies.driving);
+                let fed = self
+                    .feeding
+                    .iter_mut()
+                    .filter(|(fed, _)| Some(*fed) == exchange)
+                    .map(|(_, feeding)| &mut feeding.driving);
+                for driving in door.chain(fed) {
+                    *driving = None;
+                }
                 self.host.take_handed(request, exchange);
             }
         }
@@ -4664,14 +4780,21 @@ impl Host {
             // A native put's pieces come as its exchange delivers them, at no connection's pace,
             // and their bytes are counted in its door. Its fields are read before its put is made,
             // which takes its body.
+            // A piece taken frees the storage the node's task reads the next into, so a job on a
+            // driving shard turns it.
             Door::Native(_, native) => {
                 let Native {
                     body,
                     moved,
                     handed,
+                    node,
                     ..
                 } = &mut **native;
-                take_body(body, Some(&handed.cut), putting, moved, |_| {})
+                take_body(body, Some(&handed.cut), putting, moved, |_| {
+                    if let Some(node) = node {
+                        node.wake_by_ref();
+                    }
+                })
             }
         };
         match fed {
@@ -6489,10 +6612,7 @@ impl Host {
             // cause as it goes, as the listener counts the S3 door's. A reply no message holds, a
             // field past its bound, refuses its exchange, so its asker hears it at once.
             Door::Native(_, native) => {
-                native
-                    .handed
-                    .dropped
-                    .store(true, std::sync::atomic::Ordering::Release);
+                native.drop_body();
                 let told = match reply.encode() {
                     Ok((head, fields)) => Told::Reply(Box::new(Opening {
                         head,
@@ -7807,7 +7927,7 @@ pub(super) mod tests {
         let (sender, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
         let handed = std::sync::Arc::new(Handed::default());
         (
-            feed((putting.length, putting.trailing), sender, handed),
+            feed((putting.length, putting.trailing), sender, handed, None),
             Pieces {
                 pieces,
                 ended: None,
@@ -8665,6 +8785,7 @@ pub(super) mod tests {
             (putting.length, putting.trailing),
             sender,
             std::sync::Arc::clone(&native.handed),
+            None,
         );
         let mut moved = 0;
         for _ in 0..pieces {
@@ -8741,6 +8862,7 @@ pub(super) mod tests {
             (putting.length, putting.trailing),
             replies.body.take().unwrap(),
             std::sync::Arc::clone(&native.handed),
+            None,
         );
         native
             .handed
@@ -8764,6 +8886,7 @@ pub(super) mod tests {
             (putting.length, putting.trailing),
             replies.body.take().unwrap(),
             std::sync::Arc::clone(&native.handed),
+            None,
         );
         assert_eq!(feeding.give(&piece, &mut moved), Ok(Fed::Moved));
         replies.body = Some(feeding.let_go());
@@ -9748,6 +9871,362 @@ pub(super) mod tests {
         let (half, _) = doors.take().unwrap();
         let given_back = lanes.hand(handover(half, op(), 0, now));
         assert!(given_back.is_some_and(|request| request.driven == Some(1)));
+    }
+
+    /// A cell in memory as a test serves a driving shard's asks (node.md §2.9 step 6f): Block and
+    /// File ranges that apply their commands to models as their engines would, volumes that keep
+    /// each chunk whose CRC-32C holds, a Name range that keeps the version a put commits, and the
+    /// reads of each, so a put's bytes read back through a get.
+    struct Cell {
+        blocks: mantle_meta::engine::Model,
+        files: mantle_meta::engine::Model,
+        applied: u64,
+        chunks: std::collections::BTreeMap<(u128, mantle_chunk::ChunkKey), Bytes>,
+        version: Option<Version>,
+        answers: Vec<(Pending, Outcome)>,
+        asked: u64,
+        ended: usize,
+    }
+
+    impl Cell {
+        fn new() -> Self {
+            Self {
+                blocks: mantle_meta::engine::Model::default(),
+                files: mantle_meta::engine::Model::default(),
+                applied: 0,
+                chunks: std::collections::BTreeMap::new(),
+                version: None,
+                answers: Vec::new(),
+                asked: 0,
+                ended: 0,
+            }
+        }
+
+        /// What the cell answers `ask`, as its ranges and volumes would.
+        fn answer(&mut self, ask: JobAsk) -> Outcome {
+            self.applied += 1;
+            let read = |read: Read| Outcome::Read(ReadOutcome::Read(Box::new(read)));
+            let answered = |answer: Answer| Outcome::Command(CommandOutcome::Answered(answer));
+            match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => read(Read::Bucket(Some(bucket_row()))),
+                JobAsk::Read(_, Query::Current { .. }) => {
+                    read(Read::Current(self.version.clone().map(|v| (1, v))))
+                }
+                JobAsk::Read(_, Query::Header { file }) => read(Read::Header(
+                    mantle_meta::file::header(&mut self.files, file).unwrap(),
+                )),
+                JobAsk::Read(_, Query::Extents { file, offset, max }) => read(Read::Extents(
+                    mantle_meta::file::extents(
+                        &mut self.files,
+                        file,
+                        offset,
+                        usize::try_from(max).unwrap(),
+                    )
+                    .unwrap(),
+                )),
+                JobAsk::Read(_, Query::Block { block }) => read(Read::Block(
+                    mantle_meta::block::read(&mut self.blocks, block).unwrap(),
+                )),
+                JobAsk::Command(_, Command::Block(command)) => answered(Answer::Block(
+                    mantle_meta::block::apply(&mut self.blocks, self.applied, &command).unwrap(),
+                )),
+                JobAsk::Command(_, Command::File(command)) => answered(Answer::File(
+                    mantle_meta::file::apply(&mut self.files, self.applied, &command).unwrap(),
+                )),
+                JobAsk::Command(_, Command::Name(command)) => {
+                    let name::Command::Put(put) = *command else {
+                        panic!("a put's commit");
+                    };
+                    self.version = Some(put.version);
+                    answered(Answer::Name(name::Outcome::Put {
+                        version: "v".into(),
+                    }))
+                }
+                JobAsk::Put {
+                    volume,
+                    key,
+                    bytes,
+                    crc32c,
+                    ..
+                } => {
+                    assert_eq!(mantle_crc::crc32c(&bytes), crc32c);
+                    self.chunks.insert((volume, key), bytes);
+                    Outcome::Chunk(ChunkOutcome::Stored)
+                }
+                JobAsk::Get {
+                    volume,
+                    key,
+                    span: (offset, len),
+                    ..
+                } => {
+                    let chunk = &self.chunks[&(volume, key)];
+                    let span =
+                        usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap();
+                    Outcome::Chunk(ChunkOutcome::Read(chunk[span].to_vec()))
+                }
+                _ => panic!("an ask neither job makes"),
+            }
+        }
+    }
+
+    impl Serve for Cell {
+        fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+            let pending = match &ask {
+                JobAsk::Command(..) => Pending::Command(self.asked),
+                JobAsk::Read(..) => Pending::Read(self.asked),
+                JobAsk::Put { .. } | JobAsk::Get { .. } => Pending::Chunk(self.asked),
+            };
+            self.asked += 1;
+            let outcome = self.answer(ask);
+            self.answers.push((pending, outcome));
+            Ok(pending)
+        }
+
+        fn outcome(&mut self, pending: Pending) -> Option<Outcome> {
+            let at = self.answers.iter().position(|(p, _)| *p == pending)?;
+            Some(self.answers.swap_remove(at).1)
+        }
+
+        fn answered(&self, pending: Pending) -> bool {
+            self.answers.iter().any(|(p, _)| *p == pending)
+        }
+
+        fn abandon(&mut self, _: impl IntoIterator<Item = Pending>) {}
+
+        fn table(&mut self) -> Result<&Table, NodeError> {
+            Err(NodeError::Bounds("the shard holds its own table".into()))
+        }
+
+        fn group_of(&self, _: Layer) -> Option<u128> {
+            Some(1)
+        }
+
+        fn ranges(&self) -> usize {
+            4
+        }
+
+        fn command_room(&self) -> bool {
+            true
+        }
+
+        fn room(&self, _: &JobAsk) -> bool {
+            true
+        }
+
+        fn command_asks(&self) -> usize {
+            4
+        }
+
+        fn wall_ns(&self) -> u64 {
+            0
+        }
+
+        fn freed(&mut self) -> bool {
+            false
+        }
+
+        fn moved(&self) -> u64 {
+            0
+        }
+
+        fn read_fields(&mut self, _: &mut Job) -> Result<bool, NodeError> {
+            panic!("a request is handed with its fields read")
+        }
+
+        fn took(&mut self, _: door::Paced) {}
+
+        fn committed(&mut self, _: u64) {}
+
+        fn filled(&mut self, _: u64, _: u64) {}
+
+        fn job_ended(
+            &mut self,
+            _: Option<u64>,
+            _: u64,
+            _: Option<usize>,
+            _: impl IntoIterator<Item = Pending>,
+            half: Option<Box<Native>>,
+        ) -> Option<Box<Native>> {
+            self.ended += 1;
+            half
+        }
+    }
+
+    impl Table {
+        /// A table of three volumes in three domains, their nodes seen, read at `applied`, whose
+        /// blocks take three copies.
+        fn volumes(applied: u64) -> Self {
+            let facts: Vec<root::Fact> = placed_in(&["a", "b", "c"])
+                .into_iter()
+                .map(|placed| root::Fact {
+                    placed,
+                    standing: mantle_meta::record::VolumeStanding::Active,
+                    presence: mantle_meta::record::Presence {
+                        present: true,
+                        ..mantle_meta::record::Presence::default()
+                    },
+                })
+                .collect();
+            Self {
+                placed: facts.iter().map(|f| f.placed.clone()).collect(),
+                standing: facts.iter().map(|f| f.placed.clone()).collect(),
+                facts,
+                ..Self::empty(applied)
+            }
+        }
+    }
+
+    /// A put of a body of many pieces and a get of its bytes in many pieces, each handed to a
+    /// driving shard, the second of a two-shard runtime, and driven over its lanes by a cell in
+    /// memory on the test's thread, which stands in for the node's task (node.md §2.9 step 6f):
+    /// the test gives the put's body a piece at a time as the node's task feeds it, each only once
+    /// the job let go of the last, and writes each reply as the node's task writes it, a get's
+    /// piece taken only once the last is written whole. The shard's task waits on its lanes and
+    /// its own deadlines, so each piece given or written wakes it through the door: the put is
+    /// answered `Done` and the get `Done` with the object's bytes exact.
+    #[test]
+    fn a_driving_shards_jobs_are_woken_by_their_doors() {
+        let rt = two_shards(4);
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        // Held far past the test, so no block's hold lapses under it.
+        gateway.handover_ns = 600_000_000_000;
+        let start = super::super::driving::Start {
+            command_asks: 4,
+            read_asks: 4,
+            chunk_asks: 4,
+            groups: vec![
+                (Layer::Bucket, 1),
+                (Layer::Name, 2),
+                (Layer::File, 3),
+                (Layer::Block, 4),
+            ],
+            ranges: 4,
+            wall: super::super::Wall::From(0),
+            gateway: std::sync::Arc::new(gateway),
+            requests: 3,
+        };
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let mut lanes = super::super::driving::Lanes::start(holder, 1, start).unwrap();
+        lanes.tell_table(Box::new(Table::volumes(1)));
+        let mut doors = Doors::new(2);
+        let now = hyper_rt::futures::now_ns();
+        // Two blocks and part of a third: a body of many pieces, read back a block at a time.
+        let segments = Layout::new(durability::Scheme::Copies(3))
+            .unwrap()
+            .segments_per_block();
+        let block = usize::try_from(segments).unwrap() * mantle_s3::seal::SEGMENT;
+        let (object, trailer) = native_body(2 * block + piece_len() / 2);
+        let stream: Vec<u8> = object.iter().chain(&trailer).copied().collect();
+        let put = Op::Put {
+            bucket: "b".into(),
+            key: "k".into(),
+            id: 1,
+            length: object.len() as u64,
+            headers: Headers::default(),
+            checksum: None,
+            md5: None,
+            trailing: Some(Algorithm::Crc32c),
+            metadata: Vec::new(),
+        };
+        // The put's body as the node's task feeds it, from the sender its door lends, its door
+        // carrying the shard's word as `Node::read_fields` gives it.
+        let (put_half, mut put_replies) = doors.take().unwrap();
+        put_replies.driving = Some(lanes.doors());
+        let pieces = put_replies.body.take().unwrap();
+        let handed = std::sync::Arc::clone(&put_replies.handed);
+        let driving = put_replies.driving.clone();
+        let mut feeding = Some(feed(body_of(&put).unwrap(), pieces, handed, driving));
+        assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
+        let mut cell = Cell::new();
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut put_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut get_seen = Seen {
+            credit: usize::MAX,
+            ..Seen::default()
+        };
+        let mut rest = &stream[..];
+        let mut get_replies = None;
+        let (mut put_over, mut get_over) = (false, false);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !(put_over && get_over && cell.ended == 2) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the jobs never ended: put {put_over}, get {get_over}, {} ended",
+                cell.ended
+            );
+            lanes
+                .serve(&mut cell, |half| doors.give_native(half))
+                .unwrap();
+            // The body a piece at a time, each read only once the job let go of the last.
+            if let Some(fed) = feeding.as_mut() {
+                let over = match fed.send_held() {
+                    Some(Fed::Over) => true,
+                    Some(Fed::Still) => false,
+                    _ if fed.read_whole() => fed.end() == Fed::Over,
+                    _ if fed.free() => {
+                        let (read, left) = rest.split_at(rest.len().min(piece_len()));
+                        fed.give(read, &mut moved).unwrap();
+                        rest = left;
+                        false
+                    }
+                    _ => false,
+                };
+                if over {
+                    put_replies.body = feeding.take().map(Feeding::let_go);
+                }
+            }
+            let now = hyper_rt::futures::now_ns();
+            let body_read = feeding.is_none();
+            put_over = put_over
+                || put_replies.write(&mut put_seen, body_read, now, &mut moved, &mut slowed)
+                    == Wrote::Over;
+            // The get, once the put is answered, of the bytes it wrote.
+            if put_over && get_replies.is_none() {
+                let (get_half, mut replies) = doors.take().unwrap();
+                replies.driving = Some(lanes.doors());
+                let get = Op::Get {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    headers: Headers::default(),
+                    version: None,
+                };
+                assert!(lanes.hand(handover(get_half, get, 5, now)).is_none());
+                get_replies = Some(replies);
+            }
+            if let Some(replies) = get_replies.as_mut() {
+                get_over = get_over
+                    || replies.write(&mut get_seen, true, now, &mut moved, &mut slowed)
+                        == Wrote::Over;
+            }
+            std::thread::yield_now();
+        }
+        let put_reply = reply_seen(&put_seen);
+        assert_eq!(
+            (put_reply.status, put_reply.size),
+            (Status::Done, object.len() as u64)
+        );
+        let get_reply = reply_seen(&get_seen);
+        assert_eq!(
+            (get_reply.status, get_reply.size),
+            (Status::Done, object.len() as u64)
+        );
+        let (head, _) = get_seen.answered.as_ref().unwrap();
+        let fields = object::ReplyHead::decode(head).unwrap().fields();
+        let fields = usize::try_from(fields).unwrap();
+        assert!(
+            get_seen.body[fields..] == object[..],
+            "the object's bytes exact"
+        );
+        assert_eq!(
+            get_seen.writes.len(),
+            4,
+            "the get's fields, then its three blocks"
+        );
+        rt.shutdown().unwrap();
     }
 
     /// A host's wait is its own jobs' alone (node.md §2.9 step 6e), so a driving shard's task can

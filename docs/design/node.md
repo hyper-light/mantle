@@ -2453,6 +2453,35 @@ halves share (`Handed`), woken by the node's task as it gives a piece or writes 
 it. And the host's count of bytes moved (`Host::moved`) reaching the node's sum (`Node::moved`);
 and a refused request's place in the rule's count moved to the first shard.
 
+*As built (2026-11-19), step 6's sixth part, its first piece: a driving shard woken by its doors*
+(6f, `crates/node/src/node/driving.rs`, `host.rs`). A handed job's body and reply go through its
+door's channels, which neither task waits on, so each wakes the other as it moves the door. The
+node's task tells the shard's word (`driving::Lanes::doors`, hyper-rt's `sync::Notify`, made once
+with the lanes), which the shard's task waits on beside its lanes and its host's due, as it gives a
+piece, the end or a refusal of a put's body (`Feeding::send`), lets go of the body
+(`Feeding::let_go`), takes an answer from the job's reply channel or writes one whole
+(`Replies::write`), or lets go of the reply (`Doors::give_replies`, `Replies`' drop); the door's
+half the node's task keeps (`Replies::driving`, lent to the feeding) carries the word while its job
+runs on that shard, set as its fields are read for the hand-off (`Node::read_fields`) and taken off
+where the lane refuses it. The job wakes the node's task's waker, which its own half carries while
+it runs there (`Native::node`), as it gives its door an answer (`Native::flush`), takes a piece of
+its body, the next then readable (`feed_put`), says its work is held, or lets go of its body
+(`Native::drop_body`), as an S3 connection on another shard wakes it after each piece it sends
+(`door::Submitter::wake`). Why a `Notify` and not a lane message: hyper-rt's `Notify` is an atomic
+waker with a permit (one waiter registered in its cell, woken by `notify_one`, a notification with
+no waiter kept for the next wait), so no wake is lost and none takes a place in a lane; a message
+the lane had no room for would be dropped, and a full lane's older messages order nothing after
+what the door moved. One word a shard, not one a door, as one task steps every job of its shard at
+each of its turns; the job's half wakes the node's waker itself, a word its clone copies (hyper-rt's
+wakers count nothing), where the node's task's turn is its own. Neither allocates per wake: the
+word is made once a shard and each door's half holds a count of it (`Arc`), set and cleared with
+the door. Bound: a notification is one bit, kept until the next wait. Tested (`node::host`): a put
+of a body of 2.5 blocks, given a piece at a time, and a get of its bytes, each handed to the second
+shard of a two-shard runtime and served over its lanes by a cell in memory on the test's thread
+(Block and File ranges over models, volumes checking each chunk's CRC-32C, the Name range keeping
+the version the put commits), reach `Done`, the put's size and the get's bytes exact, given in
+three pieces after its fields; before the wake they hung (no job ended in 20 s).
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

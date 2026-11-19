@@ -30,6 +30,17 @@
 //!
 //! The node's side is generic over [`Serve`], so a test serves a driving shard from its own thread
 //! with a stub, and the node serves it by its own functions as it serves its own host.
+//!
+//! The doors (node.md §2.9 step 6f). A handed job's body and reply go through its door's channels,
+//! which neither task waits on, so each wakes the other as it moves a door: the node's task tells
+//! the shard's word ([`Lanes::doors`], hyper-rt's `Notify`, which its task waits on beside its
+//! lanes) as it gives a piece of a body, takes an answer or writes it whole, or lets go of either;
+//! the job wakes the node's task's waker, which its door's half carries while the job runs here,
+//! as it gives its door an answer, takes a piece, says its work is held or lets go of its body. A
+//! word, not a lane message: a notification kept while no one waits is never lost and holds no
+//! place in a lane, where a message the lane had no room for would be dropped with nothing to
+//! order it after what the door moved; and one word a shard, not one a door, as one task steps
+//! every job of the shard at each of its turns.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -39,7 +50,7 @@ use std::task::{Context, Poll};
 
 use hyper_rt::SlotHolder;
 use hyper_rt::combine::{Either, race2};
-use hyper_rt::sync::{ChannelReceiver, Sender, SyncError, channel};
+use hyper_rt::sync::{ChannelReceiver, Notify, Sender, SyncError, channel};
 use hyper_transport::Refusal;
 use mantle_meta::apply::Layer;
 
@@ -126,6 +137,8 @@ pub(crate) struct Lanes {
     /// Asks the node holds for the shard, each under the shard's number and the node's: at most
     /// the asks the shard's host holds.
     asked: Vec<(u64, Pending)>,
+    /// The shard's word that a door of its jobs moved, which its task waits on.
+    doors: Arc<Notify>,
 }
 
 impl Lanes {
@@ -139,12 +152,14 @@ impl Lanes {
         let (into, taken) = channel(room)?;
         let (answers, answered) = channel(slots)?;
         let (given, from) = channel(room)?;
+        let doors = Arc::new(Notify::new()?);
+        let woken = Arc::clone(&doors);
         hyper_rt::runtime::submit_to_holder(holder, async move {
             // A shard that refuses it drops the task with its lanes' ends, which the node reads as
             // the shard's end (`NodeError::ShardEnded`).
             let _ = hyper_rt::futures::spawn_detached_as(
                 hyper_rt::coop::Class::Normal,
-                run(taken, answered, given, start),
+                run((taken, answered, given), woken, start),
             );
         })?;
         Ok(Self {
@@ -158,12 +173,19 @@ impl Lanes {
             freed: false,
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
+            doors,
         })
     }
 
     /// The node's shard the lanes reach.
     pub(crate) fn shard(&self) -> usize {
         self.shard
+    }
+
+    /// The shard's word that a door of its jobs moved, which a handed request's door carries for
+    /// the node's task to tell.
+    pub(crate) fn doors(&self) -> Arc<Notify> {
+        Arc::clone(&self.doors)
     }
 
     /// Hands the shard a request with its fields read, without waiting: none once sent, and the
@@ -567,12 +589,16 @@ impl Serve for Served {
 
 /// A driving shard's task: takes what the node's task hands it and the answers it sends, at most
 /// each lane's room a turn, steps its host, and hands back what the host gave, waiting for room.
-/// Waits for the first of a request, an answer and its host's own due (`Host::due`). Ends when the
-/// node's task's end of a lane is gone, or once it handed back why its host stopped.
+/// Waits for the first of a request, an answer, a door of its jobs moved (`doors`) and its host's
+/// own due (`Host::due`). Ends when the node's task's end of a lane is gone, or once it handed back
+/// why its host stopped.
 async fn run(
-    mut taken: ChannelReceiver<In>,
-    mut answers: ChannelReceiver<(u64, Outcome)>,
-    given: Sender<Out>,
+    (mut taken, mut answers, given): (
+        ChannelReceiver<In>,
+        ChannelReceiver<(u64, Outcome)>,
+        Sender<Out>,
+    ),
+    doors: Arc<Notify>,
     start: Start,
 ) {
     let Ok(slots) = start.slots() else {
@@ -654,7 +680,7 @@ async fn run(
             hyper_rt::futures::yield_now().await;
             continue;
         }
-        let lanes = race2(taken.recv(), answers.recv());
+        let lanes = race2(race2(taken.recv(), answers.recv()), doors.notified());
         let woke = match due {
             Some(due) => {
                 match race2(lanes, hyper_rt::futures::sleep(due.saturating_sub(now))).await {
@@ -671,10 +697,17 @@ async fn run(
             None => Some(lanes.await),
         };
         match woke {
-            Some(Either::First(Ok(sent))) => handed = Some(sent),
-            Some(Either::Second(Ok(came))) => answer = Some(came),
-            Some(Either::First(Err(_)) | Either::Second(Err(_))) => return,
-            None => {}
+            Some(Either::First(Either::First(Ok(sent)))) => handed = Some(sent),
+            Some(Either::First(Either::Second(Ok(came)))) => answer = Some(came),
+            Some(Either::First(Either::First(Err(_)) | Either::Second(Err(_)))) => return,
+            // A door moved: the next step finds what moved.
+            Some(Either::Second(Ok(()))) | None => {}
+            // Its doors' word cannot be waited on: its jobs would wait on their doors for good,
+            // so the task stops, as for its timer.
+            Some(Either::Second(Err(error))) => {
+                let _ = given.send(Out::Stopped(error.into())).await;
+                return;
+            }
         }
     }
 }
@@ -709,6 +742,7 @@ pub(super) mod tests {
             freed: false,
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
+            doors: Arc::new(Notify::new().unwrap()),
         };
         (lanes, (taken, answered, given))
     }

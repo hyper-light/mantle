@@ -1435,6 +1435,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// Whether a reply's rounds ran out at the last turn's writing (`Node::write_replies`) with its
     /// exchange taking more: the next turn is due at once, for its job to give the next piece.
     replied: bool,
+    /// The exchanges whose native job gave its door something to act on, each named by its job,
+    /// from whichever shard it runs on, for the turn to visit its reply alone
+    /// (`host::Marks`): at most twice the exchanges the transport holds.
+    marks: host::Marks,
     /// The native requests the host admitted running on each of the node's shards, the count the
     /// rule places each on (node.md §2.9 step 6, `node::drivers`): over the first and each shard
     /// a driving task runs on (`Node::spread_native`), and over the first alone where none does, so each
@@ -1901,6 +1905,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             fed: false,
             replies: host::Writes::default(),
             replied: false,
+            marks: host::Marks::new(exchanges),
             drivers: drivers::Drivers::over(NonZeroUsize::MIN),
             abandoned: std::collections::HashSet::new(),
             repair: None,
@@ -3521,8 +3526,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 });
                 self.read_exchange(exchange)
             }
-            // A job's body is read, and its reply written, at the host's turn.
-            Event::BodyReady { exchange } if self.hosts(exchange) => Ok(()),
+            // A job's body is read, and its reply written, at the host's turn: its reply, which
+            // reads the rest of a body its job let go of, visited there.
+            Event::BodyReady { exchange } if self.hosts(exchange) => {
+                self.replies.mark(exchange);
+                Ok(())
+            }
             Event::BodyReady { exchange } => self.read_exchange(exchange),
             Event::Reply { exchange, body } => {
                 if self.chunks_out.contains(exchange) {
@@ -3571,7 +3580,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.keep_pool();
                 Ok(())
             }
-            Event::Writable { exchange } if self.hosts(exchange) => Ok(()),
+            // Its reply takes more: visited at the host's turn.
+            Event::Writable { exchange } if self.hosts(exchange) => {
+                self.replies.mark(exchange);
+                Ok(())
+            }
             Event::Writable { exchange } => {
                 self.write_exchange(exchange);
                 Ok(())

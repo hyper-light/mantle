@@ -1004,6 +1004,12 @@ pub(crate) struct Native {
     /// where the node's task runs the job, which steps it in its own turn. A hyper-rt waker is a
     /// word its clone copies, so holding it costs nothing.
     node: Option<std::task::Waker>,
+    /// The exchange its request came on, and the node's marks, on which the job names it as it
+    /// gives its door anything the node's task acts on ([`Native::mark`]), so the node's turn
+    /// visits its reply alone; none for a job no node's task writes for.
+    /// The marker is kept with the door, the exchange taken with each request.
+    exchange: Option<ExchangeId>,
+    marker: Option<Marker>,
 }
 
 /// What a native job tells the node's task to write to its exchange, in order, as an S3 job tells
@@ -1062,6 +1068,9 @@ struct Opening {
 /// rest, and whether the node's task let go of it (`cut`), so the job, finding nothing more given,
 /// knows its body did not come whole, the word read before the channel so a piece given before it
 /// is taken first.
+/// And whether the job named its exchange on the node's marks since the node's task took the
+/// last ([`Native::mark`]), so it names it once however much it gives meanwhile: the marks hold
+/// each exchange once.
 #[derive(Default)]
 struct Handed {
     unwritten: std::sync::atomic::AtomicUsize,
@@ -1070,6 +1079,11 @@ struct Handed {
     ended: std::sync::atomic::AtomicBool,
     dropped: std::sync::atomic::AtomicBool,
     cut: std::sync::atomic::AtomicBool,
+    marked: std::sync::atomic::AtomicBool,
+    /// The oracle's count, moved after the job's mark: the answers on the reply's channel not yet
+    /// taken (`Writes::audit`).
+    #[cfg(test)]
+    told: std::sync::atomic::AtomicUsize,
 }
 
 impl Native {
@@ -1082,6 +1096,12 @@ impl Native {
         let waiting = self.pending.len();
         let sent = flush(&self.reply, &mut self.pending);
         if self.pending.len() < waiting {
+            self.mark();
+            #[cfg(test)]
+            self.handed.told.fetch_add(
+                waiting.saturating_sub(self.pending.len()),
+                std::sync::atomic::Ordering::AcqRel,
+            );
             self.wake_node();
         }
         sent
@@ -1126,6 +1146,7 @@ impl Native {
             .held
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            self.mark();
             self.wake_node();
         }
     }
@@ -1136,6 +1157,28 @@ impl Native {
             .dropped
             .store(true, std::sync::atomic::Ordering::Release);
         self.wake_node();
+    }
+
+    /// Names its exchange on the node's marks, once until the node's task takes it: its reply may
+    /// move. The marks have room for each exchange the transport holds twice over
+    /// ([`Marks::new`]); a name they have none for is said beside them, and the node's task visits
+    /// every reply.
+    fn mark(&self) {
+        let (Some(exchange), Some(marker)) = (self.exchange, self.marker.as_ref()) else {
+            return;
+        };
+        if self
+            .handed
+            .marked
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        if marker.marks.try_send(exchange).is_err() {
+            marker
+                .missed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Turns the node's task where the job runs on a driving shard, after what it gave its door.
@@ -1233,6 +1276,8 @@ fn native_door() -> Option<(Native, Replies)> {
             handed: std::sync::Arc::clone(&handed),
             moved: 0,
             node: None,
+            exchange: None,
+            marker: None,
         },
         Replies {
             told,
@@ -1308,6 +1353,7 @@ impl Doors {
             .handed
             .ended
             .store(true, std::sync::atomic::Ordering::Release);
+        native.mark();
         self.give(Half::Native(native));
     }
 
@@ -1358,6 +1404,7 @@ impl Doors {
         native.pending.clear();
         native.moved = 0;
         native.node = None;
+        native.exchange = None;
         replies.drained = None;
         replies.out = None;
         replies.drain = Drain::default();
@@ -1373,9 +1420,12 @@ impl Doors {
             &handed.ended,
             &handed.dropped,
             &handed.cut,
+            &handed.marked,
         ] {
             word.store(false, std::sync::atomic::Ordering::Release);
         }
+        #[cfg(test)]
+        handed.told.store(0, std::sync::atomic::Ordering::Release);
         self.kept.push((native, replies));
     }
 }
@@ -1678,6 +1728,12 @@ impl Replies {
             let ended = self.handed.ended.load(std::sync::atomic::Ordering::Acquire);
             let told = self.told.try_recv();
             *took |= matches!(told, Ok(Some(_)));
+            #[cfg(test)]
+            if matches!(told, Ok(Some(_))) {
+                self.handed
+                    .told
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
             match told {
                 Ok(Some(Told::Reply(opening))) => self.drained = Some(opening),
                 Ok(Some(Told::Head(opening))) => {
@@ -1770,7 +1826,7 @@ pub(super) struct Writes<K = ExchangeId>
 where
     (K, Replies): Key<Of = K>,
 {
-    replies: super::keyed::Keyed<(K, Replies)>,
+    replies: super::keyed::Readied<(K, Replies)>,
     due: Earliest,
 }
 
@@ -1778,19 +1834,20 @@ impl<K> Default for Writes<K>
 where
     (K, Replies): Key<Of = K>,
 {
-    /// None, which allocates nothing (`Keyed::default`, `Earliest::default`).
+    /// None, which allocates nothing (`Readied::default`, `Earliest::default`).
     fn default() -> Self {
         Self {
-            replies: super::keyed::Keyed::default(),
+            replies: super::keyed::Readied::default(),
             due: Earliest::default(),
         }
     }
 }
 
-impl<K> Writes<K>
+impl<K: Copy> Writes<K>
 where
     (K, Replies): Key<Of = K>,
 {
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.replies.len()
     }
@@ -1871,6 +1928,130 @@ where
     pub(super) fn remove(&mut self, exchange: K) -> Option<(K, Replies)> {
         let at = self.replies.slot(exchange)?;
         self.take(at)
+    }
+
+    /// Marks the reply on `exchange` to visit at the next writing: something it waits on came.
+    pub(super) fn mark(&mut self, exchange: K) {
+        self.replies.mark(exchange);
+        #[cfg(test)]
+        self.audit();
+    }
+
+    /// Marks the reply on `exchange`, which its job named on the node's marks, then lets go of
+    /// its door's word, so what its job gives after names it again ([`Native::mark`]).
+    pub(super) fn marked_by_job(&mut self, exchange: K) {
+        self.replies.mark(exchange);
+        if let Some((_, replies)) = self
+            .replies
+            .slot(exchange)
+            .and_then(|at| self.replies.at(at))
+        {
+            replies
+                .handed
+                .marked
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        #[cfg(test)]
+        self.audit();
+    }
+
+    /// Marks every reply and lets go of each door's word: a mark found no room
+    /// ([`Marks::missed`]).
+    pub(super) fn mark_all(&mut self) {
+        self.replies.mark_all();
+        for (_, replies) in self.replies.iter() {
+            replies
+                .handed
+                .marked
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        #[cfg(test)]
+        self.audit();
+    }
+
+    /// The marks taken to visit at a writing, as [`super::keyed::Readied::begin_visits`]: how
+    /// many.
+    pub(super) fn begin_visits(&mut self) -> usize {
+        let visits = self.replies.begin_visits();
+        #[cfg(test)]
+        self.audit();
+        visits
+    }
+
+    /// The next reply to visit, at its slot, as [`super::keyed::Readied::next_visit`].
+    pub(super) fn next_visit(&mut self) -> Option<(K, usize)> {
+        let exchange = self.replies.next_visit()?;
+        let at = self.replies.slot(exchange)?;
+        Some((exchange, at))
+    }
+}
+
+/// The node's marks (node.md §2.9 step 6c): the exchanges whose native job gave its door something
+/// the node's task acts on since the node's task took the last, each named once by its job
+/// ([`Native::mark`]) on a bounded channel from whichever shard it runs on, taken at each turn
+/// before the replies are visited (`Node::take_marks`); and the word that a mark found no room,
+/// on which every reply is visited. Bound: the channel's room, twice
+/// the exchanges the transport holds at once ([`Marks::new`]), each named once while its door's
+/// word stands (`Handed::marked`); none made where the channel cannot be, on which every turn
+/// visits each.
+pub(super) struct Marks {
+    taken: Option<(ChannelReceiver<ExchangeId>, Marker)>,
+    room: usize,
+}
+
+/// A door's end of the node's marks: the channel's sender, whose clone is a count
+/// (`Sender::clone`), and the word a mark with no room sets.
+#[derive(Clone)]
+pub(super) struct Marker {
+    marks: Sender<ExchangeId>,
+    missed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Marks {
+    /// Marks with room for twice `exchanges`, the exchanges the transport holds, at least one: a
+    /// door names its exchange once until the node's task takes the name, and once more where it
+    /// is given back and taken by a new exchange first, its old name waiting, which the node's
+    /// task passes over. A door given back and taken again more often within a turn can find no
+    /// room, which visits every reply.
+    pub(super) fn new(exchanges: usize) -> Self {
+        let room = exchanges.saturating_mul(2).max(1);
+        let taken = hyper_rt::sync::channel(room).ok().map(|(marks, taken)| {
+            (
+                taken,
+                Marker {
+                    marks,
+                    missed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            )
+        });
+        Self { taken, room }
+    }
+
+    /// The end a door names its exchange on, kept with the door.
+    fn marker(&self) -> Option<Marker> {
+        self.taken.as_ref().map(|(_, marker)| marker.clone())
+    }
+
+    /// Whether a mark found no room since the last call, or no channel was made: every reply is
+    /// visited.
+    pub(super) fn missed(&self) -> bool {
+        match &self.taken {
+            Some((_, marker)) => marker
+                .missed
+                .swap(false, std::sync::atomic::Ordering::AcqRel),
+            None => true,
+        }
+    }
+
+    /// The marks' room, the most taken at a turn.
+    pub(super) fn room(&self) -> usize {
+        self.room
+    }
+
+    /// The next exchange named, in the order named.
+    pub(super) fn take(&mut self) -> Option<ExchangeId> {
+        let (taken, _) = self.taken.as_mut()?;
+        taken.try_recv().ok().flatten()
     }
 }
 
@@ -3384,12 +3565,18 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // the host kept from a request before it, or one made (6d): one that cannot be made leaves
         // nothing to reply on, so the exchange is refused, as an owner past what it holds refuses
         // one, which its asker asks again after.
-        let Some((native, replies)) = self.host.doors.take() else {
+        let Some((mut native, replies)) = self.host.doors.take() else {
             self.driver
                 .endpoint()
                 .refuse_exchange(exchange, Refusal::Budget);
             return;
         };
+        // Its job names its exchange on the node's marks as it gives its door anything, so the
+        // node's turn visits its reply alone; the marker kept with the door.
+        native.exchange = Some(exchange);
+        if native.marker.is_none() {
+            native.marker = self.marks.marker();
+        }
         let mut admitted_ns = None;
         let mut driven = None;
         let work = match (head, self.gateway.as_deref(), slowed) {
@@ -3914,15 +4101,20 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// The node's task's half of each native reply (node.md §2.9 step 6c): what its job gave
     /// written to its exchange as far as the exchange takes it, after the host's step and the
-    /// bodies' feeding at each turn ([`Replies`]). A get's job gives a piece only once the last is
-    /// written whole, so where one is and the exchange takes more, its job gives the next within
-    /// the turn: as many of its pieces go in a turn as the exchange takes, as when its job wrote
-    /// them, at most a window's (`GatewaySettings::window`, the blocks its driver holds read at
-    /// once) and the end past them. One whose rounds ran out makes the next turn due at once. One
-    /// over, ended, refused or let go, is let go.
+    /// bodies' feeding at each turn ([`Replies`]), of the replies marked since the last
+    /// ([`Writes`]): each at its push, as its job gives it anything or ends (`Native::mark`), as
+    /// its exchange takes more or its request's body arrives (`Node::on_event`), as its feeding
+    /// ends, and at each turn while its rounds ran out or it waits for room. A walk of every reply
+    /// visited thousands that had nothing to write. A get's job gives a piece only once the last
+    /// is written whole, so where one is and the exchange takes more, its job gives the next
+    /// within the turn: as many of its pieces go in a turn as the exchange takes, as when its job
+    /// wrote them, at most a window's (`GatewaySettings::window`, the blocks its driver holds read
+    /// at once) and the end past them. One whose rounds ran out makes the next turn due at once.
+    /// One over, ended, refused or let go, is let go.
     pub(super) fn write_replies(&mut self) -> Result<(), NodeError> {
         self.replied = false;
-        if self.replies.is_empty() {
+        self.take_marks();
+        if self.replies.begin_visits() == 0 {
             return Ok(());
         }
         // The shard's clock, read once for the turn's replies, as the host's step reads it.
@@ -3932,9 +4124,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .as_ref()
             .map_or(0, |gateway| gateway.window)
             .saturating_add(2);
-        let mut at = 0;
-        while at < self.replies.len() {
+        while let Some((exchange, at)) = self.replies.next_visit() {
             let mut left = rounds;
+            // Whether it is visited at the next turn with nothing more said: its rounds ran out,
+            // or it waits for room in the endpoint's budget, whose freeing turns no node, and its
+            // exchange is vouched for at a visit (`Replies::wait_for_room`).
+            let mut again = false;
             let over = loop {
                 match self.write_reply(at, now) {
                     Wrote::Over => break true,
@@ -3943,15 +4138,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         left = left.saturating_sub(1);
                         if left == 0 {
                             self.replied = true;
+                            again = true;
                             break false;
                         }
-                        let job = self
-                            .replies
-                            .at(at)
-                            .and_then(|(exchange, _)| self.host.job_of(*exchange));
                         // A job that ended gave all it will: the next write finds its channel
                         // ended.
-                        if let Some(job) = job {
+                        if let Some(job) = self.host.job_of(exchange) {
                             self.lend(|host, node| {
                                 host.turn_job(node, job, now, &mut Timing::from(now))
                             })?;
@@ -3959,19 +4151,40 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     }
                 }
             };
+            again |= self
+                .replies
+                .at(at)
+                .is_some_and(|(_, replies)| replies.room.is_some());
             if over {
                 let Some((exchange, mut replies)) = self.replies.take(at) else {
-                    break;
+                    continue;
                 };
                 if let Some((_, feeding)) = self.feeding.remove(exchange) {
                     replies.body = Some(feeding.let_go());
                 }
                 self.host.doors.give_replies(replies);
-            } else {
-                at = at.saturating_add(1);
+            } else if again {
+                self.replies.mark(exchange);
             }
         }
         Ok(())
+    }
+
+    /// The exchanges the node's marks name since the last turn's, each one's reply marked to
+    /// visit, then its door's word let go, so what its job gives after names it again (`Marks`);
+    /// every reply where a mark found no room. At most the marks' room a
+    /// call: a job naming its exchange again as fast as it is taken waits for the next turn, which
+    /// its waker makes due.
+    fn take_marks(&mut self) {
+        if self.marks.missed() {
+            self.replies.mark_all();
+        }
+        for _ in 0..self.marks.room() {
+            let Some(exchange) = self.marks.take() else {
+                break;
+            };
+            self.replies.marked_by_job(exchange);
+        }
     }
 
     /// One native reply written as far as its exchange takes it at the turn of `now`: a reply with
@@ -4043,7 +4256,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// and given to its job as far as the job takes it, after the host's step in which the job took
     /// what it was given ([`Feeding`]). One that moved makes the node's next turn due at once
     /// (`host_due`), so its job takes what it was given; one ended, given or dropped whole or its
-    /// exchange failed, is let go.
+    /// exchange failed, is let go, its reply marked.
     pub(super) fn feed_bodies(&mut self) {
         self.fed = false;
         let mut at = 0;
@@ -4060,8 +4273,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         break;
                     };
                     let sender = feeding.let_go();
+                    // Its reply, which waited for the body read whole, is written next.
                     self.replies
                         .change(exchange, |replies| replies.body = Some(sender));
+                    self.replies.mark(exchange);
                 }
             }
         }
@@ -8678,15 +8893,45 @@ pub(super) mod tests {
         }
     }
 
-    impl<K> Writes<K>
+    impl Replies {
+        /// Whether, by its own state and its job's alone, its visit would move it now: it waits
+        /// for room, which only a visit asks the budget for; or, waiting for no body, its job said
+        /// its work is held, or, writing nothing, its job gave an answer or ended. What its
+        /// exchange says (`BodyReady`, `Writable`) marks it as it is said (`Node::on_event`).
+        pub(super) fn could_move(&self) -> bool {
+            let load = |word: &std::sync::atomic::AtomicBool| {
+                word.load(std::sync::atomic::Ordering::Acquire)
+            };
+            let told = self.handed.told.load(std::sync::atomic::Ordering::Acquire) > 0;
+            self.room.is_some()
+                || (self.drained.is_none()
+                    && (load(&self.handed.held)
+                        || (self.out.is_none() && (told || load(&self.handed.ended)))))
+        }
+    }
+
+    impl<K: Copy> Writes<K>
     where
         (K, Replies): Key<Of = K>,
     {
         /// The oracle, after each change: its slots exact (`Keyed::audit`), its heap's places and
         /// order ([`Earliest::audit`]), each reply's key its due, and the first the earliest a
-        /// full recount finds.
+        /// full recount finds; and a recount of every reply: each that could move now marked,
+        /// taken to visit, visited, or named by its job on the node's marks (`Handed::marked`).
         pub(super) fn audit(&self) {
             self.replies.audit();
+            for (exchange, replies) in self.replies.iter() {
+                if replies.could_move() {
+                    assert!(
+                        self.replies.covered(*exchange)
+                            || replies
+                                .handed
+                                .marked
+                                .load(std::sync::atomic::Ordering::Acquire),
+                        "a reply that could move, unmarked"
+                    );
+                }
+            }
             self.due.audit(self.replies.len(), "due");
             let beat = room_beat();
             for (at, (_, replies)) in self.replies.iter().enumerate() {
@@ -13392,6 +13637,112 @@ pub(super) mod tests {
             }
         }
         (visited, due)
+    }
+
+    /// A turn's writing visits the replies something marked, not every reply in flight: 1,024
+    /// native gets held, each job giving its head as it starts, then at each of 8 turns 16 jobs
+    /// giving their next piece, each named on the node's marks as it gives (`Native::mark`, taken
+    /// as `Node::take_marks` takes them), and one reply whose exchange took no more visited again
+    /// only once its exchange says it takes more (`Event::Writable`). Before, each of the 10
+    /// writings walked every reply held (`write_replies` over every slot): 10,240 visits. Now the
+    /// first writing's 1,024, each reply's head, 16 at each turn after, and the one `Writable`
+    /// named: 1,153. The oracle checks each change against a recount of what could move
+    /// (`Writes::audit`).
+    #[test]
+    fn a_turns_writing_visits_the_replies_that_moved_not_every_one() {
+        const IN_FLIGHT: u64 = 1024;
+        const READY: u64 = 16;
+        const TURNS: u64 = 8;
+        let mut writes: Writes<u64> = Writes::default();
+        let mut natives = Vec::new();
+        let mut seen = Vec::new();
+        for exchange in 0..IN_FLIGHT {
+            let (native, replies) = native_door().unwrap();
+            assert!(writes.push((exchange, replies)).is_none());
+            natives.push(native);
+            seen.push(Seen {
+                credit: usize::MAX,
+                ..Seen::default()
+            });
+        }
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        let mut turn = |writes: &mut Writes<u64>, seen: &mut [Seen]| {
+            writes.begin_visits();
+            let mut visited = Vec::new();
+            while let Some((exchange, at)) = writes.next_visit() {
+                let to = &mut seen[usize::try_from(exchange).unwrap()];
+                let wrote = writes
+                    .change_at(at, |replies| {
+                        replies.write(to, true, 0, &mut moved, &mut slowed)
+                    })
+                    .unwrap();
+                assert_ne!(wrote, Wrote::Over);
+                visited.push(exchange);
+            }
+            visited
+        };
+        // Each job opens its get: its head given, its exchange named.
+        for (exchange, native) in (0..IN_FLIGHT).zip(natives.iter_mut()) {
+            open_get(native, b"fields", 64 * TURNS);
+            writes.marked_by_job(exchange);
+        }
+        let (mut before, mut after) = (0, 0);
+        before += writes.len();
+        let first = turn(&mut writes, &mut seen);
+        after += first.len();
+        assert_eq!(first.len(), usize::try_from(IN_FLIGHT).unwrap());
+        assert!(seen.iter().all(|seen| seen.answered.is_some()));
+        // One exchange takes nothing more: its piece waits for its `Writable`.
+        let stalled = 5;
+        seen[stalled].credit = 0;
+        for t in 0..TURNS {
+            let giving: Vec<u64> = (0..READY)
+                .map(|k| (t * READY + k * 61) % IN_FLIGHT)
+                .collect();
+            for &exchange in &giving {
+                let native = &mut natives[usize::try_from(exchange).unwrap()];
+                assert!(native.written(), "{exchange} wrote its last whole");
+                assert_eq!(
+                    native.give(Told::Bytes(Bytes::from(vec![7; 64]))),
+                    Sent::Taken
+                );
+                writes.marked_by_job(exchange);
+            }
+            before += writes.len();
+            let mut visited = turn(&mut writes, &mut seen);
+            if t == 1 {
+                // Its exchange takes more: said once, it is visited and its piece written.
+                seen[stalled].credit = usize::MAX;
+                writes.mark(u64::try_from(stalled).unwrap());
+                before += writes.len();
+                let writable = turn(&mut writes, &mut seen);
+                assert_eq!(writable, vec![u64::try_from(stalled).unwrap()]);
+                visited.extend(writable);
+            }
+            visited.sort_unstable();
+            let mut expected = giving.clone();
+            if t == 1 {
+                expected.push(u64::try_from(stalled).unwrap());
+            }
+            expected.sort_unstable();
+            expected.dedup();
+            visited.dedup();
+            assert_eq!(visited, expected, "turn {t} visits what moved alone");
+            after += visited.len();
+        }
+        println!(
+            "{IN_FLIGHT} replies in flight, {READY} moving a turn: {after} visits over {} \
+             writings ({before} before)",
+            TURNS + 2
+        );
+        assert_eq!(before, usize::try_from((TURNS + 2) * IN_FLIGHT).unwrap());
+        assert_eq!(
+            after,
+            usize::try_from(IN_FLIGHT + TURNS * READY + 1).unwrap()
+        );
+        // No reply that could move is left unmarked, and nothing is marked once each was written.
+        writes.audit();
+        assert_eq!(writes.replies.marked(), 0);
     }
 
     /// The node's wait (`Node::host_due`) reads the earliest due of the native replies waiting for

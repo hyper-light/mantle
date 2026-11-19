@@ -1863,6 +1863,83 @@ fn a_stream_its_peer_reads_at_its_own_pace_is_never_refused() {
     );
 }
 
+/// An upload its peer reads at its own pace, its peer's one note said as the request arrived, is
+/// waited on while its bytes move, wherever its peer pauses: the note starts the wait again from
+/// itself, and what the window carried is counted from it too (mantle research/77 D1). Counted from
+/// the judgement that found the note, a note heard as the request began left the next window the
+/// few milliseconds the note came after the send, and a pause of the peer's reads across them
+/// refused the exchange `Stalled` while its body was being read (mantle's put of 20 MiB on CI's
+/// ubuntu-24.04-arm, 2026-11-19: its period the 6.10 s its last put took, its node's one note
+/// 4.76 ms after the request came, 8,333,704 bytes read, and the refusal 6,114.9 ms after the send,
+/// inside a 195 ms pause of the node's reads at a block's boundary). Do: over a link of a
+/// millisecond each way, upload 2 MiB to a server that says it is at work as the request arrives
+/// and not again, reads 64 KiB each 100 ms, and reads nothing for 600 ms from 1 MiB, across the
+/// period's end; then to one that reads nothing more from 1 MiB. Expect: the first answered whole,
+/// a period and more after the send, on its one note; the second refused `Stalled` within three
+/// periods, as a peer that stops reading is.
+#[test]
+fn an_upload_paused_across_a_judgement_after_its_peers_only_note_is_waited_on() {
+    const BODY: u64 = 2 << 20;
+    const STEP: u64 = 64 << 10;
+    const EVERY: Duration = Duration::from_millis(100);
+    let upload = |pause: Duration| {
+        let pair = Pair::new();
+        let now = hyper_sim::Anchor::new().instant(0).unwrap();
+        let book = || pair.book(Role::Node, Role::Node);
+        let a = pair.node::<Mantle>(1, Role::Node, book(), limits(), 256 << 20, now);
+        let b = pair.node::<Mantle>(2, Role::Node, book(), limits(), 256 << 20, now);
+        let mut net = Net::shaped(now, a, b, 1_000_000_000, 1 << 20, Duration::from_millis(1));
+        let address = net.b_address;
+        net.a.connect(now, 2, address).unwrap();
+        let (mut asker, mut server) = (Asker::new(), Server::new());
+        server.pace = Some((STEP, EVERY));
+        server.vouch_arrived = true;
+        server.pause_read = Some((BODY / 2, pause));
+        net.until(TURNS, |net| {
+            asker.drive(&mut net.a);
+            server.serve(&mut net.b);
+            !asker.connected.is_empty() && !server.connected.is_empty()
+        });
+        let began = net.now;
+        asker
+            .ask(
+                &mut net.a,
+                net.now,
+                2,
+                (Kind::Snapshot, Class::Bulk),
+                3,
+                Some(BODY),
+                PERIOD,
+            )
+            .unwrap();
+        for _ in 0..TURNS * 10 {
+            net.exchange();
+            asker.drive(&mut net.a);
+            server.now = Some(net.now);
+            server.serve(&mut net.b);
+            if asker.finished() {
+                break;
+            }
+            net.exchange();
+            net.advance_within(Duration::from_millis(10));
+        }
+        assert!(asker.finished(), "{:?}", asker.asked);
+        (
+            asker.asked[0].clone(),
+            net.now - began,
+            net.b.stats().notes_made,
+        )
+    };
+    let (asked, took, notes) = upload(Duration::from_millis(600));
+    assert_eq!(asked.refused, None, "{asked:?} after {took:?}");
+    assert_eq!((asked.reply, asked.read), (Some(BODY), BODY), "{asked:?}");
+    assert!(took > PERIOD, "the upload outlasted a period: {took:?}");
+    assert_eq!(notes, 1, "the server said it was at work once");
+    let (asked, took, _) = upload(Duration::from_secs(3_600));
+    assert_eq!(asked.refused, Some((Refusal::Stalled, false)), "{asked:?}");
+    assert!(took <= PERIOD * 3, "{took:?}");
+}
+
 /// Replication frames on lanes arrive in order, each lane on its own stream; a lane is as wide as
 /// the core's window, and the lanes to a peer are bounded.
 #[test]

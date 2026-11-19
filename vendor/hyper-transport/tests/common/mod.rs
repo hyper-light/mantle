@@ -1006,6 +1006,8 @@ struct Served {
     whole: Option<Instant>,
     /// When its body's pause began, by the server's `now` ([`Server::pause_body`]).
     paused: Option<Instant>,
+    /// When its request body's pause began, by the server's `now` ([`Server::pause_read`]).
+    read_paused: Option<Instant>,
 }
 
 /// A node that answers every request: it reads the request's body, checking every byte, and
@@ -1024,6 +1026,9 @@ pub struct Server {
     pub vouch_seeds: Vec<u64>,
     /// It says so no more from this, by `now`: an owner whose work stopped moving.
     pub vouch_until: Option<Instant>,
+    /// It says it is at work on each request once, as the request arrives, and no more while it
+    /// reads its body: an owner whose first ask (a bucket's read) was out as the body began.
+    pub vouch_arrived: bool,
     /// Once this much of a reply's body is written, it writes no more of it for this long, by
     /// `now`, saying meanwhile that it is at work as it does while it thinks: a body paused between
     /// blocks while its owner's own asks run.
@@ -1035,6 +1040,9 @@ pub struct Server {
     /// all that has arrived, as it arrives). A peer that takes what it is sent at its own pace and
     /// in its own steps, the credit it gives back coming in those steps.
     pub pace: Option<(u64, Duration)>,
+    /// Once this much of a request body is read, it reads no more of it for this long, by `now`:
+    /// a put whose window of blocks is full while its chunks' asks are out.
+    pub pause_read: Option<(u64, Duration)>,
     /// When the paced reads began, by `now`, and what they have read since.
     paced: Option<(Instant, u64)>,
     /// The clock the think time is read against, as the test last set it.
@@ -1057,9 +1065,11 @@ impl Server {
             think: Duration::ZERO,
             vouch_seeds: Vec::new(),
             vouch_until: None,
+            vouch_arrived: false,
             pause_body: None,
             unread_above: 0,
             pace: None,
+            pause_read: None,
             paced: None,
             now: None,
             answered: 0,
@@ -1111,7 +1121,11 @@ impl Server {
                     reply: body.unwrap_or(0),
                     whole: None,
                     paused: None,
+                    read_paused: None,
                 });
+                if self.vouch_arrived {
+                    node.working(exchange);
+                }
             }
             Event::Frame {
                 peer, lane, frame, ..
@@ -1233,7 +1247,16 @@ impl Server {
             return false;
         }
         while served.read < served.body {
-            let piece = self.piece();
+            let mut piece = self.piece();
+            if let Some((after, pause)) = self.pause_read {
+                if served.read < after {
+                    piece = piece.min(after - served.read);
+                } else if let Some(now) = self.now
+                    && now < *served.read_paused.get_or_insert(now) + pause
+                {
+                    return false;
+                }
+            }
             if piece == 0 {
                 return false;
             }

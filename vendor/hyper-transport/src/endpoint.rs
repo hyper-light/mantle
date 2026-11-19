@@ -4691,14 +4691,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             // Its peer's owner said within this window that it is at work on it
             // (`Endpoint::working`): the peer's statement, not the clock, judges it, its wait
-            // starting again from the note (mantle research/77 D1). Its notes stopping, a window
-            // with no note is judged as before.
+            // starting again from the note, and what the next window carries counted from it too
+            // (`Carry::noted`; mantle research/77 D1). Its notes stopping, a window with no note
+            // is judged as before.
             if let Some(vouched) = exchange
                 .vouched
                 .filter(|&vouched| vouched > exchange.carry.started())
             {
                 let acknowledged = exchange.out.acked;
-                exchange.carry.vouched(vouched, at, backlog, acknowledged);
+                exchange.carry.vouched(vouched, backlog, acknowledged);
                 return Ok(());
             }
             if Self::ours_to_move(exchange, peer_takes) {
@@ -5228,12 +5229,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let mut bytes = lane.prefix.get(..len).ok_or(Refusal::Corrupt)?;
         let stream = StreamId::from(VarInt::decode(&mut bytes).map_err(|_| Refusal::Corrupt)?);
         let now = self.now;
-        if let Some(id) = self.exchange_on(conn, stream)
+        // The window the note begins is counted from what the connection had moved as it came
+        // (`Carry::noted`), not from the judgement that finds it.
+        let noted = self
+            .exchange_on(conn, stream)
+            .map(|id| (id, moved(conn, self.rank_of(id))));
+        if let Some((id, at)) = noted
             && let Some(exchange) = self.exchanges.get_mut(id)
             && exchange.opened
             && !exchange.ended
         {
             exchange.vouched = Some(now);
+            exchange.carry.noted(at);
             self.stats.notes_heard = self.stats.notes_heard.saturating_add(1);
         }
         Ok(true)

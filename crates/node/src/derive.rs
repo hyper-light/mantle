@@ -200,14 +200,17 @@ pub fn operations(share: u64, beside: u64, charges: &Charges, serving: Served) -
     (usize::try_from(count).unwrap_or(usize::MAX), bytes)
 }
 
-/// The operations a copy holds at once once taken, its get and its put (research/89 §3.7): a
-/// copy is charged each at the most an operation holds (`host::charged`).
+/// The drivers a copy runs at once once taken, its get of the source and its put of the copy
+/// (research/89 §3.7): a copy is charged both at once ([`Charges::copy`], `host::charged`), each
+/// at most the most an operation holds.
 pub(crate) const COPY_WEIGHT: usize = 2;
 
-/// The most bytes one operation is charged: a copy's, its get's and its put's at once, each at
-/// the most a get or a put holds ([`COPY_WEIGHT`], `host::charged`). The operations' bytes are
-/// never less, so every operation is admitted alone, and the door, which takes its requests in
-/// the order they came, never holds one that can never be taken.
+/// The most bytes one operation is charged as it is admitted: a copy's, its get's and its put's
+/// at once at the floor's window, each at most the most a get or a put holds ([`COPY_WEIGHT`];
+/// [`Charges::copy`] of the largest body a copy writes, `host::charged`). The operations' bytes
+/// are never less, so every operation is admitted alone, and the door, which takes its requests
+/// in the order they came, never holds one that can never be taken. A put, a get or a copy holds
+/// a window past the floor's only where those bytes hold it beside the others' (`host::fitting`).
 pub fn most_charged(charges: &Charges) -> u64 {
     u64::try_from(COPY_WEIGHT)
         .ok()
@@ -325,8 +328,9 @@ pub fn charges(
 /// `get::most_bytes`) and the host's: a put's chunks copied to send, every chunk of every block
 /// going down, a piece of its body carried, and its records of the blocks it wrote until its file
 /// names them (`put::records_for`); a get's block taken and written out. A write is
-/// charged at its body's length, known from its head; every other operation at the most any
-/// holds, as a get's object's size is known only once its row is read.
+/// charged at its body's length, known from its head ([`Charges::write`]); a get for its window
+/// ([`Charges::read`]); a copy for its get's and its put's at once ([`Charges::copy`]); every
+/// other operation at the most any holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Charges {
     window: usize,
@@ -418,6 +422,13 @@ impl Charges {
             held = held.max(bytes.unwrap_or(u64::MAX));
         }
         held
+    }
+
+    /// What a copy holds with `get` blocks of its source being read and `put` blocks of its copy
+    /// of `length` bytes going down at once: its get's ([`Charges::read`]) beside its put's
+    /// ([`Charges::write`]), as both run at once. A sum past a u64 saturates: past any memory.
+    pub fn copy(&self, get: usize, put: usize, length: u64) -> u64 {
+        self.read(get).saturating_add(self.write(put, length))
     }
 
     /// The least of the schemes' whole blocks: the most blocks a body is cut into.
@@ -4039,6 +4050,32 @@ mod tests {
         assert_eq!(charges.smallest_block(), block(copies));
         assert_eq!(charges.largest_block(), block(coded));
         assert!(block(copies) < block(coded));
+    }
+
+    /// A copy is charged its get and its put at once, each for its own window: its get's blocks
+    /// being read beside its put's going down of its copy's length, each block more of either
+    /// charged more. At the floor's windows and the largest body a copy writes it is within the
+    /// most one operation is charged, which the operations' bytes always hold, and a shorter copy
+    /// holds less.
+    #[test]
+    fn a_copy_is_charged_its_get_and_its_put_at_once() {
+        let copies = durability::Scheme::Copies(3);
+        let coded = durability::Scheme::Rs(mantle_ec::Code::new(2, 1).unwrap());
+        let charges = Charges::new(1, &[copies, coded]).unwrap();
+        let largest = mantle_s3::body::MAX_UPLOAD;
+        for (get, put, length) in [(1, 1, largest), (4, 2, largest), (2, 3, 1 << 20)] {
+            assert_eq!(
+                charges.copy(get, put, length),
+                charges.read(get) + charges.write(put, length)
+            );
+            assert!(charges.copy(get + 1, put, length) > charges.copy(get, put, length));
+            assert!(charges.copy(get, put + 1, largest) > charges.copy(get, put, largest));
+        }
+        let floor = charges.copy(1, 1, largest);
+        assert!(floor > charges.most());
+        assert!(floor <= most_charged(&charges));
+        assert!(charges.copy(1, 1, 1 << 20) < floor);
+        assert_eq!(charges.copy(usize::MAX, 1, largest), u64::MAX);
     }
 
     /// A share holds an operation of the largest blocks and as many more at the least an operation

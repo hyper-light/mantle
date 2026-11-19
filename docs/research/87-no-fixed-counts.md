@@ -143,12 +143,17 @@ per-principal shedding stay as §4.5 plans them.
 | `derive::batch` (8) and `entry_limits`' commands | an entry carries at most 8 commands | an entry carries every command waiting that fits its bytes, `max_entry_bytes` (`wire::largest_entry_bytes`, 561,804) | [1] §10.2.2, [8]: the batch is what waited |
 | the volume's batch (`identities × batch`) | the chunks the cell's operations may write a volume at once | the cell's identities times each node's admission ceiling times its window | the same rule, now from the ceiling |
 | `derive::OBJECTS` (8) | the operations a node runs at once, and its native clients | a learned limit within `[1, C]`, the point of greatest power found by probing, from the operations' own completions; `C` as many operations as the operations' bytes hold, each charged its own (§4, §4a) | [3] p. 240, [4], [6], [7] |
-| `gateway.window` (1), as each put and get held it | the blocks a put holds going down and a get holds being read | the floor; a put and a get each hold `⌈R·T/B⌉` blocks, `T` a block's measured time (a put's to recorded, a get's to read) and `R` its clients' measured pace (a put's first block filled, a get's block taken once its client's room was full), each smoothed at RFC 6298's gain of 1/8, within `[1, the body's blocks]` and the operations' bytes (node.md §2.8, `crate::window`); a copy's still one | [7]; node.md §2.6 |
+| `gateway.window` (1), as each put, get and copy held it | the blocks a put holds going down and a get holds being read | the floor, `⌈R·T/B⌉` at its least, the least a put or a get holds and still moves; a put and a get each hold `⌈R·T/B⌉` blocks, `T` a block's measured time (a put's to recorded, a get's to read) and `R` its clients' measured pace (a put's first block filled, a get's block taken once its client's room was full), each smoothed at RFC 6298's gain of 1/8, within `[1, the body's blocks]` and the operations' bytes (node.md §2.8, `crate::window`); a copy's put the put's window `W`, and its get, whose client is that put, draining `W` blocks a block's time to recorded `T_w`, `⌈W·T_r/T_w⌉` blocks, `T_r` a block's time to read (`Windows::copy_get`) | [7]; node.md §2.6 |
 | `gateway.scan_rows` (1) | the rows a step of a bucket's attempt passes or removes | as many as the largest entry a range takes holds of what one row a collection removes writes (`derive::scan_rows`, `wire::largest_collected_bytes`) | the range's own bound, `max_entry_bytes` (§1: a batch bounded by bytes) |
 
 The window, `gateway.window`, is one block, "the floor" (node.md §1.4). It is not one of the three
-counts; node.md §2.6 planned it as `⌈R·T/B⌉`, and since 2026-11-18 a put and a get each hold that,
-learned from the node's own (node.md §2.8).
+counts; node.md §2.6 planned it as `⌈R·T/B⌉`, and since 2026-11-18 a put, a get and a copy each hold
+that, learned from the node's own (node.md §2.8), the floor's one block only until the node has
+measured its operations or where the operations' bytes hold no more. A copy's get is the law with
+its put as the client: its drain is the put's throughput, its window of blocks over a block's time
+to recorded, taken from what the node learned of its puts, since a put faster than the reads would
+never fill its room and so never be timed from it. With that, no count in admission, batching or
+sessions is fixed: each row above is learned or derived from the bytes it bounds.
 
 ## 3. The learned limit
 

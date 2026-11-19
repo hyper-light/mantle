@@ -490,7 +490,8 @@ chunks (one referrer a file, metadata design §2), under each metadata directive
 `x-amz-copy-source-if-*` conditions, a version named as the source, a part copy's range, and S3's
 refusals of a copy onto itself, past 5 GiB, of a delete marker and of a range of a small source;
 the copy's ETag is its bytes' MD5 and its checksum a full-object value, and a whole copy is held
-to the source's own digests. A copy counts as two of the host's operations at both doors.
+to the source's own digests. A copy is charged its get's and its put's windows at once at both
+doors.
 DeleteObjects deletes up to 1,000 objects, each as DeleteObject would, its document held to its
 `Content-MD5` or checksum, quiet or not. mantle keeps no object tags yet and answers as S3 answers
 a directory bucket: GetObjectTagging gives a version's empty set, which the AWS CLI asks of every
@@ -1403,7 +1404,13 @@ targets. Each item is done when its test passes on every supported target.
    a block the node holds whole; a get is admitted at one block and widens to that window once its
    version is read, as its range's blocks and the operations' bytes hold (node.md §2.8). On the S3
    door the connection times its client's pace from its socket as it writes each block, so a client
-   that outpaces the reads is paced too (`listener::io::Drained`; node.md §2.8). A replica's chunk put no longer ends at the
+   that outpaces the reads is paced too (`listener::io::Drained`; node.md §2.8). *Built
+   (2026-11-18)*: a copy's windows, its put the window the node learned of its puts and its get as
+   many blocks as that put drains while one is read (`Windows::copy_get`), each admitted at one
+   block and widened once its source's version is read, the bytes its span does not need given back
+   (`host::copy_windows`; node.md §2.8). With it goal 16 holds no fixed count in admission, batching
+   or sessions (research/87 §2): the window's one block is the floor the windows are learned from,
+   `gateway:window`'s row derived. A replica's chunk put no longer ends at the
    idle timeout (3.07 s) while the peer's
    device makes it durable, a write slower than that once ending the put as stalled (on
    windows-11-arm a volume's first write took up to 8.0 s before calibration saw NTFS's zeros;
@@ -1412,8 +1419,7 @@ targets. Each item is done when its test passes on every supported target.
    (research/77 D1 and D2, on main at `17eb8032`, above), and since 2026-11-17 the node's client
    gives an object's or a chunk's exchange at least the node's serve period and at most the stock
    patience before it has measured a reply (above). *Open*: the entitled rate `min(body rate,
-   principal's fair share)`, which needs item 6; a copy's get's and put's windows, still one block,
-   the floor (`gateway:window` in `scripts/arbitrary-open.txt`); the hedge quantile, with hedging (gateway.md
+   principal's fair share)`, which needs item 6; the hedge quantile, with hedging (gateway.md
    §3); telling held from moved in a note for an asker with no deadline (research/77); and the done
    test.
 9. **Operation identity**: client-drawn identities, `amz-sdk-invocation-id` on the listener,

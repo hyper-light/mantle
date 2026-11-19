@@ -139,7 +139,8 @@ pub(crate) struct Job {
     charge: u64,
     /// The blocks a put of it holds going down, or a get of it being read, at once, as the node
     /// learned them (`crate::window`) when it was admitted, a get's once its version was read
-    /// (`reading`), and charged for them.
+    /// (`reading`), and charged for them. A copy's get and put hold their own, fitted once its
+    /// source's version is read (`copy_windows`), and this is the floor's.
     window: usize,
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
@@ -310,15 +311,6 @@ enum Work {
     Copy(Box<Copying>),
     /// An operator's request on the account's principals and their keys.
     Admin(Box<Administering>),
-}
-
-/// The operations an op holds at once once taken: a copy two, its get and its put (research/89
-/// §3.7); any other one.
-pub(super) fn weight(op: &Op) -> usize {
-    match op {
-        Op::Copy(_) | Op::CopyPart(_) => crate::derive::COPY_WEIGHT,
-        _ => 1,
-    }
 }
 
 /// The version a request's `versionId` names: `null`, or one of mantle's 13-character IDs
@@ -1066,7 +1058,7 @@ impl Moves {
         }
     }
 
-    /// What an operation moves: a copy's get and put are neither's, each charged the most
+    /// What an operation moves: a copy's get and put are neither's, both charged at once
     /// (`charged`).
     pub(super) fn of(op: &Op) -> Self {
         match (op, op.written()) {
@@ -1078,20 +1070,23 @@ impl Moves {
 }
 
 /// What an op is charged once taken, and its window ([`sized`]): a copy its get's and its put's at
-/// once (`weight`), each at the most an operation holds, as its source's size is known only once
-/// its row is read; any other op as what it moves says.
+/// once at the floor's window (`derive::Charges::copy`), its put's body the largest a copy writes,
+/// a CopyObject's or a part's (`MAX_UPLOAD`), as its source's size is known only once its version
+/// is read, when its windows are fitted to it ([`copy_windows`]); any other op as what it moves
+/// says. None on a node that hosts no objects.
 pub(super) fn charged(
     gateway: Option<&GatewaySettings>,
     learned: &crate::window::Windows,
     op: &Op,
 ) -> (u64, usize) {
-    let (charge, window) = sized(gateway, learned, Moves::of(op));
-    let charge = u64::try_from(weight(op))
-        .ok()
-        .and_then(|times| charge.checked_mul(times))
-        // Past what any memory holds: never admitted.
-        .unwrap_or(u64::MAX);
-    (charge, window)
+    match (gateway, op) {
+        (Some(gateway), Op::Copy(_) | Op::CopyPart(_)) => {
+            let floor = gateway.window;
+            let largest = mantle_s3::body::MAX_UPLOAD;
+            (gateway.charges.copy(floor, floor, largest), floor)
+        }
+        _ => sized(gateway, learned, Moves::of(op)),
+    }
 }
 
 /// What an operation that moves `moves` holds at its own size, and the blocks its driver holds at
@@ -1167,6 +1162,47 @@ fn reading(
             u64::MAX
         }
     })
+}
+
+/// The blocks a copy of a span of `length` bytes holds, its get's being read and its put's going
+/// down, and what it is charged for them, admitted at `charge` for the floor's windows
+/// ([`charged`]): its put's the window the node learned of its puts (`crate::window`), as a put of
+/// that length is ([`sized`]); then its get's beside it, as many blocks as that put drains while
+/// one is read (`Windows::copy_get`), no more than the span is cut into at the smallest block;
+/// each the widest whose charge (`derive::Charges::copy`) the operations' bytes hold, past what it
+/// was admitted at beside the other operations' (`admit::Admission::holds`), the floor's where none
+/// wider fits. The bytes past `charge` are taken, and those the span does not need, as a span
+/// shorter than the largest a copy writes holds less, are given back. Its source's size is known
+/// only once its version is read, so it is fitted then, before its drivers hold the blocks
+/// (`Node::copy_source_read`).
+fn copy_windows(
+    gateway: &GatewaySettings,
+    learned: &crate::window::Windows,
+    admission: Option<&mut crate::admit::Admission>,
+    length: u64,
+    charge: u64,
+) -> (usize, usize, u64) {
+    let charges = &gateway.charges;
+    let room = admission.as_deref();
+    let fits = |bytes: u64| {
+        let more = bytes.saturating_sub(charge);
+        if room.is_none_or(|room| room.holds(more)) {
+            bytes
+        } else {
+            u64::MAX
+        }
+    };
+    let floor = gateway.window;
+    let put = learned.put.blocks(length, charges.largest_block());
+    let put = fitting(gateway, put, |put| fits(charges.copy(floor, put, length)));
+    let get = learned.copy_get(put, length, charges.smallest_block());
+    let get = fitting(gateway, get, |get| fits(charges.copy(get, put, length)));
+    let held = charges.copy(get, put, length);
+    if let Some(admission) = admission {
+        admission.took(held.saturating_sub(charge));
+        admission.gave(charge.saturating_sub(held));
+    }
+    (get, put, held)
 }
 
 /// A bucket's versioning as GetBucketVersioning answers it: none for a bucket never versioned.
@@ -1726,12 +1762,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let admitted = job.charge;
         let block = op.as_ref().ok().and_then(|op| self.open_block(op));
         // A copy holds a get's window and a put's at once (`charged`), this job admitted at its
-        // head's charge, its get's: one whose put the operations' memory does not hold beside the
-        // rest is answered as one past the host's room is.
+        // head's charge, the most one operation holds: one whose put the operations' memory does
+        // not hold beside the rest is answered as one past the host's room is.
         let more = op
             .as_ref()
             .ok()
-            .filter(|op| weight(op) > 1)
+            .filter(|op| matches!(op, Op::Copy(_) | Op::CopyPart(_)))
             .map_or(0, |op| {
                 charged(self.gateway.as_ref(), &self.windows, op)
                     .0
@@ -2213,10 +2249,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 (None, _) => return self.fail_job(at, Status::Failed),
                 (Some(tag), outcome) => match untagged(tag) {
                     // An answer the driver refuses ends it with that outcome, which its next
-                    // turn replies.
+                    // turn replies. A block its get read is timed as a get's is, for the windows
+                    // the node's next gets and copies hold (`crate::window`).
                     (Driver::Get, id) => {
                         if let Some(get) = copying.get.as_mut() {
+                            get.tick(moved);
                             let _ = get.answer(id, get_answer(outcome));
+                            if let Some(ns) = get.take_read() {
+                                self.windows.get.took(ns);
+                            }
                         }
                     }
                     (Driver::Put, id) => {
@@ -4115,6 +4156,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .map(Pending::Read);
             return self.asked(at, asked, None);
         }
+        // What its put's blocks took to be recorded, for the windows the node's next puts and
+        // copies hold (`crate::window`). Its put's body comes at its get's pace, not a client's,
+        // so how fast that filled is no client's pace, and is not taken (`Put::take_filled`).
+        if let Some(ns) = copying.put.as_mut().and_then(Put::take_committed) {
+            self.windows.put.took(ns);
+        }
+        // Blocks its get begins from here are timed from now (`Get::take_read`).
+        if let Some(get) = copying.get.as_mut() {
+            get.tick(hyper_rt::futures::now_ns());
+        }
         // The put's outcome ends the copy: its reply, or its version's time to read first.
         let over = match (
             copying.put.as_ref().and_then(Put::outcome),
@@ -4343,11 +4394,6 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some((generation, root)) = gateway.keys.last() else {
             return self.fail_job(at, Status::Failed);
         };
-        let holding = Holding {
-            handover_ns: gateway.handover_ns,
-            window: gateway.window,
-        };
-        let window = gateway.window;
         let keyring = RootKeys {
             keys: gateway
                 .keys
@@ -4376,6 +4422,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let Some(Job {
             work: Work::Copy(copying),
             principal,
+            charge,
             ..
         }) = self.jobs.get_mut(at)
         else {
@@ -4531,10 +4578,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         copying.source_version = name::shown_id(version.null, order);
         copying.file = keys.file;
-        let get = Get::new(version.file, size, span, Box::new(keyring), window);
+        // Its windows, now its span's length is known: its put's the one learned, its get's as
+        // many blocks as that put drains while one is read, each as wide as the operations' bytes
+        // beside the others' hold; the bytes past its admitted charge taken, those its span does
+        // not need given back.
+        let (reads, writes, held) = copy_windows(
+            gateway,
+            &self.windows,
+            self.admission.as_mut(),
+            length,
+            *charge,
+        );
+        *charge = held;
+        let holding = Holding {
+            handover_ns: gateway.handover_ns,
+            window: writes,
+        };
+        let get = Get::new(version.file, size, span, Box::new(keyring), reads);
         let put = Put::new(commit, body, keys, layout, holding, Box::new(Random), now);
         match (get, put) {
-            (Ok(get), Ok(put)) => {
+            (Ok(mut get), Ok(put)) => {
+                get.tick(hyper_rt::futures::now_ns());
                 copying.get = Some(get);
                 copying.put = Some(put);
                 copying.stage = CopyStage::Run;
@@ -6136,6 +6200,189 @@ mod tests {
         );
     }
 
+    /// A copy is admitted at the floor's one block for its get and for its put, its source's size
+    /// unknown until its version is read: charged for both at once, its get's block being read and
+    /// its put's going down of the largest body a copy writes, whatever the node learned; never
+    /// past the most one operation is charged, which the operations' bytes always hold.
+    #[test]
+    fn a_copy_is_admitted_at_the_floor_charged_for_its_get_and_its_put_at_once() {
+        let scheme = durability::Scheme::Copies(3);
+        let charges = || crate::derive::Charges::new(1, &[scheme]).unwrap();
+        let gateway = GatewaySettings {
+            keys: Vec::new(),
+            handover_ns: 1,
+            window: 1,
+            objects: 1,
+            objects_bytes: crate::derive::most_charged(&charges()),
+            charges: charges(),
+            clients: 1,
+            bucket_quota: 1,
+            scan_rows: 1,
+            rates: Rates {
+                chunk: 0.000_001_552_511_415_525_114_2,
+                domains: None,
+                bursts: Vec::new(),
+                repair: 0.041_666_666_666_666_664,
+            },
+            target: 1e-11,
+        };
+        let source = mantle_s3::copy::Source {
+            bucket: "b".into(),
+            key: "k".into(),
+            version: None,
+        };
+        let copy = Op::Copy(Box::new(object::Copy {
+            bucket: "b".into(),
+            key: "k2".into(),
+            id: 1,
+            source: source.clone(),
+            conditions: Headers::default(),
+            headers: Headers::default(),
+            directive: Directive::Copy,
+            metadata: Vec::new(),
+            checksum: None,
+        }));
+        let part = Op::CopyPart(Box::new(object::CopyPart {
+            bucket: "b".into(),
+            key: "k2".into(),
+            upload: "0123456789ABC".into(),
+            number: 1,
+            id: 1,
+            source,
+            conditions: Headers::default(),
+        }));
+        let floor = charges().read(1) + charges().write(1, mantle_s3::body::MAX_UPLOAD);
+        let mut learned = crate::window::Windows::default();
+        assert_eq!(charged(Some(&gateway), &learned, &copy), (floor, 1));
+        assert_eq!(charged(Some(&gateway), &learned, &part), (floor, 1));
+        // Wide windows learned of the node's puts and gets: a copy is still admitted at the floor.
+        learned.put.took(80_000_000);
+        learned.put.paced(1_000_000_000, 1_000_000_000);
+        learned.get.took(80_000_000);
+        learned.get.paced(1_000_000_000, 1_000_000_000);
+        assert_eq!(charged(Some(&gateway), &learned, &copy), (floor, 1));
+        assert!(floor <= crate::derive::most_charged(&charges()));
+        // Any other operation is charged as what it moves says.
+        let get = Op::Get {
+            bucket: "b".into(),
+            key: "k".into(),
+            headers: Headers::default(),
+            version: None,
+        };
+        assert_eq!(
+            charged(Some(&gateway), &learned, &get),
+            sized(Some(&gateway), &learned, Moves::Read)
+        );
+    }
+
+    /// Once its source's version is read, a copy's put holds the window the node learned of its
+    /// puts, and its get as many blocks as that put drains while one is read (`copy_windows`,
+    /// `Windows::copy_get`): a slow put holds fewer of its source's blocks being read, a fast one
+    /// more, at least one and no more than its span's blocks, and a copy of one block holds one
+    /// for each. It is charged for both at once (`Charges::copy`): its admission takes the bytes
+    /// past what it was admitted at, gives back those its span does not need, and widens no
+    /// further than the operations' bytes hold, nor past what they hold beside the others'.
+    #[test]
+    fn a_copys_windows_follow_its_puts_pace_and_its_admission_what_they_hold() {
+        let scheme = durability::Scheme::Copies(3);
+        let charges = || crate::derive::Charges::new(1, &[scheme]).unwrap();
+        let block = charges().largest_block();
+        let long = 1u64 << 30;
+        let mut gateway = GatewaySettings {
+            keys: Vec::new(),
+            handover_ns: 1,
+            window: 1,
+            objects: 1,
+            objects_bytes: charges().copy(64, 64, long),
+            charges: charges(),
+            clients: 1,
+            bucket_quota: 1,
+            scan_rows: 1,
+            rates: Rates {
+                chunk: 0.000_001_552_511_415_525_114_2,
+                domains: None,
+                bursts: Vec::new(),
+                repair: 0.041_666_666_666_666_664,
+            },
+            target: 1e-11,
+        };
+        let admitted = charges().copy(1, 1, mantle_s3::body::MAX_UPLOAD);
+        let admission = |budget: u64, others: u64| {
+            let mut admission = crate::admit::Admission::new(64, budget, 0);
+            admission.admitted(others);
+            admission.admitted(admitted);
+            admission
+        };
+        // The bytes the admission holds, all of them: it holds no byte more.
+        let holding = |admission: &crate::admit::Admission, budget: u64, held: u64| {
+            admission.holds(budget - held) && !admission.holds(budget - held + 1)
+        };
+        let budget = gateway.objects_bytes;
+        let fitted = |gateway: &GatewaySettings, learned: &crate::window::Windows, length: u64| {
+            let mut room = admission(gateway.objects_bytes, 0);
+            copy_windows(gateway, learned, Some(&mut room), length, admitted)
+        };
+
+        // Nothing learned: one block each, and the bytes a gigabyte's copy does not need given back.
+        let mut learned = crate::window::Windows::default();
+        let mut room = admission(budget, 0);
+        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        assert_eq!((get, put), (1, 1));
+        assert_eq!(held, charges().copy(1, 1, long));
+        assert!(held < admitted);
+        assert!(holding(&room, budget, held));
+
+        // Blocks read in 40 ms and recorded in 10 ms, no client's pace measured: the put holds the
+        // floor's one block and drains it every 10 ms, so the get holds four being read.
+        learned.get.took(40_000_000);
+        learned.put.took(10_000_000);
+        assert_eq!(fitted(&gateway, &learned, long).0, 4);
+        // A slower put, its blocks recorded in 80 ms: one.
+        let mut slower = learned;
+        for _ in 0..64 {
+            slower.put.took(80_000_000);
+        }
+        assert_eq!(fitted(&gateway, &slower, long).0, 1);
+
+        // Its clients' puts paced at 1 GB/s: 10 MB while a block is recorded, two blocks of
+        // 8,325,104 bytes going down, which the put drains every 10 ms, so the get reads eight; the
+        // admission takes the bytes past the floor's.
+        learned.put.paced(1_000_000_000, 1_000_000_000);
+        let mut room = admission(budget, 0);
+        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        assert_eq!((get, put), (8, 2));
+        assert_eq!(held, charges().read(8) + charges().write(2, long));
+        assert!(held > admitted);
+        assert!(holding(&room, budget, held));
+        // No more than its span's blocks, and a copy of one block holds one block for each.
+        assert_eq!(
+            fitted(&gateway, &learned, 3 * block),
+            (3, 2, charges().copy(3, 2, 3 * block))
+        );
+        let small = 1 << 20;
+        assert_eq!(
+            fitted(&gateway, &learned, small),
+            (1, 1, charges().copy(1, 1, small))
+        );
+        assert!(charges().copy(1, 1, small) < admitted);
+
+        // Held to what the operations' bytes hold.
+        gateway.objects_bytes = charges().copy(5, 2, long);
+        assert_eq!(fitted(&gateway, &learned, long).0, 5);
+        gateway.objects_bytes = budget;
+        // And to what they hold beside the others': the room left for three blocks read.
+        let others = budget - charges().copy(3, 2, long);
+        let mut room = admission(budget, others);
+        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        assert_eq!((get, put), (3, 2));
+        assert!(holding(&room, budget, others + held));
+        // With no room past what it was admitted at, the floor's, and the rest given back.
+        let mut room = admission(budget, budget - admitted);
+        let (get, put, held) = copy_windows(&gateway, &learned, Some(&mut room), long, admitted);
+        assert_eq!((get, put), (1, 1));
+        assert!(holding(&room, budget, budget - admitted + held));
+    }
+
     /// A get blocked before reading its version must still be refused at its own deadline;
     /// once its reply began, expiry must only stop its notes, preserving the one reply. Neither
     /// its pending read nor notes from a peer extend its local bound (research/77 D2).
@@ -6284,8 +6531,7 @@ mod tests {
 
     /// What research/89 adds is refused from its request alone, before anything is read: a
     /// version ID mantle never makes (InvalidArgument), metadata past S3's 2 KB
-    /// (MetadataTooLarge) or that no HTTP field carries, a part copy's number past 10,000; and a
-    /// copy counts as two of the host's operations.
+    /// (MetadataTooLarge) or that no HTTP field carries, a part copy's number past 10,000.
     #[test]
     fn what_a_version_metadata_or_a_copy_names_is_refused_before_anything_is_read() {
         let get = |version: &str| Op::Get {
@@ -6380,11 +6626,9 @@ mod tests {
             metadata: Vec::new(),
             checksum: None,
         }));
-        assert_eq!(weight(&copy), 2);
         assert_eq!(
             refused(&work(copy, Vec::new(), None)),
             Some(Status::InvalidVersion)
         );
-        assert_eq!(weight(&get("null")), 1);
     }
 }

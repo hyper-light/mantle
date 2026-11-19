@@ -19,6 +19,13 @@
 //!
 //! Each is smoothed as RFC 6298 §2 smooths a round trip, gain 1/8 (`hyper_block::commit::smooth`).
 //! Until both are measured the window is one block, the least that moves.
+//!
+//! A copy's get is read for its own put, which is its client: the put holds the window the node
+//! learned of its puts, and drains that many blocks in the time one takes to be recorded, so the
+//! get holds that window times a block's time to read over a block's time to be recorded
+//! (`Windows::copy_get`). Its put's body comes at its get's pace, not a client's, so a copy's put
+//! measures no client's pace (`Put::take_filled`); its blocks' times to be recorded and to be read
+//! are the node's puts' and gets' own.
 
 use hyper_block::commit::smooth;
 
@@ -75,6 +82,30 @@ impl Window {
             .checked_div(SECOND_NS)
             .unwrap_or(0);
         let blocks = in_flight.div_ceil(u128::from(block.max(1)));
+        let blocks = u64::try_from(blocks).unwrap_or(u64::MAX).clamp(1, most);
+        usize::try_from(blocks).unwrap_or(usize::MAX)
+    }
+}
+
+impl Windows {
+    /// The blocks a copy's get holds being read while its put holds `put` blocks going down, its
+    /// source's span `length` bytes in blocks of at least `block` bytes. By Little's law with the
+    /// put as the get's client: the put drains `put` blocks in the time one takes to be recorded,
+    /// so the get holds `put` times a block's time to read over a block's time to be recorded, in
+    /// whole blocks, at least one and no more than the span's blocks. One until both times are
+    /// measured, or where the put's blocks took no measurable time, which says nothing of its pace.
+    pub(crate) fn copy_get(&self, put: usize, length: u64, block: u64) -> usize {
+        let most = length.div_ceil(block.max(1)).max(1);
+        let (Some(read), Some(committed)) = (
+            self.get.took_ns,
+            self.put.took_ns.filter(|&committed| committed > 0),
+        ) else {
+            return 1;
+        };
+        let draining = u128::try_from(put).unwrap_or(u128::MAX);
+        let blocks = u128::from(read)
+            .saturating_mul(draining)
+            .div_ceil(u128::from(committed));
         let blocks = u64::try_from(blocks).unwrap_or(u64::MAX).clamp(1, most);
         usize::try_from(blocks).unwrap_or(usize::MAX)
     }
@@ -141,5 +172,45 @@ mod tests {
         slow_reads.paced(1_000_000_000, 1_000_000_000);
         assert_eq!(slow_reads.blocks(u64::MAX, block), 20);
         assert_eq!(windows.put, Window::default());
+    }
+
+    /// A copy's get holds the blocks its put drains while one is read: its put's window times a
+    /// block's time to read over a block's time to be recorded, so a slow put holds fewer of its
+    /// source's blocks being read and a fast one more, never fewer than one nor more than the
+    /// span's blocks; one until both times are measured.
+    #[test]
+    fn a_copys_get_follows_its_puts_pace() {
+        let block = 8 << 20;
+        let mut windows = Windows::default();
+        assert_eq!(windows.copy_get(4, u64::MAX, block), 1);
+        // Blocks read in 40 ms each; nothing recorded yet.
+        windows.get.took(40_000_000);
+        assert_eq!(windows.copy_get(4, u64::MAX, block), 1);
+        // A put of four blocks, each recorded in 80 ms: it drains a block every 20 ms, so two are
+        // read at once.
+        let mut slow = windows;
+        slow.put.took(80_000_000);
+        assert_eq!(slow.copy_get(4, u64::MAX, block), 2);
+        // Each recorded in 10 ms: a block every 2.5 ms, sixteen.
+        let mut fast = windows;
+        fast.put.took(10_000_000);
+        assert_eq!(fast.copy_get(4, u64::MAX, block), 16);
+        // A narrower put drains slower: one block each 10 ms, four.
+        assert_eq!(fast.copy_get(1, u64::MAX, block), 4);
+        // No more than the span's blocks, at least one.
+        assert_eq!(fast.copy_get(4, 3 * block, block), 3);
+        assert_eq!(fast.copy_get(4, 0, block), 1);
+        let mut slowest = windows;
+        slowest.put.took(1_000_000_000);
+        assert_eq!(slowest.copy_get(4, u64::MAX, block), 1);
+        // A put whose blocks took no measurable time says nothing of its pace.
+        let mut unmeasured = windows;
+        unmeasured.put.took(0);
+        assert_eq!(unmeasured.copy_get(4, u64::MAX, block), 1);
+        // The clients' paces are no part of it: a put's sizes the window the copy's put is given,
+        // and a copy's get's client is its put.
+        fast.put.paced(1, 1_000_000_000);
+        fast.get.paced(1, 1_000_000_000);
+        assert_eq!(fast.copy_get(4, u64::MAX, block), 16);
     }
 }

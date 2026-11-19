@@ -170,11 +170,16 @@ impl Job {
         !self.pending.is_empty() || self.waits_for_room()
     }
 
-    /// Whether a chunk of its put waits for room at a volume or in the transport toward it.
+    /// Whether a chunk its put sends or its get reads waits for room at a volume or in the
+    /// transport toward it.
     fn waits_for_room(&self) -> bool {
         match &self.work {
             Work::Put(putting) => putting.put.as_ref().is_some_and(Put::waits_for_room),
-            Work::Copy(copying) => copying.put.as_ref().is_some_and(Put::waits_for_room),
+            Work::Get(getting) => getting.get.as_ref().is_some_and(Get::waits_for_room),
+            Work::Copy(copying) => {
+                copying.put.as_ref().is_some_and(Put::waits_for_room)
+                    || copying.get.as_ref().is_some_and(Get::waits_for_room)
+            }
             _ => false,
         }
     }
@@ -195,9 +200,9 @@ impl Job {
 
     /// Its next bound or working beat, while its own work is held. A get whose reply began
     /// and whose patience passed is vouched for no more and needs no beat; a get still reading
-    /// its version must wake at the bound even through the local S3 door. A put whose chunk waits
-    /// for room is due at the beat on either door: no answer of its own comes to turn the node
-    /// when a peer's volume frees room, so the node offers it room again then
+    /// its version must wake at the bound even through the local S3 door. A put or a get whose
+    /// chunk waits for room is due at the beat on either door: no answer of its own comes to turn
+    /// the node when a peer's volume frees room, so the node offers it room again then
     /// (`Node::step_host`).
     fn due_ns(&self, now: u64, beat: u64) -> Option<u64> {
         if self.bounded(now) == Bounded::Unvouched {
@@ -211,8 +216,8 @@ impl Job {
     }
 
     /// One of its own asks answered at `now`: its work moved, unless a chunk of it was refused for
-    /// want of room ([`Taken::Room`]), which moves nothing; else a put asked again at each beat and
-    /// refused again would never reach its client's patience (research/77 D2).
+    /// want of room ([`Taken::Room`]), which moves nothing; else a put or a get asked again at each
+    /// beat and refused again would never reach its client's patience (research/77 D2).
     fn answered(&mut self, outcome: &Outcome, now: u64) {
         if !matches!(outcome, Outcome::Chunk(chunk) if taken(chunk) == Taken::Room) {
             self.moved_ns = now;
@@ -1986,20 +1991,34 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Asks again each chunk a put's driver holds for want of room, its volume's or the
-    /// transport's; a driver that fails doing so ends its job as its failed answers do.
+    /// Asks again each chunk a put's or a get's driver holds for want of room, its volume's or the
+    /// transport's, of the same volume; a driver that fails doing so ends its job as its failed
+    /// answers do. A job past its client's patience is offered none: `bound_jobs` ends it.
     fn offer_room(&mut self) -> Result<(), NodeError> {
+        let now = hyper_rt::futures::now_ns();
         for at in 0..self.jobs.len() {
-            let put = match self.jobs.get_mut(at).map(|job| &mut job.work) {
-                Some(Work::Put(putting)) => putting.put.as_mut(),
-                Some(Work::Copy(copying)) => copying.put.as_mut(),
-                _ => None,
-            };
-            let Some(put) = put else {
+            let Some(job) = self.jobs.get_mut(at) else {
                 continue;
             };
-            // A driver that fails keeps its error as its outcome, which its job answers.
-            if put.waits_for_room() && put.room().is_err() && put.outcome().is_none() {
+            if job.bounded(now) != Bounded::Held {
+                continue;
+            }
+            let (put, get) = match &mut job.work {
+                Work::Put(putting) => (putting.put.as_mut(), None),
+                Work::Get(getting) => (None, getting.get.as_mut()),
+                Work::Copy(copying) => (copying.put.as_mut(), copying.get.as_mut()),
+                _ => (None, None),
+            };
+            // A driver that fails keeps its error as its outcome, which its job answers: a get's
+            // at its next turn (`write_get`, `step_copy`).
+            if let Some(get) = get.filter(|get| get.waits_for_room()) {
+                let _ = get.room();
+            }
+            if let Some(put) = put
+                && put.waits_for_room()
+                && put.room().is_err()
+                && put.outcome().is_none()
+            {
                 self.fail_job(at, Status::Failed)?;
             }
         }
@@ -2038,6 +2057,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Bounded::Held => {
                     if let Door::Exchange(exchange) = job.door {
                         self.driver.endpoint().working(exchange);
+                    }
+                }
+                // A chunk read waiting for room is the node's own wait, which no transport ends:
+                // its get ends there, unfinished, as one whose driver fails past its reply's head
+                // does (`write_get`).
+                Bounded::Unvouched if job.waits_for_room() => {
+                    if let Some(get) = self.get_of(at) {
+                        get.out_of_patience();
                     }
                 }
                 Bounded::Unvouched => {}
@@ -5836,11 +5863,13 @@ fn md5_of_etag(etag: &str) -> Option<[u8; 16]> {
     Some(md5)
 }
 
-/// The reply a get's failure is answered with: too few of a block's chunks read is a cause that
-/// passes, `503 SlowDown`, which clients ask again; any other `500`.
+/// The reply a get's failure is answered with: too few of a block's chunks read, or no room for
+/// its reads within its client's patience, is a cause that passes, `503 SlowDown`, which clients
+/// ask again; any other `500`.
 fn get_failed(error: &GetError) -> Reply {
     match error {
         GetError::Unreadable(_) => Reply::slowed(door::Slowed::Unreadable),
+        GetError::Patience => Reply::slowed(door::Slowed::Patience),
         _ => Reply::status(Status::Failed),
     }
 }
@@ -5909,7 +5938,9 @@ pub(super) enum Taken {
 /// its epoch and its index (`put::chunk_key`), and the volume's writer answers a whole chunk's put
 /// (`Volume::put_checked_waking`: offset 0, sealed) under a key it holds, with the same length,
 /// CRC-32C and bytes, as done without writing it again, and refuses other bytes under it `Exists`
-/// (`mantle_chunk`'s writer, `validate`; audit B05; node.md §5.2).
+/// (`mantle_chunk`'s writer, `validate`; audit B05; node.md §5.2). A chunk read's refusals are
+/// classed by it too (`get_answer`): a read asked again changes nothing, and its room, its place
+/// and its sending mean for it what they mean for a put.
 pub(super) fn taken(outcome: &ChunkOutcome) -> Taken {
     match outcome {
         ChunkOutcome::Stored => Taken::Stored,
@@ -6009,12 +6040,26 @@ fn complete_answer(outcome: Outcome) -> Option<complete::Answer> {
 fn get_answer(outcome: Outcome) -> get::Answer {
     match outcome {
         Outcome::Chunk(ChunkOutcome::Read(bytes)) => get::Answer::Chunk(Bytes::from(bytes)),
-        // No bytes from this place, for any cause, room's among them: the get reads another place
-        // that holds them, as a volume whose reads are full asks of itself (`chunk::Status::Busy`,
-        // node.md §5.4), and nothing takes the copy for lost.
-        Outcome::Chunk(ChunkOutcome::Stored | ChunkOutcome::Refused(_) | ChunkOutcome::Lost(_)) => {
-            get::Answer::Unreadable
-        }
+        // A put's word from a volume answering a read (`Node::chunk_replied`): that place answers
+        // no read, and another may.
+        Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Stored)) => get::Answer::Unreadable,
+        // Every other outcome by its class ([`taken`]), as a put's is.
+        Outcome::Chunk(chunk) => match taken(&chunk) {
+            // No room for the read now, at the volume's reads or in the transport toward it, or
+            // its peer too busy to move it a period: the place still holds the bytes, is asked
+            // again once room frees within its client's patience (research/77 D2), and no copy
+            // is taken for lost.
+            Taken::Room => get::Answer::Busy,
+            // This place cannot give them: its volume fenced, closing or not on the node asked,
+            // the chunk not found there, past its end or corrupt, its head or a put's status
+            // answering, or its peer gone or not the one named. Another place that holds them
+            // is read, or the block decoded.
+            Taken::Refused | Taken::Full => get::Answer::Unreadable,
+            // No volume serves it as it was asked (the node's role, its frame bound, the
+            // exchange's order, identifiers or settings), or a put's outcome answering a get:
+            // the node crossed its asks.
+            Taken::Failed | Taken::Stored => get::Answer::Failed,
+        },
         Outcome::Read(ReadOutcome::Read(read)) => match *read {
             Read::Header(header) => get::Answer::Header(header),
             Read::Extents(extents) => get::Answer::Extents(extents),
@@ -6919,6 +6964,220 @@ mod tests {
         assert!(job.held() && job.waits_for_room());
         job.answered(&Outcome::Chunk(ChunkOutcome::Stored), patience);
         assert_eq!(job.bounded(patience + 1), Bounded::Held);
+    }
+
+    /// A keyring that gives any file a key of its own: these gets read no bytes.
+    struct AnyKey;
+
+    impl Keyring for AnyKey {
+        fn unwrap(&self, _: &WrappedKey) -> Result<DataKey, GetError> {
+            DataKey::generate().map_err(|_| GetError::Key)
+        }
+    }
+
+    /// A get of a one-byte object in one block of three copies on volumes 1, 2 and 3 (block 9),
+    /// read as far as its chunk read: the driver, and the read's ID and request.
+    fn get_of_copies() -> (Get, u64, get::Request) {
+        let length = mantle_s3::seal::sealed_len(1).unwrap();
+        let mut get = Get::new(Some(1), 1, 0..1, Box::new(AnyKey), 1).unwrap();
+        let header = record::FileHeader {
+            length,
+            extents: 1,
+            made_ns: 0,
+            deadline_ns: 0,
+            referrer: record::Referrer {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+            },
+            key: Some(WrappedKey {
+                by: Wrapper::Root(1),
+                bytes: [0; 40],
+            }),
+        };
+        let block = record::BlockHeader {
+            length,
+            data: 1,
+            parity: 2,
+            chunk_len: length,
+            crc32c: 0,
+        };
+        let places = (1..=3)
+            .map(|volume| record::ChunkPlace {
+                volume,
+                key: mantle_chunk::ChunkKey {
+                    block: 9,
+                    epoch: 1,
+                    index: 0,
+                },
+            })
+            .collect();
+        let extent = record::Extent {
+            length,
+            target: record::Target::Block(9),
+        };
+        for answer in [
+            get::Answer::Header(Some(header)),
+            get::Answer::Extents(vec![(0, extent)]),
+            get::Answer::Block(Some((block, places))),
+        ] {
+            let (id, _) = get.poll().unwrap();
+            get.answer(id, answer).unwrap();
+        }
+        let (id, request) = get.poll().unwrap();
+        assert!(
+            get.poll().is_none(),
+            "a copy is read from one place at a time"
+        );
+        (get, id, request)
+    }
+
+    /// A chunk read refused for want of room, at the volume's reads or in the transport toward
+    /// it, here or at its peer, or stalled a period at a peer too busy to move it, leaves its get
+    /// waiting, and once room frees asks the same copy for the same bytes again: it is no copy
+    /// lost and no failed read. Every such refusal was `Unreadable`, another copy read in its
+    /// stead, and a cell of three whose copies were all refused for room answered the GET
+    /// `503 SlowDown`, "fewer of a block's chunks could be read than rebuild it".
+    #[test]
+    fn a_chunk_read_refused_for_room_waits_and_is_asked_of_its_copy_again() {
+        for outcome in room_refusals() {
+            let (mut get, id, request) = get_of_copies();
+            let answered = get.answer(id, get_answer(Outcome::Chunk(outcome.clone())));
+            assert_eq!(answered, Ok(()), "{outcome:?}");
+            assert!(get.outcome().is_none(), "{outcome:?} ended the get");
+            assert!(get.waits_for_room(), "{outcome:?}");
+            assert!(get.poll().is_none(), "{outcome:?} read another copy");
+            get.room().unwrap();
+            let (_, again) = get.poll().unwrap();
+            assert_eq!(again, request, "{outcome:?}");
+            assert!(!get.waits_for_room(), "{outcome:?}");
+        }
+    }
+
+    /// A copy that cannot be read (its volume fenced, closing or not on the node asked, the chunk
+    /// not found, past its end or corrupt, a reply that is no read's, its peer gone or not the one
+    /// named) is read from another place; a read no volume serves as it was asked (this node's
+    /// role, its frame bound, the exchange's order, identifiers or settings, or a put's outcome
+    /// answering it) ends the get `Unsendable`, `500`, as reading another place would be refused
+    /// alike; a read's bytes are its answer.
+    #[test]
+    fn a_get_reads_another_copy_only_where_this_one_cannot_be_read() {
+        let elsewhere = [
+            ChunkOutcome::Refused(chunk::Status::Fenced),
+            ChunkOutcome::Refused(chunk::Status::Closed),
+            ChunkOutcome::Refused(chunk::Status::NoVolume),
+            ChunkOutcome::Refused(chunk::Status::NotFound),
+            ChunkOutcome::Refused(chunk::Status::Range),
+            ChunkOutcome::Refused(chunk::Status::Corrupt),
+            ChunkOutcome::Refused(chunk::Status::Failed),
+            ChunkOutcome::Refused(chunk::Status::Malformed),
+            ChunkOutcome::Refused(chunk::Status::Full),
+            ChunkOutcome::Refused(chunk::Status::Stored),
+            ChunkOutcome::Lost(Refusal::Closed),
+            ChunkOutcome::Lost(Refusal::NotConnected),
+            ChunkOutcome::Lost(Refusal::Identity),
+            ChunkOutcome::Lost(Refusal::UnknownExchange),
+            ChunkOutcome::Lost(Refusal::Corrupt),
+            ChunkOutcome::Lost(Refusal::Quic),
+            ChunkOutcome::Lost(Refusal::Unknown),
+        ];
+        for outcome in elsewhere {
+            let (mut get, id, request) = get_of_copies();
+            get.answer(id, get_answer(Outcome::Chunk(outcome.clone())))
+                .unwrap();
+            assert!(!get.waits_for_room(), "{outcome:?}");
+            let (_, next) = get.poll().unwrap();
+            let (get::Request::Chunk { volume: was, .. }, get::Request::Chunk { volume, .. }) =
+                (request, next)
+            else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!((was, volume), (1, 2), "{outcome:?}");
+        }
+        let unsendable = [
+            ChunkOutcome::Lost(Refusal::Kind),
+            ChunkOutcome::Lost(Refusal::FrameBound),
+            ChunkOutcome::Lost(Refusal::Order),
+            ChunkOutcome::Lost(Refusal::Exhausted),
+            ChunkOutcome::Lost(Refusal::Configuration),
+            ChunkOutcome::Stored,
+        ];
+        for outcome in unsendable {
+            let (mut get, id, _) = get_of_copies();
+            let failed = get.answer(id, get_answer(Outcome::Chunk(outcome.clone())));
+            assert_eq!(failed, Err(GetError::Unsendable(9)), "{outcome:?}");
+            assert!(get.poll().is_none(), "{outcome:?}");
+            assert_eq!(get_failed(&GetError::Unsendable(9)).status, Status::Failed);
+        }
+        assert_eq!(
+            get_answer(Outcome::Chunk(ChunkOutcome::Read(vec![7]))),
+            get::Answer::Chunk(Bytes::from(vec![7]))
+        );
+    }
+
+    /// A get whose chunk read waits for room is held, due at its beat on either door so the node
+    /// offers it room again, and its refusals for room are no movement of its work: refused at
+    /// each beat, it still ends at its client's patience, `SlowDown` for patience while its reply
+    /// is held. Once its reply began, past that patience it is vouched for no more, and its driver
+    /// ends `Patience`, which no transport would end for it, so its response ends unfinished.
+    #[test]
+    fn a_get_refused_for_room_at_each_beat_ends_at_its_clients_patience() {
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let (mut get, id, _) = get_of_copies();
+        get.answer(id, get::Answer::Busy).unwrap();
+        let (_body, body) = hyper_rt::sync::channel(1).unwrap();
+        let (reply, _answers) = hyper_rt::sync::channel(1).unwrap();
+        let mut job = Job {
+            door: Door::Local(Box::new(Local {
+                body,
+                reply,
+                ended: None,
+                pending: VecDeque::new(),
+                ready: false,
+            })),
+            principal: "client".into(),
+            work: getting("b".into(), "k".into(), Headers::default(), None, false),
+            pending: Vec::new(),
+            deadline_ns: None,
+            moved_ns: 1,
+            admitted_ns: Some(1),
+            charge: 0,
+            window: 1,
+            label: None,
+            room_to_reply: false,
+        };
+        let Work::Get(getting) = &mut job.work else {
+            panic!("the job is a get");
+        };
+        getting.get = Some(get);
+        getting.held = Some(Box::new(Reply::status(Status::Done)));
+        assert!(job.held() && job.waits_for_room());
+        assert_eq!(job.due_ns(5, 2), Some(7), "the S3 door's get, at its beat");
+        for outcome in room_refusals() {
+            job.answered(&Outcome::Chunk(outcome.clone()), patience);
+            assert_eq!(job.bounded(patience), Bounded::Held, "{outcome:?}");
+            assert_eq!(job.bounded(patience + 1), Bounded::SlowDown, "{outcome:?}");
+        }
+        assert_eq!(
+            get_failed(&GetError::Patience).slowed,
+            Some(door::Slowed::Patience)
+        );
+        let Work::Get(getting) = &mut job.work else {
+            panic!("the job is a get");
+        };
+        getting.held = None;
+        assert_eq!(job.bounded(patience + 1), Bounded::Unvouched);
+        assert!(
+            job.waits_for_room(),
+            "past its patience, nothing else ends it"
+        );
+        let Work::Get(getting) = &mut job.work else {
+            panic!("the job is a get");
+        };
+        let get = getting.get.as_mut().unwrap();
+        get.out_of_patience();
+        assert_eq!(get.outcome(), Some(&Err(GetError::Patience)));
+        assert!(!job.waits_for_room() && !job.held());
     }
 
     fn refused(work: &Work) -> Option<Status> {

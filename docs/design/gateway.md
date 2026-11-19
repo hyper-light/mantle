@@ -484,7 +484,12 @@ so, a GET of an object put in runs past 5 GiB was refused by the transport and f
 3. Only the chunk bytes holding the wanted segments are read: a copy's, or each data chunk's
    part of them. A chunk read that fails or does not verify, the chunk store's `Corrupt`
    (chunk-store.md §7), is read from another copy, or its block decoded from any `data` whole
-   chunks, checked against the block's CRC-32C.
+   chunks, checked against the block's CRC-32C. One refused for want of room, at the volume's
+   reads or in the transport toward it, is no copy lost: it waits, and is asked of the same place
+   again once room frees or at each beat, within its client's patience, past which the GET is
+   answered `503 SlowDown` for patience, or, its reply begun, ends unfinished (node.md §3.8,
+   §5.2). Too few places readable for any other cause is `Unreadable`, `503 SlowDown`; a read no
+   volume serves as it was asked, `500`.
 4. Each segment is opened, its tag checked under the file's key and its index, the last marked
    as sealed, and the range cut exactly. A block's chunk bytes are gathered into one buffer and
    each segment opened where it lies, its plaintext laid after the range's part of the segment

@@ -1098,7 +1098,7 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     storage: Storage,
     /// The storage's puts and gets answered, taken each turn (kept for its allocation).
     stored: Vec<Done>,
-    /// Whether a volume answered a put since the host last offered its puts room.
+    /// Whether a volume answered a put or a get since the host last offered its jobs room.
     room_freed: bool,
     /// When, on the shard's clock, the host last offered its puts room, or last had none waiting
     /// for it: a put whose chunk waits for room is offered it again a beat after (`step_host`).
@@ -4213,7 +4213,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Poll::Ready(())
         })
         .await;
-        self.room_freed |= stored.iter().any(|done| matches!(done, Done::Put(..)));
+        // A volume's put or get answered frees room at its writer queue or its reads.
+        self.room_freed |= stored
+            .iter()
+            .any(|done| matches!(done, Done::Put(..) | Done::Get(..)));
         for done in stored.drain(..) {
             match done {
                 Done::Put(Origin::Exchange(exchange), _, Ok(())) => {

@@ -1,8 +1,9 @@
 //! Reading an object or a range of it (docs/design/gateway.md §3): the extents holding the
 //! wanted bytes found a page at a time from the one holding the first, each block's row read
 //! for its chunks' places, only the chunk bytes holding the wanted segments read, a chunk that
-//! fails replaced by another copy or by decoding its block from any `data` of its chunks, and
-//! each segment opened under its file's key.
+//! fails replaced by another copy or by decoding its block from any `data` of its chunks, one
+//! refused for want of room asked of its place again once room frees, and each segment opened
+//! under its file's key.
 //!
 //! A [`Get`] names each request and moves on with its answer, doing no I/O, as a PUT does. It
 //! starts from the version the Name range read, whose preconditions, lock and range the caller
@@ -55,9 +56,15 @@ pub enum Answer {
     Extents(Vec<(u64, Extent)>),
     Block(Option<(BlockHeader, Vec<ChunkPlace>)>),
     Chunk(Bytes),
-    /// The volume did not give the bytes: it failed, did not answer in time, or found them
-    /// corrupt.
+    /// This place cannot give the bytes: its volume failed, is fenced or closing, or does not
+    /// hold them whole and verified, or its peer is gone. Another place that holds them is read.
     Unreadable,
+    /// No room for the read now, at the volume's reads or in the transport toward it: the place
+    /// still holds the bytes, and is asked again once room frees ([`Get::room`], research/77 D2).
+    Busy,
+    /// No volume serves the read as it was asked: the node may not send it, or sent it so that
+    /// every place refuses it alike. The GET cannot go on.
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -69,6 +76,14 @@ pub enum GetError {
     /// Fewer of a block's chunks could be read than rebuild it (`503 SlowDown`, retried).
     #[error("block {0:032x}: too few of its chunks could be read")]
     Unreadable(u128),
+    /// A chunk read of the block no volume serves as it was asked ([`Answer::Failed`]): reading
+    /// another place would be refused alike, so the GET ends at once (`500 InternalError`).
+    #[error("no volume serves a chunk read of block {0:032x} as it was asked")]
+    Unsendable(u128),
+    /// Its client's patience passed while a chunk read waited for room
+    /// ([`Get::out_of_patience`]): `503 SlowDown` for patience, which clients ask again.
+    #[error("no room for its chunk reads came within its client's patience")]
+    Patience,
     /// A block rebuilt from its chunks does not match its CRC-32C, or a segment its tag.
     #[error("block {0:032x} did not verify")]
     Corrupt(u128),
@@ -246,6 +261,10 @@ pub struct Get {
     out: VecDeque<Bytes>,
     ready: VecDeque<(Id, Request)>,
     asked: BTreeMap<Id, Asked>,
+    /// The chunk reads answered [`Answer::Busy`] whose bytes their block still wants, each waiting
+    /// for room at the place it asked: at most the chunk reads the window holds out at once
+    /// ([`most_chunks`]), as each was one of them.
+    roomless: Vec<Asked>,
     next_id: Id,
     outcome: Option<Result<(), GetError>>,
     /// The caller's time, as it last told it ([`Get::tick`]); none before it first does.
@@ -286,6 +305,7 @@ impl Get {
             out: VecDeque::new(),
             ready: VecDeque::new(),
             asked: BTreeMap::new(),
+            roomless: Vec::new(),
             next_id: 0,
             outcome: None,
             now_ns: None,
@@ -323,6 +343,39 @@ impl Get {
             get.answered(asked, answer)?;
             get.advance()
         })
+    }
+
+    /// Room may have freed where its chunk reads were refused for want of it: each is asked
+    /// again of the place it asked, which still holds its bytes (research/77 D2). The caller's
+    /// patience ends a GET whose room never comes ([`Get::out_of_patience`]).
+    pub fn room(&mut self) -> Result<(), GetError> {
+        self.guard(|get| {
+            for asked in std::mem::take(&mut get.roomless) {
+                match asked {
+                    Asked::Span(key, i) => get.ask_span(key, i)?,
+                    Asked::Whole(key, at) => get.ask_whole(key, at)?,
+                    Asked::Top
+                    | Asked::Part { .. }
+                    | Asked::PartExtent
+                    | Asked::Extents
+                    | Asked::Block(_) => return Err(GetError::Mismatch),
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Whether a chunk read of it waits for room ([`Get::room`]).
+    pub fn waits_for_room(&self) -> bool {
+        !self.roomless.is_empty()
+    }
+
+    /// Its client's patience passed while a chunk read of it waited for room, which no transport
+    /// ends: the GET ends [`GetError::Patience`] and lets go of what it holds.
+    pub fn out_of_patience(&mut self) {
+        if self.outcome.is_none() {
+            self.fail(GetError::Patience);
+        }
     }
 
     /// The next plaintext of the range, in order; `None` while none is ready.
@@ -366,6 +419,7 @@ impl Get {
         self.outcome = Some(Err(e));
         self.ready.clear();
         self.asked.clear();
+        self.roomless.clear();
         self.out.clear();
         self.read.clear();
         self.reading.clear();
@@ -470,8 +524,28 @@ impl Get {
             (Asked::Span(key, i), Answer::Unreadable) => self.span(key, i, None),
             (Asked::Whole(key, c), Answer::Chunk(bytes)) => self.whole(key, c, Some(bytes)),
             (Asked::Whole(key, c), Answer::Unreadable) => self.whole(key, c, None),
+            (Asked::Span(key, _) | Asked::Whole(key, _), Answer::Busy) => {
+                self.wait_for_room(key, asked)
+            }
+            (Asked::Span(key, _) | Asked::Whole(key, _), Answer::Failed) => {
+                let reading = self.reading.get(&key).ok_or(GetError::Mismatch)?;
+                Err(GetError::Unsendable(reading.block))
+            }
             _ => Err(GetError::Mismatch),
         }
+    }
+
+    /// A chunk read of block `key` refused for want of room: no copy is lost and no other place
+    /// is read, as the place still holds its bytes; it waits to be asked of the same place again
+    /// ([`Get::room`]), a whole chunk still counted as asked. A span of a block now decoded from
+    /// whole chunks is wanted no more, and the block finishes if that read was the last it
+    /// waited on.
+    fn wait_for_room(&mut self, key: u64, asked: Asked) -> Result<(), GetError> {
+        let reading = self.reading.get(&key).ok_or(GetError::Mismatch)?;
+        if !(matches!(asked, Asked::Span(..)) && reading.whole.is_some()) {
+            self.roomless.push(asked);
+        }
+        self.finish(key)
     }
 
     /// The object's file: of blocks, sealed under its own key, or of parts, each a file of
@@ -797,6 +871,10 @@ impl Get {
                         let tried = span.tried.clone();
                         let whole = reading.whole.get_or_insert_with(Box::default);
                         whole.tried.extend(tried);
+                        // Decoded from whole chunks now, the block wants no span's bytes: none
+                        // of its spans waits for room.
+                        self.roomless
+                            .retain(|asked| !matches!(asked, Asked::Span(k, _) if *k == key));
                         self.ask_wholes(key)?;
                     }
                 }
@@ -815,7 +893,6 @@ impl Get {
         let width = needed
             .checked_add(usize::from(header.parity))
             .ok_or(GetError::Overflow)?;
-        let chunk_len = header.chunk_len;
         let whole = reading.whole.as_mut().ok_or(GetError::Mismatch)?;
         // A chunk none of whose places is left untried cannot be read.
         for c in 0..width {
@@ -847,9 +924,8 @@ impl Get {
             return Err(GetError::Unreadable(block));
         }
         // A reservation the allocator refuses is an error, not an abort.
-        let mut requests = Vec::new();
-        requests
-            .try_reserve_exact(next.len())
+        let mut ats = Vec::new();
+        ats.try_reserve_exact(next.len())
             .map_err(|_| GetError::Overflow)?;
         for c in next {
             let at = (0..places.len())
@@ -860,23 +936,28 @@ impl Get {
                             .is_some_and(|pl| usize::from(pl.key.index) == c)
                 })
                 .ok_or(GetError::Overflow)?;
-            let place = places.get(at).ok_or(GetError::Overflow)?;
             whole.asked.insert(c);
             whole.tried.insert(at);
-            requests.push((
-                Request::Chunk {
-                    volume: place.volume,
-                    key: place.key,
-                    offset: 0,
-                    len: chunk_len,
-                },
-                Asked::Whole(key, at),
-            ));
+            ats.push(at);
         }
-        for (request, asked) in requests {
-            self.ask(request, asked)?;
+        for at in ats {
+            self.ask_whole(key, at)?;
         }
         Ok(())
+    }
+
+    /// Asks for the whole chunk of block `key` its place at `at` holds.
+    fn ask_whole(&mut self, key: u64, at: usize) -> Result<(), GetError> {
+        let reading = self.reading.get(&key).ok_or(GetError::Mismatch)?;
+        let (header, places) = reading.row.as_ref().ok_or(GetError::Mismatch)?;
+        let place = places.get(at).ok_or(GetError::Overflow)?;
+        let request = Request::Chunk {
+            volume: place.volume,
+            key: place.key,
+            offset: 0,
+            len: header.chunk_len,
+        };
+        self.ask(request, Asked::Whole(key, at))
     }
 
     /// A whole chunk read to decode block `key`, from the place at `at`, answered.
@@ -1031,4 +1112,262 @@ fn to_front(bytes: &mut [u8], from: usize) -> Option<()> {
         *bytes.get_mut(at)? = byte;
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use mantle_meta::record::{Referrer, Wrapper};
+    use mantle_s3::seal::WrappingKey;
+
+    use super::*;
+
+    const FILE: u128 = 7;
+    const BLOCK: u128 = 9;
+
+    /// The key every file of these tests is wrapped under.
+    struct Root(WrappingKey);
+
+    impl Keyring for Root {
+        fn unwrap(&self, key: &WrappedKey) -> Result<DataKey, GetError> {
+            DataKey::unwrap(&key.bytes, &self.0).map_err(|_| GetError::Key)
+        }
+    }
+
+    /// An object of `plain` plaintext in one block of one segment, its chunks under `scheme` on
+    /// volumes 1, 2 and 3, and a GET of all of it holding one block, asked as far as its chunk
+    /// reads: the GET, its chunks' bytes by place, and the chunk reads it asked.
+    fn reading(scheme: Scheme, plain: &[u8]) -> (Get, Vec<Vec<u8>>, Vec<(Id, Request)>) {
+        let wrapping = WrappingKey::generate().unwrap();
+        let data = DataKey::generate().unwrap();
+        let mut sealed = plain.to_vec();
+        Segments::new(&data, FILE)
+            .unwrap()
+            .seal(0, true, &mut sealed)
+            .unwrap();
+        let length = sealed.len() as u64;
+        let (header, chunks) = match scheme {
+            Scheme::Copies(n) => {
+                let header = BlockHeader {
+                    length,
+                    data: 1,
+                    parity: (n - 1) as u8,
+                    chunk_len: length,
+                    crc32c: mantle_crc::crc32c(&sealed),
+                };
+                (header, vec![sealed.clone(); n])
+            }
+            Scheme::Rs(code) => {
+                let header = BlockHeader {
+                    length,
+                    data: code.data() as u8,
+                    parity: code.parity() as u8,
+                    chunk_len: code.chunk_len(sealed.len()).unwrap() as u64,
+                    crc32c: mantle_crc::crc32c(&sealed),
+                };
+                (header, code.encode(&sealed).unwrap())
+            }
+        };
+        let places = (0..chunks.len())
+            .map(|i| ChunkPlace {
+                volume: i as u128 + 1,
+                key: ChunkKey {
+                    block: BLOCK,
+                    epoch: 1,
+                    index: if header.data == 1 { 0 } else { i as u16 },
+                },
+            })
+            .collect();
+        let key = WrappedKey {
+            by: Wrapper::Root(1),
+            bytes: data.wrap(&wrapping).unwrap(),
+        };
+        let size = plain.len() as u64;
+        let mut get = Get::new(Some(FILE), size, 0..size, Box::new(Root(wrapping)), 1).unwrap();
+        let file = FileHeader {
+            length,
+            extents: 1,
+            made_ns: 0,
+            deadline_ns: 0,
+            referrer: Referrer {
+                bucket: "b".into(),
+                incarnation: 1,
+                key: "k".into(),
+            },
+            key: Some(key),
+        };
+        let extent = Extent {
+            length,
+            target: Target::Block(BLOCK),
+        };
+        let answers = [
+            Answer::Header(Some(file)),
+            Answer::Extents(vec![(0, extent)]),
+            Answer::Block(Some((header, places))),
+        ];
+        for answer in answers {
+            let (id, _) = get.poll().unwrap();
+            get.answer(id, answer).unwrap();
+        }
+        let asked = std::iter::from_fn(|| get.poll()).collect();
+        (get, chunks, asked)
+    }
+
+    /// The bytes a chunk read asks of `chunks`, its places' bytes.
+    fn served(chunks: &[Vec<u8>], request: &Request) -> Answer {
+        let Request::Chunk {
+            volume,
+            offset,
+            len,
+            ..
+        } = *request
+        else {
+            panic!("{request:?}");
+        };
+        let chunk = &chunks[volume as usize - 1];
+        Answer::Chunk(Bytes::copy_from_slice(
+            &chunk[offset as usize..(offset + len) as usize],
+        ))
+    }
+
+    /// Answers each read `asked` from `chunks`, and each the GET asks after, until it ends: the
+    /// plaintext it gave out.
+    fn read_out(get: &mut Get, chunks: &[Vec<u8>], asked: Vec<(Id, Request)>) -> Vec<u8> {
+        let mut asked = VecDeque::from(asked);
+        let mut out = Vec::new();
+        while let Some((id, request)) = asked.pop_front() {
+            get.answer(id, served(chunks, &request)).unwrap();
+            asked.extend(std::iter::from_fn(|| get.poll()));
+            while let Some(bytes) = get.take() {
+                out.extend_from_slice(&bytes);
+            }
+        }
+        assert_eq!(get.outcome(), Some(&Ok(())));
+        out
+    }
+
+    fn schemes() -> [Scheme; 2] {
+        [Scheme::Copies(3), Scheme::Rs(Code::new(2, 1).unwrap())]
+    }
+
+    /// A chunk read refused for want of room, at the volume's reads or in the transport toward
+    /// it, is not a copy lost: the GET neither reads another place nor ends, but waits, and once
+    /// room frees asks the same place for the same bytes again, its plaintext then exact. It read
+    /// another place for every refusal, room's among them, and a cell of three whose copies were
+    /// all refused for room ended `Unreadable`, `503 SlowDown`.
+    #[test]
+    fn a_chunk_read_refused_for_room_waits_and_asks_the_same_place_again() {
+        let plain = b"the plaintext of a small object, read back exactly".to_vec();
+        for scheme in schemes() {
+            let (mut get, chunks, mut asked) = reading(scheme, &plain);
+            let (mut id, request) = asked.remove(0);
+            // Refused for room at each turn of room, then read.
+            for _ in 0..3 {
+                get.answer(id, Answer::Busy).unwrap();
+                assert!(get.waits_for_room(), "{scheme:?}");
+                assert!(get.outcome().is_none(), "{scheme:?}");
+                assert!(get.poll().is_none(), "{scheme:?} read another place");
+                get.room().unwrap();
+                assert!(!get.waits_for_room(), "{scheme:?}");
+                let (again, same) = get.poll().unwrap();
+                assert_eq!(same, request, "{scheme:?}");
+                id = again;
+            }
+            asked.insert(0, (id, request));
+            assert!(read_out(&mut get, &chunks, asked) == plain, "{scheme:?}");
+        }
+    }
+
+    /// A coded block's whole chunk, read once a span's every place failed, refused for room waits
+    /// still counted as asked, and is asked of the same place again: the block is decoded exactly,
+    /// and no other chunk is read in its stead.
+    #[test]
+    fn a_whole_chunk_refused_for_room_is_asked_of_its_place_again() {
+        let plain = b"a coded block decoded from its whole chunks".to_vec();
+        let (mut get, chunks, asked) = reading(Scheme::Rs(Code::new(2, 1).unwrap()), &plain);
+        let (span, _) = &asked[0];
+        get.answer(*span, Answer::Unreadable).unwrap();
+        let wholes: Vec<_> = std::iter::from_fn(|| get.poll()).collect();
+        assert_eq!(wholes.len(), 2, "{wholes:?}");
+        let (id, request) = wholes[0].clone();
+        get.answer(id, Answer::Busy).unwrap();
+        assert!(get.waits_for_room());
+        assert!(get.poll().is_none(), "another chunk read in its stead");
+        get.room().unwrap();
+        let again = get.poll().unwrap();
+        assert_eq!(again.1, request);
+        let rest = asked[1..]
+            .iter()
+            .cloned()
+            .chain([again, wholes[1].clone()])
+            .collect();
+        assert!(read_out(&mut get, &chunks, rest) == plain);
+    }
+
+    /// A place that cannot give the bytes (its volume fenced, closing or not there, the chunk not
+    /// found or corrupt, its peer gone) still sends the read to another place; with too few places
+    /// readable for such causes the GET ends `Unreadable`, however often room was refused
+    /// meanwhile.
+    #[test]
+    fn a_place_that_cannot_be_read_moves_on_and_too_few_end_unreadable() {
+        for scheme in schemes() {
+            let (mut get, _, asked) = reading(scheme, b"held at three places");
+            // The first span's reads, each refused for room and then found unreadable; the rest
+            // left out.
+            let mut queue = VecDeque::from([asked[0].clone()]);
+            let mut volumes = BTreeSet::new();
+            let ended = loop {
+                let (id, request) = queue.pop_front().expect("the GET asks on");
+                let Request::Chunk { volume, .. } = request else {
+                    panic!("{request:?}");
+                };
+                get.answer(id, Answer::Busy).unwrap();
+                assert!(
+                    get.poll().is_none(),
+                    "{scheme:?}: read another place for room"
+                );
+                get.room().unwrap();
+                let (again, same) = get.poll().unwrap();
+                assert_eq!(same, request, "{scheme:?}");
+                volumes.insert(volume);
+                if let Err(e) = get.answer(again, Answer::Unreadable) {
+                    break e;
+                }
+                queue.extend(std::iter::from_fn(|| get.poll()));
+            };
+            assert_eq!(ended, GetError::Unreadable(BLOCK), "{scheme:?}");
+            assert_eq!(get.outcome(), Some(&Err(GetError::Unreadable(BLOCK))));
+            // A copy's every place; a code's first data chunk's and the whole chunk read in its
+            // place, after which too few are left to decode it.
+            let read = match scheme {
+                Scheme::Copies(_) => 3,
+                Scheme::Rs(_) => 2,
+            };
+            assert_eq!(volumes.len(), read, "{scheme:?}: {volumes:?}");
+        }
+    }
+
+    /// A read no volume serves as it was asked ends the GET at once, `Unsendable`: another place
+    /// would refuse it alike.
+    #[test]
+    fn a_read_no_volume_serves_as_asked_ends_the_get() {
+        for scheme in schemes() {
+            let (mut get, _, asked) = reading(scheme, b"asked as no volume serves it");
+            let failed = get.answer(asked[0].0, Answer::Failed);
+            assert_eq!(failed, Err(GetError::Unsendable(BLOCK)), "{scheme:?}");
+            assert!(get.poll().is_none(), "{scheme:?}");
+        }
+    }
+
+    /// A GET whose read waits for room past its client's patience ends `Patience`, holding
+    /// nothing, and asks nothing more.
+    #[test]
+    fn a_get_waiting_for_room_past_its_clients_patience_ends_patience() {
+        let (mut get, _, asked) = reading(Scheme::Copies(3), b"never given room");
+        get.answer(asked[0].0, Answer::Busy).unwrap();
+        get.out_of_patience();
+        assert_eq!(get.outcome(), Some(&Err(GetError::Patience)));
+        assert!(!get.waits_for_room());
+        assert!(get.reading.is_empty() && get.poll().is_none());
+        assert_eq!(get.room(), Err(GetError::Over));
+    }
 }

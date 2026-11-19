@@ -2481,8 +2481,11 @@ less than a datagram moved, or after the peer had the whole request and a period
    `ReceiveBuffer`, the admission's `Pending`, `Identities`, `Connections` and `Busy`, and
    `Unsent`), or `Stalled`, whose chunk the volume answers as done when the same key and bytes are
    put again (§5.2), is asked again of the same volume once a chunk is answered or a volume answers
-   a put, not sent on and the block left `Unplaced` (`host::taken` classes each outcome; a
-   refusal for room is no movement of the job's work, so its patience still ends it); and at each
+   a put or a get, not sent on and the block left `Unplaced` (`host::taken` classes each outcome; a
+   refusal for room is no movement of the job's work, so its patience still ends it); a chunk read
+   refused so is asked of the same copy again, a read changing nothing, never taken for a copy
+   lost, and a get whose reply began and whose read still waits at its client's patience ends
+   unfinished there, as no transport ends that wait (`Get::out_of_patience`); and at each
    beat it waits, at most once a beat (`Node::step_host`), on either door:
    a peer's volume whose queue other writes or its cleaner hold, as a filling volume's is, tells
    the asker nothing when it frees room, and with no other chunk of the node out nothing asked it
@@ -3358,9 +3361,13 @@ answered as done, and a retry with different bytes is refused (chunk-store.md §
 S05), so sending a chunk again never changes what an earlier write stored.
 
 A chunk read asks for exactly the bytes the driver names, which the volume verifies before it
-returns them; `Corrupt`, an error or no answer by the deadline is `Unreadable`, and the driver
-reads another copy or decodes the block (gateway.md §3). A volume that returned `Corrupt` also
-reports the chunk for repair (chunk-store.md §7).
+returns them; a place that cannot give them (`Corrupt`, `NotFound`, `Range`, its volume failed,
+fenced, closing or not there, its peer gone) is `Unreadable`, and the driver reads another copy or
+decodes the block (gateway.md §3). One refused for want of room, the volume's reads full (`Busy`),
+a bound of the transport's reached for now or a period that moved nothing (`Stalled`), waits and
+is asked of the same place again, as a put's chunk is (§3.8, `host::taken`), within its client's
+patience; one no volume serves as it was asked ends the GET `500`. A volume that returned
+`Corrupt` also reports the chunk for repair (chunk-store.md §7).
 
 *As built (2026-10-21).* A node's storage role (`crates/node/src/storage.rs`) opens each volume
 its configuration names before its runtime starts, since an issuer's start and a volume's

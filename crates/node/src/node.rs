@@ -28,7 +28,9 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -1229,6 +1231,35 @@ impl<E: Engine + 'static, L: NodeLog> Taking<'_, E, L> {
     }
 }
 
+/// The node's task's waker as the sources of its answers hold it (its logs, its volumes, the S3
+/// listener's door): a wake records that it came, then wakes the task. A wake ends whichever await
+/// of the task it finds, and one that came while the process said a line between turns ended that
+/// await rather than the node's wait, which then slept with the request or answer in hand until
+/// its next due: a timer's period, not the event (node.md §2.2). The wait takes the record first
+/// ([`Woken::take`]), so every wake turns the node at most once and none is lost.
+struct Woken {
+    task: Waker,
+    woken: AtomicBool,
+}
+
+impl Woken {
+    /// Whether a wake came since the last take.
+    fn take(&self) -> bool {
+        self.woken.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Release);
+        self.task.wake_by_ref();
+    }
+}
+
 /// One shard's ranges and the transport they replicate over, on the node's log.
 pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     id: u64,
@@ -1338,7 +1369,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     timings: Vec<Option<hyper_raft::Timing>>,
     sends: Sends,
     received: Received,
+    /// The waker every source of the node's answers holds: a wake through it is kept ([`Woken`])
+    /// until the node's next wait takes it.
     waker: Waker,
+    woken: Arc<Woken>,
     storage: Storage,
     /// The storage's puts and gets answered, taken each turn (kept for its allocation).
     stored: Vec<Done>,
@@ -1645,7 +1679,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// whose id is above its own. The task that opens it is the one that turns it: its waker is the
     /// one the log answers through.
     pub async fn open_on(mut settings: NodeSettings<E>, log: L) -> Result<Self, StartError> {
-        let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
+        let woken = Arc::new(Woken {
+            task: poll_fn(|context| Poll::Ready(context.waker().clone())).await,
+            woken: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&woken));
         let layout = Layout::new(&settings.dir);
         let run = layout.raise_run().map_err(at(Step::Storage))?;
         let stated = settings.stated().map_err(at(Step::Budgets))?;
@@ -1852,6 +1890,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             sends: Sends::default(),
             received: Received::default(),
             waker,
+            woken,
             storage: std::mem::take(&mut settings.storage),
             stored: Vec::new(),
             room_freed: false,
@@ -2827,7 +2866,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// so every heartbeat the kernel stamped before that clock is fed first, and after what its
     /// write made durable (`Liveness::poll`; hyper-raft's E2E node orders it the same way).
     pub async fn turn(&mut self) -> Result<(), NodeError> {
-        let own = poll_fn(|context| Poll::Ready(context.waker().will_wake(&self.waker))).await;
+        let own = poll_fn(|context| Poll::Ready(context.waker().will_wake(&self.woken.task))).await;
         if !own {
             return Err(NodeError::Task);
         }
@@ -2997,7 +3036,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// reported to the stream as it ends: its lateness is the stream's granularity
     /// (`Liveness::on_wait`).
     async fn wait(&mut self) -> Result<(), NodeError> {
-        if self.owner.has_work() || self.answered().await? {
+        // A wake that came since the last wait looked, through the waker the node's sources hold,
+        // turns the node at once: one that came while the process said a line between turns ended
+        // that await, not this wait, and the source that sent it is looked at only by a turn.
+        let woken = self.woken.take();
+        if woken || self.owner.has_work() || self.answered().await? {
             return Ok(());
         }
         // A range's engine owes maintenance: the turn comes again at once, after the shard's other
@@ -6040,6 +6083,27 @@ mod tests {
     use mantle_meta::root;
 
     use super::*;
+
+    /// A wake through the waker the node's sources hold, which an await between turns spent (the
+    /// process saying a line), is kept for the node's next wait, which then turns the node at once
+    /// rather than sleeping to its next due with the request in hand; and it turns it once.
+    #[test]
+    fn a_wake_an_await_between_turns_spent_turns_the_next_wait_once() {
+        let woken = Arc::new(Woken {
+            task: Waker::noop().clone(),
+            woken: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&woken));
+        assert!(!woken.take(), "no wake came");
+        // The S3 listener's door submits a request while the task awaits a line said.
+        waker.wake_by_ref();
+        assert!(woken.take(), "the wait after the line said turns the node");
+        assert!(!woken.take(), "and only once");
+        // A volume's or a log's answer, through a clone, from another thread.
+        let clone = waker.clone();
+        std::thread::spawn(move || clone.wake()).join().unwrap();
+        assert!(woken.take(), "a wake from another thread is kept as well");
+    }
 
     /// The liveness stream keeps a pair for each peer every hosted range may name at once: each
     /// range's own bound on members, and one more range's for the range moving its pairs, so a

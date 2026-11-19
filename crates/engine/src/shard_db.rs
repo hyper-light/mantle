@@ -2127,6 +2127,23 @@ impl<F: BlockFile> ShardDb<F> {
         self.store.set_cache(pages);
     }
 
+    /// Lowers the page cache's limit to `pages` at once, keeping the pages within it
+    /// (`Store::shrink_cache`): the pages dropped.
+    pub fn shrink_cache(&mut self, pages: usize) -> usize {
+        self.store.shrink_cache(pages)
+    }
+
+    /// Raises the page cache's limit to `pages`, keeping its pages (`Store::grow_cache`).
+    pub fn grow_cache(&mut self, pages: usize) {
+        self.store.grow_cache(pages);
+    }
+
+    /// The pages the page cache may hold, none without one (`Store::cache_pages`), and the
+    /// bytes of each.
+    pub fn cache_limit(&self) -> (usize, usize) {
+        (self.store.cache_pages().0, self.store.page_size())
+    }
+
     /// Another way to the device's issuer through `attacher`, for the maintenance workers' pool: a
     /// kernel issuer's holds a descriptor of its own of the issuer's bell (`Attacher::try_clone`).
     fn way_to(

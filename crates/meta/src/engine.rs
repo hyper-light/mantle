@@ -72,6 +72,16 @@ pub trait Engine: Rows {
     /// Replaces every row with `rows`, as of log entry `index`: a snapshot installed. It is
     /// durable once `persist` returns.
     fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError>;
+
+    /// Holds at most `bytes` of its pages in its page cache from now: the pages past them dropped
+    /// at once, those within them kept and served, and a cache below them raised keeping its
+    /// pages (docs/design/node.md §1.4: the caches borrow the bytes no running operation holds).
+    /// The bytes its cache may hold then, a whole number of its pages, at most `bytes`; an engine
+    /// with no page cache holds none.
+    fn lend_cache(&mut self, bytes: u64) -> u64 {
+        let _ = bytes;
+        0
+    }
 }
 
 /// An engine held in memory for deterministic simulation (06 §C.b.3): what is applied, and

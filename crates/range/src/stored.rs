@@ -208,6 +208,26 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
         self.unpersisted = true;
         Ok(())
     }
+
+    /// Its cache's limit set to the pages `bytes` hold, whole: lowered at once, the pages past it
+    /// dropped and none kept at none (`ShardDb::shrink_cache`), or raised keeping its pages, a
+    /// cache made where it had none (`ShardDb::grow_cache`); a limit of as many pages is left as
+    /// it is, so a part that moves by less than a page costs nothing.
+    fn lend_cache(&mut self, bytes: u64) -> u64 {
+        let (now, page) = self.db.cache_limit();
+        let page = u64::try_from(page).unwrap_or(u64::MAX).max(1);
+        let whole = bytes.checked_div(page).unwrap_or(0);
+        let pages = usize::try_from(whole).unwrap_or(usize::MAX);
+        if pages < now {
+            self.db.shrink_cache(pages);
+        } else if pages > now {
+            self.db.grow_cache(pages);
+        }
+        u64::try_from(pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(page))
+            .unwrap_or(bytes)
+    }
 }
 
 #[cfg(test)]

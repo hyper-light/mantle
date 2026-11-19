@@ -1281,6 +1281,25 @@ impl<F: BlockFile> Store<F> {
         }
     }
 
+    /// Lowers the page cache's limit to `pages` and brings it down to it at once
+    /// (`Cache::shrink`), keeping and serving the pages within it: the pages dropped. At none
+    /// the cache goes, every page it held dropped.
+    pub fn shrink_cache(&mut self, pages: usize) -> usize {
+        if pages == 0 {
+            return self.cache.take().map_or(0, |c| c.live());
+        }
+        self.cache.as_mut().map_or(0, |c| c.shrink(pages))
+    }
+
+    /// Raises the page cache's limit to `pages`, keeping every page it holds (`Cache::grow`); a
+    /// store without one is given one.
+    pub fn grow_cache(&mut self, pages: usize) {
+        match self.cache.as_mut() {
+            Some(c) => c.grow(pages),
+            None => self.set_cache(pages),
+        }
+    }
+
     /// Up to `n` steps bringing the page cache down to its limit (`Cache::trim`); true while it
     /// is still above it.
     /// The page cache's slots still to reserve ([`cache::Cache::reserve`]).

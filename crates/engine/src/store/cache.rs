@@ -1358,6 +1358,33 @@ impl Cache {
         self.settle_retirement();
     }
 
+    /// Lowers the limit to `pages`, at least one, and brings the cache down to it at once: its
+    /// pages past it freed by the cache's own rule, then the chunks past it given back the last
+    /// first with the pages they hold ([`Self::trim`]), so its memory is within the limit too;
+    /// the pages dropped. One trim of as many steps as every page held may take and every slot
+    /// made may be looked at: a page is freed within [`EVICT_STEPS`] queue steps of its own (it
+    /// moves to main once and goes round it at most [`MAX_FREQ`] times), so no page stays past
+    /// the limit, and a chunk past it is given back unless it is out on loan, whose memory comes
+    /// back as its worker's job ends. What the cache keeps it serves.
+    pub fn shrink(&mut self, pages: usize) -> usize {
+        let held = self.held();
+        self.resize(pages);
+        let steps = held
+            .max(self.slots.len())
+            .saturating_mul(EVICT_STEPS)
+            .max(1);
+        self.trim(steps);
+        held.saturating_sub(self.held())
+    }
+
+    /// Raises the limit to `pages`, keeping every page the cache holds: a limit no higher than
+    /// its own is left as it is.
+    pub fn grow(&mut self, pages: usize) {
+        if pages > self.limit {
+            self.resize(pages);
+        }
+    }
+
     /// Up to `n` queue steps toward the limit: pages freed by the cache's own rule (S3-FIFO's
     /// evictions), then up to `n` freed buffers dropped. True while the cache is still above it.
     pub fn trim(&mut self, n: usize) -> bool {
@@ -1552,6 +1579,11 @@ impl Cache {
     /// Pages the cache may hold.
     pub fn pages(&self) -> usize {
         self.limit
+    }
+
+    /// Pages the cache holds.
+    pub fn live(&self) -> usize {
+        self.held()
     }
 
     /// Reads served, and reads missed.
@@ -2721,5 +2753,57 @@ mod tests {
                 "step {step}"
             );
         }
+    }
+
+    /// A cache shrunk at once comes down to its new limit in that one call: its pages past it
+    /// freed by S3-FIFO's rule, the pages read twice kept, and the chunks past it given back with
+    /// the pages they held, so its memory is within the limit too; it says how many pages it
+    /// dropped and serves every page it kept. Grown again it keeps every page, and reads the
+    /// pages it lost into the room it was given back.
+    #[test]
+    fn a_cache_shrunk_at_once_drops_to_its_limit_and_grown_keeps_its_pages() {
+        let mut c = Cache::new(256, 32, EXTENT);
+        let mut out = Vec::new();
+        for a in 0..256u64 {
+            c.insert(a, &page(a));
+        }
+        // Read twice, the first 64 go to main: those S3-FIFO keeps.
+        for _ in 0..2 {
+            for a in 0..64u64 {
+                assert!(c.get(a, &mut out));
+            }
+        }
+        assert_eq!(c.live(), 256);
+        let dropped = c.shrink(100);
+        assert_eq!(dropped, 256 - c.live());
+        assert!(dropped >= 156, "{dropped}");
+        assert_eq!((c.pages(), c.over()), (100, 0));
+        assert!(c.bytes() <= 100 * 32, "{}", c.bytes());
+        let kept: Vec<u64> = (0..256u64).filter(|&a| c.contains(a)).collect();
+        assert_eq!(kept.len(), c.live());
+        assert!(
+            (0..64u64).all(|a| c.contains(a)),
+            "a page read twice dropped"
+        );
+        for &a in &kept {
+            out.clear();
+            assert!(c.get(a, &mut out));
+            assert_eq!(out, page(a));
+        }
+        // Shrunk to its own limit, it drops nothing.
+        assert_eq!(c.shrink(100), 0);
+        let live = c.live();
+        c.grow(256);
+        assert_eq!((c.live(), c.pages()), (live, 256));
+        assert!(kept.iter().all(|&a| c.contains(a)), "a page lost growing");
+        c.grow(10);
+        assert_eq!(c.pages(), 256, "a grow never lowers the limit");
+        for a in 0..256u64 {
+            if !c.contains(a) {
+                c.insert(a, &page(a));
+            }
+        }
+        assert_eq!(c.live(), 256);
+        assert!((0..256u64).all(|a| c.contains(a)));
     }
 }

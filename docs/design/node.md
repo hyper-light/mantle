@@ -3867,6 +3867,21 @@ each request at the first depths and at the caps of both channels: a get at the 
 two channels' larger rings beside what it holds at the first, 408 octets more over plain HTTP,
 within `REQUEST_BYTES` as at the first.
 
+*Since 2026-11-19, a job answered before its body ended lets go of the body.* A reply's head and
+its end are two answers, so in a channel of one the end waits for the connection to read the head,
+and a connection sending a body reads its reply only once the body is sent or the body's channel is
+closed (`listener::conn`'s `stream`). A job answered before its body ended, a put refused or slowed
+with its body unread, lets go of the body as it answers (`Host::drain_job`), its channel closed, so
+the connection stops sending, reads the reply and closes (§4.5), as the native door's job lets go of
+its body before its reply (§2.9 step 6c). Held until the job ended, its end gone, the body kept the
+connection from the reply and the reply kept the job from its end: from the commit that learned the
+reply's depth from one (9a312b2b, where two had held a head and its end), `tests/serve.rs`'s S3 put
+of the first object its filling cell held for room, then refused `InsufficientStorage`, went
+unanswered until its client gave it up, about four runs in five on Linux x86_64 and aarch64 and on
+macOS (CI runs 44575349545, 44578467575 and 44581897076 bisected it). The host test
+`an_s3_put_answered_while_its_body_waits_lets_go_of_the_body_so_its_answer_is_read` runs that put
+against the connection's order of waits at the first depths.
+
 What the door makes of a head does not grow with its fields' count: they are read where the head
 holds them (`request::Parts`, `mantle_s3::sigv4::Fields`), no table of them made, which at 32
 octets a field held 60,160 for a head padded to 8 KB with 1,880 empty fields; and the metadata a

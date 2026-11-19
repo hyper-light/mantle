@@ -1618,22 +1618,21 @@ fn liveness_pairs<E>(ranges: &[Hosted<E>]) -> Result<usize, NodeError> {
     pairs.checked_add(largest).ok_or_else(unfit)
 }
 
-/// The node's message bounds: a Raft message is at most the larger of a page of entries and one
-/// entry of the range's largest, inside the core's fixed bytes, in a frame; a command is an entry
-/// behind its head, and its reply no larger (`command::Status::TooLarge` otherwise); a snapshot's
-/// data is at most what hyper-raft's wire states, a u32 of bytes.
+/// The node's message bounds: a Raft message is at most its range's largest, the one its core is
+/// told (`mantle_range::largest_message`: a page of entries, or one entry of the range's largest
+/// with its fixed bytes, inside the core's fixed bytes), in a frame; a command is an entry behind
+/// its head, and its reply no larger (`command::Status::TooLarge` otherwise); a snapshot's data is
+/// at most what hyper-raft's wire states, a u32 of bytes. Stated as the larger of the page and an
+/// entry's own bytes, the Raft bound fell the entry's fixed bytes short of an append carrying an
+/// entry within them of the largest, alone: the transport refused its frame before it left
+/// (`Refusal::FrameBound`), the leader sent it again for good, and the range's commit froze there.
 pub fn message_bounds<E>(ranges: &[Hosted<E>], chunk_bytes: u64) -> Result<Bounds, NodeError> {
     let unfit = || NodeError::Bounds("a range's settings overflow a message's bound".into());
     let mut largest = 0u64;
     let mut entry = 0u64;
     for hosted in ranges {
         let s = &hosted.range.settings;
-        let message = s
-            .max_size_per_msg
-            .max(s.max_entry_bytes)
-            .checked_add(
-                u64::try_from(hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES).map_err(|_| unfit())?,
-            )
+        let message = mantle_range::largest_message(s)
             .and_then(|m| m.checked_add(u64::try_from(frame::HEADER_BYTES).ok()?))
             .ok_or_else(unfit)?;
         largest = largest.max(message);

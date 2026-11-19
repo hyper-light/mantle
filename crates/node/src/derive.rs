@@ -4404,6 +4404,35 @@ mod tests {
         assert_eq!(rules.max_key_bytes, key::largest_bytes());
     }
 
+    /// The bound every node of a cell states on a Raft frame holds the largest append a range's
+    /// core sends at the cell's settings: one entry of the range's largest, alone, past its page,
+    /// with its fixed bytes, as the wire writes it in a node's frame. Stated as the larger of the
+    /// page and an entry's own bytes, the bound fell the entry's fixed bytes short of that frame,
+    /// so an entry within them of the largest was refused by the transport for good.
+    #[test]
+    fn the_raft_frame_bound_holds_an_append_of_the_largest_entry_alone() {
+        let (settings, _) = cell(3).unwrap();
+        let bound = messages().unwrap().replication;
+        let largest = Message {
+            msg_type: hyper_raft::proto::MessageType::MsgAppend,
+            classic: Some(u64::MAX),
+            entries: vec![Entry {
+                data: vec![0; usize::try_from(settings.max_entry_bytes).unwrap()],
+                ..Entry::default()
+            }],
+            ..Message::default()
+        };
+        let frame = u64::try_from(crate::frame::encoded_len(&largest)).unwrap();
+        eprintln!(
+            "largest entry {} bytes, page {} bytes, its append's frame {frame} bytes, bound {bound}",
+            settings.max_entry_bytes, settings.max_size_per_msg
+        );
+        assert!(
+            frame <= bound,
+            "the append of the largest entry, a frame of {frame} bytes, past the bound {bound}"
+        );
+    }
+
     /// The engine derived holds a row at the range's bounds, and a page one write unit smaller
     /// or a memtable a byte smaller does not; its extents are the share's, and a share of fewer
     /// than two is refused.
@@ -5064,16 +5093,18 @@ mod tests {
     /// (5f3839f2): 291,834,348 bytes less than at every one of its 32 shards. A connection's state
     /// holds its lanes' unsent bytes by rank since hyper-transport kept them as sums
     /// (`lane::Unsent`, vendor/UPSTREAM.md): 1,248 bytes more over the connections it counts.
-    /// Linux's differs in two classes. Its threads: the kernel holds the device's 32 transfers on
-    /// the issuer's one thread, where a pool's worker carries each elsewhere
-    /// (`Issuer::device_threads`), 32 stacks fewer. Its transport: a receive takes a train from
-    /// each of the node's three peers and the ten operations' clients it serves at once
-    /// ([`runs`]), 1,605,344 bytes more: the buffers of the 12 trains past the first, 131,072
+    /// A Raft frame's bound holds an append of the range's largest entry alone
+    /// (`mantle_range::largest_message`): 2,575 bytes more, 25 for each of the 103 Raft frames
+    /// its transport holds room for. Linux's differs in two classes. Its threads: the kernel
+    /// holds the device's 32 transfers on the issuer's one thread, where a pool's worker carries
+    /// each elsewhere (`Issuer::device_threads`), 32 stacks fewer. Its transport: a receive takes
+    /// a train from each of the node's three peers and the ten operations' clients it serves at
+    /// once ([`runs`]), 1,605,344 bytes more: the buffers of the 12 trains past the first, 131,072
     /// bytes each, and every train's messages' headers.
     const NEED_96_GIB: u64 = if cfg!(target_os = "linux") {
-        13_714_100_270 - 32 * STACK + 1_605_344
+        13_714_102_845 - 32 * STACK + 1_605_344
     } else {
-        13_714_100_270
+        13_714_102_845
     };
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
@@ -7353,7 +7384,9 @@ mod tests {
     /// Each node counted once ([`nodes_named`]), by derive and by the node as it opens its
     /// transport (`NodeSettings::stated`), it derives its founders' settings, rules and transport,
     /// and its floor is theirs, 7,289,300,291 bytes at one operation, 226,892,477 within the
-    /// machine: it starts.
+    /// machine: it starts. Since a Raft frame's bound holds an append of the range's largest entry
+    /// alone (`mantle_range::largest_message`), 25 bytes more for each of the 408 Raft frames its
+    /// transport holds room for, its floor is 7,289,310,491.
     #[test]
     fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
         let founder = repair_founder;
@@ -7393,7 +7426,7 @@ mod tests {
         // train past the first a receive takes, its eight peers' and its operation's client's
         // ([`runs`]).
         assert!(
-            runs(7_255_000_000..7_260_000_000, 7_289_300_291..7_289_300_292).contains(&founded),
+            runs(7_255_000_000..7_260_000_000, 7_289_310_491..7_289_310_492).contains(&founded),
             "{founded}"
         );
         // It starts on the runner, every class of its floor its founders'.
@@ -7467,7 +7500,10 @@ mod tests {
     /// takes 109 and starts: its issuer's workers, its volumes' reads and transfers and the
     /// transport's room for them all at the depth taken. Where the kernel holds the transfers on
     /// the issuer's one thread (Linux), its threads are 16 stacks at any depth, and it takes the
-    /// 240 measured.
+    /// 240 measured. Since a Raft frame's bound holds an append of the range's largest entry alone
+    /// (`mantle_range::largest_message`), 25 bytes more for each of the 408 Raft frames its
+    /// transport holds room for, each floor is 10,200 bytes more: 7,831,261,211 at 240 deep, and
+    /// 7,514,358,587 at the 109 it still takes, 1,834,181 within.
     #[test]
     fn a_repair_founder_measured_deep_on_cis_macos_runner_takes_the_deepest_its_allowance_holds() {
         let measured = repair_runner(240, 436);
@@ -7502,10 +7538,10 @@ mod tests {
                 "{at_measured}"
             );
         } else {
-            assert_eq!(at_measured, 7_831_251_011);
+            assert_eq!(at_measured, 7_831_261_211);
             assert_eq!(taken, 109);
-            assert_eq!(at_taken, 7_514_348_387);
-            assert_eq!((7u64 << 30) - at_taken, 1_844_381);
+            assert_eq!(at_taken, 7_514_358_587);
+            assert_eq!((7u64 << 30) - at_taken, 1_834_181);
             assert!(floor_at_one(repair_founder(), &repair_runner(110, 436)) > 7 << 30);
         }
         // Every term that holds the depth holds the one taken: the issuer's workers among the

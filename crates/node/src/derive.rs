@@ -2478,9 +2478,9 @@ pub fn derive(
         "transport_bytes",
         transport_bytes,
         Kind::Derived,
-        "the transport's floor: what it holds besides QUIC's windows, and each share at QUIC's \
-         initial window, for the node's peers, ranges, transfers and messages \
-         (bounds::least_transport)",
+        "the transport's floor: what it holds besides QUIC's windows, the receive ring's growth \
+         at its most among it (bounds::ring_growth), and each share at QUIC's initial window, for \
+         the node's peers, ranges, transfers and messages (bounds::least_transport)",
     );
     // In whole milliseconds, as the key states it, rounded up: a bound on a starved host only.
     let budget_ms = u64::try_from(probe_budget()?.as_nanos().div_ceil(1_000_000))
@@ -3878,6 +3878,26 @@ mod tests {
         assert!(transport_bytes_beside(&stated(2, least(2))).unwrap() > one);
         assert!(transport_bytes_beside(&stated(1, 8 * least(1))).unwrap() > one);
         assert_eq!(transport_bytes_beside(&stated(1, least(1) - 1)), None);
+        // The transport's floor counts the driver's receive ring at its most past its first
+        // buffer, which the driver charges to the budget as the ring grows (`bounds::ring_growth`):
+        // on Linux a 64 KiB buffer for each peer past the first, a train from each a receive call
+        // takes (`bounds::io`), none elsewhere; a budget that leaves the ring less is refused.
+        for peers in [1usize, 2, 9] {
+            let ring = mantle_protocol::bounds::ring_growth(&stated(peers, 0)).unwrap();
+            let buffers = if cfg!(target_os = "linux") { peers } else { 1 };
+            assert_eq!(
+                ring,
+                (buffers as u64 - 1) * hyper_rt_transport::RECEIVE_BYTES as u64
+            );
+            assert!(mantle_protocol::bounds::limits(&stated(peers, least(peers))).is_ok());
+            if ring > 0 {
+                let short = stated(peers, least(peers) - ring);
+                assert!(
+                    mantle_protocol::bounds::limits(&short).is_err(),
+                    "{peers} peers"
+                );
+            }
+        }
     }
 
     /// The schemes a block may take grow with the domains a cell holds, each no wider than them:

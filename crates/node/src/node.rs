@@ -804,6 +804,76 @@ struct Commanded {
 /// The piece a body is read in: the transport's own receive chunk.
 const PIECE: u64 = hyper_transport::RECEIVE_CHUNK as u64;
 
+/// Reads the next bytes of `exchange`'s body, at most a piece, into `piece`, empty: how many. The
+/// piece is the reader's own, never the endpoint's budget's, its buffer kept from read to read: a
+/// put's, whose admission charged it a piece (`derive::Charges`, node.md §2.8), or the node's
+/// task's, which reads every native body a piece at a time (`Node::piece`): hyper-transport reads a
+/// body into any reservation its owner's accountant granted, mantle's admission among them (its
+/// `budget` module). A piece of the endpoint's budget, which every connection's windows, receive
+/// chunks, heads and frames share, could be refused while an operation's body waited on no ask of
+/// its own: it was then neither read nor vouched for, and the budget freeing woke nothing, so its
+/// client gave it up a period later (`Lost(Stalled)`, tests/put_body.rs).
+pub fn read_piece(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    piece: &mut Vec<u8>,
+) -> Result<usize, Refusal> {
+    read_at_most(endpoint, exchange, piece, hyper_transport::RECEIVE_CHUNK)
+}
+
+/// Reads the next bytes of `exchange`'s body, at most `most`, into `piece`, empty: how many
+/// ([`read_piece`]); a piece made larger than `most` once is kept so.
+fn read_at_most(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    piece: &mut Vec<u8>,
+    most: usize,
+) -> Result<usize, Refusal> {
+    let mut buffer = std::mem::take(piece);
+    buffer.clear();
+    buffer.reserve_exact(most);
+    let granted = u64::try_from(most).unwrap_or(u64::MAX);
+    let mut into = hyper_transport::Reservation::new(granted, buffer);
+    let got = endpoint.read_body(exchange, &mut into);
+    *piece = into.into_buffer();
+    got
+}
+
+/// What became of a reply's head offered to its exchange ([`reply_head`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replied {
+    /// It went; its body, if it has one, follows.
+    Sent,
+    /// The endpoint's budget has no room for it now: the exchange stays open, untouched, for its
+    /// owner to offer the head again, the reply held meanwhile (`host::Replies`).
+    WaitsForRoom,
+    /// The exchange is over: its asker gone, or the head refused for a cause no wait mends, which
+    /// the exchange is refused with, so its asker hears it at once.
+    Ended,
+}
+
+/// Offers `head` as the reply on `exchange`, with a body of `body` bytes to follow. The endpoint
+/// takes the head's room from its budget (hyper-transport's `Core::message`), which every
+/// connection's windows, receive chunks, heads and frames share, and refuses it `Budget` while
+/// that is held: a reply refused so is not lost, it waits for room ([`Replied::WaitsForRoom`]).
+/// Taken as the exchange's end, a job ended with its exchange open and its asker waiting on
+/// nothing, and its client gave it up a period later (`Lost(Stalled)`, tests/put_body.rs).
+pub fn reply_head(
+    endpoint: &mut Endpoint<NodeClasses, Fixed, Peers>,
+    exchange: ExchangeId,
+    head: &[u8],
+    body: Option<u64>,
+) -> Replied {
+    match endpoint.reply(exchange, head, body) {
+        Ok(()) => Replied::Sent,
+        Err(Refusal::Budget) => Replied::WaitsForRoom,
+        Err(refusal) => {
+            endpoint.refuse_exchange(exchange, refusal);
+            Replied::Ended
+        }
+    }
+}
+
 /// The parts of a node a plane message or a Raft frame steps, borrowed apart from the plane and its
 /// socket, so a message is taken where its datagram was opened (`Node::drain_plane`).
 struct Taking<'a, E: Engine + 'static, L: NodeLog> {
@@ -1048,6 +1118,12 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The exchange's half of each native put's body, read from its exchange for its job (node.md
     /// §2.9 step 6c, `host::Feeding`): at most one a job, each job one of the host's.
     feeding: Vec<(ExchangeId, host::Feeding)>,
+    /// The piece the node's task reads native bodies into, a piece at a time (`read_piece`): a
+    /// put's fields past their first read, its body's pieces before each is copied into its
+    /// feeding's storage, the piece its admission charged it for, and what is left of an admitted
+    /// job's body after its reply; made once, at most a piece (`PIECE`), never the endpoint's
+    /// budget's, which other traffic may hold past a client's patience.
+    piece: Vec<u8>,
     /// Whether a body moved at the last turn's feeding (`Node::feed_bodies`): the next turn is due
     /// at once, for its job to take what it was given.
     fed: bool,
@@ -1547,6 +1623,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             parked_most: exchanges,
             put_window: crate::window::Window::default(),
             feeding: Vec::new(),
+            piece: Vec::new(),
             fed: false,
             replies: Vec::new(),
             replied: false,

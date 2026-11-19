@@ -455,9 +455,12 @@ measures the second, and derives the rest by these rules:
   `Superseded`, so none delivered late ends a session opened after it whose commands may be out:
   a retry under a new session would apply one of them twice (`mantle_meta::session::register`).
   An identity the directory pins then holds at most one session a range, so `max_sessions` is the
-  identities the configuration names, and no session expires by time: a restart leaves none
-  behind. A process refused `Superseded` is not its identity's newest, and its commands there are
-  answered so. A client registers under its id and its start.
+  identities the configuration names, each once however many of its lines name it
+  (`derive::cell_identities`: a rejoined founder's `seed` lines name the members its `peer` lines
+  pin, and counted a line each its cell was 12 identities where its founders derive 9, its rules
+  and settings not theirs), and no session expires by time: a restart leaves none behind. A
+  process refused `Superseded` is not its identity's newest, and its commands there are answered
+  so. A client registers under its id and its start.
 - **The floor's classes**, each the most its configuration lets it hold, beside the objects'
   (the `gateway.*` row below): a volume's buffers (`mantle_chunk::layout::most_bytes`: its writer's
   queue, two batches; the cleaner's relocation, a batch and the record that crossed it; the

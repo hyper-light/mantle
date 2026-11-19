@@ -696,8 +696,14 @@ async fn run<E: Engine + Send + 'static>(
     // a node's process moves them (node.md §2.9).
     let opened = Node::open(settings)
         .await
-        .and_then(|mut node| node.spread(&others).map(|()| node));
-    let mut node = match opened.and_then(|node| node.addresses().map(|a| (node, a))) {
+        .map_err(|e| e.to_string())
+        .and_then(|mut node| {
+            node.spread(&others)
+                .and_then(|()| node.addresses())
+                .map(|a| (node, a))
+                .map_err(|e| e.to_string())
+        });
+    let mut node = match opened {
         Ok((node, (quic, plane))) => {
             // The rule places the range past the first shard wherever there is one (§2.9).
             let placed = usize::from(!others.is_empty());
@@ -719,7 +725,7 @@ async fn run<E: Engine + Send + 'static>(
             node
         }
         Err(error) => {
-            let _ = reports.send(Report::Failed(id, error.to_string()));
+            let _ = reports.send(Report::Failed(id, error));
             return;
         }
     };

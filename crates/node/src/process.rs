@@ -44,7 +44,7 @@
 //! each range's store and replica); the network (the peers' addresses resolved, the runtime and
 //! beside it hyper-rt's compute pool, said `compute WORKERS LOWERED PRIORITY` as it starts, the
 //! QUIC endpoint and the plane bound). A failure ends the start naming its step ([`Step`],
-//! [`ProcessError::Start`]), and the process exits non-zero.
+//! [`Exit::Start`]), and the process exits non-zero.
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
@@ -153,7 +153,7 @@ use crate::history;
 use crate::layout::{Layout, LayoutError, Live, Stopped};
 use crate::names::{Answered, Names};
 use crate::node::{
-    GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, Status, Step, Wall,
+    GatewaySettings, Hosted, Link, Node, NodeError, NodeSettings, StartError, Status, Step, Wall,
 };
 use crate::rejoin::{self, Configured, RejoinError, Resume};
 use crate::secret::{self, SecretError};
@@ -161,7 +161,7 @@ use crate::storage::{Locks, NodeLock, Storage, StorageError, VolumeSettings};
 use mantle_protocol::classes::Role;
 use mantle_protocol::enroll as wire;
 
-/// Why the process stopped.
+/// What stops the process, in a step of its start ([`Exit::Start`]) or after it.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
     /// A file the configuration is, or names, that could not be read.
@@ -201,8 +201,6 @@ pub enum ProcessError {
     Say(String),
     #[error("peer {0}'s address {1}: {2}")]
     Resolve(u64, String, String),
-    #[error("the start's {0} step: {1}")]
-    Start(Step, Box<ProcessError>),
     #[error("stopped at once: {0}")]
     Stopped(&'static str),
     #[error("the node's history: {0}")]
@@ -222,6 +220,26 @@ pub enum ProcessError {
     /// starts it again later, as for any exit.
     #[error("{0}")]
     Unrejoined(rejoin::AskError),
+}
+
+/// Why the process stopped: in a step of its start, which it names (node.md §1.7), or after it.
+/// A step's failure is never itself a step's.
+#[derive(Debug, thiserror::Error)]
+pub enum Exit {
+    #[error("the start's {0} step: {1}")]
+    Start(Step, ProcessError),
+    #[error(transparent)]
+    Failed(ProcessError),
+}
+
+/// Whatever the process's failures are made from fails it after its start.
+impl<E> From<E> for Exit
+where
+    ProcessError: From<E>,
+{
+    fn from(error: E) -> Self {
+        Self::Failed(error.into())
+    }
 }
 
 /// The signals that stop the node in order (node.md §1.7): SIGTERM, which a service manager or a
@@ -262,18 +280,13 @@ impl Stop {
 }
 
 /// `error` as a failure of the start's `step` (node.md §1.7).
-fn step<T: Into<ProcessError>>(at: Step) -> impl FnOnce(T) -> ProcessError {
-    move |error| ProcessError::Start(at, Box::new(error.into()))
+fn step<T: Into<ProcessError>>(at: Step) -> impl FnOnce(T) -> Exit {
+    move |error| Exit::Start(at, error.into())
 }
 
-/// A node's failure to open as the process says it: one in a step of its start as that step's.
-fn opened(error: NodeError) -> ProcessError {
-    match error {
-        NodeError::Start(at, inner) => {
-            ProcessError::Start(at, Box::new(ProcessError::Node(*inner)))
-        }
-        other => ProcessError::Node(other),
-    }
+/// A node's failure to open as the process says it: its start's step's.
+fn opened(StartError(at, error): StartError) -> Exit {
+    Exit::Start(at, ProcessError::Node(error))
 }
 
 /// What the node is and whom it trusts, read at its start's first step (node.md §1.7): its
@@ -1408,7 +1421,7 @@ fn volumes(lines: &Lines) -> Result<Vec<VolumeSettings>, ProcessError> {
 }
 
 /// Runs the node the file at `config` states until it stops in order or standard input closes.
-pub fn run(config: &Path) -> Result<(), ProcessError> {
+pub fn run(config: &Path) -> Result<(), Exit> {
     // Before any thread allocates: a freed large block's memory goes back to the OS, which a range's
     // budget following the machine reads as room (docs/research/65 §6).
     mantle_engine::port::mmap::return_freed_blocks();
@@ -1596,7 +1609,7 @@ fn since(now: &Histogram, then: &Histogram, q_ppm: u32) -> Option<u64> {
 /// node directory's device and the host's memory, cores and page measured; every other value
 /// derived from those (`derive::derive`) and said on standard output, a `basis` line each, before
 /// anything opens; then the node, as `mantle node` runs it, until it stops in order.
-pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
+pub fn serve_stated(config: &Path, leave: bool) -> Result<(), Exit> {
     mantle_engine::port::mmap::return_freed_blocks();
     let stated = read_stated(config).map_err(step(Step::Configuration))?;
     let switched = resume_rejoin(
@@ -1666,8 +1679,8 @@ pub fn serve_stated(config: &Path, leave: bool) -> Result<(), ProcessError> {
 fn resume_rejoin(
     configured: Configured,
     read: impl Fn(&Path) -> Result<Configured, ProcessError>,
-    ask: impl FnOnce(&Configured, &mantle_cert::KeyPair) -> Result<CellAnswer, ProcessError>,
-) -> Result<bool, ProcessError> {
+    ask: impl FnOnce(&Configured, &mantle_cert::KeyPair) -> Result<CellAnswer, Exit>,
+) -> Result<bool, Exit> {
     let stands = rejoin::state(&configured)?;
     if stands == Resume::Start {
         return Ok(false);
@@ -1684,7 +1697,7 @@ fn resume_rejoin(
                 if let Some(line) = unanswered_line(&unanswered) {
                     say_now(&line)?;
                 }
-                return Err(ProcessError::Unrejoined(unanswered));
+                return Err(ProcessError::Unrejoined(unanswered).into());
             }
         };
         rejoin::seed(&configured, &granted.members)?;
@@ -1732,10 +1745,7 @@ fn say_now(line: &str) -> Result<(), ProcessError> {
 /// QUIC address on a port the OS chooses, under the message bounds the node's ranges state
 /// (`node::message_bounds`), the process's one statement of them, so the start that follows
 /// states the same.
-fn ask_cell(
-    config: &ProcessConfig,
-    key: &mantle_cert::KeyPair,
-) -> Result<CellAnswer, ProcessError> {
+fn ask_cell(config: &ProcessConfig, key: &mantle_cert::KeyPair) -> Result<CellAnswer, Exit> {
     let identity = identity(
         (&config.certificate, &config.key, &config.authority),
         &config.peers,
@@ -1775,7 +1785,7 @@ fn ask_cell(
     let runtime = runtime(config, None).map_err(step(Step::Network))?;
     let rt = Runtime::start(&runtime)
         .map_err(|e| step(Step::Network)(ProcessError::Runtime(format!("{e:?}"))))?;
-    run_on_first_shard(rt, move || rejoin::ask(asking))
+    run_on_first_shard(rt, move || rejoin::ask(asking)).map_err(Exit::from)
 }
 
 /// The members the start's ask dials (membership.md §5.1 step 3), each once and never itself:
@@ -1784,7 +1794,7 @@ fn ask_cell(
 /// each member its replica of the root range holds serving or leaving ([`held_members`]); at most
 /// the cell's bound on nodes where the configuration states it, else as many as its lines, its
 /// marker and its replica's table name, each bounded already.
-fn asked_members(config: &ProcessConfig) -> Result<Vec<(PeerId, SocketAddr)>, ProcessError> {
+fn asked_members(config: &ProcessConfig) -> Result<Vec<(PeerId, SocketAddr)>, Exit> {
     let max_nodes = config.enlist.as_ref().map(|e| e.max_nodes);
     let stated = match max_nodes {
         Some(n) => Some(
@@ -1904,7 +1914,7 @@ struct Asked {
 /// keeps it, the rest measured, and every other value derived (`derive::derive`). Among the bases
 /// is `memory.need`, what an orchestrator gives the node's pod (docs/design/kubernetes.md §3), so
 /// an operator derives it on the machine the node will run on before it is deployed.
-pub fn derive_stated(config: &Path) -> Result<(), ProcessError> {
+pub fn derive_stated(config: &Path) -> Result<(), Exit> {
     let stated = read_stated(config).map_err(step(Step::Configuration))?;
     let (_derived, _node, _locks) = said_derived(stated)?;
     Ok(())
@@ -1912,7 +1922,7 @@ pub fn derive_stated(config: &Path) -> Result<(), ProcessError> {
 
 /// The start's steps from the locks to the budgets (node.md §1.7) for `stated`: its directory's
 /// and its volumes' locks, the measurements, the derivation, each basis said on standard output.
-fn said_derived(stated: Stated) -> Result<(Derived, NodeLock, Locks), ProcessError> {
+fn said_derived(stated: Stated) -> Result<(Derived, NodeLock, Locks), Exit> {
     let node = Locks::node(&stated.dir).map_err(step(Step::Locks))?;
     let locks = Locks::take(stated.volumes.iter().map(|(dir, _)| dir.as_path()))
         .map_err(step(Step::Locks))?;
@@ -1921,7 +1931,7 @@ fn said_derived(stated: Stated) -> Result<(Derived, NodeLock, Locks), ProcessErr
 
 /// [`said_derived`]'s derivation, under the locks its caller holds: each device measured or its
 /// profile kept, every value derived and said, a `basis` line each.
-fn said(stated: Stated) -> Result<Derived, ProcessError> {
+fn said(stated: Stated) -> Result<Derived, Exit> {
     let measured = measure(&stated).map_err(step(Step::Devices))?;
     let dir = stated.dir.clone();
     let align = measured.meta.align;
@@ -1949,7 +1959,7 @@ fn said(stated: Stated) -> Result<Derived, ProcessError> {
 /// How the node's thread ended, as [`start`] hears it.
 enum Ended {
     /// The node ran to its end, in order or failing, its teardown done: its result.
-    Ran(Result<(), ProcessError>),
+    Ran(Result<(), Exit>),
     /// A stop that ends the process at once, as a crash would: a second request to stop, or the
     /// stop's bound passing (node.md §1.7), told before the node's teardown begins.
     AtOnce(&'static str),
@@ -1973,7 +1983,7 @@ fn start(
     identity: Identity,
     s3: Option<S3Keys>,
     asked: Asked,
-) -> Result<(), ProcessError> {
+) -> Result<(), Exit> {
     // Room for both: a stop at once, and the node's end after its teardown, which no one hears.
     let (tell, heard) = sync_channel::<Ended>(2);
     let at_once = tell.clone();
@@ -1991,10 +2001,10 @@ fn start(
                 .map_err(|_| ProcessError::Runtime("the node's thread unwound".into()))?;
             ran
         }
-        Ok(Ended::AtOnce(why)) => Err(ProcessError::Stopped(why)),
-        Err(_) => Err(ProcessError::Runtime(
-            "the node's thread ended without saying how".into(),
-        )),
+        Ok(Ended::AtOnce(why)) => Err(ProcessError::Stopped(why).into()),
+        Err(_) => {
+            Err(ProcessError::Runtime("the node's thread ended without saying how".into()).into())
+        }
     }
 }
 
@@ -2006,7 +2016,7 @@ fn run_node(
     identity: Identity,
     (s3, asked): (Option<S3Keys>, Asked),
     at_once: SyncSender<Ended>,
-) -> Result<(), ProcessError> {
+) -> Result<(), Exit> {
     let (node, locks) = held;
     // The volumes open before the node's runtime starts: an issuer's start and a volume's
     // recovery wait on their device, which no shard may (node.md §1.3).
@@ -2592,7 +2602,7 @@ async fn serve(
     ),
     (resolved, s3, others): (Resolved, Option<S3Keys>, Vec<SlotHolder>),
     (asked, at_once): (Asked, SyncSender<Ended>),
-) -> Result<(), ProcessError> {
+) -> Result<(), Exit> {
     let Asked {
         ends_with_input,
         leave,
@@ -3010,10 +3020,10 @@ async fn serve(
                 // A line is never longer than the buffer it is read into.
                 if pending.len() > chunk {
                     let text = String::from_utf8_lossy(&pending).into_owned();
-                    return Err(ProcessError::Input(text, "a line longer than a page"));
+                    return Err(ProcessError::Input(text, "a line longer than a page").into());
                 }
             }
-            Either3::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}"))),
+            Either3::Second(Err(e)) => return Err(ProcessError::Runtime(format!("{e:?}")).into()),
             Either3::Third(Either3::First(signal)) => {
                 signal.map_err(|e| ProcessError::Runtime(format!("{e:?}")))?;
                 stop_asked(&mut stop, &mut node, (&mut output, &at_once)).await?;
@@ -3025,11 +3035,11 @@ async fn serve(
                 if !node.stop_at_bound() {
                     let why = "the stop's bound passed";
                     let _ = at_once.try_send(Ended::AtOnce(why));
-                    return Err(ProcessError::Stopped(why));
+                    return Err(ProcessError::Stopped(why).into());
                 }
             }
             Either3::Third(Either3::Third(Either::First(ended))) => {
-                return Err(ProcessError::Listener(ended.to_string()));
+                return Err(ProcessError::Listener(ended.to_string()).into());
             }
             Either3::Third(Either3::Third(Either::Second((peer, found)))) => {
                 looking = None;
@@ -3077,7 +3087,7 @@ async fn serve(
                         living.state(&mut node, e.root, own, started_ns)?;
                     }
                 }
-                other => return Err(ProcessError::Enlist(format!("{other:?}"))),
+                other => return Err(ProcessError::Enlist(format!("{other:?}")).into()),
             }
             // A node that was leaving when it stopped leaves on; one started to leave asks it now.
             if resumed {
@@ -3112,7 +3122,7 @@ async fn serve(
                 .retire(&fingerprint, &listening, max_nodes)
                 .map_err(|e| ProcessError::History(e.to_string()))?;
             say(&mut output, "retired\n").await?;
-            return Err(ProcessError::Retired(hex(&fingerprint)));
+            return Err(ProcessError::Retired(hex(&fingerprint)).into());
         }
         // Each statement asked in the order it was stated, and said once answered.
         let mut at = 0;
@@ -4115,6 +4125,32 @@ async fn say(output: &mut hyper_rt::stdio::Stdout, line: &str) -> Result<(), Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start's failure says its step and then what failed, the node's as the node says it, and
+    /// a failure after the start says only itself: the lines `mantle serve` ends with, as they
+    /// were when a step's failure held a failure of its own kind.
+    #[test]
+    fn a_failed_start_names_its_step_before_its_failure() {
+        let read = step(Step::Configuration)(ProcessError::Missing("id"));
+        assert_eq!(
+            read.to_string(),
+            "the start's configuration step: the configuration states no id"
+        );
+        let node = StartError(Step::Storage, NodeError::Log("full".into()));
+        assert_eq!(
+            node.to_string(),
+            "the start's storage step: the node's log: full"
+        );
+        assert_eq!(
+            opened(node).to_string(),
+            "the start's storage step: the node: the node's log: full"
+        );
+        let after = Exit::from(ProcessError::Stopped("a second request to stop"));
+        assert_eq!(
+            after.to_string(),
+            "stopped at once: a second request to stop"
+        );
+    }
 
     /// An operator's `gone ID`, `ban ID` and `rejoin automatic|off` lines are the statements they
     /// name, said back as they were written; a malformed one is refused with the line, and any
@@ -5295,7 +5331,7 @@ mod tests {
                 Ok(Err(rejoin::AskError::Refused(refusal)))
             });
             match refused {
-                Err(ProcessError::Unrejoined(rejoin::AskError::Refused(r))) => {
+                Err(Exit::Failed(ProcessError::Unrejoined(rejoin::AskError::Refused(r)))) => {
                     assert_eq!(r, refusal)
                 }
                 other => panic!("{refusal:?} not refused: {other:?}"),
@@ -5309,7 +5345,7 @@ mod tests {
             keys.push(key.public_key().to_vec());
             Ok(Err(rejoin::AskError::Unreachable(Vec::new())))
         }) {
-            Err(ProcessError::Unrejoined(rejoin::AskError::Unreachable(_))) => {}
+            Err(Exit::Failed(ProcessError::Unrejoined(rejoin::AskError::Unreachable(_)))) => {}
             other => panic!("not unreachable: {other:?}"),
         }
         assert_eq!(
@@ -5374,7 +5410,10 @@ mod tests {
             }))
         });
         assert!(
-            matches!(refused, Err(ProcessError::Rejoin(RejoinError::Place(3, _)))),
+            matches!(
+                refused,
+                Err(Exit::Failed(ProcessError::Rejoin(RejoinError::Place(3, _))))
+            ),
             "{refused:?}"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), config);

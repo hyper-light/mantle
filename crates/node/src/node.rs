@@ -272,15 +272,19 @@ impl std::fmt::Display for Step {
 }
 
 /// `error` as a failure of the start's `step`.
-fn at<T: Into<NodeError>>(step: Step) -> impl FnOnce(T) -> NodeError {
-    move |error| NodeError::Start(step, Box::new(error.into()))
+fn at<T: Into<NodeError>>(step: Step) -> impl FnOnce(T) -> StartError {
+    move |error| StartError(step, error.into())
 }
+
+/// Why a node did not open: the step of its start that failed (node.md §1.7), and its failure,
+/// which is never itself a step's.
+#[derive(Debug, thiserror::Error)]
+#[error("the start's {0} step: {1}")]
+pub struct StartError(pub Step, pub NodeError);
 
 /// Why the node stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
-    #[error("the start's {0} step: {1}")]
-    Start(Step, Box<NodeError>),
     #[error("the node's records: {0}")]
     Layout(#[from] crate::layout::LayoutError),
     #[error("the node's log: {0}")]
@@ -1225,7 +1229,7 @@ pub fn message_bounds<E>(ranges: &[Hosted<E>], chunk_bytes: u64) -> Result<Bound
 impl<E: Engine + 'static> Node<E> {
     /// Opens the node on the current hyper-rt shard on its log in its directory, as
     /// [`Node::open_on`] opens it on any.
-    pub async fn open(settings: NodeSettings<E>) -> Result<Self, NodeError> {
+    pub async fn open(settings: NodeSettings<E>) -> Result<Self, StartError> {
         let log = open_log(&settings.dir, settings.id, settings.log).map_err(at(Step::Storage))?;
         Self::open_on(settings, log).await
     }
@@ -1243,7 +1247,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// groups and opens their replicas, binds its QUIC endpoint and its plane, and dials each peer
     /// whose id is above its own. The task that opens it is the one that turns it: its waker is the
     /// one the log answers through.
-    pub async fn open_on(mut settings: NodeSettings<E>, log: L) -> Result<Self, NodeError> {
+    pub async fn open_on(mut settings: NodeSettings<E>, log: L) -> Result<Self, StartError> {
         let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
         let layout = Layout::new(&settings.dir);
         let run = layout.raise_run().map_err(at(Step::Storage))?;

@@ -825,7 +825,7 @@ founder's peers with the addresses the founders stated, but for a founder stated
 address of its own: where it listens is known only once it binds, and its peers learn it on standard
 input, as of a peer that moved.
 
-A start's failure names its step (`Step`, `ProcessError::Start`): configuration, identity, locks,
+A start's failure names its step (`Step`, `Exit::Start`): configuration, identity, locks,
 devices, budgets, storage or network, as in `mantle: the start's locks step: …/LOCK: another
 process holds this lock`. The identity (the node's key and certificate, the authority's, each
 peer's and the root keys) is read before any lock, so a missing key file refuses the start without

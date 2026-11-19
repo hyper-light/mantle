@@ -17,7 +17,7 @@ use hyper_block::block::BlockFile;
 use mantle_engine::rows::Rows as EngineRows;
 use mantle_engine::shard_db::ShardDb;
 use mantle_engine::store::{Config, IoStats};
-use mantle_engine::trunk::TrunkConfig;
+use mantle_engine::trunk::{TrunkConfig, TrunkStats};
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
 use mantle_meta::session::Rules;
 
@@ -84,6 +84,24 @@ impl<F: BlockFile + 'static> Stored<F> {
         }
     }
 
+    /// Runs the engine's packings and compactions on at most `most` maintenance workers, each
+    /// writing through its own handle on the store's file that `open` gives
+    /// (`ShardDb::set_workers_within`): an apply then hands a full memtable or a due compaction to
+    /// a worker and takes its result back, where it wrote every page of it on its own thread.
+    /// [`Engine::persist`] still returns only once the checkpoint is durable, waiting for the
+    /// workers' jobs out first. The owner counts the workers' threads and memory
+    /// (docs/design/node.md §1.4).
+    pub fn set_workers(
+        &mut self,
+        open: impl FnMut() -> Result<F, mantle_engine::Error> + Send + 'static,
+        most: usize,
+    ) -> Result<(), mantle_engine::Error>
+    where
+        F: Send,
+    {
+        self.db.set_workers_within(open, most)
+    }
+
     /// Gives gets and lookups a cache of `pages` of the store's pages, each verified as it was
     /// read or written, replacing any it had; none at 0 (`ShardDb::set_cache`). Without one,
     /// every page a get or a lookup needs is read from the device again.
@@ -95,6 +113,12 @@ impl<F: BlockFile + 'static> Stored<F> {
     /// its cache served and missed (`ShardDb::stats`).
     pub fn io_stats(&self) -> IoStats {
         self.db.stats().2
+    }
+
+    /// The trunk's maintenance since the engine opened: its compactions, and the most that held
+    /// their inputs on the engine's own thread at once (`ShardDb::stats`).
+    pub fn trunk_stats(&self) -> TrunkStats {
+        self.db.stats().1
     }
 
     /// The rows of `[from, to)` (to the end with no `to`), all of them, into the scan buffer.

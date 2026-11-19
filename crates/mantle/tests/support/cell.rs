@@ -174,6 +174,7 @@ engine.max_extents = 256
 engine.cache_bytes = 4194304
 engine.fanout = 3
 engine.leaf_entries = 96
+engine.workers = 1
 stop_ms = 10000
 chunk_bytes = 8388608
 ";

@@ -516,6 +516,9 @@ pub struct ProcessConfig {
     pub cache_bytes: u64,
     pub memtable_bytes: usize,
     pub trunk: TrunkConfig,
+    /// The most maintenance workers each range's engine runs its packings and compactions on
+    /// (`engine.workers`, `derive::ENGINE_WORKERS`), none where the node derived none.
+    pub engine_workers: usize,
     pub transport_bytes: u64,
     /// Each probe of the machine's calibration runs within this (hyper-rt `Calibration::measure`).
     pub probe_budget: Duration,
@@ -720,6 +723,7 @@ pub const KEYS: &[&str] = &[
     "engine.memtable_bytes",
     "engine.fanout",
     "engine.leaf_entries",
+    "engine.workers",
     "transport_bytes",
     "runtime.probe_budget_ms",
     "stop_ms",
@@ -1228,6 +1232,7 @@ impl ProcessConfig {
                 fanout: lines.get("engine.fanout")?,
                 leaf_entries: lines.get("engine.leaf_entries")?,
             },
+            engine_workers: lines.get("engine.workers")?,
             transport_bytes: lines.get("transport_bytes")?,
             probe_budget: Duration::from_millis(lines.get("runtime.probe_budget_ms")?),
             stop: Duration::from_millis(lines.get("stop_ms")?),
@@ -2629,7 +2634,11 @@ fn read_file(path: &Path) -> Result<Vec<u8>, ProcessError> {
 /// Range `group`'s engine in the node's directory, holding `layer`'s rows: opened at its last
 /// checkpoint when its store is there, created when not, a Name range founded with its first rows
 /// (its descriptor, spanning every key), with no page cache: `engine.cache_bytes` is no share of
-/// the node's memory, the most a cache holds once it is lent bytes no operation holds.
+/// the node's memory, the most a cache holds once it is lent bytes no operation holds. Its
+/// packings and compactions run on `engine.workers` maintenance workers, each over the store's
+/// file opened again, so an apply on the node's shard writes none of their pages: inline, they
+/// were a quarter of the busiest shard's time under small PUTs, its `pwrite`s (node.md §1.2).
+/// None where the node derived none (`derive::derive`): its shard packs and compacts them.
 pub(crate) fn engine(
     config: &ProcessConfig,
     group: u128,
@@ -2644,12 +2653,32 @@ pub(crate) fn engine(
     let file = DeviceFile::open(&path, fresh, CachingRequest::Buffered, align)
         .map_err(|e| ProcessError::Engine(e.to_string()))?;
     let engine = |e: mantle_engine::Error| ProcessError::Engine(e.to_string());
+    // Each worker's own handle on the store's file, opened as the shard's was.
+    let reopen = move || {
+        DeviceFile::open(&path, false, CachingRequest::Buffered, align).map_err(|e| {
+            mantle_engine::Error::Io {
+                op: "open a range's store for its maintenance worker",
+                detail: e.to_string(),
+            }
+        })
+    };
     if !fresh {
-        return Stored::open(file, config.store, config.memtable_bytes, config.trunk)
-            .map_err(engine);
+        let mut stored = Stored::open(file, config.store, config.memtable_bytes, config.trunk)
+            .map_err(engine)?;
+        if config.engine_workers > 0 {
+            stored
+                .set_workers(reopen, config.engine_workers)
+                .map_err(engine)?;
+        }
+        return Ok(stored);
     }
     let mut stored =
         Stored::create(file, config.store, config.memtable_bytes, config.trunk).map_err(engine)?;
+    if config.engine_workers > 0 {
+        stored
+            .set_workers(reopen, config.engine_workers)
+            .map_err(engine)?;
+    }
     let founded = |e: mantle_meta::engine::EngineError| ProcessError::Engine(e.to_string());
     if layer == Layer::Name {
         let first = name::first(1).map_err(|e| ProcessError::Engine(e.to_string()))?;

@@ -1045,6 +1045,62 @@ pub fn engine_within(engine: Engine, metadata: u64) -> Result<Engine, DeriveErro
     })
 }
 
+/// The maintenance workers each range's engine runs its packings and compactions on
+/// (`ShardDb::set_workers_within`), where the allowance holds the node's need with them
+/// ([`derive`]): one, the least a pool holds. Measured: at 4,000 to 6,000 small PUTs a second the
+/// leader's shard spent 31% of its busy time packing and compacting its five ranges inline
+/// (`Trunk::run` 26%, the memtable's packing 5%; macOS `sample` of `mantle bench doors --sizes 1
+/// --kinds PUT,GET --load open:12000`, 2026-11-19), a need of one worker for all five by Little's
+/// law, as an engine's pool measures its need (`trunk::pool`); each worker more costs a
+/// compaction's statement, about 90 MB at the range's longest keys ([`workers_bytes`]). A pool
+/// serves one engine's file (`trunk::pool::serve`), so the node's engines cannot share one, and its
+/// five ranges hold five workers, where node.md §1.2 states the engines' pools shared.
+pub const ENGINE_WORKERS: usize = 1;
+
+/// The entries a sorter's two lists, a kept key's hash and offset, and a radix sort's counts take
+/// a memtable's packing (`mantle_engine::memtable::hashed::Sorter`, `mantle_engine::kept::KeyList`):
+/// 16 bytes an entry each list, 12 a key, and eight passes of 256 four-byte counts.
+const SORT_ENTRY_BYTES: u64 = 2 * 16 + 12;
+const SORT_COUNTS_BYTES: u64 = 8 * 256 * 4;
+
+/// What `workers` maintenance workers of `engine`'s hold beside their threads' stacks, at keys of
+/// at most `key` bytes: each worker's store keeps its pools at a compaction's most, a cursor over
+/// each of its inputs (`TrunkConfig::inputs_most`) and two builders of at most a leaf's limit
+/// (`TrunkConfig::built_most`), its reads one at a time with no issuer and the store's range
+/// filter (`mantle_engine::shard_db::pooled_bytes`, a packing's one builder within them); and a
+/// packing's buffers for each worker and the active memtable, which keeps the copy of its arena a
+/// worker sorts (`SortPack`): an arena of the memtable's bytes, and the sorter's lists, the kept
+/// keys and a cut at each of the root's pivots for its entries, at most a leaf's
+/// (`TrunkConfig::leaf_entries`, every row a memtable holds). None for none: without workers a
+/// memtable keeps no copy.
+pub fn workers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64> {
+    if workers == 0 {
+        return Some(0);
+    }
+    let trunk = &engine.trunk;
+    let pooled = mantle_engine::shard_db::pooled_bytes(
+        &engine.store,
+        trunk.inputs_most(),
+        2,
+        key,
+        trunk.built_most(trunk.leaf_entries),
+        1,
+        mantle_engine::store::RANGE_FILTER_BITS,
+    )?;
+    let cuts = u64::try_from(trunk.fanout.checked_add(1)?)
+        .ok()?
+        .checked_mul(u64::try_from(key.checked_add(size_of::<Vec<u8>>())?).ok()?)?;
+    let packing = u64::try_from(engine.memtable_bytes)
+        .ok()?
+        .checked_add(trunk.leaf_entries.checked_mul(SORT_ENTRY_BYTES)?)?
+        .checked_add(SORT_COUNTS_BYTES)?
+        .checked_add(cuts)?;
+    let workers = u64::try_from(workers).ok()?;
+    workers
+        .checked_mul(pooled)?
+        .checked_add(workers.checked_add(1)?.checked_mul(packing)?)
+}
+
 /// The node's shared log on a device whose write unit is `align`, for `ranges` ranges and the
 /// liveness stream's group (`hyper_log::Config::derive`):
 ///
@@ -1518,13 +1574,15 @@ pub fn descriptor_operations(limit: u64, fixed: u64, each: u64) -> u64 {
 /// issuer (`hyper_block::issuer::Issuer::start_device`), on Linux one thread whatever the device's
 /// depth, the kernel holding its transfers, and elsewhere that thread and a worker for each read
 /// its profile measured at the device at once (`Issuer::device_threads`); and for each volume its
-/// writer and its cleaner, and its scrubber where it scrubs. `devices` are those devices' depths,
-/// `volumes` whether each scrubs.
-pub fn threads(shards: usize, devices: &[usize], volumes: &[bool]) -> Option<u64> {
+/// writer and its cleaner, and its scrubber where it scrubs; and its ranges' engines' `workers`
+/// maintenance workers, all of them ([`ENGINE_WORKERS`] each). `devices` are those devices'
+/// depths, `volumes` whether each scrubs.
+pub fn threads(shards: usize, devices: &[usize], volumes: &[bool], workers: usize) -> Option<u64> {
     // The node's own, its standard input's and output's, its log's and its log's device's, and
     // its runtime's watchdog.
     let mut threads = 6u64;
     threads = threads.checked_add(u64::try_from(shards).ok()?)?;
+    threads = threads.checked_add(u64::try_from(workers).ok()?)?;
     for &depth in devices {
         let issuer = hyper_block::issuer::Issuer::device_threads(depth)?;
         threads = threads.checked_add(u64::try_from(issuer).ok()?)?;
@@ -2215,6 +2273,12 @@ fn layer_name(layer: Layer) -> &'static str {
 ///   not open below (`Store::open`). An engine's page cache takes no share: its want, every page
 ///   of its rows at most its store's ([`engine_cache_wants_for`]), is the most it may hold, and
 ///   the node gives it none until it lends the cache bytes no operation holds.
+/// - each engine's maintenance workers ([`ENGINE_WORKERS`]), their stacks among the floor's
+///   threads and their cursors, builders and packings among its engines ([`workers_bytes`]),
+///   where the allowance holds the node's need with them, said as `memory.need_workers`; else
+///   none, each engine packing and compacting on its shard, as at `memory.need`, which every want
+///   whole needs: a compaction's statement at the range's longest keys is about 90 MB, and CI's
+///   7 GiB macOS runner holds no five of them past a founder's need.
 ///
 /// `stores` reads range `group`'s store as it stands, its superblocks read at the page a new store
 /// would take or the one they name (`Store::shape`): none before its first start.
@@ -2223,6 +2287,22 @@ pub fn derive(
     measured: &Measured,
     stores: &mut dyn FnMut(u128, usize) -> Result<Option<Shape>, String>,
 ) -> Result<Derived, DeriveError> {
+    let allowed = allowance(stated.ceiling, &measured.memory)?;
+    let (bare, need) = derive_with(stated.clone(), measured, stores, (0, None))?;
+    match derive_with(stated, measured, stores, (ENGINE_WORKERS, Some(need))) {
+        Ok((derived, needed)) if needed <= allowed => Ok(derived),
+        _ => Ok(bare),
+    }
+}
+
+/// [`derive`] with `workers` maintenance workers each engine, and the node's need with them;
+/// `bare` the need without, said as `memory.need` where given.
+fn derive_with(
+    stated: Stated,
+    measured: &Measured,
+    stores: &mut dyn FnMut(u128, usize) -> Result<Option<Shape>, String>,
+    (workers, bare): (usize, Option<u64>),
+) -> Result<(Derived, u64), DeriveError> {
     let overflow = DeriveError::Overflow;
     let mut said = Said::default();
     say_stated(&mut said, &stated);
@@ -2547,7 +2627,11 @@ pub fn derive(
         })
     };
     let held_by = |objects: usize, window: u64| held_at(objects, transfers, window);
-    // The floor, class by class.
+    // The floor, class by class. Each engine's configured buffers, and what its maintenance
+    // workers hold beside their stacks.
+    let all_workers = workers
+        .checked_mul(ranges)
+        .ok_or(overflow("the engines' workers"))?;
     let engines_bytes = mantle_engine::shard_db::bounded_bytes(
         &StoreConfig {
             max_extents: 0,
@@ -2555,6 +2639,8 @@ pub fn derive(
         },
         made.memtable_bytes,
     )
+    .zip(workers_bytes(&made, rules.max_key_bytes, workers))
+    .and_then(|(each, held)| each.checked_add(held))
     .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
     .ok_or(overflow("the engines' buffers"))?;
     // A device's issuer, one a device the OS names, started by its first volume.
@@ -2563,8 +2649,8 @@ pub fn derive(
         .map(|(_, depth)| depth)
         .collect();
     let scrubs = vec![true; stated.volumes.len()];
-    let started =
-        threads(measured.cores, &depths, &scrubs).ok_or(overflow("the node's threads"))?;
+    let started = threads(measured.cores, &depths, &scrubs, all_workers)
+        .ok_or(overflow("the node's threads"))?;
     let log_held = log_bytes(&log_config).ok_or(overflow("the log's memory"))?;
     let stacks_held = stacks(started).ok_or(overflow("the threads' stacks"))?;
     // Every class at its floor: the operations' at `objects_bytes` and what they hold beside in
@@ -2624,8 +2710,8 @@ pub fn derive(
         .into_iter()
         .map(|(_, depth)| depth)
         .collect();
-        let deep_threads =
-            threads(measured.cores, &deep_depths, &scrubs).ok_or(overflow("the node's threads"))?;
+        let deep_threads = threads(measured.cores, &deep_depths, &scrubs, all_workers)
+            .ok_or(overflow("the node's threads"))?;
         let served = if hosts {
             usize::try_from(serving.operations).map_err(|_| overflow("a stock client"))?
         } else {
@@ -2688,7 +2774,18 @@ pub fn derive(
     // The need holds the capacity wants and the operations the node serves at least: a node given
     // it starts with every capacity want whole, and the transport's growth and more operations
     // take what a larger allowance leaves.
-    say_need(&mut said, need(&deepest_floor, wanted)?);
+    let needed = need(&deepest_floor, wanted)?;
+    say_need(&mut said, bare.unwrap_or(needed));
+    if bare.is_some() {
+        said.add(
+            "memory.need_workers",
+            needed,
+            Kind::Derived,
+            "memory.need with each engine's maintenance workers, their stacks and their cursors, \
+             builders and packings (derive::ENGINE_WORKERS, derive::workers_bytes): a node \
+             allowed less runs none, its engines packing and compacting on its shard",
+        );
+    }
     // The bytes of every class at `held` with `objects_bytes` for the operations.
     let floor_at = |held: &Held, objects_bytes: u64| -> Result<u64, DeriveError> {
         classes_at(held, objects_bytes)?
@@ -2942,6 +3039,18 @@ pub fn derive(
         held_extents,
         shapes.iter().any(Option::is_some),
     );
+    said.add(
+        "engine.workers",
+        workers,
+        Kind::Derived,
+        "the most maintenance workers each range's engine packs and compacts on, so an apply on \
+         the node's shard writes none of their pages: one, the least a pool holds, the measured \
+         need of all five ranges' maintenance under small PUTs (derive::ENGINE_WORKERS); their \
+         stacks among the floor's threads, their cursors, \
+         builders and packings among its engines (derive::workers_bytes); none where the \
+         allowance does not hold the node's need with them, each engine then packing and \
+         compacting on its shard",
+    );
     let config = log_config;
     say_log(&mut said, &config);
     say_transport(&mut said, transport_bytes, transport_floor, transport_want);
@@ -3000,42 +3109,46 @@ pub fn derive(
         bursts: rates.bursts.clone(),
         target,
     });
-    Ok(Derived {
-        config: ProcessConfig {
-            id: stated.id,
-            dir: stated.dir,
-            quic: stated.quic,
-            plane: stated.plane,
-            authority: stated.authority,
-            certificate: stated.certificate,
-            key: stated.key,
-            peers: stated.peers,
-            seeds: stated.seeds,
-            reach: stated.reach,
-            ranges: stated.ranges,
-            voters: stated.voters,
-            settings,
-            rules,
-            log: config,
-            store: engine.store,
-            memtable_bytes: engine.memtable_bytes,
-            cache_bytes: cache,
-            trunk: engine.trunk,
-            transport_bytes,
-            probe_budget,
-            stop,
-            volumes,
-            chunk_bytes: chunk,
-            chunk_asks: asked.chunks,
-            command_asks: asked.commands,
-            read_asks: asked.reads,
-            enlist: stated.enlist,
-            gateway: gateway_config,
-            range_shards,
-            native_shards,
+    Ok((
+        Derived {
+            config: ProcessConfig {
+                id: stated.id,
+                dir: stated.dir,
+                quic: stated.quic,
+                plane: stated.plane,
+                authority: stated.authority,
+                certificate: stated.certificate,
+                key: stated.key,
+                peers: stated.peers,
+                seeds: stated.seeds,
+                reach: stated.reach,
+                ranges: stated.ranges,
+                voters: stated.voters,
+                settings,
+                rules,
+                log: config,
+                store: engine.store,
+                memtable_bytes: engine.memtable_bytes,
+                cache_bytes: cache,
+                trunk: engine.trunk,
+                engine_workers: workers,
+                transport_bytes,
+                probe_budget,
+                stop,
+                volumes,
+                chunk_bytes: chunk,
+                chunk_asks: asked.chunks,
+                command_asks: asked.commands,
+                read_asks: asked.reads,
+                enlist: stated.enlist,
+                gateway: gateway_config,
+                range_shards,
+                native_shards,
+            },
+            bases: said.0,
         },
-        bases: said.0,
-    })
+        needed,
+    ))
 }
 
 /// The transfers a volume's device's issuer keeps in flight: the smaller of the queue the OS
@@ -3717,7 +3830,9 @@ fn say_floor(
                 Class::Volumes => "each volume's buffers (mantle_chunk::layout::most_bytes)",
                 Class::Engines => {
                     "each engine's memtables and store buffers \
-                     (mantle_engine::shard_db::bounded_bytes); its extents' from what remains"
+                     (mantle_engine::shard_db::bounded_bytes) and its maintenance workers' \
+                     cursors, builders and packings (derive::workers_bytes); its extents' from \
+                     what remains"
                 }
                 Class::Ranges => {
                     "each range's member at hyper-raft's limits, its reads the node's own and \
@@ -3737,8 +3852,8 @@ fn say_floor(
                      the first, each at its measured bytes (derive::runtime_bytes)"
                 }
                 Class::Threads => {
-                    "the threads the node starts, each a 2 MiB stack reserved whole \
-                     (derive::threads)"
+                    "the threads the node starts, its engines' maintenance workers among them, \
+                     each a 2 MiB stack reserved whole (derive::threads)"
                 }
             },
         );
@@ -4175,9 +4290,9 @@ mod tests {
         assert_eq!(a.reads, g.objects);
     }
 
-    /// The node's own six threads, its runtime's watchdog among them, and a thread a shard, and
-    /// each device's issuer and workers and each volume's writer, cleaner and scrubber where it
-    /// scrubs, each a 2 MiB stack.
+    /// The node's own six threads, its runtime's watchdog among them, and a thread a shard, each
+    /// device's issuer and workers, each volume's writer, cleaner and scrubber where it scrubs, and
+    /// its engines' maintenance workers, each a 2 MiB stack.
     #[test]
     fn the_threads_are_the_nodes_own_its_shards_and_its_storages() {
         // A device's issuer: one thread on Linux, the kernel holding its depth; elsewhere a worker
@@ -4189,13 +4304,14 @@ mod tests {
                 depth + 1
             }
         };
-        assert_eq!(threads(1, &[], &[]), Some(7));
-        assert_eq!(threads(8, &[], &[]), Some(6 + 8));
-        assert_eq!(threads(1, &[2], &[true]), Some(7 + issuer(2) + 3));
+        assert_eq!(threads(1, &[], &[], 0), Some(7));
+        assert_eq!(threads(8, &[], &[], 0), Some(6 + 8));
+        assert_eq!(threads(1, &[2], &[true], 0), Some(7 + issuer(2) + 3));
         assert_eq!(
-            threads(4, &[1, 4], &[true, false]),
+            threads(4, &[1, 4], &[true, false], 0),
             Some(6 + 4 + issuer(1) + issuer(4) + 3 + 2)
         );
+        assert_eq!(threads(18, &[], &[], 15), Some(6 + 18 + 15));
         assert_eq!(stacks(10), Some(20 << 20));
     }
 
@@ -4590,6 +4706,25 @@ mod tests {
         assert_eq!(
             said_bytes(&derived, "memory.need"),
             NEED_96_GIB + crate::node::PIECE
+        );
+        // Its five engines each take a maintenance worker: its need with them is its need and
+        // five workers' stacks, cursors, builders and packings, about 90 MB each at the range's
+        // longest keys, which its operations' bytes give up.
+        assert_eq!(
+            said_bytes(&derived, "engine.workers"),
+            ENGINE_WORKERS as u64
+        );
+        let c = &derived.config;
+        let engine = Engine {
+            store: c.store,
+            memtable_bytes: c.memtable_bytes,
+            trunk: c.trunk,
+        };
+        let each = workers_bytes(&engine, c.rules.max_key_bytes, ENGINE_WORKERS).unwrap();
+        assert!((80_000_000..100_000_000).contains(&each), "{each}");
+        assert_eq!(
+            said_bytes(&derived, "memory.need_workers"),
+            NEED_96_GIB + crate::node::PIECE + 5 * (each + STACK)
         );
     }
 
@@ -5801,8 +5936,11 @@ mod tests {
         );
         assert!(all <= memory, "{all}");
         if !cfg!(target_os = "linux") {
-            let stacks = threads(3, &[256], &[true]).unwrap() * STACK;
+            // Its engines take no maintenance workers: 7 GiB holds no five compactions' statements
+            // past its need (`derive`, `ENGINE_WORKERS`).
+            let stacks = threads(3, &[256], &[true], 0).unwrap() * STACK;
             assert_eq!(stacks, 269 * STACK);
+            assert_eq!(said_bytes(&deep, "engine.workers"), 0);
             assert_eq!(said_bytes(&deep, "memory.floor.threads"), stacks);
         }
     }

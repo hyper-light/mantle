@@ -98,9 +98,10 @@ fn a_cell_at_rest_turns_without_remaking_what_a_turn_keeps() {
     );
 }
 
-/// The cell's allocations while its three clients ask `ops` operations each.
-fn serving(seed: u64, ops: u64) -> alloc::Counts {
-    let mut cell = Sim::new(seed);
+/// The cell's allocations while its three clients ask `ops` operations each, the cell made by
+/// `make`.
+fn serving(make: fn(u64) -> Sim, seed: u64, ops: u64) -> alloc::Counts {
+    let mut cell = make(seed);
     cell.leader();
     cell.judged();
     cell.open_bucket();
@@ -180,6 +181,24 @@ fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     } else {
         35_075
     };
-    let counts = serving(1, 40);
+    let counts = serving(Sim::new, 1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");
+}
+
+/// The same cell serving the same writes and reads, each node's transport given its want past its
+/// floor, each share at a receive chunk (`bounds::chunked_transport`), as a node whose memory
+/// holds it derives (`derive`'s `transport.want`): each connection's window may grow to a chunk
+/// and each peer's pool holds one, so a datagram a node receives is cut from a chunk, where at
+/// the floor's windows, QUIC's initial window of 12,000 bytes, each was copied into a buffer of
+/// its own. Fewer allocations and fewer bytes asked of the allocator than at the floor: on this
+/// Mac 33,116 allocations, 2,048 reallocations and 16,163,710 bytes, where the same tree at the
+/// floor's windows counted 34,319, 2,051 and 17,557,473, 1,203 allocations and 1,393,763 bytes
+/// more.
+#[test]
+fn a_cell_serving_writes_at_chunked_windows_copies_fewer_datagrams() {
+    let floor = serving(Sim::new, 1, 40);
+    let chunked = serving(Sim::chunked, 1, 40);
+    eprintln!("at the floor's windows {floor:?}\nat a chunk's {chunked:?}");
+    assert!(chunked.allocations < floor.allocations, "{chunked:?}");
+    assert!(chunked.bytes < floor.bytes, "{chunked:?}");
 }

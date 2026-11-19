@@ -625,7 +625,13 @@ pub struct Sim {
     moved_at: u64,
     /// The node starts so far, each drawing its endpoint's seed afresh.
     starts: u64,
+    /// The transport budget each node holds, from its statement.
+    budget: Budget,
 }
+
+/// A node's transport budget from its statement: its floor (`bounds::least_transport`) or with
+/// its want past it, each share at a receive chunk (`bounds::chunked_transport`).
+type Budget = fn(&bounds::Stated) -> Result<u64, bounds::Unfit>;
 
 impl Sim {
     pub fn new(seed: u64) -> Self {
@@ -635,17 +641,30 @@ impl Sim {
     /// The cell of `seed`, its range under `settings` and its nodes' logs under `log`.
     pub fn with(seed: u64, settings: Settings, log: LogConfig) -> Self {
         let nodes = if seed % 2 == 1 { NODES } else { MOST_NODES };
-        Self::of(seed, nodes, settings, log)
+        Self::of(seed, nodes, settings, log, bounds::least_transport)
+    }
+
+    /// The cell of `seed`, each node's transport given its want past its floor, each share at a
+    /// receive chunk (`bounds::chunked_transport`), as a node whose memory holds it derives.
+    pub fn chunked(seed: u64) -> Self {
+        let nodes = if seed % 2 == 1 { NODES } else { MOST_NODES };
+        Self::of(
+            seed,
+            nodes,
+            SETTINGS,
+            log_config(),
+            bounds::chunked_transport,
+        )
     }
 
     /// The cell of `seed` of one node, as a laptop's is: its range one voter, so every frame
     /// holding it is answered once confirmed (durability.md §7.5).
     pub fn lone(seed: u64) -> Self {
-        Self::of(seed, 1, SETTINGS, log_config())
+        Self::of(seed, 1, SETTINGS, log_config(), bounds::least_transport)
     }
 
     /// The cell of `seed` of `nodes`, its range under `settings` and its nodes' logs under `log`.
-    fn of(seed: u64, nodes: u64, settings: Settings, log: LogConfig) -> Self {
+    fn of(seed: u64, nodes: u64, settings: Settings, log: LogConfig, budget: Budget) -> Self {
         let shards = usize::try_from(nodes + CLIENTS + 1).unwrap();
         let mut rt = SimRuntime::new(
             &RuntimeConfig {
@@ -718,6 +737,7 @@ impl Sim {
             learns: Vec::new(),
             moved_at: 0,
             starts: 0,
+            budget,
         };
         for id in 1..=nodes {
             let file = SimFile::new(
@@ -806,7 +826,7 @@ impl Sim {
         // The budget a node's configuration derives (`derive`'s transport class): the least its
         // statement holds, each window at QUIC's initial window beside the messages' room, each
         // connection's reserve and state and the receive ring at its most, and no receive chunk.
-        settings.transport_bytes = bounds::least_transport(&settings.stated().unwrap()).unwrap();
+        settings.transport_bytes = (self.budget)(&settings.stated().unwrap()).unwrap();
         self.starts += 1;
         let shard = member.shard;
         let tell = self.tell.clone();

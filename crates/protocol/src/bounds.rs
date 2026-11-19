@@ -225,16 +225,35 @@ fn shape(stated: &Stated) -> Result<Shape, Unfit> {
 
 /// The least bytes the node's transport may hold for `stated` (its `transport_bytes` aside):
 /// what it holds besides QUIC's windows, and each share of the rest at QUIC's initial window,
-/// below which [`limits`] refuses (docs/design/node.md §1.4). Receive chunks past it spare a
-/// datagram its copy, which its connection's window already charges (hyper-transport's
-/// `receive`), and wait for their knee.
+/// below which [`limits`] refuses (docs/design/node.md §1.4). Its windows' ceiling is below a
+/// receive chunk, so it holds none, and each datagram it receives is copied into a buffer of its
+/// own (hyper-transport's `receive`); [`chunked_transport`] is what spares them.
 pub fn least_transport(stated: &Stated) -> Result<u64, Unfit> {
+    transport_at(stated, initial_window(MIN_DATAGRAM))
+}
+
+/// The bytes the node's transport holds for `stated` (its `transport_bytes` aside) with each
+/// share at a receive chunk, [`RECEIVE_CHUNK`]: its want past its floor (docs/design/node.md
+/// §1.4, §3.3). Each connection's window may grow to a chunk, which hyper-transport's auto-tuning
+/// takes as a whole window is read within two round trips (Chromium QUIC's
+/// `QuicFlowController::MaybeIncreaseMaxWindowSize`; RFC 9000 §4.2 lets a receiver raise its
+/// limits as data is consumed), and each peer's pool holds a chunk for the window's unread data
+/// ([`buffering`]), so a datagram it receives is cut from a chunk, not copied into a buffer of its
+/// own (hyper-transport's `receive`). Past [`least_transport`] by a chunk less QUIC's initial
+/// window for each share.
+pub fn chunked_transport(stated: &Stated) -> Result<u64, Unfit> {
+    let chunk = u64::try_from(RECEIVE_CHUNK).map_err(|_| Unfit("a receive chunk"))?;
+    transport_at(stated, chunk)
+}
+
+/// What the transport holds for `stated` besides QUIC's windows, and each share at `window`.
+fn transport_at(stated: &Stated, window: u64) -> Result<u64, Unfit> {
     let shape = shape(stated)?;
     let (held, shares) = held(stated, &shape)?;
     shares
-        .checked_mul(initial_window(MIN_DATAGRAM))
+        .checked_mul(window)
         .and_then(|windows| windows.checked_add(held))
-        .ok_or(Unfit("the transport's least bytes"))
+        .ok_or(Unfit("the transport's bytes"))
 }
 
 /// The transport's limits for a node of `stated`.
@@ -672,6 +691,46 @@ mod tests {
             let limits = at(least).unwrap();
             assert_eq!(limits.window_ceiling, initial_window(MIN_DATAGRAM));
             assert!(at(least - 1).is_err());
+        }
+    }
+
+    /// The transport's want past its floor gives each share a receive chunk: each connection's
+    /// window may grow to a chunk and each peer's pool holds one, a chunk for each full window,
+    /// where at the floor's windows, QUIC's initial window, the pool holds none and each datagram
+    /// is copied into a buffer of its own. It is the floor and a chunk less the initial window for
+    /// each share, every class held beside the windows as at the floor; a byte less holds no chunk.
+    #[test]
+    fn the_transports_want_gives_each_window_and_pool_a_receive_chunk() {
+        let chunk = RECEIVE_CHUNK as u64;
+        let initial = initial_window(MIN_DATAGRAM);
+        for (peers, clients) in [(1, 0), (2, 0), (9, 0), (2, 64), (2, 1_000)] {
+            let at = |transport_bytes| Stated {
+                peers,
+                clients,
+                pool: clients,
+                transport_bytes,
+                ..stated()
+            };
+            let least = least_transport(&at(0)).unwrap();
+            let chunked = chunked_transport(&at(0)).unwrap();
+            let identities = (peers.max(1) + clients) as u64;
+            let shares = identities * (CONNECTIONS_PER_PEER as u64 + 1);
+            assert_eq!(chunked - least, shares * (chunk - initial));
+            let floor = limits(&at(least)).unwrap();
+            assert_eq!((floor.window_ceiling, floor.receive_chunks), (initial, 0));
+            let want = limits(&at(chunked)).unwrap();
+            assert_eq!(
+                want.window_ceiling, chunk,
+                "{peers} peers, {clients} clients"
+            );
+            assert_eq!(want.receive_chunks as u64, identities);
+            let (held, _) = held(&at(chunked), &shape(&at(chunked)).unwrap()).unwrap();
+            let connections = identities * CONNECTIONS_PER_PEER as u64;
+            assert_eq!(
+                held + connections * want.window_ceiling + want.receive_chunks as u64 * chunk,
+                chunked
+            );
+            assert_eq!(limits(&at(chunked - 1)).unwrap().receive_chunks, 0);
         }
     }
 

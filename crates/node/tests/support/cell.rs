@@ -477,10 +477,15 @@ enum Order {
 }
 
 /// What a task tells the test.
+// A node's status is carried in its report, not boxed as the lint asks: a node reports it at
+// almost every turn, its counts moving, and `turn_allocs` counts the test's taking of the reports
+// with the node's turns, so a box apiece was an allocation a status (72,008 more in the cell at
+// rest's ten seconds, 7,435 more serving its clients' writes).
+#[allow(clippy::large_enum_variant)]
 enum Report {
     /// Where a node listens, once open.
     Bound(u64, SocketAddr, SocketAddr),
-    Status(u64, Box<Status>),
+    Status(u64, Status),
     /// A node's power cut: its log and its range's engine, as they stood.
     Crashed(u64, SimLog, Vec<(u128, Model)>),
     /// A node stopped on an error, as its process would, giving back what it held.
@@ -563,7 +568,7 @@ async fn run_node(
         if status != told
             && let Some(now) = status
         {
-            if reports.send(Report::Status(id, Box::new(now))).is_err() {
+            if reports.send(Report::Status(id, now)).is_err() {
                 return;
             }
             told = status;
@@ -1051,7 +1056,7 @@ impl Sim {
                     self.members.get_mut(&id).unwrap().bound = Some((quic, plane));
                 }
                 Report::Status(id, status) => {
-                    self.members.get_mut(&id).unwrap().status = Some(*status);
+                    self.members.get_mut(&id).unwrap().status = Some(status);
                 }
                 Report::Crashed(id, log, engines) => {
                     let file = only(log.log).close().unwrap();

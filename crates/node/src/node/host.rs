@@ -138,7 +138,8 @@ pub(crate) struct Job {
     /// (`derive::Charges`); none for one not admitted.
     charge: u64,
     /// The blocks a put of it holds going down, or a get of it being read, at once, as the node
-    /// learned them when it was admitted (`crate::window`) and charged for them.
+    /// learned them (`crate::window`) when it was admitted, a get's once its version was read
+    /// (`reading`), and charged for them.
     window: usize,
     /// Its operation's label (`crate::labels::host`), once its operation is known: none while a
     /// native request's fields are read, or for one answered without its operation.
@@ -1096,12 +1097,12 @@ pub(super) fn charged(
 }
 
 /// What an operation that moves `moves` holds at its own size, and the blocks its driver holds at
-/// once: a write's window going down as `learned` measured the node's puts, a get's being read as
-/// it measured its gets (`crate::window`), each at least the floor's (`GatewaySettings::window`)
-/// and charged for those blocks (`derive::Charges::write`, `Charges::read`); every other operation
-/// the most, at the floor's window. A get's object's size is known only once its row is read, so
-/// it is charged at the window learned, and what its object's blocks do not take is given back
-/// then (`Node::current_read`). None on a node that hosts no objects.
+/// once: a write's window going down as `learned` measured the node's puts (`crate::window`), at
+/// least the floor's (`GatewaySettings::window`), charged for those blocks
+/// (`derive::Charges::write`); a get's at the floor's window (`Charges::read`), as its object's
+/// size is known only once its row is read, widened then to the window learned of the node's gets
+/// ([`reading`]); every other operation the most, at the floor's window. None on a node that
+/// hosts no objects.
 pub(super) fn sized(
     gateway: Option<&GatewaySettings>,
     learned: &crate::window::Windows,
@@ -1117,11 +1118,7 @@ pub(super) fn sized(
             let window = fitting(gateway, learned, |window| charges.write(window, length));
             (charges.write(window, length), window)
         }
-        Moves::Read => {
-            let learned = learned.get.blocks(u64::MAX, charges.largest_block());
-            let window = fitting(gateway, learned, |window| charges.read(window));
-            (charges.read(window), window)
-        }
+        Moves::Read => (charges.read(gateway.window), gateway.window),
         Moves::Neither => (charges.of(None), gateway.window),
     }
 }
@@ -1144,6 +1141,34 @@ fn fitting(gateway: &GatewaySettings, learned: usize, charge: impl Fn(usize) -> 
         }
     }
     low
+}
+
+/// The blocks a get of a range of `length` bytes holds being read, admitted at `charge` for the
+/// floor's window: the blocks the node learned its clients take while one is read (`learned`,
+/// `crate::window`), no more than the range is cut into at the smallest block, and the widest
+/// whose charge (`derive::Charges::read`) the operations' bytes hold, past what it was admitted
+/// at beside the other operations' as `holds` says (`admit::Admission::holds`); the floor's where
+/// none wider fits. Its object's size is known only once its row is read, so it is widened then,
+/// before it holds the blocks, and takes their bytes (`Node::current_read`).
+fn reading(
+    gateway: &GatewaySettings,
+    learned: &crate::window::Window,
+    length: u64,
+    charge: u64,
+    holds: impl Fn(u64) -> bool,
+) -> usize {
+    let charges = &gateway.charges;
+    let cut = length.div_ceil(charges.smallest_block().max(1));
+    let most = usize::try_from(cut).unwrap_or(usize::MAX);
+    let learned = learned.blocks(u64::MAX, charges.largest_block()).min(most);
+    fitting(gateway, learned, |window| {
+        let read = charges.read(window);
+        if holds(read.saturating_sub(charge)) {
+            read
+        } else {
+            u64::MAX
+        }
+    })
 }
 
 /// A bucket's versioning as GetBucketVersioning answers it: none for a bucket never versioned.
@@ -3096,15 +3121,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if length > mantle_s3::body::MAX_GET {
             return self.fail_job(at, Status::EntityTooLarge);
         }
-        // The window it was charged for, no wider than the blocks its range is cut into at the
-        // smallest block: what that window's charge does not take is given back.
-        let most = length
-            .div_ceil(gateway.charges.smallest_block().max(1))
-            .max(1);
-        let held = (*window)
-            .min(usize::try_from(most).unwrap_or(usize::MAX))
-            .max(1);
-        let excess = charge.saturating_sub(gateway.charges.read(held));
+        // Its window, now its range's length is known: the one learned, as wide as its blocks and
+        // the operations' bytes beside the others' hold, the bytes past its admitted charge taken.
+        let admission = self.admission.as_ref();
+        let held = reading(gateway, &self.windows.get, length, *charge, |more| {
+            admission.is_none_or(|admission| admission.holds(more))
+        });
+        let more = gateway.charges.read(held).saturating_sub(*charge);
         match Get::new(version.file, size, served, Box::new(keyring), held) {
             Ok(mut get) => {
                 get.tick(hyper_rt::futures::now_ns());
@@ -3116,9 +3139,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         getting.total = length;
         getting.held = Some(Box::new(reply));
         *window = held;
-        *charge = charge.saturating_sub(excess);
+        *charge = charge.saturating_add(more);
         if let Some(admission) = self.admission.as_mut() {
-            admission.gave(excess);
+            admission.took(more);
         }
         Ok(())
     }
@@ -6059,12 +6082,13 @@ mod tests {
         assert_eq!(fitting(&gateway, learned, charge), learned);
     }
 
-    /// A get is admitted with the window the node learned of its gets (`crate::window`): the
-    /// floor's until it measured them, as many blocks as its clients take while one is read once
-    /// it has, fewer for a slower client, and never wider than the operations' bytes hold; and it
-    /// is charged for what its driver holds with that window, its blocks being read at the largest
-    /// block and the one taken to be written out (`get::most_bytes`). A put's measures leave it
-    /// alone.
+    /// A get is admitted at the floor's window, its object's size unknown (`sized`), and once its
+    /// row is read holds the window the node learned of its gets (`reading`, `crate::window`): the
+    /// floor's until it measured them, as many blocks as its clients take while one is read once it
+    /// has, fewer for a slower client, no more than its range is cut into, and never wider than the
+    /// operations' bytes hold beside the others'; charged for what its driver holds with it, its
+    /// blocks being read at the largest block and the one taken to be written out
+    /// (`get::most_bytes`). A put's measures leave it alone.
     #[test]
     fn a_gets_window_is_learned_and_charged_for_what_it_holds() {
         let scheme = durability::Scheme::Copies(3);
@@ -6090,30 +6114,42 @@ mod tests {
             target: 1e-11,
         };
         let mut learned = crate::window::Windows::default();
-        let read = |learned: &crate::window::Windows, gateway: &GatewaySettings| {
-            sized(Some(gateway), learned, Moves::Read)
-        };
-        assert_eq!(read(&learned, &gateway), (charges().read(1), 1));
+        let admitted = sized(Some(&gateway), &learned, Moves::Read);
+        assert_eq!(admitted, (charges().read(1), 1));
+        let all = |_: u64| true;
+        let long = 1u64 << 30;
+        assert_eq!(reading(&gateway, &learned.get, long, admitted.0, all), 1);
         // Blocks read in 80 ms, a client taking 1 GB/s: 80 MB, ten blocks of 8,325,104 bytes.
         learned.get.took(80_000_000);
         learned.get.paced(1_000_000_000, 1_000_000_000);
-        let (charge, window) = read(&learned, &gateway);
+        assert_eq!(sized(Some(&gateway), &learned, Moves::Read), admitted);
+        let window = reading(&gateway, &learned.get, long, admitted.0, all);
         assert_eq!(window, 10);
-        assert_eq!(charge, charges().read(window));
+        let charge = charges().read(window);
         assert!(charge >= get::most_bytes(window, &layout).unwrap() + block);
         assert!(charge > charges().read(window - 1));
+        // No more than its range is cut into.
+        assert_eq!(
+            reading(&gateway, &learned.get, 3 * block, admitted.0, all),
+            3
+        );
+        assert_eq!(reading(&gateway, &learned.get, 1, admitted.0, all), 1);
         // A put of a gigabyte has measured nothing of its own: the floor's.
-        let put = sized(Some(&gateway), &learned, Moves::Written(1 << 30));
-        assert_eq!(put.1, 1);
-        // Held to what the operations' bytes hold.
+        assert_eq!(sized(Some(&gateway), &learned, Moves::Written(long)).1, 1);
+        // Held to what the operations' bytes hold, and to what they hold beside the others'.
         gateway.objects_bytes = charges().read(4);
-        assert_eq!(read(&learned, &gateway), (charges().read(4), 4));
-        // A slower client: 100 MB/s, 8 MB while a block is read, one block.
+        assert_eq!(reading(&gateway, &learned.get, long, admitted.0, all), 4);
         gateway.objects_bytes = charges().read(64);
+        let room = charges().read(6) - admitted.0;
+        let beside = |more: u64| more <= room;
+        assert_eq!(reading(&gateway, &learned.get, long, admitted.0, beside), 6);
+        let none = |more: u64| more == 0;
+        assert_eq!(reading(&gateway, &learned.get, long, admitted.0, none), 1);
+        // A slower client: 100 MB/s, 8 MB while a block is read, one block.
         for _ in 0..64 {
             learned.get.paced(100_000_000, 1_000_000_000);
         }
-        assert_eq!(read(&learned, &gateway).1, 1);
+        assert_eq!(reading(&gateway, &learned.get, long, admitted.0, all), 1);
         // A head reads no bytes: the most, at the floor's window.
         assert_eq!(
             sized(Some(&gateway), &learned, Moves::Neither),

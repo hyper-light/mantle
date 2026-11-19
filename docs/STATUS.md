@@ -1400,8 +1400,8 @@ targets. Each item is done when its test passes on every supported target.
    smoothed with RFC 6298's gain, one block until both are measured (`crates/node/src/window.rs`;
    node.md §2.8). *Built (2026-11-18)*: a GET's window learned the same way from the node's own
    gets, a block's time from its row asked to its plaintext opened times the pace its client takes
-   a block the node holds whole, its charge at that window, and what its range's blocks do not take
-   given back once its version is read (node.md §2.8). A replica's chunk put no longer ends at the
+   a block the node holds whole; a get is admitted at one block and widens to that window once its
+   version is read, as its range's blocks and the operations' bytes hold (node.md §2.8). A replica's chunk put no longer ends at the
    idle timeout (3.07 s) while the peer's
    device makes it durable, a write slower than that once ending the put as stalled (on
    windows-11-arm a volume's first write took up to 8.0 s before calibration saw NTFS's zeros;

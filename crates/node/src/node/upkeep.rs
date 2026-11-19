@@ -7,9 +7,12 @@
 //!
 //! Maintenance comes last in a turn, after its reads, writes and messages, and waits for nothing:
 //! a turn's budget is about as long again as the turn's own work took ([`Upkeep::budget`]), so a
-//! request that arrives during it waits no longer than that. While an engine owes work the shard's
-//! wait is due at once, after a yield to its other tasks, so an idle shard works through the debt;
-//! once none is owed its wait is what it was.
+//! request that arrives during it waits no longer than that. While an engine owes work it can do
+//! now the shard's wait is due at once, after a yield to its other tasks, so an idle shard works
+//! through the debt; once none is owed its wait is what it was. An engine whose work waits on a
+//! job out on a worker does none and says so, and the worker's message wakes the shard's task
+//! (`ShardDb::idle_step_now`), which ends its wait: the shard neither turns to look for the result
+//! nor sleeps past it.
 
 use std::time::Instant;
 
@@ -53,6 +56,10 @@ pub(super) struct Upkeep {
     /// Whether an engine that did work at the last turn still owed some at its end, or the budget
     /// ran out before every range was asked: the wait is due at once while so.
     owed: bool,
+    /// Whether an engine owed work at the last turn but could do none of it now, a job out on a
+    /// worker among such: the worker's message wakes the task, and the node's wait asks it again
+    /// before it sleeps (`Node::wait`).
+    waiting: bool,
 }
 
 impl Upkeep {
@@ -75,6 +82,11 @@ impl Upkeep {
         self.owed
     }
 
+    /// Whether an engine owed work at the last turn that it could do none of then.
+    pub(super) fn waiting(&self) -> bool {
+        self.waiting
+    }
+
     /// One turn's maintenance over `count` ranges, after `own_ns` of the turn's own work
     /// ([`Self::budget`]): `step(at, units)` steps range `at`'s engine with at most `units` and
     /// answers the units it did and whether its engine still owes work, or the node's error for a
@@ -87,6 +99,7 @@ impl Upkeep {
         mut step: impl FnMut(usize, u64) -> Result<(u64, bool), NodeError>,
     ) -> Result<u64, NodeError> {
         self.owed = false;
+        self.waiting = false;
         if count == 0 {
             return Ok(0);
         }
@@ -109,10 +122,11 @@ impl Upkeep {
             let (did, owes) = step(at, left)?;
             done = done.saturating_add(did);
             left = left.saturating_sub(did);
-            // One that owes work but could do none now (its cache refused a slot, its index still
-            // out) is asked again at the next turn something else brings: turned at once, the
-            // shard would spin on it.
+            // One that owes work but could do none now (its cache refused a slot, a job out on a
+            // worker) is asked again at the next turn something else brings, a worker's message
+            // among them: turned at once, the shard would spin on it.
             self.owed |= owes && did > 0;
+            self.waiting |= owes && did == 0;
         }
         if done > 0 {
             let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -143,6 +157,8 @@ fn failed<E: Engine>(group: u128, engine: &E, e: EngineError) -> NodeError {
 
 #[cfg(test)]
 mod tests {
+    use mantle_protocol::bounds;
+
     use super::*;
 
     /// A turn's own work, as the tests' turns state it: 10 µs.
@@ -225,12 +241,16 @@ mod tests {
             assert!(!upkeep.owed());
         }
         assert_eq!(upkeep.budget(OWN_NS), 1, "an untimed rate grew");
-        // One that owes work but can do none now brings no wait forward either.
+        assert!(!upkeep.waiting());
+        // One that owes work but can do none now brings no wait forward either: it waits, as a
+        // job out on a worker does, to be asked again before the node's wait sleeps.
         assert_eq!(upkeep.turn(OWN_NS, 1, |_, _| Ok((0, true))).unwrap(), 0);
         assert!(!upkeep.owed());
+        assert!(upkeep.waiting());
         // With no ranges, none is asked.
         assert_eq!(upkeep.turn(OWN_NS, 0, |_, _| Ok((1, true))).unwrap(), 0);
         assert!(!upkeep.owed());
+        assert!(!upkeep.waiting());
     }
 
     /// The rows of a PUT burst a metadata range's engine takes: 40,000, as read-amp's counting
@@ -281,21 +301,67 @@ mod tests {
     }
 
     /// What a burst then gets alone showed: the cost at once and at each doubling of the node's
-    /// idle turns until none was owed, then after; the turns; the units done; the most units a
-    /// turn did over its budget (none past it); and the checkpoints and flushes, before and after.
+    /// idle turns until none was owed, then after; the turns; the units done; the checkpoints and
+    /// flushes, before and after; and the turns' waits on the workers.
     #[derive(Debug)]
     struct Caught {
         costs: Vec<(u64, Cost)>,
         turns: u64,
         units: u64,
         checkpoints: ((u64, u64), (u64, u64)),
+        waits: Waits,
+    }
+
+    /// How a shard's turns met jobs out on its engine's workers: the turns whose step found
+    /// nothing to do but a job out (`FlushStats::idle_waits`); of those, the ones after which the
+    /// shard turned again at once to look (polled) and the ones after which it waited for a wake;
+    /// the waits a wake ended and those that ran to the wait's bound; the turns a wake began whose
+    /// step found nothing to take; and the turns after a wait that ran to its bound whose step
+    /// found the result there, a wait that slept past it.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct Waits {
+        looked: u64,
+        polled: u64,
+        waited: u64,
+        woken: u64,
+        slept: u64,
+        woken_idle: u64,
+        slept_past: u64,
+    }
+
+    /// Waits as a node's or a range shard's turn waits with nothing due but its bound: until any
+    /// wake of the task, or `bound_ns`. Whether a wake ended it.
+    async fn wait_for_wake(bound_ns: u64) -> bool {
+        use hyper_rt::combine::{Either, race2};
+        use std::future::poll_fn;
+        use std::pin::pin;
+        use std::task::Poll;
+        let mut woken = false;
+        let any_wake = pin!(poll_fn(move |_| {
+            if woken {
+                Poll::Ready(())
+            } else {
+                woken = true;
+                Poll::Pending
+            }
+        }));
+        let sleep = pin!(hyper_rt::futures::sleep(bound_ns));
+        match race2(sleep, any_wake).await {
+            Either::First(slept) => {
+                slept.unwrap();
+                false
+            }
+            Either::Second(()) => true,
+        }
     }
 
     /// A range's engine under the node's derived configuration (`derive::engine` of a cell's rules
     /// on a device of 4 KiB writes), opened as `process::engine` opens it with `workers`
     /// maintenance workers or none, on a shard that may wait: a burst applied and checkpointed,
     /// then a get each of the node's turns, each turn ending in its maintenance (`Upkeep::turn`),
-    /// until none is owed.
+    /// until none is owed. Between turns the shard does as the node's wait does: it turns again
+    /// at once, after a yield, while maintenance is owed, and otherwise waits for a wake of its
+    /// task, at most the node's idle timeout.
     fn burst_then_gets(workers: usize) -> Caught {
         use hyper_block::buf::Alignment;
         use hyper_block::file::{CachingRequest, DeviceFile};
@@ -364,6 +430,9 @@ mod tests {
                     let mut costs = vec![(0, cost(&mut e))];
                     let mut upkeep = Upkeep::default();
                     let (mut turns, mut units, mut next) = (0u64, 0u64, 1u64);
+                    let mut waits = Waits::default();
+                    let (mut woke, mut slept) = (false, false);
+                    let bound = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap();
                     loop {
                         // A turn's own work, a get, then its maintenance.
                         let began = Instant::now();
@@ -371,14 +440,25 @@ mod tests {
                         assert_eq!(e.get(&k).unwrap(), Some(v));
                         let own_ns = u64::try_from(began.elapsed().as_nanos()).unwrap();
                         let budget = upkeep.budget(own_ns);
+                        let looked = e.flush_stats().idle_waits;
+                        let mut owes = false;
                         let done = upkeep
-                            .turn(own_ns, 1, |_, units| step(1, &mut e, units))
+                            .turn(own_ns, 1, |_, units| {
+                                let stepped = step(1, &mut e, units)?;
+                                owes = stepped.1;
+                                Ok(stepped)
+                            })
                             .unwrap();
                         assert!(done <= budget, "turn {turns} did {done} past {budget}");
                         units += done;
                         turns += 1;
-                        if !upkeep.owed() {
-                            break;
+                        let looked = e.flush_stats().idle_waits - looked;
+                        waits.looked += looked;
+                        if woke && looked > 0 {
+                            waits.woken_idle += 1;
+                        }
+                        if slept && looked == 0 {
+                            waits.slept_past += 1;
                         }
                         if turns == next {
                             costs.push((turns, cost(&mut e)));
@@ -388,6 +468,26 @@ mod tests {
                             turns <= BURST,
                             "the burst's maintenance outlasted {BURST} turns"
                         );
+                        if upkeep.owed() {
+                            // The wait is due at once: a yield, then the next turn.
+                            waits.polled += looked;
+                            (woke, slept) = (false, false);
+                            hyper_rt::futures::yield_now().await;
+                            continue;
+                        }
+                        if !owes || looked == 0 {
+                            // Nothing owed, or nothing it can do now and no job out to wait for.
+                            break;
+                        }
+                        assert!(upkeep.waiting(), "turn {turns} looked and is not waiting");
+                        waits.waited += 1;
+                        woke = wait_for_wake(bound).await;
+                        slept = !woke;
+                        if woke {
+                            waits.woken += 1;
+                        } else {
+                            waits.slept += 1;
+                        }
                     }
                     costs.push((turns, cost(&mut e)));
                     let checkpoints = (persisted, e.checkpoints());
@@ -397,6 +497,7 @@ mod tests {
                         turns,
                         units,
                         checkpoints,
+                        waits,
                     }
                 })
                 .unwrap()
@@ -408,7 +509,10 @@ mod tests {
     /// After a burst, a range taking only gets reads the busy trunk until its maintenance is paid:
     /// the node's idle turns pay it within as many turns as the burst had rows, inline or on its
     /// worker, none doing more than its budget; the lookups' cost falls to the maintained
-    /// trunk's; and maintenance makes no checkpoint and flushes nothing.
+    /// trunk's; and maintenance makes no checkpoint and flushes nothing. A turn that finds only
+    /// a job out on the worker does nothing, and the shard neither turns again to look nor sleeps
+    /// past the job's result: it waits, the worker's message wakes it, and the turn that wake
+    /// begins takes what came.
     #[test]
     fn a_burst_s_maintenance_is_paid_in_the_node_s_idle_turns() {
         for workers in [0, crate::derive::ENGINE_WORKERS] {
@@ -416,11 +520,23 @@ mod tests {
             eprintln!("workers {workers}: {caught:?}");
             let (busy, idle) = (caught.costs[0].1, caught.costs.last().unwrap().1);
             assert!(caught.turns > 1, "the burst left nothing owed: {caught:?}");
-            // Every turn but the last did work toward the debt.
+            let w = caught.waits;
+            // Every turn but the last, and those that waited on the worker, did work.
             assert!(
-                caught.units + 1 >= caught.turns,
+                caught.units + 1 + w.waited >= caught.turns,
                 "a turn did nothing: {caught:?}"
             );
+            // No turn looked for a job out and turned again at once; each such turn waited, each
+            // wait a wake ended began a turn that found something to take, and none that ran to
+            // its bound (the job still out after the node's idle timeout) slept past a result.
+            assert_eq!(w.polled, 0, "a turn polled a job out: {caught:?}");
+            assert_eq!(w.looked, w.waited, "{caught:?}");
+            assert_eq!(w.woken + w.slept, w.waited, "{caught:?}");
+            assert_eq!(w.woken_idle, 0, "a wake found nothing: {caught:?}");
+            assert_eq!(w.slept_past, 0, "a wait slept past a result: {caught:?}");
+            if workers == 0 {
+                assert_eq!(w, Waits::default(), "an inline engine waited: {caught:?}");
+            }
             assert!(
                 idle.seek_sources * 2 <= busy.seek_sources,
                 "a seek's sources did not fall: {busy:?} to {idle:?}"

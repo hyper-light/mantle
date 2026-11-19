@@ -82,6 +82,10 @@ pub struct FlushStats {
     /// A runtime task's idle slices ([`ShardDb::idle_paced_step`]) and the work units they did.
     pub idle_slices: u64,
     pub idle_units: u64,
+    /// Of the idle steps that wait for nothing ([`ShardDb::idle_step_now`]), those that found
+    /// nothing to do but wait for a worker's job, and left the owner's task to be woken by the
+    /// workers' next message.
+    pub idle_waits: u64,
     /// Looks a budget that follows the machine took at it ([`ShardDb::look_machine`]).
     pub looks: u64,
     /// The record cache's gets served and missed, its misses on keys its ghost named, and its
@@ -361,6 +365,10 @@ pub struct ShardDb<F: BlockFile> {
     kept_index: Option<crate::kept::KeptIndex>,
     kept_spare: Option<crate::kept::KeptIndex>,
     kept_out: bool,
+    /// Whether the last idle step did nothing but look for its workers' results: the jobs its
+    /// work waits on out, none back, nothing handed and nothing done here
+    /// ([`Self::idle_step_now`]).
+    looked: bool,
     /// The bytes the index out on a worker held when it went.
     kept_out_bytes: usize,
     /// The next kept memtable's number.
@@ -885,6 +893,7 @@ impl<F: BlockFile> ShardDb<F> {
             kept_index: None,
             kept_spare: None,
             kept_out: false,
+            looked: false,
             kept_out_bytes: 0,
             kept_next: 0,
             kept_whole: false,
@@ -4588,16 +4597,47 @@ impl<F: BlockFile> ShardDb<F> {
     /// for, so the step lasts its `keys`. The work is the runtime's idle slice's (`idle_owed`): an
     /// active memtable's runs merge only once scans paid for it. Returns the work done and whether
     /// such work is still owed; none while a checkpoint holds the trunk.
+    ///
+    /// A step that could do nothing but look for a job still out on a worker did no work: it
+    /// answers none done and work owed, and the runtime task it runs on is woken by the workers'
+    /// next message ([`Pool::wake_on_message`](crate::trunk::pool::Pool)), so its owner neither
+    /// turns again to look nor sleeps past the result. A message come already is taken, and the
+    /// step answers work it can do now.
     pub fn idle_step_now(&mut self, keys: u64) -> Result<(u64, bool), Error> {
         if !self.idle_owed() {
             return Ok((0, false));
         }
         self.trunk.clear_io_wait();
         let done = self.idle_step_with(keys, true)?;
+        let owed = self.idle_owed();
+        self.flush_stats.idle_slices = self.flush_stats.idle_slices.saturating_add(1);
+        if owed
+            && (self.looked || done == 0)
+            && let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.busy())
+        {
+            match pool.wake_on_message(&mut self.store)? {
+                Some(false) => {
+                    self.flush_stats.idle_waits = self.flush_stats.idle_waits.saturating_add(1);
+                    return Ok((0, true));
+                }
+                // A message came as it looked: taken, its result is the next step's work.
+                Some(true) => {
+                    let f = &mut self.flush_stats;
+                    f.idle_units = f.idle_units.saturating_add(done);
+                    return Ok((done.max(1), true));
+                }
+                None => {}
+            }
+        }
         let f = &mut self.flush_stats;
-        f.idle_slices = f.idle_slices.saturating_add(1);
         f.idle_units = f.idle_units.saturating_add(done);
-        Ok((done, self.idle_owed()))
+        Ok((done, owed))
+    }
+
+    /// The moves of the workers' pool ([`Pool::moves`](crate::trunk::pool::Pool)): one that
+    /// changed none in a step only looked. None without workers.
+    fn pool_moves(&mut self) -> Option<u64> {
+        self.trunk.pool_mut().map(|pool| pool.moves())
     }
 
     /// A range task's turn: what the workers sent back since its last turn is taken, a growth
@@ -4708,6 +4748,7 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     fn idle_step_inner(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
+        self.looked = false;
         // A file kept as segments grows first: the room every allocation after needs.
         if (self.growth.is_some() || self.growth_due()) && self.grow(!paced)? {
             return Ok(1);
@@ -4717,16 +4758,23 @@ impl<F: BlockFile> ShardDb<F> {
             // At least one: a memtable packed whole with no filter page left still has its
             // branch to finish.
             let w = keys.min(left).max(1);
+            let moves = self.pool_moves();
             self.pack_some(w, !paced)?;
+            // Still waiting for a worker's seat, and nothing back: it only looked.
+            self.looked = self.packing.as_ref().is_some_and(|p| p.sort.is_some())
+                && self.pool_moves() == moves;
             return Ok(w);
         }
         if !self.frozen.is_empty() {
             // Only workers' branches owed: an idle shard that may wait waits for the oldest.
+            let moves = self.pool_moves();
             self.take_packs(!paced)?;
+            self.looked = self.pool_moves() == moves;
             return Ok(1);
         }
         if self.trunk.debt() > 0 || !self.trunk.is_idle() {
             let t = self.timed.then(std::time::Instant::now);
+            let moves = self.pool_moves();
             let used = if paced {
                 self.trunk.step_paced(&mut self.store, keys)?
             } else {
@@ -4735,6 +4783,8 @@ impl<F: BlockFile> ShardDb<F> {
             if self.timed {
                 self.note_trunk(ns_since(t));
             }
+            // Nothing merged here and nothing handed out or back: its jobs are out.
+            self.looked = used == 0 && self.pool_moves() == moves;
             return Ok(used.max(1));
         }
         if self.kept_out || !self.kept_lists.is_empty() {

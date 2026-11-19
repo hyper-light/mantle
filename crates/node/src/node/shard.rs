@@ -2893,6 +2893,204 @@ mod tests {
         }
     }
 
+    /// What a range shard's turns did with an [`Upkept`] engine's maintenance: the turns it was
+    /// asked at and the units done; the turns that found its job out; and, the job ended, the
+    /// turns asked as it ended and the turn that took its result. The task that looked last is
+    /// woken as the job ends, as a maintenance worker's message wakes its shard
+    /// (`ShardDb::idle_step_now`).
+    #[derive(Default)]
+    struct Ledger {
+        turns: std::sync::atomic::AtomicU64,
+        units: std::sync::atomic::AtomicU64,
+        looked: std::sync::atomic::AtomicU64,
+        ended_at: std::sync::atomic::AtomicU64,
+        taken_at: std::sync::atomic::AtomicU64,
+        /// Whether the job ended, and the task to wake as it does: one lock, so a turn either
+        /// takes the result or is woken for it.
+        job: std::sync::Mutex<(bool, Option<Waker>)>,
+    }
+
+    impl Ledger {
+        fn get(at: &std::sync::atomic::AtomicU64) -> u64 {
+            at.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// The job ends, as a worker's does: its owner's task woken.
+        fn end_job(&self) {
+            let mut job = self.job.lock().unwrap();
+            self.ended_at
+                .store(Self::get(&self.turns), std::sync::atomic::Ordering::SeqCst);
+            job.0 = true;
+            if let Some(waker) = job.1.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// A model engine whose maintenance is `inline` units done on its shard, a turn's budget at a
+    /// time, then, when `out`, a job out on a worker that the test ends ([`Ledger::end_job`]).
+    struct Upkept {
+        rows: Model,
+        inline: u64,
+        out: bool,
+        ledger: std::sync::Arc<Ledger>,
+    }
+
+    impl mantle_meta::engine::Rows for Upkept {
+        fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, mantle_meta::engine::EngineError> {
+            self.rows.get(key)
+        }
+
+        fn next(
+            &mut self,
+            from: &[u8],
+            to: &[u8],
+        ) -> Result<Option<mantle_meta::engine::Row>, mantle_meta::engine::EngineError> {
+            self.rows.next(from, to)
+        }
+
+        fn apply(
+            &mut self,
+            index: u64,
+            writes: Vec<mantle_meta::engine::Write>,
+        ) -> Result<(), mantle_meta::engine::EngineError> {
+            self.rows.apply(index, writes)
+        }
+    }
+
+    impl Engine for Upkept {
+        fn applied(&self) -> u64 {
+            self.rows.applied()
+        }
+
+        fn durable(&self) -> u64 {
+            self.rows.durable()
+        }
+
+        fn persist(&mut self) -> Result<(), mantle_meta::engine::EngineError> {
+            self.rows.persist()
+        }
+
+        fn image(
+            &mut self,
+        ) -> Result<Vec<mantle_meta::engine::Row>, mantle_meta::engine::EngineError> {
+            self.rows.image()
+        }
+
+        fn image_size(&self) -> Option<(u64, u64)> {
+            self.rows.image_size()
+        }
+
+        fn install(
+            &mut self,
+            index: u64,
+            rows: Vec<mantle_meta::engine::Row>,
+        ) -> Result<(), mantle_meta::engine::EngineError> {
+            self.rows.install(index, rows)
+        }
+
+        fn upkeep(&mut self, budget: u64) -> Result<(u64, bool), mantle_meta::engine::EngineError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let ledger = &self.ledger;
+            let turn = ledger.turns.fetch_add(1, SeqCst) + 1;
+            if self.inline > 0 {
+                let did = budget.min(self.inline);
+                self.inline -= did;
+                ledger.units.fetch_add(did, SeqCst);
+                return Ok((did, self.inline > 0 || self.out));
+            }
+            if !self.out {
+                return Ok((0, false));
+            }
+            let mut job = ledger.job.lock().unwrap();
+            if job.0 {
+                self.out = false;
+                ledger.taken_at.store(turn, SeqCst);
+                ledger.units.fetch_add(1, SeqCst);
+                return Ok((1, false));
+            }
+            // Nothing to do but the job: the task is left to be woken as it ends.
+            let task = hyper_rt::futures::current_task().unwrap();
+            job.1 = Some(hyper_rt::waker::waker_for(task.0));
+            ledger.looked.fetch_add(1, SeqCst);
+            Ok((0, true))
+        }
+    }
+
+    /// A range shard turns at once while its range's engine owes maintenance it can do, and works
+    /// through it with nothing else to turn it; with only a job out on a worker it waits, and the
+    /// job's end wakes it, its result taken within a turn of the job's end.
+    #[test]
+    fn a_range_shard_turns_for_maintenance_it_can_do_and_wakes_for_its_workers() {
+        let rt = started(2, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let range = one_member();
+        let log = log_in(dir.path(), &range);
+        let mut rows = Model::default();
+        rows.install(0, name::first(1).unwrap()).unwrap();
+        rows.persist().unwrap();
+        let ledger = std::sync::Arc::new(Ledger::default());
+        const INLINE: u64 = 1_000;
+        let engine = Upkept {
+            rows,
+            inline: INLINE,
+            out: true,
+            ledger: std::sync::Arc::clone(&ledger),
+        };
+        let store = Answers::new(mantle_range::claim(&log, GROUP, &range).unwrap());
+        // A member that never campaigns (`following`): nothing but its maintenance turns it.
+        let replica =
+            mantle_range::open_shell(1, store, engine, &range, 1, Elections::Suspicion).unwrap();
+        let holder = rt.holder_of(rt.shard_ids()[1]).unwrap();
+        let mut lanes = Lanes::<Upkept, Stored>::start(holder, 1, 1, 8).unwrap();
+        lanes.send(In::Adopt(GROUP, Box::new(replica))).unwrap();
+        let mut until = |what: &str, done: &dyn Fn() -> bool| {
+            let until = deadline();
+            while !done() {
+                match lanes.take() {
+                    Ok(Some(Out::Stopped(error))) | Err(error) => {
+                        panic!("{what}: the shard stopped: {error}")
+                    }
+                    Ok(_) => {}
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "{what}: past {PATIENCE:?}"
+                );
+                std::thread::yield_now();
+            }
+        };
+        // The inline work, with nothing else to turn the shard: each turn did some.
+        until("the inline maintenance done", &|| {
+            Ledger::get(&ledger.looked) > 0
+        });
+        let inline_turns = Ledger::get(&ledger.turns) - Ledger::get(&ledger.looked);
+        assert_eq!(Ledger::get(&ledger.units), INLINE);
+        assert!(
+            inline_turns <= INLINE,
+            "{inline_turns} turns for {INLINE} units"
+        );
+        // The job out: the shard looked, and waits. Its end wakes the shard, whose next turn
+        // takes the result.
+        ledger.end_job();
+        until("the job's result taken", &|| {
+            Ledger::get(&ledger.taken_at) > 0
+        });
+        let (ended, taken) = (Ledger::get(&ledger.ended_at), Ledger::get(&ledger.taken_at));
+        eprintln!(
+            "inline turns {inline_turns}, looks {}, ended at turn {ended}, taken at {taken}",
+            Ledger::get(&ledger.looked)
+        );
+        assert!(
+            taken <= ended + 1,
+            "taken at turn {taken}, ended at {ended}"
+        );
+        assert_eq!(Ledger::get(&ledger.units), INLINE + 1);
+        drop(lanes);
+        rt.shutdown().unwrap();
+        drop(log);
+    }
+
     /// A range whose engine fails stops the node with the engine's own error in its text, beside
     /// the step that failed and the error the step met. The node suite's nodes stopped saying
     /// only the step ("the engine failed to persist a snapshot"), the engine's error out only

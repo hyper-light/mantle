@@ -4497,18 +4497,34 @@ what its workers finished, then the consolidations seeks paid for, then the cach
 budget is as long again as the turn's own work took, in units at the rate the shard's turns have
 done them, both measured, as the engine's runtime slices are sized (`mantle_engine::ranges`): a
 request that arrives during it waits no longer than that, and a shard with no request gives
-maintenance about half its time. Each owed range is first in turn. While any engine
-owes work the shard's wait is due at once, after one yield to its other tasks; with none owed,
-or none it can do now, the wait is what it was. A job out on a worker is polled for at each such
-turn: a wake from the worker's message (the pool's `receive`, which the runtime's ranges await)
-would spare those turns, and is open. Maintenance writes no checkpoint and flushes nothing, so what is durable
-and when a checkpoint answers are unchanged. Counted (`node::upkeep::tests`, 40,000 Name-sized
-rows under the derived engine, checkpointed, then a get a turn, each turn ending in its
-maintenance; a debug build on macOS aarch64, 2026-11-19): inline, a one-row seek listed 5.9
-sources right after the burst and 1.0 after 4,222 turns (40,103 units); with the worker, 12.8 and
-1.0 after 129 turns; a get read 1.005 and 1.018 pages, then 1.000; no turn did more than its
-budget, and maintenance made no checkpoint and no flush. The turns depend on the measured budget;
-the test holds them within the burst's rows.
+maintenance about half its time. Each owed range is first in turn. While any engine owes work it
+can do now the shard's wait is due at once, after one yield to its other tasks; with none owed,
+or none it can do now, the wait is what it was. A step that finds nothing to do but a job out on
+a worker (nothing back, nothing handed out, nothing merged on the shard) answers none done and
+work owed, and leaves the task it runs on registered on the pool's channel back, as the pool's
+`receive` does for the runtime's ranges, so that the worker's next message wakes it once
+(`ShardDb::idle_step_now`, `Pool::wake_on_message`): the wake ends the shard's wait, and the turn
+it begins takes the result. Such a look used to answer a unit done, so the shard turned again at
+once to look until the job came back. The node's own wait asks such an engine again before it
+sleeps (`Node::wait`): the process awaits between the node's turns (saying a line), and a wake
+that came then ended that await rather than the wait, which would sleep with the result in hand;
+asked, the engine takes the result or leaves the task waiting on its workers again, with no await
+between that and the wait. A range shard's loop awaits nothing between its maintenance and its
+wait. Maintenance writes no checkpoint and flushes nothing, so
+what is durable and when a checkpoint answers are unchanged. Counted (`node::upkeep::tests`,
+40,000 Name-sized rows under the derived engine, checkpointed, then a get a turn, each turn
+ending in its maintenance and followed, as a node's wait follows it, by a yield while maintenance
+is owed and otherwise by a wait for any wake of the task, at most the idle timeout; a debug
+build on macOS aarch64, 2026-11-19): inline, a one-row seek listed 5.9 sources right after the
+burst and 1.0 after 4,222 to 4,616 turns (about 40,100 units; the turns follow the measured
+budget); with the node's one worker, 12.8 and 1.0 after 129 turns, 120 of them looks the shard
+turned again at once after, and since the wake 10.6 and 1.0 after 15 turns, none polled: six
+found only the job out and waited, each wait ended by the worker's message and none by its
+bound, and the turn each wake began found the result. A get read 1.005 and 1.018 pages, then
+1.000; no turn did more than its budget, and maintenance made no checkpoint and no flush. The
+test holds the turns within the burst's rows. Through a range shard's own loop
+(`shard::tests`), an engine whose job ended while the shard waited had its result taken at the
+next turn.
 
 ### 6.2 Applied index, flush and truncation
 

@@ -52,7 +52,7 @@ pub struct Stored<F: BlockFile> {
     value: Vec<u8>,
     rows: EngineRows,
     /// The engine's own error that fenced it, the first: an [`EngineError::Fenced`] says only
-    /// that one did, and its owner reports this one ([`Self::fault`]).
+    /// that one did, and its owner reports this one ([`Engine::fault`]).
     fault: Option<mantle_engine::Error>,
 }
 
@@ -90,11 +90,6 @@ impl<F: BlockFile + 'static> Stored<F> {
             rows: EngineRows::new(),
             fault: None,
         }
-    }
-
-    /// The engine's own error that fenced it, the first, if one has.
-    pub fn fault(&self) -> Option<&mantle_engine::Error> {
-        self.fault.as_ref()
     }
 
     /// Runs the engine's packings and compactions on at most `most` maintenance workers, each
@@ -248,6 +243,12 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
 
     fn checkpoints(&self) -> (u64, u64) {
         (self.checkpoints, self.db.syncs())
+    }
+
+    fn fault(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.fault
+            .as_ref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
     }
 
     fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {

@@ -27,10 +27,10 @@ pub use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
     Message, MessageType,
 };
-pub use machine::{Applied, RangeMachine};
+pub use machine::{Applied, Failure, RangeMachine};
 pub use replica::{
     Output, Range, Replica, Settings, Shell, claim, limits, open_shell, propose_encoded,
-    propose_entry, ready_bytes, ready_held, remove,
+    propose_entry, ready_bytes, ready_held, refused, remove,
 };
 pub use stored::{Stored, holds_rows};
 

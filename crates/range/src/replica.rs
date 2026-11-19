@@ -27,7 +27,7 @@ use mantle_meta::session::Rules;
 use mantle_meta::wire;
 
 use crate::error::ReplicaError;
-use crate::machine::{Applied, RangeMachine};
+use crate::machine::{Applied, Failure, RangeMachine};
 use crate::membership::Replacement;
 
 /// What a drive gives out, in buffers the owner keeps and reuses: messages to send, the answers
@@ -201,6 +201,48 @@ fn shell_error(e: hyper_durable::ReplicaError) -> ReplicaError {
     }
 }
 
+/// `e`, what a member's shell answered a call, as the range's error, `machine` the member's: a
+/// member its machine fenced is reported with the error the machine met there and, where its
+/// engine was fenced, the engine's own error ([`RangeMachine::failure`], [`Engine::fault`]),
+/// which the shell's cause names only by the step that failed. Read only once a call failed.
+pub fn refused<E: Engine>(
+    machine: &RangeMachine<E>,
+    e: hyper_durable::ReplicaError,
+) -> ReplicaError {
+    match e {
+        hyper_durable::ReplicaError::Fenced(cause @ hyper_durable::Cause::Machine(_)) => {
+            let fence = Fence {
+                cause: &cause,
+                failure: machine.failure(),
+                fault: machine.engine().fault(),
+            };
+            ReplicaError::Fenced(fence.to_string())
+        }
+        e => shell_error(e),
+    }
+}
+
+/// A member its machine fenced, as its error says it: the shell's cause, then the error the
+/// machine met, then the engine's own error, each that there is.
+struct Fence<'a> {
+    cause: &'a hyper_durable::Cause,
+    failure: Option<&'a Failure>,
+    fault: Option<&'a (dyn std::error::Error + 'static)>,
+}
+
+impl std::fmt::Display for Fence<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.cause)?;
+        if let Some(failure) = self.failure {
+            write!(f, ": {failure}")?;
+        }
+        if let Some(fault) = self.fault {
+            write!(f, ": {fault}")?;
+        }
+        Ok(())
+    }
+}
+
 fn opened(e: OpenError) -> ReplicaError {
     match e {
         OpenError::Core(e) => e.into(),
@@ -300,7 +342,9 @@ pub fn propose_encoded<L: LogStore, E: Engine>(
             max: max_entry_bytes,
         });
     }
-    shell.propose(Vec::new(), data).map_err(shell_error)
+    shell
+        .propose(Vec::new(), data)
+        .map_err(|e| refused(shell.machine(), e))
 }
 
 impl<L: LogStore, E: Engine> Replica<L, E> {
@@ -492,19 +536,26 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     /// counts say. A replica waiting for room is not ticked, as it takes no part in the group,
     /// and the ticks it missed are not given again.
     pub fn tick(&mut self) -> Result<(), ReplicaError> {
-        self.shell.tick().map(drop).map_err(shell_error)
+        self.shell
+            .tick()
+            .map(drop)
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 
     /// Takes a message, bound to its sender by the transport. Taken while writes are out; a
     /// replica waiting for room refuses it with `Stalled`, as the network may drop it.
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
-        self.shell.step(message).map_err(shell_error)
+        self.shell
+            .step(message)
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 
     /// Campaigns now; refused [`ReplicaError::Uncertain`] while its log may lack entries it
     /// acknowledged and the others are no quorum without it (core step R-7).
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
-        self.shell.campaign().map_err(shell_error)
+        self.shell
+            .campaign()
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 
     /// Proposes an entry of commands; only a leader takes it, and none larger than the range's
@@ -521,7 +572,9 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
 
     pub fn propose_change(&mut self, change: &ConfChangeV2) -> Result<(), ReplicaError> {
         self.bounded(change.encoded_len())?;
-        self.shell.change(Vec::new(), change).map_err(shell_error)
+        self.shell
+            .change(Vec::new(), change)
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 
     fn bounded(&self, len: usize) -> Result<(), ReplicaError> {
@@ -541,14 +594,18 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     /// and one a leader that steps down held is dropped, as a lost message is, for its caller to
     /// ask again.
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicaError> {
-        self.shell.read(context).map_err(shell_error)
+        self.shell
+            .read(context)
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 
     /// Reports whether a snapshot this member sent to `to` arrived. Replication to a member
     /// pauses while its snapshot is out, so the transport reports every snapshot's fate; one
     /// that comes while the replica waits for room is kept, the latest for each member.
     pub fn report_snapshot(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
-        self.shell.report_snapshot(to, arrived).map_err(shell_error)
+        self.shell
+            .report_snapshot(to, arrived)
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 
     /// Does what there is to do (docs/design/replica.md §3): takes the log's answers, applies
@@ -562,7 +619,9 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
         waker: &Waker,
         out: &mut Output,
     ) -> Result<Driven, ReplicaError> {
-        self.shell.drive(now, waker, out).map_err(shell_error)
+        self.shell
+            .drive(now, waker, out)
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 
     /// The owner freed room in the log (another group compacted or left): a replica waiting for
@@ -575,6 +634,8 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     /// keeping `keep` entries behind for followers that lag (docs/design/replica.md §4); true
     /// when a compaction's start went out, with `waker`.
     pub fn compact(&mut self, keep: u64, now: u64, waker: &Waker) -> Result<bool, ReplicaError> {
-        self.shell.compact(keep, now, waker).map_err(shell_error)
+        self.shell
+            .compact(keep, now, waker)
+            .map_err(|e| refused(self.shell.machine(), e))
     }
 }

@@ -10,11 +10,15 @@
 //! hyper-raft's `Raft::become_leader` appends it), so an ordinary entry's batch carries nothing
 //! more. An install writes the snapshot's term with its rows.
 
+use std::collections::TryReserveError;
+
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
 use mantle_codec::{Reader, Writer};
 use mantle_meta::apply::{Layer, apply_entry_with};
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
+use mantle_meta::error::MetaError;
 use mantle_meta::key::{LOCAL, marker};
+use mantle_meta::record::RecordError;
 use mantle_meta::session::{Rules, Watermark};
 use mantle_meta::wire::{self, Answer};
 
@@ -63,11 +67,43 @@ pub struct Applied {
     pub answer: Answer,
 }
 
+/// The error a step of the machine met where it failed, which the [`Fatal`] it answers the shell
+/// names only by the step. The shell fences the replica on the first and asks the machine nothing
+/// more until the member opens again, so the machine keeps that one alone
+/// ([`RangeMachine::failure`]); an engine that was fenced keeps its own error ([`Engine::fault`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Failure {
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    #[error(transparent)]
+    Meta(#[from] MetaError),
+    #[error(transparent)]
+    Record(#[from] RecordError),
+    #[error(transparent)]
+    Memory(#[from] TryReserveError),
+}
+
+/// The [`Fatal`] of the step `what`, which failed on `e`, kept in `failure` unless one is
+/// already, the first being the cause.
+fn failed(failure: &mut Option<Failure>, what: &'static str, e: impl Into<Failure>) -> Fatal {
+    failure.get_or_insert_with(|| e.into());
+    Fatal(what)
+}
+
 /// The engine, with the term row added to the batch it applies next: what the first entry of a
 /// term carries besides its own writes.
 struct Termed<'a, E> {
     engine: &'a mut E,
     row: Option<Write>,
+}
+
+impl<'a, E> Termed<'a, E> {
+    /// `engine`, the term row for an entry of `term` added to its next batch if the term differs
+    /// from `last`, the last entry's.
+    fn new(engine: &'a mut E, last: u64, term: u64) -> Self {
+        let row = (term != last).then(|| Write::Put(TERM.to_vec(), encode_term(term)));
+        Self { engine, row }
+    }
 }
 
 impl<E: Rows> Rows for Termed<'_, E> {
@@ -110,6 +146,8 @@ pub struct RangeMachine<E> {
     /// this only until the next `persist`; the shell is then told less than the engine holds,
     /// which keeps every rule that reads it (the fence, compaction) on the safe side.
     durable: Point,
+    /// The error of the step that failed the machine, the first ([`Failure`]).
+    failure: Option<Failure>,
 }
 
 impl<E: Engine> RangeMachine<E> {
@@ -148,11 +186,18 @@ impl<E: Engine> RangeMachine<E> {
             configuration,
             applied: point,
             durable: point,
+            failure: None,
         })
     }
 
     pub fn engine(&self) -> &E {
         &self.engine
+    }
+
+    /// The error of the step that failed the machine, the first, if one has: what its replica
+    /// was fenced on.
+    pub fn failure(&self) -> Option<&Failure> {
+        self.failure.as_ref()
     }
 
     /// The layer whose rows the range holds.
@@ -168,16 +213,6 @@ impl<E: Engine> RangeMachine<E> {
     pub fn into_engine(self) -> E {
         self.engine
     }
-
-    /// The engine with the term row for an entry of `term` added to its next batch, if the term
-    /// differs from the last entry's.
-    fn termed(&mut self, term: u64) -> Termed<'_, E> {
-        let row = (term != self.applied.term).then(|| Write::Put(TERM.to_vec(), encode_term(term)));
-        Termed {
-            engine: &mut self.engine,
-            row,
-        }
-    }
 }
 
 impl<E: Engine> StateMachine for RangeMachine<E> {
@@ -187,7 +222,8 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         let (layer, rules) = (self.layer, self.rules);
         // Lent to the entry, as the engine is, and kept only once the entry applies.
         let mut watermark = std::mem::take(&mut self.watermark);
-        let mut engine = self.termed(entry.term);
+        let failure = &mut self.failure;
+        let mut engine = Termed::new(&mut self.engine, self.applied.term, entry.term);
         if entry.kind != EntryType::EntryNormal {
             return Err(Fatal(
                 "a change of configuration given to apply as an entry",
@@ -197,10 +233,10 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         if entry.data.is_empty() {
             engine
                 .apply(entry.index, Vec::new())
-                .map_err(|_| Fatal("the engine refused an entry"))?;
+                .map_err(|e| failed(failure, "the engine refused an entry", e))?;
         } else {
             let batch = wire::Entry::decode(entry.data)
-                .map_err(|_| Fatal("a committed entry does not decode"))?;
+                .map_err(|e| failed(failure, "a committed entry does not decode", e))?;
             let made = apply_entry_with(
                 &mut engine,
                 entry.index,
@@ -209,10 +245,16 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
                 &rules,
                 &mut watermark,
             )
-            .map_err(|_| Fatal("a committed entry breaks the range's state machine"))?;
+            .map_err(|e| {
+                failed(
+                    failure,
+                    "a committed entry breaks the range's state machine",
+                    e,
+                )
+            })?;
             answers
                 .try_reserve(made.len())
-                .map_err(|_| Fatal("no memory for an entry's answers"))?;
+                .map_err(|e| failed(failure, "no memory for an entry's answers", e))?;
             answers.extend(batch.commands.iter().zip(made).map(|(c, answer)| Applied {
                 index: entry.index,
                 session: c.session,
@@ -238,10 +280,9 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         configuration: &ConfState,
     ) -> Result<(), Fatal> {
         let bytes = conf::encode(configuration).ok_or(Fatal("a configuration past u32 members"))?;
-        let mut engine = self.termed(at.term);
-        engine
+        Termed::new(&mut self.engine, self.applied.term, at.term)
             .apply(at.index, vec![Write::Put(conf::ROW.to_vec(), bytes)])
-            .map_err(|_| Fatal("the engine refused a change"))?;
+            .map_err(|e| failed(&mut self.failure, "the engine refused a change", e))?;
         self.configuration = configuration.clone();
         self.applied = at;
         Ok(())
@@ -268,7 +309,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         let rows = self
             .engine
             .image()
-            .map_err(|_| Fatal("the engine gave no image"))?;
+            .map_err(|e| failed(&mut self.failure, "the engine gave no image", e))?;
         *into = image::encode(&rows).ok_or(Fatal("a row past u32 bytes"))?;
         Ok((self.applied, self.configuration.clone()))
     }
@@ -296,10 +337,14 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         self.engine
             .install(at.index, rows)
-            .map_err(|_| Fatal("the engine refused a snapshot"))?;
-        self.engine
-            .persist()
-            .map_err(|_| Fatal("the engine failed to persist a snapshot"))?;
+            .map_err(|e| failed(&mut self.failure, "the engine refused a snapshot", e))?;
+        self.engine.persist().map_err(|e| {
+            failed(
+                &mut self.failure,
+                "the engine failed to persist a snapshot",
+                e,
+            )
+        })?;
         self.configuration = configuration.clone();
         self.applied = at;
         self.durable = at;
@@ -309,7 +354,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     fn persist(&mut self) -> Result<(), Fatal> {
         self.engine
             .persist()
-            .map_err(|_| Fatal("the engine failed to persist"))?;
+            .map_err(|e| failed(&mut self.failure, "the engine failed to persist", e))?;
         self.durable = self.applied;
         Ok(())
     }

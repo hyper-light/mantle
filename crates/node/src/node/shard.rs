@@ -629,7 +629,7 @@ pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
         }
         let compacted = shell
             .compact(0, now, waker)
-            .map_err(mantle_range::ReplicaError::from)?;
+            .map_err(|e| mantle_range::refused(shell.machine(), e))?;
         made_room |= compacted;
         if stalled && !compacted {
             shell.resume();
@@ -706,6 +706,20 @@ impl<E: Engine, S: LogStore> std::ops::DerefMut for Here<E, S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.owner
     }
+}
+
+/// `e`, what the replica at `handle` of `owner` answered its drive, as the node's error: a range
+/// its machine fenced with the error the machine met and its engine's own
+/// (`mantle_range::refused`).
+pub(crate) fn refused<E: Engine + 'static, S: LogStore>(
+    owner: &Owner<Answers<S>, RangeMachine<E>, Unbounded>,
+    handle: Handle,
+    e: ReplicaError,
+) -> NodeError {
+    NodeError::Range(match owner.get(handle) {
+        Some(replica) => mantle_range::refused(replica.machine(), e),
+        None => e.into(),
+    })
 }
 
 /// Refused, typed, when `replica` has writes out: each write records the waker of the task that
@@ -1528,7 +1542,7 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             match outcome {
                 Ok(d) => driven.push((handle, d)),
                 Err(e) => {
-                    fenced.get_or_insert(e);
+                    fenced.get_or_insert((handle, e));
                 }
             }
         });
@@ -1592,7 +1606,7 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
         self.serve();
         match fenced {
             // A fenced range stops the node, as one on the node's shard does (`Node::drive`).
-            Some(e) => Err(NodeError::Range(e.into())),
+            Some((handle, e)) => Err(refused(&self.owner, handle, e)),
             None => Ok(()),
         }
     }
@@ -2742,6 +2756,147 @@ mod tests {
             movable(GROUP, &replica),
             Err(NodeError::WritesOut(GROUP))
         ));
+    }
+
+    /// A model engine whose calls fail once `failing` is set, as `mantle_range::Stored`'s fail
+    /// once its store refuses: each answers `Fenced`, the engine keeping its own error, the one a
+    /// node of the node suite stopped on (2026-11-19), as its fault.
+    struct Failing {
+        rows: Model,
+        failing: bool,
+        fault: Option<mantle_engine::Error>,
+    }
+
+    impl Failing {
+        fn fenced(&mut self) -> mantle_meta::engine::EngineError {
+            self.fault
+                .get_or_insert(mantle_engine::Error::LimitExceeded {
+                    what: "extents of a store",
+                    limit: 256,
+                });
+            mantle_meta::engine::EngineError::Fenced
+        }
+    }
+
+    impl mantle_meta::engine::Rows for Failing {
+        fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, mantle_meta::engine::EngineError> {
+            if self.failing {
+                return Err(self.fenced());
+            }
+            self.rows.get(key)
+        }
+
+        fn next(
+            &mut self,
+            from: &[u8],
+            to: &[u8],
+        ) -> Result<Option<mantle_meta::engine::Row>, mantle_meta::engine::EngineError> {
+            if self.failing {
+                return Err(self.fenced());
+            }
+            self.rows.next(from, to)
+        }
+
+        fn apply(
+            &mut self,
+            index: u64,
+            writes: Vec<mantle_meta::engine::Write>,
+        ) -> Result<(), mantle_meta::engine::EngineError> {
+            if self.failing {
+                return Err(self.fenced());
+            }
+            self.rows.apply(index, writes)
+        }
+    }
+
+    impl Engine for Failing {
+        fn applied(&self) -> u64 {
+            self.rows.applied()
+        }
+
+        fn durable(&self) -> u64 {
+            self.rows.durable()
+        }
+
+        fn persist(&mut self) -> Result<(), mantle_meta::engine::EngineError> {
+            if self.failing {
+                return Err(self.fenced());
+            }
+            self.rows.persist()
+        }
+
+        fn image(
+            &mut self,
+        ) -> Result<Vec<mantle_meta::engine::Row>, mantle_meta::engine::EngineError> {
+            self.rows.image()
+        }
+
+        fn image_size(&self) -> Option<(u64, u64)> {
+            self.rows.image_size()
+        }
+
+        fn install(
+            &mut self,
+            index: u64,
+            rows: Vec<mantle_meta::engine::Row>,
+        ) -> Result<(), mantle_meta::engine::EngineError> {
+            self.rows.install(index, rows)
+        }
+
+        fn fault(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.fault
+                .as_ref()
+                .map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// A range whose engine fails stops the node with the engine's own error in its text, beside
+    /// the step that failed and the error the step met. The node suite's nodes stopped saying
+    /// only the step ("the engine failed to persist a snapshot"), the engine's error out only
+    /// through a diagnostic print (2026-11-19). The sole voter leads at a drive past its first
+    /// and applies its term's empty entry, which its engine refuses.
+    #[test]
+    fn a_range_whose_engine_fails_stops_the_node_with_the_engines_own_error() {
+        let range = one_member();
+        let mut rows = Model::default();
+        rows.install(0, name::first(1).unwrap()).unwrap();
+        rows.persist().unwrap();
+        let engine = Failing {
+            rows,
+            failing: false,
+            fault: None,
+        };
+        let store = Answers::new(hyper_durable::RamStore::new());
+        let mut replica =
+            mantle_range::open_shell(1, store, engine, &range, 1, Elections::Suspicion).unwrap();
+        replica.machine_mut().engine_mut().failing = true;
+        replica.campaign().unwrap();
+        let mut owner = Owner::new(vec![Waker::noop().clone()]);
+        let Ok(handle) = owner.insert(replica) else {
+            panic!("the arena's one slot is free");
+        };
+        let mut out = Output::default();
+        let mut fenced = None;
+        // A vote's write, its answer, the leader's entry's write and its apply: a few turns, and
+        // the bound fails only a range that never applies.
+        for now in 0..64 {
+            owner.schedule(handle);
+            owner.turn(now, &mut out, |_, outcome, _| {
+                if let Err(e) = outcome {
+                    fenced.get_or_insert(e);
+                }
+            });
+            if fenced.is_some() {
+                break;
+            }
+        }
+        let e = fenced.expect("the range's engine refused its entry");
+        assert_eq!(
+            refused(&owner, handle, e).to_string(),
+            "a range: the replica is fenced: the state machine failed: the engine refused an \
+             entry: the engine is fenced after a failed write: extents of a store would exceed \
+             its bound of 256"
+        );
     }
 
     /// A lane that holds all it takes refuses the next, typed, and one whose shard's end is gone

@@ -89,6 +89,13 @@ pub trait Engine: Rows {
     fn checkpoints(&self) -> (u64, u64) {
         (0, 0)
     }
+
+    /// The engine's own error that fenced it, the first, where it keeps one: what each
+    /// [`EngineError::Fenced`] it answered since stands for, which its owner reports beside the
+    /// fence. Asked only once a call failed; an engine that keeps none answers none.
+    fn fault(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
 }
 
 /// An engine held in memory for deterministic simulation (06 §C.b.3): what is applied, and

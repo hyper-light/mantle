@@ -4667,6 +4667,23 @@ mod tests {
         )
     }
 
+    /// The operations a node derived on this platform runs: `linux` on Linux, `elsewhere` on macOS
+    /// and Windows. Each operation holds 133,520 bytes more on Linux, its client's train in a
+    /// receive's batch: a receive there takes a datagram train from each peer and client at once
+    /// (recvmmsg(2) with `UDP_GRO`, `bounds::io`), so the transport's receive ring and the plane's
+    /// socket each hold a buffer of 64 KiB for it (hyper-rt `RECEIVE_BYTES`; `bounds::ring_growth`,
+    /// `Io::held_bound`), 131,072 bytes, and the headers of its messages, 2,448; a receive
+    /// elsewhere takes one datagram into one buffer. Read as `memory.native`, an operation's charge,
+    /// what one more adds beside it and its records: 133,520 bytes apart on Linux and macOS in
+    /// every node these tests derive (c1589e30).
+    fn runs(linux: std::ops::Range<u64>, elsewhere: std::ops::Range<u64>) -> std::ops::Range<u64> {
+        if cfg!(target_os = "linux") {
+            linux
+        } else {
+            elsewhere
+        }
+    }
+
     /// A founder of the ladder's cell (three founders, each a 32 GiB volume and its S3 endpoint)
     /// on the Mac Studio's 96 GiB and 32 cores gives its transport its want whole: every share,
     /// each operation's client's among them, at a receive chunk, so each datagram is cut from a
@@ -4674,7 +4691,8 @@ mod tests {
     /// operations where 71,522 at QUIC's initial window (36ad012b), 9.47 GB past the transport's
     /// floor; the need is 36ad012b's, which holds the capacity wants and the operations served,
     /// and the piece the node's task reads every native body into, which step 6 counts in the
-    /// transport's floor (`node::PIECE`, node.md §2.9 step 6c).
+    /// transport's floor (`node::PIECE`, node.md §2.9 step 6c). Each operation holds 133,520 bytes
+    /// more on Linux ([`runs`]), and the founder runs 54,591 there (c1589e30).
     #[test]
     fn a_node_with_memory_to_spare_gives_every_operations_windows_a_receive_chunk() {
         let mut founder = Stated {
@@ -4702,7 +4720,10 @@ mod tests {
         assert_eq!(want, (3 + clients) * 3 * (chunk - initial));
         assert_eq!(bytes - floor, want);
         let operations = said_bytes(&derived, "gateway.objects");
-        assert!((58_000..60_000).contains(&operations), "{operations}");
+        assert!(
+            runs(54_000..56_000, 58_000..60_000).contains(&operations),
+            "{operations}"
+        );
         assert_eq!(
             said_bytes(&derived, "memory.need"),
             NEED_96_GIB + crate::node::PIECE
@@ -4735,7 +4756,17 @@ mod tests {
     /// (5f3839f2): 291,834,348 bytes less than at every one of its 32 shards. A connection's state
     /// holds its lanes' unsent bytes by rank since hyper-transport kept them as sums
     /// (`lane::Unsent`, vendor/UPSTREAM.md): 1,248 bytes more over the connections it counts.
-    const NEED_96_GIB: u64 = 13_714_100_270;
+    /// Linux's differs in two classes. Its threads: the kernel holds the device's 32 transfers on
+    /// the issuer's one thread, where a pool's worker carries each elsewhere
+    /// (`Issuer::device_threads`), 32 stacks fewer. Its transport: a receive takes a train from
+    /// each of the node's three peers and the ten operations' clients it serves at once
+    /// ([`runs`]), 1,605,344 bytes more: the buffers of the 12 trains past the first, 131,072
+    /// bytes each, and every train's messages' headers.
+    const NEED_96_GIB: u64 = if cfg!(target_os = "linux") {
+        13_714_100_270 - 32 * STACK + 1_605_344
+    } else {
+        13_714_100_270
+    };
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
     /// as they were before the caches were wants: a founder of the membership suite's cell holds
@@ -4744,8 +4775,10 @@ mod tests {
     /// metadata, each with at least the ten operations a stock client asks at once, and more
     /// where what remains holds them, each with its client's windows at a receive chunk: a
     /// founder measuring four deep runs 235, where 27 while its floor counted a lane at each of
-    /// its three shards (5f3839f2) and 31 at QUIC's initial window (36ad012b). Each
-    /// cache's line is its want, its store's pages at most.
+    /// its three shards (5f3839f2) and 31 at QUIC's initial window (36ad012b). On Linux it runs
+    /// 219: each operation holds 133,520 bytes more there ([`runs`]), though the kernel holds the
+    /// device's four transfers on the issuer's one thread, four stacks fewer. Each cache's line is
+    /// its want, its store's pages at most.
     #[test]
     fn on_cis_macos_runner_the_capacity_wants_stand_and_the_operations_take_the_rest() {
         let member = |volume: bool| {
@@ -4806,7 +4839,10 @@ mod tests {
                     assert_eq!(bytes - floor, want, "depth {depth}, volume {volume}");
                 }
                 if depth == 4 && volume {
-                    assert!((230..240).contains(&operations), "{operations}");
+                    assert!(
+                        runs(215..225, 230..240).contains(&operations),
+                        "{operations}"
+                    );
                 }
                 assert!(cache <= cache_want && cache > 0);
             }
@@ -5851,8 +5887,11 @@ mod tests {
     /// count but their bytes (node.md §1.4), hold more than 5 GiB at any depth, the ranges alone
     /// more than a third of the machine: the suite's three founders, which are alike, each start,
     /// but their floors together pass the machine. Its need, its floor at the deepest its queue lets
-    /// calibration measure with every want whole, passes the machine: no memory it states starts
-    /// it there.
+    /// calibration measure with every want whole, holds the issuer's threads at 256 deep, and their
+    /// stacks decide where it stands (`Issuer::device_threads`): where a pool's worker carries each
+    /// transfer (macOS, Windows) its 256 workers' stacks take it past the machine, and no memory it
+    /// states starts it there; where the kernel holds the transfers on the issuer's one thread
+    /// (Linux) it is within the machine, 7,227,826,162 bytes (c1589e30), and a node given it starts.
     #[test]
     fn a_membership_founder_on_cis_macos_runner_starts_at_its_issuers_stacks() {
         let founder = || {
@@ -5890,11 +5929,19 @@ mod tests {
         };
         let shallow = derive(founder(), &runner(4), &mut fresh).unwrap();
         let need = said_bytes(&shallow, "memory.need");
-        assert!(need > memory, "{need}");
-        assert!(matches!(
-            allowance(Some(need), &machine(memory, None)),
-            Err(DeriveError::Ceiling { .. })
-        ));
+        // The issuer's workers at 256 deep beside its own thread: 256 where a pool carries the
+        // transfers, none where the kernel holds them. Without their stacks the need is within
+        // the machine on every platform; with them, past it.
+        let workers =
+            u64::try_from(hyper_block::issuer::Issuer::device_threads(256).unwrap() - 1).unwrap();
+        assert!(need - workers * STACK <= memory, "{need}");
+        let given = allowance(Some(need), &machine(memory, None));
+        if workers > 0 {
+            assert!(need > memory, "{need}");
+            assert!(matches!(given, Err(DeriveError::Ceiling { .. })));
+        } else {
+            assert_eq!(given.ok(), Some(need));
+        }
         let floor = |derived: &Derived, classes: &[&str]| -> u64 {
             classes
                 .iter()
@@ -5935,14 +5982,14 @@ mod tests {
             ],
         );
         assert!(all <= memory, "{all}");
-        if !cfg!(target_os = "linux") {
-            // Its engines take no maintenance workers: 7 GiB holds no five compactions' statements
-            // past its need (`derive`, `ENGINE_WORKERS`).
-            let stacks = threads(3, &[256], &[true], 0).unwrap() * STACK;
-            assert_eq!(stacks, 269 * STACK);
-            assert_eq!(said_bytes(&deep, "engine.workers"), 0);
-            assert_eq!(said_bytes(&deep, "memory.floor.threads"), stacks);
-        }
+        // Its engines take no maintenance workers: 7 GiB holds no five compactions' statements
+        // past its need (`derive`, `ENGINE_WORKERS`). Its threads are the node's six, a shard's on
+        // each of three cores, its volume's three, the issuer's own and its workers: 269 with a
+        // worker for each of 256 transfers, 13 where the kernel holds them.
+        let stacks = threads(3, &[256], &[true], 0).unwrap() * STACK;
+        assert_eq!(stacks, (13 + workers) * STACK);
+        assert_eq!(said_bytes(&deep, "engine.workers"), 0);
+        assert_eq!(said_bytes(&deep, "memory.floor.threads"), stacks);
     }
 
     /// A founder of the repair suite's cells (crates/mantle/tests/repair.rs `founders`, made by
@@ -6478,7 +6525,8 @@ mod tests {
     /// host alike, the index and the engines' metadata take their whole wants, the transport its
     /// want whole, every operation's client's windows at a receive chunk, and the operations
     /// everything past those, no more on the smaller host: 10,414 on 16 GiB, where 13,764 at
-    /// QUIC's initial window (36ad012b), 1.67 GB past the transport's floor. No cache takes a
+    /// QUIC's initial window (36ad012b), 1.67 GB past the transport's floor; on Linux 9,264, each
+    /// operation holding 133,520 bytes more there ([`runs`], c1589e30). No cache takes a
     /// share: `engine.cache_bytes` is each cache's want, the most it may borrow of the
     /// operations' idle bytes, the same on either host. The classes the operations and the
     /// transport do not size are the same on either host.
@@ -6527,7 +6575,10 @@ mod tests {
         let (_, roomy_want, _) = transport(&roomy);
         assert_eq!(roomy_bytes - roomy_floor, roomy_want);
         let operations = said_bytes(&small, "gateway.objects");
-        assert!((10_000..11_000).contains(&operations), "{operations}");
+        assert!(
+            runs(9_000..10_000, 10_000..11_000).contains(&operations),
+            "{operations}"
+        );
         assert!(operations <= said_bytes(&roomy, "gateway.objects"));
         for class in ["volumes", "engines", "log", "threads"] {
             let key = format!("memory.floor.{class}");

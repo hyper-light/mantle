@@ -416,24 +416,90 @@ fn owned<R: Rows>(rows: &mut R, owner: u64) -> Result<Option<Owned>, MetaError> 
     }))
 }
 
+/// What a range knows of its sessions' last use, kept in memory beside its rows by whatever
+/// applies its entries, so that an entry at a time no session's lifetime can have passed reads
+/// nothing to learn so. Without it every entry's expiry scans the order of last use, a merge over
+/// every source of the engine, to find its first session not yet due, which is almost always the
+/// answer (docs/design/replica.md §1, "The expiry watermark").
+///
+/// It is a lower bound on every session's last use, so it is exact: at an entry time within a
+/// lifetime of it no session is due, and the scan it spares would have expired nothing and
+/// written nothing. It stays a lower bound because only a scan raises it, to the first row the
+/// scan leaves (to none past the last), and each expiry row an entry's batch puts lowers it to
+/// that row ([`Self::wrote`]): registration and every use write their session's row at the
+/// entry's time, the proposing node's wall clock, which may stand still or go back, so a row
+/// written may be the earliest. Every other change only takes rows away: expiry, a registration
+/// taking its owner's earlier session's place or the least recently used one's, and a split's
+/// clears, which span no session's row; a split's child and a merge take none of a range's
+/// sessions (`name::child`, `name::merge`).
+///
+/// It is not persisted, being derived from the rows: nothing is known at open, after a snapshot
+/// replaces the rows, or after an entry that failed, until the next entry's scan. Replicas may
+/// hold different bounds, one that restarted knowing less, but each is below every row, so each
+/// expires the same sessions at the same entry and writes the same batch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Watermark {
+    /// No session the range holds was last used before this, `u64::MAX` where it holds none;
+    /// `None` where nothing is known.
+    first_ns: Option<u64>,
+}
+
+impl Watermark {
+    /// Whether no session can have passed its lifetime at entry time `at_ns`, by `expire`'s own
+    /// rule: the rows' last uses are at or after the bound, and a lifetime is added saturating.
+    fn none_due(&self, at_ns: u64, rules: &Rules) -> bool {
+        self.first_ns
+            .is_some_and(|first_ns| at_ns <= first_ns.saturating_add(rules.lifetime_ns))
+    }
+
+    /// Lowers the bound to each expiry row `writes`, an entry's batch, puts. A row whose time
+    /// does not decode leaves nothing known: the next entry scans, and meets it as it did before.
+    pub(crate) fn wrote(&mut self, writes: &[Write]) {
+        let order = [LOCAL, EXPIRY];
+        let least = writes
+            .iter()
+            .try_fold(u64::MAX, |least, write| match write {
+                Write::Put(k, _) if k.starts_with(&order) => {
+                    last_used(k).ok().map(|ns| least.min(ns))
+                }
+                _ => Some(least),
+            });
+        self.first_ns = self
+            .first_ns
+            .zip(least)
+            .map(|(first_ns, least)| first_ns.min(least));
+    }
+}
+
 /// Expires the sessions whose lifetime entry time `at_ns` has passed, at most
-/// `expiries_per_entry` of them; the rest expire at the entries after.
+/// `expiries_per_entry` of them; the rest expire at the entries after. An entry at a time
+/// `watermark` shows no session's lifetime can have passed reads nothing; any other scans the
+/// order of last use and sets `watermark` from what it read.
 pub fn expire<R: Rows>(
     rows: &mut R,
     index: u64,
     at_ns: u64,
     rules: &Rules,
+    watermark: &mut Watermark,
 ) -> Result<(), MetaError> {
+    if watermark.none_due(at_ns, rules) {
+        return Ok(());
+    }
     let (mut from, to) = (vec![LOCAL, EXPIRY], vec![LOCAL, EXPIRY.saturating_add(1)]);
     let mut writes = Vec::new();
     let mut expired = 0u64;
+    // Unknown where the scan fails, or ends at its budget before a row it keeps.
+    watermark.first_ns = None;
     for _ in 0..rules.expiries_per_entry {
         let Some((k, _)) = rows.next(&from, &to)? else {
+            watermark.first_ns = Some(u64::MAX);
             break;
         };
         let last_ns = last_used(&k)?;
         // A lifetime past the end of time never expires.
         if last_ns.saturating_add(rules.lifetime_ns) >= at_ns {
+            // The first row left: every other sorts after it, used no earlier.
+            watermark.first_ns = Some(last_ns);
             break;
         }
         writes.extend(removal(&k)?);
@@ -716,11 +782,11 @@ mod tests {
         assert_eq!(check(&mut m, b, 1).unwrap(), Check::Unknown);
         assert_eq!(check(&mut m, a, 1).unwrap(), Check::Answered(answer(1)));
         // An entry at 131 passes a's lifetime (30 + 100) but not c's (121 + 100).
-        expire(&mut m, 5, 131, &RULES).unwrap();
+        expire(&mut m, 5, 131, &RULES, &mut Watermark::default()).unwrap();
         assert_eq!(check(&mut m, a, 1).unwrap(), Check::Unknown);
         assert_eq!(check(&mut m, c, 1).unwrap(), Check::New);
         assert_eq!(count(&mut m).unwrap(), 1);
-        expire(&mut m, 6, 222, &RULES).unwrap();
+        expire(&mut m, 6, 222, &RULES, &mut Watermark::default()).unwrap();
         assert_eq!(count(&mut m).unwrap(), 0);
     }
 
@@ -810,7 +876,7 @@ mod tests {
         let mut m = Model::default();
         register_as(&mut m, (1, 0), 10, &RULES, (5, 1, 1)).unwrap();
         // Unused past its lifetime, the session expires; its owner's row still names it.
-        expire(&mut m, 2, 111, &RULES).unwrap();
+        expire(&mut m, 2, 111, &RULES, &mut Watermark::default()).unwrap();
         assert_eq!(count(&mut m).unwrap(), 0);
         let next = register_as(&mut m, (3, 0), 120, &RULES, (5, 1, 2)).unwrap();
         assert_eq!(check(&mut m, next, 1).unwrap(), Check::New);

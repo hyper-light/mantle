@@ -12,10 +12,10 @@
 
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
 use mantle_codec::{Reader, Writer};
-use mantle_meta::apply::{Layer, apply_entry};
+use mantle_meta::apply::{Layer, apply_entry_with};
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
 use mantle_meta::key::{LOCAL, marker};
-use mantle_meta::session::Rules;
+use mantle_meta::session::{Rules, Watermark};
 use mantle_meta::wire::{self, Answer};
 
 use hyper_raft::proto::{ConfChangeV2, ConfState, EntryType};
@@ -96,6 +96,11 @@ pub struct RangeMachine<E> {
     engine: E,
     layer: Layer,
     rules: Rules,
+    /// What the range knows of its sessions' last use, which spares an entry no session's
+    /// lifetime has passed the scan of the order of last use (`mantle_meta::session::Watermark`).
+    /// Held in memory only, as it derives from the rows: nothing is known at open or after an
+    /// install, whose rows may be of any time, until the next entry's scan.
+    watermark: Watermark,
     /// The configuration as of the last entry applied.
     configuration: ConfState,
     /// The last entry applied.
@@ -139,6 +144,7 @@ impl<E: Engine> RangeMachine<E> {
             engine,
             layer,
             rules,
+            watermark: Watermark::default(),
             configuration,
             applied: point,
             durable: point,
@@ -179,6 +185,8 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
 
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Applied>) -> Result<(), Fatal> {
         let (layer, rules) = (self.layer, self.rules);
+        // Lent to the entry, as the engine is, and kept only once the entry applies.
+        let mut watermark = std::mem::take(&mut self.watermark);
         let mut engine = self.termed(entry.term);
         if entry.kind != EntryType::EntryNormal {
             return Err(Fatal(
@@ -193,8 +201,15 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         } else {
             let batch = wire::Entry::decode(entry.data)
                 .map_err(|_| Fatal("a committed entry does not decode"))?;
-            let made = apply_entry(&mut engine, entry.index, &batch, layer, &rules)
-                .map_err(|_| Fatal("a committed entry breaks the range's state machine"))?;
+            let made = apply_entry_with(
+                &mut engine,
+                entry.index,
+                &batch,
+                layer,
+                &rules,
+                &mut watermark,
+            )
+            .map_err(|_| Fatal("a committed entry breaks the range's state machine"))?;
             answers
                 .try_reserve(made.len())
                 .map_err(|_| Fatal("no memory for an entry's answers"))?;
@@ -205,6 +220,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
                 answer,
             }));
         }
+        self.watermark = watermark;
         self.applied = Point {
             index: entry.index,
             term: entry.term,
@@ -269,6 +285,9 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     /// The engine takes the image's rows, with the configuration and the term of its point, and
     /// makes them durable before the log's start moves to it (I8).
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
+        // The image's sessions may have been used at any time, and an install that fails part
+        // way leaves rows of both.
+        self.watermark = Watermark::default();
         let mut rows = image::decode(image).ok_or(Fatal("a snapshot's rows do not decode"))?;
         let conf = conf::encode(configuration).ok_or(Fatal("a configuration past u32 members"))?;
         rows.retain(|(k, _)| k.as_slice() != conf::ROW && k.as_slice() != TERM);
@@ -334,5 +353,181 @@ mod tests {
             assert_eq!(bytes, expected, "{term}");
             assert_eq!(decode_term(&bytes), Some(term), "{term}");
         }
+    }
+
+    /// A model engine that counts the reads of the order of last use it is asked.
+    struct Counted {
+        rows: mantle_meta::engine::Model,
+        scans: u64,
+    }
+
+    impl Rows for Counted {
+        fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+            self.rows.get(key)
+        }
+
+        fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+            if from.starts_with(&[LOCAL, marker::EXPIRY]) {
+                self.scans += 1;
+            }
+            self.rows.next(from, to)
+        }
+
+        fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
+            self.rows.apply(index, writes)
+        }
+    }
+
+    impl Engine for Counted {
+        fn applied(&self) -> u64 {
+            self.rows.applied()
+        }
+
+        fn durable(&self) -> u64 {
+            self.rows.durable()
+        }
+
+        fn persist(&mut self) -> Result<(), EngineError> {
+            self.rows.persist()
+        }
+
+        fn image(&mut self) -> Result<Vec<Row>, EngineError> {
+            self.rows.image()
+        }
+
+        fn image_size(&self) -> Option<(u64, u64)> {
+            self.rows.image_size()
+        }
+
+        fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
+            self.rows.install(index, rows)
+        }
+    }
+
+    const RULES: Rules = Rules {
+        lifetime_ns: 1_000,
+        max_sessions: 8,
+        expiries_per_entry: 1,
+        max_key_bytes: usize::MAX,
+        max_value_bytes: usize::MAX,
+    };
+
+    /// A cell's first Name range, as a replica opens it.
+    fn opened() -> RangeMachine<Counted> {
+        let mut rows = mantle_meta::engine::Model::default();
+        rows.install(0, mantle_meta::name::first(1).unwrap())
+            .unwrap();
+        let engine = Counted { rows, scans: 0 };
+        RangeMachine::open(engine, Layer::Name, RULES, &ConfState::default()).unwrap()
+    }
+
+    /// A command of `session` under `serial`: opening a bucket's gate, which reads no order.
+    fn command(session: u64, serial: u64) -> wire::Sessioned {
+        let gate = mantle_meta::name::GateChange {
+            bucket: "b".into(),
+            incarnation: 1,
+            attempt: 1,
+            from: None,
+            to: Some(mantle_meta::record::GateState::Open),
+            generation: 1,
+        };
+        wire::Sessioned {
+            session,
+            serial,
+            unanswered: 1,
+            command: wire::Command::Name(Box::new(mantle_meta::name::Command::Gate(gate))),
+        }
+    }
+
+    /// Applies the entry of `commands` at `at_ns` as entry `index`: its answers, and the reads of
+    /// the order of last use it made.
+    fn apply_at(
+        machine: &mut RangeMachine<Counted>,
+        index: u64,
+        at_ns: u64,
+        commands: Vec<wire::Sessioned>,
+    ) -> (Vec<Answer>, u64) {
+        let data = wire::Entry { at_ns, commands }.encode().unwrap();
+        let entry = EntryRef {
+            index,
+            term: 1,
+            kind: EntryType::EntryNormal,
+            context: &[],
+            data: &data,
+        };
+        let scans = machine.engine().scans;
+        let mut answers = Vec::new();
+        machine.apply(&entry, &mut answers).unwrap();
+        let answers = answers.into_iter().map(|a| a.answer).collect();
+        (answers, machine.engine().scans - scans)
+    }
+
+    /// A range reopened, or given a snapshot, knows nothing of its sessions' last use: its first
+    /// entry reads the order of last use, and the entries after it read nothing until a session's
+    /// lifetime can have passed. A snapshot's sessions were used at its own entries' times, which
+    /// a range that kept its watermark over its own rows could not know: given one of a session
+    /// that a lifetime later is due, it expires the session at the entry its source does.
+    #[test]
+    fn a_range_reopened_or_given_a_snapshot_scans_once_then_skips() {
+        let registration = wire::Sessioned {
+            session: 0,
+            serial: 0,
+            unanswered: 0,
+            command: wire::Command::Register {
+                owner: 1,
+                run: 1,
+                nth: 1,
+            },
+        };
+        let mut source = opened();
+        let (answers, scans) = apply_at(&mut source, 1, 10, vec![registration]);
+        let [Answer::Registered { session }] = answers[..] else {
+            panic!("{answers:?}")
+        };
+        assert_eq!(scans, 1);
+        assert_eq!(apply_at(&mut source, 2, 20, vec![command(session, 1)]).1, 0);
+        // Reopened, as a restart opens its engine as it stands.
+        let mut source = RangeMachine::open(
+            source.into_engine(),
+            Layer::Name,
+            RULES,
+            &ConfState::default(),
+        )
+        .unwrap();
+        // A command of a session the range does not hold changes no session.
+        let stranger = || vec![command(session + 1, 1)];
+        assert_eq!(apply_at(&mut source, 3, 30, stranger()).1, 1);
+        assert_eq!(apply_at(&mut source, 4, 40, stranger()).1, 0);
+        // A range holding no session knows none can be due, and reads nothing, until the
+        // snapshot of the source's rows gives it the session, last used at 20.
+        let mut given = opened();
+        assert_eq!(apply_at(&mut given, 1, 400, stranger()).1, 1);
+        assert_eq!(apply_at(&mut given, 2, 450, stranger()).1, 0);
+        let mut image = Vec::new();
+        let (at, configuration) = source.image(&mut image).unwrap();
+        given.install(&image, at, &configuration).unwrap();
+        let later = [
+            (500, stranger()),
+            (600, stranger()),
+            (1_021, vec![command(session, 2)]),
+        ];
+        let mut read = Vec::new();
+        for ((at_ns, commands), index) in later.into_iter().zip(5u64..) {
+            let (answers, scans) = apply_at(&mut given, index, at_ns, commands.clone());
+            assert_eq!(answers, apply_at(&mut source, index, at_ns, commands).0);
+            read.push((answers, scans));
+        }
+        let expired = vec![Answer::SessionExpired];
+        assert_eq!(
+            read,
+            [(expired.clone(), 1), (expired.clone(), 0), (expired, 1)]
+        );
+        // The same rows but the configuration's, which only an install writes here.
+        let rows = |m: &mut RangeMachine<Counted>| {
+            let mut rows = m.engine_mut().image().unwrap();
+            rows.retain(|(k, _)| k.as_slice() != conf::ROW);
+            rows
+        };
+        assert_eq!(rows(&mut given), rows(&mut source));
     }
 }

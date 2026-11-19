@@ -5,7 +5,7 @@
 use crate::engine::{EngineError, Rows};
 use crate::error::{MetaError, reserved};
 use crate::overlay::Overlay;
-use crate::session::{self, Check, Rules, Touched};
+use crate::session::{self, Check, Rules, Touched, Watermark};
 use crate::wire::{Answer, Command, Entry};
 use crate::{block, bucket, file, name, root};
 
@@ -20,8 +20,9 @@ pub enum Layer {
     Root,
 }
 
-/// Applies entry `index` to the range's rows and answers its commands in order. An error
-/// means the entry breaks the state machine, and the replica stops.
+/// Applies entry `index` to rows for which the caller keeps no [`Watermark`], as a benchmark or
+/// a test does: its expiry reads the order of last use. A replica keeps one
+/// ([`apply_entry_with`]).
 pub fn apply_entry<R: Rows>(
     rows: &mut R,
     index: u64,
@@ -29,9 +30,25 @@ pub fn apply_entry<R: Rows>(
     layer: Layer,
     rules: &Rules,
 ) -> Result<Vec<Answer>, MetaError> {
+    apply_entry_with(rows, index, entry, layer, rules, &mut Watermark::default())
+}
+
+/// Applies entry `index` to the range's rows and answers its commands in order, `watermark`
+/// being what the range knows of its sessions' last use, which the entry moves on. An error
+/// means the entry breaks the state machine, and the replica stops; it leaves `watermark`
+/// knowing nothing, since the rows stay as they were whatever the entry's scan read.
+pub fn apply_entry_with<R: Rows>(
+    rows: &mut R,
+    index: u64,
+    entry: &Entry,
+    layer: Layer,
+    rules: &Rules,
+    watermark: &mut Watermark,
+) -> Result<Vec<Answer>, MetaError> {
+    let mut known = std::mem::take(watermark);
     let (answers, writes) = {
         let mut overlay = Overlay::new(&mut *rows, (rules.max_key_bytes, rules.max_value_bytes));
-        session::expire(&mut overlay, index, entry.at_ns, rules)?;
+        session::expire(&mut overlay, index, entry.at_ns, rules, &mut known)?;
         let mut touched = Touched::default();
         let mut answers = reserved(entry.commands.len())?;
         for (position, c) in entry.commands.iter().enumerate() {
@@ -100,7 +117,9 @@ pub fn apply_entry<R: Rows>(
         touched.write(&mut overlay, index)?;
         (answers, overlay.into_writes())
     };
+    known.wrote(&writes);
     rows.apply(index, writes)?;
+    *watermark = known;
     Ok(answers)
 }
 
@@ -604,7 +623,14 @@ mod tests {
         let (answers, writes) = {
             let bound = (rules.max_key_bytes, rules.max_value_bytes);
             let mut overlay = Overlay::new(&mut *rows, bound);
-            session::expire(&mut overlay, index, entry.at_ns, rules).unwrap();
+            session::expire(
+                &mut overlay,
+                index,
+                entry.at_ns,
+                rules,
+                &mut Watermark::default(),
+            )
+            .unwrap();
             let mut answers = Vec::new();
             let mut refused = std::collections::BTreeSet::new();
             for (position, c) in entry.commands.iter().enumerate() {
@@ -845,5 +871,225 @@ mod tests {
             );
         }
         assert_eq!(all(&mut a), all(&mut b));
+    }
+
+    /// A model engine that counts the scans it is asked and keeps the batch it applied last.
+    struct Counted {
+        rows: Model,
+        scans: u64,
+        batch: Vec<Write>,
+    }
+
+    impl Counted {
+        fn of(rows: Model) -> Self {
+            Self {
+                rows,
+                scans: 0,
+                batch: Vec::new(),
+            }
+        }
+    }
+
+    impl Rows for Counted {
+        fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+            self.rows.get(key)
+        }
+
+        fn next(
+            &mut self,
+            from: &[u8],
+            to: &[u8],
+        ) -> Result<Option<crate::engine::Row>, EngineError> {
+            self.scans += 1;
+            self.rows.next(from, to)
+        }
+
+        fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
+            self.batch.clone_from(&writes);
+            self.rows.apply(index, writes)
+        }
+    }
+
+    /// The reference a kept watermark is checked against: an entry that knows nothing of its
+    /// range's sessions, so scans the order of last use, as every entry did before the watermark.
+    fn scanning(rows: &mut Counted, index: u64, entry: &Entry, rules: &Rules) -> Vec<Answer> {
+        let mut nothing_known = Watermark::default();
+        apply_entry_with(rows, index, entry, Layer::Name, rules, &mut nothing_known).unwrap()
+    }
+
+    /// An entry at a time the watermark shows no session's lifetime has passed scans nothing to
+    /// expire sessions: an entry of commands answered from their sessions scans nothing at all,
+    /// where it scanned once before; a PUT scans only for its key's current version.
+    #[test]
+    fn an_entry_before_the_watermark_scans_nothing_to_expire_sessions() {
+        // The cell's budget (`crates/node/src/derive.rs` `cell:expiries_per_entry`).
+        let rules = Rules {
+            expiries_per_entry: 1,
+            ..RULES
+        };
+        let (mut kept, mut before) = (Counted::of(name_range()), Counted::of(name_range()));
+        let mut watermark = Watermark::default();
+        let mut run = |index, e: Entry| {
+            (kept.scans, before.scans) = (0, 0);
+            let answers =
+                apply_entry_with(&mut kept, index, &e, Layer::Name, &rules, &mut watermark);
+            assert_eq!(
+                answers.as_ref().ok(),
+                Some(&scanning(&mut before, index, &e, &rules))
+            );
+            assert_eq!(kept.batch, before.batch, "entry {index}");
+            println!(
+                "entry {index}: {} scans before, {} now",
+                before.scans, kept.scans
+            );
+            (answers.unwrap(), (before.scans, kept.scans))
+        };
+        // Knowing nothing at first, the registration's entry scans, and finds no session.
+        let (answers, scans) = run(1, entry(10, vec![registration()]));
+        let [Answer::Registered { session }] = answers[..] else {
+            panic!("{answers:?}")
+        };
+        assert_eq!(scans, (1, 1));
+        let (_, scans) = run(2, entry(20, vec![from(session, 1, open_gate())]));
+        assert_eq!(scans, (1, 0));
+        // Asked again, the gate's command is answered from its session, and runs nothing.
+        let (_, scans) = run(3, entry(30, vec![from(session, 1, open_gate())]));
+        assert_eq!(scans, (1, 0));
+        let (answers, scans) = run(4, entry(40, vec![from(session, 2, put("k", "a", false))]));
+        assert!(matches!(answers[..], [Answer::Name(Outcome::Put { .. })]));
+        assert_eq!(scans, (2, 1));
+        // Entries of a command no session holds, which touches none: the watermark stays at the
+        // registration's time, a bound below the session's last use, until an entry past its
+        // lifetime scans and raises it to that use. Each lifetime's end is within it, as `expire`
+        // counts it; past the session's, the entry scans and the session expires.
+        let stranger = || vec![from(session + 1, 1, open_gate())];
+        for (index, at_ns, scans) in [(5, 1_010, (1, 0)), (6, 1_011, (1, 1)), (7, 1_040, (1, 0))] {
+            let (answers, counted) = run(index, entry(at_ns, stranger()));
+            assert_eq!(
+                (answers, counted),
+                (vec![Answer::SessionExpired], scans),
+                "{at_ns}"
+            );
+        }
+        let (answers, scans) = run(8, entry(1_041, vec![from(session, 3, open_gate())]));
+        assert_eq!(answers, [Answer::SessionExpired]);
+        assert_eq!(scans, (1, 1));
+    }
+
+    /// A kept watermark changes no answer and no write: random entries of registrations, some of
+    /// an owner's later run or delivered again or late, and commands under their sessions'
+    /// serials, at times that move on, stand still and now and then go back, under rules of
+    /// several lifetimes, bounds and expiry budgets, answer the same and apply the same batch,
+    /// entry by entry, as scanning the order of last use at every entry does, and scan less.
+    #[test]
+    fn a_kept_watermark_answers_and_writes_as_scanning_every_entry_does() {
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        // Each rules' lifetime, bound on sessions and expiry budget.
+        let ruled = [
+            (100, 4, 1),
+            (300, 3, 2),
+            (0, 4, 1),
+            (u64::MAX, 2, 1),
+            (40, 8, 3),
+        ];
+        let (mut spared, mut expired, mut full) = (0u64, 0u64, 0u64);
+        for (lifetime_ns, max_sessions, expiries_per_entry) in ruled {
+            let rules = Rules {
+                lifetime_ns,
+                max_sessions,
+                expiries_per_entry,
+                ..RULES
+            };
+            let (mut kept, mut each) = (Counted::of(name_range()), Counted::of(name_range()));
+            let mut watermark = Watermark::default();
+            // Each session registered, with the highest serial its gateway has sent.
+            let mut sessions: Vec<(u64, u64)> = Vec::new();
+            // Each owner's last registration's place in its run.
+            let mut last = [0u64; 6];
+            let mut at_ns = 1_000u64;
+            for index in 1..=300u64 {
+                at_ns = match next(16) {
+                    0 => at_ns - next(120),
+                    1 | 2 => at_ns,
+                    _ => at_ns + next(60),
+                };
+                let commands = (0..1 + next(6))
+                    .map(|_| {
+                        if sessions.is_empty() || next(5) == 0 {
+                            let owner = next(6);
+                            let nth = &mut last[owner as usize];
+                            let nth = match next(8) {
+                                0 => nth.saturating_sub(1),
+                                1 => *nth,
+                                _ => {
+                                    *nth += 1;
+                                    *nth
+                                }
+                            };
+                            return from(0, 0, Command::Register { owner, run: 1, nth });
+                        }
+                        let pick = next(sessions.len() as u64) as usize;
+                        let (session, sent) = &mut sessions[pick];
+                        let serial = match next(8) {
+                            0 => sent.saturating_sub(next(3)),
+                            _ => *sent + 1,
+                        };
+                        *sent = (*sent).max(serial);
+                        let command = match next(3) {
+                            0 => open_gate(),
+                            _ => put(
+                                &format!("k{}", next(4)),
+                                &format!("e{}", next(3)),
+                                next(2) == 0,
+                            ),
+                        };
+                        Sessioned {
+                            session: *session,
+                            serial,
+                            unanswered: sent.saturating_sub(next(3)),
+                            command,
+                        }
+                    })
+                    .collect();
+                let e = entry(at_ns, commands);
+                (kept.scans, each.scans) = (0, 0);
+                let answers =
+                    apply_entry_with(&mut kept, index, &e, Layer::Name, &rules, &mut watermark)
+                        .unwrap();
+                let reference = scanning(&mut each, index, &e, &rules);
+                let at = (lifetime_ns, index);
+                assert_eq!(answers, reference, "{at:?}");
+                assert_eq!(kept.batch, each.batch, "{at:?}");
+                assert!(kept.scans <= each.scans, "{at:?}");
+                spared += each.scans - kept.scans;
+                for (answer, c) in answers.iter().zip(&e.commands) {
+                    match answer {
+                        Answer::Registered { session }
+                            if !sessions.iter().any(|(s, _)| s == session) =>
+                        {
+                            sessions.push((*session, 0));
+                        }
+                        Answer::SessionExpired => {
+                            expired += 1;
+                            sessions.retain(|(s, _)| *s != c.session);
+                        }
+                        Answer::SessionsFull { .. } => full += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(all(&mut kept.rows), all(&mut each.rows), "{lifetime_ns}");
+        }
+        // Sessions expired and registrations met the bound, and most entries scanned nothing to
+        // expire sessions.
+        println!("{expired} expired, {full} full, {spared} scans spared");
+        assert!(expired > 20 && full > 0, "{expired} expired, {full} full");
+        assert!(spared > 750, "{spared} scans spared");
     }
 }

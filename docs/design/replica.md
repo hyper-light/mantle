@@ -50,6 +50,31 @@ answer its session kept: an entry of 256 commands from a session keeping 256 ans
 the command-by-command order over random entries (audit P04;
 [measurements](../measurements/2026-09-29-metadata-apply.md)).
 
+**The expiry watermark.** Expiry reads the order of last use, `[LOCAL, EXPIRY, last use,
+session]`, from its first row, and every entry made that read, an engine scan merging every
+source of the store, almost always to learn that the first session was not yet due. Under a
+closed ladder of 1-byte PUTs it was 39% of a cell's CPU samples, `<Stored as Rows>::next` under
+`apply_entry`, the scan itself 31% (`perf record --call-graph fp`, the final build on the box,
+2026-11-19). A replica now keeps beside the range's rows, in memory, a lower bound on every
+session's last use (`session::Watermark`, held by `RangeMachine`), and an entry within a lifetime
+of it reads nothing. The bound is exact because it is never above a row: a scan sets it to the
+first row it leaves, or to none; each expiry row an entry's batch puts lowers it to that row,
+since a session's row is written at its entry's time, the proposing node's wall clock, which may
+stand still or go back; and every other change only takes rows away: expiry, a registration
+taking its owner's earlier session's place or the least recently used one's, and a split's
+clears, which span no session's row; a split's child and a merge take none of a range's
+sessions. An entry that skips the read writes what the read
+would have, nothing, so every replica applies the same batch whatever bound it holds, and one
+that restarted, knowing less, only reads more. The bound is not persisted, being derived from
+the rows: a replica that opens, installs a snapshot or fails an entry knows nothing, and its next
+entry scans. Only a scan raises it, so a range whose oldest session is used again and again scans
+about once a lifetime; under the cell's derived rules nothing expires by time (lifetime
+`u64::MAX`), and every entry a replica applies after its first since opening or installing reads
+nothing
+(`an_entry_before_the_watermark_scans_nothing_to_expire_sessions` and
+`a_kept_watermark_answers_and_writes_as_scanning_every_entry_does`, `crates/meta/src/apply.rs`;
+`a_range_reopened_or_given_a_snapshot_scans_once_then_skips`, `crates/range/src/machine.rs`).
+
 A session forgets an answer only once its gateway has acknowledged it, by naming a lowest
 unanswered serial past it; that serial is the session's watermark, and a serial below it is a
 repeat. In the dissertation, the client piggybacks the lowest sequence number it has no

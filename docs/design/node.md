@@ -2277,6 +2277,75 @@ its beat, then goes whole, or past its patience is refused `Budget`, a get's hea
 reply no message holds is refused `FrameBound`; an S3 put waiting for room is due at its beat;
 tests/put_body.rs, red then green on upload-stall, passes over the merged code.
 
+*As built (2026-11-18), step 6's fifth part, its first piece: a host's own wait, and the node's
+piece in its floor* (6e, `crates/node/src/node/host.rs`, `crates/node/src/derive.rs`). The host's
+wait is its own jobs' alone (`Host::due`): at once where whoever serves it holds the answer of
+one of its jobs' asks, untaken (`Serve::answered`, the node's `has_outcome`), as an answer that
+came after the host's step in a turn waits on no event; else its puts' renewals, and the beat or
+bound of each job whose work is held. `Node::host_due` keeps beside it what the node's task waits
+on itself: an ended job's answered ask, its outcome to drop (`abandoned`), a lookup answered, a
+body fed at the last turn, a reply whose rounds ran out, and a reply waiting for room in the
+endpoint's budget (`Replies::room_due_ns`). So a driving shard's task can wait on its host and
+nothing of the node's. The piece the node's task reads every native body into (`Node::piece`,
+`node::PIECE`, one a node, made once, at most a piece, outside the transport's budget) is counted
+in the floor's transport class (`derive::Class::Transport`, §1.4). Tested (`node::host`): a host
+running no job waits on nothing; a job whose ask is out is due at its client's patience; and once
+the ask's answer is held, at once. The host, node and derive unit tests and tests/put_body.rs
+pass.
+
+What 6e needs still, as worked out (none of it built): the lanes, in `node::driving` beside
+`node::shard`, and the body's channel kept with its door.
+
+- *The answer slots, pooled.* `hyper_rt::sync::oneshot` boxes the block its ends share and makes
+  its ring at each one made (`ring::Shared::new`, `Ring::new`), so a slot made as it is asked
+  allocates per ask. A lane of answers from the node's task to the driving
+  shard, made once and holding `command_asks + read_asks + chunk_asks` values, is a pool of those
+  slots: the shard's host holds each kind to the node's bound for it, each ask holding its place
+  from its send until its answer is taken (an abandoned ask's until its answer comes and is
+  dropped), so the node's task never finds the lane full and an answer cannot be refused, and the
+  steady state allocates nothing past what the ask's own value holds.
+- *An ask the node has no room for is held by the node's task, not answered `Asks`.* Answered
+  `Asks` in its slot, the shard would ask it again with nothing to wait on but the next answer, a
+  loop between the two tasks for as long as the room stays taken; and the job cannot take it back,
+  its driver's request having become the ask. The node's task holds it, in order, at most the
+  asks the shard's host holds (its count), and asks it at each turn while it has room
+  (`Node::command_room`, the read and chunk bounds checked as `Node::read` and
+  `Node::put_chunk` check them, before the ask's value is given up). An ask `Node::ask` refuses
+  otherwise is answered its kind's refusal (`CommandOutcome::Refused`, `ReadOutcome::Refused`,
+  `ChunkOutcome::Lost`), which the job ends `Failed` on as it does now.
+- *The node's side of the lanes is generic over `Serve`*: each ask taken from the lane served by
+  `Serve::ask`, each held ask's outcome sent once `Serve::outcome` gives it, and each job's end and
+  put sample told through `Serve::job_ended`, `committed` and `filled`; so a unit test serves a
+  two-shard runtime's driving task from the test's thread with the stub (`Stub`), as no unit test
+  builds a `Node`, and the node serves it in 6f by lending its host as it does now.
+- *A job's end carries its door's half back.* A driving shard's host keeps no doors: its job's
+  half (`Native`) would wait in its `Doors` for a `Replies` half the node's task keeps, and that
+  wait has no bound there. So `Serve::job_ended` takes the job's half and gives back what the host
+  keeps: the node's own, the half, kept in its doors as now; the lanes', none, the half riding the
+  job's end to the node's task, which gives it to its doors.
+- *A request handed carries its operation, not its work* (its door's job half, its principal, its
+  `Op`, its Open's block, its deadline, its admission and its shard), and the shard makes the work
+  (`work`), as a job's drivers need not cross (step 6's check). Its door's exchange is the node's
+  task's alone: `ExchangeId` is made only inside hyper-transport, so a test cannot make a request
+  that names one, and the shard needs none (`Door::Native`'s exchange becomes optional).
+- *The rest of `Serve` over the lanes*: the volume table the node last read handed in, a settled
+  copy (its scheme chosen on the node's task), the latest superseding one the lane had no room for;
+  the ranges' groups, their count, the ask bounds and the node's wall clock (`Wall`, `Copy`) handed
+  at the task's start; `read_fields` refused, typed; `took` nothing; `freed` a flag the node's
+  task tells, held while the lane is full; a chunk's move (`Host::chunk_moved`) told by the number
+  the shard gave its ask, dropped where the lane is full, its next piece telling it again.
+- *Production starts none, and compiles every piece*: with no `#[allow(dead_code)]`, the task's
+  start is reached through the node's turn and a list of driving lanes production leaves empty
+  until 6f fills it.
+- *The put's body channel kept with its door.* The receiver stays in the job's half (`Native`)
+  and the sender in the node's task's (`Replies`), the body's feeding (`Feeding`) holding no
+  sender of its own: what the ends' drops said becomes two words in `Handed`, the job let go of
+  its body (the feeding reads and drops the rest, where its send found the channel closed) and the
+  node's task let go of it before its end (the job's body is `IncompleteBody`, where its take found
+  the channel closed, read before the channel so a piece given before it is taken first); and
+  `Doors::keep` empties the body's channel as it empties the reply's. Shown by the door's
+  allocation count over 64 puts, as the reply's is (0 allocations).
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

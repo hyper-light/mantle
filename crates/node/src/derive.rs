@@ -2454,8 +2454,9 @@ pub fn derive(
     // floor holds them; (2) the operations the node serves at least ([`served`]), the one the
     // floor holds and the rest at what each adds; (3) the transport's growth past its floor to a
     // receive chunk each share for the connections those operations open, whole while what
-    // remains holds it; (4) every operation more that what remains then holds. No page cache takes
-    // a share: the most each engine's holds is its want, `engine.cache_bytes`.
+    // remains holds it; (4) every operation more that what remains then holds, each with its
+    // client's windows at a receive chunk. No page cache takes a share: the most each engine's
+    // holds is its want, `engine.cache_bytes`.
     let (each, floor_one) = if hosts { one_at(initial)? } else { (0, 0) };
     let base = if hosts {
         floor_one
@@ -2490,20 +2491,31 @@ pub fn derive(
         .zip(total(&held_at(serves, transfers, initial)?))
         .and_then(|(chunks, floor)| chunks.checked_sub(floor))
         .ok_or(overflow("the transport's growth"))?;
-    // (3): the transport's growth, a byte amount whole while what remains holds it. Its budget is
-    // its floor at the operations (4) gives it and this part, which raises each share's window
-    // past QUIC's initial one by the part over the shares (`bounds::limits`): a chunk each where
-    // the operations are those served, a few bytes each where they are thousands, which a chunk
-    // each would have cost a quarter of them (10,414 where 13,765 on a 16 GiB host).
+    // (3): the transport's growth, a byte amount whole while what remains holds it. Short of it,
+    // the operations are those served, each share's window past QUIC's initial one by the part
+    // over the shares (`bounds::limits`); whole, every operation's windows hold a chunk.
     let transport_part = growth.min(transport_room);
+    let window = if transport_part == growth {
+        chunk_window
+    } else {
+        initial
+    };
     let (objects, objects_bytes, native) = if hosts {
-        // (4): what the memory holds past the floor, the capacity wants and the transport's growth
+        // (4): what the memory holds past the floor, the capacity wants and the transport's part
         // is the operations', with the one, its state and its charge, each operation adding its
-        // client's windows at QUIC's initial window.
+        // client's windows at `window`: a chunk each where (3) is whole, so a datagram each
+        // connection receives is cut from a chunk, not copied (10,414 operations where 13,764 at
+        // QUIC's initial window on a 16 GiB host, research/87 §4).
+        let (each, floor_one) = if window == initial {
+            (each, floor_one)
+        } else {
+            one_at(window)?
+        };
+        let part = if window == initial { transport_part } else { 0 };
         let slack = allowed
             .saturating_sub(floor_one)
             .saturating_sub(wanted)
-            .saturating_sub(transport_part);
+            .saturating_sub(part);
         let share = most_charged(&charges)
             .checked_add(each)
             .and_then(|share| share.checked_add(slack))
@@ -2522,11 +2534,18 @@ pub fn derive(
         ranges_bytes,
         listener,
         runtime,
-    } = held_by(objects, initial)?;
-    let transport_floor = bounds.transport_bytes;
-    let transport_bytes = transport_floor
-        .checked_add(transport_part)
-        .ok_or(overflow("the transport's budget"))?;
+    } = held_by(objects, window)?;
+    let transport_floor = mantle_protocol::bounds::least_transport(&bounds)
+        .map_err(|e| DeriveError::Bounds(e.to_string()))?;
+    // At a chunk's windows the budget is the transport's want whole; short of it, its floor and
+    // the part (3) gave.
+    let transport_bytes = if window == initial {
+        transport_floor
+            .checked_add(transport_part)
+            .ok_or(overflow("the transport's budget"))?
+    } else {
+        bounds.transport_bytes
+    };
     bounds.transport_bytes = transport_bytes;
     let transport_want = mantle_protocol::bounds::chunked_transport(&bounds)
         .ok()
@@ -3638,17 +3657,20 @@ fn say_transport(said: &mut Said, bytes: u64, floor: u64, want: u64) {
          Chromium QUIC's QuicFlowController) and each peer's pool holds a chunk for it, so a \
          datagram is cut from a chunk, not copied (bounds::chunked_transport); a performance \
          want, past the capacity wants and the operations the node serves, whole while what \
-         remains holds it (research/87 §4 rule D)",
+         remains holds it, and then each operation more costs its client's windows at a chunk \
+         (research/87 §4 rule D)",
     );
     said.add(
         "transport_bytes",
         bytes,
         Kind::Derived,
-        "the transport's budget: transport.floor at the operations the node runs, and past it \
-         the growth of the connections of the operations it serves at least, each share from \
-         QUIC's initial window to a receive chunk, whole while what remains past the capacity \
-         wants and those operations holds it; spread over every share, it raises each window \
-         past QUIC's initial one by the growth over the shares (derive::derive, bounds::limits)",
+        "the transport's budget: where what remains past the capacity wants and the operations \
+         the node serves at least holds those operations' windows at a receive chunk, its want \
+         whole, every operation's client's windows at a chunk, each operation more costing them, \
+         so each datagram is cut from a chunk, not copied (fewer operations for it: 10,414 where \
+         13,764 at QUIC's initial window on a 16 GiB host); short of it, transport.floor at the \
+         operations served and what remains, which raises each window past QUIC's initial one by \
+         it over the shares (derive::derive, bounds::limits)",
     );
 }
 
@@ -4169,12 +4191,13 @@ mod tests {
     }
 
     /// A founder of the ladder's cell (three founders, each a 32 GiB volume and its S3 endpoint)
-    /// on the Mac Studio's 96 GiB and 32 cores gives its transport its floor and the growth of the
-    /// connections of the operations it serves, a stock client's, each share from QUIC's initial
-    /// window to a receive chunk; its operations take everything past, each with its client's
-    /// windows at QUIC's initial window, as they did before the caches were wants.
+    /// on the Mac Studio's 96 GiB and 32 cores gives its transport its want whole: every share,
+    /// each operation's client's among them, at a receive chunk, so each datagram is cut from a
+    /// chunk, not copied. Each operation so costs its client's windows at a chunk: 58,965
+    /// operations where 71,522 at QUIC's initial window (36ad012b), 9.47 GB past the transport's
+    /// floor; the need is 36ad012b's, which holds the capacity wants and the operations served.
     #[test]
-    fn a_node_with_memory_to_spare_grows_its_transport_for_the_operations_it_serves() {
+    fn a_node_with_memory_to_spare_gives_every_operations_windows_a_receive_chunk() {
         let mut founder = Stated {
             s3: s3(),
             ..stated(1)
@@ -4196,24 +4219,27 @@ mod tests {
             said_bytes(&derived, "gateway.objects_bytes"),
             said_bytes(&derived, "memory.remaining"),
         );
-        // Every client's shares at a chunk is its want; the served operations' clients' and the
-        // pinned peers' shares, each a chunk past QUIC's initial window, at least its growth.
+        // Every client's shares at a chunk is its want, and the transport holds it whole.
         assert_eq!(want, (3 + clients) * 3 * (chunk - initial));
-        let served = (3 + crate::listener::STOCK_CLIENT) * 3 * (chunk - initial);
-        assert!(
-            bytes - floor >= served && bytes - floor < want,
-            "{}",
-            bytes - floor
-        );
-        assert!(said_bytes(&derived, "gateway.objects") > 70_000);
+        assert_eq!(bytes - floor, want);
+        let operations = said_bytes(&derived, "gateway.objects");
+        assert!((58_000..60_000).contains(&operations), "{operations}");
+        assert_eq!(said_bytes(&derived, "memory.need"), NEED_96_GIB);
     }
+
+    /// The need of a ladder founder on 96 GiB and 32 cores at 36ad012b, rule D's order before
+    /// each operation's windows held a chunk: the floor at the operations served and the
+    /// capacity wants, which the transport's growth and the operations past those never raise.
+    const NEED_96_GIB: u64 = 14_005_933_370;
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
     /// as they were before the caches were wants: a founder of the membership suite's cell holds
     /// its index's 23,068,852 bytes and each engine's metadata's 18,029,352 at every depth its
     /// device may measure, and a node of it granted with no volume of its own its engines'
     /// metadata, each with at least the ten operations a stock client asks at once, and more
-    /// where what remains holds them. Each cache's line is its want, its store's pages at most.
+    /// where what remains holds them, each with its client's windows at a receive chunk: a
+    /// founder measuring four deep runs 27, where 31 at QUIC's initial window (36ad012b). Each
+    /// cache's line is its want, its store's pages at most.
     #[test]
     fn on_cis_macos_runner_the_capacity_wants_stand_and_the_operations_take_the_rest() {
         let member = |volume: bool| {
@@ -4269,6 +4295,13 @@ mod tests {
                     operations >= crate::listener::STOCK_CLIENT,
                     "depth {depth}, volume {volume}"
                 );
+                if operations > crate::listener::STOCK_CLIENT {
+                    // Past those served, every operation's windows at a chunk: the want whole.
+                    assert_eq!(bytes - floor, want, "depth {depth}, volume {volume}");
+                }
+                if depth == 4 && volume {
+                    assert!((25..30).contains(&operations), "{operations}");
+                }
                 assert!(cache <= cache_want && cache > 0);
             }
         }
@@ -5600,10 +5633,12 @@ mod tests {
 
     /// Rule D's order (research/87 §4): on a host whose memory holds every want and on a 16 GiB
     /// host alike, the index and the engines' metadata take their whole wants, the transport its
-    /// growth for the operation served, and the operations everything past those, no more on the
-    /// smaller host. No cache takes a share: `engine.cache_bytes` is each cache's want, the most it
-    /// may hold, the same on either host. The classes
-    /// the operations and the transport do not size are the same on either host.
+    /// want whole, every operation's client's windows at a receive chunk, and the operations
+    /// everything past those, no more on the smaller host: 10,414 on 16 GiB, where 13,764 at
+    /// QUIC's initial window (36ad012b), 1.67 GB past the transport's floor. No cache takes a
+    /// share: `engine.cache_bytes` is each cache's want, the most it may borrow of the
+    /// operations' idle bytes, the same on either host. The classes the operations and the
+    /// transport do not size are the same on either host.
     #[test]
     fn the_caches_take_no_share_and_the_operations_take_what_the_wants_leave() {
         let roomy = derive(stated(1), &roomy(facts(1)), &mut fresh).unwrap();
@@ -5644,10 +5679,13 @@ mod tests {
             said_bytes(&roomy, "gateway.objects"),
             said_bytes(&small, "gateway.objects_bytes"),
         );
-        // The growth of the served operation's connections, the same on either host.
-        assert!(bytes > floor && bytes - floor < want_past);
-        assert_eq!(bytes - floor, roomy_bytes - roomy_floor);
-        assert!(said_bytes(&small, "gateway.objects") <= said_bytes(&roomy, "gateway.objects"));
+        // Every share at a receive chunk on either host: the transport's want whole.
+        assert_eq!(bytes - floor, want_past);
+        let (_, roomy_want, _) = transport(&roomy);
+        assert_eq!(roomy_bytes - roomy_floor, roomy_want);
+        let operations = said_bytes(&small, "gateway.objects");
+        assert!((10_000..11_000).contains(&operations), "{operations}");
+        assert!(operations <= said_bytes(&roomy, "gateway.objects"));
         for class in ["volumes", "engines", "log", "threads"] {
             let key = format!("memory.floor.{class}");
             assert_eq!(

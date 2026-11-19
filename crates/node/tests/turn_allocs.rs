@@ -192,20 +192,29 @@ fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     assert_eq!(counts.allocations, SERVING, "{counts:?}");
 }
 
-/// The same cell serving the same writes and reads, each node's transport given its want past its
-/// floor, each share at a receive chunk (`bounds::chunked_transport`), as a node whose memory
-/// holds it derives (`derive`'s `transport.want`): each connection's window may grow to a chunk
-/// and each peer's pool holds one, so a datagram a node receives is cut from a chunk, where at
-/// the floor's windows, QUIC's initial window of 12,000 bytes, each was copied into a buffer of
-/// its own. Fewer allocations and fewer bytes asked of the allocator than at the floor: on this
-/// Mac 33,116 allocations, 2,048 reallocations and 16,163,710 bytes, where the same tree at the
-/// floor's windows counted 34,319, 2,051 and 17,557,473, 1,203 allocations and 1,393,763 bytes
-/// more.
+/// The same cell serving the same writes and reads at the budget a node derives where its memory
+/// holds the operations it serves (`derive`'s `transport_bytes`, rule D's order): its want whole,
+/// every share at a receive chunk (`bounds::chunked_transport`), each operation's client's among
+/// them. Each connection's window may grow to a chunk and each peer's pool holds one, so a
+/// datagram a node receives is cut from a chunk, where at the floor's windows, QUIC's initial
+/// window of 12,000 bytes, each was copied into a buffer of its own. On this Mac 33,116
+/// allocations, 2,048 reallocations and 16,163,710 bytes, at d1e5342a and again with every
+/// operation's windows at a chunk and the caches borrowing the operations' idle bytes (the
+/// cell's nodes host no objects, so they lend nothing); the same tree at the floor's windows
+/// counts 34,319, 2,051 and 17,557,473: 1,203 allocations and 1,393,763 bytes fewer, the
+/// datagrams the clients' run carries to the nodes cut from chunks, not copied. On Linux 33,167,
+/// this Mac's and the 51 its sockets' batched headers add, derived and not yet counted there.
 #[test]
 fn a_cell_serving_writes_at_chunked_windows_copies_fewer_datagrams() {
+    const CHUNKED: u64 = if cfg!(target_os = "linux") {
+        33_167
+    } else {
+        33_116
+    };
     let floor = serving(Sim::new, 1, 40);
     let chunked = serving(Sim::chunked, 1, 40);
     eprintln!("at the floor's windows {floor:?}\nat a chunk's {chunked:?}");
+    assert_eq!(chunked.allocations, CHUNKED, "{chunked:?}");
     assert!(chunked.allocations < floor.allocations, "{chunked:?}");
     assert!(chunked.bytes < floor.bytes, "{chunked:?}");
 }

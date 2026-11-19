@@ -95,7 +95,8 @@ const QUANTUM: Duration = Duration::from_micros(93_750);
 const CHECKSUM_SHIFT_MOST: u8 = 14;
 
 /// The stack a thread the node starts takes: Rust's default, 2 MiB on every tier-1 platform
-/// (std `thread` module, "Stack size"), which no thread of mantle's or its crates' sets.
+/// (std `thread` module, "Stack size"), which no thread of mantle's or its crates' sets but a
+/// device issuer's pool workers, spawned at their own measured size ([`stacks`]).
 const STACK: u64 = 2 << 20;
 
 /// How long one scrub of a whole volume takes: research 03 §15.9's target of seven days, of the
@@ -1657,9 +1658,26 @@ pub fn threads(shards: usize, devices: &[usize], volumes: &[bool], workers: usiz
     Some(threads)
 }
 
-/// The stacks of `threads` threads, each reserved whole at its start.
-pub fn stacks(threads: u64) -> Option<u64> {
-    threads.checked_mul(STACK)
+/// The pool workers among the threads [`threads`] counts for devices of `devices` depths: one a
+/// transfer where a pool carries them, none where the kernel holds them (Linux;
+/// `Issuer::device_workers`).
+pub fn issuer_workers(devices: &[usize]) -> Option<u64> {
+    devices.iter().try_fold(0u64, |workers, &depth| {
+        let pool = hyper_block::issuer::Issuer::device_workers(depth);
+        workers.checked_add(u64::try_from(pool).ok()?)
+    })
+}
+
+/// The stacks of `threads` threads, each reserved whole at its start: `workers` of them a device
+/// issuer's pool workers ([`issuer_workers`]), each at the stack hyper-block spawns it with, sized
+/// by measuring a worker's paths (`hyper_block::issuer::WORKER_STACK`), and every other at Rust's
+/// default ([`STACK`]).
+pub fn stacks(threads: u64, workers: u64) -> Option<u64> {
+    let worker = u64::try_from(hyper_block::issuer::WORKER_STACK).ok()?;
+    threads
+        .checked_sub(workers)?
+        .checked_mul(STACK)?
+        .checked_add(workers.checked_mul(worker)?)
 }
 
 /// What the node's runtime holds of its own beside its shards: its watchdog's thread and its lists
@@ -2376,7 +2394,8 @@ pub fn derive(
 /// one transfer at a time is past the allowance, with that refusal. On CI's 7 GiB macOS runner a
 /// founder of the repair suite's cell whose device measured 240 deep was refused at its threads,
 /// 7,831,251,011 bytes (gates run 44596668868): its issuer's 240 workers' stacks alone were
-/// 503 MB, and at 109 it starts.
+/// 503 MB at Rust's default 2 MiB, and it took 109. Spawned at the 128 KiB hyper-block sizes them
+/// at by measuring their paths (`WORKER_STACK`), they hold 31 MB, and it takes the 240 measured.
 fn deepest_held(
     stated: &Stated,
     measured: &Measured,
@@ -2805,7 +2824,9 @@ fn derive_with(
     let started = threads(measured.cores, &depths, &scrubs, all_workers)
         .ok_or(overflow("the node's threads"))?;
     let log_held = log_bytes(&log_config).ok_or(overflow("the log's memory"))?;
-    let stacks_held = stacks(started).ok_or(overflow("the threads' stacks"))?;
+    let stacks_held = issuer_workers(&depths)
+        .and_then(|workers| stacks(started, workers))
+        .ok_or(overflow("the threads' stacks"))?;
     // Every class at its floor: the operations' at `objects_bytes` and what they hold beside in
     // `held`, the volumes' buffers at `volume_bytes` and the threads' stacks at `stacks_held`.
     let classes_of = |held: &Held,
@@ -2883,7 +2904,9 @@ fn derive_with(
             &held_at(served, deep.transfers, initial)?,
             served_bytes,
             deep.bytes,
-            stacks(deep_threads).ok_or(overflow("the threads' stacks"))?,
+            issuer_workers(&deep_depths)
+                .and_then(|workers| stacks(deep_threads, workers))
+                .ok_or(overflow("the threads' stacks"))?,
         )?
     };
     // What remains, shared: each index wants a fragment at each of its volume's blocks, and each
@@ -4041,7 +4064,8 @@ fn say_floor(
                 }
                 Class::Threads => {
                     "the threads the node starts, its engines' maintenance workers among them, \
-                     each a 2 MiB stack reserved whole (derive::threads)"
+                     each a 2 MiB stack reserved whole but a device issuer's pool workers, each \
+                     at the stack it is spawned with (derive::threads, derive::stacks)"
                 }
             },
         );
@@ -4379,6 +4403,9 @@ mod tests {
     use hyper_block::sim::SimFile;
     use hyper_log::Log;
 
+    /// The stack a device issuer's pool worker is spawned with, which the floor counts of each.
+    const WORKER: u64 = hyper_block::issuer::WORKER_STACK as u64;
+
     /// Every member derives the same settings and rules from the same identities. The settings
     /// take one `Ready` of the largest entry; the rules keep a session of each identity for
     /// good, admit the rows the session layer writes of itself, and bound a row at what a
@@ -4494,18 +4521,16 @@ mod tests {
 
     /// The node's own six threads, its runtime's watchdog among them, and a thread a shard, each
     /// device's issuer and workers, each volume's writer, cleaner and scrubber where it scrubs, and
-    /// its engines' maintenance workers, each a 2 MiB stack.
+    /// its engines' maintenance workers, each a 2 MiB stack but the issuers' pool workers, each
+    /// the 128 KiB hyper-block spawns it with.
     #[test]
     fn the_threads_are_the_nodes_own_its_shards_and_its_storages() {
         // A device's issuer: one thread on Linux, the kernel holding its depth; elsewhere a worker
         // for each transfer at once besides.
-        let issuer = |depth: u64| {
-            if cfg!(target_os = "linux") {
-                1
-            } else {
-                depth + 1
-            }
+        let workers = |depth: u64| {
+            if cfg!(target_os = "linux") { 0 } else { depth }
         };
+        let issuer = |depth: u64| 1 + workers(depth);
         assert_eq!(threads(1, &[], &[], 0), Some(7));
         assert_eq!(threads(8, &[], &[], 0), Some(6 + 8));
         assert_eq!(threads(1, &[2], &[true], 0), Some(7 + issuer(2) + 3));
@@ -4514,7 +4539,12 @@ mod tests {
             Some(6 + 4 + issuer(1) + issuer(4) + 3 + 2)
         );
         assert_eq!(threads(18, &[], &[], 15), Some(6 + 18 + 15));
-        assert_eq!(stacks(10), Some(20 << 20));
+        assert_eq!(issuer_workers(&[]), Some(0));
+        assert_eq!(issuer_workers(&[1, 4]), Some(workers(1) + workers(4)));
+        assert_eq!(WORKER, 128 << 10);
+        assert_eq!(stacks(10, 0), Some(20 << 20));
+        assert_eq!(stacks(10, 4), Some((6 << 21) + (4 << 17)));
+        assert_eq!(stacks(3, 4), None);
     }
 
     /// Each shard is sized for the first's role: the node's task and launcher, the timers its task
@@ -5064,16 +5094,17 @@ mod tests {
     /// (5f3839f2): 291,834,348 bytes less than at every one of its 32 shards. A connection's state
     /// holds its lanes' unsent bytes by rank since hyper-transport kept them as sums
     /// (`lane::Unsent`, vendor/UPSTREAM.md): 1,248 bytes more over the connections it counts.
-    /// Linux's differs in two classes. Its threads: the kernel holds the device's 32 transfers on
-    /// the issuer's one thread, where a pool's worker carries each elsewhere
-    /// (`Issuer::device_threads`), 32 stacks fewer. Its transport: a receive takes a train from
-    /// each of the node's three peers and the ten operations' clients it serves at once
-    /// ([`runs`]), 1,605,344 bytes more: the buffers of the 12 trains past the first, 131,072
-    /// bytes each, and every train's messages' headers.
+    /// The issuer's 32 pool workers each hold the 128 KiB they are spawned with, not Rust's 2 MiB
+    /// (hyper-block `WORKER_STACK`): 62,914,560 bytes less. Linux's differs in two classes. Its
+    /// threads: the kernel holds the device's 32 transfers on the issuer's one thread, where a
+    /// pool's worker carries each elsewhere (`Issuer::device_threads`), 32 workers' stacks fewer.
+    /// Its transport: a receive takes a train from each of the node's three peers and the ten
+    /// operations' clients it serves at once ([`runs`]), 1,605,344 bytes more: the buffers of the
+    /// 12 trains past the first, 131,072 bytes each, and every train's messages' headers.
     const NEED_96_GIB: u64 = if cfg!(target_os = "linux") {
         13_714_100_270 - 32 * STACK + 1_605_344
     } else {
-        13_714_100_270
+        13_714_100_270 - 32 * (STACK - WORKER)
     };
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
@@ -5082,10 +5113,12 @@ mod tests {
     /// device may measure, and a node of it granted with no volume of its own its engines'
     /// metadata, each with at least the ten operations a stock client asks at once, and more
     /// where what remains holds them, each with its client's windows at a receive chunk: a
-    /// founder measuring four deep runs 235, where 27 while its floor counted a lane at each of
-    /// its three shards (5f3839f2) and 31 at QUIC's initial window (36ad012b). On Linux it runs
-    /// 219: each operation holds 133,520 bytes more there ([`runs`]), though the kernel holds the
-    /// device's four transfers on the issuer's one thread, four stacks fewer. Counting its
+    /// founder measuring four deep runs 240, where 235 while its issuer's four workers each
+    /// counted Rust's 2 MiB stack rather than the 128 KiB they are spawned with (hyper-block
+    /// `WORKER_STACK`), 27 while its floor counted a lane at each of its three shards (5f3839f2)
+    /// and 31 at QUIC's initial window (36ad012b). On Linux it runs 219: each operation holds
+    /// 133,520 bytes more there ([`runs`]), though the kernel holds the device's four transfers on
+    /// the issuer's one thread, four workers' stacks fewer. Counting its
     /// operations at their count moves neither: with its eight peers they make 243 trains and 227,
     /// within the receive batch's 1,024, and every train charged is one it holds. Each cache's
     /// line is its want, its store's pages at most.
@@ -5150,7 +5183,7 @@ mod tests {
                 }
                 if depth == 4 && volume {
                     assert!(
-                        runs(215..225, 230..240).contains(&operations),
+                        runs(215..225, 235..245).contains(&operations),
                         "{operations}"
                     );
                 }
@@ -6136,7 +6169,8 @@ mod tests {
     /// A device's depth costs a node no thread's stack where the kernel holds its transfers
     /// (Linux): the KIND cell's pod whose device measured 316 needed its 2 MiB stacks past its
     /// 2 GiB (kind-cell run 131575146397), and here the threads class is the same at a depth of 316
-    /// as at one. Elsewhere a pool's worker a transfer still counts its stack.
+    /// as at one. Elsewhere a pool's worker a transfer still counts its stack, the 128 KiB it is
+    /// spawned with (hyper-block `WORKER_STACK`), where it counted 2 MiB.
     #[test]
     fn a_devices_depth_costs_no_threads_stack_where_the_kernel_holds_it() {
         let threads_at = |depth| {
@@ -6147,7 +6181,7 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert_eq!(shallow, deepest);
         } else {
-            assert_eq!(deepest - shallow, 315 * STACK);
+            assert_eq!(deepest - shallow, 315 * WORKER);
         }
     }
 
@@ -6242,9 +6276,11 @@ mod tests {
     /// but their floors together pass the machine. Its need, its floor at the deepest its queue lets
     /// calibration measure with every want whole, holds the issuer's threads at 256 deep, and their
     /// stacks decide where it stands (`Issuer::device_threads`): where a pool's worker carries each
-    /// transfer (macOS, Windows) its 256 workers' stacks take it past the machine, and no memory it
-    /// states starts it there; where the kernel holds the transfers on the issuer's one thread
-    /// (Linux) it is within the machine, 7,227,826,162 bytes (c1589e30), and a node given it starts.
+    /// transfer (macOS, Windows) its 256 workers' stacks took it past the machine while each
+    /// counted Rust's 2 MiB, 7,762,424,130 bytes, and no memory it stated started it there. Each
+    /// is spawned with 128 KiB (hyper-block `WORKER_STACK`), and its need is 7,259,107,650 bytes,
+    /// within the machine as where the kernel holds the transfers on the issuer's one thread
+    /// (Linux), 7,227,826,162 bytes (c1589e30): a node given it starts on every platform.
     #[test]
     fn a_membership_founder_on_cis_macos_runner_starts_at_its_issuers_stacks() {
         let founder = || {
@@ -6283,18 +6319,17 @@ mod tests {
         let shallow = derive(founder(), &runner(4), &mut fresh).unwrap();
         let need = said_bytes(&shallow, "memory.need");
         // The issuer's workers at 256 deep beside its own thread: 256 where a pool carries the
-        // transfers, none where the kernel holds them. Without their stacks the need is within
-        // the machine on every platform; with them, past it.
-        let workers =
-            u64::try_from(hyper_block::issuer::Issuer::device_threads(256).unwrap() - 1).unwrap();
-        assert!(need - workers * STACK <= memory, "{need}");
-        let given = allowance(Some(need), &machine(memory, None));
+        // transfers, none where the kernel holds them. At the stack each is spawned with the need
+        // is within the machine on every platform; at Rust's default it passed it.
+        let workers = issuer_workers(&[256]).unwrap();
+        assert_eq!(workers, if cfg!(target_os = "linux") { 0 } else { 256 });
+        assert!(need <= memory, "{need}");
         if workers > 0 {
-            assert!(need > memory, "{need}");
-            assert!(matches!(given, Err(DeriveError::Ceiling { .. })));
-        } else {
-            assert_eq!(given.ok(), Some(need));
+            assert_eq!(need, 7_259_107_650);
+            assert_eq!(need + workers * (STACK - WORKER), 7_762_424_130);
         }
+        let given = allowance(Some(need), &machine(memory, None));
+        assert_eq!(given.ok(), Some(need));
         let floor = |derived: &Derived, classes: &[&str]| -> u64 {
             classes
                 .iter()
@@ -6338,11 +6373,12 @@ mod tests {
         // Its engines take no maintenance workers: 7 GiB holds no five compactions' statements
         // past its need (`derive`, `ENGINE_WORKERS`). Its threads are the node's six, a shard's on
         // each of three cores, its volume's three, the issuer's own and its workers: 269 with a
-        // worker for each of 256 transfers, 13 where the kernel holds them.
-        let stacks = threads(3, &[256], &[true], 0).unwrap() * STACK;
-        assert_eq!(stacks, (13 + workers) * STACK);
+        // worker for each of 256 transfers, 13 where the kernel holds them, the workers' stacks
+        // each 128 KiB and the others' 2 MiB.
+        let held = stacks(threads(3, &[256], &[true], 0).unwrap(), workers).unwrap();
+        assert_eq!(held, 13 * STACK + workers * WORKER);
         assert_eq!(said_bytes(&deep, "engine.workers"), 0);
-        assert_eq!(said_bytes(&deep, "memory.floor.threads"), stacks);
+        assert_eq!(said_bytes(&deep, "memory.floor.threads"), held);
     }
 
     /// A founder of the repair suite's cells (crates/mantle/tests/repair.rs `founders`, made by
@@ -6359,10 +6395,13 @@ mod tests {
     /// (`Node::spread`). Counted at the lanes it opens, the transport's budget is the least the
     /// node's own transport takes, which its bounds admit, and the runtime holds no lane between
     /// shards: one operation's floor is 7,341,380,028 bytes with one volume at 256 and 7,254,623,836
-    /// with two at 4 (macOS), within the machine. Two volumes measured past 112 deep still pass it
+    /// with two at 4 (macOS), within the machine. Two volumes measured past 112 deep still passed it
     /// where a pool's worker carries each transfer (macOS, Windows): 7,518,023,644 bytes at 113,
     /// 7,863,584,860 at 256, refused at their threads, as their ranges, log and transport grow with
-    /// their transfers and the issuer's workers' stacks with the depth.
+    /// their transfers and the issuer's workers' stacks with the depth, each Rust's 2 MiB then.
+    /// Spawned with 128 KiB (hyper-block `WORKER_STACK`), two volumes at 256 hold 7,366,581,059
+    /// bytes, where 2 MiB a worker would hold 7,869,897,539 now, and start at the depth measured on
+    /// every platform.
     #[test]
     fn a_repair_founder_on_cis_macos_runner_starts_at_the_lanes_its_ranges_open() {
         let founder = |volumes: usize| {
@@ -6418,7 +6457,7 @@ mod tests {
             "runtime",
             "threads",
         ];
-        for (volumes, depth) in [(1, 4), (1, 256), (2, 4), (2, 16)] {
+        for (volumes, depth) in [(1, 4), (1, 256), (2, 4), (2, 16), (2, 256)] {
             let case = format!("{volumes} volumes, {depth} deep");
             // The floor at one operation, what the node is refused at where it passes the
             // allowance: a ceiling of a byte leaves the operations nothing past their first.
@@ -6476,15 +6515,17 @@ mod tests {
                 "{case}"
             );
         }
-        // Two volumes measured at the device's queue: the issuer's 257 threads' stacks where a pool
-        // carries the transfers pass the machine, and the node takes the deepest its allowance
-        // holds; Linux's kernel holds them, and it takes the depth measured.
+        // Two volumes measured at the device's queue: the issuer's 256 workers' 128 KiB stacks where
+        // a pool carries the transfers are within the machine, as where Linux's kernel holds them,
+        // and the node takes the depth measured; at Rust's 2 MiB a worker they passed it.
         let deepest = derive(founder(2), &runner(2, 256), &mut fresh).unwrap();
         assert_eq!(said_bytes(&deepest, "volume.1.depth"), 256);
-        assert_eq!(
-            said_bytes(&deepest, "volume.1.depth_taken"),
-            if cfg!(target_os = "linux") { 256 } else { 109 }
-        );
+        assert_eq!(said_bytes(&deepest, "volume.1.depth_taken"), 256);
+        if cfg!(not(target_os = "linux")) {
+            let at = floor_at_one(founder(2), &runner(2, 256));
+            assert_eq!(at, 7_366_581_059);
+            assert_eq!(at + 256 * (STACK - WORKER), 7_869_897_539);
+        }
         // Spread over the shards, the same founder's ranges take a lane from each peer for each
         // shard past the first, and two lanes to the node's shard from each.
         let spread = floor_at_one(
@@ -7352,8 +7393,9 @@ mod tests {
     /// transport 974,293,070, where a founder's are 4,102,904,425, 2,177,077,666 and 562,407,499.
     /// Each node counted once ([`nodes_named`]), by derive and by the node as it opens its
     /// transport (`NodeSettings::stated`), it derives its founders' settings, rules and transport,
-    /// and its floor is theirs, 7,289,300,291 bytes at one operation, 226,892,477 within the
-    /// machine: it starts.
+    /// and its floor is theirs, 7,257,843,011 bytes at one operation, 258,349,757 within the
+    /// machine: it starts. Its issuer's 16 workers each count the 128 KiB they are spawned with
+    /// (hyper-block `WORKER_STACK`), where at Rust's 2 MiB its floor was 7,289,300,291 bytes.
     #[test]
     fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
         let founder = repair_founder;
@@ -7389,11 +7431,11 @@ mod tests {
         eprintln!("7 GiB, 16 deep: a founder's floor {founded}, the rejoined node's {again}");
         assert_eq!(again, founded);
         // Linux's, by derive's model and not measured here: the issuer's 16 workers' stacks fewer
-        // (33,554,432 bytes), the kernel holding its transfers, and about 133 KB more for each
+        // (2,097,152 bytes), the kernel holding its transfers, and about 133 KB more for each
         // train past the first a receive takes, its eight peers' and its operation's client's
         // ([`runs`]).
         assert!(
-            runs(7_255_000_000..7_260_000_000, 7_289_300_291..7_289_300_292).contains(&founded),
+            runs(7_255_000_000..7_260_000_000, 7_257_843_011..7_257_843_012).contains(&founded),
             "{founded}"
         );
         // It starts on the runner, every class of its floor its founders'.
@@ -7456,18 +7498,20 @@ mod tests {
     /// A founder of the repair suite's cell on CI's 7 GiB macOS runner whose device measured 240
     /// deep and its shards 436 control entries, as one did at its first start in gates run
     /// 44596668868 (macos-aarch64, `Cell::made_partly`, repair.rs:809), was refused at its threads
-    /// at 7,831,251,011 bytes, CI's exactly, its floor at that depth. Every byte past its floor at
-    /// 16 deep and 64 entries, 7,289,300,291, is what its depth and its ring hold: the device's
-    /// issuer carries each transfer on a worker of its own where a pool carries them (macOS,
-    /// Windows; `Issuer::device_threads`), 224 more threads' 2 MiB stacks, 469,762,048 bytes; its
-    /// two volumes take 448 more transfers at once, whose exchanges the transport holds,
+    /// at 7,831,251,011 bytes, CI's exactly, its floor at that depth while each of its issuer's
+    /// workers counted Rust's 2 MiB stack, and took 109. Each is spawned with 128 KiB (hyper-block
+    /// `WORKER_STACK`, sized by measuring a worker's paths). Every
+    /// byte past its floor at 16 deep and 64 entries, 7,257,843,011, is what its depth and its ring
+    /// hold: the device's issuer carries each transfer on a worker of its own where a pool carries
+    /// them (macOS, Windows; `Issuer::device_threads`), 224 more workers' stacks, 29,360,128
+    /// bytes; its two volumes take 448 more transfers at once, whose exchanges the transport holds,
     /// 34,843,648, and whose reads the ranges hold, 37,273,600; and three shards' rings 372 entries
-    /// longer, 71,424. Its floor grows 2,419,104 bytes a transfer, so the deepest its allowance
-    /// holds is 109, 7,514,348,387 bytes at one operation, 1,844,381 within, and 110 is past it. It
-    /// takes 109 and starts: its issuer's workers, its volumes' reads and transfers and the
-    /// transport's room for them all at the depth taken. Where the kernel holds the transfers on
-    /// the issuer's one thread (Linux), its threads are 16 stacks at any depth, and it takes the
-    /// 240 measured.
+    /// longer, 71,424. Its floor grows 453,024 bytes a transfer, where it grew 2,419,104, and at 240
+    /// is 7,359,391,811 bytes at one operation, 156,800,957 within the machine: it takes the 240
+    /// measured and starts, its issuer's workers, its volumes' reads and transfers and the
+    /// transport's room for them all at that depth. Where the kernel holds the transfers on the
+    /// issuer's one thread (Linux), its threads are 16 stacks at any depth, and it takes the 240
+    /// measured too.
     #[test]
     fn a_repair_founder_measured_deep_on_cis_macos_runner_takes_the_deepest_its_allowance_holds() {
         let measured = repair_runner(240, 436);
@@ -7492,27 +7536,27 @@ mod tests {
                 taken
             );
         }
+        assert_eq!(taken, 240);
+        assert_eq!(at_taken, at_measured);
         if cfg!(target_os = "linux") {
-            assert_eq!(taken, 240);
             // Derive's Linux model, not measured here: the issuer's 240 workers' stacks fewer
             // than macOS's, and about 133 KB more a train ([`runs`]).
-            assert_eq!(at_taken, at_measured);
             assert!(
                 (7_327_000_000..7_332_000_000).contains(&at_measured),
                 "{at_measured}"
             );
         } else {
-            assert_eq!(at_measured, 7_831_251_011);
-            assert_eq!(taken, 109);
-            assert_eq!(at_taken, 7_514_348_387);
-            assert_eq!((7u64 << 30) - at_taken, 1_844_381);
-            assert!(floor_at_one(repair_founder(), &repair_runner(110, 436)) > 7 << 30);
+            assert_eq!(at_measured, 7_359_391_811);
+            assert_eq!((7u64 << 30) - at_measured, 156_800_957);
+            // Its workers at Rust's 2 MiB: CI's refusal, exactly.
+            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_251_011);
         }
         // Every term that holds the depth holds the one taken: the issuer's workers among the
         // threads, each volume's reads and transfers, and the transport's room for them.
+        let workers = issuer_workers(&[depth]).unwrap();
         assert_eq!(
             said_bytes(&derived, "memory.floor.threads"),
-            threads(3, &[depth], &[true, true], 0).unwrap() * STACK
+            stacks(threads(3, &[depth], &[true, true], 0).unwrap(), workers).unwrap()
         );
         let config = &derived.config;
         for v in &config.volumes {

@@ -251,18 +251,27 @@ impl Carry {
             *had = false;
         }
     }
+    /// The peer named the exchange in a note, as the connection had moved `moved` (mantle
+    /// research/77 D1): the window the note begins is counted from here, and the judgement that
+    /// finds the note starts the wait's clock from it too ([`Carry::vouched`]), after what that
+    /// judgement weighs first, a stream its peer does not read. Any restart of the wait meanwhile
+    /// counts afresh from its own instant, later than the note's, which it makes stale.
+    pub(crate) fn noted(&mut self, moved: Moved) {
+        self.before = moved;
+    }
     /// The peer said, at `vouched`, that its owner is at work on the exchange (mantle research/77
-    /// D1): the wait starts again from that note, and a request the peer has whole (`acknowledged`)
-    /// is waited on for that window alone, its peer's work stated, not for one more to answer in.
-    /// A window that brings neither another note nor what it is judged on without one ends it.
-    pub(crate) fn vouched(
-        &mut self,
-        vouched: Instant,
-        moved: Moved,
-        backlog: u64,
-        acknowledged: bool,
-    ) {
-        self.hold(vouched, moved, backlog);
+    /// D1): the wait starts again from that note, its bytes counted from it ([`Carry::noted`]), and
+    /// a request the peer has whole (`acknowledged`) is waited on for that window alone, its peer's
+    /// work stated, not for one more to answer in. A window that brings neither another note nor
+    /// what it is judged on without one ends it. Counted from the judgement that found the note,
+    /// one heard early in a window left the next the instants between the two: a put of 20 MiB to
+    /// mantle's node, its period 6.10 s and its node's one note 4.76 ms after the request came, was
+    /// refused `Stalled` 6,114.9 ms after its send, inside a 195 ms pause of the node's reads at a
+    /// block's boundary, its window from the note having carried 8,333,704 bytes (CI's
+    /// ubuntu-24.04-arm, 2026-11-19; `tests/exchange.rs`, an upload paused across a judgement).
+    pub(crate) fn vouched(&mut self, vouched: Instant, backlog: u64, acknowledged: bool) {
+        let noted = self.before;
+        self.hold(vouched, noted, backlog);
         if let Phase::Asking { had, .. } = &mut self.phase {
             *had = acknowledged;
         }
@@ -779,6 +788,40 @@ mod tests {
                 busy(2_000_000, 60_000),
                 0,
                 10_000,
+                false,
+                Duration::ZERO
+            ),
+            Err(Refusal::Stalled)
+        );
+    }
+
+    /// A note starts the window it begins, its bytes counted from it: one heard early in a window
+    /// and found at its end is judged a period after the note on what moved since the note, not on
+    /// the instants between its finding and that period's end (mantle's put of 20 MiB, refused 6 ms
+    /// after the judgement that found its node's one note, inside a pause of the node's reads).
+    /// A window from the note that moves nothing still ends it, a period after the note.
+    #[test]
+    fn a_notes_window_is_counted_from_the_note() {
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
+        let note = start + Duration::from_millis(5);
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
+        carry.asking(start, moved(0, 0), 20 << 20);
+        carry.noted(moved(13_054, 2_000));
+        // Found at the period's end, the stream paused there: the wait starts from the note.
+        carry.vouched(note, 0, false);
+        assert_eq!(carry.due(), Some(note + PERIOD));
+        // Nothing moved between the finding and the note's period's end, all of it since the note.
+        let paused = moved(8_333_704, 400_000);
+        assert_eq!(
+            carry.judge(note + PERIOD, paused, 20 << 20, 0, false, Duration::ZERO),
+            Ok(())
+        );
+        assert_eq!(
+            carry.judge(
+                note + PERIOD * 2,
+                paused,
+                20 << 20,
+                0,
                 false,
                 Duration::ZERO
             ),

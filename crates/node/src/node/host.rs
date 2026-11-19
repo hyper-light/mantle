@@ -306,6 +306,29 @@ impl Job {
         }
     }
 
+    /// Tells its asker its work moves, through its native door, where its own bytes moved since it
+    /// was last told (its body taken or its reply given, `Host::turn_job`), at most twice a beat
+    /// (`vouch_every`) from then, or from its admission before it first was: a job holding nothing
+    /// of its own out says its work moves as it moves (research/77 D1), as a held one says each
+    /// beat that it is held (`Job::vouch`), and nothing while it stands still. Its asker counts
+    /// each window from the note that begins it (hyper-transport's `Carry::noted`). Holding
+    /// nothing, a put taking its body said nothing: CI's put of 20 MiB to a node on
+    /// ubuntu-24.04-arm (2026-11-19) was named once, 4.76 ms after it came, in the 6,119 ms its
+    /// node took 8,333,704 bytes of its body, and its client's judgement rested on that note. One
+    /// done within half a beat of its admission is told nothing.
+    fn moving(&mut self, now: u64, beat: u64) {
+        let Door::Native(_, native) = &self.door else {
+            return;
+        };
+        let Some(since) = self.vouched_ns.or(self.admitted_ns) else {
+            return;
+        };
+        if self.moved_ns > since && now >= since.saturating_add(vouch_every(beat)) {
+            native.held();
+            self.vouched_ns = Some(now);
+        }
+    }
+
     /// One of its own asks answered at `now`: its work moved, unless a chunk of it was refused for
     /// want of room ([`Taken::Room`]), which moves nothing; else a put or a get asked again at each
     /// beat and refused again would never reach its client's patience (research/77 D2).
@@ -4693,13 +4716,18 @@ impl Host {
     /// peers say nothing, and it ends unfinished as a get does; one whose chunk read waits for room
     /// is the node's own wait, which no transport ends, and its driver ends `Patience`. An
     /// operation waiting on its client, for its body or room to write its reply, is the
-    /// transport's to judge.
+    /// transport's to judge, and a native one whose own bytes move tells its asker so as they
+    /// move (`Job::moving`).
     fn bound_jobs<N: Serve>(&mut self, node: &mut N, now: u64, beat: u64) -> Result<(), NodeError> {
         for at in 0..self.jobs.len() {
             let Some(job) = self.jobs.get_mut(at) else {
                 continue;
             };
-            if !job.working() || !job.held() {
+            if !job.working() {
+                continue;
+            }
+            if !job.held() {
+                job.moving(now, beat);
                 continue;
             }
             match job.bounded(now) {
@@ -12666,6 +12694,54 @@ pub(super) mod tests {
             }
             assert_eq!(vouches(&mut replies, &mut seen), expected, "at {now}");
         }
+    }
+
+    /// A native put taking its body, nothing of its own out, tells its asker its work moves as its
+    /// body is taken, half a beat apart at the most often (`vouch_every`), and nothing while its
+    /// body stands still (research/77 D1, said as work moves). Holding nothing, it said nothing:
+    /// CI's put of 20 MiB to a node on ubuntu-24.04-arm (2026-11-19) was named in its node's notes
+    /// once in the 6,119 ms the node took 8,333,704 bytes of its body, 4.76 ms after it came, and
+    /// its client's judgement rested on that note. Do: take its body each 9.3 ms, as that node
+    /// did, for three beats, then stop. Expect: told first half a beat after its admission, then
+    /// each half beat to within a piece, and once more at most after its body stops.
+    #[test]
+    fn a_native_put_taking_its_body_is_vouched_for_as_its_body_moves() {
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        let every = vouch_every(beat);
+        let piece = 9_300_000;
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut stub = silent_stub();
+        let (job, half) = handed_job(Work::Put(native_put(20 << 20)), 1, 0);
+        assert!(job.working() && !job.held());
+        host.jobs.push(job);
+        let (mut replies, mut seen) = (vec![half], vec![Seen::default()]);
+        let mut told = Vec::new();
+        let mut now = 1;
+        while now < 1 + 3 * beat {
+            host.bound_jobs(&mut stub, now, beat).unwrap();
+            if vouches(&mut replies, &mut seen) == [1] {
+                told.push(now);
+            }
+            host.jobs[0].moved_ns = now;
+            now += piece;
+        }
+        assert!(told.len() >= 5, "told at {told:?}");
+        let mut last = 1;
+        for at in &told {
+            assert!(
+                at - last >= every && at - last < every + piece,
+                "told {} ns after the last, at {told:?}",
+                at - last
+            );
+            last = *at;
+        }
+        let mut after = 0;
+        for _ in 0..8 {
+            now += every;
+            host.bound_jobs(&mut stub, now, beat).unwrap();
+            after += vouches(&mut replies, &mut seen)[0];
+        }
+        assert!(after <= 1, "told {after} times with its body still");
     }
 
     /// Requests parked for want of room are each told they are held at the first turn they are

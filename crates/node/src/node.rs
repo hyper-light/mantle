@@ -1511,8 +1511,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// The written-off nodes' requests this node holds, at most `command_asks`
     /// (`enrollments`), and the highest issuer's grant its own re-grants spent, which the root
     /// range's rows may not yet hold. Each request found by its own exchange, and one forwarded to
-    /// the leader by its forward's (`keyed::KeyedOn`), as either ends, in one probe; each turn's
-    /// step walks them all.
+    /// the leader by its forward's (`keyed::KeyedOn`), as either ends, and a node's own by its old
+    /// identity, as a second of its comes, in one probe; each turn's step walks them all, none
+    /// but while written-off nodes enroll, and one own request of each at most.
     enrollments: KeyedOn<enrollments::Enrollment>,
     issuer_spent: u64,
     /// The members whose reach names a host the process looks up, not yet taken

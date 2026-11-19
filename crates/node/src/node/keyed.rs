@@ -173,7 +173,8 @@ pub(super) trait On: Key {
 
     /// What its list's owner finds a set of entries by, many an entry of: a command's and a read's
     /// range group, let go a group at a time as the range stops leading (`Node::commanded`,
-    /// `Node::reading`). None for the other lists, and an entry of none.
+    /// `Node::reading`), and a written-off node's own request's old identity, of which one is held
+    /// at a time (`Node::enrollments`). None for the other lists, and an entry of none.
     fn class(&self) -> Option<u128> {
         None
     }
@@ -1664,6 +1665,83 @@ pub(super) mod tests {
         commanded.answered_into(&mut replying);
         assert!(replying.is_empty());
         commanded.audit();
+    }
+
+    /// A written-off node's request, by its own exchange, its old identity's class where it is the
+    /// node's own and not a member's forward (`enrollments::Enrollment`).
+    struct Request(u64, u64, bool);
+
+    impl Key for Request {
+        type Of = u64;
+
+        fn key(&self) -> u64 {
+            self.0
+        }
+    }
+
+    impl On for Request {
+        type By = u64;
+
+        fn on(&self) -> Option<u64> {
+            None
+        }
+
+        fn class(&self) -> Option<u128> {
+            (!self.2).then(|| u128::from(self.1))
+        }
+    }
+
+    /// A new request's check for a second of one node's (`Node::enrollment_read`), found by its
+    /// old identity in one probe of the classes (`KeyedOn::of_class`): 1,024 requests held, every
+    /// other one a member's forward, which no check finds; then 1,024 new ones checked, half a
+    /// second of a node's held. Each answered request lets its class go, its set put aside for the
+    /// next class, so as many come and go as are held and no set more is made. Before, each check
+    /// walked every request held.
+    #[test]
+    fn a_second_request_of_one_node_is_found_with_no_scan() {
+        const HELD: u64 = 1024;
+        let mut enrollments = KeyedOn::default();
+        for exchange in 0..HELD {
+            enrollments.push(Request(exchange, 50_000 + exchange, exchange % 2 == 1));
+        }
+        let sets = enrollments.classes.len() + enrollments.aside.len();
+        let (mut before, mut seconds) = (0, 0);
+        probes();
+        for old in 0..HELD {
+            // A second of each node held, or one no request names.
+            let asked = if old % 2 == 0 {
+                50_000 + old
+            } else {
+                90_000 + old
+            };
+            before += enrollments.len();
+            seconds += usize::from(enrollments.of_class(u128::from(asked)).is_some());
+        }
+        let after = probes();
+        assert_eq!(
+            seconds,
+            usize::try_from(HELD / 2).unwrap(),
+            "each node's own held"
+        );
+        assert_eq!(after, usize::try_from(HELD).unwrap(), "one probe a check");
+        // Answered and taken out, a new node's request in each one's place.
+        for exchange in 0..HELD {
+            assert!(enrollments.remove(exchange).is_some());
+            enrollments.push(Request(
+                HELD + exchange,
+                70_000 + exchange,
+                exchange % 2 == 1,
+            ));
+        }
+        assert_eq!(
+            enrollments.classes.len() + enrollments.aside.len(),
+            sets,
+            "each class gone put its set aside for the next"
+        );
+        println!(
+            "{HELD} requests held: {HELD} checks, {after} probes ({before} requests visited before)"
+        );
+        enrollments.audit();
     }
 
     /// A lost exchange (`Event::Refused`, a forward's bytes refused) lets go of the written-off

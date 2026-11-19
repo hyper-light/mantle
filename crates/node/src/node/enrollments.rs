@@ -63,6 +63,12 @@ impl On for Enrollment {
             Stands::Waiting | Stands::Proposed { .. } | Stands::Removing { .. } => None,
         }
     }
+
+    /// And a written-off node's own request, not a member's forward, by its old identity: a second
+    /// of one node's is refused while its first is held (`Node::enrollment_read`).
+    fn class(&self) -> Option<u128> {
+        (!self.forwarded).then(|| u128::from(self.enrolling.old))
+    }
 }
 
 enum Stands {
@@ -131,11 +137,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             endpoint.refuse_exchange(exchange, Refusal::Kind);
             return Ok(());
         };
+        // A second of one node's own requests found by its old identity, in one probe.
         if self.enrollments.len() >= self.command_asks
-            || self
-                .enrollments
-                .iter()
-                .any(|e| !e.forwarded && !forwarded && e.enrolling.old == enrolling.old)
+            || (!forwarded
+                && self
+                    .enrollments
+                    .of_class(u128::from(enrolling.old))
+                    .is_some())
         {
             self.driver
                 .endpoint()

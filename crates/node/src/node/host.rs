@@ -2765,8 +2765,30 @@ fn parked_vouch_ns(vouched_ns: Option<u64>, now: u64, beat: u64) -> u64 {
 /// it up a serve period, three beats, after it last heard (hyper-transport `Endpoint::working`,
 /// `NOTES_A_PERIOD`). Told every half beat, a held request is named in notes at most a beat and a
 /// half apart, the margin it had told at every turn, at two vouches a beat, each a flag.
-fn vouch_every(beat: u64) -> u64 {
+pub(super) fn vouch_every(beat: u64) -> u64 {
     beat.checked_div(2).unwrap_or(beat).max(1)
+}
+
+/// Tells `tell` each of `held`, the askers of work held at once, that it is held, at `now` where
+/// half a beat passed since they last were, at `vouched_ns`, or none was told since none was held
+/// ([`parked_vouch_ns`]): one call each a half beat, not one each turn. `vouched_ns` becomes `now`
+/// where any was told, and none where none is held, so the first held after none is told at its
+/// first turn and one held beside others at their next vouch, within half a beat.
+pub(super) fn vouch_held<T>(
+    vouched_ns: &mut Option<u64>,
+    (now, beat): (u64, u64),
+    held: impl IntoIterator<Item = T>,
+    mut tell: impl FnMut(T),
+) {
+    if now < parked_vouch_ns(*vouched_ns, now, beat) {
+        return;
+    }
+    let mut told = false;
+    for asker in held {
+        tell(asker);
+        told = true;
+    }
+    *vouched_ns = if told { Some(now) } else { None };
 }
 
 impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
@@ -12270,6 +12292,74 @@ pub(super) mod tests {
             2 * PARKED,
             PARKED * turns
         );
+    }
+
+    /// The peers' chunks a volume holds while their requests wait (`Storage::held`), idle: each
+    /// turn told every one's asker, one call into the transport each per turn; now all at once at
+    /// the first turn any is held, then half a beat apart (`vouch_held`), the node's next turn due
+    /// by the next vouch (`Node::wait`). A chunk held beside others is told at their next vouch,
+    /// within half a beat, and none is told once none is held.
+    #[test]
+    fn held_chunks_are_vouched_for_twice_a_beat_not_at_each_turn() {
+        const HELD: usize = 64;
+        const BEATS: u64 = 3;
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        let every = vouch_every(beat);
+        let mut held: Vec<usize> = (0..HELD).collect();
+        let mut last: Vec<Option<u64>> = vec![None; HELD + 1];
+        let mut vouched = None;
+        let mut per_turn = Vec::new();
+        let mut now = 1;
+        while now <= 1 + BEATS * beat {
+            // One more is held half way through, beside the others.
+            if now >= 1 + beat + beat / 4 && held.len() == HELD {
+                held.push(HELD);
+                last[HELD] = Some(now);
+            }
+            let mut told = 0;
+            vouch_held(&mut vouched, (now, beat), held.iter().copied(), |chunk| {
+                if let Some(at) = last[chunk] {
+                    assert!(
+                        now - at <= every,
+                        "chunk {chunk} told {} ns after",
+                        now - at
+                    );
+                }
+                last[chunk] = Some(now);
+                told += 1;
+            });
+            per_turn.push(told);
+            // The node's next turn is due at the next vouch, within half a beat (`Node::wait`).
+            let next = vouched.unwrap() + every;
+            assert!(
+                next > now && next <= now + every,
+                "next vouch {next} at {now}"
+            );
+            now += beat / 16;
+        }
+        let turns = per_turn.len();
+        let told: usize = per_turn.iter().sum();
+        let vouches = per_turn.iter().filter(|told| **told > 0).count();
+        println!(
+            "{HELD} held over {turns} turns: {told} vouches in {vouches} turns, {} before",
+            HELD * turns
+        );
+        assert!(turns > 16 * usize::try_from(BEATS).unwrap());
+        // Two vouches a beat, the first turn's and each half beat's after.
+        assert_eq!(vouches, 2 * usize::try_from(BEATS).unwrap() + 1);
+        assert_eq!(per_turn[0], HELD, "every one at the first turn held");
+        assert!(per_turn.iter().all(|told| *told == 0 || *told >= HELD));
+
+        // None held: none told, and the next held is told at its first turn.
+        vouch_held(&mut vouched, (now + every, beat), None::<usize>, |_| {
+            panic!("none held")
+        });
+        assert_eq!(vouched, None);
+        let mut told = 0;
+        vouch_held(&mut vouched, (now + every + 1, beat), Some(0), |_| {
+            told += 1
+        });
+        assert_eq!((told, vouched), (1, Some(now + every + 1)));
     }
 
     thread_local! {

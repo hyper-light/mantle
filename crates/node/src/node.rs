@@ -1198,6 +1198,9 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// When, on the shard's clock, the parked requests' askers were last told their requests are
     /// held (`Node::take_parked`), all at once half a beat apart; none since none was parked.
     parked_vouched_ns: Option<u64>,
+    /// When, on the shard's clock, the askers of the peers' chunks a volume holds were last told
+    /// their work is held (`Node::vouch_held`), all at once half a beat apart; none while none is.
+    held_vouched_ns: Option<u64>,
     /// What the node measured of its puts' and its gets' blocks and bodies, the windows each
     /// holds (`crate::window`).
     windows: crate::window::Windows,
@@ -1680,6 +1683,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             parked: VecDeque::new(),
             parked_most: exchanges,
             parked_vouched_ns: None,
+            held_vouched_ns: None,
             windows: crate::window::Windows::default(),
             feeding: Vec::new(),
             piece: Vec::new(),
@@ -2773,9 +2777,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         } else {
             self.remotes.iter().filter_map(|r| r.redial_at).min()
         };
-        // A peer's chunk a volume holds is vouched for each beat while its request waits.
-        let held = self.storage.held(now).next().map(|_| {
-            now.saturating_add(u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX))
+        // The peers' chunks a volume holds are vouched for half a beat after they last were.
+        let held = self.held_vouched_ns.map(|vouched| {
+            let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+            vouched.saturating_add(host::vouch_every(beat))
         });
         let due = [
             self.deadlines.first().map(|(at, _)| *at),
@@ -4431,12 +4436,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// Tells the askers of the peers' chunks a volume holds, put and not yet durable, that their
     /// work is held while their requests wait (research/77 D2): a device slow to make a chunk
     /// durable is waited on as long as its asker's client would wait, and one that never answers
-    /// is given up once that time has passed.
+    /// is given up once that time has passed. All are told at once half a beat apart
+    /// (`host::vouch_held`), not each at every turn: a vouch reaches its asker in the next note on
+    /// its connection, as a held job's does (`Job::vouch`). A chunk is put as its body is read
+    /// whole, at the turn's events, before this: the first held after none is told at its first
+    /// turn, and one held beside others within half a beat. Its work moves only as it is answered,
+    /// which its reply says.
     fn vouch_held(&mut self, now: u64) {
-        let endpoint = self.driver.endpoint();
-        for exchange in self.storage.held(now) {
-            endpoint.working(exchange);
-        }
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
+        let Self {
+            storage,
+            driver,
+            held_vouched_ns,
+            ..
+        } = self;
+        let endpoint = driver.endpoint();
+        host::vouch_held(
+            held_vouched_ns,
+            (now, beat),
+            storage.held(now),
+            |exchange| {
+                endpoint.working(exchange);
+            },
+        );
     }
 
     /// A peer's reply to a chunk put or get this node asked: a put's status, or a get's bytes,

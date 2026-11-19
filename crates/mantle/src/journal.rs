@@ -137,7 +137,7 @@ impl Record {
     /// the checksum after them. A path is read as text once, for both.
     fn encode(&self) -> Vec<u8> {
         let path = match &self.origin {
-            Origin::File { path, .. } => path.to_string_lossy(),
+            Origin::File { path, .. } => lossy(path),
             Origin::Standard => Cow::Borrowed(""),
         };
         let Ok(mut w) = mantle_codec::encode(CRC_BYTES, |w| {
@@ -219,6 +219,46 @@ impl Record {
             upload,
         })
     }
+}
+
+/// `path` as text, as `Path::to_string_lossy` gives it, made at its length. On Unix a path that is
+/// not UTF-8 is its valid runs with U+FFFD for each invalid one, which std's
+/// `String::from_utf8_lossy` writes into a string made at the path's length and grows at each
+/// U+FFFD longer than the run it replaces; here the text is counted first, then made once.
+#[cfg(unix)]
+fn lossy(path: &Path) -> Cow<'_, str> {
+    const REPLACEMENT: &str = "\u{FFFD}";
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Cow::Borrowed(text);
+    }
+    let replaced = |chunk: &std::str::Utf8Chunk<'_>| {
+        if chunk.invalid().is_empty() {
+            ""
+        } else {
+            REPLACEMENT
+        }
+    };
+    let len = bytes.utf8_chunks().fold(0usize, |len, chunk| {
+        len.saturating_add(chunk.valid().len())
+            .saturating_add(replaced(&chunk).len())
+    });
+    let mut text = String::new();
+    // Refused only for more than memory holds, where the writes below fail as well.
+    let _ = text.try_reserve_exact(len);
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        text.push_str(replaced(&chunk));
+    }
+    Cow::Owned(text)
+}
+
+/// `path` as text, as `Path::to_string_lossy` gives it: Windows's replaces each unpaired
+/// surrogate's three bytes with U+FFFD's three, in a string std makes at the path's length,
+/// which is the text's.
+#[cfg(not(unix))]
+fn lossy(path: &Path) -> Cow<'_, str> {
+    path.to_string_lossy()
 }
 
 fn text(w: &mut Writer, text: &str) {
@@ -473,6 +513,39 @@ mod tests {
             assert_eq!(Record::decode(&bytes), Some(r), "{what}");
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A record whose path is not UTF-8 is two buffers made at their lengths, the path's text and
+    /// the record, the bytes the encoder before Lean doors step 7 wrote (std's lossy text): one
+    /// invalid byte, a run cut short, and a path at Linux's PATH_MAX of invalid bytes, each three
+    /// bytes of U+FFFD. Its path reads back as that text.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_whose_path_is_not_utf8_is_written_at_its_length() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let paths: [&[u8]; 3] = [b"/tmp/\xffsource", b"/tmp/caf\xc3", &[0xff; 4096]];
+        for path in paths {
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(path));
+            let r = record(Origin::File {
+                path: path.clone(),
+                length: 5,
+                modified_ns: 7,
+                identity: Some((1, 2)),
+            });
+            let (expected, before) = counted(|| reference(&r));
+            let (bytes, made) = counted(|| r.encode());
+            println!(
+                "record of a {}-byte path: before {before:?}, now {made:?}",
+                path.as_os_str().len()
+            );
+            assert_eq!((made, bytes.capacity()), ((2, 0), bytes.len()), "{path:?}");
+            assert_eq!(bytes, expected, "{path:?}");
+            let read = Record::decode(&bytes).unwrap();
+            let Origin::File { path: read, .. } = read.origin else {
+                panic!("{path:?} read back as standard input");
+            };
+            assert_eq!(read.to_str(), Some(&*path.to_string_lossy()));
+        }
     }
 
     /// Past its bound the journal refuses a new record, and keeps taking the ones it holds.

@@ -164,6 +164,38 @@ consecutively 99 lost messages." Read as 27 bursts holding 99 of the losses, the
 147 runs, a mean run of 219/147 = 1.49. Research/06 §V cites the same experiment as "~0.4% loss in
 bursts", the figure the owner chose for the relay's loss.
 
+[25] perf-stat(1) (tools/perf/Documentation/perf-stat.txt, Linux master, read 2026-11-18), "CSV
+FORMAT", its list of fields joined: "The fields are in this order: optional usec time stamp in fractions of second (with -I
+xxx); optional CPU, core, or socket identifier; optional number of logical CPUs aggregated; counter
+value; unit of the counter value or empty; event name; run time of counter; percentage of
+measurement time the counter was running; optional variance if multiple values are collected with
+-r; optional metric value; optional unit of metric. Additional metrics may be printed with all
+earlier fields being empty." Scaling is the default: `--no-scale` "Don't scale/normalize counter
+values" (builtin-stat.c: "Use --no-scale to disable counter scaling for multiplexing"). perf's
+source, same date: tools/lib/perf/evsel.c, `perf_counts_values__scale`, sets a count that ran less
+than it was enabled to `val * ena / run` and one that never ran (`run == 0`) to none;
+tools/perf/util/stat-display.c prints in the value's place `<not counted>` for a count that never
+ran and `<not supported>` for an event perf could not open (`print_counter_value_csv`), and the
+percentage as `100 * run / ena` (`print_running_csv`); builtin-stat.c writes `# started on` and the
+date first into an `-o` file.
+
+[26] What the kernel's generic events count (Linux master, read 2026-11-18). Intel
+(arch/x86/events/intel/core.c, `intel_perfmon_event_map`): cache-references 0x4f2e and
+cache-misses 0x412e, event 0x2E with umasks 0x4F and 0x41, which perf's Skylake events
+(tools/perf/pmu-events/arch/x86/skylake/cache.json) name LONGEST_LAT_CACHE.REFERENCE and .MISS:
+"Counts core-originated cacheable requests that miss the L3 cache (Longest Latency cache)." AMD
+(arch/x86/events/amd/core.c): every Zen generation's map (`amd_zen1_perfmon_event_map`, `zen2`,
+`zen4`) has cache-references 0xff60, cache-misses 0x0964 and branch-misses 0x00c3; its cache table
+from family 17h has L1-dcache-loads 0x0040 "Data Cache Accesses", L1-dcache-load-misses 0xc860
+"L2$ access from DC Miss", dTLB-load-misses 0xf045 "L2 DTLB misses (PT walks)", and the LLC's
+entries 0, an event the kernel does not count; event 0x64 umask 0x09 is
+`l2_cache_req_stat.ic_dc_miss_in_l2` (tools/perf/pmu-events/arch/x86/amdzen2/cache.json): "Core to
+L2 cacheable request access status (not including L2 Prefetch). Instruction cache request miss in
+L2 and Data cache request miss in L2 (all types)." Arm (drivers/perf/arm_pmuv3.c,
+`armv8_pmuv3_perf_map`): cache-references L1D_CACHE, cache-misses L1D_CACHE_REFILL, branch-misses
+BR_MIS_PRED; its cache map's L1D read access and miss are the same two, its dTLB read miss
+L1D_TLB_REFILL.
+
 ## Decisions
 
 **Operations: everything a client asks of an object, through both doors.** PUT whole and streamed
@@ -184,10 +216,12 @@ the engine is reported at 100M and 10M keys [18]. A listing page holds 1,000 key
 
 **Measures, per operation.** Allocations, reallocations, reallocations that moved, bytes asked;
 peak live heap per request and per connection; minor and major faults (Mach faults on macOS) [5];
-user and system CPU; instructions and cycles where the OS counts them; context switches; wire bytes
-and, on the native door, datagrams; and latency at p50, p99, p99.9, p99.99 and max from each
-request's intended start [2][6]. Per connection, the memory slope between two connection counts and
-the handshake's counts [8].
+user and system CPU; instructions and cycles where the OS counts them; under `perf stat`, the L1
+data cache's loads and misses, the generic cache references and misses, branch misses and data TLB
+misses, each as the CPU's kernel maps it [26], scaled where perf multiplexed them and the share of
+the phase counted said [25]; context switches; wire bytes and, on the native door, datagrams; and
+latency at p50, p99, p99.9, p99.99 and max from each request's intended start [2][6]. Per
+connection, the memory slope between two connection counts and the handshake's counts [8].
 
 **Instruments: the counting allocator in a diagnostic build only.** `mantle serve` and the harness
 built with `count-allocs` install hyper-measure's counting allocator; timed builds run on the

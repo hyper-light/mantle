@@ -695,8 +695,9 @@ enum BenchCommand {
         condition: String,
         #[command(flatten)]
         endpoint: Box<EndpointArgs>,
-        /// Count the servers' user-space instructions and cycles each phase with `perf stat`
-        /// (Linux), which must be on the PATH.
+        /// Count the servers' user-space instructions, cycles, L1 data-cache loads and misses,
+        /// cache references and misses, branch misses and data TLB misses each phase with `perf
+        /// stat` (Linux), which must be on the PATH.
         #[arg(long)]
         perf: bool,
         /// A run for CI: a few operations a phase, the small sizes, a set of twenty, two clients

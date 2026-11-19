@@ -776,13 +776,18 @@ impl Host {
         );
     }
 
-    /// A native job whose fields were read for a driving shard (`Work::Handing`), taken out to be
-    /// handed there: its request and its exchange.
-    fn handing(&mut self) -> Option<(Box<Handover>, Option<ExchangeId>)> {
+    /// The first native job from slot `from` on whose fields were read for a driving shard
+    /// (`Work::Handing`), taken out to be handed there: its request and its exchange. `from` is
+    /// left at its slot, where the job moved into it is looked at next, so a turn's handing passes
+    /// each job once, not every job again for each one handed.
+    fn handing(&mut self, from: &mut usize) -> Option<(Box<Handover>, Option<ExchangeId>)> {
         let at = self
             .jobs
+            .get(*from..)?
             .iter()
-            .position(|job| matches!(job.work, Work::Handing(_)))?;
+            .position(|job| matches!(job.work, Work::Handing(_)))?
+            .checked_add(*from)?;
+        *from = at;
         let job = self.remove(at)?;
         let (Door::Native(exchange, half), Work::Handing(handing)) = (job.door, job.work) else {
             return None;
@@ -3669,7 +3674,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.driving.is_empty() {
             return;
         }
-        while let Some((request, exchange)) = self.host.handing() {
+        // Each job passed once: one handed leaves its slot to the job moved into it, and one its
+        // lane refuses runs here as a job pushed last, not handed.
+        let mut from = 0;
+        while let Some((request, exchange)) = self.host.handing(&mut from) {
             let lanes = self
                 .driving
                 .iter()
@@ -13112,5 +13120,64 @@ pub(super) mod tests {
             assert_eq!(keys.heap.len(), listed.iter().flatten().count());
         }
         assert_eq!(most, 512, "the run reached its most jobs");
+    }
+
+    /// A turn's handing passes each job once (`Host::handing`, `Node::hand_off`): with 2,048 jobs,
+    /// every other one's fields read for a driving shard, each of those is taken out and the rest
+    /// stay, the jobs looked at at most the jobs and the ones handed, where a search of every job
+    /// from the first for each one handed looked at about an eighth of the jobs' square.
+    #[test]
+    fn a_turns_handing_passes_each_job_once() {
+        const JOBS: usize = 2048;
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let mut halves = Vec::new();
+        for job in 0..JOBS {
+            let op = Op::Get {
+                bucket: "b".into(),
+                key: format!("k{job}"),
+                headers: Headers::default(),
+                version: None,
+            };
+            let work = if job % 2 == 0 {
+                Work::Handing(Box::new((op, None)))
+            } else {
+                work(op, None)
+            };
+            let (job, half) = handed_job(work, 0, 0);
+            host.push(job, 0);
+            halves.push(half);
+        }
+        let (mut from, mut looked, mut searched, mut handed) = (0, 0, 0, 0);
+        loop {
+            let before = from;
+            let taken = host.handing(&mut from);
+            match taken {
+                Some(_) => {
+                    // This call looked at the jobs from `before` to the one taken; a search from
+                    // the first would have looked at every one up to it.
+                    looked += from - before + 1;
+                    searched += from + 1;
+                    handed += 1;
+                }
+                None => {
+                    looked += host.jobs.len() - before;
+                    searched += host.jobs.len();
+                    break;
+                }
+            }
+        }
+        println!(
+            "{handed} handed of {JOBS} jobs: {looked} looked at, {searched} by a search of each"
+        );
+        assert_eq!(handed, JOBS / 2);
+        assert_eq!(host.jobs.len(), JOBS / 2);
+        assert!(
+            host.jobs
+                .iter()
+                .all(|job| !matches!(job.work, Work::Handing(_)))
+        );
+        // Each job looked at once, and a job moved into a slot handed from looked at there again.
+        assert!(looked <= JOBS + handed, "{looked} looked at");
+        host.audit();
     }
 }

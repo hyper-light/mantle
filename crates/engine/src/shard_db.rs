@@ -5014,6 +5014,11 @@ impl<F: BlockFile> ShardDb<F> {
             .unwrap_or(0)
             .saturating_add(1)
             .saturating_add(pack.cuts.len());
+        #[cfg(test)]
+        let extents = self
+            .trunk
+            .pack_most
+            .map_or(extents, |most| extents.min(most));
         let asked = u64::try_from(extents).unwrap_or(u64::MAX);
         // The seat first: taking what the workers sent answers their asks for extents, which
         // take from the extents counted next.
@@ -5693,6 +5698,10 @@ mod tune_tests {
 #[cfg(test)]
 #[path = "shard_db/room_seats.rs"]
 mod room_seats;
+
+#[cfg(test)]
+#[path = "shard_db/worker_need.rs"]
+mod worker_need;
 
 #[cfg(test)]
 mod grant_tests {

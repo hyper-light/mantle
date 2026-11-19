@@ -667,6 +667,15 @@ pub struct Pool {
     prepared: bool,
     /// Handles adopted on the cold caller; runtime retirement sends no native owner.
     retirement: Option<hyper_rt::runtime::RetirementLease>,
+    /// A test's count of the workers' asks for extents, and of those the store's extents left
+    /// could not answer whole when they came.
+    #[cfg(test)]
+    pub(crate) asks: (u64, u64),
+    /// A test's store near its limit: while an ask for extents is answered, all but this many of
+    /// the store's free extents are held aside ([`Self::set_aside`]), so it is answered as a
+    /// store with that many left answers it.
+    #[cfg(test)]
+    pub(crate) ask_room: Option<u64>,
 }
 
 /// A borrowed wait's share of the pool's measured period, including a request that interrupts
@@ -725,6 +734,10 @@ impl Pool {
             close_error: None,
             prepared: false,
             retirement: None,
+            #[cfg(test)]
+            asks: (0, 0),
+            #[cfg(test)]
+            ask_room: None,
         })
     }
 
@@ -1374,6 +1387,12 @@ impl Pool {
     /// Takes one message from the workers, waiting for one when `wait`: an ask for extents is
     /// answered from `store`, a result kept for its owner. Whether one was taken.
     fn next<F: BlockFile>(&mut self, store: &mut Store<F>, wait: bool) -> Result<bool, Error> {
+        // In a store that does not grow, the asks that waited take the extents results taken
+        // since gave back, and, with no job out that may give more, what is left: a worker never
+        // waits for an answer while the shard waits for that worker.
+        if store.segments().is_none() {
+            self.answer_needs(store)?;
+        }
         let message = match self.messages.try_recv() {
             Ok(Some(m)) => m,
             Ok(None) if wait => {
@@ -1444,10 +1463,29 @@ impl Pool {
                 }
             }
             Message::Need { worker, n } => {
+                let asked = u64::try_from(n).unwrap_or(u64::MAX);
+                #[cfg(test)]
+                {
+                    self.asks.0 = self.asks.0.saturating_add(1);
+                    let aside = self.set_aside(store)?;
+                    if store.capacity() < asked {
+                        self.asks.1 = self.asks.1.saturating_add(1);
+                    }
+                    store.grant_back(&aside)?;
+                }
+                if !self.closing && store.segments().is_none() {
+                    // A store that does not grow answers from the extents it has left, which may
+                    // be fewer than the ask, a doubling of the job's grant, though the job needs
+                    // fewer: refused, the job failed and its shard with it. The ask waits instead,
+                    // one a worker, while a job out may give extents back, and the last one out
+                    // takes what is left ([`Self::answer_needs`]).
+                    self.needs.push_back((worker, n));
+                    self.answer_needs(store)?;
+                    return Ok(true);
+                }
                 // A file grown by segments may not have admitted the extents yet: the ask waits,
                 // one a worker, until growth does ([`Self::answer_needs`]).
-                let asked = u64::try_from(n).unwrap_or(u64::MAX);
-                if !self.closing && store.segments().is_some() && store.capacity() < asked {
+                if !self.closing && store.capacity() < asked {
                     if store.grows_in_place() {
                         // Where the shard may wait, its file grows by the ask here.
                         store.grow_now(asked)?;
@@ -1610,15 +1648,40 @@ impl Pool {
 
     /// Whether a job of `owner`'s is out, or back and not yet taken.
     /// Answers the asks for extents that waited, oldest first, while the store's admitted
-    /// extents give them: after the file grows, or extents are freed.
+    /// extents give them: after the file grows, or extents are freed. In a store that does not
+    /// grow, once no job out may give extents back, every one out waiting for its own ask, the
+    /// oldest ask takes what is left: with the job's own grant, all the room the shard would
+    /// have to run that job inline. With none left it is refused, the store's extents all held,
+    /// as the job run inline would find them.
     pub fn answer_needs<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        if self.needs.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let aside = self.set_aside(store)?;
+        let answered = self.answer_from(store);
+        #[cfg(test)]
+        store.grant_back(&aside)?;
+        answered
+    }
+
+    fn answer_from<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
         while let Some(&(worker, n)) = self.needs.front() {
             let asked = u64::try_from(n).unwrap_or(u64::MAX);
-            if store.capacity() < asked {
+            let left = store.capacity();
+            let give = if left >= asked {
+                n
+            } else if store.segments().is_none() && !self.giving_back() {
+                // None left: the ask whole, which the store refuses with its own typed error.
+                usize::try_from(left)
+                    .ok()
+                    .filter(|&left| left > 0)
+                    .unwrap_or(n)
+            } else {
                 return Ok(());
-            }
+            };
             self.needs.pop_front();
-            let more = store.grant(n);
+            let more = store.grant(give);
             let w = self
                 .workers
                 .get_mut(worker)
@@ -1645,6 +1708,27 @@ impl Pool {
             }
         }
         Ok(())
+    }
+
+    /// Whether a job out may give extents back: one whose worker is not itself waiting for the
+    /// answer to its ask. Its result, taken, gives back the grant it did not write.
+    fn giving_back(&self) -> bool {
+        self.workers.iter().enumerate().any(|(at, w)| {
+            w.as_ref().is_some_and(|w| w.owner.is_some())
+                && !self.needs.iter().any(|&(asker, _)| asker == at)
+        })
+    }
+
+    /// A test's store near its limit ([`Self::ask_room`]): the free extents past its room, held
+    /// aside until the ask is answered.
+    #[cfg(test)]
+    fn set_aside<F: BlockFile>(&self, store: &mut Store<F>) -> Result<Vec<u64>, Error> {
+        match self.ask_room {
+            Some(room) if store.capacity() > room => {
+                store.grant(usize::try_from(store.capacity().saturating_sub(room)).unwrap_or(0))
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// The extents the waiting asks want in all: what the shard's file grows by at least.

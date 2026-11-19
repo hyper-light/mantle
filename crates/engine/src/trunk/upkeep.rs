@@ -1535,6 +1535,8 @@ impl Trunk {
                     .saturating_add(1);
                 let parts = usize::try_from(parts).unwrap_or(usize::MAX);
                 let needed = extents.saturating_add(parts);
+                #[cfg(test)]
+                let needed = self.compact_most.map_or(needed, |most| needed.min(most));
                 let asked = u64::try_from(needed).unwrap_or(u64::MAX);
                 if store.segments().is_some() && store.capacity() < asked {
                     if store.grows_in_place() {

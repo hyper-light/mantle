@@ -1281,9 +1281,10 @@ pub const VOLUME_DESCRIPTORS: u64 = 2;
 /// and the log's file (`node::open_log`).
 pub const DIRECTORY_DESCRIPTORS: u64 = 3;
 
-/// What a file the node keeps by replacing it whole holds at once: the temporary written and the
-/// directory flushed after the rename (`files::write`); one at a time, from the node's task.
-pub const KEEPING_DESCRIPTORS: u64 = 2;
+/// What a file the node keeps by replacing it whole holds at once (`files::write`): the temporary,
+/// written, flushed and closed before the rename, then the directory, flushed after it; one
+/// descriptor at a time, one file at a time from the node's task.
+pub const KEEPING_DESCRIPTORS: u64 = 1;
 
 /// What a name lookup holds at once, one at a time (`crate::names`): a socket for each name server
 /// the resolver asks, at most `MAXNS`, 3 (resolv.conf(5)), and a file it reads (`/etc/hosts`,

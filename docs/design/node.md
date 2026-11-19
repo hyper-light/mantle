@@ -266,9 +266,9 @@ admission, never met by `EMFILE` at `accept`. A limit short of the fixed descrip
 operation refuses the start (`DeriveError::Descriptors`). `mantle node` runs the numbers it is told,
 and its start, before a socket opens, refuses operations whose descriptors with its fixed ones pass
 the limit, naming them (`derive::within_descriptors`).
-`mantle bench doors` counts its own clients' sockets, its cell's pipes and, under `--relay` and
-`--perf`, theirs, against the same limit before it starts, and refuses past it, naming both
-(`bench_doors::descriptors_fit`).
+`mantle bench doors` counts its own clients' sockets, its cell's pipes, the file it reads or
+writes at a time and, under `--relay` and `--perf`, theirs, against the same limit before it starts,
+and refuses past it, naming both (`bench_doors::descriptors_fit`).
 
 A configuration key the node does not know is refused, as the S3 layer's readers refuse what
 they do not know. Every derived value is said with the input or constraint that bound it (audit

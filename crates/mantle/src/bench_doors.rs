@@ -239,6 +239,12 @@ fn doing(what: &'static str) -> impl Fn(std::io::Error) -> Error {
 /// (`transfer::cell`'s founders, `mantle serve` each; [`Perf`]).
 const CHILD_PIPES: u64 = 2;
 
+/// The files the harness holds at once beside its clients, one at a time from its one thread: a
+/// native client's identity, which `mantle init client` writes a file at a time as the client opens
+/// (`files::write`: the temporary, closed before the rename, then its directory), and what it reads
+/// between steps (a server's usage, its own threads and faults), each read whole and closed.
+const FILE_AT_ONCE: u64 = 1;
+
 /// The sockets one of the relay's links holds: its front, which the client sends to, and its back,
 /// which sends on to the node (`relay::links_on`).
 const LINK_SOCKETS: u64 = 2;
@@ -246,7 +252,7 @@ const LINK_SOCKETS: u64 = 2;
 /// The descriptors the harness holds at its most with `clients` logical clients through each door,
 /// on its own cell (`cell`) or an endpoint's, under `--perf` and `--relay`, refused past `limit`,
 /// the process's (`mantle_node::descriptors`): standard input, output and error; its runtime's
-/// shard; each founder's pipes; a native client's sockets for each client through the native door
+/// shard; a file at a time ([`FILE_AT_ONCE`]); each founder's pipes; a native client's sockets for each client through the native door
 /// (`mantle_client::sockets`), which no node admits more of than its descriptors hold
 /// (`mantle_node::derive`), and an HTTP client's connection for each through the HTTP door and each
 /// of the slope's beside them, which a node past its connections answers `503 SlowDown`; perf's
@@ -273,6 +279,7 @@ fn descriptors_fit(
         .ok_or_else(over)?;
     let mut need = mantle_node::derive::STDIO_DESCRIPTORS
         .checked_add(shard)
+        .and_then(|n| n.checked_add(FILE_AT_ONCE))
         .and_then(|n| n.checked_add(held.checked_mul(native)?))
         .and_then(|n| n.checked_add(http))
         .ok_or_else(over)?;

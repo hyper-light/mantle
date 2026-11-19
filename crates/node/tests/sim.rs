@@ -531,6 +531,86 @@ fn batch_answered(answered: &[Answer]) -> bool {
             .all(|a| matches!(a, Answer::Name(name::Outcome::Put { .. })))
 }
 
+/// An entry at the range's bound on an entry, and each within an entry's fixed bytes of it, is
+/// sent, committed on every node and answered: the bound the nodes state on a Raft frame holds the
+/// largest append the core sends, one entry of the range's largest with its fixed bytes, alone
+/// (`mantle_range::largest_message`). The bound once held a page of entries or an entry's own
+/// bytes and not its fixed bytes (`ENTRY_FIXED_BYTES`, 25): with the simulated range's page and
+/// entry both 1 KiB, an entry of 1,000 to 1,024 bytes went alone in an append whose frame took
+/// 1,149 to 1,173 bytes, past the bound of 1,148. The transport refused it before it left
+/// (`Refusal::FrameBound`), the node dropped it as the network drops a message, and the leader
+/// sent it again and again, the range's commit frozen before it for good. A node packs the commands
+/// waiting into one entry while they fit the range's bound (`ask::Asking::another_entry`), so a
+/// burst makes such entries, as one command of the range's largest does.
+#[test]
+fn an_entry_at_the_ranges_bound_is_sent_and_commits_on_every_node() {
+    for seed in seeds(&[1, 2, 7]) {
+        let mut cell = Sim::new(seed);
+        cell.leader();
+        cell.open_bucket();
+        let order: Vec<u64> = (1..=cell.nodes).collect();
+        let asking = cell.asking(CLIENT, &order);
+        let (registered, _) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 1));
+        let session = match registered.as_deref() {
+            Ok([Answer::Registered { session }]) => *session,
+            other => panic!("seed {seed}: the registration answered {other:?}"),
+        };
+        let largest = usize::try_from(SETTINGS.max_entry_bytes).unwrap();
+        let within = largest - hyper_raft::wire::ENTRY_FIXED_BYTES;
+        for (serial, bytes) in (1..).zip(within..=largest) {
+            asking
+                .try_send((GROUP, sized(session, serial, bytes)))
+                .map_err(|_| "the client's asks are full")
+                .unwrap();
+            let (answered, _) = cell.until("the entry's answer", |c| {
+                for (id, member) in &c.members {
+                    if let Some((hyper_transport::Refusal::FrameBound, frame, kind)) =
+                        member.status.and_then(|s| s.sends.refused)
+                    {
+                        panic!(
+                            "seed {seed}: node {id} refused a frame of {frame} bytes ({kind:?}) \
+                             for its class's bound, the entry {bytes} bytes; commits {:?}",
+                            c.members
+                                .iter()
+                                .map(|(id, m)| (*id, m.status.map(|s| s.commit)))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+                c.asked.take()
+            });
+            assert!(
+                matches!(
+                    answered.as_deref(),
+                    Ok([Answer::Name(name::Outcome::Put { .. })])
+                ),
+                "seed {seed}: the entry of {bytes} bytes answered {answered:?}"
+            );
+        }
+        // Every node applies as far as the leader that answered the last.
+        cell.converged();
+    }
+}
+
+/// An entry of one put whose encoding is `bytes` long, its key padded to make it so: its session's
+/// serial `serial`, every answer before it read.
+fn sized(session: u64, serial: u64, bytes: usize) -> Entry {
+    let entry = |key: &str| Entry {
+        at_ns: 0,
+        commands: vec![Sessioned {
+            session,
+            serial,
+            unanswered: serial,
+            command: put(key, "e", u128::from(serial)),
+        }],
+    };
+    let tag = format!("{serial}.");
+    let short = entry(&tag).encode().unwrap().len();
+    let sized = entry(&format!("{tag}{}", "k".repeat(bytes - short)));
+    assert_eq!(sized.encode().unwrap().len(), bytes);
+    sized
+}
+
 /// A batch is answered only after the flushes it needs (CLAUDE.md §6): the group commit of
 /// research/71 step 9 and research/87 §1, an entry carrying every command that waited, answers
 /// none of them before its own write is durable on a quorum, and on the leader that answers. A

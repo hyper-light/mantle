@@ -29,8 +29,8 @@ pub use hyper_raft::proto::{
 };
 pub use machine::{Applied, Failure, RangeMachine};
 pub use replica::{
-    Output, Range, Replica, Settings, Shell, claim, limits, open_shell, propose_encoded,
-    propose_entry, ready_bytes, ready_held, refused, remove,
+    Output, Range, Replica, Settings, Shell, claim, largest_message, limits, open_shell,
+    propose_encoded, propose_entry, ready_bytes, ready_held, refused, remove,
 };
 pub use stored::{Stored, holds_rows};
 

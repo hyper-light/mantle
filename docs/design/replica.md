@@ -340,7 +340,12 @@ for each.
 chosen apart from them:
 - **Largest message.** It is an append. The core takes entries while their encoding fits
   `max_size_per_msg` and always at least one, so an append carries that or one entry of
-  `max_entry_bytes` with its fixed bytes. A range's entries carry no context.
+  `max_entry_bytes` with its fixed bytes. A range's entries carry no context. The node's bound
+  on a Raft frame is this message in its frame (`largest_message`), the one statement of it:
+  the node once stated the larger of the page and an entry's own bytes, 25 bytes short of an
+  append of the largest entry alone, so the transport refused such an append before it left, the
+  leader sent it again for good, and the range's commit froze before it (the simulation's
+  `an_entry_at_the_ranges_bound_is_sent_and_commits_on_every_node`).
 - **Members.** A configuration names at most the boot configuration's members and the one learner
   a replacement adds, the only change a range's membership makes (§6).
 - **Queue memory.** Each queue holds one write's worth: the bytes above, counted as the most

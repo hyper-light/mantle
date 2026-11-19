@@ -119,9 +119,8 @@ pub fn endpoint_under(
 /// What a node of a cell of three states of its transport, with one peer and `transport_bytes`.
 pub fn stated(transport_bytes: u64) -> Stated {
     let (settings, _) = derive::cell(3).unwrap();
-    let largest = settings.max_size_per_msg.max(settings.max_entry_bytes)
-        + hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES as u64
-        + mantle_node::frame::HEADER_BYTES as u64;
+    let largest =
+        mantle_range::largest_message(&settings).unwrap() + mantle_node::frame::HEADER_BYTES as u64;
     Stated {
         peers: 1,
         replicas: 1,

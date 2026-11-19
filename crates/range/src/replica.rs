@@ -135,12 +135,28 @@ pub fn ready_bytes(settings: &Settings) -> Option<u64> {
         .and_then(|b| b.checked_add(settings.max_entry_bytes))
 }
 
+/// The bytes of the largest message a member of a range under `settings` sends, its record as the
+/// wire writes it: an append. The core takes entries while their encoding fits `max_size_per_msg`,
+/// and one at least, so an append carries either that or one entry of the range's largest with its
+/// fixed bytes (`ENTRY_FIXED_BYTES`; a range's entries carry no context), alone, inside the
+/// record's fixed bytes (`MESSAGE_RECORD_FIXED_BYTES`). The core is told this ([`limits`]) and the
+/// node's transport carries a frame of it (`mantle_node::node::message_bounds`), one statement, so
+/// the transport never refuses an append the core makes. None past what a `u64` counts.
+pub fn largest_message(settings: &Settings) -> Option<u64> {
+    let fixed = |bytes: usize| u64::try_from(bytes).ok();
+    let alone = settings
+        .max_entry_bytes
+        .checked_add(fixed(ENTRY_FIXED_BYTES)?)?;
+    settings
+        .max_size_per_msg
+        .max(alone)
+        .checked_add(fixed(MESSAGE_RECORD_FIXED_BYTES)?)
+}
+
 /// What the range states of its members to the core (`hyper_raft::Limits::derive`), each from the
 /// range's own settings, so that no bound is chosen apart from them:
-/// - the largest message is an append. The core takes entries while their encoding fits
-///   `max_size_per_msg`, and one at least, so it carries either that or one entry of the range's
-///   largest with its fixed bytes (a range's entries carry no context), inside the record's
-///   fixed bytes;
+/// - the largest message is an append ([`largest_message`]): a page of entries, or one entry of
+///   the range's largest with its fixed bytes, inside the record's fixed bytes;
 /// - the most members a configuration names are the cell's bound on nodes where its members come
 ///   and go ([`Range::members`]), else the boot configuration's and the one learner a replacement
 ///   adds, the only change such a range's membership makes ([`Replacement`]);
@@ -152,14 +168,8 @@ pub fn ready_bytes(settings: &Settings) -> Option<u64> {
 pub fn limits(range: &Range) -> Result<Limits, ReplicaError> {
     let s = &range.settings;
     let unfit = || ReplicaError::Config("the range's settings exceed what this machine addresses");
-    let entry = usize::try_from(s.max_entry_bytes)
-        .ok()
-        .and_then(|bytes| bytes.checked_add(ENTRY_FIXED_BYTES))
-        .ok_or_else(unfit)?;
-    let page = usize::try_from(s.max_size_per_msg).map_err(|_| unfit())?;
-    let message = page
-        .max(entry)
-        .checked_add(MESSAGE_RECORD_FIXED_BYTES)
+    let message = largest_message(s)
+        .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(unfit)?;
     let members = range
         .boot

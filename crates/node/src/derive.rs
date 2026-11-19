@@ -4431,6 +4431,35 @@ mod tests {
         assert_eq!(rules.max_key_bytes, key::largest_bytes());
     }
 
+    /// The bound every node of a cell states on a Raft frame holds the largest append a range's
+    /// core sends at the cell's settings: one entry of the range's largest, alone, past its page,
+    /// with its fixed bytes, as the wire writes it in a node's frame. Stated as the larger of the
+    /// page and an entry's own bytes, the bound fell the entry's fixed bytes short of that frame,
+    /// so an entry within them of the largest was refused by the transport for good.
+    #[test]
+    fn the_raft_frame_bound_holds_an_append_of_the_largest_entry_alone() {
+        let (settings, _) = cell(3).unwrap();
+        let bound = messages().unwrap().replication;
+        let largest = Message {
+            msg_type: hyper_raft::proto::MessageType::MsgAppend,
+            classic: Some(u64::MAX),
+            entries: vec![Entry {
+                data: vec![0; usize::try_from(settings.max_entry_bytes).unwrap()],
+                ..Entry::default()
+            }],
+            ..Message::default()
+        };
+        let frame = u64::try_from(crate::frame::encoded_len(&largest)).unwrap();
+        eprintln!(
+            "largest entry {} bytes, page {} bytes, its append's frame {frame} bytes, bound {bound}",
+            settings.max_entry_bytes, settings.max_size_per_msg
+        );
+        assert!(
+            frame <= bound,
+            "the append of the largest entry, a frame of {frame} bytes, past the bound {bound}"
+        );
+    }
+
     /// The engine derived holds a row at the range's bounds, and a page one write unit smaller
     /// or a memtable a byte smaller does not; its extents are the share's, and a share of fewer
     /// than two is refused.
@@ -5095,16 +5124,18 @@ mod tests {
     /// holds its lanes' unsent bytes by rank since hyper-transport kept them as sums
     /// (`lane::Unsent`, vendor/UPSTREAM.md): 1,248 bytes more over the connections it counts.
     /// The issuer's 32 pool workers each hold the 128 KiB they are spawned with, not Rust's 2 MiB
-    /// (hyper-block `WORKER_STACK`): 62,914,560 bytes less. Linux's differs in two classes. Its
+    /// (hyper-block `WORKER_STACK`): 62,914,560 bytes less. A Raft frame's bound holds an append of
+    /// the range's largest entry alone (`mantle_range::largest_message`): 2,575 bytes more, 25 for
+    /// each of the 103 Raft frames its transport holds room for. Linux's differs in two classes. Its
     /// threads: the kernel holds the device's 32 transfers on the issuer's one thread, where a
     /// pool's worker carries each elsewhere (`Issuer::device_threads`), 32 workers' stacks fewer.
     /// Its transport: a receive takes a train from each of the node's three peers and the ten
     /// operations' clients it serves at once ([`runs`]), 1,605,344 bytes more: the buffers of the
     /// 12 trains past the first, 131,072 bytes each, and every train's messages' headers.
     const NEED_96_GIB: u64 = if cfg!(target_os = "linux") {
-        13_714_100_270 - 32 * STACK + 1_605_344
+        13_714_102_845 - 32 * STACK + 1_605_344
     } else {
-        13_714_100_270 - 32 * (STACK - WORKER)
+        13_714_102_845 - 32 * (STACK - WORKER)
     };
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
@@ -6277,8 +6308,8 @@ mod tests {
     /// calibration measure with every want whole, holds the issuer's threads at 256 deep, and their
     /// stacks decide where it stands (`Issuer::device_threads`): where a pool's worker carries each
     /// transfer (macOS, Windows) its 256 workers' stacks took it past the machine while each
-    /// counted Rust's 2 MiB, 7,762,424,130 bytes, and no memory it stated started it there. Each
-    /// is spawned with 128 KiB (hyper-block `WORKER_STACK`), and its need is 7,259,107,650 bytes,
+    /// counted Rust's 2 MiB, 7,762,434,330 bytes, and no memory it stated started it there. Each
+    /// is spawned with 128 KiB (hyper-block `WORKER_STACK`), and its need is 7,259,117,850 bytes,
     /// within the machine as where the kernel holds the transfers on the issuer's one thread
     /// (Linux), 7,227,826,162 bytes (c1589e30): a node given it starts on every platform.
     #[test]
@@ -6325,8 +6356,8 @@ mod tests {
         assert_eq!(workers, if cfg!(target_os = "linux") { 0 } else { 256 });
         assert!(need <= memory, "{need}");
         if workers > 0 {
-            assert_eq!(need, 7_259_107_650);
-            assert_eq!(need + workers * (STACK - WORKER), 7_762_424_130);
+            assert_eq!(need, 7_259_117_850);
+            assert_eq!(need + workers * (STACK - WORKER), 7_762_434_330);
         }
         let given = allowance(Some(need), &machine(memory, None));
         assert_eq!(given.ok(), Some(need));
@@ -6399,8 +6430,8 @@ mod tests {
     /// where a pool's worker carries each transfer (macOS, Windows): 7,518,023,644 bytes at 113,
     /// 7,863,584,860 at 256, refused at their threads, as their ranges, log and transport grow with
     /// their transfers and the issuer's workers' stacks with the depth, each Rust's 2 MiB then.
-    /// Spawned with 128 KiB (hyper-block `WORKER_STACK`), two volumes at 256 hold 7,366,581,059
-    /// bytes, where 2 MiB a worker would hold 7,869,897,539 now, and start at the depth measured on
+    /// Spawned with 128 KiB (hyper-block `WORKER_STACK`), two volumes at 256 hold 7,366,591,259
+    /// bytes, where 2 MiB a worker would hold 7,869,907,739 now, and start at the depth measured on
     /// every platform.
     #[test]
     fn a_repair_founder_on_cis_macos_runner_starts_at_the_lanes_its_ranges_open() {
@@ -6523,8 +6554,8 @@ mod tests {
         assert_eq!(said_bytes(&deepest, "volume.1.depth_taken"), 256);
         if cfg!(not(target_os = "linux")) {
             let at = floor_at_one(founder(2), &runner(2, 256));
-            assert_eq!(at, 7_366_581_059);
-            assert_eq!(at + 256 * (STACK - WORKER), 7_869_897_539);
+            assert_eq!(at, 7_366_591_259);
+            assert_eq!(at + 256 * (STACK - WORKER), 7_869_907_739);
         }
         // Spread over the shards, the same founder's ranges take a lane from each peer for each
         // shard past the first, and two lanes to the node's shard from each.
@@ -7393,9 +7424,12 @@ mod tests {
     /// transport 974,293,070, where a founder's are 4,102,904,425, 2,177,077,666 and 562,407,499.
     /// Each node counted once ([`nodes_named`]), by derive and by the node as it opens its
     /// transport (`NodeSettings::stated`), it derives its founders' settings, rules and transport,
-    /// and its floor is theirs, 7,257,843,011 bytes at one operation, 258,349,757 within the
+    /// and its floor is theirs, 7,257,853,211 bytes at one operation, 258,339,557 within the
     /// machine: it starts. Its issuer's 16 workers each count the 128 KiB they are spawned with
-    /// (hyper-block `WORKER_STACK`), where at Rust's 2 MiB its floor was 7,289,300,291 bytes.
+    /// (hyper-block `WORKER_STACK`), where at Rust's 2 MiB its floor was 7,289,310,491 bytes; a
+    /// Raft frame's bound holds an append of the range's largest entry alone
+    /// (`mantle_range::largest_message`), 25 bytes more for each of the 408 Raft frames its
+    /// transport holds room for.
     #[test]
     fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
         let founder = repair_founder;
@@ -7435,7 +7469,7 @@ mod tests {
         // train past the first a receive takes, its eight peers' and its operation's client's
         // ([`runs`]).
         assert!(
-            runs(7_255_000_000..7_260_000_000, 7_257_843_011..7_257_843_012).contains(&founded),
+            runs(7_255_000_000..7_260_000_000, 7_257_853_211..7_257_853_212).contains(&founded),
             "{founded}"
         );
         // It starts on the runner, every class of its floor its founders'.
@@ -7507,11 +7541,13 @@ mod tests {
     /// bytes; its two volumes take 448 more transfers at once, whose exchanges the transport holds,
     /// 34,843,648, and whose reads the ranges hold, 37,273,600; and three shards' rings 372 entries
     /// longer, 71,424. Its floor grows 453,024 bytes a transfer, where it grew 2,419,104, and at 240
-    /// is 7,359,391,811 bytes at one operation, 156,800,957 within the machine: it takes the 240
+    /// is 7,359,402,011 bytes at one operation, 156,790,757 within the machine: it takes the 240
     /// measured and starts, its issuer's workers, its volumes' reads and transfers and the
     /// transport's room for them all at that depth. Where the kernel holds the transfers on the
     /// issuer's one thread (Linux), its threads are 16 stacks at any depth, and it takes the 240
-    /// measured too.
+    /// measured too. A Raft frame's bound holds an append of the range's largest entry alone
+    /// (`mantle_range::largest_message`): 25 bytes more for each of the 408 Raft frames its
+    /// transport holds room for, 10,200 in all.
     #[test]
     fn a_repair_founder_measured_deep_on_cis_macos_runner_takes_the_deepest_its_allowance_holds() {
         let measured = repair_runner(240, 436);
@@ -7546,10 +7582,10 @@ mod tests {
                 "{at_measured}"
             );
         } else {
-            assert_eq!(at_measured, 7_359_391_811);
-            assert_eq!((7u64 << 30) - at_measured, 156_800_957);
-            // Its workers at Rust's 2 MiB: CI's refusal, exactly.
-            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_251_011);
+            assert_eq!(at_measured, 7_359_402_011);
+            assert_eq!((7u64 << 30) - at_measured, 156_790_757);
+            // Its workers at Rust's 2 MiB: CI's refusal and the frames' 10,200 bytes, exactly.
+            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_261_211);
         }
         // Every term that holds the depth holds the one taken: the issuer's workers among the
         // threads, each volume's reads and transfers, and the transport's room for them.

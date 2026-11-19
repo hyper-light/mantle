@@ -14,8 +14,8 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{Poll, Waker};
 
 use hyper_block::block::BlockFile;
@@ -71,11 +71,22 @@ struct Request {
     found: bool,
     stats: Option<RangeStats>,
     result: Result<(), Error>,
-    /// Where the answer goes. The range sends it back inside the answer, so the client's
-    /// channel closes when a range drops a request unanswered.
-    reply: Option<Sender<Box<Request>>>,
+    /// Where the answer goes.
+    reply: Option<Reply>,
     /// Admission travels with the request, including after its client drops while waiting.
     _lease: Option<Arc<ClientLease>>,
+}
+
+/// Where a request's answer goes: its client's mailbox, which the request reaches without holding
+/// it, and the bell the client waits on, whose one sender the request carries. A range puts the
+/// answered request in the mailbox, then rings the bell ([`Range::reply`]); a range that drops a
+/// request unanswered drops the bell's sender with it, and the client's wait ends closed. The
+/// mailbox's sender is the client's alone, so no request holds a channel that holds requests, and
+/// a request dropped drops no other request (CLAUDE.md §10).
+#[derive(Debug)]
+struct Reply {
+    mailbox: Weak<Sender<Box<Request>>>,
+    bell: Sender<()>,
 }
 
 #[derive(Debug)]
@@ -719,11 +730,17 @@ impl Range {
         Started::Replied
     }
 
-    fn reply(mut request: Box<Request>) {
-        if let Some(reply) = request.reply.take() {
-            request.reply = Some(reply.clone());
-            // A client gone has nobody to tell.
-            drop(reply.try_send(request));
+    fn reply(request: Box<Request>) {
+        let Some(reply) = request.reply.as_ref() else {
+            return;
+        };
+        // The bell is rung once the request is in the mailbox, its own sender in the request by
+        // then. A client gone has nobody to tell.
+        let (mailbox, bell) = (reply.mailbox.upgrade(), reply.bell.clone());
+        if let Some(mailbox) = mailbox
+            && mailbox.try_send(request).is_ok()
+        {
+            drop(bell.try_send(()));
         }
     }
 
@@ -1125,9 +1142,9 @@ impl Ranges {
                 limit: u64::try_from(self.clients).unwrap_or(u64::MAX),
             });
         }
-        let (reply, answers) = match channel(1) {
-            Ok(pair) => pair,
-            Err(_) => {
+        let (mailbox, answers, bell, rung) = match (channel(1), channel(1)) {
+            (Ok((mailbox, answers)), Ok((bell, rung))) => (mailbox, answers, bell, rung),
+            _ => {
                 self.live.fetch_sub(1, Ordering::AcqRel);
                 return Err(Error::LimitExceeded {
                     what: "a client's answer channel",
@@ -1135,6 +1152,7 @@ impl Ranges {
                 });
             }
         };
+        let mailbox = Arc::new(mailbox);
         let lease = Arc::new(ClientLease(Arc::clone(&self.live)));
         Ok(Client {
             ranges: self,
@@ -1142,11 +1160,16 @@ impl Ranges {
             // range's channel as a pointer, not as the 808 bytes of their buffers' headers and
             // counters (measured: moving them by value was a fifth of a get's time).
             request: Some(Box::new(Request {
-                reply: Some(reply),
+                reply: Some(Reply {
+                    mailbox: Arc::downgrade(&mailbox),
+                    bell,
+                }),
                 _lease: Some(Arc::clone(&lease)),
                 ..Request::new()
             })),
+            rung,
             answers,
+            _mailbox: mailbox,
             barrier: None,
             turn: Turn::default(),
             inlined: 0,
@@ -1201,7 +1224,12 @@ pub struct Client<'a> {
     /// The request and its buffers while none is out; none while a range owns it, or after
     /// that range dropped it unanswered. Canceling a borrowed async wait keeps it outstanding.
     request: Option<Box<Request>>,
+    /// The bell its answers ring, closed when a range dropped its request unanswered, and the
+    /// mailbox they arrive in ([`Reply`]).
+    rung: ChannelReceiver<()>,
     answers: ChannelReceiver<Box<Request>>,
+    /// The mailbox's one sender, which a range reaches through the request's weak reference.
+    _mailbox: Arc<Sender<Box<Request>>>,
     barrier: Option<Barrier>,
     /// Its turn on its shard for operations made inline ([`Self::turn`]), and those it made.
     turn: Turn,
@@ -1281,13 +1309,19 @@ impl Client<'_> {
         let t = std::time::Instant::now();
         let window = u128::from(self.ranges.spin_ns);
         while t.elapsed().as_nanos() < window {
-            match self.answers.try_recv() {
-                Ok(Some(answer)) => return Some(answer),
+            match self.rung.try_recv() {
+                Ok(Some(())) => return self.collect(),
                 Ok(None) => std::hint::spin_loop(),
                 Err(_) => return None,
             }
         }
-        self.answers.blocking_recv().ok()
+        self.rung.blocking_recv().ok()?;
+        self.collect()
+    }
+
+    /// The answer a rung bell says is in the mailbox, put there before the bell was rung.
+    fn collect(&mut self) -> Option<Box<Request>> {
+        self.answers.try_recv().ok().flatten()
     }
 
     /// Publishes one request; refusal returns its buffers and admission to the client.
@@ -1365,8 +1399,8 @@ impl Client<'_> {
     /// Context is checked before every receive poll, including a queued answer. A refusal
     /// leaves ownership and barrier progress intact; it is distinct from a received error.
     async fn answer_async(&mut self) -> Result<Result<(), Error>, SyncError<()>> {
-        let answer = {
-            let mut recv = std::pin::pin!(self.answers.recv());
+        {
+            let mut recv = std::pin::pin!(self.rung.recv());
             std::future::poll_fn(|cx| {
                 if client_task(cx.waker()) {
                     recv.as_mut().poll(cx)
@@ -1374,8 +1408,9 @@ impl Client<'_> {
                     Poll::Ready(Err(SyncError::NotOnShardThread(())))
                 }
             })
-            .await?
-        };
+            .await?;
+        }
+        let answer = self.collect().ok_or(SyncError::Closed(()))?;
         Ok(self.accept(answer).map(drop))
     }
 
@@ -1841,5 +1876,79 @@ impl Client<'_> {
             }
         }
         Ok(all)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client's answer route as [`Ranges::client`] makes it.
+    struct Route {
+        request: Box<Request>,
+        rung: ChannelReceiver<()>,
+        answers: ChannelReceiver<Box<Request>>,
+        mailbox: Arc<Sender<Box<Request>>>,
+        /// The admission count the request's lease holds.
+        live: Arc<AtomicUsize>,
+    }
+
+    fn route() -> Route {
+        let (mailbox, answers) = channel(1).unwrap();
+        let (bell, rung) = channel(1).unwrap();
+        let mailbox = Arc::new(mailbox);
+        let live = Arc::new(AtomicUsize::new(1));
+        let request = Box::new(Request {
+            reply: Some(Reply {
+                mailbox: Arc::downgrade(&mailbox),
+                bell,
+            }),
+            _lease: Some(Arc::new(ClientLease(Arc::clone(&live)))),
+            ..Request::new()
+        });
+        Route {
+            request,
+            rung,
+            answers,
+            mailbox,
+            live,
+        }
+    }
+
+    /// An answer is in the mailbox when its bell rings and comes back with its route, so the
+    /// next answer rings the same bell; a request dropped unanswered closes the bell, so the
+    /// client's wait ends closed; and a request answered to a client gone is dropped, its
+    /// admission released.
+    #[test]
+    fn an_answer_rings_its_bell_and_a_request_dropped_closes_it() {
+        let Route {
+            request,
+            mut rung,
+            mut answers,
+            mailbox: _mailbox,
+            live,
+        } = route();
+        Range::reply(request);
+        assert!(matches!(rung.try_recv(), Ok(Some(()))));
+        let request = answers.try_recv().unwrap().unwrap();
+        assert!(matches!(rung.try_recv(), Ok(None)));
+        Range::reply(request);
+        assert!(matches!(rung.try_recv(), Ok(Some(()))));
+        let request = answers.try_recv().unwrap().unwrap();
+        assert_eq!(live.load(Ordering::Acquire), 1);
+        drop(request);
+        assert!(matches!(rung.try_recv(), Err(SyncError::Closed(()))));
+        assert_eq!(live.load(Ordering::Acquire), 0);
+
+        let Route {
+            request,
+            rung,
+            answers,
+            mailbox,
+            live,
+        } = route();
+        drop((rung, answers, mailbox));
+        Range::reply(request);
+        assert_eq!(live.load(Ordering::Acquire), 0);
     }
 }

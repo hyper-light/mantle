@@ -1103,6 +1103,7 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/engine/src/memtable/hashed.rs` `sort_step:width` | derived | `1` | A group's first width, one run. |
 | `crates/engine/src/ranges.rs` `Client::turn:done` | derived | `1` | The turn's first item, done. |
 | `crates/engine/src/ranges.rs` `Ranges::client:channel(1)` | derived | `1` | A channel of one slot: one reply, wake or job, taken before the next is sent (a rendezvous). |
+| `crates/engine/src/ranges.rs` `Ranges::client:channel(1)#2` | derived | `1` | A channel of one slot: one reply, wake or job, taken before the next is sent (a rendezvous). |
 | `crates/engine/src/ranges.rs` `Ranges::client:limit` | derived | `1` | The one-slot reply channel's bound, said in its refusal. |
 | `crates/engine/src/ranges.rs` `Ranges::start_cold:channel(1)` | derived | `1` | A channel of one slot: one reply, wake or job, taken before the next is sent (a rendezvous). |
 | `crates/engine/src/ranges.rs` `Ranges::start_cold:limit` | derived | `1` | A range's single cold engine handoff, said in its refusal. |

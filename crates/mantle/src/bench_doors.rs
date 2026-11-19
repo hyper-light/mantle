@@ -195,22 +195,119 @@ fn coverage() -> Option<Level> {
 }
 
 #[derive(Debug)]
-pub struct Error(String);
+pub enum Error {
+    /// What failed, said with what was being done.
+    Failed(String),
+    /// The harness's clients and its cell need more descriptors at once than the process may hold
+    /// ([`descriptors_fit`]).
+    Descriptors {
+        clients: usize,
+        need: u64,
+        limit: u64,
+    },
+}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Failed(why) => f.write_str(why),
+            Self::Descriptors {
+                clients,
+                need,
+                limit,
+            } => write!(
+                f,
+                "{clients} clients and the cell's servers need {need} descriptors at once, past the \
+                 process's limit of {limit} (its soft RLIMIT_NOFILE raised to the hard): raise the \
+                 hard limit or run fewer clients"
+            ),
+        }
     }
 }
 
 fn failed(e: impl std::fmt::Display) -> Error {
-    Error(e.to_string())
+    Error::Failed(e.to_string())
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        failed(e)
+/// An I/O failure named by what was being done when it came: `doing("writing output")` makes
+/// "writing output: Too many open files (os error 24)" of the OS's error, never the bare error.
+fn doing(what: &'static str) -> impl Fn(std::io::Error) -> Error {
+    move |e| Error::Failed(format!("{what}: {e}"))
+}
+
+/// The pipes the harness holds to a process it starts and talks to: its standard input and output
+/// (`transfer::cell`'s founders, `mantle serve` each; [`Perf`]).
+const CHILD_PIPES: u64 = 2;
+
+/// The sockets one of the relay's links holds: its front, which the client sends to, and its back,
+/// which sends on to the node (`relay::links_on`).
+const LINK_SOCKETS: u64 = 2;
+
+/// The descriptors the harness holds at its most with `clients` logical clients through each door,
+/// on its own cell (`cell`) or an endpoint's, under `--perf` and `--relay`, refused past `limit`,
+/// the process's (`mantle_node::descriptors`): standard input, output and error; its runtime's
+/// shard; each founder's pipes; a native client's sockets for each client through the native door
+/// (`mantle_client::sockets`), which no node admits more of than its descriptors hold
+/// (`mantle_node::derive`), and an HTTP client's connection for each through the HTTP door and each
+/// of the slope's beside them, which a node past its connections answers `503 SlowDown`; perf's
+/// pipes; and the relay's shard and a link to each founder for each client the harness holds
+/// ([`run`]'s `most`).
+fn descriptors_fit(
+    clients: usize,
+    (cell, perf, relay): (bool, bool, bool),
+    limit: u64,
+) -> Result<u64, Error> {
+    let over = || failed("the harness's descriptors, past what this machine addresses");
+    let count = |n: usize| u64::try_from(n).map_err(|_| over());
+    let shard = mantle_node::derive::shard_descriptors();
+    let native = if cell {
+        count(mantle_client::sockets(cell::FOUNDERS).map_err(failed)?)?
+    } else {
+        0
+    };
+    let held = count(clients)?;
+    let slope = count(SLOPE_HIGH)?;
+    let http = held
+        .checked_add(slope)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(over)?;
+    let mut need = mantle_node::derive::STDIO_DESCRIPTORS
+        .checked_add(shard)
+        .and_then(|n| n.checked_add(held.checked_mul(native)?))
+        .and_then(|n| n.checked_add(http))
+        .ok_or_else(over)?;
+    if cell {
+        need = count(cell::FOUNDERS)?
+            .checked_mul(CHILD_PIPES)
+            .and_then(|pipes| need.checked_add(pipes))
+            .ok_or_else(over)?;
     }
+    if perf {
+        need = need.checked_add(CHILD_PIPES).ok_or_else(over)?;
+    }
+    if relay {
+        // A link set for each client the harness holds at most, `run`'s `most`: both doors' clients
+        // and the slope's.
+        let links = held
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(slope))
+            .and_then(|n| n.checked_add(1))
+            .and_then(|sets| sets.checked_mul(count(cell::FOUNDERS).ok()?))
+            .and_then(|links| links.checked_mul(LINK_SOCKETS))
+            .ok_or_else(over)?;
+        need = need
+            .checked_add(shard)
+            .and_then(|n| n.checked_add(links))
+            .ok_or_else(over)?;
+    }
+    if need > limit {
+        return Err(Error::Descriptors {
+            clients,
+            need,
+            limit,
+        });
+    }
+    Ok(need)
 }
 
 /// How requests arrive.
@@ -718,7 +815,8 @@ struct Signer {
 impl Signer {
     /// The key `mantle init` wrote, as AWS's shared credentials file states it.
     fn read(cell: &Path, region: String) -> Result<Self, Error> {
-        let text = std::fs::read_to_string(cell.join("s3").join("credentials"))?;
+        let text = std::fs::read_to_string(cell.join("s3").join("credentials"))
+            .map_err(doing("reading the cell's S3 credentials"))?;
         let value = |name: &str| {
             text.lines().find_map(|line| {
                 let (n, v) = line.split_once('=')?;
@@ -872,11 +970,10 @@ impl Http {
 
     async fn stream(&mut self) -> Result<&TcpStream, Error> {
         if self.stream.is_none() {
-            self.stream = Some(
-                TcpStream::connect(self.at)
-                    .await
-                    .map_err(|e| failed(format!("connecting: {e:?}")))?,
-            );
+            self.stream =
+                Some(TcpStream::connect(self.at).await.map_err(|e| {
+                    failed(format!("opening a client's socket to {}: {e:?}", self.at))
+                })?);
             self.opened = self.opened.saturating_add(1);
             self.held = 0;
         }
@@ -3219,7 +3316,7 @@ impl<'o> Bench<'o> {
             lane_columns(&before.counts, &after.counts),
             slow_columns(slow.as_deref(), ops),
             stall_column(stalled.as_deref()),
-        )?;
+        ).map_err(doing("writing output"))?;
         self.step_line(out, m)?;
         for e in slow.iter().flatten() {
             writeln!(
@@ -3237,7 +3334,7 @@ impl<'o> Bench<'o> {
                 e.longest_ns.map_or_else(|| "-".to_owned(), micros),
                 e.task,
                 e.host,
-            )?;
+            ).map_err(doing("writing output"))?;
         }
         for s in stalled.iter().flatten() {
             writeln!(
@@ -3250,7 +3347,8 @@ impl<'o> Bench<'o> {
                 s.server,
                 s.shard,
                 s.stalls,
-            )?;
+            )
+            .map_err(doing("writing output"))?;
         }
         for kind in Failure::ALL {
             let Some(why) = t.first.get(kind.at()).and_then(Option::as_ref) else {
@@ -3267,9 +3365,10 @@ impl<'o> Bench<'o> {
                 m.kind.name(),
                 m.size,
                 self.options.condition,
-            )?;
+            )
+            .map_err(doing("writing output"))?;
         }
-        out.flush()?;
+        out.flush().map_err(doing("writing output"))?;
         Ok(())
     }
 
@@ -3288,16 +3387,18 @@ impl<'o> Bench<'o> {
             m.clients,
             m.paused.0.checked_div(1_000_000).unwrap_or(0),
             m.paused.1.checked_div(1_000_000).unwrap_or(0),
-        )?;
+        )
+        .map_err(doing("writing output"))?;
         let Some(judged) = m.judged else {
-            writeln!(out)?;
+            writeln!(out).map_err(doing("writing output"))?;
             return Ok(());
         };
         write!(
             out,
             " rounds kept {} order {:?} lag1 {:.2}",
             judged.rounds, judged.order, judged.lag1,
-        )?;
+        )
+        .map_err(doing("writing output"))?;
         let mut states: Vec<&rounds::State> = judged.states.iter().collect();
         states.sort_by_key(|s| std::cmp::Reverse(s.rounds.len()));
         for state in states {
@@ -3312,9 +3413,10 @@ impl<'o> Bench<'o> {
                 state.median,
                 state.min,
                 state.max,
-            )?;
+            )
+            .map_err(doing("writing output"))?;
         }
-        writeln!(out)?;
+        writeln!(out).map_err(doing("writing output"))?;
         Ok(())
     }
 
@@ -3362,7 +3464,7 @@ impl<'o> Bench<'o> {
                         self.named(work.door),
                         work.kind.name(),
                         self.options.condition,
-                    )?;
+                    ).map_err(doing("writing output"))?;
                 }
                 break;
             }
@@ -3379,7 +3481,7 @@ impl<'o> Bench<'o> {
                 best.median,
                 best.low,
                 best.high,
-            )?;
+            ).map_err(doing("writing output"))?;
         }
         if finish && at < end {
             let clients = climb.best.map_or(1, |best| best.clients);
@@ -3505,7 +3607,8 @@ impl<'o> Bench<'o> {
                 self.named(door),
                 self.options.condition,
                 mantle_s3::body::MAX_UPLOAD
-            )?;
+            )
+            .map_err(doing("writing output"))?;
             return Ok(());
         }
         // A whole object's ETag is the MD5 of its bytes; a larger one's is not, and goes unchecked.
@@ -3679,7 +3782,9 @@ impl Opening {
         let began = now_ns();
         let conn = match self {
             Self::Native(settings) => {
-                let mut client = Client::open(settings).await.map_err(failed)?;
+                let mut client = Client::open(settings)
+                    .await
+                    .map_err(|e| failed(format!("opening a native client's sockets: {e}")))?;
                 let op = Op::Head {
                     bucket: BUCKET.to_owned(),
                     key: NEVER_PUT.to_owned(),
@@ -3784,10 +3889,18 @@ pub fn counts_line() -> String {
 /// Runs every phase of `options` against a cell of three made under its directory: whether every
 /// check was exact and each control was caught.
 pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
+    // Its clients and its cell fit the process's descriptors, or the run is refused before it
+    // starts, never ended by an `EMFILE` part way.
+    descriptors_fit(
+        options.clients,
+        (options.endpoint.is_none(), options.perf, options.relay),
+        mantle_node::descriptors::limit().map_err(failed)?,
+    )?;
     let messages = mantle_node::derive::messages().map_err(failed)?;
     mantle_protocol::classes::state_bounds(messages).map_err(failed)?;
-    std::fs::create_dir_all(options.dir.parent().unwrap_or(Path::new(".")))?;
-    std::fs::create_dir(&options.dir)?;
+    std::fs::create_dir_all(options.dir.parent().unwrap_or(Path::new(".")))
+        .map_err(doing("making the run's directory"))?;
+    std::fs::create_dir(&options.dir).map_err(doing("making the run's directory"))?;
     let counting = alloc::installed();
     writeln!(
         out,
@@ -3806,7 +3919,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         } else {
             "no (a count-allocs build counts allocations)"
         }
-    )?;
+    )
+    .map_err(doing("writing output"))?;
     let client_dir = options.dir.join("client");
     let (cell, listeners, signer) = match &options.endpoint {
         Some(endpoint) => {
@@ -3814,7 +3928,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
                 out,
                 "doors endpoint http@{} at {} bucket {} region {} pids {:?}",
                 endpoint.arm, endpoint.at, endpoint.bucket, endpoint.region, endpoint.pids
-            )?;
+            )
+            .map_err(doing("writing output"))?;
             let signer = Signer {
                 id: endpoint.id.clone(),
                 secret: endpoint.secret.clone(),
@@ -3850,7 +3965,8 @@ pub fn doors(out: &mut impl Write, options: &Options) -> Result<bool, Error> {
         let watching = &watch;
         let watching = std::thread::Builder::new()
             .name("doors-watch".to_owned())
-            .spawn_scoped(scope, move || watching.run(&ended))?;
+            .spawn_scoped(scope, move || watching.run(&ended))
+            .map_err(doing("starting the harness's watch"))?;
         let ran = run(
             out,
             options,
@@ -3891,7 +4007,7 @@ fn run(
     writeln!(
         out,
         "doors native clients at most {native_most}: each node admits gateway.clients identities at once"
-    )?;
+    ).map_err(doing("writing output"))?;
     // The relay condition: a link set for each client the harness holds at most, each direction
     // holding what one client's transport may have unacknowledged or unread.
     let relay = match (options.relay, &cell) {
@@ -3915,7 +4031,7 @@ fn run(
                 crate::relay::SENT,
                 crate::relay::LOST,
                 crate::relay::RUNS,
-            )?;
+            ).map_err(doing("writing output"))?;
             Some(relay)
         }
     };
@@ -3966,7 +4082,8 @@ fn run(
         out,
         "doors handshakes native {} http {}",
         bench.opened[0], bench.opened[1]
-    )?;
+    )
+    .map_err(doing("writing output"))?;
     // The relay's own count: what its chain lost, what passed a direction's bytes, and how late it
     // sent what it held, so its cost is not charged to the stack (research/70 [12]).
     if let Some(relay) = bench.relay.take() {
@@ -3980,7 +4097,8 @@ fn run(
             said.sent,
             said.late_ns.checked_div(said.sent).unwrap_or(0),
             said.latest_ns,
-        )?;
+        )
+        .map_err(doing("writing output"))?;
     }
     writeln!(
         out,
@@ -3991,13 +4109,14 @@ fn run(
             "-".to_owned()
         },
         bench.threads,
-    )?;
+    )
+    .map_err(doing("writing output"))?;
     let controls = u32::try_from(doors.len()).unwrap_or(0).saturating_mul(3);
     writeln!(
         out,
         "doors verified ops {} differed {} refused {} unanswered {} skipped {} failed {} controls caught {caught} of {controls}",
         bench.ops, bench.differed, bench.refused, bench.unanswered, bench.skipped, bench.failures
-    )?;
+    ).map_err(doing("writing output"))?;
     Ok(bench.exact && caught == controls)
 }
 
@@ -4034,7 +4153,9 @@ impl Bench<'_> {
         let made = self
             .rt
             .block_on(async move {
-                let mut client = Client::open(settings).await.map_err(failed)?;
+                let mut client = Client::open(settings)
+                    .await
+                    .map_err(|e| failed(format!("opening a native client's sockets: {e}")))?;
                 let op = Op::Create {
                     bucket: BUCKET.to_owned(),
                     id: mantle_client::identity().map_err(failed)?,
@@ -4129,7 +4250,8 @@ impl Bench<'_> {
         let [flipped, missing, etag] = match said {
             Ok(said) => said,
             Err(why) => {
-                writeln!(out, "doors control {} NOT run: {why}", self.named(door))?;
+                writeln!(out, "doors control {} NOT run: {why}", self.named(door))
+                    .map_err(doing("writing output"))?;
                 return Ok(0);
             }
         };
@@ -4159,13 +4281,15 @@ impl Bench<'_> {
                     out,
                     "doors control {} {name} failed: {why} (caught)",
                     self.named(door)
-                )?;
+                )
+                .map_err(doing("writing output"))?;
             } else {
                 writeln!(
                     out,
                     "doors control {} {name} NOT caught: {why}",
                     self.named(door)
-                )?;
+                )
+                .map_err(doing("writing output"))?;
             }
         }
         Ok(caught)
@@ -4196,7 +4320,8 @@ impl Bench<'_> {
                 "doors {} slope {}: the cell admits {high_count} connections, no second point",
                 self.named(door),
                 self.options.condition
-            )?;
+            )
+            .map_err(doing("writing output"))?;
             return Ok(());
         }
         let low = self.open(door, low_count)?;
@@ -4238,7 +4363,7 @@ impl Bench<'_> {
             per(live, added),
             per(footprint, added),
             per(mine(client_live as f64), added),
-        )?;
+        ).map_err(doing("writing output"))?;
         writeln!(
             out,
             "doors {} handshake {} handshakes {added} allocs/handshake {} bytes/handshake {} client_allocs/handshake {} client_bytes/handshake {} latency_us p50 {} max {}",
@@ -4250,7 +4375,7 @@ impl Bench<'_> {
             per(mine(client.bytes as f64), added),
             quantile(&took, Level::P50, 500_000),
             micros(took.max()),
-        )?;
+        ).map_err(doing("writing output"))?;
         let all = low
             .into_iter()
             .chain(more)
@@ -4323,10 +4448,12 @@ impl Perf {
             .stdin
             .as_mut()
             .ok_or_else(|| failed("perf's input"))?;
-        writeln!(control, "{command}")?;
-        control.flush()?;
+        writeln!(control, "{command}").map_err(doing("asking perf"))?;
+        control.flush().map_err(doing("asking perf"))?;
         let mut line = String::new();
-        self.ack.read_line(&mut line)?;
+        self.ack
+            .read_line(&mut line)
+            .map_err(doing("reading perf's answer"))?;
         if line.trim_matches(['\0', '\n']) == "ack" {
             Ok(())
         } else {
@@ -4340,9 +4467,12 @@ impl Perf {
         self.command("disable")?;
         Command::new("kill")
             .args(["-INT", &self.child.id().to_string()])
-            .status()?;
-        self.child.wait()?;
-        let text = std::fs::read_to_string(&self.out)?;
+            .status()
+            .map_err(doing("stopping perf"))?;
+        self.child
+            .wait()
+            .map_err(doing("waiting for perf to end"))?;
+        let text = std::fs::read_to_string(&self.out).map_err(doing("reading perf's counts"))?;
         // A CSV line: the count, its unit, the event, ...; `<not counted>` where none ran.
         let count = |event: &str| {
             text.lines().find_map(|line| {
@@ -4475,6 +4605,57 @@ async fn head_etag(conn: &mut Conn, key: &str) -> Result<Read, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The harness's clients and its cell fit the process's descriptors or the run is refused
+    /// before it starts, typed, naming the clients, what they need and the limit: 2,048 clients
+    /// past a soft limit of 1,024, as systemd gives a user's service, are refused; the need grows
+    /// with each client by a native client's sockets and an HTTP connection, and the relay and perf
+    /// add theirs.
+    #[test]
+    fn the_harness_refuses_clients_past_the_descriptor_limit() {
+        let need =
+            |clients, perf, relay| descriptors_fit(clients, (true, perf, relay), u64::MAX).unwrap();
+        let native = u64::try_from(mantle_client::sockets(cell::FOUNDERS).unwrap()).unwrap();
+        assert_eq!(need(2, false, false) - need(1, false, false), native + 1);
+        assert_eq!(need(1, true, false) - need(1, false, false), CHILD_PIPES);
+        let shard = mantle_node::derive::shard_descriptors();
+        // A client through each door, the slope's and one: `run`'s `most` at one client.
+        let sets = 2 + u64::try_from(SLOPE_HIGH).unwrap() + 1;
+        assert_eq!(
+            need(1, false, true) - need(1, false, false),
+            shard + sets * u64::try_from(cell::FOUNDERS).unwrap() * LINK_SOCKETS
+        );
+        let endpoint = descriptors_fit(1, (false, false, false), u64::MAX).unwrap();
+        assert!(
+            endpoint < need(1, false, false),
+            "an endpoint has no native door or cell"
+        );
+
+        match descriptors_fit(2_048, (true, false, false), 1_024) {
+            Err(Error::Descriptors {
+                clients,
+                need: needed,
+                limit,
+            }) => {
+                assert_eq!((clients, limit), (2_048, 1_024));
+                assert_eq!(needed, need(2_048, false, false));
+                let said = Error::Descriptors {
+                    clients,
+                    need: needed,
+                    limit,
+                }
+                .to_string();
+                assert!(
+                    said.contains("2048 clients") && said.contains("1024"),
+                    "{said}"
+                );
+            }
+            other => panic!("2,048 clients under 1,024 descriptors: {other:?}"),
+        }
+        let at = need(16, false, false);
+        assert_eq!(descriptors_fit(16, (true, false, false), at).unwrap(), at);
+        assert!(descriptors_fit(16, (true, false, false), at - 1).is_err());
+    }
 
     /// A seed and a name make the same bytes each time, and another name other bytes: what every
     /// read is checked against. The bytes are the ones AES-256-CTR makes under the key and counter

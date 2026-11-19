@@ -2427,6 +2427,8 @@ fn measure(stated: &Stated) -> Result<Measured, ProcessError> {
         page: facts.page.base,
         meta,
         volumes,
+        descriptors: crate::descriptors::limit()
+            .map_err(|e| ProcessError::Runtime(e.to_string()))?,
     })
 }
 

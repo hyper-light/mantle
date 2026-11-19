@@ -1,0 +1,14 @@
+# The commits bench-bisect measures, one a line (2026-11-19: the post-fill flush on Linux x86_64,
+# 4.2 s at e118c09d and 7.3 s at 29e42e9d in bench-targets run 44437096594).
+e118c09d070674eca6a9459dda320e5b46813271 the build docs/measurements/2026-11-06-targets.md measured
+3ba8047e28edd875161cee5d4b70ff59b5148fc3 first-parent 40
+6266d15d5690005703e49a7a97798e8917cd198e first-parent 61
+fcf527f98e980cd7e272c38c4481b6f384f87f3d first-parent 64, log-full merged
+e6bf50021c63148eb87dadf9a981f29083572900 first-parent 65, ci-health merged (b543fb0c)
+b95e5ff4f291654a5681aeef6be27d86e1595012 first-parent 66, shared-fds merged (2582d060)
+d9346f06c8815995c9b0d4ec46b1bb59cf1d4a3c first-parent 93
+7a3eca960a1516ac4478158c71f7dc75f23e0372 first-parent 123
+2d6c0d8edb217f7611a772fa60ed0a7f7a52ec81 first-parent 138
+825b8b9b5f7ac99b8bfc1d977139d44de2b4f82c first-parent 159
+7fa1bc284266706dac0dd80409594a2e70c9e3e8 first-parent 208
+29e42e9d55c8f85d431b23ac441474986e359261 the head bench-targets measured

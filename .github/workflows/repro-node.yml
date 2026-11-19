@@ -39,7 +39,9 @@ jobs:
             else
               failed=$((failed + 1))
               echo "run $i FAILED in $(($(date +%s) - start)) s: $(ls out/trace-$i | wc -l) trace files"
-              grep -E "panicked at|^the put|FAILED|Lost\(" "out/run-$i.txt" | head -20
+              # The step's bash runs with -e and pipefail: a grep that finds nothing, or a pipe's
+              # reader that ends first, would end the loop here, the runs left never run.
+              grep -m 20 -E "panicked at|^the put|FAILED|Lost\(" "out/run-$i.txt" || true
             fi
           done
           echo "failed $failed of 10"

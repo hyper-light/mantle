@@ -180,13 +180,29 @@ fn serving(make: fn(u64) -> Sim, seed: u64, ops: u64) -> alloc::Counts {
 /// every range. 756 allocations and 4,536 bytes fewer (17,557,473), reallocations 2,051 both: the
 /// floor's budget alone (a08f3f83) counts 35,075 on this Mac, and with b237dadd applied 34,319, as
 /// perf-10k's merge of the two (7a37446a) does. On Linux 34,370, this Mac's and the 51 its
-/// sockets' batched headers add, derived and not yet counted there.
+/// sockets' batched headers add, derived and not yet counted there. 34,346 since three of
+/// perf-10k's merges, 27 allocations more, each made once by an endpoint or a connection the
+/// clients' run opens or first uses, none a turn remakes; the first two at hyper-transport's sites,
+/// vendored and not changed here. 22 since 05c14470, hyper-transport's progress pass: a budget's
+/// spare buffers kept by class (`budget::Fixed`'s heads, made with each of the three clients'
+/// endpoints, and its slots and links, made as it keeps its first: 9 where its list of spares made
+/// 3), and a connection's visit lists one for each rank and two more (`tally::Table::revisit`: the
+/// 10 connections whose exchanges the run first visits each make their table of lists and a list
+/// for each slot visited, 26 where one list each made 10); reallocations 2 more, one budget's
+/// slots and links grown past four. 3 since 39ca69bd, hyper-transport's transmit side: each
+/// client's endpoint keeps its connections' deferred deadlines (`Endpoint`'s `wanted`), made at
+/// its first connection; reallocations 2 more, two endpoints' grown past four connections. 2 since
+/// 9ec351b7: the reads peers ask of a node are found by their own number and by the exchange each
+/// came on, a map each (`keyed::KeyedOn`), whose first tables are made at the first read a peer
+/// asks, which the clients' run is: the cell's warm-up asks none. Reallocations 2,055. On Linux
+/// 34,397, this Mac's and the 51, derived as before: CI run 44547229268's linux-aarch64 crates
+/// leg counted the chunked windows' run at 5fbd5059 51 above this Mac's.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_370
+        34_397
     } else {
-        34_319
+        34_346
     };
     let counts = serving(Sim::new, 1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");
@@ -204,12 +220,16 @@ fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
 /// counts 34,319, 2,051 and 17,557,473: 1,203 allocations and 1,393,763 bytes fewer, the
 /// datagrams the clients' run carries to the nodes cut from chunks, not copied. On Linux 33,167,
 /// this Mac's and the 51 its sockets' batched headers add, derived and not yet counted there.
+/// 33,143 since the 27 the floor's run names (05c14470's 22, 39ca69bd's 3, 9ec351b7's 2), the
+/// same sites made once here, reallocations 2,052. On Linux 33,194: CI run 44547229268's
+/// linux-aarch64 crates leg counted 40,729 at 5fbd5059, with the cell's status reports boxed,
+/// where this Mac counted 40,678, the 51 above it.
 #[test]
 fn a_cell_serving_writes_at_chunked_windows_copies_fewer_datagrams() {
     const CHUNKED: u64 = if cfg!(target_os = "linux") {
-        33_167
+        33_194
     } else {
-        33_116
+        33_143
     };
     let floor = serving(Sim::new, 1, 40);
     let chunked = serving(Sim::chunked, 1, 40);

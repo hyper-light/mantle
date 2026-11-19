@@ -545,9 +545,9 @@ fn fault(e: &LogError) -> Fault {
         LogError::Busy => Fault::Room("the log's queue"),
         LogError::Behind(_) => Fault::Behind,
         LogError::Invalid { reason, .. } => {
-            Fault::FailedFor("the log refused an update the group cannot take", reason)
+            Fault::failed_for("the log refused an update the group cannot take", reason)
         }
-        LogError::Damaged(reason) => Fault::FailedFor("the group is damaged", reason),
+        LogError::Damaged(reason) => Fault::failed_for("the group is damaged", reason),
         LogError::Fenced => Fault::Failed("the log is fenced after a failed write or flush"),
         LogError::Closed => Fault::Failed("the log is closed"),
         LogError::Disk(_) => Fault::Failed("the device failed"),
@@ -556,16 +556,16 @@ fn fault(e: &LogError) -> Fault {
         LogError::Compacted { .. } => Fault::Failed("an entry the group compacted"),
         LogError::Corrupt { .. } => Fault::Failed("an entry read back does not verify"),
         LogError::Claimed(_) => Fault::Failed("the group is written through its handle"),
-        LogError::Foreign(reason) => Fault::FailedFor("the file is not this log", reason),
+        LogError::Foreign(reason) => Fault::failed_for("the file is not this log", reason),
         LogError::SealedWithoutKeys => {
             Fault::Failed("the log is sealed and was opened without its keys")
         }
         LogError::UnsealedWithKeys => {
             Fault::Failed("the log is not sealed and was opened with keys")
         }
-        LogError::Config(reason) => Fault::FailedFor("the log's configuration is invalid", reason),
+        LogError::Config(reason) => Fault::failed_for("the log's configuration is invalid", reason),
         LogError::Unfit(_) => Fault::Failed("no log configuration derives from the facts given"),
-        LogError::Tampered(reason) => Fault::FailedFor("the sealed log was tampered with", reason),
+        LogError::Tampered(reason) => Fault::failed_for("the sealed log was tampered with", reason),
         LogError::Seal(_) => {
             Fault::Failed("a sealed log's key could not be made, wrapped or unwrapped")
         }

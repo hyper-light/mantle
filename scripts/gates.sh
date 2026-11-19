@@ -6,6 +6,7 @@ python3 scripts/check-contracts.py --known scripts/arbitrary-open.txt
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bash scripts/check-production.sh
+python3 scripts/check-recursion.py --known scripts/recursion-open.txt
 cargo deny check advisories bans licenses sources 2>/dev/null
 cargo test --workspace --locked
 cargo test --manifest-path vendor/Cargo.toml --workspace --locked

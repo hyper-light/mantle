@@ -1,0 +1,13 @@
+# The known call-graph cycles in mantle's built code (CLAUDE.md §10), as scripts/check-recursion.py
+# names them: each cycle's functions of mantle's, sorted and joined by ` | `, one cycle a line. The
+# list only shrinks: rewrite a cycle as flat work and take it off here.
+<mantle_engine::codec::zstd::decoder::Decoder>::step
+<mantle_engine::codec::zstd::decoder::Execution>::copy_from_dictionary
+<mantle_gateway::repair::Repairer>::read_more | <mantle_gateway::repair::Repairer>::rebuild
+<mantle_s3::json::Reader>::array | <mantle_s3::json::Reader>::object | <mantle_s3::json::Reader>::value
+<mantle_s3::json::Value>::write
+core::ptr::drop_glue::<(alloc::string::String, mantle_s3::json::Value)> | core::ptr::drop_glue::<[(alloc::string::String, mantle_s3::json::Value)]> | core::ptr::drop_glue::<[mantle_s3::json::Value]> | core::ptr::drop_glue::<alloc::vec::Vec<(alloc::string::String, mantle_s3::json::Value)>> | core::ptr::drop_glue::<alloc::vec::Vec<mantle_s3::json::Value>> | core::ptr::drop_glue::<mantle_s3::json::Value>
+core::ptr::drop_glue::<alloc::boxed::Box<hyper_rt::sync::ChannelState<alloc::boxed::Box<mantle_engine::ranges::Request>>>> | core::ptr::drop_glue::<alloc::boxed::Box<mantle_engine::ranges::Request>> | core::ptr::drop_glue::<core::option::Option<alloc::boxed::Box<mantle_engine::ranges::Request>>> | core::ptr::drop_glue::<core::option::Option<hyper_rt::sync::Sender<alloc::boxed::Box<mantle_engine::ranges::Request>>>> | core::ptr::drop_glue::<hyper_rt::sync::ChannelState<alloc::boxed::Box<mantle_engine::ranges::Request>>> | core::ptr::drop_glue::<hyper_rt::sync::Sender<alloc::boxed::Box<mantle_engine::ranges::Request>>> | core::ptr::drop_glue::<hyper_rt::sync::ring::Ring<alloc::boxed::Box<mantle_engine::ranges::Request>>> | core::ptr::drop_glue::<hyper_rt::sync::ring::Shared<hyper_rt::sync::ChannelState<alloc::boxed::Box<mantle_engine::ranges::Request>>>> | core::ptr::drop_glue::<mantle_engine::ranges::Request>
+core::ptr::drop_glue::<alloc::boxed::Box<mantle_node::node::NodeError>> | core::ptr::drop_glue::<mantle_node::node::NodeError>
+core::ptr::drop_glue::<alloc::boxed::Box<mantle_node::process::ProcessError>> | core::ptr::drop_glue::<mantle_node::process::ProcessError>
+mantle_ec::durability::fill

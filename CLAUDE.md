@@ -85,13 +85,15 @@ cycles are found with a tool on the built code, not by reading.
 ## Gates
 
 Every commit passes these on its final tree (`bash scripts/gates.sh` runs them in order and
-stops at the first failure); CI runs them on Linux, macOS and Windows, x86_64 and aarch64.
+stops at the first failure); CI runs them on Linux, macOS and Windows, x86_64 and aarch64, the
+recursion check on Linux x86_64 alone (`.github/workflows/ci.yml` says why).
 
 ```
 python3 scripts/check-contracts.py --known scripts/arbitrary-open.txt
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bash scripts/check-production.sh
+python3 scripts/check-recursion.py --known scripts/recursion-open.txt
 cargo deny check advisories bans licenses sources
 cargo test --workspace --locked
 cargo test --manifest-path vendor/Cargo.toml --workspace --locked

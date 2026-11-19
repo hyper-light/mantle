@@ -155,6 +155,136 @@ impl<T: Key> Keyed<T> {
     }
 }
 
+/// What an entry of a [`KeyedOn`] list is also found by while it holds one: a read out's exchange,
+/// while it is out on one (`Node::read_on`).
+pub(super) trait On: Key {
+    type By: Copy + Eq + Hash + std::fmt::Debug;
+
+    fn on(&self) -> Option<Self::By>;
+}
+
+/// A [`Keyed`] list whose entries are also found by a second key while each holds one, in one
+/// probe of `by`, the entry's own key there: kept in step as an entry is pushed, changed and
+/// removed, a change made only through [`KeyedOn::change`] or [`KeyedOn::change_at`], which read
+/// its second key before and after. Bound: one `by` an entry, so at most its entries'.
+pub(super) struct KeyedOn<T: On> {
+    keyed: Keyed<T>,
+    by: HashMap<T::By, T::Of>,
+}
+
+impl<T: On> Default for KeyedOn<T> {
+    /// None, which allocates nothing (`Keyed::default`, `HashMap::new`).
+    fn default() -> Self {
+        Self {
+            keyed: Keyed::default(),
+            by: HashMap::new(),
+        }
+    }
+}
+
+impl<T: On> KeyedOn<T> {
+    pub(super) fn len(&self) -> usize {
+        self.keyed.len()
+    }
+
+    /// Its entries, in no order a caller may rely on, as [`Keyed::iter`].
+    pub(super) fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.keyed.iter()
+    }
+
+    /// The entry at slot `at`, as [`Keyed::at`].
+    pub(super) fn at(&self, at: usize) -> Option<&T> {
+        self.keyed.at(at)
+    }
+
+    pub(super) fn get(&self, key: T::Of) -> Option<&T> {
+        self.keyed.get(key)
+    }
+
+    /// The key of the entry holding `by` as its second key.
+    pub(super) fn on(&self, by: T::By) -> Option<T::Of> {
+        #[cfg(test)]
+        tests::PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
+        self.by.get(&by).copied()
+    }
+
+    /// Holds `entry`, last, as [`Keyed::push`]: an entry it displaces given back, its second key
+    /// let go.
+    pub(super) fn push(&mut self, entry: T) -> Option<T> {
+        let (key, on) = (entry.key(), entry.on());
+        let displaced = self.keyed.push(entry);
+        if let Some(by) = displaced.as_ref().and_then(On::on) {
+            self.by.remove(&by);
+        }
+        if let Some(by) = on {
+            self.by.insert(by, key);
+        }
+        #[cfg(test)]
+        self.audit();
+        displaced
+    }
+
+    /// The entry holding `key` changed by `change`, all but its key, its second key kept.
+    pub(super) fn change<R>(&mut self, key: T::Of, change: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let entry = self.keyed.get_mut(key)?;
+        let before = entry.on();
+        let changed = change(entry);
+        let after = entry.on();
+        self.moved(key, before, after);
+        Some(changed)
+    }
+
+    /// The entry at slot `at` changed by `change`, all but its key, its second key kept.
+    pub(super) fn change_at<R>(
+        &mut self,
+        at: usize,
+        change: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        let entry = self.keyed.at_mut(at)?;
+        let (key, before) = (entry.key(), entry.on());
+        let changed = change(entry);
+        let after = entry.on();
+        self.moved(key, before, after);
+        Some(changed)
+    }
+
+    /// The entry holding `key` went from second key `before` to `after`.
+    fn moved(&mut self, key: T::Of, before: Option<T::By>, after: Option<T::By>) {
+        if before != after {
+            if let Some(by) = before {
+                self.by.remove(&by);
+            }
+            if let Some(by) = after {
+                self.by.insert(by, key);
+            }
+        }
+        #[cfg(test)]
+        self.audit();
+    }
+
+    /// The entry holding `key` taken out, as [`Keyed::remove`], its second key let go.
+    pub(super) fn remove(&mut self, key: T::Of) -> Option<T> {
+        let entry = self.keyed.remove(key)?;
+        self.let_go(&entry);
+        Some(entry)
+    }
+
+    /// The entry at slot `at` taken out, as [`Keyed::take`], its second key let go.
+    pub(super) fn take(&mut self, at: usize) -> Option<T> {
+        let entry = self.keyed.take(at)?;
+        self.let_go(&entry);
+        Some(entry)
+    }
+
+    fn let_go(&mut self, entry: &T) {
+        if let Some(by) = entry.on() {
+            self.by.remove(&by);
+        }
+        #[cfg(test)]
+        self.audit();
+    }
+}
+
 impl<T: Key> Extend<T> for Keyed<T> {
     /// Each pushed, as [`Keyed::push`] holds one.
     fn extend<I: IntoIterator<Item = T>>(&mut self, entries: I) {
@@ -166,7 +296,7 @@ impl<T: Key> Extend<T> for Keyed<T> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{Key, Keyed};
+    use super::{Key, Keyed, KeyedOn, On};
 
     thread_local! {
         /// The probes this thread made of a keyed list's slots ([`Keyed::slot`]).
@@ -191,6 +321,26 @@ pub(super) mod tests {
                 self.slots.len(),
                 self.entries.len(),
                 "a key's slot no entry holds, or two entries holding one key"
+            );
+        }
+    }
+
+    impl<T: On> KeyedOn<T> {
+        /// The oracle, after each change: its list's own slots exact ([`Keyed::audit`]), and its
+        /// second keys agree with a full recount, each entry holding one found by it, no other.
+        pub(in crate::node) fn audit(&self) {
+            self.keyed.audit();
+            let mut on = 0;
+            for entry in self.keyed.iter() {
+                if let Some(by) = entry.on() {
+                    assert_eq!(self.by.get(&by), Some(&entry.key()), "{by:?}");
+                    on += 1;
+                }
+            }
+            assert_eq!(
+                self.by.len(),
+                on,
+                "a second key no entry holds, or two entries holding one"
             );
         }
     }
@@ -409,5 +559,122 @@ pub(super) mod tests {
         );
         assert_eq!(after[1], 3 * native.len(), "a probe a lookup");
         assert!(replies.is_empty());
+    }
+
+    /// A read out as `ReadOut` holds one: its ask, and the exchange it is out on, if any (`via`).
+    #[derive(Debug, PartialEq, Eq)]
+    struct Out(u64, Option<u64>);
+
+    impl Key for Out {
+        type Of = u64;
+
+        fn key(&self) -> u64 {
+            self.0
+        }
+    }
+
+    impl On for Out {
+        type By = u64;
+
+        fn on(&self) -> Option<u64> {
+            self.1
+        }
+    }
+
+    /// Pushes, each change of a second key (asked on an exchange, let go of it, asked on another),
+    /// removals by key and by slot and a displacing push each keep both maps exact (the audit after
+    /// each change), and every second key held finds its entry in one probe.
+    #[test]
+    fn a_keyed_on_lists_second_keys_follow_each_change() {
+        let mut reads = KeyedOn::default();
+        for ask in 0..64 {
+            assert!(reads.push(Out(ask, None)).is_none());
+            assert_eq!(reads.change(ask, |out| out.1 = Some(1000 + ask)), Some(()));
+        }
+        for ask in (0..64).filter(|ask| ask % 2 == 0) {
+            reads.change(ask, |out| out.1 = None);
+        }
+        for ask in (0..64).filter(|ask| ask % 4 == 0) {
+            reads.change(ask, |out| out.1 = Some(2000 + ask));
+        }
+        assert_eq!(reads.remove(1), Some(Out(1, Some(1001))));
+        let first = reads.at(0).map(|out| out.0);
+        assert_eq!(reads.take(0).map(|out| out.0), first);
+        assert_eq!(reads.push(Out(5, None)), Some(Out(5, Some(1005))));
+        reads.change_at(0, |out| out.1 = Some(3000));
+        assert_eq!(reads.change(64, |_| ()), None, "none holds it");
+        probes();
+        assert_eq!(reads.on(3000), reads.at(0).map(|out| out.0));
+        assert_eq!(reads.on(1005), None, "let go with the entry it displaced");
+        assert_eq!(reads.on(1003), Some(3));
+        assert_eq!(reads.on(1002), None, "let go");
+        assert_eq!(reads.on(2004), Some(4));
+        assert_eq!(reads.on(1001), None, "removed");
+        assert_eq!(probes(), 6, "one probe a lookup");
+        assert_eq!(reads.len(), 62);
+        reads.audit();
+    }
+
+    /// The node's task's events on the exchanges of the reads it asks itself (`Node::reads_out`),
+    /// each found by its exchange in a probe of their second keys (`KeyedOn::on`): 1,024 reads out
+    /// on exchanges, every third answered and taken out; a `Reply` on each read left
+    /// (`Event::Reply`'s `read_on`, then `read_replied`'s and its read's), a `Refused` on each of
+    /// 2,048 exchanges no read is out on (`ask_lost`'s), and each read's answer whole
+    /// (`read_came`'s, then its removal). Before, each lookup searched the reads out.
+    #[test]
+    fn a_reads_exchange_is_found_with_no_scan() {
+        const READS: u64 = 1024;
+        let mut reads = KeyedOn::default();
+        for ask in 0..READS {
+            reads.push(Out(ask, None));
+            reads.change(ask, |out| out.1 = Some(READS + ask));
+        }
+        for ask in (0..READS).filter(|ask| ask % 3 == 0) {
+            assert!(reads.remove(ask).is_some());
+        }
+        let out: Vec<u64> = reads.iter().filter_map(|read| read.1).collect();
+        let others: Vec<u64> = (4 * READS..4 * READS + 2048).collect();
+        let searched = |reads: &KeyedOn<Out>, exchange: u64| {
+            reads
+                .iter()
+                .position(|read| read.1 == Some(exchange))
+                .map_or(reads.len(), |at| at + 1)
+        };
+        let (mut before, mut after) = ([0; 3], [0; 3]);
+        probes();
+        for &exchange in &out {
+            before[0] += 2 * searched(&reads, exchange);
+            assert!(reads.on(exchange).is_some(), "Event::Reply's");
+            let ask = reads.on(exchange).unwrap();
+            assert!(reads.get(ask).is_some(), "read_replied's");
+        }
+        after[0] = probes();
+        for &exchange in &others {
+            before[1] += searched(&reads, exchange);
+            assert!(reads.on(exchange).is_none(), "ask_lost's");
+        }
+        after[1] = probes();
+        for &exchange in &out {
+            before[2] += searched(&reads, exchange);
+            let ask = reads.on(exchange).unwrap();
+            assert!(reads.remove(ask).is_some(), "read_came's");
+        }
+        after[2] = probes();
+        println!(
+            "{} reads out: Reply {} probes ({} visited by the searches), Refused on {} other \
+             exchanges {} ({}), answers whole {} ({})",
+            out.len(),
+            after[0],
+            before[0],
+            others.len(),
+            after[1],
+            before[1],
+            after[2],
+            before[2]
+        );
+        assert_eq!(after[0], 3 * out.len(), "three probes a Reply");
+        assert_eq!(after[1], others.len(), "a probe a Refused");
+        assert_eq!(after[2], 2 * out.len(), "two probes an answer");
+        assert_eq!(reads.len(), 0);
     }
 }

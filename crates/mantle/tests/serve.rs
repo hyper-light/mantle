@@ -2367,16 +2367,20 @@ fn is_phase(line: &str) -> bool {
 
 /// A phase line's columns are read by their names, wherever the bench writes them: `failed`
 /// reads the same with the write path's, slow polls' and stalls' columns after it (a
-/// linux-aarch64 smoke's line, CI run 44239790476), and a phase that failed reads as failed. None
-/// of the lines that follow a phase's and begin as it does is taken for a phase's, nor are the
-/// run's and a door's lines that name `clients`. The ladder's and an unanswered operation's lines
-/// are the bench's formats (src/bench_doors.rs), an open loop's smoke writing none.
+/// linux-aarch64 smoke's line, CI run 44239790476, with the cache columns the bench writes after
+/// the cycles since, dashes without `--perf`), and a phase that failed reads as failed; under
+/// `--perf` the cache columns read as counted, an event perf did not count a dash. None of the
+/// lines that follow a phase's and begin as it does is taken for a phase's, nor are the run's
+/// and a door's lines that name `clients`. The ladder's and an unanswered operation's lines are
+/// the bench's formats (src/bench_doors.rs), an open loop's smoke writing none.
 #[test]
 fn a_bench_doors_phase_line_is_read_by_name_and_no_other_line_is_a_phase() {
     let phase = "doors native PUT 0B quiet clients 2 elapsed_ms 77 ops 4 allocs/op - reallocs/op - \
                  moved/op - bytes/op - peak_live/request - peak_live/connection - client_allocs/op \
                  - client_bytes/op - minor_faults/op 4.0 major_faults/op 0.0 user_ns/op 40000000.0 \
-                 system_ns/op 2500000.0 instructions/op - cycles/op - switches/op 344.0 \
+                 system_ns/op 2500000.0 instructions/op - cycles/op - l1d_loads/op - \
+                 l1d_misses/op - cache_refs/op - cache_misses/op - branch_misses/op - \
+                 dtlb_misses/op - perf_counted - switches/op 344.0 \
                  wire_bytes/op 8483.5 datagrams/op 10.8 server_footprint_bytes 265056256 \
                  harness_allocs/op - harness_peak_live_bytes - out_most 2 threads 5 latency_us p50 \
                  - p50_95 - - p99 - p99.9 - p99.99 - max 45975.8 generator_cpu_ns/op 2162244.0 \
@@ -2400,8 +2404,34 @@ fn a_bench_doors_phase_line_is_read_by_name_and_no_other_line_is_a_phase() {
         ("slow_polls/op", "29.00"),
         ("slowest_label", "Put"),
         ("stalls", "11"),
+        ("l1d_misses/op", "-"),
+        ("perf_counted", "-"),
+        ("switches/op", "344.0"),
     ] {
         assert_eq!(measure(phase, name), Some(value), "{name}");
+    }
+    let counted = phase.replace(
+        "instructions/op - cycles/op - l1d_loads/op - l1d_misses/op - cache_refs/op - \
+         cache_misses/op - branch_misses/op - dtlb_misses/op - perf_counted -",
+        "instructions/op 152345.7 cycles/op 100234.6 l1d_loads/op 61234.6 l1d_misses/op 1234.6 \
+         cache_refs/op 456.8 cache_misses/op 123.5 branch_misses/op 234.6 dtlb_misses/op - \
+         perf_counted 0.62",
+    );
+    assert!(is_phase(&counted), "{counted}");
+    for (name, value) in [
+        ("instructions/op", "152345.7"),
+        ("cycles/op", "100234.6"),
+        ("l1d_loads/op", "61234.6"),
+        ("l1d_misses/op", "1234.6"),
+        ("cache_refs/op", "456.8"),
+        ("cache_misses/op", "123.5"),
+        ("branch_misses/op", "234.6"),
+        ("dtlb_misses/op", "-"),
+        ("perf_counted", "0.62"),
+        ("switches/op", "344.0"),
+        ("failed", "0"),
+    ] {
+        assert_eq!(measure(&counted, name), Some(value), "{name}");
     }
     let failing = phase.replace(
         "unanswered 0 skipped 0 differed 0 again 0 failed 0",

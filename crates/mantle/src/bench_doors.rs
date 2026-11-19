@@ -57,10 +57,12 @@
 //!
 //! A measure this build or this OS does not give prints `-`: the allocators' counts outside a
 //! `count-allocs` build, instructions and cycles where the OS does not count them per process
-//! (Linux: `usage::of` reads none; `--perf` counts them with `perf stat`, [`Perf`]), a major fault
-//! count on Windows, and datagrams on the HTTP door, which has none of its own. The native door's
-//! wire bytes and datagrams are what its clients' sockets sent and received (`Client::wire`), the
-//! HTTP door's the octets each connection wrote and read.
+//! (Linux: `usage::of` reads none; `--perf` counts them with `perf stat`, [`Perf`]), the caches',
+//! branches' and data TLB's counts without `--perf` and each event the CPU or kernel does not
+//! count with it ([`cache_columns`]), a major fault count on Windows, and datagrams on the HTTP
+//! door, which has none of its own. The native door's wire bytes and datagrams are what its
+//! clients' sockets sent and received (`Client::wire`), the HTTP door's the octets each
+//! connection wrote and read.
 //! A quantile is a dash below the samples that resolve it at 95% (`quantile::samples_for`; §12's
 //! rounds).
 //!
@@ -257,7 +259,8 @@ pub struct Options {
     pub condition: String,
     /// An S3 server outside this program the HTTP door's phases run against, instead of a cell.
     pub endpoint: Option<Endpoint>,
-    /// Count the servers' instructions and cycles a phase with `perf stat` ([`Perf`]).
+    /// Count the servers' instructions, cycles and cache, branch and data TLB events a phase with
+    /// `perf stat` ([`Perf`]).
     pub perf: bool,
     /// The operations whose phases run; every one when empty. A phase reads the objects the
     /// phases before it made, so a read or a delete is asked beside the put it reads.
@@ -2739,6 +2742,30 @@ fn stall_column(grown: Option<&[Stalled]>) -> String {
     }
 }
 
+/// A phase line's columns of the servers' cache use, after its cycles, as `perf stat` counted it
+/// ([`Counters`]): the L1 data cache's loads and load misses, the generic cache references and
+/// misses, the branch misses and the data TLB's load misses, each an operation, and the least
+/// share of its measurement time any event was counted (`perf_counted`), below 1.00 where the
+/// kernel multiplexed the counters and perf scaled their counts. A dash for each event perf did
+/// not count, and for every column where `--perf` counted none.
+fn cache_columns(perf: Option<&Counters>, ops: u64) -> String {
+    let per_op = |field: fn(&Counters) -> Option<u64>| {
+        per(perf.and_then(field).map(|count| count as f64), ops)
+    };
+    format!(
+        " l1d_loads/op {} l1d_misses/op {} cache_refs/op {} cache_misses/op {} branch_misses/op {} \
+         dtlb_misses/op {} perf_counted {}",
+        per_op(|p| p.l1d_loads),
+        per_op(|p| p.l1d_misses),
+        per_op(|p| p.cache_refs),
+        per_op(|p| p.cache_misses),
+        per_op(|p| p.branch_misses),
+        per_op(|p| p.dtlb_misses),
+        perf.and_then(|p| p.counted)
+            .map_or_else(|| "-".to_owned(), |share| format!("{share:.2}")),
+    )
+}
+
 /// `value / ops` to a tenth, or `-` where there is no value or no operation.
 fn per(value: Option<f64>, ops: u64) -> String {
     match value {
@@ -3153,7 +3180,7 @@ impl<'o> Bench<'o> {
         writeln!(
             out,
             "doors {} {} {} {} clients {} elapsed_ms {} ops {ops} allocs/op {} reallocs/op {} moved/op {} bytes/op {} peak_live/request {} peak_live/connection {} \
-             client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {} switches/op {} \
+             client_allocs/op {} client_bytes/op {} minor_faults/op {} major_faults/op {} user_ns/op {} system_ns/op {} instructions/op {} cycles/op {}{} switches/op {} \
              wire_bytes/op {} datagrams/op {} server_footprint_bytes {} harness_allocs/op {} harness_peak_live_bytes {} out_most {} threads {} \
              latency_us p50 {} p50_95 {} p99 {} p99.9 {} p99.99 {} max {} generator_cpu_ns/op {} lateness_us p99 {} refused {} unanswered {} skipped {} differed {} again {} failed {}{}{}{}{}",
             self.named(m.door),
@@ -3179,6 +3206,7 @@ impl<'o> Bench<'o> {
                 ops
             ),
             per(perf(|p| p.cycles).or(charged(|u| u.cycles)), ops),
+            cache_columns(m.perf.as_ref(), ops),
             per(grew(|c| c.switches), ops),
             per(Some(m.wire.bytes as f64), ops),
             match m.door {
@@ -4279,13 +4307,30 @@ fn faults_of(pid: u32) -> Counted {
     }
 }
 
-/// `perf stat` counting the servers' user-space instructions and cycles across one phase
-/// (`--perf`, Linux; perf-stat(1)): started on the servers' pids with its events disabled
-/// (`--delay -1`), enabled before the phase and disabled after it through its control descriptors,
-/// its standard input and output (`--control fd:0,1`), each command acknowledged before going on,
-/// so its count spans the phase; then ended with SIGINT, on which it writes its counts to `out`.
-/// The events count user space only (`:u`), which `perf_event_paranoid` 2 lets a user count of
-/// its own processes.
+/// The field of [`Counters`] an event fills.
+type Slot = fn(&mut Counters) -> &mut Option<u64>;
+
+/// The events `perf stat` counts across a phase, each named as `-e` asks for it and perf's output
+/// names it, and the field of [`Counters`] it fills: user space only (`:u`). `cache-references`
+/// and `cache-misses` are the kernel's generic cache events, which AMD's Zen cores count where
+/// they count no `LLC-load-misses` (measurement.md §12 says what each counts on each CPU).
+const EVENTS: &[(&str, Slot)] = &[
+    ("instructions:u", |c| &mut c.instructions),
+    ("cycles:u", |c| &mut c.cycles),
+    ("L1-dcache-loads:u", |c| &mut c.l1d_loads),
+    ("L1-dcache-load-misses:u", |c| &mut c.l1d_misses),
+    ("cache-references:u", |c| &mut c.cache_refs),
+    ("cache-misses:u", |c| &mut c.cache_misses),
+    ("branch-misses:u", |c| &mut c.branch_misses),
+    ("dTLB-load-misses:u", |c| &mut c.dtlb_misses),
+];
+
+/// `perf stat` counting the servers' user-space [`EVENTS`] across one phase (`--perf`, Linux;
+/// perf-stat(1)): started on the servers' pids with its events disabled (`--delay -1`), enabled
+/// before the phase and disabled after it through its control descriptors, its standard input and
+/// output (`--control fd:0,1`), each command acknowledged before going on, so its count spans the
+/// phase; then ended with SIGINT, on which it writes its counts to `out`. The events count user
+/// space only (`:u`), which `perf_event_paranoid` 2 lets a user count of its own processes.
 struct Perf {
     child: Child,
     ack: BufReader<ChildStdout>,
@@ -4295,8 +4340,9 @@ struct Perf {
 impl Perf {
     fn start(pids: &[u32], out: &Path) -> Result<Self, Error> {
         let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        let events: Vec<&str> = EVENTS.iter().map(|(event, _)| *event).collect();
         let mut child = Command::new("perf")
-            .args(["stat", "-x,", "-e", "instructions:u,cycles:u", "-D", "-1"])
+            .args(["stat", "-x,", "-e", &events.join(","), "-D", "-1"])
             .args(["--control", "fd:0,1", "-o"])
             .arg(out)
             .args(["-p", &pids.join(",")])
@@ -4335,33 +4381,69 @@ impl Perf {
     }
 
     /// Disables the events, ends perf with SIGINT (by kill(1), this program holding no signal
-    /// call) and reads its instructions and cycles.
+    /// call) and reads its counts.
     fn end(mut self) -> Result<Counters, Error> {
         self.command("disable")?;
         Command::new("kill")
             .args(["-INT", &self.child.id().to_string()])
             .status()?;
         self.child.wait()?;
-        let text = std::fs::read_to_string(&self.out)?;
-        // A CSV line: the count, its unit, the event, ...; `<not counted>` where none ran.
-        let count = |event: &str| {
-            text.lines().find_map(|line| {
-                let mut fields = line.split(',');
-                let value = fields.next()?;
-                (fields.nth(1)? == event).then(|| value.parse::<u64>().ok())?
-            })
-        };
-        Ok(Counters {
-            instructions: count("instructions:u"),
-            cycles: count("cycles:u"),
-        })
+        Ok(Counters::parse(&std::fs::read_to_string(&self.out)?))
     }
 }
 
-/// The servers' user-space instructions and cycles across a phase, as `perf stat` counted them.
+/// The servers' user-space [`EVENTS`] across a phase, as `perf stat` counted them, each none where
+/// it did not; and the least share of its measurement time any event given a count was counted,
+/// as perf states each event's (perf-stat(1), "CSV FORMAT").
+#[derive(Debug, Default, PartialEq)]
 struct Counters {
     instructions: Option<u64>,
     cycles: Option<u64>,
+    l1d_loads: Option<u64>,
+    l1d_misses: Option<u64>,
+    cache_refs: Option<u64>,
+    cache_misses: Option<u64>,
+    branch_misses: Option<u64>,
+    dtlb_misses: Option<u64>,
+    counted: Option<f64>,
+}
+
+impl Counters {
+    /// `perf stat -x,`'s output. Each event's line holds its fields in perf-stat(1)'s order ("CSV
+    /// FORMAT"): an optional time stamp (`-I`), CPU identifier and CPU count (per-CPU
+    /// aggregations), none of which this run asks for, so its first field is the counter value;
+    /// then the value's unit or empty, the event name, the counter's run time, the percentage of
+    /// the measurement time it was running, and an optional metric's value and unit. The value is
+    /// `<not supported>` for an event the CPU or kernel does not count and `<not counted>` for one
+    /// that never ran (tools/perf/util/stat-display.c, `print_counter_value_csv`): neither is a
+    /// count, so the event has none. perf scales by default (perf-stat(1), `--no-scale`): a count
+    /// the kernel multiplexed with others is its value times the time its event was enabled over
+    /// the time it ran (tools/lib/perf/evsel.c, `perf_counts_values__scale`), so the value is
+    /// taken as perf gives it, not scaled again, and its percentage says how much of its
+    /// measurement time it was counted. The line `-o` writes first (`# started on`), the blank
+    /// one after it and a metric's own lines, their first fields empty, name no event.
+    fn parse(text: &str) -> Self {
+        let mut counters = Self::default();
+        for line in text.lines() {
+            let mut fields = line.split(',');
+            let (Some(value), Some(event)) = (fields.next(), fields.nth(1)) else {
+                continue;
+            };
+            let Some((_, slot)) = EVENTS.iter().find(|(name, _)| *name == event) else {
+                continue;
+            };
+            let Ok(count) = value.parse::<u64>() else {
+                continue;
+            };
+            *slot(&mut counters) = Some(count);
+            // Past the run time, the percentage of its measurement time the event was counted.
+            if let Some(percent) = fields.nth(1).and_then(|p| p.parse::<f64>().ok()) {
+                let share = percent / 100.0;
+                counters.counted = Some(counters.counted.map_or(share, |c| c.min(share)));
+            }
+        }
+        counters
+    }
 }
 
 fn control_key(door: Door, name: char) -> String {
@@ -5110,6 +5192,151 @@ mod tests {
         assert_eq!(stalls_grown(&pids, &pids), None);
         assert_eq!(stalls_grown(&before, &pids), None);
         assert_eq!(stall_column(None), " stalls -");
+    }
+
+    /// `perf stat -x,`'s output for [`EVENTS`] as `-o` writes it: its `# started on` line and a
+    /// blank one, then a line an event, `value` its counter value or perf's word for none, and the
+    /// percentage of the phase it ran, with the metrics perf states beside some (perf-stat(1),
+    /// "CSV FORMAT").
+    fn perf_csv(events: [(&str, &str, &str); 8]) -> String {
+        let mut text = "# started on Wed Nov 18 10:00:00 2026\n\n".to_owned();
+        for (event, value, percent) in events {
+            let metric = match event {
+                "instructions:u" => "1.52,insn per cycle",
+                "L1-dcache-load-misses:u" => "2.02,of all L1-dcache accesses",
+                _ => ",",
+            };
+            text.push_str(&format!("{value},,{event},2000000000,{percent},{metric}\n"));
+        }
+        text
+    }
+
+    /// Every event perf counted is read into its own field, the line `-o` writes first, the blank
+    /// one and the metrics beside the counts read as none, and an event counted the whole phase
+    /// says 1.00; the phase line's columns are each a count over the operations, after its cycles.
+    #[test]
+    fn perfs_counts_are_read_event_by_event() {
+        let text = perf_csv([
+            ("instructions:u", "1523456789", "100.00"),
+            ("cycles:u", "1002345678", "100.00"),
+            ("L1-dcache-loads:u", "612345678", "100.00"),
+            ("L1-dcache-load-misses:u", "12345678", "100.00"),
+            ("cache-references:u", "4567890", "100.00"),
+            ("cache-misses:u", "1234567", "100.00"),
+            ("branch-misses:u", "2345678", "100.00"),
+            ("dTLB-load-misses:u", "345678", "100.00"),
+        ]);
+        let counters = Counters::parse(&text);
+        assert_eq!(
+            counters,
+            Counters {
+                instructions: Some(1_523_456_789),
+                cycles: Some(1_002_345_678),
+                l1d_loads: Some(612_345_678),
+                l1d_misses: Some(12_345_678),
+                cache_refs: Some(4_567_890),
+                cache_misses: Some(1_234_567),
+                branch_misses: Some(2_345_678),
+                dtlb_misses: Some(345_678),
+                counted: Some(1.0),
+            }
+        );
+        assert_eq!(
+            cache_columns(Some(&counters), 1_000),
+            " l1d_loads/op 612345.7 l1d_misses/op 12345.7 cache_refs/op 4567.9 cache_misses/op \
+             1234.6 branch_misses/op 2345.7 dtlb_misses/op 345.7 perf_counted 1.00"
+        );
+        // No operation: no count an operation, though perf counted.
+        assert_eq!(
+            cache_columns(Some(&counters), 0),
+            " l1d_loads/op - l1d_misses/op - cache_refs/op - cache_misses/op - branch_misses/op - \
+             dtlb_misses/op - perf_counted 1.00"
+        );
+        // Without `--perf`, nothing.
+        assert_eq!(
+            cache_columns(None, 1_000),
+            " l1d_loads/op - l1d_misses/op - cache_refs/op - cache_misses/op - branch_misses/op - \
+             dtlb_misses/op - perf_counted -"
+        );
+        assert_eq!(Counters::parse(""), Counters::default());
+    }
+
+    /// An event the CPU or kernel does not count (`<not supported>`) or that never ran (`<not
+    /// counted>`) has no count, never a zero, and its column is a dash; the others are read as
+    /// before, and the share counted is theirs.
+    #[test]
+    fn an_event_perf_did_not_count_is_a_dash_not_a_zero() {
+        let mut events = [
+            ("instructions:u", "1523456789", "100.00"),
+            ("cycles:u", "1002345678", "100.00"),
+            ("L1-dcache-loads:u", "612345678", "100.00"),
+            ("L1-dcache-load-misses:u", "12345678", "100.00"),
+            ("cache-references:u", "4567890", "100.00"),
+            ("cache-misses:u", "1234567", "100.00"),
+            ("branch-misses:u", "2345678", "100.00"),
+            ("dTLB-load-misses:u", "<not supported>", "100.00"),
+        ];
+        let unsupported = Counters::parse(&perf_csv(events));
+        assert_eq!(unsupported.dtlb_misses, None);
+        assert_eq!(unsupported.branch_misses, Some(2_345_678));
+        assert_eq!(unsupported.counted, Some(1.0));
+        assert_eq!(
+            cache_columns(Some(&unsupported), 1_000),
+            " l1d_loads/op 612345.7 l1d_misses/op 12345.7 cache_refs/op 4567.9 cache_misses/op \
+             1234.6 branch_misses/op 2345.7 dtlb_misses/op - perf_counted 1.00"
+        );
+
+        // A count that never ran: perf states its percentage as 0, which is no share of a count.
+        events[5] = ("cache-misses:u", "<not counted>", "0.00");
+        let uncounted = Counters::parse(&perf_csv(events));
+        assert_eq!(
+            (uncounted.cache_misses, uncounted.dtlb_misses),
+            (None, None)
+        );
+        assert_eq!(uncounted.cache_refs, Some(4_567_890));
+        assert_eq!(uncounted.counted, Some(1.0));
+        assert_eq!(
+            cache_columns(Some(&uncounted), 1_000),
+            " l1d_loads/op 612345.7 l1d_misses/op 12345.7 cache_refs/op 4567.9 cache_misses/op - \
+             branch_misses/op 2345.7 dtlb_misses/op - perf_counted 1.00"
+        );
+
+        // Nothing counted, as in a guest whose PMU the hypervisor keeps: no share either.
+        let none = events.map(|(event, _, _)| (event, "<not supported>", "100.00"));
+        assert_eq!(Counters::parse(&perf_csv(none)), Counters::default());
+        assert_eq!(
+            cache_columns(Some(&Counters::default()), 1_000),
+            " l1d_loads/op - l1d_misses/op - cache_refs/op - cache_misses/op - branch_misses/op - \
+             dtlb_misses/op - perf_counted -"
+        );
+    }
+
+    /// Eight events on fewer counters are multiplexed: each counted part of the phase, its
+    /// percentage below 100, and its value perf's scaled estimate (its count times the time it
+    /// was enabled over the time it ran), which is read as perf gives it, not scaled again. The
+    /// phase says the least share any was counted, so a reader knows its counts are estimates.
+    #[test]
+    fn a_multiplexed_count_is_perfs_scaled_one_and_its_share_is_said() {
+        // An event counted 1,240,000 times over 62% of the phase is scaled to 2,000,000.
+        let text = perf_csv([
+            ("instructions:u", "2000000", "62.00"),
+            ("cycles:u", "1500000", "75.00"),
+            ("L1-dcache-loads:u", "800000", "75.00"),
+            ("L1-dcache-load-misses:u", "40000", "75.00"),
+            ("cache-references:u", "6000", "87.00"),
+            ("cache-misses:u", "1500", "87.00"),
+            ("branch-misses:u", "3000", "62.00"),
+            ("dTLB-load-misses:u", "200", "75.00"),
+        ]);
+        let counters = Counters::parse(&text);
+        assert_eq!(counters.instructions, Some(2_000_000));
+        assert_eq!(counters.l1d_misses, Some(40_000));
+        assert_eq!(counters.counted, Some(0.62));
+        assert_eq!(
+            cache_columns(Some(&counters), 100),
+            " l1d_loads/op 8000.0 l1d_misses/op 400.0 cache_refs/op 60.0 cache_misses/op 15.0 \
+             branch_misses/op 30.0 dtlb_misses/op 2.0 perf_counted 0.62"
+        );
     }
 
     /// A listing's keys are its set's, each after the one before it as S3 orders keys, byte by

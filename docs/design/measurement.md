@@ -306,11 +306,27 @@ stock clients stay the correctness suite.
 - **Measures per operation**: allocations, reallocations, moved reallocations, bytes asked, peak
   live heap per request and per connection (the servers' peak over a phase above what they held
   as it began, over the most requests out at once and over the connections the phase held), minor
-  and major faults, user and system CPU, instructions and cycles where the OS counts them, context
-  switches, wire bytes (the native door's its clients' sockets' UDP payload, the HTTP door's octets
-  on TCP), datagrams on the native door, and latency at p50, p99, p99.9, p99.99 and max from each
-  request's intended start; per connection, the memory slope at two connection counts (§10) and
-  the handshake's counts (70 [2][4][5]).
+  and major faults, user and system CPU, instructions and cycles where the OS counts them, the
+  caches' use below, context switches, wire bytes (the native door's its clients' sockets' UDP
+  payload, the HTTP door's octets on TCP), datagrams on the native door, and latency at p50, p99,
+  p99.9, p99.99 and max from each request's intended start; per connection, the memory slope at
+  two connection counts (§10) and the handshake's counts (70 [2][4][5]).
+- **Cache use**, under `--perf` (Linux): the `perf stat` run that counts the servers' user-space
+  instructions and cycles counts beside them, and the phase line says after `cycles/op`, each an
+  operation: `l1d_loads/op` and `l1d_misses/op`, the L1 data cache's loads and the loads it missed
+  (`L1-dcache-loads`, `L1-dcache-load-misses`; on Zen its accesses and its misses that went to the
+  L2); `cache_refs/op` and `cache_misses/op`, the kernel's generic cache events, which on Intel
+  count the requests to the last-level cache and those that missed it, on AMD's Zen cores the
+  L2's requests and its misses of instruction- and data-cache requests, those that go on to the
+  L3 (Zen counts no `LLC-load-misses`), and on Arm the L1 data cache's accesses and refills, as
+  its `l1d_` columns do; `branch_misses/op`, the branches mispredicted; and `dtlb_misses/op`, the
+  loads whose translation the data TLBs did not hold, each a page-table walk (70 [26]). An event
+  the CPU or kernel does not count (`<not supported>`) or that never ran (`<not counted>`) is a
+  dash, never a zero. Eight events can outnumber a core's counters, and the kernel then
+  multiplexes them, each counted part of its measurement time: perf scales each count by the
+  time its event was enabled over the time it ran, an estimate, and the line says the least share
+  of its measurement time any event was counted, `perf_counted`, 1.00 where none was multiplexed
+  (70 [25]).
 - **The write path**, in every build: each server answers `counts` with its log's frames, their
   updates and its flushes (hyper-log's `LogStats`), and the entries it proposed as a range's leader
   and their commands, since it began, and its log's commit-wait p50, p99 and longest since it was

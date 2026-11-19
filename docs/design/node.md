@@ -2465,9 +2465,10 @@ half the node's task keeps (`Replies::driving`, lent to the feeding) carries the
 runs on that shard, set as its fields are read for the hand-off (`Node::read_fields`) and taken off
 where the lane refuses it. The job wakes the node's task's waker, which its own half carries while
 it runs there (`Native::node`), as it gives its door an answer (`Native::flush`), takes a piece of
-its body, the next then readable (`feed_put`), says its work is held, or lets go of its body
-(`Native::drop_body`), as an S3 connection on another shard wakes it after each piece it sends
-(`door::Submitter::wake`). Why a `Notify` and not a lane message: hyper-rt's `Notify` is an atomic
+its body, the next then readable (`feed_put`), says its work is held where the node's task took its
+last word (`Native::held`: it vouches once a word, and a held job says so at each of its shard's
+steps), or lets go of its body (`Native::drop_body`), as an S3 connection on another shard wakes it
+after each piece it sends (`door::Submitter::wake`). Why a `Notify` and not a lane message: hyper-rt's `Notify` is an atomic
 waker with a permit (one waiter registered in its cell, woken by `notify_one`, a notification with
 no waiter kept for the next wait), so no wake is lost and none takes a place in a lane; a message
 the lane had no room for would be dropped, and a full lane's older messages order nothing after

@@ -670,12 +670,17 @@ impl Native {
         self.handed.gone.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Says its work is held: the node's task vouches for it at its next write.
+    /// Says its work is held: the node's task vouches for it at its next write, woken where it
+    /// runs on a driving shard only where the node's task took the last word, as it vouches once
+    /// for each it takes.
     fn held(&self) {
-        self.handed
+        if !self
+            .handed
             .held
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.wake_node();
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.wake_node();
+        }
     }
 
     /// Lets go of its body: the node's task reads and drops the rest.

@@ -1138,7 +1138,7 @@ fn main() -> ExitCode {
             };
             client::run(&dir, door, command, std::io::stdout()).map_err(|e| e.to_string())
         });
-        return exit(ran);
+        return exit(written(ran, &mut std::io::stdout()));
     }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -1425,7 +1425,16 @@ fn main() -> ExitCode {
             }
         }
     };
-    exit(result)
+    exit(written(result, &mut out))
+}
+
+/// A command's result once what it wrote to `out` is out: a flush the OS refuses fails the command, as
+/// its results did not all reach their reader. Standard output holds a line not yet ended until a flush,
+/// and the one at the process's exit drops its error; the command's own failure, if it had one, is said
+/// first.
+fn written(result: Result<(), String>, out: &mut impl Write) -> Result<(), String> {
+    let flushed = out.flush().map_err(|e| format!("writing output: {e}"));
+    result.and(flushed)
 }
 
 /// `mantle bench doors`' sizes, sets, clients, operations, bytes and volumes: the flags given, each
@@ -1582,6 +1591,61 @@ fn exit(result: Result<(), String>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Standard output whose OS refuses every write (`EPIPE`, a reader gone), or holds the bytes and
+    /// refuses them at the flush, as a buffered stream's last line is refused.
+    struct Refused {
+        held: bool,
+    }
+
+    impl Write for Refused {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.held {
+                Ok(buf.len())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// A command whose results the OS refused exits non-zero, the refusal said: one refused as it
+    /// writes (`mantle durability`'s lines), and one whose lines were taken and then refused at the
+    /// flush its end makes. A command whose output went out exits zero.
+    #[test]
+    fn a_command_whose_output_is_refused_exits_non_zero() {
+        let options = durability::Options {
+            domains: 9,
+            annual_failure: 0.02,
+            repair_hours: 24.0,
+            bursts: Vec::new(),
+            zones: None,
+            target: 1e-11,
+        };
+        let mut out = Refused { held: false };
+        let ran = durability::durability(&mut out, &options);
+        assert!(ran.is_err(), "a refused write fails the command");
+        assert_eq!(exit(written(ran, &mut out)), ExitCode::FAILURE);
+
+        let mut out = Refused { held: true };
+        let ran = durability::durability(&mut out, &options);
+        assert_eq!(ran, Ok(()), "every write was taken");
+        let said = written(ran, &mut out);
+        assert!(
+            said.as_ref()
+                .is_err_and(|e| e.starts_with("writing output: ")),
+            "the flush's refusal is said: {said:?}"
+        );
+        assert_eq!(exit(said), ExitCode::FAILURE);
+
+        let mut out = Vec::new();
+        let ran = durability::durability(&mut out, &options);
+        assert_eq!(exit(written(ran, &mut out)), ExitCode::SUCCESS);
+        assert!(!out.is_empty(), "the command wrote its lines");
+    }
 
     /// `mantle bench doors --range-shards` states the shards each server places its ranges over,
     /// `first` where not given, and refuses another word (node.md §2.9).

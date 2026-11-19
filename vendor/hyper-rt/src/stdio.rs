@@ -13,7 +13,9 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::RtError;
-use crate::sync::{ChannelReceiver, OneshotSender, Sender, channel, oneshot};
+use crate::sync::{
+    ChannelReceiver, OneshotReceiver, OneshotSender, Sender, SyncError, channel, oneshot,
+};
 
 static STDIN_TAKEN: AtomicBool = AtomicBool::new(false);
 static STDOUT_TAKEN: AtomicBool = AtomicBool::new(false);
@@ -134,10 +136,58 @@ impl Stdin {
 }
 
 /// The process's standard output, written by a task.
+///
+/// **A failure ends the writer, and says why** (mantle: vendor/UPSTREAM.md). The first write or flush the
+/// OS refuses ends the writer thread: nothing handed over after it is written, so the output never goes on
+/// past a hole. The thread sends what ended it, the OS's error code where the OS gave one, and every call
+/// after it is refused with that, never a bare "closed": a reader gone (`EPIPE`), a full disk (`ENOSPC`)
+/// and a non-blocking descriptor with no room (`EAGAIN`) each say themselves (`tests/stdout_long_run.rs`).
 #[derive(Debug)]
 pub struct Stdout {
     out: Sender<OutMessage>,
     empty: ChannelReceiver<Vec<u8>>,
+    /// What ended the writer thread.
+    ended: Ended,
+}
+
+/// What ended a stdout's writer thread, as its writer hears it.
+#[derive(Debug)]
+struct Ended {
+    /// Sent by the thread before its ends of the channels go.
+    said: OneshotReceiver<RtError>,
+    /// What was said, once a call has taken it, for every call after.
+    kept: Option<RtError>,
+    /// The writers the channel to the thread holds waiting for room at once.
+    places: usize,
+}
+
+impl Ended {
+    /// What a hand-off to or from the writer thread that was refused `e` means: the thread's end where a
+    /// channel closed, else the hand-off's own refusal (a poll off a shard, or every waiting place held).
+    fn of<T>(&mut self, e: &SyncError<T>) -> RtError {
+        match e {
+            SyncError::Closed(_) => self.why(),
+            SyncError::NotOnShardThread(_) => RtError::NotOnShardThread,
+            SyncError::Full(_) => RtError::Capacity {
+                what: "stdout's writers waiting for room",
+                bound: self.places,
+            },
+        }
+    }
+
+    /// What the thread said, kept for every call after; where it said nothing, that it ended (its closure
+    /// unwound, the one way it ends with a writer left and nothing said).
+    fn why(&mut self) -> RtError {
+        let why = match self.kept.take() {
+            Some(why) => why,
+            None => match self.said.try_recv() {
+                Ok(Some(why)) => why,
+                Ok(None) | Err(_) => ENDED,
+            },
+        };
+        self.kept = Some(why.clone());
+        why
+    }
 }
 
 /// What the writer thread is handed.
@@ -147,8 +197,20 @@ struct OutMessage(OutInner);
 #[derive(Debug)]
 enum OutInner {
     Bytes(Vec<u8>),
-    Flush(OneshotSender<bool>),
+    /// Answered once everything before it reached the handle; dropped unanswered when the writer ended.
+    Flush(OneshotSender<()>),
 }
+
+/// Format: a write of standard output's calls, as an error names them: with the OS's code, and with none.
+const WRITE: (&str, &str) = (
+    "write(stdout)",
+    "write(stdout): the OS took none of the bytes",
+);
+/// Format: a flush of standard output's calls, as [`WRITE`].
+const FLUSH: (&str, &str) = (
+    "flush(stdout)",
+    "flush(stdout): the OS took none of the bytes",
+);
 
 /// Takes the process's standard output: `depth` buffers of `chunk` bytes. Refused `BadConfig` when taken
 /// already.
@@ -161,31 +223,79 @@ pub fn stdout(depth: usize, chunk: usize) -> Result<Stdout, RtError> {
     let (empty_tx, empty_rx) = pool(depth, chunk)?;
     // One more than the buffers, for a flush queued behind a full set of them.
     let (out_tx, mut out_rx) = channel::<OutMessage>(depth.saturating_add(1))?;
+    let (says, ended) = oneshot::<RtError>()?;
     thread("hyper-rt-stdout", move || {
         // Locked per message, not for the thread's life, so other writers in the process (a log line)
         // interleave between chunks rather than wait forever.
         let output = std::io::stdout();
-        let mut failed = false;
-        while let Ok(OutMessage(message)) = out_rx.blocking_recv() {
-            match message {
-                OutInner::Bytes(mut buffer) => {
-                    failed |= output.lock().write_all(&buffer).is_err();
-                    buffer.clear();
-                    if empty_tx.blocking_send(buffer).is_err() {
+        loop {
+            let Ok(OutMessage(message)) = out_rx.blocking_recv() else {
+                // Every writer is gone: nothing more to write and no one to tell.
+                return;
+            };
+            let why = match message {
+                OutInner::Bytes(mut buffer) => match output.lock().write_all(&buffer) {
+                    Err(e) => refused(WRITE, &e),
+                    Ok(()) => {
+                        buffer.clear();
+                        match empty_tx.blocking_send(buffer) {
+                            Ok(()) => continue,
+                            // The writer's pool went with the writer.
+                            Err(SyncError::Closed(_)) => return,
+                            Err(SyncError::Full(_)) => RtError::Capacity {
+                                what: "stdout's buffers handed back to its writer",
+                                bound: depth,
+                            },
+                            Err(SyncError::NotOnShardThread(_)) => RtError::BadConfig {
+                                what: "stdout's writer thread runs a shard",
+                            },
+                        }
+                    }
+                },
+                OutInner::Flush(done) => match output.lock().flush() {
+                    Ok(()) => {
+                        // A flush its writer stopped waiting for has no one to answer.
+                        let _ = done.send(());
+                        continue;
+                    }
+                    Err(e) => {
+                        // Said before the flush's answer goes unsent (`done`, dropped by the return), so
+                        // the writer woken by that finds why.
+                        let _ = says.send(refused(FLUSH, &e));
                         return;
                     }
-                }
-                OutInner::Flush(done) => {
-                    failed |= output.lock().flush().is_err();
-                    let _ = done.send(!failed);
-                }
-            }
+                },
+            };
+            // Said before the channels go (the return drops them), so a writer that finds them closed
+            // finds why; a writer gone has no one to hear it.
+            let _ = says.send(why);
+            return;
         }
     })?;
     Ok(Stdout {
         out: out_tx,
         empty: empty_rx,
+        ended: Ended {
+            said: ended,
+            kept: None,
+            places: depth.saturating_add(1),
+        },
     })
+}
+
+/// The OS's refusal of `call` on standard output, with its error code. The one failure with no code is a
+/// write the OS took none of (std's `WriteZero`), said as `uncoded`.
+fn refused((call, uncoded): (&'static str, &'static str), e: &std::io::Error) -> RtError {
+    match e.raw_os_error() {
+        Some(code) => RtError::DriverRefused {
+            call,
+            code: Some(code),
+        },
+        None => RtError::DriverRefused {
+            call: uncoded,
+            code: None,
+        },
+    }
 }
 
 impl Stdout {
@@ -197,37 +307,46 @@ impl Stdout {
     /// may answer `Pending` with its operation undone, the task's turn spent (`crate::coop`); a buffer held
     /// across the hand-off's await was dropped with such a write, and once the pool's every buffer had gone so,
     /// the next write waited for good for one no thread would hand back (`tests/stdout_dropped_write.rs`).
+    ///
+    /// Refused with what ended the writer thread once it ended ([`Stdout`]): bytes handed over before a
+    /// failure the thread had not yet met are refused by the next call, a flush at the latest.
     pub async fn write_all(&mut self, mut buf: &[u8]) -> Result<(), RtError> {
         while !buf.is_empty() {
-            let room = self.out.reserve().await.map_err(|_| closed())?;
-            let mut buffer = self.empty.recv().await.map_err(|_| closed())?;
+            let room = match self.out.reserve().await {
+                Ok(room) => room,
+                Err(e) => return Err(self.ended.of(&e)),
+            };
+            let mut buffer = match self.empty.recv().await {
+                Ok(buffer) => buffer,
+                Err(e) => return Err(self.ended.of(&e)),
+            };
             let n = buffer.capacity().min(buf.len());
             let (now, rest) = buf.split_at(n);
             buffer.extend_from_slice(now);
             buf = rest;
-            room.send(OutMessage(OutInner::Bytes(buffer)))
-                .map_err(|_| closed())?;
+            if let Err(e) = room.send(OutMessage(OutInner::Bytes(buffer))) {
+                return Err(self.ended.of(&e));
+            }
         }
         Ok(())
     }
 
-    /// Waits until everything written so far is flushed to the handle; refused when a write failed.
+    /// Waits until everything written so far is flushed to the handle; refused with what ended the writer
+    /// thread when a write or flush failed ([`Stdout`]).
     pub async fn flush(&mut self) -> Result<(), RtError> {
         let (done, flushed) = oneshot()?;
-        self.out
-            .send(OutMessage(OutInner::Flush(done)))
-            .await
-            .map_err(|_| closed())?;
+        if let Err(e) = self.out.send(OutMessage(OutInner::Flush(done))).await {
+            return Err(self.ended.of(&e));
+        }
         match flushed.await {
-            Ok(true) => Ok(()),
-            _ => Err(closed()),
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.ended.of(&e)),
         }
     }
 }
 
-fn closed() -> RtError {
-    RtError::DriverRefused {
-        call: "write(stdout)",
-        code: None,
-    }
-}
+/// What a writer hears from a writer thread that ended without saying why.
+const ENDED: RtError = RtError::DriverRefused {
+    call: "write(stdout): the writer thread ended",
+    code: None,
+};

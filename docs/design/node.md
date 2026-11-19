@@ -1616,7 +1616,11 @@ and the S3 door's accept, which hands each connection on (§4.1). With one shard
      (`door::Depth`), and whose answers the node's task writes to the exchange from a channel at the
      depth a reply needs (`door::Replying`), as an S3 connection does for its job (`Door::Local`).
      The node's task keeps the exchange: its vouching (`Endpoint::working`) and its end
-     (`Node::job_lost`).
+     (`Node::job_lost`). What the node's task does for the exchange is the exchange's half of what
+     the job does now: a body's pieces read as `feed_put` reads them and given as an S3 connection
+     gives them (`door::Piece`, its end carrying the trailer's checksum), and a reply's head, fields
+     and bytes written as `write_fields` and `write_get` write them. So it may land as two: the
+     body, then the reply.
    - *6d, a host of its own* (`host::Job` and the host's `impl Node`; `Node`'s `jobs`, `abandoned`,
      `gateway`, `moved`, `slowed`): the jobs and what they hold move from `Node` into a `host::Host`
      that the node's task holds and steps, its asks (6b) served by the node, its doors (6c) channels

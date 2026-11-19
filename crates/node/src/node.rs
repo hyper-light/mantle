@@ -1484,8 +1484,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     issuer: Option<crate::enroll::Issuer>,
     /// The written-off nodes' requests this node holds, at most `command_asks`
     /// (`enrollments`), and the highest issuer's grant its own re-grants spent, which the root
-    /// range's rows may not yet hold.
-    enrollments: Vec<enrollments::Enrollment>,
+    /// range's rows may not yet hold. Each request found by its own exchange, and one forwarded to
+    /// the leader by its forward's (`keyed::KeyedOn`), as either ends, in one probe; each turn's
+    /// step walks them all.
+    enrollments: KeyedOn<enrollments::Enrollment>,
     issuer_spent: u64,
     /// The members whose reach names a host the process looks up, not yet taken
     /// ([`Node::take_reached`]): at most the cell's members.
@@ -1897,7 +1899,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             max_nodes: settings.max_nodes,
             duties: Vec::new(),
             issuer: settings.issuer,
-            enrollments: Vec::new(),
+            enrollments: KeyedOn::default(),
             issuer_spent: 0,
             reached: Vec::new(),
         };
@@ -3479,9 +3481,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 if self.read_on(exchange).is_some() {
                     return self.read_replied(exchange, body.unwrap_or(0), now);
                 }
-                // A search of the enrollments held, at most `command_asks` and only while written-off
-                // nodes enroll, as many at once as their connections (`Peers::enrollments_at_once`):
-                // usually none.
+                // A probe of the enrollments' forwards (`KeyedOn::on`).
                 if self.forwarded_on(exchange) {
                     return self.forward_replied(exchange, body);
                 }

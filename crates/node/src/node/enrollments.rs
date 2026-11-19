@@ -23,6 +23,7 @@ use mantle_protocol::bounds;
 use mantle_protocol::classes::Kind;
 use mantle_protocol::enroll::{self as wire, Granted, Member, Request};
 
+use super::keyed::{Key, On};
 use super::{Arriving, Body, Node, NodeError, NodeLog, Receiving, Then, Writing};
 use crate::ask::{CommandAsk, CommandOutcome, Wait};
 use crate::directory::Enrolling;
@@ -39,6 +40,29 @@ pub(super) struct Enrollment {
     forwarded: bool,
     until_ns: u64,
     stands: Stands,
+}
+
+/// A request found by its own exchange, the one its answer goes on: one a request, its body's
+/// (`Node::enrollment_lost`).
+impl Key for Enrollment {
+    type Of = ExchangeId;
+
+    fn key(&self) -> ExchangeId {
+        self.exchange
+    }
+}
+
+/// And by the exchange it is forwarded on to the leader, while it is: its answer's, or its loss
+/// (`Node::forwarded_on`, `Node::forward_answered`, `Node::enrollment_lost`).
+impl On for Enrollment {
+    type By = ExchangeId;
+
+    fn on(&self) -> Option<ExchangeId> {
+        match self.stands {
+            Stands::Forwarded(out) => Some(out),
+            Stands::Waiting | Stands::Proposed { .. } | Stands::Removing { .. } => None,
+        }
+    }
 }
 
 enum Stands {
@@ -123,7 +147,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             return self.answer_enrollment(exchange, &wire::Answer::Refused(refusal_of(refused)));
         }
         let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap_or(u64::MAX);
-        self.enrollments.push(Enrollment {
+        // An exchange carries one request, so none is displaced; one that were is let go.
+        let displaced = self.enrollments.push(Enrollment {
             exchange,
             enrolling,
             key,
@@ -131,6 +156,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             until_ns: now.saturating_add(patience),
             stands: Stands::Waiting,
         });
+        if let Some(displaced) = displaced {
+            self.let_go(displaced);
+        }
         self.step_enrollments(now)
     }
 
@@ -142,7 +170,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     pub(super) fn step_enrollments(&mut self, now: u64) -> Result<(), NodeError> {
         let mut at = 0;
         while at < self.enrollments.len() {
-            let Some(held) = self.enrollments.get(at) else {
+            let Some(held) = self.enrollments.at(at) else {
                 break;
             };
             let (exchange, until_ns, old) = (held.exchange, held.until_ns, held.enrolling.old);
@@ -178,7 +206,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             };
             match answer {
                 Some(answer) => {
-                    let mut held = self.enrollments.swap_remove(at);
+                    let Some(mut held) = self.enrollments.take(at) else {
+                        break;
+                    };
                     // A proposal whose outcome was taken leaves nothing to drop.
                     if taken {
                         held.stands = Stands::Waiting;
@@ -212,10 +242,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 self.propose_regrant(at, group)?;
                 break;
             }
-            let forwarded = self.enrollments.get(at).is_some_and(|e| e.forwarded);
+            let forwarded = self.enrollments.at(at).is_some_and(|e| e.forwarded);
             if forwarded {
-                let exchange = self.enrollments.swap_remove(at).exchange;
-                self.answer_enrollment(exchange, &wire::Answer::Refused(wire::Refusal::Unled))?;
+                let Some(held) = self.enrollments.take(at) else {
+                    break;
+                };
+                let refused = wire::Answer::Refused(wire::Refusal::Unled);
+                self.answer_enrollment(held.exchange, &refused)?;
                 // The indices after it moved: the rest wait for the next turn.
                 break;
             }
@@ -226,9 +259,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Request `at` stands at `stands` from here.
     fn stand(&mut self, at: usize, stands: Stands) {
-        if let Some(held) = self.enrollments.get_mut(at) {
-            held.stands = stands;
-        }
+        self.enrollments.change_at(at, |held| held.stands = stands);
     }
 
     /// Whether the root range's rows, as this node last read them, hold node `old` removed or no
@@ -247,7 +278,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// system, the issuer window's next grant, the certificate the issuer signs for them, and the
     /// `Regrant` proposed. A request the issuer refuses is answered so.
     fn propose_regrant(&mut self, at: usize, group: u128) -> Result<(), NodeError> {
-        let Some(held) = self.enrollments.get(at) else {
+        let Some(held) = self.enrollments.at(at) else {
             return Ok(());
         };
         let (enrolling, key, exchange) = (held.enrolling, held.key, held.exchange);
@@ -276,7 +307,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let regrant = match regrant {
             Ok(regrant) => regrant,
             Err(refusal) => {
-                self.enrollments.swap_remove(at);
+                self.enrollments.take(at);
                 return self.answer_enrollment(exchange, &wire::Answer::Refused(refusal));
             }
         };
@@ -287,14 +318,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             u64::MAX,
             Wait::Request,
         )?;
-        if let Some(held) = self.enrollments.get_mut(at) {
+        self.enrollments.change_at(at, |held| {
             held.stands = Stands::Proposed {
                 ask,
                 node,
                 grant,
                 certificate,
             };
-        }
+        });
         Ok(())
     }
 
@@ -302,7 +333,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// written-off node's handshake proved; none known, it waits for the next turn.
     fn forward_enrollment(&mut self, at: usize, group: u128, now: u64) -> Result<(), NodeError> {
         let leader = self.leader_of(group);
-        let Some(held) = self.enrollments.get(at) else {
+        let Some(held) = self.enrollments.at(at) else {
             return Ok(());
         };
         if leader == 0 || leader == self.id {
@@ -327,9 +358,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         else {
             return Ok(());
         };
-        if let Some(held) = self.enrollments.get_mut(at) {
-            held.stands = Stands::Forwarded(out);
-        }
+        self.enrollments
+            .change_at(at, |held| held.stands = Stands::Forwarded(out));
         self.writing.push(Writing {
             exchange: out,
             bytes: Body::Made(body),
@@ -340,11 +370,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Whether `exchange` is a request this node forwarded to the leader.
+    /// Whether `exchange` is a request this node forwarded to the leader: one probe of the
+    /// requests' forwards (`KeyedOn::on`).
     pub(super) fn forwarded_on(&self, exchange: ExchangeId) -> bool {
-        self.enrollments
-            .iter()
-            .any(|e| matches!(e.stands, Stands::Forwarded(out) if out == exchange))
+        self.enrollments.on(exchange).is_some()
     }
 
     /// The leader replied to a forward on `exchange`: its answer, the reply's body, read whole
@@ -357,8 +386,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let body = body.unwrap_or(0);
         let Some(peer) = self
             .enrollments
-            .iter()
-            .find(|e| matches!(e.stands, Stands::Forwarded(out) if out == exchange))
+            .on(exchange)
+            .and_then(|own| self.enrollments.get(own))
             .map(|e| e.enrolling.old)
         else {
             return Ok(());
@@ -382,22 +411,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         bytes: &[u8],
     ) -> Result<(), NodeError> {
         self.driver.endpoint().end(exchange);
-        let Some(at) = self
-            .enrollments
-            .iter()
-            .position(|e| matches!(e.stands, Stands::Forwarded(out) if out == exchange))
-        else {
+        let Some(origin) = self.enrollments.on(exchange) else {
             return Ok(());
         };
         let answer =
             wire::Answer::decode(bytes).unwrap_or(wire::Answer::Refused(wire::Refusal::Unanswered));
         if answer == wire::Answer::Refused(wire::Refusal::Unled) {
-            if let Some(held) = self.enrollments.get_mut(at) {
-                held.stands = Stands::Waiting;
-            }
+            self.enrollments
+                .change(origin, |held| held.stands = Stands::Waiting);
             return Ok(());
         }
-        let origin = self.enrollments.swap_remove(at).exchange;
+        self.enrollments.remove(origin);
         self.answer_enrollment(origin, &answer)
     }
 
@@ -416,16 +440,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// `exchange` ended without its answer: a request whose own exchange it was is let go, and
-    /// one forwarded on it waits to be forwarded again.
+    /// one forwarded on it waits to be forwarded again. Each found in one probe, by its own
+    /// exchange and by its forward's (`KeyedOn`), at every `Refused` the node hears.
     pub(super) fn enrollment_lost(&mut self, exchange: ExchangeId) {
-        while let Some(at) = self.enrollments.iter().position(|e| e.exchange == exchange) {
-            let held = self.enrollments.swap_remove(at);
+        if let Some(held) = self.enrollments.remove(exchange) {
             self.let_go(held);
         }
-        for held in &mut self.enrollments {
-            if matches!(held.stands, Stands::Forwarded(out) if out == exchange) {
-                held.stands = Stands::Waiting;
-            }
+        if let Some(own) = self.enrollments.on(exchange) {
+            self.enrollments
+                .change(own, |held| held.stands = Stands::Waiting);
         }
     }
 
@@ -460,7 +483,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// holds for its old identity, the issuer's and the members' places, or the refusal.
     fn regrant_answer(&mut self, at: usize, outcome: CommandOutcome) -> wire::Answer {
         let refused = wire::Answer::Refused;
-        let Some(held) = self.enrollments.get(at) else {
+        let Some(held) = self.enrollments.at(at) else {
             return refused(wire::Refusal::Unanswered);
         };
         let outcome = match outcome {

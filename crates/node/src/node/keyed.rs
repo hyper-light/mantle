@@ -1313,6 +1313,72 @@ pub(super) mod tests {
         assert_eq!(commanded.len(), usize::try_from(IN_FLIGHT).unwrap());
     }
 
+    /// A lost exchange (`Event::Refused`, a forward's bytes refused) lets go of the written-off
+    /// node's request whose own exchange it was and puts one forwarded on it back to waiting
+    /// (`Node::enrollment_lost`), each found in one probe (`Node::enrollments`, by its own exchange
+    /// and by its forward's): 1,024 requests held, every other one forwarded to the leader; a loss
+    /// on each of 2,048 exchanges neither holds, then on each forward's, then on each request's
+    /// own. Before, each loss walked the requests for its own until none was left, then every
+    /// request for a forward on it.
+    #[test]
+    fn a_lost_exchange_finds_its_enrollment_with_no_scan() {
+        const HELD: u64 = 1024;
+        let mut enrollments = KeyedOn::default();
+        for exchange in 0..HELD {
+            let forward = (exchange % 2 == 0).then(|| 10_000 + exchange);
+            enrollments.push(Out(exchange, forward));
+        }
+        // What `enrollment_lost` visited: each request up to the one whose own exchange it was,
+        // and again past it to find no other, then every request for a forward on it.
+        let walked = |enrollments: &KeyedOn<Out>, exchange: u64| {
+            let held = enrollments.len();
+            match enrollments.iter().position(|e| e.0 == exchange) {
+                Some(at) => at + 1 + 2 * (held - 1),
+                None => 2 * held,
+            }
+        };
+        let others: Vec<u64> = (100_000..100_000 + 2048).collect();
+        let forwards: Vec<u64> = (0..HELD).step_by(2).map(|e| 10_000 + e).collect();
+        let (mut before, mut after) = ([0; 3], [0; 3]);
+        probes();
+        for &exchange in &others {
+            before[0] += walked(&enrollments, exchange);
+            assert!(enrollments.remove(exchange).is_none() && enrollments.on(exchange).is_none());
+        }
+        after[0] = probes();
+        for &exchange in &forwards {
+            before[1] += walked(&enrollments, exchange);
+            assert!(enrollments.remove(exchange).is_none());
+            let own = enrollments.on(exchange).unwrap();
+            assert_eq!(enrollments.change(own, |e| e.1 = None), Some(()), "waiting");
+        }
+        after[1] = probes();
+        for exchange in 0..HELD {
+            before[2] += walked(&enrollments, exchange);
+            assert!(enrollments.remove(exchange).is_some() && enrollments.on(exchange).is_none());
+        }
+        after[2] = probes();
+        println!(
+            "{HELD} requests held, every other forwarded: a loss on {} other exchanges {} probes \
+             ({} visited by the walks), on each forward's {} ({}), on each request's own {} ({})",
+            others.len(),
+            after[0],
+            before[0],
+            after[1],
+            before[1],
+            after[2],
+            before[2]
+        );
+        assert_eq!(after[0], 2 * others.len(), "two probes a loss");
+        assert_eq!(after[1], 3 * forwards.len(), "three, its request changed");
+        assert_eq!(
+            after[2],
+            2 * usize::try_from(HELD).unwrap(),
+            "two probes a loss"
+        );
+        assert!(enrollments.is_empty());
+    }
+
     /// Pushes, removals from the front, the middle and the end, a displacing push and a
     /// renumbering at a `u64`'s end each keep the places exact (the audit after each change), and
     /// the entries left come out in the order they came.

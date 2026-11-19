@@ -2293,8 +2293,9 @@ running no job waits on nothing; a job whose ask is out is due at its client's p
 the ask's answer is held, at once. The host, node and derive unit tests and tests/put_body.rs
 pass.
 
-What 6e needs still, as worked out (none of it built): the lanes, in `node::driving` beside
-`node::shard`, and the body's channel kept with its door.
+What 6e needed still, as worked out: the lanes, in `node::driving` beside `node::shard`, and the
+body's channel kept with its door. Built since (below): a native door's exchange optional, a job's
+end carrying its door's half, and the body's channel kept with its door; the lanes are not.
 
 - *The answer slots, pooled.* `hyper_rt::sync::oneshot` boxes the block its ends share and makes
   its ring at each one made (`ring::Shared::new`, `Ring::new`), so a slot made as it is asked
@@ -2345,6 +2346,65 @@ What 6e needs still, as worked out (none of it built): the lanes, in `node::driv
   the channel closed, read before the channel so a piece given before it is taken first); and
   `Doors::keep` empties the body's channel as it empties the reply's. Shown by the door's
   allocation count over 64 puts, as the reply's is (0 allocations).
+
+*As built (2026-11-18), step 6's fifth part, its second piece: a handed request needs no exchange*
+(6e, `crates/node/src/node/host.rs`). `Door::Native` holds an `Option<ExchangeId>`: the node's task
+names the exchange of each request it reads the fields of, and a request handed with its fields
+read names none, as only hyper-transport makes an `ExchangeId` and the job needs none, its body and
+reply going through its door. The node's lookups by exchange (`hosts`, `job_lost`, the reply's job
+in `write_replies`) find no handed job, and a handed job reads no fields, as a local one reads none.
+Tested (`node::host`): a native put and get handed with no exchange, driven only through `Serve`
+by the stub, take the put's body's end from its door and give each reply to the node's task's half
+of the door, which writes it whole (`Done`, the version written; `Done`, no bytes); each job's half
+comes back as it ends, and each door is kept once its reply's half is given back.
+
+*As built (2026-11-18), its third piece: a job's end carries its door's half* (6e,
+`crates/node/src/node/host.rs`). `Serve::job_ended` takes the ended job's native half (`Native`),
+told first that its job let go (`Handed::ended`), so the node's task writes nothing past what it
+gave wherever the half is kept, and gives back what the host keeps: the node gives the half back,
+kept in its host's doors as before; a driving shard's lanes will take it to the node's task, which
+holds the door's other half, so a driving shard's host keeps no doors and no half waits there for
+one it never sees. Tested (`node::host`): given back, the host keeps the half and the door once its
+reply's half is back; taken, as the lanes will take it, the host keeps nothing, and the node's
+task's doors keep the door whole once both halves are back.
+
+*As built (2026-11-18), its fourth piece: a put's body channel kept with its door* (6e,
+`crates/node/src/node/host.rs`). The body's channel is made with the door (`native_door`) and kept
+with it: its receiver in the job's half (`Native::body`), its sender in the node's task's
+(`Replies::body`), lent to the put's feeding while the node's task reads the body (`read_fields`,
+`feed`) and given back as the feeding is let go (`Feeding::let_go`): at its end, its exchange's
+failure or its job's drop (`feed_bodies`), its exchange's end (`job_lost`), or its reply's end
+(`write_replies`), always before its door's half goes back, so no feeding outlives the door it
+reads for. What the channel's ends' drops said is two words in `Handed`: the job let go of its
+body (`dropped`, set by `drain_job`, or of its door, `ended`), so the feeding reads and drops the
+rest, and does so at its next turn rather than waiting for a piece the job never takes to free its
+storage; and the node's task let go of it (`cut`, set as the feeding is let go), which the job
+reads before the channel (`take_body`), so a piece given before it is taken first and the body is
+then `IncompleteBody`; a job that took the body's end reads neither. `Doors::keep` empties the
+body's channel as it empties the reply's, clears both words, and keeps no door whose body sender is
+not back. A put whose door has lent its sender already, which none has, is answered `SlowDown`, as
+one whose channel could not be made was. Bound: one piece in the channel (`door::Depth::FIRST`), as
+before, and a door's two channels at most one a door kept (`Doors`). Copies: none changed.
+Allocations: a door made asks the allocator for its body's channel beside its reply's, once; past
+it a put asks nothing for its channels. Tested (`node::host`): 64 puts past the first take the one
+door kept and ask the allocator for nothing (0 allocations, 0 reallocations); with a body of four
+pieces each, only the feeding's storage, made and shared once a put as before (`BytesMut::split`
+promotes the storage to one its views share: 2 allocations a put, 0 reallocations); a job that let
+go has the rest dropped; a feeding let go tells its job its body did not come whole once it took
+the piece given before; a kept door's words are cleared. The host and node unit tests and
+tests/put_body.rs pass.
+
+What 6e needs still: the lanes (`node::driving`), as the list above works them out, and with them
+a handed request carrying its operation (`Op`) for the shard to make its work, and the task
+reachable from production. These three land as one: with no `#[allow(dead_code)]`, the request a
+lane carries, the function that makes its work on the shard and the task that takes it are
+reachable from production only through a node's turn that hands a request to a driving lane where
+one is held for its shard, which production leaves empty until 6f; so that hand-off, a request's
+fields read and its operation handed rather than made into work (`read_fields`), with a lane's
+refusal running it on the first shard, lands with the lanes. And the volume table handed in needs a
+settled copy of the node's (`Table` is not `Clone`; its scheme's choice may be pending on the pool,
+`Scheming`), and the host's count of bytes moved (`Host::moved`) a way to the node's sum
+(`Node::moved`), each a lane message or a shared word.
 
 ## 3. Transport
 

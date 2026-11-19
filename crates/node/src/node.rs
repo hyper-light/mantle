@@ -220,8 +220,9 @@ pub struct NodeSettings<E> {
 
 impl<E> NodeSettings<E> {
     /// What the node states of itself for its transport's bounds as it opens ([`Node::open_on`]):
-    /// the nodes it may keep, its pinned nodes and seeds or every member but itself of a cell
-    /// whose members come and go (membership.md §9), which its ranges' messages go to, and the
+    /// the nodes it may keep, its pinned nodes and seeds, each once however many lines name it
+    /// (`derive::nodes_named`), or every member but itself of a cell whose members come and go
+    /// (membership.md §9), which its ranges' messages go to, and the
     /// gateways it pins; its gateway's native clients and the operations they draw on; its ranges,
     /// their appends in flight and the lanes its shards give them; its volumes' transfers and its
     /// chunk asks; its budget and its ranges' message bounds. `derive` gives a node the least
@@ -234,12 +235,14 @@ impl<E> NodeSettings<E> {
             .map(|h| h.range.settings.max_inflight_msgs)
             .max()
             .unwrap_or(0);
-        let pinned_nodes = self
-            .peers
-            .iter()
-            .filter(|p| p.role == Role::Node)
-            .count()
-            .saturating_add(self.seeds.len());
+        let pinned_nodes = crate::derive::nodes_named(
+            self.id,
+            self.peers
+                .iter()
+                .filter(|p| p.role == Role::Node)
+                .map(|p| p.id)
+                .chain(self.seeds.iter().copied()),
+        );
         let node_peers = usize::try_from(self.max_nodes)
             .map_err(|_| NodeError::Bounds("the cell's nodes".into()))?
             .saturating_sub(1)

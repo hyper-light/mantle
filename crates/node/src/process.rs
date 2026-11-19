@@ -2142,7 +2142,12 @@ fn run_node(
             config.volumes.len(),
             config.ranges.len(),
         ),
-        (&config.peers, config.seeds.len(), config.enlist.as_ref()),
+        (
+            config.id,
+            &config.peers,
+            &config.seeds,
+            config.enlist.as_ref(),
+        ),
         listening.is_some() && gateway.is_some(),
         gateway.as_ref().map_or(0, |g| g.objects),
     )

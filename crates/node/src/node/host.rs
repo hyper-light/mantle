@@ -10204,6 +10204,19 @@ pub(super) mod tests {
             }
             std::thread::yield_now();
         }
+        // The shard's jobs' bytes, the put's body taken and the get's given, reach the node's
+        // side of the lanes, summed into the node's count (`Node::moved`).
+        while lanes.moved() != 2 * object.len() as u64 {
+            assert!(
+                std::time::Instant::now() < until,
+                "the shard's count never came: {}",
+                lanes.moved()
+            );
+            lanes
+                .serve(&mut cell, |half| doors.give_native(half))
+                .unwrap();
+            std::thread::yield_now();
+        }
         let put_reply = reply_seen(&put_seen);
         assert_eq!(
             (put_reply.status, put_reply.size),

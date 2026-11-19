@@ -14,8 +14,9 @@
 //! again.
 //!
 //! Out of it ([`Out`]): each ask of its jobs, under a number of the shard's; each job's end, its
-//! door's half riding it to the node's task, which holds the other half; and the put window's
-//! samples. The shard waits for room on its way out, as a range's shard does.
+//! door's half riding it to the node's task, which holds the other half; the put window's
+//! samples; and the bytes its jobs moved, after each step that moved some, which the node's count
+//! sums (`Node::moved`). The shard waits for room on its way out, as a range's shard does.
 //!
 //! The answers, from the node's task to the shard, one an ask: the shard's host holds each kind of
 //! ask to the node's bound for it (`command_asks`, `read_asks`, `chunk_asks`), refusing one past it
@@ -88,6 +89,9 @@ pub(crate) enum Out {
     Committed(u64),
     /// A put's body of this many bytes came in this many nanoseconds (`Serve::filled`).
     Filled(u64, u64),
+    /// The bytes the shard's jobs moved since its task started (`Host::moved`): their bodies'
+    /// pieces taken and their replies' given.
+    Moved(u64),
     /// The shard's host failed, and its task ended: why.
     Stopped(NodeError),
 }
@@ -139,6 +143,8 @@ pub(crate) struct Lanes {
     asked: Vec<(u64, Pending)>,
     /// The shard's word that a door of its jobs moved, which its task waits on.
     doors: Arc<Notify>,
+    /// The bytes the shard's jobs moved since its task started, as it last said.
+    moved: u64,
 }
 
 impl Lanes {
@@ -174,6 +180,7 @@ impl Lanes {
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
             doors,
+            moved: 0,
         })
     }
 
@@ -186,6 +193,12 @@ impl Lanes {
     /// the node's task to tell.
     pub(crate) fn doors(&self) -> Arc<Notify> {
         Arc::clone(&self.doors)
+    }
+
+    /// The bytes the shard's jobs moved since its task started, as it last said: summed into the
+    /// node's (`Node::moved`).
+    pub(crate) fn moved(&self) -> u64 {
+        self.moved
     }
 
     /// Hands the shard a request with its fields read, without waiting: none once sent, and the
@@ -327,6 +340,7 @@ impl Lanes {
             }
             Out::Committed(ns) => node.committed(ns),
             Out::Filled(bytes, ns) => node.filled(bytes, ns),
+            Out::Moved(bytes) => self.moved = bytes,
             Out::Stopped(error) => return Err(error),
         }
         Ok(())
@@ -634,6 +648,8 @@ async fn run(
         wall,
     };
     let (mut handed, mut answer) = (None, None);
+    // The bytes its jobs moved, as last said to the node's task.
+    let mut said = 0;
     loop {
         let mut handed_in = handed.take();
         for _ in 0..=requests {
@@ -665,6 +681,10 @@ async fn run(
             served.came(number, outcome);
         }
         let stopped = host.step(&mut served).err();
+        if host.moved() != said {
+            said = host.moved();
+            served.gave.push(Out::Moved(said));
+        }
         for out in served.gave.drain(..) {
             if given.send(out).await.is_err() {
                 return;
@@ -743,6 +763,7 @@ pub(super) mod tests {
             waiting: VecDeque::with_capacity(slots),
             asked: Vec::with_capacity(slots),
             doors: Arc::new(Notify::new().unwrap()),
+            moved: 0,
         };
         (lanes, (taken, answered, given))
     }
@@ -848,6 +869,13 @@ pub(super) mod tests {
         lanes.serve(&mut stub, |_| {}).unwrap();
         assert!(matches!(taken.try_recv(), Ok(Some(In::Freed))));
         assert!(lanes.table.is_none() && !lanes.freed);
+
+        // The bytes the shard's jobs moved reach the node's side, the latest said superseding.
+        assert!(given.try_send(Out::Moved(5)).is_ok());
+        lanes.serve(&mut stub, |_| {}).unwrap();
+        assert!(given.try_send(Out::Moved(9)).is_ok());
+        lanes.serve(&mut stub, |_| {}).unwrap();
+        assert_eq!(lanes.moved(), 9);
 
         // A shard whose task ended stops the node.
         drop(given);

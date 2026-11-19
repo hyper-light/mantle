@@ -2383,9 +2383,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 
     /// Bytes of exchanges' bodies the node has read and written since it opened: what its
     /// transfers moved (a put's body taken, a chunk's sent or received, a get's bytes written),
-    /// its own task's and its host's jobs' (node.md §2.9 step 6d).
+    /// its own task's, its host's jobs' (node.md §2.9 step 6d) and each driving shard's jobs', as
+    /// each last said (6f).
     pub fn moved(&self) -> u64 {
-        self.moved.saturating_add(self.host.moved())
+        self.driving.iter().map(driving::Lanes::moved).fold(
+            self.moved.saturating_add(self.host.moved()),
+            u64::saturating_add,
+        )
     }
 
     /// The requests this node answered `SlowDown` since it opened, on either door, a count for

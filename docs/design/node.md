@@ -2482,6 +2482,15 @@ shard of a two-shard runtime and served over its lanes by a cell in memory on th
 the version the put commits), reach `Done`, the put's size and the get's bytes exact, given in
 three pieces after its fields; before the wake they hung (no job ended in 20 s).
 
+*As built (2026-11-19), its second piece: a driving shard's bytes in the node's count* (6f,
+`crates/node/src/node/driving.rs`, `Node::moved`). After each step in which its jobs moved bytes
+(their bodies' pieces taken, their replies' given: `Host::moved`), a driving shard's task says the
+total since it started on its out lane (`Out::Moved`), as it says the put window's samples, one
+message a step at most; the node's side keeps the latest (`Lanes::moved`) and `Node::moved` sums
+each shard's with its own task's and its host's. Tested: the lane's count reaches the node's side,
+the latest superseding (`node::driving`), and the put and get handed above, once ended, are
+counted there whole, the put's body taken and the get's bytes given, twice the object (`node::host`).
+
 ## 3. Transport
 
 Nodes, and clients through mantle's client library, talk over two layers, as the hecate

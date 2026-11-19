@@ -1030,8 +1030,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     wall: Wall,
     /// The gateway host's settings, and the object operations it runs: as many at once as it has
     /// learned its knee is (`crate::admit`), at most `GatewaySettings::objects`, the ceiling its
-    /// memory was split for.
-    gateway: Option<GatewaySettings>,
+    /// memory was split for. Shared with the host (`host::Host`), which its jobs run by.
+    gateway: Option<std::sync::Arc<GatewaySettings>>,
     admission: Option<crate::admit::Admission>,
     /// The stream pool the native clients draw from, as last sized: the admission's limit.
     pooled: usize,
@@ -1458,6 +1458,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
             }
         }
+        // The gateway's settings, shared by the node and the host it lends out for each turn: one
+        // `Arc` made here, never per turn (node.md §2.9 step 6d).
+        let gateway = settings.gateway.take().map(std::sync::Arc::new);
         let mut node = Self {
             id: settings.id,
             log,
@@ -1522,22 +1525,21 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             next_read_ask: 0,
             reads_done: Vec::new(),
             wall: settings.wall,
-            admission: settings.gateway.as_ref().map(|g| {
+            admission: gateway.as_ref().map(|g| {
                 crate::admit::Admission::new(
                     g.objects,
                     g.objects_bytes,
                     hyper_rt::futures::now_ns(),
                 )
             }),
-            pooled: settings
-                .gateway
+            pooled: gateway
                 .as_ref()
                 .map_or(0, |g| if g.clients > 0 { g.objects } else { 0 }),
-            gateway: settings.gateway.take(),
+            host: host::Host::new(exchanges, gateway.clone()),
+            gateway,
             parked: VecDeque::new(),
             parked_most: exchanges,
             put_window: crate::window::Window::default(),
-            host: host::Host::new(exchanges),
             feeding: Vec::new(),
             fed: false,
             replies: Vec::new(),
@@ -2484,7 +2486,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             doorway.replies();
         }
         loop {
-            let (gateway, learned) = (self.gateway.as_ref(), &self.put_window);
+            let (gateway, learned) = (self.gateway.as_deref(), &self.put_window);
             // A key a connection asks before its operation takes no slot of the host's: it is
             // read at once, the lookups held to the door's bound (`host::take_lookup`).
             let charge = match self

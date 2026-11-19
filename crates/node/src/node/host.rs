@@ -8785,7 +8785,8 @@ pub(super) mod tests {
 
     /// The process's compute pool, started once for this test binary with one worker, so a test
     /// holding that worker holds the pool, and room for a job of each test at once; and the
-    /// tests that use it one at a time, as each may hold its worker or fill its room.
+    /// tests that use it one at a time, as each may hold its worker or fill its room. Each lets
+    /// the pool go as it found it, every job it put there ended ([`Held`]).
     fn pool() -> std::sync::MutexGuard<'static, ()> {
         static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -8800,18 +8801,43 @@ pub(super) mod tests {
         ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Holds the pool's one worker in a job until the returned sender is dropped: returns once
+    /// The pool's one worker held in a job ([`hold_the_worker`]), and the jobs its test queued
+    /// behind it that nothing else waits on. Dropped, as its test ends or unwinds, it lets the
+    /// worker go and returns once each of those jobs ended, so the next test to take the pool
+    /// finds its worker free and its room empty: a job gives its place in the room back before
+    /// its end is sent (hyper-rt `compute`). Letting the worker go alone left the room to the
+    /// worker's scheduling, below the test threads (hyper-rt `prioritysys`), on Windows at a
+    /// level that runs only while no thread at theirs is ready: the next test asked for a place
+    /// while the last one's jobs still held every one.
+    struct Held {
+        release: Option<std::sync::mpsc::SyncSender<()>>,
+        jobs: Vec<OneshotReceiver<()>>,
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            for job in &mut self.jobs {
+                let _ = job.blocking_recv();
+            }
+        }
+    }
+
+    /// Holds the pool's one worker in a job until the returned [`Held`] is dropped: returns once
     /// the worker is in it.
-    fn hold_the_worker() -> std::sync::mpsc::SyncSender<()> {
-        let (release, held) = std::sync::mpsc::sync_channel::<()>(0);
+    fn hold_the_worker() -> Held {
+        let (release, released) = std::sync::mpsc::sync_channel::<()>(0);
         let (entered, inside) = std::sync::mpsc::sync_channel::<()>(1);
         let job = compute::run(move || {
             entered.send(()).unwrap();
-            let _ = held.recv();
-        });
-        assert!(job.is_ok());
+            let _ = released.recv();
+        })
+        .expect("the pool takes the job that holds its worker");
         inside.recv().unwrap();
-        release
+        Held {
+            release: Some(release),
+            jobs: vec![job],
+        }
     }
 
     /// The volume table read again after an entry that left its volumes and their domains as
@@ -8899,7 +8925,7 @@ pub(super) mod tests {
         let four = placed_in(&["a", "b", "c", "d"]);
         let first = read(None, &[], &two, 1, &gateway);
         let held = first.now;
-        let release = hold_the_worker();
+        let worker = hold_the_worker();
         // Grown to three at 2, the choice waiting behind the held worker; grown to four at 3
         // before it ran: the one choice still runs, now stale.
         let grown = read(Some(first), &two, &three, 2, &gateway);
@@ -8907,7 +8933,7 @@ pub(super) mod tests {
         assert_eq!(again.choosing.as_ref().map(|c| c.asked_at), Some(2));
         assert_eq!(again.now, held);
         // Its answer for three domains lands: not taken, and a choice asked for four.
-        drop(release);
+        drop(worker);
         let mut stale = again.choosing.take().unwrap();
         let answer = stale.answer.blocking_recv().unwrap();
         let (sender, landed) = hyper_rt::sync::oneshot().unwrap();
@@ -8954,20 +8980,23 @@ pub(super) mod tests {
         let two = placed_in(&["a", "b"]);
         let three = placed_in(&["a", "b", "c"]);
         let first = read(None, &[], &two, 1, &gateway);
-        let release = hold_the_worker();
+        let mut worker = hold_the_worker();
         // The pool's room filled behind its held worker, a job at a time until one is refused.
-        let mut filled = Vec::new();
         for _ in 0..64 {
             match compute::run(|| ()) {
-                Ok(receiver) => filled.push(receiver),
+                Ok(job) => worker.jobs.push(job),
                 Err(refused) => {
-                    assert!(matches!(refused.error, hyper_rt::RtError::Capacity { .. }));
+                    assert!(
+                        matches!(refused.error, hyper_rt::RtError::Capacity { .. }),
+                        "{:?}",
+                        refused.error
+                    );
                     break;
                 }
             }
         }
         let grown = read(Some(first), &two, &three, 2, &gateway);
-        drop(release);
+        drop(worker);
         assert!(grown.settled && grown.choosing.is_none());
         assert_eq!(grown.now, Ok(Ask::of(&gateway, &three).choose()));
     }
@@ -8987,7 +9016,7 @@ pub(super) mod tests {
         hyper_measure::alloc::begin();
         let inline = Ask::of(&gateway, &three).choose();
         let model = hyper_measure::alloc::end();
-        let release = hold_the_worker();
+        let worker = hold_the_worker();
         hyper_measure::alloc::begin();
         let grown = read(Some(first), &two, &three, 2, &gateway);
         let shard = hyper_measure::alloc::end();
@@ -8999,7 +9028,7 @@ pub(super) mod tests {
             shard.allocations < model.allocations,
             "the shard's {shard:?} against the model's {model:?}"
         );
-        drop(release);
+        drop(worker);
         assert_eq!(choosing.answer.blocking_recv().unwrap(), inline);
     }
 

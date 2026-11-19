@@ -15,6 +15,7 @@ mod store;
 
 use std::collections::VecDeque;
 use std::task::Waker;
+use std::time::{Duration, Instant};
 
 use hyper_block::buf::Alignment;
 use hyper_block::sim::SimFile;
@@ -977,6 +978,51 @@ fn flushed(nodes: &[Node]) -> Vec<(u64, u64, u64)> {
         .collect()
 }
 
+/// The span of the failure guard on a log's fill ahead ([`filled_ahead`]), the native worker
+/// fixtures' (engine's `ranges_room.rs`): a passing run never goes this long without a piece of
+/// the fill written, and elapsed time never counts as the fact.
+const WAIT: Duration = Duration::from_secs(5);
+
+/// Waits until every member's log has filled ahead the slot past its file's last: written it
+/// with zeros a piece at a time while its device idled, and flushed the last piece (hyper-log's
+/// `Owner::fill_ahead`, counted in `LogStats::fills`). It is the one write a log makes of its
+/// own, from its creation on, at a time its threads choose; the frames the test that waits for it
+/// writes all lie in a log's first slot, so a log fills one slot ahead and then writes nothing of
+/// its own until a frame opens it. The guard is on the fill's progress, not on the wait's
+/// length: a span of [`WAIT`] with neither the fact nor a piece written fails, and the pieces are
+/// bounded (a slot's bytes in pieces of at least a device block), so the wait ends.
+fn filled_ahead(nodes: &[Node]) {
+    let pieces = log_config().segment_bytes / 4096 * nodes.len() as u64;
+    let mut spans = pieces + 1;
+    let mut seen = None;
+    let mut deadline = Instant::now() + WAIT;
+    loop {
+        let stats: Vec<_> = nodes.iter().map(|n| n.log.stats(None).unwrap()).collect();
+        if stats.iter().all(|s| s.fills == 1) {
+            return;
+        }
+        let written: u64 = stats.iter().map(|s| s.fill_pieces).sum();
+        if seen != Some(written) {
+            assert!(
+                spans > 0,
+                "a fill ahead wrote more pieces than its slot holds"
+            );
+            spans -= 1;
+            seen = Some(written);
+            deadline = Instant::now() + WAIT;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no member's log wrote a piece of its fill ahead for {WAIT:?}, filled {:?}",
+            stats
+                .iter()
+                .map(|s| (s.fills, s.fill_pieces, s.fill_failures))
+                .collect::<Vec<_>>()
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// What a group's members write while it serves only reads, counted: under a burst, every entry
 /// costs each member a frame and its flush, and a confirmation where no frame followed at once
 /// (raft-log.md §6), a flush of its own on a device that cannot write it durable alone; once the burst is applied, reads confirmed by their rounds of heartbeats
@@ -984,7 +1030,10 @@ fn flushed(nodes: &[Node]) -> Vec<(u64, u64, u64)> {
 /// then costs the frame of its new start and its confirmation, and its engine's checkpoint the
 /// engine's own (`Stored`'s count, `its_store_flushes_only_at_a_checkpoint_and_twice_there`);
 /// and after it, reads flush nothing again. The range writes its commit alone after no quiet
-/// period (`QUIET`), so nothing is owed once the burst stops.
+/// period (`QUIET`), so nothing is owed once the burst stops. Each member's log also fills the
+/// slot past its file's last ahead once, its last piece flushed, whenever its threads find the
+/// device idle ([`filled_ahead`]): the burst is counted once every member's has, so a fill
+/// that lands late is never charged to the reads.
 #[test]
 fn a_group_serving_only_reads_writes_nothing_to_its_logs() {
     const BURST: u64 = 24;
@@ -999,6 +1048,9 @@ fn a_group_serving_only_reads_writes_nothing_to_its_logs() {
         nodes[0].replica.propose(&registration(serial)).unwrap();
         settle(&mut nodes, &mut answers);
     }
+    // Every frame and confirmation of the burst was answered durable before its member's drive
+    // went on (`support::store`); the fill ahead is the log's own, and is waited for.
+    filled_ahead(&nodes);
     let burst = flushed(&nodes);
     for (id, (before, after)) in elected.iter().zip(&burst).enumerate() {
         let frames = after.0 - before.0;

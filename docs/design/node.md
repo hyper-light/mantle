@@ -4446,6 +4446,31 @@ held as the metadata layer's engine by `mantle_range::Stored` (metadata.md §4).
 extents and memtable are derived per node (§1.4). The trait has not yet gained the checkpoint of
 files, export or ingest: snapshots still carry every row through `image` and `install`.
 
+*As built (2026-11-19), maintenance in a turn's idle time.* A range's engine paid its packings,
+compactions and consolidations only as its puts and checkpoints did, so after a burst of PUTs a
+range taking only GETs read the busy trunk until its next write: about 18 sources a get, against
+2.6 once its maintenance was done (40,000 Name-sized rows under the derived engine; read-amp's
+counting test at 49e6ac8f). Each turn of a shard (the node's own and each range shard's) now ends,
+after its reads, writes and messages are out, in its ranges' maintenance (`Engine::upkeep`,
+`ShardDb::idle_step_now`, `node::upkeep`): in SILK's order (the packing, then the trunk's work and
+what its workers finished, then the consolidations seeks paid for, then the cache's; research/34
+§5), waiting for nothing, a job still out on a worker left owed rather than waited for. A turn's
+budget is as long again as the turn's own work took, in units at the rate the shard's turns have
+done them, both measured, as the engine's runtime slices are sized (`mantle_engine::ranges`): a
+request that arrives during it waits no longer than that, and a shard with no request gives
+maintenance about half its time. Each owed range is first in turn. While any engine
+owes work the shard's wait is due at once, after one yield to its other tasks; with none owed,
+or none it can do now, the wait is what it was. A job out on a worker is polled for at each such
+turn: a wake from the worker's message (the pool's `receive`, which the runtime's ranges await)
+would spare those turns, and is open. Maintenance writes no checkpoint and flushes nothing, so what is durable
+and when a checkpoint answers are unchanged. Counted (`node::upkeep::tests`, 40,000 Name-sized
+rows under the derived engine, checkpointed, then a get a turn, each turn ending in its
+maintenance; a debug build on macOS aarch64, 2026-11-19): inline, a one-row seek listed 5.9
+sources right after the burst and 1.0 after 4,222 turns (40,103 units); with the worker, 12.8 and
+1.0 after 129 turns; a get read 1.005 and 1.018 pages, then 1.000; no turn did more than its
+budget, and maintenance made no checkpoint and no flush. The turns depend on the measured budget;
+the test holds them within the burst's rows.
+
 ### 6.2 Applied index, flush and truncation
 
 The ordering audit §5.3 asks to be proven, stated as the node runs it:

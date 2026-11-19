@@ -96,6 +96,16 @@ pub trait Engine: Rows {
     fn fault(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
     }
+
+    /// Pays up to about `budget` units of the maintenance the engine owes (its packings,
+    /// compactions and consolidations, its cache's upkeep), in time its owner has no request
+    /// for, waiting for nothing: what its workers finished is taken back and what is due handed
+    /// out. The units done, and whether work is still owed. Nothing changes what is durable: only
+    /// [`Engine::persist`] does. An engine that keeps no maintenance owes none.
+    fn upkeep(&mut self, budget: u64) -> Result<(u64, bool), EngineError> {
+        let _ = budget;
+        Ok((0, false))
+    }
 }
 
 /// An engine held in memory for deterministic simulation (06 §C.b.3): what is applied, and

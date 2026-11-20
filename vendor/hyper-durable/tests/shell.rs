@@ -2013,9 +2013,10 @@ fn next_snapshot(r: &mut Sim) -> Message {
 
 /// A machine that keeps its owner's checkpoints images the latest, behind what it applied
 /// (focal's): the snapshot a member behind the log's start is sent carries the configuration the
-/// group held at the image's point, never one applied since (Ongaro and Ousterhout 2014, §7). A
-/// member added after the image is served once its owner checkpoints past the addition, and then
-/// holds what its leader holds, each change applied once.
+/// group held at the image's point, never one applied since (Ongaro and Ousterhout 2014, §7). The
+/// log's start stands at that point while its transfer is out; once it failed, a member added after
+/// the image is served once its owner checkpoints past the addition, and then holds what its leader
+/// holds, each change applied once.
 #[test]
 fn a_snapshot_carries_the_configuration_held_at_its_images_point() {
     let mut r = sole(1, Unbounded, |_| {});
@@ -2046,12 +2047,16 @@ fn a_snapshot_carries_the_configuration_held_at_its_images_point() {
         "the configuration held at the image's point"
     );
 
-    // The owner checkpoints past the addition, and the next snapshot names the learner.
+    // The log's start stands at the image's point while the transfer is out; once it failed, the
+    // owner checkpoints past the addition, and the next snapshot names the learner.
+    assert_eq!(r.image_held(), Some(imaged.index));
+    assert!(!r.compact(0, now(), waker()).unwrap(), "the start held");
+    r.report_snapshot(2, false).unwrap();
+    r.report_unreachable(2).unwrap();
+    assert_eq!(r.image_held(), None, "a failed transfer lets the hold go");
     assert!(r.compact(0, now(), waker()).unwrap());
     pump(&mut r);
     let checkpointed = r.machine().durable.applied;
-    r.report_snapshot(2, false).unwrap();
-    r.report_unreachable(2).unwrap();
     r.propose(Vec::new(), b"again".to_vec()).unwrap();
     let sent = next_snapshot(&mut r);
     let metadata = sent.snapshot.as_ref().unwrap().metadata.clone().unwrap();
@@ -2097,8 +2102,11 @@ fn a_snapshot_carries_the_configuration_held_at_its_images_point() {
 /// Paused while stalled, the image held the applies, the applies the compaction, and the
 /// compaction the stall, for good: the shape a stalled replica's applying ended for entries
 /// waiting for room in the machine (replica.md §2, §4). Made, the entries it held apply, the
-/// compaction passes them and the refused write is made again; the snapshot leaves with the first
-/// drive after the stall, the learner catches up, and every entry committed applies.
+/// stall lets go of the log's hold for the image, the compaction passes them and the refused write
+/// is made again. The snapshot made while stalled does not leave after the stall: its point is
+/// behind the log's start, so the learner would need a second image once it installed it. It is
+/// reported failed, the core asks again at its next try, a fresh image is sent, the learner catches
+/// up, and every entry committed applies.
 #[test]
 fn an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader() {
     let mut r = sole(3, Unbounded, |_| {});
@@ -2187,16 +2195,21 @@ fn an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader() {
     assert!(made_stalled, "the image was not made while stalled");
     assert!(!r.imaging() && r.images_made() == 1);
     assert!(r.applied().index >= imaged.index + 2);
-    // The snapshot leaves once the stall ends, of the point the image began at.
+    // The snapshot made while stalled is dropped as the core sends it after the stall: the
+    // compaction that cleared it passed the image's point. Reported failed, the core probes the
+    // learner again at its next try: here the owner says the learner was not reached, and the
+    // next write's append probes it; a fresh image is made, unstalled.
     to_learner.extend(pump(&mut r).messages.into_iter().filter(|m| m.to == 2));
-    let sent = to_learner
-        .iter()
-        .find(|m| m.msg_type == MessageType::MsgSnapshot)
-        .expect("the snapshot made while stalled");
-    let metadata = sent.snapshot.as_ref().and_then(|s| s.metadata.as_ref());
-    assert_eq!(metadata.unwrap().index, imaged.index);
-    // The learner installs it, and is sent what follows: the compaction that cleared the stall
-    // passed the image's point, so a second image, made unstalled.
+    assert!(
+        !to_learner
+            .iter()
+            .any(|m| m.msg_type == MessageType::MsgSnapshot),
+        "a snapshot the log's start passed was sent: {to_learner:?}"
+    );
+    r.report_unreachable(2).unwrap();
+    r.propose(Vec::new(), b"after".to_vec()).unwrap();
+    to_learner.extend(pump(&mut r).messages.into_iter().filter(|m| m.to == 2));
+    let mut snapshots = Vec::new();
     let mut learner: Sim = Replica::open(
         &settings(2, 7),
         SimStore::new(1),
@@ -2207,6 +2220,9 @@ fn an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader() {
     for _ in 0..64 {
         for m in to_learner.drain(..) {
             let snapshot = m.msg_type == MessageType::MsgSnapshot;
+            if let Some(metadata) = m.snapshot.as_ref().and_then(|s| s.metadata.as_ref()) {
+                snapshots.push(metadata.index);
+            }
             learner.step(m).unwrap();
             if snapshot {
                 r.report_snapshot(2, true).unwrap();
@@ -2229,7 +2245,205 @@ fn an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader() {
     );
     assert_eq!(learner.applied(), r.applied());
     assert_eq!(learner.machine().now.entries, r.machine().now.entries);
-    assert_eq!(r.images_made(), 2, "the second image, past the compaction");
+    assert_eq!(r.images_made(), 2, "the fresh image, past the compaction");
+    assert!(
+        snapshots.len() == 1 && snapshots[0] > imaged.index,
+        "one snapshot sent, the fresh one: {snapshots:?}"
+    );
+    let entries = r.machine().now.entries.iter();
+    let refused = entries.filter(|(_, _, data)| data == b"refused").count();
+    assert_eq!(refused, 1, "the refused write made again and applied once");
+}
+
+/// A sole voter whose learner, 2, is behind the log's start, and the drive that begins the image
+/// it is sent, its machine imaging an entry a slice: the point the leader applied as it began,
+/// which the image is of.
+fn learner_behind_the_start() -> (Sim, Point) {
+    let mut r = sole(3, Unbounded, |_| {});
+    r.machine_mut().sliced = true;
+    for i in 0..16u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    r.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, 2))
+        .unwrap();
+    let probe = pump(&mut r)
+        .messages
+        .into_iter()
+        .find(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend)
+        .expect("a probe of the learner");
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let imaged = r.applied();
+    r.step(Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: probe.term,
+        index: probe.index,
+        reject: true,
+        reject_hint: 0,
+        ..Message::default()
+    })
+    .unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.imaging());
+    (r, imaged)
+}
+
+/// Writes `writes` entries, one a drive, as sustained writes come, and compacts whenever the
+/// applied index moved, as an owner compacts a group as it is due: the messages to the learner.
+fn write_and_compact(r: &mut Sim, writes: u64, from: u64) -> Vec<Message> {
+    let mut to_learner = Vec::new();
+    let mut out = Output::default();
+    let mut tried = r.applied();
+    for i in from..from + writes {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+        out.clear();
+        r.drive(now(), waker(), &mut out).unwrap();
+        to_learner.extend(out.messages.drain(..).filter(|m| m.to == 2));
+        while r.log_mut().make_durable() {}
+        if r.applied() != tried {
+            tried = r.applied();
+            r.compact(0, now(), waker()).unwrap();
+        }
+    }
+    to_learner
+}
+
+/// Delivers what the leader sends the learner, and the learner's answers to the leader, until the
+/// learner holds what the leader applied, within a counted bound of rounds: the indexes of the
+/// snapshots sent.
+fn catch_up(r: &mut Sim, learner: &mut Sim, mut to_learner: Vec<Message>) -> Vec<u64> {
+    let mut snapshots = Vec::new();
+    for _ in 0..64 {
+        for m in to_learner.drain(..) {
+            let snapshot = m.msg_type == MessageType::MsgSnapshot;
+            if let Some(metadata) = m.snapshot.as_ref().and_then(|s| s.metadata.as_ref()) {
+                snapshots.push(metadata.index);
+            }
+            learner.step(m).unwrap();
+            if snapshot {
+                r.report_snapshot(2, true).unwrap();
+            }
+        }
+        for m in pump(learner).messages {
+            if m.to == 1 {
+                r.step(m).unwrap();
+            }
+        }
+        to_learner.extend(pump(r).messages.into_iter().filter(|m| m.to == 2));
+        if to_learner.is_empty() && learner.applied() == r.applied() {
+            return snapshots;
+        }
+    }
+    panic!(
+        "the learner never caught up: applied {:?} of {:?}, snapshots {snapshots:?}",
+        learner.applied(),
+        r.applied()
+    );
+}
+
+fn learner() -> Sim {
+    Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(voters(&[1]), false),
+        Unbounded,
+    )
+    .unwrap()
+}
+
+/// A learner behind the log's start catches up from one image under sustained writes, the image
+/// made a slice a drive over many drives and in transfer for many more: the leader's compactions
+/// meanwhile, one each time its applied index moved, stop at the image's point while the learner
+/// does not hold it (`Replica::image_held`; CockroachDB's raft log queue protects its pending
+/// snapshot index so, mantle docs/research/100), so once the learner installed it, what follows
+/// is still in the log and is sent from there. Without the hold, the compactions passed the point
+/// while the snapshot was in transfer, and the learner was sent a second image once it installed
+/// the first.
+#[test]
+fn a_member_behind_the_start_catches_up_from_one_image_under_sustained_writes() {
+    let (mut r, imaged) = learner_behind_the_start();
+    // The image's 17 entries are made a slice a drive while 40 writes come, one a drive: it is
+    // made and sent, and the writes after it apply.
+    let mut to_learner = write_and_compact(&mut r, 40, 100);
+    assert!(!r.imaging() && r.images_made() == 1);
+    assert!(r.applied().index > imaged.index + 20, "the writes applied");
+    let sent = to_learner
+        .iter()
+        .filter_map(|m| m.snapshot.as_ref().and_then(|s| s.metadata.as_ref()))
+        .map(|metadata| metadata.index)
+        .collect::<Vec<_>>();
+    assert_eq!(sent, [imaged.index], "the image, of the point it began at");
+    // The log's start stands at the image's point while the learner does not hold it.
+    assert_eq!(r.image_held(), Some(imaged.index));
+    assert!(!r.compact(0, now(), waker()).unwrap(), "the start held");
+    to_learner.extend(write_and_compact(&mut r, 8, 200));
+    let mut learner = learner();
+    let snapshots = catch_up(&mut r, &mut learner, to_learner);
+    assert_eq!(snapshots, [imaged.index], "one image sent");
+    assert_eq!(r.images_made(), 1, "one image made");
+    assert_eq!(learner.applied(), r.applied());
+    assert_eq!(learner.machine().now.entries, r.machine().now.entries);
+    // The learner holds the point: the hold is let go, and the compaction it held proceeds.
+    assert_eq!(r.image_held(), None);
+    assert!(r.compact(0, now(), waker()).unwrap());
+}
+
+/// The hold for an image is bounded by the group's room in the log: while the learner it was sent
+/// to does not install it, the start stands at its point and the writes fill the log, until one is
+/// refused for room. The stall lets the hold go, so the compaction the stalled leader waits for
+/// passes the point and frees the room; the refused write is made again within a counted bound of
+/// drives and the leader takes writes again. The image the learner then installs is behind the
+/// log's start, so it is sent a second, made after the stall, and catches up from it.
+#[test]
+fn the_hold_for_an_image_is_let_go_at_a_stall_for_room() {
+    let (mut r, imaged) = learner_behind_the_start();
+    let to_learner = write_and_compact(&mut r, 40, 100);
+    assert_eq!(r.images_made(), 1);
+    assert_eq!(r.image_held(), Some(imaged.index));
+    assert!(!r.compact(0, now(), waker()).unwrap(), "the start held");
+    // The learner does not answer; the next write is refused for room, which stalls the leader.
+    let mut out = Output::default();
+    r.propose(Vec::new(), b"refused".to_vec()).unwrap();
+    r.drive(now(), waker(), &mut out).unwrap();
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    r.log_mut().make_durable();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    assert_eq!(r.image_held(), None, "the stall lets the hold go");
+    // The owner compacts the stalled group, as mantle's node does (`Node::compact_if_stalled`):
+    // the start passes the image's point, and the stall clears within a counted bound of drives.
+    assert!(
+        r.compact(0, now(), waker()).unwrap(),
+        "the compaction proceeds"
+    );
+    let mut drives = 0;
+    while r.is_stalled() {
+        assert!(drives < 64, "the stall never cleared");
+        drives += 1;
+        out.clear();
+        r.drive(now(), waker(), &mut out).unwrap();
+        while r.log_mut().make_durable() {}
+    }
+    // The leader takes writes again.
+    let applied = r.applied();
+    r.propose(Vec::new(), b"after".to_vec()).unwrap();
+    pump(&mut r);
+    assert!(
+        r.applied().index > applied.index,
+        "a write after the stall applied"
+    );
+    // The image sent before the stall is behind the start: the learner installs it and is sent a
+    // second one.
+    let mut learner = learner();
+    let snapshots = catch_up(&mut r, &mut learner, to_learner);
+    assert_eq!(snapshots.first(), Some(&imaged.index));
+    assert_eq!(r.images_made(), 2, "the image made again past the bound");
+    assert_eq!(learner.applied(), r.applied());
+    assert_eq!(learner.machine().now.entries, r.machine().now.entries);
     let entries = r.machine().now.entries.iter();
     let refused = entries.filter(|(_, _, data)| data == b"refused").count();
     assert_eq!(refused, 1, "the refused write made again and applied once");

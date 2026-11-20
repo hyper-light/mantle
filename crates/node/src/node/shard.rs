@@ -648,16 +648,29 @@ pub(crate) fn answer_due<E: Engine + 'static, S: LogStore>(replica: &Replica<E, 
 /// try. A stalled range whose compaction had nothing to free makes its writes again at its next
 /// drive (another range's compaction may have freed it). While a range is stalled every range is
 /// driven again, as it always has been; else only those whose compaction started, or a node waiting
-/// with nothing to compact would turn every range again at every turn. Whether any started.
+/// with nothing to compact would turn every range again at every turn.
+///
+/// A range leading a member behind its log's start keeps its log's hold for the image that member
+/// is sent (hyper-durable's `Replica::image_held`): its compaction stops at the image's point, so
+/// the member that installs it is sent what follows from the log, not a second image (replica.md
+/// §4, research/100). The pass runs only when the log is out of room (`Node::compact_if_stalled`,
+/// `In::Compact`), and the log's room is shared, so a hold is kept through it only while the pass
+/// frees room otherwise: when no compaction started, and a hold kept back what one would free, each
+/// such hold is let go (`Replica::let_go_of_image`) and its range compacted again in the same pass.
+/// So a hold keeps no room the log needs for longer than the pass that finds no other: a pass that
+/// keeps one started a compaction, whose write made durable has the node try its stalled ranges
+/// again and pass again (`Node::compact_if_stalled`). A stalled range holds none of its own (its
+/// stall lets its hold go, as it takes no message that could release it). Whether any started.
 pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
     owner: &mut Owner<Answers<S>, RangeMachine<E>, Unbounded>,
-    handles: impl Iterator<Item = Handle>,
+    handles: impl Iterator<Item = Handle> + Clone,
     any_stalled: bool,
     now: u64,
     waker: &Waker,
 ) -> Result<bool, NodeError> {
     let mut made_room = false;
-    for handle in handles {
+    let mut held_back = false;
+    for handle in handles.clone() {
         let Some(shell) = owner.get_mut(handle) else {
             continue;
         };
@@ -669,6 +682,7 @@ pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
             .compact(0, now, waker)
             .map_err(|e| mantle_range::refused(shell.machine(), e))?;
         made_room |= compacted;
+        held_back |= holds_back(shell);
         if stalled && !compacted {
             shell.resume();
         }
@@ -676,7 +690,36 @@ pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
             owner.schedule(handle);
         }
     }
+    if made_room || !held_back {
+        return Ok(made_room);
+    }
+    for handle in handles {
+        let Some(shell) = owner.get_mut(handle) else {
+            continue;
+        };
+        if !holds_back(shell) || (!shell.is_stalled() && shell.in_flight() > 0) {
+            continue;
+        }
+        shell.let_go_of_image();
+        let compacted = shell
+            .compact(0, now, waker)
+            .map_err(|e| mantle_range::refused(shell.machine(), e))?;
+        made_room |= compacted;
+        if compacted {
+            owner.schedule(handle);
+        }
+    }
     Ok(made_room)
+}
+
+/// Whether `replica`'s hold for an image keeps back what its compaction would free: the hold
+/// stands, and its state machine applied past the hold's point.
+fn holds_back<E: Engine + 'static, S: LogStore>(
+    replica: &hyper_durable::Replica<Answers<S>, RangeMachine<E>, Unbounded>,
+) -> bool {
+    replica
+        .image_held()
+        .is_some_and(|point| replica.applied().index > point)
 }
 
 /// The node's shard's owner of the replicas its own task drives, and the handles it gave the
@@ -4297,6 +4340,365 @@ mod tests {
                 Err(NodeError::ShardEnded(2))
             ));
         }
+    }
+
+    /// A range's log in memory that refuses, for room, each write holding entries while `full` is
+    /// set, as a log out of room refuses a range's writes and still takes a compaction's start
+    /// (hyper-log): the test's stand-in for one log shared by two ranges, its room freed when it
+    /// says so.
+    struct Refusing {
+        inner: hyper_durable::RamStore,
+        full: Arc<AtomicBool>,
+    }
+
+    impl LogStore for Refusing {
+        type Hold = std::convert::Infallible;
+
+        fn held(&self) -> Option<&Self::Hold> {
+            None
+        }
+
+        fn release(&mut self, met: &Self::Hold) {
+            match *met {}
+        }
+
+        fn depth(&self) -> usize {
+            self.inner.depth()
+        }
+
+        fn view(&self) -> Result<hyper_durable::StoreView, hyper_durable::Fault> {
+            self.inner.view()
+        }
+
+        fn bounds(&self) -> Result<(hyper_durable::Point, u64), hyper_raft::StorageError> {
+            self.inner.bounds()
+        }
+
+        fn term(&self, index: u64) -> Result<u64, hyper_raft::StorageError> {
+            self.inner.term(index)
+        }
+
+        fn entries(
+            &self,
+            low: u64,
+            high: u64,
+            max_bytes: u64,
+            into: &mut Vec<hyper_raft::proto::Entry>,
+        ) -> Result<(), hyper_raft::StorageError> {
+            self.inner.entries(low, high, max_bytes, into)
+        }
+
+        fn visit(
+            &self,
+            low: u64,
+            high: u64,
+            page: u64,
+            visit: &mut dyn FnMut(hyper_durable::EntryRef<'_>) -> bool,
+        ) -> Result<(), hyper_raft::StorageError> {
+            self.inner.visit(low, high, page, visit)
+        }
+
+        fn proposals(
+            &self,
+            into: &mut Vec<hyper_raft::proto::Entry>,
+        ) -> Result<(), hyper_raft::StorageError> {
+            self.inner.proposals(into)
+        }
+
+        fn released(&self) -> Result<u64, hyper_raft::StorageError> {
+            self.inner.released()
+        }
+
+        fn room(&self) -> bool {
+            self.inner.room()
+        }
+
+        fn submit(
+            &mut self,
+            write: &hyper_durable::Write<'_>,
+            waker: &Waker,
+        ) -> Result<(), hyper_durable::Fault> {
+            if write.entries.is_some() && self.full.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(hyper_durable::Fault::Room("the log's segments"));
+            }
+            self.inner.submit(write, waker)
+        }
+
+        fn poll(&mut self) -> Option<Result<(), hyper_durable::Fault>> {
+            self.inner.poll()
+        }
+
+        fn write_now(
+            &mut self,
+            write: &hyper_durable::Write<'_>,
+        ) -> Result<(), hyper_durable::Fault> {
+            self.inner.write_now(write)
+        }
+
+        fn keep_after(&mut self, index: u64) {
+            self.inner.keep_after(index);
+        }
+
+        fn kept_bytes(&self) -> u64 {
+            self.inner.kept_bytes()
+        }
+    }
+
+    type Roomed = hyper_durable::Replica<Answers<Refusing>, RangeMachine<Model>, Unbounded>;
+
+    /// Node `id`'s member of `range` on a log in memory whose room `full` says.
+    fn roomed(id: u64, range: &Range, full: &Arc<AtomicBool>) -> Roomed {
+        let mut engine = Model::default();
+        engine.install(0, name::first(1).unwrap()).unwrap();
+        engine.persist().unwrap();
+        let store = Answers::new(Refusing {
+            inner: hyper_durable::RamStore::new(),
+            full: Arc::clone(full),
+        });
+        mantle_range::open_shell(id, store, engine, range, id, Elections::Suspicion).unwrap()
+    }
+
+    /// Drives `replica` until it rests, within a counted bound of drives: what it sent, and the
+    /// answers it gave.
+    fn rested(replica: &mut Roomed, now: &mut u64) -> (Vec<Message>, usize) {
+        let waker = Waker::noop().clone();
+        let mut out = Output::default();
+        let (mut sent, mut answers) = (Vec::new(), 0);
+        for _ in 0..256 {
+            *now += 1;
+            out.clear();
+            let driven = replica.drive(*now, &waker, &mut out).unwrap();
+            sent.append(&mut out.messages);
+            answers += out.answers.len();
+            if !driven.more && driven.out == 0 {
+                return (sent, answers);
+            }
+        }
+        panic!("the replica never rested");
+    }
+
+    /// Two ranges on one log: A, a sole voter whose writes fill the log, and B, led by node 1, its
+    /// learner 2 behind B's log's start, sent an image of B's state at `point` that B's log is held
+    /// at. B applied writes past the point since, and A's last write was refused for room: A is
+    /// stalled. The node's owner, its handles A and B, B's snapshot to the learner, and the room.
+    struct TwoRanges {
+        owner: Owner<Answers<Refusing>, RangeMachine<Model>, Unbounded>,
+        a: Handle,
+        b: Handle,
+        snapshot: Message,
+        point: u64,
+        full: Arc<AtomicBool>,
+        now: u64,
+    }
+
+    /// [`TwoRanges`], A's applied entries compacted before its write is refused when `a_compacted`,
+    /// so a pass for room finds nothing of A's to free.
+    fn two_ranges(a_compacted: bool) -> TwoRanges {
+        use hyper_raft::proto::MessageType;
+        let waker = Waker::noop().clone();
+        let full = Arc::new(AtomicBool::new(false));
+        let mut now = 0;
+        let mut a = roomed(1, &one_member(), &full);
+        a.campaign().unwrap();
+        rested(&mut a, &mut now);
+        for _ in 0..4 {
+            a.propose(Vec::new(), put().encode().unwrap()).unwrap();
+            rested(&mut a, &mut now);
+        }
+        let mut learning = one_member();
+        learning.boot.learners = vec![2];
+        let mut b = roomed(1, &learning, &full);
+        b.campaign().unwrap();
+        let (sent, _) = rested(&mut b, &mut now);
+        let mut probe = sent
+            .into_iter()
+            .find(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend);
+        for _ in 0..8 {
+            b.propose(Vec::new(), put().encode().unwrap()).unwrap();
+            let (sent, _) = rested(&mut b, &mut now);
+            probe = probe.or(sent
+                .into_iter()
+                .find(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend));
+        }
+        let probe = probe.expect("a probe of the learner");
+        // B's log starts past the learner's next entry: the learner, answering the probe, is behind
+        // it, and B makes an image of its state for it.
+        assert!(b.compact(0, now, &waker).unwrap());
+        rested(&mut b, &mut now);
+        b.step(Message {
+            msg_type: MessageType::MsgAppendResponse,
+            from: 2,
+            to: 1,
+            term: probe.term,
+            index: probe.index,
+            reject: true,
+            reject_hint: 0,
+            ..Message::default()
+        })
+        .unwrap();
+        let (sent, _) = rested(&mut b, &mut now);
+        let snapshot = sent
+            .into_iter()
+            .find(|m| m.to == 2 && m.msg_type == MessageType::MsgSnapshot)
+            .expect("the image sent to the learner");
+        let point = snapshot
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .index;
+        assert_eq!(b.images_made(), 1);
+        assert_eq!(b.image_held(), Some(point));
+        // B goes on taking writes while the image is in transfer.
+        for _ in 0..8 {
+            b.propose(Vec::new(), put().encode().unwrap()).unwrap();
+            rested(&mut b, &mut now);
+        }
+        assert!(
+            b.applied().index > point + 4,
+            "B applied past the image's point"
+        );
+        if a_compacted {
+            assert!(a.compact(0, now, &waker).unwrap());
+            rested(&mut a, &mut now);
+        }
+        // The log is out of room: A's next write is refused, and A stalls.
+        full.store(true, std::sync::atomic::Ordering::Relaxed);
+        a.propose(Vec::new(), put().encode().unwrap()).unwrap();
+        rested(&mut a, &mut now);
+        assert!(a.is_stalled(), "A's write refused for room");
+        let mut owner = Owner::new(vec![waker.clone(); 2]);
+        let (Ok(a), Ok(b)) = (owner.insert(a), owner.insert(b)) else {
+            panic!("the owner's two slots are free");
+        };
+        TwoRanges {
+            owner,
+            a,
+            b,
+            snapshot,
+            point,
+            full,
+            now,
+        }
+    }
+
+    /// The log's room is freed: A, stalled, makes its refused write again within a counted bound
+    /// of drives, and applies it once. A's applied index before and after.
+    fn a_clears_its_stall(cell: &mut TwoRanges) -> (u64, u64) {
+        cell.full.store(false, std::sync::atomic::Ordering::Relaxed);
+        let a = cell.owner.get_mut(cell.a).unwrap();
+        let before = a.applied().index;
+        let (_, answers) = rested(a, &mut cell.now);
+        assert!(!a.is_stalled(), "the stall cleared");
+        assert_eq!(answers, 1, "the refused write applied once");
+        (before, a.applied().index)
+    }
+
+    /// Delivers B's snapshot to a learner and what each sends the other until the learner holds
+    /// what B applied, within a counted bound of rounds: the indexes of the snapshots B sent.
+    fn learner_catches_up(cell: &mut TwoRanges) -> Vec<u64> {
+        use hyper_raft::proto::MessageType;
+        let mut learning = one_member();
+        learning.boot.learners = vec![2];
+        let quiet = Arc::new(AtomicBool::new(false));
+        let mut learner = roomed(2, &learning, &quiet);
+        let mut to_learner = vec![cell.snapshot.clone()];
+        let mut snapshots = Vec::new();
+        let b = cell.owner.get_mut(cell.b).unwrap();
+        for _ in 0..64 {
+            for m in to_learner.drain(..) {
+                let snapshot = m.msg_type == MessageType::MsgSnapshot;
+                if let Some(meta) = m.snapshot.as_ref().and_then(|s| s.metadata.as_ref()) {
+                    snapshots.push(meta.index);
+                }
+                learner.step(m).unwrap();
+                if snapshot {
+                    b.report_snapshot(2, true).unwrap();
+                }
+            }
+            let (sent, _) = rested(&mut learner, &mut cell.now);
+            for m in sent.into_iter().filter(|m| m.to == 1) {
+                b.step(m).unwrap();
+            }
+            let (sent, _) = rested(b, &mut cell.now);
+            to_learner.extend(sent.into_iter().filter(|m| m.to == 2));
+            if to_learner.is_empty() && learner.applied() == b.applied() {
+                return snapshots;
+            }
+        }
+        panic!(
+            "the learner never caught up: applied {:?} of {:?}, snapshots {snapshots:?}",
+            learner.applied(),
+            b.applied()
+        );
+    }
+
+    /// The node's pass for room keeps a range's hold for the image its member behind the log's
+    /// start is sent while another range's compaction frees the room: A's write refused for room,
+    /// the pass compacts A, and B's compaction stops at the image's point. Once the room is freed
+    /// A makes its refused write again and applies it once; B's learner installs the image and is
+    /// sent what follows it from B's log: one image made, one snapshot sent. Before, the pass let
+    /// every range's hold go, B's compaction passed the point, and the learner, installing the
+    /// image, was sent a second.
+    #[test]
+    fn the_pass_for_room_keeps_a_hold_while_another_range_frees_the_room() {
+        let mut cell = two_ranges(false);
+        let waker = Waker::noop().clone();
+        let handles = [cell.a, cell.b];
+        assert!(compact(&mut cell.owner, handles.into_iter(), true, cell.now, &waker).unwrap());
+        let b = cell.owner.get(cell.b).unwrap();
+        assert_eq!(b.image_held(), Some(cell.point), "the hold kept");
+        let (before, after) = a_clears_its_stall(&mut cell);
+        assert_eq!(after, before + 1);
+        let b = cell.owner.get_mut(cell.b).unwrap();
+        rested(b, &mut cell.now);
+        let start = b.log().bounds().unwrap().0.index;
+        assert!(
+            start <= cell.point,
+            "B's log starts at {start}, past {}",
+            cell.point
+        );
+        let snapshots = learner_catches_up(&mut cell);
+        let b = cell.owner.get(cell.b).unwrap();
+        assert_eq!(snapshots, [cell.point], "one snapshot sent");
+        assert_eq!(b.images_made(), 1, "one image made");
+        assert_eq!(
+            b.image_held(),
+            None,
+            "the learner holds the point: the hold let go"
+        );
+    }
+
+    /// A hold the pass for room cannot keep is let go in that pass: A, stalled, has nothing to
+    /// compact, so the only room is what B's hold keeps; the pass lets it go and compacts B past
+    /// the image's point within itself, A's stall clears once the room is freed, and A's refused
+    /// write applies once. B's learner, installing the image the start passed, is sent a second.
+    #[test]
+    fn a_hold_the_pass_for_room_cannot_keep_is_let_go_and_the_stall_clears() {
+        let mut cell = two_ranges(true);
+        let waker = Waker::noop().clone();
+        let handles = [cell.a, cell.b];
+        assert!(
+            compact(&mut cell.owner, handles.into_iter(), true, cell.now, &waker).unwrap(),
+            "the pass compacted B"
+        );
+        let b = cell.owner.get_mut(cell.b).unwrap();
+        assert_eq!(b.image_held(), None, "the hold let go");
+        rested(b, &mut cell.now);
+        let start = b.log().bounds().unwrap().0.index;
+        assert!(
+            start > cell.point,
+            "B's log starts at {start}, not past {}",
+            cell.point
+        );
+        let (before, after) = a_clears_its_stall(&mut cell);
+        assert_eq!(after, before + 1);
+        let snapshots = learner_catches_up(&mut cell);
+        assert_eq!(snapshots.first(), Some(&cell.point));
+        let b = cell.owner.get(cell.b).unwrap();
+        assert_eq!(b.images_made(), 2, "the image made again past the start");
     }
 
     /// What the node holds inline for each range is what derive counts (`node::slots_bytes`),

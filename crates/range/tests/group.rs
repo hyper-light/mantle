@@ -3709,3 +3709,195 @@ fn a_closed_loop_in_one_phase_is_not_held() {
         after.2
     );
 }
+
+/// The model engine whose image pages are cold two reads in three, as an engine whose pages load
+/// on its workers is refused a page not in memory (`EngineError::Unloaded`), the slice stopping
+/// there and the image going on at a later drive.
+#[derive(Debug)]
+struct Cold {
+    model: Model,
+    reads: u64,
+}
+
+impl Rows for Cold {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        self.model.get(key)
+    }
+
+    fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+        self.model.next(from, to)
+    }
+
+    fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
+        self.model.apply(index, writes)
+    }
+}
+
+impl Engine for Cold {
+    fn applied(&self) -> u64 {
+        self.model.applied()
+    }
+
+    fn durable(&self) -> u64 {
+        self.model.durable()
+    }
+
+    fn persist(&mut self) -> Result<(), EngineError> {
+        self.model.persist()
+    }
+
+    fn image(&mut self) -> Result<Vec<Row>, EngineError> {
+        self.model.image()
+    }
+
+    fn image_page(
+        &mut self,
+        from: &[u8],
+        rows: usize,
+        each: &mut mantle_meta::engine::EachRow<'_>,
+    ) -> Result<bool, EngineError> {
+        self.reads += 1;
+        if !self.reads.is_multiple_of(3) {
+            return Err(EngineError::Unloaded);
+        }
+        self.model.image_page(from, rows, each)
+    }
+
+    fn image_size(&self) -> Option<(u64, u64)> {
+        self.model.image_size()
+    }
+
+    fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
+        self.model.install(index, rows)
+    }
+}
+
+type ColdMember = Replica<Synchronous<SimFile>, Cold>;
+
+/// Drives `r` until nothing more is due, its writes answered and no image under way, within a
+/// counted bound of drives: what it sent.
+fn drive_cold(r: &mut ColdMember) -> Vec<Message> {
+    let mut out = Out::default();
+    let mut driven = r.drive(0, Waker::noop(), &mut out).unwrap();
+    for _ in 0..400 {
+        if !(driven.more || r.in_flight() > 0 || r.imaging()) {
+            break;
+        }
+        driven = r.drive(0, Waker::noop(), &mut out).unwrap();
+    }
+    out.messages
+}
+
+/// Images made in many small slices, two in three stopped by a page not in memory, while each
+/// member in turn is cut off and caught up by a snapshot, the group's writes stall on its log's
+/// room (compacted as a node compacts a stalled range) and the lead moves by campaigns: no member
+/// is fenced, so every image installed passed its checks. The failure the release ladder met
+/// (a member fenced on an image that did not decode, 2026-11-20) does not come from this
+/// replica's slicing, stalls or lead changes over the model engine.
+#[test]
+fn images_made_in_cold_slices_under_stalls_and_lead_changes_install_on_every_member() {
+    let small = Settings {
+        max_size_per_msg: 256,
+        max_inflight_msgs: 1,
+        max_uncommitted_size: 256,
+        max_entry_bytes: 256,
+        max_committed_size_per_ready: 200,
+        ..SETTINGS
+    };
+    let config = LogConfig {
+        group_entries: 102,
+        group_bytes: 1 << 20,
+        ..log_config()
+    };
+    let bounded = Range {
+        settings: small,
+        ..range()
+    };
+    let (mut stalls, mut installs, mut campaigns, mut fenced) = (0u64, 0u64, 0u64, 0u64);
+    for seed in 0..16u64 {
+        let mut nodes: Vec<(ColdMember, Log<SimFile>)> = (1..=3u64)
+            .map(|id| {
+                let device = sim(900 + 3 * seed + id);
+                let log = Log::create(device, config, 0x6c6f67 + u128::from(id)).unwrap();
+                let store =
+                    Synchronous::new(mantle_range::claim(&log, GROUP, &bounded).unwrap(), None);
+                let engine = Cold {
+                    model: first_range(),
+                    reads: seed,
+                };
+                let replica = Replica::open(id, store, engine, &bounded, 900 + seed + id).unwrap();
+                (replica, log)
+            })
+            .collect();
+        nodes[0].0.campaign().unwrap();
+        let mut serial = 0;
+        let mut wire: VecDeque<Message> = VecDeque::new();
+        for round in 0..90u64 {
+            let away = match round % 30 {
+                5..=17 => Some(1 + (round / 30 + seed) % 3),
+                _ => None,
+            };
+            let live = |id: u64| Some(id) != away;
+            if round % 5 == 3 {
+                let who = usize::try_from((round + seed) % 3).unwrap();
+                if live(nodes[who].0.id()) && nodes[who].0.campaign().is_ok() {
+                    campaigns += 1;
+                }
+            }
+            for _ in 0..3 {
+                for (r, _) in nodes.iter_mut().filter(|(r, _)| live(r.id())) {
+                    if !r.is_leader() {
+                        continue;
+                    }
+                    for _ in 0..8 {
+                        serial += 1;
+                        let _ = r.propose(&registration(serial));
+                        wire.extend(drive_cold(r));
+                    }
+                }
+                for _ in 0..10_000 {
+                    for (r, _) in nodes.iter_mut().filter(|(r, _)| live(r.id())) {
+                        if r.is_fenced() {
+                            continue;
+                        }
+                        if r.is_stalled() {
+                            stalls += 1;
+                            let _ = r.compact(0, 0, Waker::noop());
+                        }
+                        let mut out = Out::default();
+                        if r.drive(0, Waker::noop(), &mut out).is_err() {
+                            continue;
+                        }
+                        wire.extend(out.messages);
+                    }
+                    let Some(m) = wire.pop_front() else { break };
+                    if !live(m.to) {
+                        continue;
+                    }
+                    let (from, to) = (m.from, m.to);
+                    let is_snapshot = m.msg_type == MessageType::MsgSnapshot;
+                    let _ = nodes[usize::try_from(to).unwrap() - 1].0.step(m);
+                    if is_snapshot {
+                        installs += 1;
+                        let _ = nodes[usize::try_from(from).unwrap() - 1]
+                            .0
+                            .report_snapshot(to, true);
+                    }
+                }
+            }
+            for (r, _) in nodes.iter_mut().filter(|(r, _)| live(r.id())) {
+                let _ = r.tick();
+            }
+        }
+        for (r, _) in &nodes {
+            if r.is_fenced() {
+                fenced += 1;
+                eprintln!("seed {seed}: member {} fenced: {}", r.id(), r.describe());
+            }
+        }
+    }
+    assert_eq!(fenced, 0, "a member fenced");
+    assert!(stalls > 0, "no write was refused for room");
+    assert!(installs > 0, "no member was caught up by a snapshot");
+    assert!(campaigns > 0, "the lead never moved");
+}

@@ -655,7 +655,16 @@ is one owner's, so another thread reads none of it; a checkpoint is durable, but
 reused once a later one is, and no reader holds them (research/91 §6). The range's writes so wait
 on the image, about the time the whole image took on the shard, where before every range on the
 node waited on it. The checksum is kept a slice at a time and combined with the head's at the end
-(`mantle_crc::crc32c_combine`), so no step reads the image again. A snapshot's index is at or past
+(`mantle_crc::crc32c_combine`), and the image made is checked whole once before it leaves
+(`image::check`: its checksum, format, count, rows and no byte past them, one pass over its
+bytes taking no row), as the member that installs it checks it (`image::decode`). A failure of
+either names the check it failed and what the image states of itself: its point, its bytes, the
+rows its head states, and the checksum it carries beside the one its bytes give
+(`image::ImageError`, in the fence's words). An image that fails on the member that installs it
+but passed on its leader changed after it was made; one that fails on its leader was made wrong.
+A member of the release ladder's cell fenced on an image that did not decode (2026-11-20, once in
+two runs of one binary, under sustained writes and stalls) and said no more; the cause is open
+(§7). A snapshot's index is at or past
 the log's start, so the member continues from the entries after it; one a later compaction
 passed serves no member and is let go of. Until this, every compaction imaged the
 range, read and encoded every row on the node's shard whether or not any member was behind: 2%
@@ -1035,6 +1044,15 @@ A member takes a snapshot that does not name it all the same (thesis §4.1; hype
 
 ## 7. Open
 
+- An image that did not decode on the member installing it, which fenced it and stopped its node
+  (the release ladder's HTTP PUT step at 2,048 clients, 2026-11-20; not met again in a rerun of the
+  same binary). Not reproduced: images made in slices that stop on pages not in memory, stalls for
+  room, lead changes and members cut off and caught up (crates/range/tests/group.rs,
+  `images_made_in_cold_slices_under_stalls_and_lead_changes_install_on_every_member`) install on
+  every member; the slices' checksum, the frame's checksum and the wire's lengths hold. The image
+  is now checked on its leader before it leaves and on its member as it installs, each failure
+  naming its check, point, bytes, rows and both checksums (§4), so the next one says whether it was
+  made wrong or changed after.
 - A range's `max_entry_bytes`, and its log's frame, must hold the largest entry its gateways
   send, `mantle_meta::wire::largest_entry_bytes`: a CompleteMultipartUpload of 10,000 parts at
   S3's longest bucket, key and headers, 561,804 bytes; one of 10,000 parts with ordinary names

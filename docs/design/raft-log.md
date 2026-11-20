@@ -206,12 +206,12 @@ no other call until the `Ready` is made durable (07 §1.2). So a replica submits
 for room in the queue instead of taking `Busy`. Waiters wait in arrival order, each in a slot of
 its own; room the writer frees is handed to the waiters it fits, in order, and only those are
 woken, one wake each, and a fence completes every waiter's slot with its answer once (node.md
-§1.3). The waiting list is bounded by construction: a group waits with at most its three
-submissions, and the log holds at most `max_groups`. The wait lasts no longer than the writer's
-progress. Before, room was a condition variable the writer broadcast to every waiter on every
-answered submission; on macOS that broadcast walks every waiter inside one kernel spinlock, and a
-benchmark of thousands of replicas, each a thread, held it until the kernel panicked
-(research/26 §1.3–§1.4).
+§1.3). The waiting list is bounded by construction: a group waits with at most the five writes
+its handle keeps out (§3.1), and the log holds at most `max_groups`. The wait lasts no longer than
+the writer's progress. Before, room was a condition variable the writer broadcast to every waiter
+on every answered submission; on macOS that broadcast walks every waiter inside one kernel
+spinlock, and a benchmark of thousands of replicas, each a thread, held it until the kernel
+panicked (research/26 §1.3–§1.4).
 
 The writer's wait follows the chunk store's rules for power (chunk-store.md §4): on battery or
 in saver mode it waits for its returning replicas up to the measured batch service time, which
@@ -261,8 +261,9 @@ full-frame submissions would hold all of `B`.
 
 So a group's own room admits two submissions whatever their size, `GROUP_ADMITS`, and the third
 only while the bytes fit the share. A group's handle keeps out at most five (`OUT`): those two
-and the three that may wait beyond them, past which the log refuses `Busy`. Six, twice the
-count, took the group's whole count for its own room, which the share made untrue for large
+and the three that may wait beyond them, all of which the group may wait with (`GROUP_WAITERS`),
+past which the log refuses `Busy`. Six, twice the count, took the group's whole count for its
+own room, which the share made untrue for large
 parts: a write in frame-sized parts had two admitted and three waiting, all its own group's, and
 its sixth part was refused `Busy`. That is a refusal for room, on which a replica stalls, the
 refused write's messages held with it, until its owner says room was freed; with nothing else
@@ -270,8 +271,33 @@ holding the queue no other group's answer frees it. A range's leader that took 1
 while cut off, on a log of its own, wrote them in parts of 565,177 bytes, had its sixth refused,
 and never committed them (mantle-node `tests/range_log_memory.rs`, 1,000,000 rounds;
 `vendor/hyper-log/tests/log.rs`,
-`a_handles_frame_sized_parts_wait_for_their_groups_room_never_refused`). The queue's own bound
-still refuses a handle whose parts wait behind other groups', as it always has.
+`a_handles_frame_sized_parts_wait_for_their_groups_room_never_refused`).
+
+A group waits with all five whoever holds the queue's room. It waited with three, so a handle whose
+frame-sized parts found other groups' bytes holding the queue had none admitted and three
+waiting, and its fourth part was refused `Busy`; its replica stalled, and, resumed, made the same
+write again in the same parts, refused again for as long as the others kept the queue full. Four
+groups each keeping three writes of a third of a frame out, as busy ranges keep their depth, and a
+fifth group's store holding a write of eight entries of most of a frame, made again at once on
+each refusal, the soonest a resume could come: 12 refusals and 12 remakes in 12 cuts, never
+durable. Each fourth part found its group with none admitted and three waiting, and the queue
+holding 164,320 of its 184,407 bytes, all the others', short of the part's 61,263: the condition
+that never became true was room for two of the group's parts at the moment it sent them, which the
+others' waiters, ahead of every remake in arrival order, took at each cut. Waiting, the write is
+durable in 3 cuts, never refused (`vendor/hyper-durable/tests/hyperlog.rs`,
+`a_write_in_frame_sized_parts_waits_behind_groups_that_fill_the_queue`, bounded at 12 cuts:
+a cut lays two of the group's parts or more than two frames' worth of what came before them, and
+ahead of a pair wait at most the others' twelve writes, four frames' worth). The parts wait by the
+rules of §3: in arrival order with every group's waiters, none passed by a later arrival while its
+group's room takes it, so the write waits no longer than the writes before it take to be laid,
+the writer's progress, as group commit shares each flush among everything queued meanwhile
+(DeWitt et al., SIGMOD 1984 §5.2; Helland et al., Tandem TR 88.1 §2; research/11 §2.2), and within
+a frame the start tags share it as before [SFQ96]. A refusal is the bounded queue's answer to a
+caller that can come back later [research/11 §4]; a replica that has handed over a `Ready` cannot
+(07 §1.2), and its store sends no more than its handle's five. The queue's count and bytes are
+unchanged; its waiting list, `max_groups` times a group's waiters, and the owner's inbox, which
+counts them, grow from three a group to five, and the parts that wait are the write's own, moved
+from the store into the log, not copied.
 
 ### 3.2 Sharing a full frame
 

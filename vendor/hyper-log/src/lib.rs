@@ -1069,7 +1069,7 @@ impl<F: BlockFile + 'static> Log<F> {
         };
         let waiters = config
             .max_groups
-            .checked_mul(room::GROUP_SUBMISSIONS)
+            .checked_mul(room::GROUP_WAITERS)
             .ok_or(LogError::Config("waiters past usize"))?;
         let mut room = room::Room::new(room::Limits {
             submissions: config.queue_submissions,
@@ -1142,7 +1142,7 @@ impl<F: BlockFile + 'static> Log<F> {
         let capacity = config
             .queue_submissions
             .max(1)
-            .saturating_add(config.max_groups.saturating_mul(room::GROUP_SUBMISSIONS))
+            .saturating_add(config.max_groups.saturating_mul(room::GROUP_WAITERS))
             .saturating_add(device::JOBS)
             .saturating_add(1)
             .saturating_add(config.max_groups)

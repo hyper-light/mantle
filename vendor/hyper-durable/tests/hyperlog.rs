@@ -966,3 +966,113 @@ fn a_write_submitted_while_a_refused_writes_parts_are_out_is_refused_with_it() {
         "a store holding a refusal its caller has not taken has room"
     );
 }
+
+/// What [`a_write_in_frame_sized_parts_waits_behind_groups_that_fill_the_queue`] counted of the
+/// group writing in parts.
+#[derive(Debug, Default)]
+struct PartsWritten {
+    /// Cuts until its write was durable, or the cuts run.
+    cuts: usize,
+    /// Its write's answers that changed nothing: each a refusal on which a replica stalls.
+    refusals: usize,
+    /// Resumes, each making the same write again in the same parts.
+    remakes: usize,
+    durable: bool,
+}
+
+/// Four groups each keep three writes of a third of a frame out, as a busy range keeps its depth of
+/// readies, twelve thirds against the queue's three frames, so the queue holds theirs and they wait
+/// for more; a fifth group's store holds a write of eight entries of most of a frame, a part each,
+/// and keeps its handle's five out. Every write is answered as cuts lay what the log admitted, a
+/// group's answered write sent again at once; a refused one is made again at once in the same
+/// parts, as a replica resumed at once makes it (`Replica::resume`), the stalled group's best case.
+/// Expect: the write in parts waits for room in arrival order and is durable within `CUTS`, never
+/// refused. Before, a group waited with three at most: holding no room, its fourth part was refused
+/// `Busy`, the write was refused whole, and so at every remake while the others kept the queue
+/// full: 12 refusals and 12 remakes in 12 cuts, never durable; traced, each fourth part found its
+/// group with none admitted and three waiting, and the queue holding 164,320 of its 184,407 bytes,
+/// all the others', short of a part's 61,263.
+#[test]
+fn a_write_in_frame_sized_parts_waits_behind_groups_that_fill_the_queue() {
+    let written = parts_behind_a_full_queue();
+    assert!(
+        written.durable && written.refusals == 0,
+        "the write in parts behind a full queue: {written:?}"
+    );
+    assert_eq!(written.remakes, 0);
+}
+
+/// Drives the groups of [`a_write_in_frame_sized_parts_waits_behind_groups_that_fill_the_queue`]
+/// until the write in parts is durable, `CUTS` at most.
+fn parts_behind_a_full_queue() -> PartsWritten {
+    /// The cuts the write in parts takes at most. Room goes to waiters in arrival order, and no
+    /// later arrival takes it while the group's oldest part waits for the queue's room, so a cut
+    /// lays two of its parts or, of what came before them, more than two frames' worth, the queue's
+    /// room less a part's. Ahead of a pair of its parts wait at most the others' twelve writes,
+    /// four frames' worth, which two cuts lay, and the third lays the pair: four pairs, 12 cuts.
+    const CUTS: usize = 12;
+    const PARTS: u64 = 8;
+    const BUSY: u128 = 4;
+    const DEPTH: u64 = 3;
+    let log = Log::create(
+        sim_file(47),
+        Config {
+            waits: Waits::Told,
+            max_groups: 8,
+            max_segments: 512,
+            ..config(16, 1 << 12)
+        },
+        1,
+    )
+    .unwrap();
+    let room = log.frame_room().unwrap();
+    let (waker, woken) = store_waker();
+    let entry = |index: u64, len: usize| hyper_raft::proto::Entry {
+        index,
+        term: 1,
+        data: vec![index as u8; len],
+        ..hyper_raft::proto::Entry::default()
+    };
+    let mut busy: Vec<(GroupStore<SimFile>, u64)> = (0..BUSY)
+        .map(|g| (GroupStore::claim(&log, 2 + g).unwrap(), 1))
+        .collect();
+    let send = |store: &mut GroupStore<SimFile>, next: &mut u64| {
+        let one = [entry(*next, room / 3 - 64)];
+        store.submit(&write_of(*next, &one), &waker).unwrap();
+        *next += 1;
+    };
+    for (store, next) in &mut busy {
+        for _ in 0..DEPTH {
+            send(store, next);
+        }
+    }
+    let big: Vec<_> = (1..=PARTS).map(|index| entry(index, room - 256)).collect();
+    let mut parted = GroupStore::claim(&log, 1).unwrap();
+    parted.submit(&write_of(1, &big), &waker).unwrap();
+    let mut written = PartsWritten::default();
+    while written.cuts < CUTS && !written.durable {
+        log.cut().unwrap().wait().unwrap();
+        written.cuts += 1;
+        while woken.try_recv().is_ok() {}
+        for (store, next) in &mut busy {
+            while let Some(answer) = store.poll() {
+                answer.unwrap();
+                send(store, next);
+            }
+        }
+        match parted.poll() {
+            None => {}
+            Some(Ok(())) => written.durable = true,
+            Some(Err(fault)) => {
+                assert!(fault.changed_nothing(), "{fault}");
+                written.refusals += 1;
+                written.remakes += 1;
+                parted.submit(&write_of(1, &big), &waker).unwrap();
+            }
+        }
+    }
+    if written.durable {
+        assert_eq!(parted.handle().view().unwrap().unwrap().last, PARTS);
+    }
+    written
+}

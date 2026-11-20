@@ -531,6 +531,11 @@ pub(crate) struct Host {
     /// here as it is woken (`Host::wake`) and taken out as its turn leaves it resting
     /// (`Host::rest`). Bound: one a job.
     ready: Earliest,
+    /// Its jobs whose fields were read for a driving shard (`Work::Handing`), each keyed by when,
+    /// on the shard's clock, it was first keyed so: the node's task hands these alone, the first
+    /// first (`Host::handing`, `Node::hand_off`), where a pass of every job looked for them at
+    /// each turn. Kept as each job is keyed (`Host::rekey`). Bound: one a job.
+    handovers: Earliest,
     /// Wakes counted, the key of the next job woken (`Host::wake`): from a `u64` count no node's
     /// wakes wrap.
     woken: u64,
@@ -909,6 +914,7 @@ impl Host {
             room_offered_ns: 0,
             rooms: Earliest::default(),
             ready: Earliest::default(),
+            handovers: Earliest::default(),
             woken: 0,
             due: Vec::new(),
             offered: Vec::new(),
@@ -939,6 +945,7 @@ impl Host {
         self.renewals.grow();
         self.rooms.grow();
         self.ready.grow();
+        self.handovers.grow();
         if !resting {
             self.wake(at);
         }
@@ -963,6 +970,7 @@ impl Host {
         self.renewals.swap_remove(at);
         self.rooms.swap_remove(at);
         self.ready.swap_remove(at);
+        self.handovers.swap_remove(at);
         if let Some(moved) = self.jobs.get(at) {
             self.exchanges.hold(moved.door.exchange(), at);
             self.named.hold(moved.door.named(), at);
@@ -1154,9 +1162,12 @@ impl Host {
         let waiting = job
             .waits_for_room()
             .then(|| self.rooms.key(at).unwrap_or(now));
+        let handing =
+            matches!(job.work, Work::Handing(_)).then(|| self.handovers.key(at).unwrap_or(now));
         self.beats.set(at, due);
         self.renewals.set(at, renewal);
         self.rooms.set(at, waiting);
+        self.handovers.set(at, handing);
     }
 
     /// The slot of the job of the native request on `exchange`.
@@ -1216,18 +1227,14 @@ impl Host {
         );
     }
 
-    /// The first native job from slot `from` on whose fields were read for a driving shard
-    /// (`Work::Handing`), taken out to be handed there: its request and its exchange. `from` is
-    /// left at its slot, where the job moved into it is looked at next, so a turn's handing passes
-    /// each job once, not every job again for each one handed.
-    fn handing(&mut self, from: &mut usize) -> Option<(Box<Handover>, Option<ExchangeId>)> {
-        let at = self
-            .jobs
-            .get(*from..)?
-            .iter()
-            .position(|job| matches!(job.work, Work::Handing(_)))?
-            .checked_add(*from)?;
-        *from = at;
+    /// The first native job whose fields were read for a driving shard (`Work::Handing`), taken
+    /// out to be handed there: its request and its exchange. Found among the handovers alone
+    /// (`handovers`), so a turn's handing reads the jobs it hands and no other, where a pass of
+    /// every job looked for them at each turn the node drives shards.
+    fn handing(&mut self) -> Option<(Box<Handover>, Option<ExchangeId>)> {
+        let (_, at) = self.handovers.least()?;
+        #[cfg(test)]
+        tests::READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let job = self.remove(at)?;
         let (Door::Native(exchange, half), Work::Handing(handing)) = (job.door, job.work) else {
             return None;
@@ -3329,6 +3336,10 @@ struct Commanding {
     then: Then,
     /// The command asked.
     asked: bool,
+    /// The bucket's row, read and kept while the node has no room for the command made from it:
+    /// made and asked at a later turn, as a completion's and a put's requests wait, so nothing of
+    /// the request is spent on an ask the node refuses.
+    row: Option<Bucket>,
 }
 
 /// The command a bucket's row is read for.
@@ -4738,10 +4749,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.driving.is_empty() {
             return;
         }
-        // Each job passed once: one handed leaves its slot to the job moved into it, and one its
-        // lane refuses runs here as a job pushed last, not handed.
-        let mut from = 0;
-        while let Some((request, exchange)) = self.host.handing(&mut from) {
+        // Each handover taken once: one its lane refuses runs here as a job pushed last, its work
+        // made from its operation, not handed again.
+        while let Some((request, exchange)) = self.host.handing() {
             let lanes = self
                 .driving
                 .iter()
@@ -7380,6 +7390,22 @@ impl Host {
         if !pending.is_empty() || commanding.asked {
             return Ok(false);
         }
+        if let Some(Job {
+            work: Work::Command(commanding),
+            ..
+        }) = self.jobs.get_mut(at)
+            && let Some(row) = commanding.row.take()
+        {
+            self.command_read(node, at, Read::Bucket(Some(row)))?;
+            return self.moved_on(at);
+        }
+        let Some(Job {
+            work: Work::Command(commanding),
+            ..
+        }) = self.jobs.get(at)
+        else {
+            return Ok(true);
+        };
         let Some(group) = node.group_of(Layer::Bucket) else {
             self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
@@ -7419,6 +7445,13 @@ impl Host {
         else {
             return Ok(());
         };
+        // A command the node has no room for is refused before it is asked (`Node::command`),
+        // its value given up: the row is kept and the command made at a later turn, where one
+        // made and refused was never asked again and its job, holding no ask, had no bound.
+        if !node.command_room() {
+            commanding.row = Some(row);
+            return Ok(());
+        }
         let (group, command) = match &mut commanding.then {
             Then::Delete {
                 key,
@@ -8944,6 +8977,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                     named,
                 },
                 asked: false,
+                row: None,
             })),
         },
         Op::PutVersioning {
@@ -8955,6 +8989,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                 mantle_s3::body::Versioning::Suspended => Versioning::Suspended,
             }),
             asked: false,
+            row: None,
         })),
         Op::GetVersioning { bucket } => Work::Read(Box::new(Single::Versioning(bucket))),
         // A checksum type its algorithm does not have: a full-object hash or a composite
@@ -8984,6 +9019,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                 metadata,
             },
             asked: false,
+            row: None,
         })),
         Op::UploadPart { length, .. } if length > name::MAX_PART => {
             Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
@@ -9043,6 +9079,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
             bucket,
             then: Then::Abort { key, upload },
             asked: false,
+            row: None,
         })),
         // A native upload's object is held to a CRC, which combines from its runs' (05 §3.3).
         Op::Open { checksum, .. } if !checksum.full_object() => {
@@ -9072,6 +9109,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                         metadata,
                     },
                     asked: false,
+                    row: None,
                 })),
                 // No run fits: an object past what 10,000 runs of S3's largest part hold, or a
                 // buffer below its least part or too small for the length's runs.
@@ -9743,6 +9781,7 @@ pub(super) mod tests {
             self.renewals.audit(self.jobs.len(), "renewal");
             self.rooms.audit(self.jobs.len(), "room");
             self.ready.audit(self.jobs.len(), "wake");
+            self.handovers.audit(self.jobs.len(), "handover");
             for (at, job) in self.jobs.iter().enumerate() {
                 assert_eq!(
                     self.ready.key(at).is_some(),
@@ -9787,6 +9826,11 @@ pub(super) mod tests {
                     self.rooms.key(at).is_some(),
                     job.waits_for_room(),
                     "job {at} among the waiters for room"
+                );
+                assert_eq!(
+                    self.handovers.key(at).is_some(),
+                    matches!(job.work, Work::Handing(_)),
+                    "job {at} among the handovers exactly where it is handed"
                 );
                 beats.extend(key);
             }
@@ -10689,6 +10733,7 @@ pub(super) mod tests {
                         named: None,
                     },
                     asked: false,
+                    row: None,
                 }))
             },
             |ask| match ask {
@@ -10743,6 +10788,63 @@ pub(super) mod tests {
         for answers in &replies {
             assert!(replied(answers, Status::Done, |_| true), "{answers:?}");
         }
+    }
+
+    /// A DeleteObject whose bucket's row comes while the node has no room for its delete keeps
+    /// the row and asks the delete at its next turn with room, answered `Done`; where the delete
+    /// was made, refused and never asked again, the job held no ask and no bound and was stepped
+    /// for good (measured: no reply in 1,000 turns). It does not rest meanwhile.
+    #[test]
+    fn a_command_the_node_has_no_room_for_is_asked_at_a_later_turn() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let (job, _, mut answers) = local_job(
+            Work::Command(Box::new(Commanding {
+                bucket: "b".into(),
+                then: Then::Delete {
+                    key: "k".into(),
+                    if_match: None,
+                    named: None,
+                },
+                asked: false,
+                row: None,
+            })),
+            now,
+            1,
+        );
+        host.push(job, now);
+        let mut stub = put_and_get_stub();
+        stub.answer = |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                Answer::Name(name::Outcome::Deleted {
+                    marker: false,
+                    version: None,
+                }),
+            )),
+            _ => panic!("an ask a DeleteObject does not make"),
+        };
+        host.step(&mut stub).unwrap();
+        assert_eq!(stub.asked, 1, "its row asked");
+        // Its row comes while the node holds as many commands as it keeps.
+        stub.no_room = true;
+        for _ in 0..4 {
+            host.step(&mut stub).unwrap();
+            assert!(!host.jobs[0].resting, "a job holding no ask does not rest");
+        }
+        assert_eq!(stub.asked, 1, "no command asked without room");
+        stub.no_room = false;
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 1_000, "the delete was never asked");
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(stub.asked, 2, "its row, then its delete");
+        let answers = answered(&mut answers);
+        assert!(replied(&answers, Status::Done, |_| true), "{answers:?}");
     }
 
     /// A native request's job of `work`, handed with its fields read (`handed_job`), named `name`
@@ -12998,6 +13100,9 @@ pub(super) mod tests {
 
     impl Serve for Stub {
         fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+            if self.no_room {
+                return Err(NodeError::Asks);
+            }
             let pending = match &ask {
                 JobAsk::Command(..) => Pending::Command(self.asked),
                 JobAsk::Read(..) => Pending::Read(self.asked),
@@ -13036,7 +13141,7 @@ pub(super) mod tests {
         }
 
         fn command_room(&self) -> bool {
-            true
+            !self.no_room
         }
 
         fn room(&self, _: &JobAsk) -> bool {
@@ -16285,12 +16390,13 @@ pub(super) mod tests {
         assert_eq!(most, 512, "the run reached its most jobs");
     }
 
-    /// A turn's handing passes each job once (`Host::handing`, `Node::hand_off`): with 2,048 jobs,
-    /// every other one's fields read for a driving shard, each of those is taken out and the rest
-    /// stay, the jobs looked at at most the jobs and the ones handed, where a search of every job
-    /// from the first for each one handed looked at about an eighth of the jobs' square.
+    /// A turn's handing reads the handovers alone (`Host::handing`, `Node::hand_off`): with 2,048
+    /// jobs, every other one's fields read for a driving shard, each of those is taken out and
+    /// read once, 1,024 reads, and the rest stay; a turn with none to hand reads none. The pass
+    /// before looked at every job at each turn the node drives shards: 2,048 jobs at this turn
+    /// (`looked <= JOBS + handed`, its test), and 2,048 again at each turn with none to hand.
     #[test]
-    fn a_turns_handing_passes_each_job_once() {
+    fn a_turns_handing_reads_the_handovers_alone() {
         const JOBS: usize = 2048;
         let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
         let mut halves = Vec::new();
@@ -16310,37 +16416,26 @@ pub(super) mod tests {
             host.push(job, 0);
             halves.push(half);
         }
-        let (mut from, mut looked, mut searched, mut handed) = (0, 0, 0, 0);
-        loop {
-            let before = from;
-            let taken = host.handing(&mut from);
-            match taken {
-                Some(_) => {
-                    // This call looked at the jobs from `before` to the one taken; a search from
-                    // the first would have looked at every one up to it.
-                    looked += from - before + 1;
-                    searched += from + 1;
-                    handed += 1;
-                }
-                None => {
-                    looked += host.jobs.len() - before;
-                    searched += host.jobs.len();
-                    break;
-                }
-            }
+        let _ = reads();
+        let mut handed = 0;
+        while let Some((handover, _)) = host.handing() {
+            assert!(matches!(handover.op, Op::Get { .. }));
+            handed += 1;
         }
-        println!(
-            "{handed} handed of {JOBS} jobs: {looked} looked at, {searched} by a search of each"
-        );
         assert_eq!(handed, JOBS / 2);
+        assert_eq!(
+            reads(),
+            (JOBS / 2) as u64,
+            "each handover read once, no other job"
+        );
+        assert!(host.handing().is_none());
+        assert_eq!(reads(), 0, "a turn with none to hand reads none");
         assert_eq!(host.jobs.len(), JOBS / 2);
         assert!(
             host.jobs
                 .iter()
                 .all(|job| !matches!(job.work, Work::Handing(_)))
         );
-        // Each job looked at once, and a job moved into a slot handed from looked at there again.
-        assert!(looked <= JOBS + handed, "{looked} looked at");
-        host.audit();
+        host.audit_keys(0);
     }
 }

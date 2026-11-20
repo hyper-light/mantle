@@ -2796,9 +2796,24 @@ deleted, `NoSuchUpload`, `Done` with the version committed, `NoSuchKey`, `NoSuch
 Open: a native job reading its fields (`Work::Fields`) is stepped at every turn until they are
 whole: the node's task marks its exchange's feeding and reply as the exchange's body is ready
 (`Event::BodyReady`), not its job, which waking the job there would close. A job draining its
-reply (`Work::Draining`) takes one step to its last answers, which rest as before. A driving
-shard's hand-off still looks for jobs handed from the slot it reached (`Host::handing`), each job
-once a turn where the node drives shards.
+reply (`Work::Draining`) takes one step to its last answers, which rest as before.
+
+*As built (2026-11-20): a turn's hand-off reads the handovers alone, and a command refused room is
+asked again* (`crates/node/src/node/host.rs`).
+- A native request whose fields are read for a driving shard (`Work::Handing`) is kept among the
+  handovers (`Host::handovers`, keyed by when it was first keyed so, as each job is keyed,
+  `Host::rekey`), and the node's task hands those alone, the first first (`Host::handing`,
+  `Node::hand_off`), where a pass looked at every job at each turn the node drives shards. Bound:
+  one entry a job. Tested: of 2,048 jobs, every other one handed, the turn reads the 1,024 it
+  hands and no other, and a turn with none to hand reads none, where the pass looked at all 2,048
+  at each turn.
+- A command whose bucket's row came while the node held as many commands as it keeps was made,
+  refused by `Node::command` (`NodeError::Asks`) once its value was given up, and never asked
+  again: holding no ask, its bound was keyed in no deadline, and on the S3 door nothing ended it.
+  It now asks for room first (`Serve::command_room`, the check `Node::command` refuses by) and
+  keeps the row until there is some (`Commanding::row`), stepped at each turn meanwhile as every
+  job refused room is. Tested: a DeleteObject whose row comes without room asks its delete at the
+  first turn with room and is answered `Done`; by the rule before it had no reply in 1,000 turns.
 
 *As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
 The node's task reads every native body, so it reads them as upload-stall's job did, never into a

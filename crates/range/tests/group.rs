@@ -2574,3 +2574,762 @@ fn a_member_behind_the_start_is_sent_its_snapshot_by_the_drive_that_makes_it() {
     let leader = rows_applied(nodes[0].replica.engine_mut());
     assert_eq!(rows_applied(nodes[2].replica.engine_mut()), leader);
 }
+
+/// When a write's answer is given, as hyper-log's writer gives it (docs/design/raft-log.md §3), on
+/// the test's clock: a frame takes what was admitted while the device was busy, its flush takes
+/// `flush_ns`, and its persist record confirms the frame before it, whose writes are answered once
+/// its flush ends; a frame whose flush ends with nothing admitted is confirmed by a write and
+/// flush of its own. A group holds three writes at most (`room::GROUP_SUBMISSIONS`), a fourth
+/// admitted once the frame before is answered, after the device looked for a frame to follow.
+/// Every write is made durable on the real log as it is submitted ([`Synchronous`]); the device
+/// says only when its answer is given.
+struct Device {
+    flush_ns: u64,
+    /// How long a frame whose flush ended with nothing admitted, and answered the frame before's
+    /// writes, waits for a write to follow it before it is confirmed on its own; zero confirms at
+    /// once, as hyper-log's device did before its owner held such a confirmation for one measured
+    /// frame's writes and flush (hyper-log `owner::write`'s `hold_confirmation`).
+    wait_ns: u64,
+    /// While set, the frame flushed waits until then for a write to follow it.
+    waiting_until: Option<u64>,
+    /// The frame or confirmation on the device: when its flush ends, its writes, and whether it is
+    /// a confirmation of its own.
+    on: Option<(u64, Vec<Sub>, bool)>,
+    /// The frame flushed, awaiting the record that confirms it.
+    awaiting: Vec<Sub>,
+    /// Admitted for the next frame.
+    gathering: Vec<Sub>,
+    /// Waiting for their group's room.
+    waiting: VecDeque<Sub>,
+    frames: u64,
+    confirmations: u64,
+}
+
+struct Sub {
+    range: usize,
+    released: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    waker: Waker,
+}
+
+impl Device {
+    fn new(flush_ns: u64) -> Self {
+        Self {
+            flush_ns,
+            wait_ns: 0,
+            waiting_until: None,
+            on: None,
+            awaiting: Vec::new(),
+            gathering: Vec::new(),
+            waiting: VecDeque::new(),
+            frames: 0,
+            confirmations: 0,
+        }
+    }
+
+    fn held(&self, range: usize) -> usize {
+        let on = self.on.as_ref().map_or(0, |(_, subs, _)| {
+            subs.iter().filter(|s| s.range == range).count()
+        });
+        on + [&self.awaiting, &self.gathering]
+            .iter()
+            .map(|subs| subs.iter().filter(|s| s.range == range).count())
+            .sum::<usize>()
+    }
+
+    fn submit(&mut self, sub: Sub) {
+        if self.held(sub.range) < 3 && !self.waiting.iter().any(|w| w.range == sub.range) {
+            self.gathering.push(sub);
+        } else {
+            self.waiting.push_back(sub);
+        }
+    }
+
+    /// Starts a frame of what was admitted, if the device is idle.
+    fn kick(&mut self, now: u64) {
+        if self.on.is_none() && !self.gathering.is_empty() {
+            self.waiting_until = None;
+            self.start(now);
+        }
+    }
+
+    /// A frame of the writes admitted, one a group at most, the rest left for the frame after.
+    fn start(&mut self, at: u64) {
+        let mut taken: Vec<Sub> = Vec::new();
+        let mut left = Vec::new();
+        for sub in self.gathering.drain(..) {
+            if taken.iter().any(|t| t.range == sub.range) {
+                left.push(sub);
+            } else {
+                taken.push(sub);
+            }
+        }
+        self.gathering = left;
+        self.on = Some((at + self.flush_ns, taken, false));
+        self.frames += 1;
+    }
+
+    /// Ends every flush due by `now`: the times of the confirmations of their own begun.
+    fn advance(&mut self, now: u64) -> Vec<u64> {
+        let mut began = Vec::new();
+        // A wait for a write to follow that ran out: the frame is confirmed on its own.
+        if let Some(until) = self.waiting_until
+            && until <= now
+            && self.on.is_none()
+        {
+            self.waiting_until = None;
+            self.on = Some((until + self.flush_ns, Vec::new(), true));
+            self.confirmations += 1;
+            began.push(until);
+        }
+        while let Some((ends, _, _)) = self.on.as_ref() {
+            let ends = *ends;
+            if ends > now {
+                break;
+            }
+            let (_, subs, alone) = self.on.take().unwrap();
+            // Whether this flush's end answered writes: their submitters come back with their next
+            // in a closed loop, which a frame flushed with nothing to follow waits for.
+            let answered = !self.awaiting.is_empty();
+            for s in self.awaiting.drain(..) {
+                s.released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                s.waker.wake_by_ref();
+            }
+            if !alone {
+                self.awaiting = subs;
+            }
+            if !self.gathering.is_empty() {
+                self.start(ends);
+            } else if !self.awaiting.is_empty() && self.wait_ns > 0 && answered {
+                self.waiting_until = Some(ends + self.wait_ns);
+            } else if !self.awaiting.is_empty() {
+                self.on = Some((ends + self.flush_ns, Vec::new(), true));
+                self.confirmations += 1;
+                began.push(ends);
+            }
+            // Room given back once the device has looked for a frame to follow.
+            let mut kept = VecDeque::new();
+            while let Some(w) = self.waiting.pop_front() {
+                if self.held(w.range) < 3 && !kept.iter().any(|k: &Sub| k.range == w.range) {
+                    self.gathering.push(w);
+                } else {
+                    kept.push_back(w);
+                }
+            }
+            self.waiting = kept;
+            if self.on.is_none() && !self.gathering.is_empty() {
+                self.start(ends);
+            }
+        }
+        began
+    }
+}
+
+/// A group's store whose answers the modeled [`Device`] gives.
+struct Paced {
+    inner: Synchronous<SimFile>,
+    range: usize,
+    device: std::sync::Arc<std::sync::Mutex<Device>>,
+    released: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    taken: u64,
+}
+
+impl hyper_durable::LogStore for Paced {
+    type Hold = std::convert::Infallible;
+
+    fn held(&self) -> Option<&Self::Hold> {
+        None
+    }
+
+    fn release(&mut self, met: &Self::Hold) {
+        match *met {}
+    }
+
+    fn depth(&self) -> usize {
+        self.inner.depth()
+    }
+
+    fn view(&self) -> Result<hyper_durable::StoreView, Fault> {
+        self.inner.view()
+    }
+
+    fn bounds(&self) -> Result<(hyper_durable::Point, u64), hyper_raft::StorageError> {
+        self.inner.bounds()
+    }
+
+    fn term(&self, index: u64) -> Result<u64, hyper_raft::StorageError> {
+        self.inner.term(index)
+    }
+
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_bytes: u64,
+        into: &mut Vec<mantle_range::Entry>,
+    ) -> Result<(), hyper_raft::StorageError> {
+        self.inner.entries(low, high, max_bytes, into)
+    }
+
+    fn visit(
+        &self,
+        low: u64,
+        high: u64,
+        page: u64,
+        visit: &mut dyn FnMut(hyper_durable::EntryRef<'_>) -> bool,
+    ) -> Result<(), hyper_raft::StorageError> {
+        self.inner.visit(low, high, page, visit)
+    }
+
+    fn proposals(
+        &self,
+        into: &mut Vec<mantle_range::Entry>,
+    ) -> Result<(), hyper_raft::StorageError> {
+        self.inner.proposals(into)
+    }
+
+    fn released(&self) -> Result<u64, hyper_raft::StorageError> {
+        self.inner.released()
+    }
+
+    fn room(&self) -> bool {
+        self.inner.room()
+    }
+
+    fn submit(&mut self, write: &hyper_durable::Write<'_>, waker: &Waker) -> Result<(), Fault> {
+        self.inner.submit(write, waker)?;
+        self.device.lock().unwrap().submit(Sub {
+            range: self.range,
+            released: std::sync::Arc::clone(&self.released),
+            waker: waker.clone(),
+        });
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<Result<(), Fault>> {
+        if self.released.load(std::sync::atomic::Ordering::SeqCst) <= self.taken {
+            return None;
+        }
+        let answer = self.inner.poll();
+        if answer.is_some() {
+            self.taken += 1;
+        }
+        answer
+    }
+
+    fn write_now(&mut self, write: &hyper_durable::Write<'_>) -> Result<(), Fault> {
+        self.inner.write_now(write)
+    }
+
+    fn keep_after(&mut self, index: u64) {
+        self.inner.keep_after(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.inner.kept_bytes()
+    }
+}
+
+/// The waker of a node's member of a range: queues it for the node's next turn.
+struct Woke {
+    node: usize,
+    range: usize,
+    woken: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+}
+
+impl std::task::Wake for Woke {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.woken.lock().unwrap().push((self.node, self.range));
+    }
+}
+
+/// A node of the paced cell: its member of each range, its log and its device, and its turn's
+/// state as the node's task keeps it (mantle-node's `Node::turn`).
+struct CellNode {
+    members: Vec<Replica<Paced, Model>>,
+    wakers: Vec<Waker>,
+    device: std::sync::Arc<std::sync::Mutex<Device>>,
+    queued: VecDeque<usize>,
+    is_queued: Vec<bool>,
+    wake_at: Vec<Option<u64>>,
+    /// Commands come to this node for each range, waiting to be proposed.
+    asked: Vec<u64>,
+    busy_until: u64,
+    /// When the turn begun drives.
+    drive_at: Option<u64>,
+    _log: Log<SimFile>,
+}
+
+impl CellNode {
+    fn queue(&mut self, range: usize) {
+        if !self.is_queued[range] {
+            self.is_queued[range] = true;
+            self.queued.push_back(range);
+        }
+    }
+}
+
+/// What a paced cell's run counted: each node's frames and confirmations of their own, and for
+/// each confirmation what each range's member on that node was doing as the frame's flush ended.
+#[derive(Default, Debug)]
+struct Paced3 {
+    frames: Vec<u64>,
+    confirmations: Vec<u64>,
+    /// For each reason, the confirmations at which at least one range of the node had it.
+    reasons: std::collections::BTreeMap<(&'static str, &'static str), u64>,
+    /// Confirmations by the role of the node (leader of every range, or follower of every one).
+    by_role: std::collections::BTreeMap<&'static str, u64>,
+}
+
+/// Timings of the paced cell, in nanoseconds of the test's clock.
+#[derive(Clone, Copy)]
+struct Pace {
+    flush_ns: u64,
+    /// One way between nodes, and between a client and a node.
+    hop_ns: u64,
+    /// A turn's fixed cost and each drive's.
+    turn_ns: u64,
+    drive_ns: u64,
+    /// Ranges, all led by node 0, and the clients of each, each with one command out at a time.
+    ranges: usize,
+    clients: u64,
+    /// Commands answered at the leader before the run ends.
+    commands: u64,
+    /// Between one command to a range and its next, an open stream; zero for a closed loop of
+    /// `clients`, each sending its next command once its last is answered.
+    gap_ns: u64,
+    /// The most a client of a closed loop works between an answer and its next command.
+    think_ns: u64,
+    /// A turn's work before its drive.
+    pre_ns: u64,
+    /// How long a frame flushed with nothing to follow waits for a write before its own
+    /// confirmation ([`Device::wait_ns`]).
+    wait_ns: u64,
+}
+
+/// Runs a cell of three nodes, each with one log on a device of `pace.flush_ns` flushes, hosting a
+/// member of each of `pace.ranges` ranges, all led by node 0, under a steady closed loop of
+/// clients; each node turns as mantle-node's task does: it takes what arrived, drives each member
+/// queued once, sends what they gave at the turn's end, then proposes the commands that came.
+fn paced_cell(pace: Pace) -> Paced3 {
+    use std::sync::{Arc, Mutex};
+    let woken: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let config = LogConfig {
+        waits: Waits::Never,
+        ..log_config()
+    };
+    let mut nodes: Vec<CellNode> = (0..3usize)
+        .map(|n| {
+            let id = n as u64 + 1;
+            let log = Log::create(sim(id), config, 0x6c6f67 + u128::from(id)).unwrap();
+            let device = Arc::new(Mutex::new(Device {
+                wait_ns: pace.wait_ns,
+                ..Device::new(pace.flush_ns)
+            }));
+            let mut members = Vec::new();
+            let mut wakers = Vec::new();
+            for r in 0..pace.ranges {
+                let group = GROUP + r as u128;
+                let store = Paced {
+                    inner: Synchronous::new(
+                        mantle_range::claim(&log, group, &range()).unwrap(),
+                        None,
+                    ),
+                    range: r,
+                    device: Arc::clone(&device),
+                    released: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    taken: 0,
+                };
+                members.push(Replica::open(id, store, first_range(), &range(), id).unwrap());
+                wakers.push(Waker::from(Arc::new(Woke {
+                    node: n,
+                    range: r,
+                    woken: Arc::clone(&woken),
+                })));
+            }
+            CellNode {
+                members,
+                wakers,
+                device,
+                queued: VecDeque::new(),
+                is_queued: vec![false; pace.ranges],
+                wake_at: vec![None; pace.ranges],
+                asked: vec![0; pace.ranges],
+                busy_until: 0,
+                drive_at: None,
+                _log: log,
+            }
+        })
+        .collect();
+    // (arrives, node, range, message) and (arrives, range) for a client's command at the leader.
+    let mut wire: Vec<(u64, usize, usize, Message)> = Vec::new();
+    let mut asks: Vec<(u64, usize)> = Vec::new();
+    for r in 0..pace.ranges {
+        nodes[0].members[r].campaign().unwrap();
+        nodes[0].queue(r);
+    }
+    let mut counted = Paced3 {
+        frames: vec![0; 3],
+        confirmations: vec![0; 3],
+        ..Paced3::default()
+    };
+    let mut started = false;
+    let mut serial = 0u64;
+    let mut drawn = 0x9e37_79b9_7f4a_7c15u64;
+    let mut now = 0u64;
+    let mut answered = 0u64;
+    let mut base: Option<(Vec<u64>, Vec<u64>)> = None;
+    for _ in 0..5_000_000u64 {
+        // Every flush ended by now, each confirmation of its own looked at as it begins.
+        for (n, node) in nodes.iter().enumerate() {
+            let began = node.device.lock().unwrap().advance(now);
+            for _ in began {
+                if base.is_none() {
+                    continue;
+                }
+                let role = if n == 0 { "leader" } else { "follower" };
+                *counted.by_role.entry(role).or_default() += 1;
+                let mut seen: Vec<&'static str> = Vec::new();
+                for r in 0..pace.ranges {
+                    let device = node.device.lock().unwrap();
+                    let untaken = node.members[r].in_flight();
+                    let submitted =
+                        device.held(r) + device.waiting.iter().filter(|w| w.range == r).count();
+                    let reason = if untaken >= 3 && submitted + 1 >= untaken {
+                        "readies in flight at depth, every one a write"
+                    } else if untaken >= 3 {
+                        "readies in flight at depth, one a ready that wrote nothing"
+                    } else if device.held(r) >= 3 || device.waiting.iter().any(|w| w.range == r) {
+                        "group's room"
+                    } else if node.is_queued[r] && node.busy_until > now {
+                        "queued, the node's turn not yet reached"
+                    } else if node.is_queued[r] {
+                        "queued, drive not yet taken"
+                    } else if node.asked[r] > 0 {
+                        "commands waiting to be proposed"
+                    } else if wire.iter().any(|(_, to, rr, _)| *to == n && *rr == r) {
+                        "messages on the wire to it"
+                    } else if n == 0 && asks.iter().any(|(_, rr)| *rr == r) {
+                        "commands on the wire to it"
+                    } else {
+                        "nothing to write"
+                    };
+                    if !seen.contains(&reason) {
+                        seen.push(reason);
+                    }
+                }
+                for reason in seen {
+                    *counted.reasons.entry((role, reason)).or_default() += 1;
+                }
+            }
+        }
+        for (n, r) in woken.lock().unwrap().drain(..) {
+            nodes[n].queue(r);
+        }
+        let mut i = 0;
+        while i < wire.len() {
+            if wire[i].0 <= now {
+                let (_, to, r, m) = wire.swap_remove(i);
+                let _ = nodes[to].members[r].step(m);
+                nodes[to].queue(r);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < asks.len() {
+            if asks[i].0 <= now {
+                let (at, r) = asks.swap_remove(i);
+                nodes[0].asked[r] += 1;
+                // An open stream: the range's next command comes its gap after this one.
+                if pace.gap_ns > 0 {
+                    asks.push((at + pace.gap_ns, r));
+                }
+            } else {
+                i += 1;
+            }
+        }
+        for (n, node) in nodes.iter_mut().enumerate() {
+            if node.busy_until > now {
+                continue;
+            }
+            for r in 0..pace.ranges {
+                if node.wake_at[r].is_some_and(|at| at <= now) {
+                    node.wake_at[r] = None;
+                    node.queue(r);
+                }
+            }
+            let work = !node.queued.is_empty() || node.asked.iter().any(|a| *a > 0);
+            // A turn takes what came, then spends `pre_ns` before it drives (its inbox, its
+            // plane, its events); its drive comes then.
+            match node.drive_at {
+                Some(at) if at <= now => node.drive_at = None,
+                Some(_) => continue,
+                None if !work => continue,
+                None if pace.pre_ns > 0 => {
+                    node.drive_at = Some(now + pace.pre_ns);
+                    node.busy_until = now + pace.pre_ns;
+                    continue;
+                }
+                None => {}
+            }
+            let mut drives = 0u64;
+            let mut sends = Vec::new();
+            for _ in 0..node.queued.len() {
+                let r = node.queued.pop_front().unwrap();
+                node.is_queued[r] = false;
+                let mut out = Out::default();
+                let driven = node.members[r]
+                    .drive(now, &node.wakers[r], &mut out)
+                    .unwrap();
+                drives += 1;
+                for m in out.messages.drain(..) {
+                    let to = usize::try_from(m.to).unwrap() - 1;
+                    sends.push((to, r, m));
+                }
+                if n == 0 {
+                    for _ in out.answers.drain(..) {
+                        answered += 1;
+                        if pace.gap_ns == 0 {
+                            // A client's own work between its answer and its next command, drawn
+                            // up to `think_ns` (xorshift64, Marsaglia 2003).
+                            drawn ^= drawn << 13;
+                            drawn ^= drawn >> 7;
+                            drawn ^= drawn << 17;
+                            let think = drawn % (pace.think_ns + 1);
+                            asks.push((now + pace.turn_ns + 2 * pace.hop_ns + think, r));
+                        }
+                    }
+                }
+                node.wake_at[r] = driven.wake;
+                if driven.more {
+                    node.queue(r);
+                }
+            }
+            let ends = now + pace.turn_ns + drives * pace.drive_ns;
+            for (to, r, m) in sends {
+                wire.push((ends + pace.hop_ns, to, r, m));
+            }
+            // The commands that came, proposed after the drives, as `Node::turn` steps its asks.
+            for r in 0..pace.ranges {
+                let count = std::mem::take(&mut node.asked[r]);
+                if count == 0 {
+                    continue;
+                }
+                let commands = (0..count)
+                    .map(|_| {
+                        serial += 1;
+                        Sessioned {
+                            session: 0,
+                            serial,
+                            unanswered: 0,
+                            command: Command::Register {
+                                owner: serial,
+                                run: 1,
+                                nth: 1,
+                            },
+                        }
+                    })
+                    .collect();
+                node.members[r]
+                    .propose(&Entry {
+                        at_ns: 10,
+                        commands,
+                    })
+                    .unwrap();
+                node.queue(r);
+            }
+            node.busy_until = ends;
+            node.device.lock().unwrap().kick(now);
+        }
+        if !started && (0..pace.ranges).all(|r| nodes[0].members[r].is_leader()) {
+            started = true;
+            for r in 0..pace.ranges {
+                // Each client's first command at its own moment within a flush's span, so the
+                // clients are not all in one phase of the pipeline.
+                for c in 0..if pace.gap_ns > 0 { 1 } else { pace.clients } {
+                    let spread = (c * pace.ranges as u64 + r as u64) * 2 * pace.flush_ns
+                        / (pace.clients * pace.ranges as u64);
+                    asks.push((now + pace.hop_ns + spread, r));
+                }
+            }
+        }
+        // The count starts once every client has had a command answered.
+        if base.is_none() && answered >= pace.clients * pace.ranges as u64 {
+            let d = |n: &CellNode| {
+                let d = n.device.lock().unwrap();
+                (d.frames, d.confirmations)
+            };
+            base = Some((
+                nodes.iter().map(|n| d(n).0).collect(),
+                nodes.iter().map(|n| d(n).1).collect(),
+            ));
+        }
+        if answered >= pace.commands {
+            let (frames, confirmations) = base.unwrap();
+            for n in 0..3 {
+                let d = nodes[n].device.lock().unwrap();
+                counted.frames[n] = d.frames - frames[n];
+                counted.confirmations[n] = d.confirmations - confirmations[n];
+            }
+            return counted;
+        }
+        // The next moment anything happens.
+        let mut next = u64::MAX;
+        for node in &nodes {
+            let device = node.device.lock().unwrap();
+            if let Some((ends, _, _)) = device.on.as_ref() {
+                next = next.min(*ends);
+            }
+            if let Some(until) = device.waiting_until {
+                next = next.min(until.max(now + 1));
+            }
+            drop(device);
+            let work = !node.queued.is_empty() || node.asked.iter().any(|a| *a > 0);
+            if work {
+                next = next.min(node.busy_until.max(now + 1));
+            }
+            if let Some(at) = node.drive_at {
+                next = next.min(at.max(now + 1));
+            }
+            for at in node.wake_at.iter().flatten() {
+                next = next.min((*at).max(node.busy_until).max(now + 1));
+            }
+        }
+        for (at, ..) in &wire {
+            next = next.min(*at);
+        }
+        for (at, _) in &asks {
+            next = next.min(*at);
+        }
+        assert!(
+            next != u64::MAX,
+            "the cell went idle with {answered} answered"
+        );
+        now = next.max(now);
+    }
+    panic!("the cell never answered its commands: {answered}");
+}
+
+/// The paced cell's frames and confirmations of their own, summed over its three nodes, with the
+/// device's wait for the callers a flush answered (`Device::wait_ns`) none, as hyper-log's
+/// device confirmed before, and one flush, as hyper-log's owner now holds a confirmation for one
+/// measured frame's writes and flush (hyper-log `owner::write`'s `hold_confirmation`).
+fn before_and_after(pace: Pace) -> [(u64, u64, Paced3); 2] {
+    [0, pace.flush_ns].map(|wait_ns| {
+        let counted = paced_cell(Pace { wait_ns, ..pace });
+        (
+            counted.frames.iter().sum(),
+            counted.confirmations.iter().sum(),
+            counted,
+        )
+    })
+}
+
+/// A flush of 4.5 ms (the Mac Studio's `F_FULLFSYNC`), 100 us a hop, and turns about as long as
+/// a flush around their drive: 2 ms before it and 3 ms after, as the cell's 0.33 confirmations a
+/// frame were reproduced (docs/design/raft-log.md §3).
+const LONG_TURNS: Pace = Pace {
+    flush_ns: 4_500_000,
+    hop_ns: 100_000,
+    turn_ns: 3_000_000,
+    drive_ns: 20_000,
+    ranges: 8,
+    clients: 1,
+    commands: 20_000,
+    gap_ns: 0,
+    think_ns: 0,
+    pre_ns: 2_000_000,
+    wait_ns: 0,
+};
+
+/// Do: an open stream, a command a range every 0.4 ms across eight ranges, on nodes whose turns
+/// take about a flush around their drive. Expect: with no wait, a frame's flush often ends just
+/// before the next ready of a member it answered reaches the log, and about one frame in seven
+/// is confirmed on its own (0.145 measured); with the log holding a confirmation one flush for
+/// the callers its flush answered, under one in fifty.
+#[test]
+fn an_open_stream_on_long_turns_confirms_few_frames_on_their_own_once_the_log_holds() {
+    let [before, after] = before_and_after(Pace {
+        gap_ns: 400_000,
+        ..LONG_TURNS
+    });
+    assert!(
+        before.1 * 10 >= before.0,
+        "with no wait, {} confirmations in {} frames: {:?}",
+        before.1,
+        before.0,
+        before.2
+    );
+    assert!(
+        after.1 * 50 <= after.0,
+        "holding, {} confirmations in {} frames: {:?}",
+        after.1,
+        after.0,
+        after.2
+    );
+}
+
+/// Do: a closed loop, 32 clients a range across eight ranges, each working up to 5 ms between
+/// an answer and its next command, on nodes whose turns take about a flush around their drive.
+/// Expect: with no wait, more than one frame in five is confirmed on its own (0.283 measured);
+/// with the log holding a confirmation one flush for the callers its flush answered, under one
+/// in fifty (0.010 measured).
+#[test]
+fn a_closed_loop_on_long_turns_confirms_few_frames_on_their_own_once_the_log_holds() {
+    let [before, after] = before_and_after(Pace {
+        clients: 32,
+        think_ns: 5_000_000,
+        ..LONG_TURNS
+    });
+    assert!(
+        before.1 * 5 >= before.0,
+        "with no wait, {} confirmations in {} frames: {:?}",
+        before.1,
+        before.0,
+        before.2
+    );
+    assert!(
+        after.1 * 50 <= after.0,
+        "holding, {} confirmations in {} frames: {:?}",
+        after.1,
+        after.0,
+        after.2
+    );
+}
+
+/// Do: a closed loop whose clients send their next command the moment one is answered, 16 a
+/// range across four ranges, on short turns: every client in one phase, each waiting on the
+/// frame being confirmed. Expect: with no wait every other frame is confirmed on its own, as
+/// nothing can follow; the hold does not make it worse, since a flush that answered no one is
+/// confirmed at once (without that condition the wait cost a flush a cycle, measured: one
+/// confirmation a frame).
+#[test]
+fn a_closed_loop_in_one_phase_is_not_held() {
+    let [before, after] = before_and_after(Pace {
+        turn_ns: 50_000,
+        pre_ns: 0,
+        ranges: 4,
+        clients: 16,
+        ..LONG_TURNS
+    });
+    assert!(
+        before.1 * 5 >= before.0 * 2,
+        "with no wait, {} confirmations in {} frames: {:?}",
+        before.1,
+        before.0,
+        before.2
+    );
+    assert!(
+        after.1 <= before.1,
+        "holding, {} confirmations in {} frames, against {} in {}: {:?}",
+        after.1,
+        after.0,
+        before.1,
+        before.0,
+        after.2
+    );
+}

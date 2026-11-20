@@ -135,6 +135,35 @@ the load ended, and the 151 frames took 151 flushes. A Mac Studio cell taking a 
 PUTs wrote 8,469 such confirmations in 26,670 log flushes, 32%, at perf-10k `b3d4ac5d`. A frame
 is still answered only once a later durable record confirms it.
 
+With room for three the cell still wrote 5,717 in 22,959, a quarter, at `cb1d04de`. Those come
+from the node's turn: a member is driven once a turn (node.md §1.2), and once a turn's work
+around its drive takes about a flush, the flush that answers a member's ready ends before the
+member has taken the answer and handed the log its next ready, so the device, with no word that
+another frame follows, confirms the frame on its own, and the next ready reaches the log just
+after. A model of three nodes, each with one log on a device whose flush takes 4.5 ms (the Mac's
+`F_FULLFSYNC`), hyper-log's rules, and turns as `Node::turn` takes them
+(`crates/range/tests/group.rs`, `paced_cell`), writes none with short turns, and with turns of
+about a flush (2 ms before the drive, 3 ms after) 0.145 a frame for an open stream and 0.283 for
+a closed loop, near the cell's 0.33. So a frame whose flush answered the frame before's callers
+is held: the device leaves its confirmation to the owner, which, with nothing queued, waits for
+those callers to come back, and a submission that comes meanwhile takes the next frame, whose
+record confirms it; with none come, the confirmation is written. This is group commit's rule
+again, one flush shared among what queues while waiting is expected to lower total latency
+(DeWitt et al., SIGMOD 1984 §5.2; Helland et al., Tandem TR 88.1 §2; research/11 §2.2), and the
+wait is the gather's (`hyper_block::commit`, chunk-store.md §4): with nothing yet in the batch,
+its wait for a first returner, `p·S / (0 + p)`, is `S`, one frame's writes and flush as the log
+measures them, so the hold is bounded by one measured service time and adds no constant. A frame
+whose flush answered no one has no one to come back, every caller in one phase and waiting on it,
+and is confirmed at once: holding those too cost the one-phase loop a flush a cycle. In the model
+the hold takes the open stream from 84 confirmations in 579 frames to none in 576, the closed loop
+from 420 in 1,486 to 15 in 1,523 (0.010), and the one-phase loop from 936 in 1,872 to 3; the
+range tests assert each before and after (`crates/range/tests/group.rs`). A held frame's callers
+hear their answer at the next frame's flush instead of a confirmation's, or, with none come, one
+wait later (`vendor/hyper-log/tests/confirm.rs` bounds it); durability is unchanged, a frame
+answered only once a later durable record or its own confirmation confirms it (durability.md
+§7.5). Only `Waits::Measured` holds, and only once a service time is measured: under
+`Waits::Never`, the simulations', the device confirms at once.
+
 A frame is laid out once: its header, whose checksum covers the payload where it lies, and
 then the payload, go straight into the aligned buffer the last frame used, kept while it is
 large enough, where before the payload was copied into a frame and the frame into a fresh

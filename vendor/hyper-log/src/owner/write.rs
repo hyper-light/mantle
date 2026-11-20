@@ -2,19 +2,21 @@
 //! docs/design/raft-log.md §3, §5, §6).
 //!
 //! At the top of the loop the batch is what was held for this frame and what is queued. When
-//! nothing is, the last frame is confirmed on its own, or the owner waits for a submission and
-//! takes the first that comes. Under `Waits::Measured` it then waits for the submitters the last
-//! frame answered (`hyper_block::commit`), and commits: a sweep of the tail is read on the device,
-//! the batch is laid into a frame after the sweep's copies, and the frame is written and flushed
-//! on the device; once it is, the frame is published, the frame before it answered, and the loop
-//! goes round. Mantle's writer did each of these in turn on its own thread, blocking on the
+//! nothing is, the last frame is confirmed on its own, once the callers its flush answered have
+//! had a measured wait to come back (`Owner::hold_confirmation`), or the owner waits for a
+//! submission and takes the first that comes. Under `Waits::Measured` it then waits for the
+//! submitters the last frame answered (`hyper_block::commit`), and commits: a sweep of the tail
+//! is read on the device, the batch is laid into a frame after the sweep's copies, and the frame
+//! is written and flushed on the device; once it is, the frame is published, the frame before it
+//! answered, and the loop goes round. Mantle's writer did each of these in turn on its own thread, blocking on the
 //! device; here the owner hands each I/O to the device, done by a caller of the frame that waits
 //! on its answer or by the log's I/O thread (`owner.rs`), and goes on answering callers until it
 //! comes back, and the order of everything the log decides is the same. The device finishes a frame as the writer did after its flush
 //! (`device.rs`): the frame before is answered, its confirmation being this frame's record, and
 //! this frame confirmed on its own unless the owner has said another follows, which is when
 //! submissions were admitted while the frame was on the device: what the writer found queued
-//! when its flush returned.
+//! when its flush returned; or unless the owner holds the frame's confirmation for the callers
+//! its flush answered (`Owner::hold_confirmation`).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -39,6 +41,10 @@ pub(super) struct Unconfirmed<F> {
     answering: Vec<Answering>,
     /// The frame's own confirmation, laid out with the frame.
     confirm: Option<AlignedBuf>,
+    /// The frame's flush answered the frame before's callers, so with nothing queued its
+    /// confirmation waits for them to come back first (`Owner::hold_confirmation`); taken once
+    /// it has.
+    hold: bool,
 }
 
 /// What the writer is waiting on the device for.
@@ -89,6 +95,8 @@ pub(super) struct Writing<F> {
     sequence: u64,
     /// The frame is answered at its own flush, never confirmed (`device::Frame::at_flush`).
     at_flush: bool,
+    /// Its confirmation is the owner's, should no frame follow (`device::Frame::hold`).
+    hold: bool,
 }
 
 impl<F> Writing<F> {
@@ -216,13 +224,14 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
     }
 
-    /// Nothing is queued: the last frame is confirmed on its own, at once, since no frame would
-    /// carry the confirmation; or, with none to confirm, the next slot's zeros are written ahead
-    /// a piece at a time, and with none of those either the owner parks. Whether the loop goes
-    /// round again at once.
+    /// Nothing is queued: the last frame is confirmed on its own, since no frame would carry the
+    /// confirmation, once the callers its flush answered have had their wait to come back
+    /// (`Owner::hold_confirmation`), at once otherwise; or, with none to confirm, the next slot's
+    /// zeros are written ahead a piece at a time, and with none of those either the owner parks.
+    /// Whether the loop goes round again at once.
     fn idle(&mut self) -> bool {
         if self.unconfirmed.is_some() {
-            if self.confirm(false) {
+            if self.hold_confirmation() || self.confirm(false) {
                 return false;
             }
             self.schedule.backlog = self.queued();
@@ -424,6 +433,46 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.keep_gathering();
     }
 
+    /// Holds the last frame's confirmation while the callers its flush answered, the frame
+    /// before's, come back: a submission that comes meanwhile takes the next frame, whose record
+    /// confirms this one, so no flush is spent on a confirmation of its own. Replicas submit in a
+    /// closed loop (mantle docs/design/raft-log.md §3), and once a node's turn around its drive
+    /// takes about a flush, the next write of a caller a flush answered reaches the log just after
+    /// that flush ended: without the hold, a quarter of a cell's flushes on the Mac were
+    /// confirmations of their own. Group commit shares one flush among what queues while waiting
+    /// is expected to lower total latency (DeWitt et al., SIGMOD 1984 §5.2; Helland et al., Tandem
+    /// TR 88.1 §2), the gather's rule (`hyper_block::commit`, as mantle's chunk writer waits):
+    /// with nothing yet in the batch, the gather's wait for a first returner, `p·S / (0 + p)`, is
+    /// `S`, one frame's writes and flush as measured, so the hold is bounded by one measured
+    /// service time and adds no constant. A frame whose flush answered no one, its callers all in
+    /// one phase and waiting on it, has no one to come back and is confirmed at once, as is any
+    /// frame under the other waits or before a service time is measured. Whether the owner now
+    /// waits: a gathering of an empty batch, which comes to nothing should none come
+    /// (`Owner::gathered`).
+    fn hold_confirmation(&mut self) -> bool {
+        let held = self
+            .unconfirmed
+            .as_mut()
+            .is_some_and(|u| std::mem::take(&mut u.hold));
+        let answered = self.schedule.answered;
+        if !held || answered == 0 || self.fenced || self.p.config.waits != Waits::Measured {
+            return false;
+        }
+        let Some(step) = self.schedule.anticipation.wait(0) else {
+            return false;
+        };
+        let mut batch = std::mem::take(&mut self.buffers.batch);
+        batch.clear();
+        self.gather = Some(Gather {
+            batch,
+            before: 0,
+            answered,
+            gathered: 0,
+            deadline: deadline(step),
+        });
+        true
+    }
+
     /// Waits on for one more submitter, or ends the gathering. A batch that holds a frame's
     /// worth already is not waited on: what came next would go in a later frame whatever the
     /// wait.
@@ -442,12 +491,19 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
     }
 
-    /// The gathering is over: the writer learns how many returned and commits the batch.
+    /// The gathering is over: the writer learns how many returned and commits the batch. A held
+    /// confirmation's gathering that none came to (`Owner::hold_confirmation`) commits nothing:
+    /// the loop goes round, and finding nothing queued confirms the frame on its own.
     pub(super) fn gathered(&mut self) {
         let Some(g) = self.gather.take() else {
             return;
         };
         self.schedule.anticipation.learn(g.answered, returned(&g));
+        if g.batch.is_empty() {
+            self.buffers.batch = g.batch;
+            self.agenda.step = true;
+            return;
+        }
         self.commit_unless_fenced(g.batch);
     }
 
@@ -992,6 +1048,11 @@ impl<F: BlockFile + 'static> Owner<F> {
                 // Under `Waits::Told` what waits is written next only if told to.
                 let more = waiting && (self.p.config.waits != Waits::Told || self.told());
                 self.more_told = more;
+                // The frame's flush answers the frame before's callers: should none follow, its
+                // confirmation waits for them to come back (`Owner::hold_confirmation`).
+                let hold = !before.is_empty()
+                    && self.p.config.waits == Waits::Measured
+                    && self.schedule.anticipation.wait(0).is_some();
                 self.phase = Phase::Writing(Writing {
                     taken,
                     sweep,
@@ -999,6 +1060,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     tail,
                     sequence,
                     at_flush,
+                    hold,
                 });
                 self.io.push_back((
                     Job::Frame(Frame {
@@ -1011,6 +1073,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                         before,
                         these,
                         more,
+                        hold,
                         at_flush,
                     }),
                     doer,
@@ -1284,6 +1347,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             tail,
             sequence,
             at_flush,
+            hold,
         } = w;
         // The frame before's answers come back only when this frame failed.
         match self.unconfirmed.as_mut() {
@@ -1346,6 +1410,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             updates: taken,
             answering: these,
             confirm: None,
+            hold,
         };
         let settled = self.await_answer(frame, (at_flush, confirming), confirm, timing.flushed_at);
         self.schedule.answered = confirmed.saturating_add(settled);

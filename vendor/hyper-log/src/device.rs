@@ -27,7 +27,9 @@
 //! did, without handing back first: the frame before it is confirmed by this one's record, so its
 //! callers are answered; then, unless the owner has said another frame follows
 //! (`Device::follows`), this frame is confirmed on its own, as the owner would have had it be,
-//! and its callers are answered too. The owner hears of the flush before the confirmation is
+//! and its callers are answered too; but a frame the owner holds, whose flush answered the frame
+//! before's callers, goes back unconfirmed, and the owner waits for those callers to come back
+//! before it confirms it (`Frame::hold`). The owner hears of the flush before the confirmation is
 //! written, and publishes the frame then, as the writer published a frame once flushed. Each
 //! answer goes out only after the owner's inbox holds the message that frees its room, so a
 //! caller that submits again on hearing it finds the room given back, as it did when the writer
@@ -330,6 +332,11 @@ pub(crate) struct Frame {
     pub(crate) these: Vec<Answering>,
     /// The owner knew when it laid the frame out that another follows.
     pub(crate) more: bool,
+    /// The frame's flush answers the frame before's callers (`before`), so with no word that
+    /// another frame follows, its confirmation is the owner's: the owner waits for those callers
+    /// to come back, whose next frame's record confirms it, before it confirms the frame on its
+    /// own (`owner::write`'s `Owner::hold_confirmation`).
+    pub(crate) hold: bool,
     /// The frame is answered at its own flush (mantle durability.md §7.1): its record says so and
     /// the log answers so (`Answers::at_flush`), so no confirmation of it is written.
     pub(crate) at_flush: bool,
@@ -616,7 +623,7 @@ impl<F: BlockFile> Device<F> {
     }
 
     /// A frame, its record and one flush; the frame before answered; this one confirmed and
-    /// answered unless another frame follows.
+    /// answered unless another frame follows or the owner holds its confirmation (`Frame::hold`).
     fn frame(
         &mut self,
         mut f: Frame,
@@ -625,9 +632,11 @@ impl<F: BlockFile> Device<F> {
     ) -> Completion {
         let (result, timing) =
             self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
-        // The owner's words are read for a frame answered at its flush too, which needs none, so
-        // that a word about it never fills the room a later frame's word needs.
-        let confirming = result.is_ok() && !(f.more || self.follows(f.sequence)) && !f.at_flush;
+        // The owner's words are read for a frame answered at its flush, or whose confirmation the
+        // owner holds, too, which need none, so that a word about it never fills the room a later
+        // frame's word needs.
+        let follows = f.more || self.follows(f.sequence);
+        let confirming = result.is_ok() && !follows && !f.hold && !f.at_flush;
         if result.is_ok() {
             // This frame's record confirms the frame before.
             answers.append(&mut f.before);

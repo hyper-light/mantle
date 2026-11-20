@@ -76,6 +76,29 @@ fn entries(s: &mut Store<DeviceFile>, parts: &[(Vec<u8>, Branch)]) -> Vec<(Vec<u
     out
 }
 
+/// The extents `parts` were written in, each once. A part may begin in the pages the part before
+/// it left unwritten in its last extent, so small branches share extents
+/// (docs/design/engine-structure.md §3): only so do two parts name one extent.
+fn written(parts: &[(Vec<u8>, Branch)]) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    for (_, b) in parts {
+        let mut extents = b.extents.iter().copied();
+        if b.first > 0 {
+            let first = extents.next().unwrap();
+            assert_eq!(
+                out.last(),
+                Some(&first),
+                "a part began in an extent other than the last the part before it wrote"
+            );
+        }
+        for e in extents {
+            assert!(!out.contains(&e), "extent {e} written by two parts apart");
+            out.push(e);
+        }
+    }
+    out
+}
+
 #[test]
 fn a_workers_compaction_writes_what_the_shards_would_within_its_grant() {
     let dir = tempfile::tempdir().unwrap();
@@ -108,10 +131,7 @@ fn a_workers_compaction_writes_what_the_shards_would_within_its_grant() {
     shard.extend_end(end);
 
     // Its branches lie within the grant, and every extent of it is either written or given back.
-    let written: Vec<u64> = there
-        .iter()
-        .flat_map(|(_, b)| b.extents.iter().copied())
-        .collect();
+    let written = written(&there);
     assert!(
         written.iter().all(|e| grant.contains(e)),
         "{written:?} {grant:?}"
@@ -182,10 +202,7 @@ fn a_job_past_its_grant_asks_for_more_and_writes_the_same() {
     let unused = worker.unused_grant();
     let end = worker.end();
     drop(worker);
-    let written: Vec<u64> = there
-        .iter()
-        .flat_map(|(_, b)| b.extents.iter().copied())
-        .collect();
+    let written = written(&there);
     let mut accounted = written.clone();
     accounted.extend(&unused);
     accounted.sort_unstable();

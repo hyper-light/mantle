@@ -20,7 +20,7 @@ use mantle_engine::branch::{Builder, Op};
 use mantle_engine::store::{Config, Store};
 use mantle_engine::trunk::{Trunk, TrunkConfig};
 use proptest::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 const CONFIG: Config = Config {
     page_size: 4096,
@@ -32,23 +32,29 @@ fn key(k: u32) -> Vec<u8> {
     format!("bucket-{}/dir{:03}/obj-{k:08}", k % 3, k % 97).into_bytes()
 }
 
+/// The store holds exactly the extents the trunk's branches name, each counted once for every
+/// branch naming it, since small branches share extents (docs/design/engine-structure.md §3),
+/// and the superblocks' and the allocator map's once, which no branch names.
 fn check_refs(store: &Store<SimFile>, trunk: &Trunk) {
-    let mut named: BTreeSet<u64> = BTreeSet::new();
+    let mut expected: BTreeMap<u64, u32> = BTreeMap::new();
     for b in trunk.branches() {
         for e in b.extents {
-            assert!(named.insert(e), "extent {e} named by two branches");
+            *expected.entry(e).or_default() += 1;
         }
     }
-    let held: BTreeSet<u64> = store
+    for &e in std::iter::once(&0).chain(store.map_extents()) {
+        assert!(
+            expected.insert(e, 1).is_none(),
+            "extent {e} named by a branch and by the store"
+        );
+    }
+    let held: BTreeMap<u64, u32> = store
         .refs()
         .iter()
         .enumerate()
         .filter(|&(_, &c)| c > 0)
-        .map(|(e, _)| e as u64)
+        .map(|(e, &c)| (e as u64, c))
         .collect();
-    let mut expected = named.clone();
-    expected.insert(0);
-    expected.extend(store.map_extents());
     assert_eq!(held, expected);
 }
 

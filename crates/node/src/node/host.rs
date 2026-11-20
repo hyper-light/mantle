@@ -246,7 +246,12 @@ impl Job {
     /// - a put not over whose driver takes none of its body now waits on its asks;
     /// - a put whose driver wants its body found its door's channel empty, or a get or its last
     ///   answers found no room in its door's reply, a native one's until the node's task wrote
-    ///   the last whole: the door names it as more comes or room frees.
+    ///   the last whole: the door names it as more comes or room frees;
+    /// - any other kind has an ask of its own out and nothing more to ask or feed until one is
+    ///   answered: a single read, a command, a bucket's or an operator's request, or a copy
+    ///   reading a row, version or mark, at once; a batch delete with none refused for the
+    ///   node's room; a completion or a running copy with no request held for it and no outcome
+    ///   to answer, a copy's get holding nothing its put takes now. None of these reads its door.
     ///
     /// A job whose door names it not, made with no mark or call, is turned at every step.
     fn rests(&self) -> bool {
@@ -285,7 +290,50 @@ impl Job {
                 Some(get) => roomless || (asking && !get.ready() && get.outcome().is_none()),
             },
             Work::Answering(_) => roomless,
-            _ => false,
+            // One read, one command, a bucket's coordinator's next request, an operator's
+            // request, and a copy's row, version or mark: its step asks nothing while an ask of
+            // its own is out.
+            Work::Read(_) | Work::Command(_) | Work::Bucket(_) | Work::Admin(_) => asking,
+            Work::Copy(copying) if copying.stage != CopyStage::Run => asking,
+            // Its deletes out to its share of the node's commands, or every one asked: only an
+            // answer lets it ask the next.
+            Work::Deletes(deleting) => asking && !deleting.held,
+            // Its driver asks the next request as an answer moves it, none held for want of the
+            // node's room.
+            Work::Complete(completing) => {
+                asking
+                    && completing.waiting.is_empty()
+                    && completing
+                        .completion
+                        .as_ref()
+                        .is_none_or(|completion| completion.outcome().is_none())
+            }
+            // Its get and its put each wait on their asks, as a get and a put do: the get holds no
+            // plaintext the put could take, or the put takes none now, and neither driver has
+            // a request held for want of room or an outcome to answer.
+            Work::Copy(copying) => {
+                let (Some(get), Some(put)) = (copying.get.as_ref(), copying.put.as_ref()) else {
+                    return false;
+                };
+                let fed = match &copying.carry {
+                    Some((bytes, took)) => bytes.len() > *took && !put.wants_body(),
+                    None => !get.ready(),
+                };
+                let got = match get.outcome() {
+                    None => true,
+                    Some(Ok(())) => copying.ended,
+                    Some(Err(_)) => false,
+                };
+                asking
+                    && fed
+                    && got
+                    && put.outcome().is_none()
+                    && !put.waits_for_room()
+                    && !get.waits_for_room()
+                    && copying.get_waiting.is_empty()
+                    && copying.put_waiting.is_empty()
+            }
+            Work::Fields(..) | Work::Handing(_) | Work::Draining(_) => false,
         }
     }
 
@@ -3064,6 +3112,8 @@ pub(crate) struct Deleting {
     next: usize,
     /// Deletes asked and not yet answered.
     out: usize,
+    /// The node had no room for its next delete at its last turn: asked again at the next.
+    held: bool,
     results: Vec<Option<Deleted>>,
 }
 
@@ -7727,6 +7777,7 @@ impl Host {
             let asked = node.ask(JobAsk::Read(group, query));
             return self.asked(node, at, asked, None);
         };
+        deleting.held = false;
         let Some(group) = node.group_of(Layer::Name) else {
             self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
@@ -7804,7 +7855,16 @@ impl Host {
                     }
                 }
                 // The node holds as many commands as it keeps: the rest are asked at a later turn.
-                Err(NodeError::Asks) => break,
+                Err(NodeError::Asks) => {
+                    if let Some(Job {
+                        work: Work::Deletes(deleting),
+                        ..
+                    }) = self.jobs.get_mut(at)
+                    {
+                        deleting.held = true;
+                    }
+                    break;
+                }
                 Err(_) => {
                     self.fail_job(node, at, Status::Failed)?;
                     return self.drain_job(at);
@@ -9162,6 +9222,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                 row: None,
                 next: 0,
                 out: 0,
+                held: false,
                 results,
             }))
         }
@@ -10320,6 +10381,367 @@ pub(super) mod tests {
                     if reply.status == Status::Done && reply.size == 0),
                 "{answers:?}"
             );
+        }
+    }
+
+    /// Runs 64 jobs of `work` through the S3 door on a stub answering each ask with `answer`, each
+    /// answer given 32 turns after its ask, as a range's log answers many turns of a loaded node's
+    /// task later: the turns they took, the steps, and each one's answers on its door.
+    fn held_jobs(
+        work: impl Fn() -> Work,
+        answer: fn(&JobAsk) -> Outcome,
+    ) -> (u64, u64, Vec<Vec<door::Answer>>) {
+        const JOBS: usize = 64;
+        const LATE: u64 = 32;
+        let now = hyper_rt::futures::now_ns();
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        let mut host = Host::new(JOBS, Some(std::sync::Arc::new(gateway)));
+        let mut replies = Vec::new();
+        for _ in 0..JOBS {
+            let (job, _, answers) = local_job(work(), now, 1);
+            host.push(job, now);
+            replies.push(answers);
+        }
+        let mut stub = put_and_get_stub();
+        stub.answer = answer;
+        stub.table = Some(Table::empty(0));
+        let mut held: VecDeque<(u64, (Pending, Outcome))> = VecDeque::new();
+        let _ = clock_reads();
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 1_000, "the jobs never ended");
+            while held.front().is_some_and(|(asked, _)| asked + LATE <= turns) {
+                let (_, answer) = held.pop_front().unwrap();
+                stub.answers.push(answer);
+            }
+            host.step(&mut stub).unwrap();
+            held.extend(stub.answers.drain(..).map(|answer| (turns, answer)));
+        }
+        let (_, steps) = clock_reads();
+        (turns, steps, replies.iter_mut().map(answered).collect())
+    }
+
+    /// Whether `answers` are a reply of `status` and its end, the reply as `reply` holds.
+    fn replied(answers: &[door::Answer], status: Status, reply: impl Fn(&Reply) -> bool) -> bool {
+        matches!(answers, [door::Answer::Head(head), door::Answer::End]
+            if head.status == status && reply(head))
+    }
+
+    /// 64 HeadBuckets whose bucket's row is read 32 turns after it is asked take 128 steps, each
+    /// stepped as it asks and as it is answered, where every turn stepped every one, 2,112, 33 a
+    /// job; each answered `Done`.
+    #[test]
+    fn a_single_read_is_stepped_only_as_it_is_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || Work::Read(Box::new(Single::HeadBucket("b".into()))),
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                _ => panic!("an ask a HeadBucket does not make"),
+            },
+        );
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::Done, |_| true), "{answers:?}");
+        }
+    }
+
+    /// 64 DeleteObjects of three keys each, its bucket's row read first, then one delete out at a
+    /// time (the stub's one command, an operation's share), each answer 32 turns after its ask:
+    /// 320 steps, five a job, its row and three deletes asked and its reply given, where every turn
+    /// stepped every one, 8,256, 129 a job; each answered `Done` listing its three keys deleted.
+    #[test]
+    fn a_batch_delete_is_stepped_only_as_its_deletes_are_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                let objects: Vec<Target> = ["a", "b", "c"]
+                    .into_iter()
+                    .map(|key| Target {
+                        key: key.into(),
+                        version: None,
+                        etag: None,
+                    })
+                    .collect();
+                Work::Deletes(Box::new(Deleting {
+                    bucket: "b".into(),
+                    results: vec![None; objects.len()],
+                    objects,
+                    quiet: false,
+                    row: None,
+                    next: 0,
+                    out: 0,
+                    held: false,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                    Answer::Name(name::Outcome::Deleted {
+                        marker: false,
+                        version: None,
+                    }),
+                )),
+                _ => panic!("an ask a DeleteObjects does not make"),
+            },
+        );
+        assert_eq!(turns, 129, "its row and three deletes, each 32 turns");
+        assert_eq!(
+            steps,
+            5 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::Done, |reply| matches!(
+                    &reply.listing,
+                    Some(Listing::Deleted(deleted)) if deleted.len() == 3
+                        && deleted.iter().all(|d| d.status == Status::Done)
+                )),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// 64 CompleteMultipartUploads of one part, each ask answered 32 turns after it is asked: the
+    /// bucket's row, then the driver's upload row, which finds none, then its Complete asked as a
+    /// retry of one that may have committed, which the Name range answers `NoSuchUpload`: 256
+    /// steps, four a job, where every turn stepped every one, 6,208, 97 a job; each answered
+    /// `NoSuchUpload`, its driver's outcome.
+    #[test]
+    fn a_completion_is_stepped_only_as_its_driver_is_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Complete(Box::new(Completing {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    upload: "0123456789ABC".into(),
+                    listed: vec![(1, "0".repeat(32))],
+                    native: None,
+                    preconditions: Preconditions::default(),
+                    completion: None,
+                    waiting: VecDeque::new(),
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Read(_, Query::Upload { .. }) => {
+                    Outcome::Read(ReadOutcome::Read(Box::new(Read::Upload(None))))
+                }
+                JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                    Answer::Name(name::Outcome::NoSuchUpload),
+                )),
+                _ => panic!("an ask a completion of no upload does not make"),
+            },
+        );
+        assert_eq!(
+            turns, 97,
+            "its row, its upload and its Complete, each 32 turns"
+        );
+        assert_eq!(
+            steps,
+            4 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::NoSuchUpload, |_| true),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// 64 CopyObjects of an empty source, each read answered 32 turns after it is asked: the
+    /// destination's bucket's row, the source's version, then its put's commit: 256 steps, four
+    /// a job, where every turn stepped every one, 6,208, 97 a job; each answered `Done` with the
+    /// version committed. And 64 whose source is gone take three steps each, 192, where every
+    /// turn stepped every one, 4,160; each answered `NoSuchKey`.
+    #[test]
+    fn a_copy_is_stepped_only_as_its_reads_and_its_drivers_are_answered() {
+        fn copy() -> Work {
+            work(
+                Op::Copy(Box::new(object::Copy {
+                    bucket: "b".into(),
+                    key: "k2".into(),
+                    id: 1,
+                    source: mantle_s3::copy::Source {
+                        bucket: "b".into(),
+                        key: "k".into(),
+                        version: None,
+                    },
+                    conditions: Headers::default(),
+                    headers: Headers::default(),
+                    directive: Directive::Copy,
+                    metadata: Vec::new(),
+                    checksum: None,
+                })),
+                None,
+            )
+        }
+        let (turns, steps, replies) = held_jobs(copy, |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Current(Some((1, empty_version()))),
+            ))),
+            JobAsk::Command(_, Command::Name(_)) => {
+                Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                    version: mantle_meta::key::version_id(1),
+                })))
+            }
+            _ => panic!("an ask a copy of an empty source does not make"),
+        });
+        assert_eq!(
+            turns, 97,
+            "its row, its source and its commit, each 32 turns"
+        );
+        assert_eq!(
+            steps,
+            4 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::Done, |reply| reply.version
+                    == mantle_meta::key::version_id(1)),
+                "{answers:?}"
+            );
+        }
+        let (turns, steps, replies) = held_jobs(copy, |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Read(_, Query::Current { .. }) => {
+                Outcome::Read(ReadOutcome::Read(Box::new(Read::Current(None))))
+            }
+            _ => panic!("an ask a copy of no source does not make"),
+        });
+        assert_eq!(turns, 65, "its row and its source, each 32 turns");
+        assert_eq!(
+            steps,
+            3 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::NoSuchKey, |_| true), "{answers:?}");
+        }
+    }
+
+    /// 64 DeleteBuckets of a bucket gone, its row read for its owner 32 turns after it is asked,
+    /// take 128 steps, where every turn stepped every one, 2,112; each answered `NoSuchBucket`.
+    #[test]
+    fn a_bucket_operation_is_stepped_only_as_it_is_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Bucket(Box::new(Coordinating {
+                    bucket: "b".into(),
+                    delete: true,
+                    owned: false,
+                    coordinator: None,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => {
+                    Outcome::Read(ReadOutcome::Read(Box::new(Read::Bucket(None))))
+                }
+                _ => panic!("an ask a DeleteBucket of no bucket does not make"),
+            },
+        );
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::NoSuchBucket, |_| true),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// 64 DeleteObjects, each its bucket's row read and then its delete, each answered 32 turns
+    /// after it is asked: 192 steps, three a job, where every turn stepped every one, 4,160, 65 a
+    /// job; each answered `Done`. And 64 ListPrincipals, an operator's read of the root range: 128
+    /// steps, where every turn stepped every one, 2,112; each answered `Done`.
+    #[test]
+    fn a_command_and_an_operators_request_are_stepped_only_as_they_are_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Command(Box::new(Commanding {
+                    bucket: "b".into(),
+                    then: Then::Delete {
+                        key: "k".into(),
+                        if_match: None,
+                        named: None,
+                    },
+                    asked: false,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                    Answer::Name(name::Outcome::Deleted {
+                        marker: false,
+                        version: None,
+                    }),
+                )),
+                _ => panic!("an ask a DeleteObject does not make"),
+            },
+        );
+        assert_eq!(turns, 65, "its row and its delete, each 32 turns");
+        assert_eq!(
+            steps,
+            3 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::Done, |_| true), "{answers:?}");
+        }
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Admin(Box::new(Administering {
+                    asking: Admin::Read {
+                        query: Query::Principals {
+                            after: None,
+                            max: 10,
+                        },
+                        one: false,
+                    },
+                    asked: false,
+                    issued: None,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Principals { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Principals(Principals::default())),
+                )),
+                _ => panic!("an ask a ListPrincipals does not make"),
+            },
+        );
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::Done, |_| true), "{answers:?}");
         }
     }
 

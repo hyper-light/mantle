@@ -2759,6 +2759,47 @@ stepped at every turn, now kept awake rather than found by a walk. A driving sha
 looks for jobs handed from the slot it reached (`Host::handing`), each job once a turn where the
 node drives shards.
 
+*As built (2026-11-20): every kind of job rests on its asks* (`crates/node/src/node/host.rs`). The
+first open part of the note above. Commands, bucket and admin operations, single reads, batch
+deletes, completions and copies were stepped at every turn while their asks were out, each step
+finding its asks unanswered and asking nothing: a HeadBucket whose row came 32 turns after it was
+asked was stepped 33 times. Each now rests after a step that found nothing to do (`Job::rests`), by
+the edge-triggered rule (research/99 [1]), woken by the events that already wake a put or a get: an
+answer to one of its asks (`answer_job`), a reply or `SlowDown` given it at its bound
+(`reply_job`; its bound is keyed in `beats` while an ask of its own is out, `Job::beat_ns`), room
+offered a copy's chunk (`offer_room`) and a copy's put's renewal (`renewals`). None of these steps
+reads its door, so none rests on it: an exchange that ends ends its job by its own path
+(`Node::job_lost`), and an S3 connection that lets go names its job (`door::Named`).
+
+| Kind | Rests where, after its step |
+| --- | --- |
+| single read, command, bucket create or delete, operator's request | an ask of its own is out: its step asks nothing while one is |
+| copy reading its destination's row, its upload's, its source's version or its mark | its read is out |
+| batch delete | an ask of its own is out and none of its deletes was refused for the node's room at that step (`Deleting::held`): its deletes are out to its share of the node's commands, or all asked, and only an answer frees the next |
+| completion | an ask of its own is out, no request of its driver waits for the node's room (`Completing::waiting`), and its driver has no outcome to answer |
+| copy running its get and put | an ask of its own is out; no request of either driver waits for the node's room, nor a chunk for a volume's; its put has no outcome and its get none but a whole end its put was given; and its get holds no plaintext its put could take: none ready, or what it carries its put takes none of now |
+
+A job whose ask the node had no room for, or whose step found work, does not rest and is stepped
+at the next turn, as before; a job with no ask out never rests, so a resting job's bound is always
+keyed.
+
+Tested (`node::host`, 64 jobs of each kind on the S3 door, each ask answered 32 turns after it is
+asked; each count of the rule before measured by the same test with these kinds kept awake):
+HeadBucket, 128 steps, two a job, where the rule before took 2,112; DeleteObjects of three keys,
+one delete out at a time, 320, five a job, where 8,256; CompleteMultipartUpload of one part whose
+upload is gone, its Complete asked again as a retry, 256 where 6,208; CopyObject of an empty source,
+its row, source and commit, 256 where 6,208, and of a source gone 192 over 65 turns, 64 × 65 =
+4,160 before; DeleteBucket of a bucket gone, 128 where 2,112; DeleteObject, 192 where 4,160; and
+ListPrincipals, 128, 64 × 33 = 2,112 before. Each answered its reply: `Done` with its three keys
+deleted, `NoSuchUpload`, `Done` with the version committed, `NoSuchKey`, `NoSuchBucket`, `Done`.
+
+Open: a native job reading its fields (`Work::Fields`) is stepped at every turn until they are
+whole: the node's task marks its exchange's feeding and reply as the exchange's body is ready
+(`Event::BodyReady`), not its job, which waking the job there would close. A job draining its
+reply (`Work::Draining`) takes one step to its last answers, which rest as before. A driving
+shard's hand-off still looks for jobs handed from the slot it reached (`Host::handing`), each job
+once a turn where the node drives shards.
+
 *As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
 The node's task reads every native body, so it reads them as upload-stall's job did, never into a
 piece of the endpoint's budget: a job's fields straight into their buffer, made at their length as

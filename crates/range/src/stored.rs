@@ -126,6 +126,12 @@ impl<F: BlockFile + 'static> Stored<F> {
         self.db.set_workers_within(open, most, name)
     }
 
+    /// Whether the engine is at its store's extent bound (`ShardDb::at_extent_bound`): every
+    /// entry waits for room ([`Engine::apply_now`] answers false) until extents are freed.
+    pub fn at_extent_bound(&self) -> bool {
+        self.db.at_extent_bound()
+    }
+
     /// Gives gets and lookups a cache of `pages` of the store's pages, each verified as it was
     /// read or written, replacing any it had; none at 0 (`ShardDb::set_cache`). Without one,
     /// every page a get or a lookup needs is read from the device again.
@@ -279,9 +285,12 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
     }
 
     /// A checkpoint begun without waiting and still out is finished first, waiting on its worker
-    /// (`ShardDb::checkpoint`): nothing applied since it began leaves it unpersisted.
+    /// (`ShardDb::checkpoint`): nothing applied since it began leaves it unpersisted. With
+    /// nothing applied since the last, one is made all the same while the engine waits for
+    /// extents the next checkpoint frees (`ShardDb::wants_checkpoint`), at the index already
+    /// durable.
     fn persist(&mut self) -> Result<(), EngineError> {
-        if self.unpersisted || self.out.is_some() {
+        if self.unpersisted || self.out.is_some() || self.db.wants_checkpoint() {
             self.db
                 .checkpoint(self.applied)
                 .map_err(|e| fenced(&mut self.fault, e))?;
@@ -311,7 +320,10 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
                 return Ok(true);
             }
             Some(at) => at,
-            None if !self.unpersisted => return Ok(true),
+            // With nothing applied since the last, the engine may still wait for extents only
+            // the next checkpoint frees (`ShardDb::wants_checkpoint`): one at the index applied,
+            // durable already, so the log's start stays where it may.
+            None if !self.unpersisted && !self.db.wants_checkpoint() => return Ok(true),
             None => {
                 // Begun here: what is applied from now on is the next checkpoint's.
                 self.unpersisted = false;

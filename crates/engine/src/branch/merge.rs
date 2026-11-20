@@ -429,6 +429,14 @@ impl Compaction {
         self.merge.opening
     }
 
+    /// An unfinished opening given up: every partial cursor, its read buffers and its reads
+    /// still unclaimed, back to `store` ([`Merge::cancel_opening`]); none built output yet.
+    pub(crate) fn cancel_opening<F: BlockFile>(&mut self, store: &mut Store<F>) {
+        if self.merge.opening {
+            self.merge.cancel_opening(store);
+        }
+    }
+
     /// Whether it holds any input open: a cursor's span and pages, kept until it finishes.
     pub(crate) fn holds_inputs(&self) -> bool {
         !self.merge.cursors.is_empty()

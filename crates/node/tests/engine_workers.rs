@@ -606,3 +606,152 @@ fn reads_with_a_worker_or_inline_stay_within_the_trunks_bounds() {
         );
     }
 }
+
+/// The entries of a sustained fill of the cell's store, each a row put over a key space of
+/// [`FILL_KEYS`]: 3,000 rows of about 170 bytes, about 510 KB, an eighth of the store's 4 MiB,
+/// rewritten eight times over as compaction merges their versions.
+const FILL: u64 = 24_000;
+const FILL_KEYS: u64 = 3_000;
+/// Units of maintenance a node's turn gives its engine at most (`upkeep::step`'s budget).
+const TURN_UNITS: u64 = 64;
+/// The turns one entry may wait for room: the drive's loop bound (CLAUDE.md §2), past which the
+/// engine neither took the entry nor stated it is at its store's extent bound.
+const TURNS_MOST: u64 = 1_000_000;
+
+/// The fill's entry `index`: a row of the key space, its value naming the entry, so a read
+/// tells which version it found.
+fn fill_row(index: u64) -> (Vec<u8>, Vec<u8>) {
+    let (key, _) = row(index * 7_919 % FILL_KEYS);
+    (key, index.to_le_bytes().repeat(15))
+}
+
+/// A range's engine in the cell's store, opened as `process::engine` opens it with `workers`
+/// workers on a shard that may wait, takes [`FILL`] entries as a node's drive applies them
+/// (`Engine::apply_now`, its turn's `Engine::upkeep` while an entry waits for room), and its
+/// log's compaction asks a checkpoint every [`CHECKPOINT`] entries and while an entry waits, made
+/// without waiting (`Engine::persist_now`) where `paced`, else whole (`Engine::persist`). The
+/// fill ends with every entry taken, or where an entry waits and the engine states it is at its
+/// store's extent bound (`Stored::at_extent_bound`): then nothing it holds gives extents back.
+/// Either way the engine is checkpointed, every row acknowledged reads back, and so does it
+/// from the store opened again. The last entry taken, or the engine's error where it fenced.
+fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.store");
+        mantle_engine::store::permit_blocking();
+        let writes = Arc::new(Writes {
+            shard: std::thread::current().id(),
+            on_shard: AtomicU64::new(0),
+            elsewhere: AtomicU64::new(0),
+        });
+        shard()
+            .block_on(async move {
+                let mut e =
+                    Stored::create(counted(&path, true, &writes), CELL, CELL.page_size, TRUNK)
+                        .unwrap();
+                if workers > 0 {
+                    let (again, worker_counts) = (path.clone(), Arc::clone(&writes));
+                    e.set_workers(move || Ok(counted(&again, false, &worker_counts)), workers)
+                        .unwrap();
+                }
+                let fault = |e: &Stored<Counted>, error: mantle_meta::engine::EngineError| {
+                    format!("{error}: the engine's {:?}", e.fault())
+                };
+                let mut acknowledged = std::collections::BTreeMap::new();
+                let mut taken = 0;
+                // A checkpoint begun without waiting and not yet durable.
+                let mut out = false;
+                'fill: for index in 1..=FILL {
+                    let (k, v) = fill_row(index);
+                    let mut turns = 0;
+                    loop {
+                        if e.apply_now(index, vec![Write::Put(k.clone(), v.clone())])
+                            .map_err(|error| fault(&e, error))?
+                        {
+                            break;
+                        }
+                        e.upkeep(TURN_UNITS).map_err(|error| fault(&e, error))?;
+                        if paced {
+                            out = !e.persist_now().map_err(|error| fault(&e, error))?;
+                        } else {
+                            e.persist().map_err(|error| fault(&e, error))?;
+                        }
+                        if !out && e.at_extent_bound() {
+                            break 'fill;
+                        }
+                        turns += 1;
+                        assert!(
+                            turns < TURNS_MOST,
+                            "entry {index} neither found room nor met the store's extent bound"
+                        );
+                    }
+                    acknowledged.insert(k, v);
+                    taken = index;
+                    e.upkeep(TURN_UNITS).map_err(|error| fault(&e, error))?;
+                    if paced {
+                        if out || index % CHECKPOINT == 0 {
+                            out = !e.persist_now().map_err(|error| fault(&e, error))?;
+                        }
+                    } else if index % CHECKPOINT == 0 {
+                        e.persist().map_err(|error| fault(&e, error))?;
+                    }
+                }
+                e.persist().map_err(|error| fault(&e, error))?;
+                assert!(e.fault().is_none(), "the engine fenced: {:?}", e.fault());
+                for (k, v) in &acknowledged {
+                    assert_eq!(
+                        e.get(k).map_err(|error| fault(&e, error))?.as_ref(),
+                        Some(v)
+                    );
+                }
+                drop(e);
+                let mut e =
+                    Stored::open(counted(&path, false, &writes), CELL, CELL.page_size, TRUNK)
+                        .unwrap();
+                assert_eq!(e.applied(), taken, "the store opened again lost entries");
+                for (k, v) in &acknowledged {
+                    assert_eq!(e.get(k).unwrap().as_ref(), Some(v), "reopened");
+                }
+                Ok(taken)
+            })
+            .unwrap()
+    })
+    .join()
+    .unwrap()
+}
+
+/// A range's engine in the node suite's cell's store (256 extents of four 4 KiB pages, 4 KiB
+/// memtables, its one worker, a checkpoint made without waiting as the range's compaction makes
+/// it) under a sustained fill reaches the store's extent bound and waits there; it is never
+/// fenced, and every row it acknowledged reads back. The node suite's sustained-writes cell
+/// stopped on "range 626c6f636b's engine in its maintenance: the engine is fenced after a failed
+/// write: extents of a store would exceed its bound of 256" (CI run 44721951954): an inline
+/// compaction of the engine's idle step took the store's last extent while 42 the durable
+/// checkpoint named waited for the next checkpoint (held 214, pending 42 at the refusal). Each
+/// small branch takes a whole extent, so the store's extents, not its bytes, bound the fill:
+/// the whole fill waits for small branches to share extents. The cell's key space is taken whole
+/// first.
+#[test]
+fn a_sustained_fill_of_the_cells_store_waits_at_its_extent_bound_and_never_fences() {
+    match fill_to_the_bound(1, true) {
+        Ok(taken) => {
+            eprintln!("the fill took {taken} of its {FILL} entries");
+            assert!(taken > FILL_KEYS, "the bound met at entry {taken}");
+        }
+        Err(error) => panic!("the fill fenced the engine: {error}"),
+    }
+}
+
+/// The same fill on the shard alone with whole checkpoints, deterministic: the checkpoint's
+/// drain of the trunk's maintenance (`ShardDb::flush`, `Trunk::drain`) took the store's last
+/// extent while 47 the durable checkpoint named waited for this one (held 209, pending 47).
+#[test]
+fn a_sustained_fill_of_the_cells_store_on_the_shard_alone_waits_at_its_extent_bound() {
+    match fill_to_the_bound(0, false) {
+        Ok(taken) => {
+            eprintln!("the fill took {taken} of its {FILL} entries");
+            assert!(taken > FILL_KEYS, "the bound met at entry {taken}");
+        }
+        Err(error) => panic!("the fill fenced the engine: {error}"),
+    }
+}

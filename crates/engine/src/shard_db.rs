@@ -1088,8 +1088,91 @@ impl<F: BlockFile> ShardDb<F> {
     pub fn checkpoint(&mut self, applied: u64) -> Result<(), Error> {
         self.no_checkpoint_mutation()?;
         self.flush()?;
+        self.trunk_saveable()?;
         let head = self.trunk.save(&mut self.store)?;
         self.store.checkpoint(Some(head), applied)
+    }
+
+    /// The trunk made saveable for a checkpoint: a flush that stopped where its maintenance
+    /// waits for extents only this checkpoint frees ([`Trunk::stalled_for_room`]) leaves tasks
+    /// planned and not begun, dropped here and planned anew after.
+    fn trunk_saveable(&mut self) -> Result<(), Error> {
+        if !self.trunk.saveable() {
+            self.trunk.drop_unstarted(&mut self.store)?;
+        }
+        Ok(())
+    }
+
+    /// The extents the next checkpoint takes besides the trunk's image: a packing for the
+    /// memtable taking puts and one for each frozen or packing, and the allocator's map. The
+    /// trunk's maintenance leaves them free ([`Trunk::set_checkpoint_room`]), so a checkpoint
+    /// always has the room to free the extents the one before names.
+    fn checkpoint_room(&self) -> u64 {
+        let packings = u64::try_from(self.frozen.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+            .saturating_add(u64::from(self.packing.is_some()));
+        self.packing_extents()
+            .saturating_mul(packings)
+            .saturating_add(self.store.map_room())
+    }
+
+    /// Tells the trunk the room the next checkpoint takes ([`Self::checkpoint_room`]).
+    fn keep_checkpoint_room(&mut self) {
+        let room = self.checkpoint_room();
+        self.trunk.set_checkpoint_room(room);
+    }
+
+    /// Whether a rotation has its room: a packing more than the checkpoint's room
+    /// ([`Self::checkpoint_room`]) and the trunk's image beside it, in extents the store may hand
+    /// out once grown. Without it the entry waits for the checkpoint that frees the extents the
+    /// one before names, and maintenance that would make room waits for it too.
+    fn rotation_room(&mut self) -> Result<bool, Error> {
+        self.keep_checkpoint_room();
+        // Maintenance waiting for extents goes first: its compactions are what give extents
+        // back, and packings taking the room it waits for would fill the store with branches
+        // none could compact.
+        if self.trunk.waits_for_room(&self.store) {
+            return Ok(false);
+        }
+        let kept = self
+            .checkpoint_room()
+            .saturating_add(self.trunk.image_extents_now(&self.store)?);
+        let packing = self.packing_extents();
+        let own = kept
+            .saturating_add(packing)
+            .saturating_add(self.trunk.owed_room(&self.store)?);
+        // A wait of maintenance's, its tasks dropped for a checkpoint and not yet planned anew,
+        // keeps its room from the packing too.
+        let need = own.max(self.trunk.room_waited().saturating_add(packing));
+        if self.store.room_most() >= need {
+            return Ok(true);
+        }
+        self.trunk.note_room_short(own);
+        Ok(false)
+    }
+
+    /// Whether a checkpoint would give the engine extents it waits for: maintenance or a
+    /// rotation waits for room ([`Trunk::waits_for_room`]) and the durable checkpoint names
+    /// extents freed since, which the next frees. A range then checkpoints at the index it has
+    /// applied even with nothing applied since its last (`Stored::persist_now`): what is durable
+    /// stays as it was, and the extents come back.
+    pub fn wants_checkpoint(&self) -> bool {
+        self.store.pending_extents() > 0 && self.trunk.waits_for_room(&self.store)
+    }
+
+    /// Whether the engine is at its store's extent bound: maintenance waits for room
+    /// ([`Trunk::waits_for_room`]) the file grown to its bound would not hold, and nothing it
+    /// holds can give extents back, no task begun, no memtable frozen or packing and none freed
+    /// pending a checkpoint. Every entry waits ([`Self::room_now`]) until extents are freed;
+    /// none is refused part way and the store is not fenced.
+    pub fn at_extent_bound(&self) -> bool {
+        self.trunk.waits_for_room(&self.store)
+            && self.store.room_most() < self.trunk.room_waited()
+            && self.trunk.none_begun()
+            && self.frozen.is_empty()
+            && self.packing.is_none()
+            && self.store.pending_extents() == 0
     }
 
     /// [`Self::checkpoint`] made without waiting on a maintenance worker or the device: true once
@@ -1201,6 +1284,7 @@ impl<F: BlockFile> ShardDb<F> {
                 if !(packed && swapped) {
                     return Ok(Some(Flush::Pack { swapped }));
                 }
+                self.trunk_saveable()?;
                 let head = self.trunk.save(&mut self.store)?;
                 let sb = self.store.checkpoint_map(Some(head), applied)?;
                 let ticket = self.send_sync()?;
@@ -1492,6 +1576,7 @@ impl<F: BlockFile> ShardDb<F> {
                 if !self.flush_paced(keys)? {
                     return Ok(false);
                 }
+                self.trunk_saveable()?;
                 CheckpointPhase::Save
             }
             CheckpointPhase::Save => {
@@ -5050,8 +5135,8 @@ impl<F: BlockFile> ShardDb<F> {
             || self.growth_due()
             || self.packing.is_some()
             || !self.frozen.is_empty()
-            || self.trunk.debt() > 0
-            || !self.trunk.is_idle()
+            || ((self.trunk.debt() > 0 || !self.trunk.is_idle())
+                && !self.trunk.stalled_for_room(&self.store))
             || self.trunk.consolidation_owed()
             || (if paced {
                 self.mem.debt() > 0
@@ -5247,6 +5332,7 @@ impl<F: BlockFile> ShardDb<F> {
 
     fn idle_step_inner(&mut self, keys: u64, paced: bool) -> Result<u64, Error> {
         self.looked = false;
+        self.keep_checkpoint_room();
         // A file kept as segments grows first: the room every allocation after needs.
         if (self.growth.is_some() || self.growth_due()) && self.grow(!paced)? {
             return Ok(1);
@@ -5576,7 +5662,7 @@ impl<F: BlockFile> ShardDb<F> {
         };
         // The inline compactions writing now take extents as they write: the grant leaves them
         // room, as a compaction's does (`Trunk::inline_room`).
-        let room = asked.saturating_add(self.trunk.inline_room()?);
+        let room = asked.saturating_add(self.trunk.inline_room(&self.store)?);
         if self.store.capacity() < room {
             // A file grown by segments grows first. A store at its limit holds no grant this
             // size beside the extents held and the inline compactions' room, more than the
@@ -5700,6 +5786,15 @@ impl<F: BlockFile> ShardDb<F> {
         // packed it, and resumed it would swap an empty memtable.
         if self.mem.is_empty() {
             self.rotation = None;
+        }
+        // While maintenance waits for extents only a checkpoint frees, every entry waits for it:
+        // one put into the memtable's room would be packed by that checkpoint into extents its
+        // room keeps for the memtable already there, and the store would fill a memtable a
+        // checkpoint.
+        if self.trunk.waits_for_room(&self.store) {
+            return Ok(false);
+        }
+        if self.mem.is_empty() {
             return Ok(true);
         }
         if self.rotation.is_none() && self.mem.room() >= bytes {
@@ -5720,6 +5815,9 @@ impl<F: BlockFile> ShardDb<F> {
         self.no_worker_failure()?;
         self.no_checkpoint_mutation()?;
         self.trunk.clear_io_wait();
+        if self.rotation.is_none() && !self.rotation_room()? {
+            return Ok(false);
+        }
         // A message taken as the step looked may hold what the rotation waits on: each pass
         // takes at most one, and no more can be out than the pool has workers, each with one job.
         let passes = self.trunk.pool_mut().map_or(0, |pool| pool.seats());
@@ -5737,10 +5835,15 @@ impl<F: BlockFile> ShardDb<F> {
             }
         }
         // Whatever still holds the rotation waits on no job out (or no task could be woken for
-        // one): the blocking rotation does it inline at the put that needs it, so the paced one
-        // begun is dropped rather than resumed later over a memtable that is not full.
+        // one): the blocking rotation does it inline, here rather than at the put that needs it,
+        // so one whose maintenance waits for extents only a checkpoint frees leaves the entry
+        // waiting for that checkpoint rather than refuse the put. The paced one begun is dropped
+        // rather than resumed later over a memtable that is not full.
         self.rotation = None;
-        Ok(true)
+        if self.mem.room() >= bytes {
+            return Ok(true);
+        }
+        self.rotate_with(true)
     }
 
     /// [`Self::rotate_paced`]'s steps, on a store of either backend.
@@ -5872,7 +5975,10 @@ impl<F: BlockFile> ShardDb<F> {
             self.pack_full(full)?;
             return Ok(false);
         }
-        if !self.trunk.is_idle() {
+        // Maintenance runs to its end, or until what is left waits for extents only the
+        // checkpoint this flush is for frees: then the trunk is saved as it stands.
+        self.keep_checkpoint_room();
+        if !self.trunk.is_idle() && !self.trunk.stalled_for_room(&self.store) {
             self.trunk.step_paced(&mut self.store, keys.max(1))?;
             return Ok(false);
         }
@@ -5884,6 +5990,14 @@ impl<F: BlockFile> ShardDb<F> {
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
     /// trunk's maintenance when its root has no room for more branches.
     fn rotate(&mut self) -> Result<(), Error> {
+        self.rotate_with(false).map(|_| ())
+    }
+
+    /// [`Self::rotate`]; where `stall`, false with the memtable kept when the rotation has no
+    /// room ([`Self::rotation_room`]) or the maintenance that would make the root room waits for
+    /// extents only a checkpoint frees ([`Trunk::stalled_for_room`]); else such a rotation is
+    /// refused, typed.
+    fn rotate_with(&mut self, stall: bool) -> Result<bool, Error> {
         // A checkpoint out names the trunk and allocator this rotation's packing changes.
         self.finish_checkpoint()?;
         // A paced rotation begun ([`Self::room_now`]) is this one, done whole here: resumed after,
@@ -5893,7 +6007,10 @@ impl<F: BlockFile> ShardDb<F> {
         // [`Self::flush`] packs every memtable: the puts have their room, and an empty memtable
         // swapped would go to a worker whose sort keeps no entry and builds no branch.
         if self.mem.is_empty() {
-            return Ok(());
+            return Ok(true);
+        }
+        if stall && !self.rotation_room()? {
+            return Ok(false);
         }
         self.rebudget();
         self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
@@ -5941,7 +6058,14 @@ impl<F: BlockFile> ShardDb<F> {
                 // oldest packing's result frees one.
                 self.take_packs(true)?;
             }
-            self.trunk.make_room(&mut self.store)?;
+            self.keep_checkpoint_room();
+            if stall {
+                if !self.trunk.make_room_or_stall(&mut self.store)? {
+                    return Ok(false);
+                }
+            } else {
+                self.trunk.make_room(&mut self.store)?;
+            }
             stalled = true;
         }
         if stalled {
@@ -5955,7 +6079,7 @@ impl<F: BlockFile> ShardDb<F> {
         let full = std::mem::replace(&mut self.mem, fresh);
         self.pack_full(full)?;
         self.rotated = Some(std::time::Instant::now());
-        Ok(())
+        Ok(true)
     }
 
     /// Pays maintenance owed, for the shard's idle time: the packing memtable's whole, then up
@@ -5964,6 +6088,7 @@ impl<F: BlockFile> ShardDb<F> {
     /// Returns the work done, less than `budget` only once nothing is owed.
     pub fn maintain(&mut self, budget: u64) -> Result<u64, Error> {
         self.finish_packing()?;
+        self.keep_checkpoint_room();
         let t = self.timed.then(std::time::Instant::now);
         let mut used = self.trunk.step(&mut self.store, budget)?;
         if self.timed {
@@ -6021,6 +6146,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.finish_packing()?;
         }
         let t = self.timed.then(std::time::Instant::now);
+        self.keep_checkpoint_room();
         self.trunk.drain(&mut self.store)?;
         self.note_trunk(ns_since(t));
         self.trunk_carry = 0;

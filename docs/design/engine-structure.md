@@ -836,6 +836,18 @@ Mac under load, 2026-10-07; benches/shard_db.rs `attribute`):
   `room_now` makes no rotation and answers no room, and a put that cannot wait finishes the
   checkpoint first, inline. Puts into the memtable go on throughout, past the checkpoint's index.
   A crash before the second flush opens at the superblock before.
+- **A rotation the checkpoint overtakes.** The checkpoint packs the memtable it found, so it may
+  pack the one a rotation was begun for: in its own step, taken by the `room_now` that rotates
+  next; or finished inline by the put whose memtable is full, which packs that memtable whole as
+  `flush` does. Either leaves the active memtable empty, and a rotation that finds it so ends
+  with no swap (`ShardDb::rotate`, `ShardDb::rotate_step`). Swapped, the empty memtable went to a
+  worker whose sort keeps no entry and builds no branch, a result of no parts, and the engine
+  fenced as it took it back. Two of a three-node cell's members fenced so within a minute of
+  1-byte PUTs: an entry's commands apply as one batch, which can be larger than a range's
+  memtable, one row at the bounds
+  (`an_entry_past_a_memtable_while_a_checkpoint_packs_rotates_no_empty_memtable`,
+  `a_rotation_a_flush_overtook_swaps_no_empty_memtable`, and on a node's shard
+  `an_entry_larger_than_the_memtable_while_a_checkpoint_packs_applies_whole`).
 - **Recovery.** Open the newest valid superblock, check its root and map, and replay the Raft log
   from the applied index.
 - **Log holes.** A Raft log with several batches in flight must not acknowledge a batch while a

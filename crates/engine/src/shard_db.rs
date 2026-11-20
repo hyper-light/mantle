@@ -5688,6 +5688,15 @@ impl<F: BlockFile> ShardDb<F> {
 
     /// [`Self::rotate_paced`]'s steps, on a store of either backend.
     fn rotate_step(&mut self, keys: u64) -> Result<bool, Error> {
+        // A rotation ends only by its swap, which leaves the memtable it filled packing. One
+        // that finds the memtable empty was overtaken by what packed it: a checkpoint stepped by
+        // the ask that rotates ([`Self::room_now`]) or finished inline, or a flush. The puts have
+        // their room, and an empty memtable swapped would go to a worker whose sort keeps no
+        // entry and builds no branch.
+        if self.mem.is_empty() {
+            self.rotation = None;
+            return Ok(true);
+        }
         if self.rotation.is_none() {
             self.rebudget();
             self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
@@ -5823,6 +5832,12 @@ impl<F: BlockFile> ShardDb<F> {
         // A paced rotation begun ([`Self::room_now`]) is this one, done whole here: resumed after,
         // it would swap the memtable this one gives the puts.
         self.rotation = None;
+        // A checkpoint finished at its packing packed the memtable this rotation was for, as
+        // [`Self::flush`] packs every memtable: the puts have their room, and an empty memtable
+        // swapped would go to a worker whose sort keeps no entry and builds no branch.
+        if self.mem.is_empty() {
+            return Ok(());
+        }
         self.rebudget();
         self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
         let now = std::time::Instant::now();
@@ -7095,5 +7110,147 @@ mod frozen_tests {
         db.fill_ns = 0;
         db.pack_ns = 5_000;
         assert_eq!(db.frozen_most(), 0, "no fill measured, none");
+    }
+
+    /// An entry applied as a range applies one (`mantle_range::stored`): room for all of its
+    /// writes asked first ([`ShardDb::room_now`]), each ask stepping a checkpoint out, then the
+    /// writes. Off a runtime task no ask waits on a rotation, so the bound is on the checkpoint's.
+    fn entry(
+        db: &mut ShardDb<Held>,
+        oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        writes: &[(Vec<u8>, Vec<u8>)],
+    ) {
+        let bytes = writes
+            .iter()
+            .map(|(k, v)| crate::memtable::hashed::entry_bytes(k.len(), v.len()).unwrap())
+            .sum();
+        let keys = writes.len() as u64;
+        let mut asks = 0;
+        while !db.room_now(bytes, keys).unwrap() {
+            asks += 1;
+            assert!(asks < 1 << 12, "no room after {asks} asks");
+        }
+        for (k, v) in writes {
+            db.put(k, v).unwrap();
+            oracle.insert(k.clone(), v.clone());
+        }
+    }
+
+    /// An entry larger than a whole memtable applied while the checkpoint a range's compaction
+    /// begins without waiting ([`ShardDb::checkpoint_now`]) still packs: the checkpoint has
+    /// swapped out the memtable it found, so the active one is empty and room is answered at
+    /// once; the entry's writes fill the memtable, and the put that no longer fits rotates
+    /// inline ([`ShardDb::rotate`]), which finishes the checkpoint first, packing the memtable
+    /// those writes went into. The rotation is then left an empty memtable: handed to a worker,
+    /// its sort keeps no entry and builds no branch, a result of no parts, and the engine fences
+    /// as it retires it. Each cycle's checkpoint completes and every write reads back.
+    #[test]
+    fn an_entry_past_a_memtable_while_a_checkpoint_packs_rotates_no_empty_memtable() {
+        const CYCLES: u64 = 24;
+        const SMALL: u64 = 40;
+        const BIG: u64 = 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        let p = path.clone();
+        db.set_workers_within(move || Ok(plain(&p, false)), 1)
+            .unwrap();
+        let mut oracle = BTreeMap::new();
+        let mut i = 0u64;
+        let mut overtaken = 0;
+        for _ in 0..CYCLES {
+            for _ in 0..SMALL {
+                entry(
+                    &mut db,
+                    &mut oracle,
+                    &[(key(i), format!("v{i}").into_bytes())],
+                );
+                i += 1;
+            }
+            let at = i;
+            let done = db.checkpoint_now(at).unwrap();
+            // The interleaving: the checkpoint out at its packing, the memtable it found swapped
+            // out, the active one empty.
+            if !done
+                && db.mem.is_empty()
+                && matches!(
+                    db.flushing,
+                    Some(Flushing {
+                        stage: Flush::Pack { swapped: true },
+                        ..
+                    })
+                )
+            {
+                overtaken += 1;
+            }
+            let big: Vec<_> = (0..BIG)
+                .map(|j| (key(i + j), vec![b'a' + ((i + j) % 26) as u8; 300]))
+                .collect();
+            assert!(
+                big.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() > MEM,
+                "the entry is larger than a memtable"
+            );
+            entry(&mut db, &mut oracle, &big);
+            i += BIG;
+            let mut steps = 0;
+            while !db.checkpoint_now(i).unwrap() {
+                steps += 1;
+                assert!(steps < 1 << 12, "the checkpoint at {i} never completed");
+            }
+        }
+        assert!(overtaken > 0, "no entry met a checkpoint packing");
+        db.flush().unwrap();
+        check(&mut db, &oracle);
+    }
+
+    static GATES_R: Gates = Gates::new();
+
+    /// A paced rotation left waiting on a packing out, as [`ShardDb::room_now`] leaves one on a
+    /// runtime task for the worker's message, overtaken by a flush that packs every memtable (a
+    /// range's blocking checkpoint: an install, an open); the checkpoint begun without waiting
+    /// after it ([`ShardDb::checkpoint_now`]) steps the rotation still begun. The memtable it was
+    /// for is packed and the active one empty: the rotation ends with no swap, rather than hand
+    /// an empty memtable to a worker whose result of no parts fences the engine as it retires.
+    #[test]
+    fn a_rotation_a_flush_overtook_swaps_no_empty_memtable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        db.set_workers_within(gated(&path, &GATES_R), 1).unwrap();
+        let _open = Open(&GATES_R);
+        let mut oracle = BTreeMap::new();
+        let mut i = 0u64;
+        warm(&mut db, &mut oracle, &mut i, put_or_delete);
+        stall_oldest(&mut db, &mut oracle, &mut i, put_or_delete, &GATES_R, false);
+        for _ in 0..8 {
+            put_or_delete(&mut db, &mut oracle, i);
+            i += 1;
+        }
+        // The overlap measured lets no packing stay frozen past a rotation: the step an entry
+        // with no room takes waits for the stalled one.
+        db.pack_ns = 0;
+        assert!(
+            !db.rotate_step(1).unwrap(),
+            "the rotation waits on the packing out"
+        );
+        assert!(db.rotation.is_some() && !db.mem.is_empty());
+        GATES_R.release();
+        db.flush().unwrap();
+        assert!(
+            db.rotation.is_some() && db.mem.is_empty(),
+            "the flush packed the memtable the rotation was for"
+        );
+        let mut steps = 0;
+        while !db.checkpoint_now(i).unwrap() {
+            steps += 1;
+            assert!(steps < 1 << 12, "the checkpoint at {i} never completed");
+        }
+        assert!(db.rotation.is_none(), "the rotation overtaken ended");
+        for _ in 0..1000 {
+            put_or_delete(&mut db, &mut oracle, i);
+            i += 1;
+        }
+        db.flush().unwrap();
+        check(&mut db, &oracle);
     }
 }

@@ -1147,6 +1147,58 @@ mod tests {
         });
     }
 
+    /// An entry larger than a whole memtable applied while the checkpoint a range's compaction
+    /// begins without waiting still packs, as a three-node cell's entries of many 1-byte PUTs
+    /// were: the checkpoint's first step swaps the memtable out to the worker, so the entry finds
+    /// the memtable empty and is answered room at once (`ShardDb::room_now`); its writes fill
+    /// the memtable, and the write that no longer fits rotates inline, finishing the checkpoint
+    /// first, which packs the memtable those writes went into. The rotation is left an empty
+    /// memtable and swaps none (`ShardDb::rotate`): swapped, its packing came back from the
+    /// worker with no parts and fenced the engine ("a packing worker's result of other than its
+    /// parts"). The entry and those after it apply whole, the checkpoint is durable at the index
+    /// applied when it began, and the next takes every packing back.
+    #[test]
+    fn an_entry_larger_than_the_memtable_while_a_checkpoint_packs_applies_whole() {
+        on_a_shard_with_a_held_flush(|mut e, held, _here, _path| async move {
+            use mantle_meta::engine::{Engine, Rows, Write};
+            for i in 1..=8 {
+                assert!(e.apply_now(i, batch(i)).unwrap(), "entry {i}");
+            }
+            // Only the checkpoint's packing meets the entry, not its flushes.
+            held.open();
+            assert!(
+                !e.persist_now().unwrap(),
+                "durable before the memtable it packs came back"
+            );
+            // Past the memtable's room for 64 entries of eight rows.
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..600u32)
+                .map(|r| (format!("big-{r:012}").into_bytes(), vec![7; 100]))
+                .collect();
+            let writes = rows
+                .iter()
+                .map(|(k, v)| Write::Put(k.clone(), v.clone()))
+                .collect();
+            assert!(e.apply_now(9, writes).unwrap(), "entry 9, past a memtable");
+            for i in 10..=16 {
+                assert!(e.apply_now(i, batch(i)).unwrap(), "entry {i}");
+            }
+            assert!(e.persist_now().unwrap(), "the checkpoint entry 9 finished");
+            assert_eq!(e.durable(), 8);
+            e.persist().unwrap();
+            assert_eq!((e.applied(), e.durable()), (16, 16));
+            for (key, value) in &rows {
+                assert_eq!(
+                    e.get(key).unwrap().as_ref(),
+                    Some(value),
+                    "a row of entry 9"
+                );
+            }
+            for i in (1..=8).chain(10..=16) {
+                assert_eq!(whole(&mut e, i), Some(true), "entry {i}");
+            }
+        });
+    }
+
     /// A range's engine opened again over rows only its store's file holds, its cache empty: an
     /// entry's read of a row (`Engine::get_now`, `Engine::next_now`, as the range's state
     /// machine reads them) is answered not in memory at once, the shard's own handle reading

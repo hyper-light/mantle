@@ -553,6 +553,7 @@ async fn run_node(
     reports: mpsc::Sender<Report>,
     load: &'static AtomicU64,
     answer: &'static AtomicU64,
+    draw: u64,
 ) {
     let id = settings.id;
     let opened = Node::open_on(settings, log)
@@ -578,7 +579,7 @@ async fn run_node(
     let mut told: Option<Status> = None;
     // The suspicions of each peer last reported.
     let mut suspicions: Vec<(u64, u64)> = Vec::new();
-    let mut drawn = id.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut drawn = (id ^ draw).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     let mut own_reads: Vec<(u64, u64)> = Vec::new();
     let mut own_commands: Vec<(u64, u64)> = Vec::new();
     loop {
@@ -834,6 +835,8 @@ pub struct Sim {
     budget: Budget,
     /// The times each node's detectors came to suspect each peer, by (node, peer), as reported.
     pub suspected: BTreeMap<(u64, u64), u64>,
+    /// What a loaded node's stalls are drawn from beside its id ([`Sim::with_spare_drawn`]).
+    draw: u64,
 }
 
 /// A node's transport budget from its statement: its floor (`bounds::least_transport`) or with
@@ -872,7 +875,7 @@ impl Sim {
 
     /// The cell of `seed` of `nodes`, its range under `settings` and its nodes' logs under `log`.
     fn of(seed: u64, nodes: u64, settings: Settings, log: LogConfig, budget: Budget) -> Self {
-        Self::spared(seed, (nodes, nodes), (settings, log), budget, 0)
+        Self::spared(seed, (nodes, nodes), (settings, log), budget, 0, 0)
     }
 
     /// The cell of `seed`, its range under `settings`, each node holding `command_asks` commands
@@ -885,18 +888,26 @@ impl Sim {
             (settings, log_config()),
             bounds::least_transport,
             command_asks,
+            0,
         )
     }
 
     /// The cell of `seed` of `voters` founding voters and one spare past them, which runs from the
     /// start and votes on nothing until a replacement adds it (`Sim::replace`).
     pub fn with_spare(seed: u64, voters: u64) -> Self {
+        Self::with_spare_drawn(seed, voters, 0)
+    }
+
+    /// [`Sim::with_spare`], a loaded node's stalls ([`Sim::load`]) drawn from `draw` as well as
+    /// its id: each draw is another loaded host, the same one every run.
+    pub fn with_spare_drawn(seed: u64, voters: u64, draw: u64) -> Self {
         Self::spared(
             seed,
             (voters, voters + 1),
             (SETTINGS, log_config()),
             bounds::least_transport,
             0,
+            draw,
         )
     }
 
@@ -907,6 +918,7 @@ impl Sim {
         (settings, log): (Settings, LogConfig),
         budget: Budget,
         command_asks: usize,
+        draw: u64,
     ) -> Self {
         let shards = usize::try_from(nodes + CLIENTS + 1).unwrap();
         let mut rt = SimRuntime::new(
@@ -998,6 +1010,7 @@ impl Sim {
             starts: 0,
             budget,
             suspected: BTreeMap::new(),
+            draw,
         };
         for id in 1..=nodes {
             let file = SimFile::new(
@@ -1093,7 +1106,10 @@ impl Sim {
         let (load, answer) = (member.load, member.answer);
         let tell = self.tell.clone();
         self.rt
-            .spawn_on(shard, run_node(settings, log, taken, tell, load, answer))
+            .spawn_on(
+                shard,
+                run_node(settings, log, taken, tell, load, answer, self.draw),
+            )
             .unwrap();
     }
 

@@ -1645,7 +1645,12 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   1.73 s). Without the retry it counted both, the first refusal's compaction having written, then
   took no proof, and the cell stood still 3.1 s until the test failed.
 - (6) Each range's next wake and the stream's are the task's deadlines, and a wait that ends at
-  or past the stream's wake is reported (`Liveness::on_wait`).
+  or past the stream's wake is reported (`Liveness::on_wait`): one begun before the wake, or, while
+  the stream has measured no granularity, any. A node whose every turn ran past its stream's wake,
+  a loaded host's, began no wait before one, measured no granularity and refused every peer's
+  heartbeat as unmeasured for good: a founder loaded before a join never judged its joiner, whose
+  promotion waited on it (`tests/sim.rs`, `FOUNDER_DRAWS`). Until a wait has measured it, the
+  lateness of the node's poll past its wake is the measure, its stalls included.
 - (7) The root range keeps each enlisted node's history: the time it has run over all its runs and
   its runs that ended without an orderly stop (`root::Command::Lived`, a node stating its own
   alone, the greater of each total kept, so a statement applied late or twice takes nothing back).

@@ -1462,7 +1462,7 @@ const FOUNDER_HEARTBEATS: u64 = 100;
 #[test]
 fn a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off() {
     for seed in seeds(&[1, 2]) {
-        let suspicions = loaded_founder(seed, false);
+        let suspicions = loaded_founder(seed, false, 0);
         assert_eq!(
             suspicions, 0,
             "seed {seed}: the joiner suspected its live founder while it took \
@@ -1494,7 +1494,7 @@ const FOUNDER_LIVE_SUSPICIONS: u64 = 2;
 #[test]
 fn a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_it_cut_off() {
     for seed in seeds(&[1]) {
-        let suspicions = loaded_founder(seed, true);
+        let suspicions = loaded_founder(seed, true, 0);
         assert!(
             suspicions <= FOUNDER_LIVE_SUSPICIONS,
             "seed {seed}: the joiner suspected its live founder {suspicions} times while it took \
@@ -1503,12 +1503,57 @@ fn a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_
     }
 }
 
+/// The founder's stalls drawn from four starts besides its own (`Sim::with_spare_drawn`): four
+/// more loaded hosts, each the same every run. Loaded from before the join, on the second and third
+/// the joiner's join never completed at 83c3ece6: the founder, each of its turns run past its
+/// stream's wake, began no wait before a wake, so its stream measured no timer granularity and
+/// refused every heartbeat of the joiner as unmeasured (hyper-liveness `Refusal::Unmeasured`),
+/// taking none of its 1,777 and 1,881 while the joiner took the founder's, and never judged the
+/// joiner its promotion waits on; on the first, the joiner suspected its cut-off founder 140.0 ms
+/// after the cut, past the 139.6 ms of patience it stated. A poll past a wake now measures the
+/// granularity until a wait has (`Node::wait`). On the fourth the joiner states no patience as the
+/// join completes, no margin yet judging its founder: owed, so it is not among these tests.
+const FOUNDER_DRAWS: [u64; 4] = [1, 2, 3, 4];
+
+macro_rules! loaded_founder_at {
+    ($($name:ident: $after:expr, $draw:expr;)*) => {$(
+        #[test]
+        fn $name() {
+            let suspicions = loaded_founder(1, $after, FOUNDER_DRAWS[$draw]);
+            if $after {
+                assert!(
+                    suspicions <= FOUNDER_LIVE_SUSPICIONS,
+                    "draw {}: the joiner suspected its live founder {suspicions} times, past \
+                     {FOUNDER_LIVE_SUSPICIONS}",
+                    FOUNDER_DRAWS[$draw]
+                );
+            } else {
+                assert_eq!(
+                    suspicions, 0,
+                    "draw {}: the joiner suspected its live founder",
+                    FOUNDER_DRAWS[$draw]
+                );
+            }
+        }
+    )*};
+}
+
+loaded_founder_at! {
+    a_joiner_meets_its_founder_loaded_before_the_join_on_the_first_other_draw: false, 0;
+    a_joiner_meets_its_founder_loaded_before_the_join_on_the_second_other_draw: false, 1;
+    a_joiner_meets_its_founder_loaded_before_the_join_on_the_third_other_draw: false, 2;
+    a_joiner_meets_its_founder_loaded_after_the_join_on_the_first_other_draw: true, 0;
+    a_joiner_meets_its_founder_loaded_after_the_join_on_the_second_other_draw: true, 1;
+    a_joiner_meets_its_founder_loaded_after_the_join_on_the_third_other_draw: true, 2;
+    a_joiner_meets_its_founder_loaded_after_the_join_on_the_fourth_other_draw: true, 3;
+}
+
 /// Runs the cell of [`a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off`],
 /// its founder loaded from before the join or, `after_join`, from after it; checks that the joiner
 /// suspects the cut-off founder within the patience it states, and gives the times it suspected
 /// its live founder while it took [`FOUNDER_HEARTBEATS`] of its heartbeats.
-fn loaded_founder(seed: u64, after_join: bool) -> u64 {
-    let mut cell = Sim::with_spare(seed, 1);
+fn loaded_founder(seed: u64, after_join: bool, draw: u64) -> u64 {
+    let mut cell = Sim::with_spare_drawn(seed, 1, draw);
     cell.until("the founder leads", |c| {
         if c.members[&1].status.is_some_and(|s| s.leader == 1) {
             Some(())

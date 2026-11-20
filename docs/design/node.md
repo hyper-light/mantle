@@ -474,9 +474,13 @@ measures the second, and derives the rest by these rules:
   whole; a page buffer, a point read's page, a checkpoint page and an extent's run), each extent's
   allocator count, free or pending slot, map bit and map word apart, charged with the extent's
   resident metadata from what memory remains (`shard_db::measured_per_extent`), and its
-  maintenance workers' pools, a compaction's cursors and two builders each at the range's longest
-  keys and a packing's buffers for each worker and the active memtable (`derive::workers_bytes`,
-  about 90 MB a worker), where the node runs them (`engine.workers`); and the threads
+  maintenance workers' pools, a compaction's cursors and two builders, each the larger of a
+  compaction's at a leaf's limit of the range's longest keys and a packing's at the entries and key
+  bytes its memtable holds, and a packing's buffers for each worker and the active memtable
+  (`derive::workers_bytes`, about 90 MB a worker), and the pages its entries' reads hold loaded on
+  them until the entry applies, twice the sources at a trunk's root or a memtable's pages
+  (`shard_db::loads_bytes`, 848,640 bytes a range at the least buffer), where the node runs them
+  (`engine.workers`); and the threads
   the node starts (`derive::threads`: its own, which starts its shards and waits for the node's
   end, standard input's and output's, the log's two, the runtime's watchdog, a shard's for each
   CPU the process runs at once (hyper-rt `Facts::cpus_at_once`), each device's issuer, with a
@@ -610,8 +614,9 @@ measures the second, and derives the rest by these rules:
   filter and lists, and its two tries, at most a level and a label a key byte
   (`branch::builder_bytes`, `fst::trie::builder_bytes`); a cursor an extent, four pages and its
   reads in flight (`branch::cursor_bytes`); at most `TrunkConfig::cursors_most` cursors and
-  `builders_most` builders at once, each building a branch of at most `built_most` entries, a leaf's
-  limit, stated together by `shard_db::pooled_bytes`; the branches' resident metadata, each
+  `builders_most` builders at once, each building a branch of at most `built_within`: a leaf's
+  limit of entries at the longest key, or a memtable's packing, its most entries and each trie's
+  labels at most its bytes (`branch::Built`), stated together by `shard_db::pooled_bytes`; the branches' resident metadata, each
   branch's filters, tries, page counts, extents' numbers and record, at most the extents they hold
   times an extent's statement (`shard_db::resident_per_extent`: at the floor 63,698 bytes an extent
   at 8-byte keys and 87,430 at 2,132, the range filter's labels bounded by its keys' rises and those
@@ -722,7 +727,7 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
 | `engine.cache_bytes` | derived | the most each range's engine's page cache holds, its want: every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`), at most its store's pages. No share of the split: each engine opens with no cache (`process::engine`) and borrows its part of the operations' bytes no running operation holds, giving it back at once before one is charged it (`admit::cache_part`, `host::lend`, `Engine::lend_cache`; rule B for the caches, research/87 §4) |
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | each range's write buffer, its share of the engines' write buffers (§2.6): the least, one row at the range's bounds whole (`memtable::hashed::entry_bytes`), which the floor counts; raised toward its want, an entry of the range's largest (`range.max_entry_bytes`) within the bytes its log group retains, by what remains past the capacity wants and the operations served, the largest buffer whose engine holds no more than its part (`derive::write_buffer_want`, `derive::write_buffer`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row the least memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so), the same on every member and at every open since a trunk keeps its leaf's entries in its image and a snapshot carries them |
-| `engine.workers`, `memory.need_workers` | derived, measured | the maintenance workers each range's engine packs and compacts on, so an apply on the node's shard writes none of their pages: one, the least a pool holds, Little's law's need for all five ranges at once at the measured load (the leader's shard 31% busy packing and compacting inline at 4,000 to 6,000 small PUTs a second, macOS `sample`, 2026-11-19; `derive::ENGINE_WORKERS`). Their stacks are among the floor's threads and their pools among its engines (`derive::workers_bytes`); `memory.need_workers` is `memory.need` with them, and a node whose allowance holds less runs none (`derive::derive`): a founder on CI's 7 GiB macOS runner holds no five past its need. `memory.need` stays the need without them, at which every want is whole |
+| `engine.workers`, `memory.need_workers` | derived, measured | the maintenance workers each range's engine packs and compacts on, so an apply on the node's shard writes none of their pages: one, the least a pool holds, Little's law's need for all five ranges at once at the measured load (the leader's shard 31% busy packing and compacting inline at 4,000 to 6,000 small PUTs a second, macOS `sample`, 2026-11-19; `derive::ENGINE_WORKERS`). Their stacks are among the floor's threads, and their pools and the pages an entry's reads hold loaded on them among its engines (`derive::workers_bytes`, `shard_db::loads_bytes`); `memory.need_workers` is `memory.need` with them, and a node whose allowance holds less runs none (`derive::derive`): a founder on CI's 7 GiB macOS runner holds no five past its need. `memory.need` stays the need without them, at which every want is whole |
 | `transport_bytes` | derived | the transport's floor (`transport.floor`): what it holds besides QUIC's windows, the connections' state at the most connections it holds (`bounds::connections_state`) and the receive ring's growth at its most (`bounds::ring_growth`) among it, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`); and past it its want whole (`transport.want`, each share at a receive chunk, `bounds::chunked_transport`) where what remains past the capacity wants and the operations the node serves holds those operations' connections at a chunk, every operation more costing its client's windows at a chunk; short of it, the operations are those served and its budget is its floor and what remains, each share's window past the initial window by it over the shares (`bounds::limits`) |
 | `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
 | `gateway.window`, `gateway.objects`, `chunk_asks`, `command_asks`, `read_asks` | derived, measured | a window of one block, the floor, the least a put or a get holds and still moves (§2.6's `⌈R·T/B⌉` at its least), a put and a get each holding the window the node learns of its own puts and gets, and a copy its put's that of the node's puts and its get's as many blocks as that put drains while one is read, where the operations' bytes hold it (§2.8, `crate::window`); the operations' bytes, what the memory holds past every class's floor and the indexes' and engines' wants (`gateway.objects_bytes`; research/87 §4 rule D), each operation charged what it holds at its own size (`derive::Charges`), and a ceiling of as many operations as those bytes hold at the least one holds (`gateway.objects`), within which the host admits as many as it learns its knee is (§2.8, `crate::admit`); the asks the operations hold at once, each at its most under the schemes a block may take in a cell of the domains the volume table may name, the durability model's choice at each count of them (`derive::schemes`): a put's chunks at its width, or a get's spans and the whole chunks a failed span adds, twice its data less one, past the width of a code whose parity is less than its data less one (`put::most_chunks`, `get::most_chunks`); a put's command for each block of the largest body S3 takes, its renewals, and its file's write beside its blocks' (`put::most_commands`; gateway.md §2.2); one read each; and the node's enlistment (`derive::asks`). The memory an operation holds at its most: the larger of a put and a get of the schemes' largest blocks, the drivers' own (`put::most_bytes`: the segment, the block filling, each block going down with a code's parity and padded chunk, or a block coded with nothing filling beside it; `get::most_bytes`: the spans read, the whole chunks read in a failed span's place, the decoding, the cut bytes and the plaintext opened from them) and the host's, a put's chunks copied to send and a piece of body carried, a get's block taken; the coding's bytes are reed-solomon-simd's work, measured with the call's own (`Code::encode_bytes`, `Code::decode_bytes`), and its tables once a process (`mantle_ec::TABLE_BYTES`) (`derive::objects`) |
@@ -1550,7 +1555,7 @@ cancellation, never by a timeout that leaves the work running.
 | A device's read depth | where throughput stops growing | calibration | chunk-store.md §7 |
 | Background shares on a device | the largest share that keeps measured foreground latency within its bound; raised while blocks have lost redundancy | foreground latency under cleaning, scrubbing and repair | 11 §18 item 7; 04 R3 item 4; 10 §1 item 10 |
 | The log file's size | twice the live bytes: append rate times the engine's durable lag | both, measured by the log | raft-log.md §5 |
-| Engine write buffers, node total | `min(memory share, replay rate × restart budget)`; with no restart budget stated, the space bound, each range's log group's retention; each range an entry of its largest at most, within its part of what remains past the capacity wants and the operations served (*Write buffers*, below) | replay rate at each open (*open*: not measured) | 12 §6.2, §6.6; 11 §9.3 |
+| Engine write buffers, node total | `min(memory share, replay rate × restart budget)`; with no restart budget stated, the space bound, each range's log group's retention; each range an entry of its largest at most, within its part of what remains past the capacity wants and the operations served, its packings' builders charged for what its bytes hold (*Write buffers*, below) | replay rate at each open (*open*: not measured) | 12 §6.2, §6.6; 11 §9.3 |
 | A range's `max_entry_bytes` | the largest command a gateway sends: a completion of 10,000 parts, 561,804 bytes | `mantle_meta::wire::largest_entry_bytes` | replica.md §7; audit §16.5 |
 | Sessions a range holds | the gateway incarnations that may hold a live session (§5.3) | the cell's membership and its gateways' restarts | replica.md §1 |
 | A PUT's block window `w` | `w = ⌈R·T/B⌉`: the rate the upload is entitled to, `R = min(body rate, the principal's fair share over the authorities it uses)`, times the block chain's latency over a block's bytes, capped by memory; recomputed at each block | the body's arrival rate, the principal's share (§2.7), each chain's latency | gateway.md §2; audit §16.3; research/27 §6.1, D7 |
@@ -1584,11 +1589,30 @@ same part of it, as built:
   (`Stored::apply_now`): at the least, one row at the bounds, 20,840 bytes, an entry of 1-byte
   PUTs carried about 187 commands and nearly every one overflowed its memtable, each rotation a
   packing on the range's one worker, and the node's shard waited on rotations 12% to 57% of its
-  time (macOS `sample`, 2026-11-20). No more than the entry: each byte of a memtable is charged
-  hundreds in its worker's builders, the densest rows' count at the longest key's statement
-  (`TrunkConfig::built_most`, `branch::builder_bytes`), 174,508,244 bytes a range past the least
-  at the want, so a larger buffer would take from the operations what no measurement has yet
-  shown it gives back.
+  time (macOS `sample`, 2026-11-20).
+- **What a memtable byte costs.** A packing's builder was charged the densest rows' count
+  (`key::least_bytes`, 11 bytes each) with each row at the longest key's labels, 256 in its leaf
+  index, which no memtable holds: 174,508,244 bytes a range past the least at the want. It is
+  charged now what the memtable's bytes hold (`derive::workers_bytes`, `TrunkConfig::built_within`,
+  `branch::Built`): at most `memtable::hashed::most_entries` entries, each a key of the shortest
+  at its head's least, three bytes, so 112,375 in 561,885 bytes, more than the 51,080 counted
+  before, as an insert asks room for a head of nine and takes three; and each trie's labels at
+  most the memtable's bytes, as a range filter's entry or a leaf's separator is a prefix of a key
+  within the arena. A pool's builder is the larger of each part of a packing's and a compaction's,
+  a leaf's limit at the longest key, as its lists keep what they grew to for either. The sorter's
+  lists take the same entries. Pinned by the engine's `tests/builder_memory.rs`, a packing of a
+  memtable at its most entries of the shortest distinct keys, at keys of each trie's depth, the
+  longest, pairs of the longest, and the longest with the largest values, each within its
+  statement: 34,986,486 bytes a range past the least at the want, about 65 a memtable byte.
+- **Where the want stops.** At the entry. Raised to the retention, 18,671,880 bytes, the share
+  took 7,153 of the Mac Studio's 62,382 operations, 10,035 of a 16 GiB host's 10,830 and all but
+  the 10 a 7 GiB runner serves at least (`derive::tests`, 2026-11-20): it comes before the
+  operations past those served, and a memtable's lists still cost about 65 bytes a byte at its
+  most entries. Past the entry a buffer saves rotations, each a packing on the range's one worker
+  and a branch for its trunk to merge (SplinterDB packs 24 MiB a branch, research/34 §1), but no
+  measurement yet shows those rotations cost the node what the operations would give up. A
+  replay rate measured and a restart budget stated, or the rotations' cost measured past an
+  entry, reopen it; the retention bounds it whatever they show.
 - **The memory share** comes in rule D's order (research/87 §4) after the capacity wants and the
   operations served, before the transport's growth and the operations past those: a write buffer
   is held whole once written and gives its rows back only by a packing, so it takes a share where
@@ -1599,12 +1623,14 @@ same part of it, as built:
 - **The leaves stay the least buffer's**: a leaf holding every row the least memtable gives it, on
   every member and at every open alike, since a trunk keeps its leaf's entries in its image and a
   snapshot carries them to a follower whose memory may differ. A packing's builder takes every
-  row of the larger memtable (`TrunkConfig::built_most`, as the engine already bounds it).
+  entry of the larger memtable (`TrunkConfig::built_within`, as the engine bounds it).
 
 On a founder of the ladder's cell on the Mac Studio's 96 GiB and 32 cores (`derive::tests`, macOS
 aarch64), each range's buffer is its want whole, 561,885 bytes, its five engines holding
-872,541,220 bytes past the least, and the operations 61,897 where they were 62,502; on a 16 GiB
-host also whole, the operations 10,151 where they were 10,999.
+174,932,430 bytes past the least, and the operations 62,382 where they were 62,502 at the least
+and 61,897 under the charge before; on a 16 GiB host also whole, the operations 10,830 where they
+were 10,999 and 10,151. Linux's are estimates, not yet run: 62,234 and 10,691, as many fewer than
+its runs at the least as macOS's.
 
 ### 2.7 Scheduling: no upload dominates, every upload as fast as it can be
 

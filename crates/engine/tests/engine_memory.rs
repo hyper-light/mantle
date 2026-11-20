@@ -1,7 +1,7 @@
 //! What an engine at a range's floor holds, counted by hyper-measure's counting allocator against
 //! what `mantle_engine` states from its configuration and its trunk's height: its configured bytes
 //! (`shard_db::bounded_bytes`), its pools and builders at the most the trunk lets be out at once
-//! (`shard_db::pooled_bytes` over `TrunkConfig::cursors_most`, `builders_most` and `built_most`),
+//! (`shard_db::pooled_bytes` over `TrunkConfig::cursors_most`, `builders_most` and `built_within`),
 //! its branches' resident metadata at most the extents they hold times what an extent's is stated
 //! (`shard_db::resident_per_extent`; research/68), and the trunk's own records, its nodes, pivots
 //! and lists, as held (`ShardDb::memory`; node.md §1.4 names them open). Filled with paced puts
@@ -98,7 +98,13 @@ fn fill(key_bytes: usize, value_bytes: usize, rows: u64) {
     );
     // No workers: the shard steps its compactions, two holding their inputs at once at most.
     let (cursors, builders) = (trunk.cursors_most(height, 0), TrunkConfig::builders_most(0));
-    let entries = trunk.built_most(memtable_entries);
+    let built = trunk
+        .built_within(
+            key_bytes,
+            mantle_engine::branch::Built::of(key_bytes, memtable_entries, u64::MAX).unwrap(),
+        )
+        .unwrap();
+    let entries = built.entries;
     assert!(
         stats.open_most <= 2,
         "{key_bytes}-byte keys: {} compactions held their inputs at once",
@@ -144,7 +150,7 @@ fn fill(key_bytes: usize, value_bytes: usize, rows: u64) {
     let trunk_held = (memory.pivots + memory.branches) as u64 - branches * record - extents * 8;
     let bounded = shard_db::bounded_bytes(&config, memtable).unwrap();
     let pooled =
-        shard_db::pooled_bytes(&config, cursors, builders, key_bytes, entries, 1, bits).unwrap();
+        shard_db::pooled_bytes(&config, cursors, builders, key_bytes, built, 1, bits).unwrap();
     let stated = bounded + pooled + branch_stated + trunk_held;
     eprintln!(
         "keys {key_bytes} values {value_bytes} rows {rows}: held {held} of {stated} stated (configured {bounded}, pooled {pooled} for {cursors} cursors and {builders} builders of {entries} entries at height {height}, peaks {peaks:?}, branches' metadata {branch_held} of {branch_stated} stated for {branches} branches of {extents} extents at {per_extent} an extent, trunk's records {trunk_held} {memory:?}, inflight_most {}, open_most {}, compacted_most {})",

@@ -817,18 +817,18 @@ pub fn bounded_bytes(config: &Config, mem_limit: usize) -> Option<u64> {
 /// `cursors` cursors at once, each an extent buffer, its span's list of reads in flight, its
 /// three page buffers and a page the span may hold ([`crate::branch::cursor_bytes`], the device's
 /// issuer taking `batches` reads at once), and at most `builders` builders at once, each building a
-/// branch of at most `entries` entries of keys at most `key` bytes, its range filter keeping
-/// `range_bits` bits a key ([`crate::branch::builder_bytes`]: its run, its pages, its working
-/// lists, its filter and its tries). The pools keep no more than was ever out at once, and the
-/// trunk bounds what is out at once by its fanout and its height
-/// ([`crate::trunk::TrunkConfig::cursors_most`], [`crate::trunk::TrunkConfig::builders_most`],
-/// [`crate::trunk::TrunkConfig::built_most`]).
+/// branch of at most `built` ([`crate::branch::Built`]: its entries and its tries' labels) of keys
+/// at most `key` bytes, its range filter keeping `range_bits` bits a key
+/// ([`crate::branch::builder_bytes_of`]: its run, its pages, its working lists, its filter and its
+/// tries). The pools keep no more than was ever out at once, and the trunk bounds what is out at
+/// once by its fanout and its height ([`crate::trunk::TrunkConfig::cursors_most`],
+/// [`crate::trunk::TrunkConfig::builders_most`], [`crate::trunk::TrunkConfig::built_within`]).
 pub fn pooled_bytes(
     config: &Config,
     cursors: usize,
     builders: usize,
     key: usize,
-    entries: u64,
+    built: crate::branch::Built,
     batches: usize,
     range_bits: u32,
 ) -> Option<u64> {
@@ -836,16 +836,47 @@ pub fn pooled_bytes(
     let page = bytes(config.page_size)?;
     let extent = page.checked_mul(u64::from(config.extent_pages))?;
     let cursor = crate::branch::cursor_bytes(config.page_size, config.extent_pages, batches)?;
-    let builder = crate::branch::builder_bytes(
+    let builder = crate::branch::builder_bytes_of(
         crate::store::page::capacity(config.page_size),
         usize::try_from(extent).ok()?,
         key,
-        entries,
+        built,
         range_bits,
     )?;
     bytes(cursors)?
         .checked_mul(cursor)?
         .checked_add(bytes(builders)?.checked_mul(builder)?)
+}
+
+/// The most pages an engine of `trunk`'s shape, pages of `page_size` bytes and memtables of
+/// `mem_limit` holds loaded and loading at once for reads that may not wait
+/// (`ShardDb::get_ready`): twice the sources a read's path opens at a trunk's root
+/// (`TrunkConfig::sources_most` of one level), each source's leaf and the index page a get reads
+/// above it, or as many pages as a memtable's bytes hold where that is more. A one-row scan lands
+/// a leaf of every source on its path, so an extent's pages, two in a node's engines, were too
+/// few for one entry's reads, and its scan read on the shard. Fixed by the configuration, not by
+/// the trunk's height as it stands, so a node counts it in its floor ([`loads_bytes`]); a read
+/// past it is made on the shard as before.
+pub fn loads_most(trunk: &TrunkConfig, page_size: usize, mem_limit: usize) -> usize {
+    let path = trunk.sources_most(1).saturating_mul(2);
+    let memtable = mem_limit.checked_div(page_size).unwrap_or(0);
+    path.max(memtable).max(1)
+}
+
+/// The most bytes [`loads_most`]'s pages take: each page's payload, a page's bytes at most, read
+/// into a buffer of its length; its record among the pages held and its load's among those
+/// loading, each list grown at most twice over; and the job a load goes out in, boxed with its
+/// load.
+pub fn loads_bytes(trunk: &TrunkConfig, page_size: usize, mem_limit: usize) -> Option<u64> {
+    let records = std::mem::size_of::<(u64, Vec<u8>)>()
+        .checked_add(std::mem::size_of::<(u64, u64, bool)>())?
+        .checked_mul(2)?
+        .checked_add(std::mem::size_of::<Job>())?
+        .checked_add(std::mem::size_of::<Load>())?;
+    let page = u64::try_from(page_size.checked_add(records)?).ok()?;
+    u64::try_from(loads_most(trunk, page_size, mem_limit))
+        .ok()?
+        .checked_mul(page)
 }
 
 /// The most bytes of resident metadata a branch holds for each extent of `config`'s it holds, at
@@ -2941,18 +2972,13 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// The most pages loaded and loading at once for reads that may not wait
-    /// ([`Self::get_ready`]): twice the sources a read's path opens through the trunk as it
-    /// stands (`TrunkConfig::sources_most`), each source's leaf and the index page a get reads
-    /// above it, or as many pages as a memtable's bytes hold where that is more. A one-row scan
-    /// lands a leaf of every source on its path, so an extent's pages, two in a node's engines,
-    /// were too few for one entry's reads, and its scan read on the shard.
-    pub fn loads_most(&self) -> Result<usize, Error> {
-        let path = self.trunk.sources_most()?.saturating_mul(2);
-        let memtable = self
-            .mem_limit
-            .checked_div(self.store.config().page_size)
-            .unwrap_or(0);
-        Ok(path.max(memtable).max(1))
+    /// ([`Self::get_ready`]), [`loads_most`] at this engine's shape, pages and memtables.
+    pub fn loads_most(&self) -> usize {
+        loads_most(
+            &self.trunk.config(),
+            self.store.config().page_size,
+            self.mem_limit,
+        )
     }
 
     /// Whether a read that may not wait loads its missing page on a worker: on a runtime task,
@@ -2972,7 +2998,7 @@ impl<F: BlockFile> ShardDb<F> {
             return Ok(false);
         };
         if !self.store.loads_page(address) {
-            if self.store.loads() >= self.loads_most()? {
+            if self.store.loads() >= self.loads_most() {
                 return Ok(false);
             }
             let job = Box::new(Job {

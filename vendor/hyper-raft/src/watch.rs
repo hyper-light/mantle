@@ -119,6 +119,12 @@ pub(crate) struct Watch {
     stopped: Vec<NodeId>,
     /// The span, the round tail and the expected election, nanoseconds, once the owner gave them.
     pub(crate) timing: Option<(u64, u64, u64)>,
+    /// A sole voter's round to the other members it sends to and back, at its tail with a flush,
+    /// nanoseconds, once the owner gave it (`Raft::set_reach`): how often it beats, leading, while
+    /// work is in flight, as `timing`'s round is for a group of voters. No law times a sole
+    /// voter's elections, so it is given no timing; without this its beat was never armed, and a
+    /// learner's answer lost on its way left the learner's probe out for good.
+    pub(crate) reach: Option<u64>,
     /// The owner's clock at the last wake, nanoseconds: what a learner's catch-up round is timed on
     /// (`crate::CatchUp`).
     pub(crate) now: u64,

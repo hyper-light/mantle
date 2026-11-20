@@ -3994,6 +3994,54 @@ fn by_suspicion_a_learners_rounds_are_judged_on_the_owners_clock() {
     }
 }
 
+/// By suspicion a sole voter is given no timing, as no law times its elections, and beats on its
+/// reach (`Raft::set_reach`): a learner's answer lost on its way while the learner's probe is out
+/// is recovered by the beat, whose heartbeat's answer says where the learner's log ends, and the
+/// leader sends on. Without a reach no beat was armed and the probe stayed out for good: mantle's
+/// loaded founder, a sole voter whose replica, stalled for room, refused its learner's answer to
+/// the probe that followed a snapshot, sent that learner nothing more (mantle's node simulation,
+/// seed 2 of `a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off`).
+#[test]
+fn by_suspicion_a_sole_voter_beats_on_its_reach_and_a_learners_lost_answer_is_recovered() {
+    let suspicion = Config {
+        elections: crate::Elections::Suspicion,
+        ..config(1)
+    };
+    let mut store = Memory::with_voters(&[1]);
+    store.configuration.learners = vec![2];
+    let mut node = RawNode::new(&suspicion, store).unwrap();
+    node.campaign().unwrap();
+    let messages = drain(&mut node);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    // The probe's one message is out to the learner, and its answer is lost.
+    assert_eq!(sent(&messages, 2), vec![1]);
+    for now in [0, 1_000_000_000] {
+        node.wake(now).unwrap();
+        assert_eq!(node.deadline(), None, "no reach: no beat armed at {now}");
+    }
+    assert!(drain(&mut node).is_empty());
+    let reach = 5_000_000;
+    node.set_reach(std::time::Duration::from_nanos(reach))
+        .unwrap();
+    let start = 2_000_000_000;
+    node.wake(start).unwrap();
+    assert_eq!(node.deadline(), Some(start + reach));
+    node.wake(start + reach).unwrap();
+    let beats = drain(&mut node)
+        .into_iter()
+        .filter(|message| message.to == 2 && message.msg_type == MessageType::MsgHeartbeat)
+        .count();
+    assert_eq!(beats, 1);
+    // The learner holds entry 1, of the leader's term: its answer says so, and the leader sends
+    // it what follows at once.
+    let mut held = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    held.index = 1;
+    held.log_term = 1;
+    node.step(held).unwrap();
+    node.propose(vec![], b"x".to_vec()).unwrap();
+    assert_eq!(sent(&drain(&mut node), 2), vec![2]);
+}
+
 /// The thesis's Figure 4.4(a): the rounds of replication from voter 3's loss to the first commit
 /// after it, where member 4 joined `staged` (a learner caught up first) or directly as a voter.
 fn rounds_to_commit_after_a_loss(staged: bool) -> u64 {

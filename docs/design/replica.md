@@ -499,6 +499,24 @@ passed serves no member and is let go of. Until this, every compaction imaged th
 range, read and encoded every row on the node's shard whether or not any member was behind: 2%
 of that thread's time in a profile of a three-node cell on one Mac Studio taking one-byte PUTs at
 about 5,500 a second, and a cost that grew with every object stored.
+After a snapshot the member's progress is a probe: its report (`Replica::report_snapshot`) or
+the member's answer that it holds the snapshot's index ends the snapshot's state, the core sends
+the entries after it, and waits on the member's answer to them, as raft-rs does ("If snapshot
+finish, wait for the msgAppResp from the remote node", research/91 §2b). An answer lost on its
+way (the network's loss, or a leader stalled for room that refuses what arrives, §3) is recovered
+by the leader's beat: the heartbeat's answer says where the member's log ends and the core sends
+on (raft-rs's `pr.resume()` at a heartbeat's answer; Ongaro's dissertation §3.5, a lost RPC is
+retried). Under elections by suspicion a leader beats on its group's round (hyper-raft's
+`Timing::round`), which hyper-timing's law gives a group of two voters or more; a sole voter,
+whose elections no law times, was given none, so its beat was never armed, and its learner's
+probe stayed out for good once an answer was lost: the node simulation's loaded founder, seed 2 of
+`a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off`,
+refused its joiner's answer to the probe after the joiner's second snapshot while stalled for
+room, and sent it nothing more from entry 812 on while it committed past 2,600. A sole voter now
+beats on its reach (`Replica::measure_reach`, hyper-raft's `Raft::set_reach`): the measured
+round trip to the slowest of its other members at its tail, and a flush, as the law's round tail
+is to voters. hyper-raft's
+`by_suspicion_a_sole_voter_beats_on_its_reach_and_a_learners_lost_answer_is_recovered`.
 `a_compaction_with_no_member_behind_makes_no_image`,
 `a_member_behind_the_start_catches_up_by_an_image_made_when_asked`,
 `an_image_made_for_a_member_is_of_the_point_applied_when_asked` and

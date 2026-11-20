@@ -1142,17 +1142,21 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             return Ok(None);
         };
         let id = self.id();
-        let configuration = self.node.raft.configuration();
-        let voters = configuration.voters();
-        let paths = voters
-            .iter()
-            .filter(|voter| **voter != id)
-            .filter_map(|voter| liveness.round_trip(*voter));
         let durable = self
             .flushes
             .mean()
             .or_else(|| liveness.flush_mean())
             .unwrap_or(Duration::ZERO);
+        let configuration = self.node.raft.configuration();
+        let voters = configuration.voters();
+        if voters.iter().all(|voter| *voter == id) {
+            self.measure_reach(liveness, granularity, durable)?;
+            return Ok(None);
+        }
+        let paths = voters
+            .iter()
+            .filter(|voter| **voter != id)
+            .filter_map(|voter| liveness.round_trip(*voter));
         let Some(ballot) = Ballot::measure(paths, voters.len(), durable, granularity) else {
             return Ok(None);
         };
@@ -1164,6 +1168,38 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.set_timing(timing)?;
         }
         Ok(Some(span))
+    }
+
+    /// A sole voter's reach, given to the core when it moved: the measured round trip to the
+    /// slowest of the group's other members at its tail, and a flush, as a ballot's round tail is
+    /// to its voters (`hyper_timing::Ballot::broadcast_tail`). A sole voter has no election to
+    /// time and is given no timing, so it beats, leading, on this alone: the beat that recovers a
+    /// learner's answer lost on its way, which its probe waits on (`hyper_raft::Raft::set_reach`).
+    /// None before a path to one of them is measured.
+    fn measure_reach(
+        &mut self,
+        liveness: &Liveness,
+        granularity: Duration,
+        durable: Duration,
+    ) -> Result<(), ReplicaError> {
+        let granularity = u64::try_from(granularity.as_nanos()).unwrap_or(u64::MAX);
+        let tail = self
+            .peers()
+            .filter_map(|peer| liveness.round_trip(peer))
+            .filter(|path| path.samples() > 0)
+            .filter_map(|path| path.tail_ns(granularity))
+            .max();
+        let Some(tail) = tail else {
+            return Ok(());
+        };
+        let reach = Duration::from_nanos(tail).saturating_add(durable);
+        if self.node.raft.reach() != Some(reach) {
+            self.guarded(|r| {
+                let set = r.node.set_reach(reach);
+                r.heard(set)
+            })?;
+        }
+        Ok(())
     }
 
     /// When the owner is to drive the replica though nothing arrives (`Driven::wake`): the core's

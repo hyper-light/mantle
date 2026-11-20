@@ -1706,7 +1706,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.make_again(now, waker)?;
             }
             r.wake(now)?;
-            if r.stall.is_none() {
+            if r.stall.is_some() {
+                // What the fence lets go, and what the core committed meanwhile, is applied while
+                // stalled as well: applying takes no write, and only what is applied is
+                // compacted, which is what frees the log's room. Held until the stall cleared,
+                // entries that waited for room in the machine and filled their group's retained
+                // bound held back the compaction the refused write waited for, and it them
+                // (mantle's leader-failure runs, replica.md §2).
+                r.release_fence(out)?;
+                r.take_committed(out)?;
+            } else {
                 r.take_reports()?;
                 r.release_fence(out)?;
                 r.take_ready(now, waker, out)?;
@@ -1730,13 +1739,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     fn driven(&mut self) -> Driven {
         let slot = self.has_slot();
         let paged = self.wait == Wait::Page && self.fence.is_some();
-        let more = self.stall.is_none()
-            && (paged
-                || (slot
-                    && (self.ready_due()
-                        || self
-                            .behind_fence()
-                            .is_some_and(|(_, last)| !self.fence_covered(last)))));
+        // A page held is applied at the next drive, stalled or not (`drive`).
+        let more = paged
+            || (self.stall.is_none()
+                && slot
+                && (self.ready_due()
+                    || self
+                        .behind_fence()
+                        .is_some_and(|(_, last)| !self.fence_covered(last))));
         Driven {
             more,
             out: self.writes.len(),
@@ -1950,6 +1960,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let light = self.node.light_now(true);
         let mut light = self.must(light)?;
         self.emit(light.take_messages(), out);
+        if let Some((first, last)) = light.committed_range() {
+            self.apply_range(first, last, out)?;
+        }
+        self.tell_applied()
+    }
+
+    /// What the core committed, applied while the replica is stalled (`drive`): nothing is sent
+    /// with it, as a stalled replica takes no part in the group until its writes are made again.
+    fn take_committed(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
+        let light = self.node.committed_now(true);
+        let light = self.must(light)?;
         if let Some((first, last)) = light.committed_range() {
             self.apply_range(first, last, out)?;
         }

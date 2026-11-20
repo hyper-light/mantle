@@ -214,6 +214,65 @@ fn an_entry_the_machine_has_no_room_for_waits_committed_for_the_drive_that_finds
     assert!(!r.waits_for_room());
 }
 
+/// Entries that wait for room in the state machine, and those committed behind them, are applied
+/// once it has room even while a write the log refused for room stalls the replica, which sends
+/// nothing: applying takes no write, and only what is applied is compacted, which is what frees
+/// the log's room. Applied only once the stall cleared, entries that filled their group's retained
+/// bound held back the compaction the refused write waited for, and it them, for good (mantle's
+/// end-to-end runs through a leader's failure: a follower caught up from the new leader stood 25
+/// entries behind its commit, its group's bound, for ten minutes; its docs/design/replica.md §2).
+#[test]
+fn entries_waiting_for_room_apply_while_a_refusal_for_room_stalls_the_replica() {
+    let mut r = sole(3, Unbounded, |_| {});
+    let before = r.applied().index;
+    // The log starts at what is applied: a compaction frees only what is applied past it.
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    r.machine_mut().roomless = true;
+    for i in 0..4u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    assert!(r.waits_for_room());
+    assert_eq!(r.applied().index, before);
+    // Two more commit while the four wait, and the core gives them to apply to no one meanwhile.
+    for i in 4..6u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    assert!(r.durable_commit() >= before + 6);
+    // The next write is refused for room: the replica stalls with the entries still waiting.
+    r.propose(Vec::new(), b"refused".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    r.log_mut().make_durable();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    assert!(r.waits_for_room());
+    assert!(
+        !r.compact(0, now(), waker()).unwrap(),
+        "nothing applied to free"
+    );
+    // The machine's room comes, and the drive its work wakes the owner for applies the entries
+    // and those committed behind them, the replica still stalled and sending nothing.
+    r.machine_mut().roomless = false;
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    let applied: Vec<u64> = out.answers.iter().map(|(index, _)| *index).collect();
+    assert_eq!(applied, (before + 1..=before + 6).collect::<Vec<_>>());
+    assert_eq!(r.applied().index, before + 6);
+    assert!(r.is_stalled() && !r.waits_for_room());
+    assert!(out.messages.is_empty());
+    // So the compaction passes them, and once its start is durable the refused write is made
+    // again and its entry applied.
+    assert!(r.compact(0, now(), waker()).unwrap());
+    let out = pump(&mut r);
+    assert!(!r.is_stalled());
+    let applied: Vec<u64> = out.answers.iter().map(|(index, _)| *index).collect();
+    assert_eq!(applied, vec![before + 7]);
+}
+
 /// A compaction whose machine's checkpoint is not durable yet moves no start: the replica holds
 /// the compaction, rests (the machine's work wakes its owner), and goes on applying entries
 /// meanwhile; the drive that finds the checkpoint durable moves the start to the index applied

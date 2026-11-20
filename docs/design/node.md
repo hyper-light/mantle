@@ -2844,6 +2844,16 @@ delivery costs a server by its events, not by the connections it holds (research
   a connection that went is stepped and finds its door gone, not left to rest unbounded; it says
   the connection went first (`Mark::gone`), so a job stepped before the connection's channels
   close, as they do just after, rests on them no more and finds them closed at its next turn.
+- **What a request is named on is its connection's** (`door::Marker`). A connection serves one
+  request at a time, the next read only once the last's exchange ended (RFC 9112 §9.3,
+  `listener::conn`), so one marker, made with its first request and kept for each it serves
+  after, holds two words, each a request's name: the request the connection holds (`Mark::gone`
+  reads whether it is the job's own) and the one it named last (`Mark::taken` lets go of it only
+  where it is the job's own). A word left by a request the connection let go names that request:
+  taken, its name finds that request's job or none, and lets go of no name of the next's; and the
+  next is named past it, never held back by it. A request is named with no allocation of its own,
+  where a mark of its own was one allocation more for every S3 request (as built 2026-11-20,
+  `tests/listener_memory.rs`: 14 allocations a warmed HEAD where 13 cross to the host).
 - **The node's task takes the names before the host's step** (`Node::take_door`,
   `Host::take_marks`): each name's job found in one probe (`Host::named`, slots by name kept with
   the job table, one a job, as `exchanges` is), its name let go, then woken. A job's name is let go
@@ -2864,7 +2874,8 @@ delivery costs a server by its events, not by the connections it holds (research
   answers at every turn, a probe for each ask in flight.
 
 Bound: the names a turn takes are at most the marks' room; the host's slots by name, one a job,
-are bounded by its job table, and a name whose job ended finds none and is dropped. The answered
+are bounded by its job table, and a name whose job ended finds none and is dropped. A connection
+holds one marker, two words, made with its first request and kept for its life. The answered
 jobs a turn takes are at most the asks answered, in a vector kept from turn to turn.
 
 Tested (`node::host`, `door`): 64 S3 gets of an empty object, each reply's channel one answer and
@@ -2878,7 +2889,12 @@ sends the end and names its put (64) and as each commit is answered (64): 192 st
 where every turn stepped every put waiting on its body, 2,240; each answered `Done`. 64 gets whose
 version read is answered 32 turns after it is asked are stepped twice each, 128 steps, where every
 turn stepped every get, 2,112. A connection names its request once until the name is let go, again
-as it lets go of the request, and a name past the marks' room is missed and read once.
+as it lets go of the request, and a name past the marks' room is missed and read once. A
+connection's next request is named though the last one's name waits untaken, and the last one's
+name, taken, lets go of no name of the next's (`door`); three gets on one connection, each let go
+with its end held for want of room, are each stepped by their own names alone: the first's name
+steps the first get while the second rests, and the turn taking the second's name and the third's
+steps each once (`node::host`).
 
 Open: a native job's door events name its exchange to the node's task (`Native::mark`), not its
 job to the host, so native jobs waiting on their exchange, and every job on a driving shard

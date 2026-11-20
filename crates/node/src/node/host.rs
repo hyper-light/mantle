@@ -2811,7 +2811,7 @@ struct Local {
     /// The request's name, which its connection names as it gives the job a piece of its body or
     /// room in its reply, or lets go of it (`door::Mark`): the job's turns pass it by while it
     /// waits on its connection alone (`Job::rests`). None for a job made with none.
-    mark: Option<std::sync::Arc<door::Mark>>,
+    mark: Option<door::Mark>,
 }
 
 /// A native put's body as the node's task reads it from its exchange for the put's job (node.md
@@ -10295,18 +10295,18 @@ pub(super) mod tests {
     }
 
     /// A job of `work` admitted at `now` and charged `charge`, its request `op` submitted at
-    /// `doorway` by a connection of its own with a reply's channel of `room` answers, as the
-    /// listener submits one (`listener::conn`): its door names it by the request's mark.
+    /// `doorway` by the connection whose submitter is `submitter`, its next request, with a reply's
+    /// channel of `room` answers, as the listener submits one (`listener::conn`): its door names it
+    /// by the request's mark.
     fn named_job(
         (work, op): (Work, Op),
         now: u64,
         charge: u64,
-        (submitter, doorway): (&door::Submitter, &mut door::Doorway),
+        (mut submitter, doorway): (door::Submitter, &mut door::Doorway),
         room: usize,
     ) -> (Job, Connection) {
         let (body, pieces) = hyper_rt::sync::channel(2).unwrap();
         let (reply, answers) = hyper_rt::sync::channel(room).unwrap();
-        let mut submitter = submitter.clone();
         let named = submitter
             .submit(door::Request {
                 op,
@@ -10392,7 +10392,7 @@ pub(super) mod tests {
         let mut connections = Vec::new();
         for _ in 0..64 {
             let get = (work(get_op(), None), get_op());
-            let (job, connection) = named_job(get, now, read, (&submitter, &mut doorway), 1);
+            let (job, connection) = named_job(get, now, read, (submitter.clone(), &mut doorway), 1);
             host.push(job, now);
             connections.push(connection);
         }
@@ -10426,6 +10426,91 @@ pub(super) mod tests {
         }
     }
 
+    /// A connection serves its requests one at a time on one marker (`door::Mark`): the name of a
+    /// request it let go steps that request's job alone, never its next request's, and its next is
+    /// named as the connection moves it though that name waits untaken. Three gets of an empty
+    /// object on one connection, each reply's channel one answer: each is let go with its end held
+    /// for want of room, its head taken, and named as it is; the next is stepped to rest before
+    /// that name is taken. The first's name steps the first get alone, which gives its end and
+    /// ends. The third, its head taken, is named while the second's name waits, and the turn that
+    /// takes both steps each once. Each gave its head and end, no wake lost.
+    #[test]
+    fn a_name_of_a_request_its_connection_let_go_steps_no_job_of_its_next() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        let (mut doorway, submitter) = door::doorway(64, std::task::Waker::noop().clone()).unwrap();
+        let read = scheming_gateway().charges.read(1);
+        let mut stub = put_and_get_stub();
+        let get = || (work(get_op(), None), get_op());
+        // Steps of the host's turns that take no names: the door's names wait untaken.
+        let unnamed = |host: &mut Host, stub: &mut Stub, turns: usize| -> Vec<u64> {
+            (0..turns)
+                .map(|_| {
+                    let _ = clock_reads();
+                    host.step(stub).unwrap();
+                    clock_reads().1
+                })
+                .collect::<Vec<_>>()
+        };
+        let (job, first) = named_job(get(), now, read, (submitter.clone(), &mut doorway), 1);
+        host.push(job, now);
+        // Its version asked, then read: its head given, its end held for want of room.
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 2), [1, 1]);
+        let mut heads = Vec::new();
+        let mut replies = Vec::new();
+        // Its head taken, it is let go of, and named once as it is.
+        let let_go = |connection: Connection,
+                      heads: &mut Vec<Option<door::Answer>>,
+                      replies: &mut Vec<ChannelReceiver<door::Answer>>| {
+            let Connection {
+                submitter,
+                mut answers,
+                _named: named,
+                ..
+            } = connection;
+            heads.push(answers.try_recv().unwrap());
+            drop(named);
+            replies.push(answers);
+            submitter
+        };
+        let connection = let_go(first, &mut heads, &mut replies);
+        // The connection's next get, stepped to rest while the first's name waits untaken.
+        let (job, second) = named_job(get(), now, read, (connection, &mut doorway), 1);
+        host.push(job, now);
+        assert_eq!(
+            unnamed(&mut host, &mut stub, 2),
+            [1, 1],
+            "the second get alone"
+        );
+        // The first's name taken steps the first get alone: its end given, it ends.
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 1), [1]);
+        assert_eq!(host.jobs.len(), 1, "the first get ended, the second rests");
+        // The second let go of, its name untaken; the third stepped to rest.
+        let connection = let_go(second, &mut heads, &mut replies);
+        let (job, mut third) = named_job(get(), now, read, (connection, &mut doorway), 1);
+        host.push(job, now);
+        assert_eq!(
+            unnamed(&mut host, &mut stub, 2),
+            [1, 1],
+            "the third get alone"
+        );
+        // The third's head taken names it, though the second's name waits: both stepped once.
+        heads.push(third.answers.try_recv().unwrap());
+        third.submitter.wake();
+        third.submitter.wake();
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 1), [2]);
+        assert!(host.idle(), "every get ended");
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 1), [0]);
+        replies.push(third.answers);
+        for (head, answers) in heads.iter().zip(&mut replies) {
+            assert!(
+                matches!(head, Some(door::Answer::Head(reply)) if reply.status == Status::Done && reply.size == 0),
+                "{head:?}"
+            );
+            assert_eq!(answered(answers), [door::Answer::End]);
+        }
+    }
+
     /// Steps puts of an empty body through the S3 door whose connections send their bodies late:
     /// 64 puts, each told its driver wants its body (`door::Answer::Ready`) at its first turn and
     /// finding its body's channel empty; 32 turns then pass every put by (`Job::rests`), where
@@ -10455,7 +10540,7 @@ pub(super) mod tests {
                 metadata: Vec::new(),
             };
             let put = (Work::Put(putting), op);
-            let (job, connection) = named_job(put, now, 7, (&submitter, &mut doorway), 4);
+            let (job, connection) = named_job(put, now, 7, (submitter.clone(), &mut doorway), 4);
             host.push(job, now);
             connections.push(connection);
         }

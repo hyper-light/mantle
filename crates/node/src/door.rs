@@ -86,24 +86,42 @@ pub struct Request {
     pub reply: Sender<Answer>,
     /// Its name on the node's marks ([`Mark`]), given as it is submitted
     /// ([`Submitter::submit`]): none before.
-    pub mark: Option<Arc<Mark>>,
+    pub mark: Option<Mark>,
 }
 
 /// A request's name on its node's marks (node.md §2.9 step 6d): its connection names it as it gives
 /// its job something to take, a piece of its body or room in its reply, and as it lets go of it
 /// ([`Named`]), so the node's task steps that job alone where a walk stepped every job it held at
 /// every turn. Named once until the node's task takes the name ([`Mark::taken`]), so the marks hold
-/// each request at most once.
+/// each request at most once. What it is named on is its connection's ([`Marker`]), made with the
+/// connection's first request and kept for each it serves after, so a request is named with no
+/// allocation of its own.
+#[derive(Clone)]
 pub struct Mark {
     /// Unique among its door's requests: one a request, from a `u64` count no door's requests
     /// wrap.
     id: u64,
-    marked: AtomicBool,
-    /// Whether its connection let go of it ([`Named`]): set before the name that says so, so a job
-    /// stepped before the connection's channels close, as they do just after, does not wait on
-    /// them for a name that will not come.
-    gone: AtomicBool,
+    marker: Arc<Marker>,
 }
+
+/// What a connection names its requests on. A connection serves one request at a time, the next
+/// read only once the last's exchange ended (RFC 9112 §9.3, `listener::conn`), so one marker serves
+/// them all, each word a request's name or [`NO_REQUEST`]: a word left by a request its connection
+/// let go names that request, not the next, and is read as nothing of the next's.
+struct Marker {
+    /// The request its connection holds, from its submission ([`Submitter::submit`]) until its
+    /// connection lets go of it ([`Named`]): let go before the name that says so, so a job stepped
+    /// before the connection's channels close, as they do just after, does not wait on them for a
+    /// name that will not come.
+    held: AtomicU64,
+    /// The request its connection named last, until the node's task takes the name
+    /// ([`Mark::taken`]).
+    named: AtomicU64,
+}
+
+/// No request's name: a marker's word where its connection holds no request, or has none named.
+/// Names count from 0, one a request, and no door's requests reach it, as none wrap the count.
+const NO_REQUEST: u64 = u64::MAX;
 
 impl Mark {
     /// Its name, which the node's host finds its job by.
@@ -111,20 +129,33 @@ impl Mark {
         self.id
     }
 
-    /// Whether its connection let go of it: its job waits on its connection no more.
+    /// Whether its connection let go of it: its job waits on its connection no more. A connection
+    /// that let go of it holds its next request or none, never this one again.
     pub fn gone(&self) -> bool {
-        self.gone.load(Ordering::Acquire)
+        self.marker.held.load(Ordering::Acquire) != self.id
     }
 
     /// The node's task took its name: what its connection gives its job from here names it again.
+    /// A name its connection gave its next request since stays given, so taking a request's name
+    /// lets go of no other's. Taking it reads what its connection gave the job before naming it,
+    /// which the step that follows sees.
     pub fn taken(&self) {
-        self.marked.store(false, Ordering::Release);
+        let _ = self.marker.named.compare_exchange(
+            self.id,
+            NO_REQUEST,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Named on `marks` unless it is already, and the node's task turned: a name with no room sets
-    /// `missed`, and the node's task steps every request's job.
+    /// `missed`, and the node's task steps every request's job. A name its connection left
+    /// untaken for the request before this one is no name of this one's: this one is named past
+    /// it.
     fn name(&self, marks: &Sender<u64>, missed: &AtomicBool, node: &Waker) {
-        if !self.marked.swap(true, Ordering::AcqRel) && marks.try_send(self.id).is_err() {
+        if self.marker.named.swap(self.id, Ordering::AcqRel) != self.id
+            && marks.try_send(self.id).is_err()
+        {
             missed.store(true, Ordering::Release);
         }
         node.wake_by_ref();
@@ -136,7 +167,7 @@ impl Mark {
 /// more, so its job, waiting on a connection that went for the room or the body it would give, is
 /// stepped and finds its door gone.
 pub struct Named {
-    mark: Arc<Mark>,
+    mark: Mark,
     marks: Sender<u64>,
     marking: Arc<Marking>,
     node: Waker,
@@ -144,9 +175,15 @@ pub struct Named {
 
 impl Drop for Named {
     fn drop(&mut self) {
-        self.mark.gone.store(true, Ordering::Release);
-        self.mark
-            .name(&self.marks, &self.marking.missed, &self.node);
+        // Let go of unless its connection holds its next request already, which stays held.
+        let mark = &self.mark;
+        let _ = mark.marker.held.compare_exchange(
+            mark.id,
+            NO_REQUEST,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        mark.name(&self.marks, &self.marking.missed, &self.node);
     }
 }
 
@@ -348,10 +385,11 @@ pub struct Submitter {
     requests: Sender<Asked>,
     /// Where its requests are named, and the name of the one it submitted last, which its
     /// connection's turns of the node name ([`Submitter::wake`]): a connection holds one request
-    /// at a time.
+    /// at a time, each named on the connection's marker ([`Marker`]), made with its first and kept
+    /// for each after. Each connection submits on a clone of its own (`listener::begin`).
     marks: Sender<u64>,
     marking: Arc<Marking>,
-    mark: Option<Arc<Mark>>,
+    mark: Option<Mark>,
     node: Waker,
     slowed: Arc<Slowings>,
     learned: Arc<Learned>,
@@ -513,14 +551,25 @@ impl Submitter {
     /// on it, which names it once more as it is let go ([`Named`]). Refused when the door holds as
     /// many as it takes or the node is gone, the request dropped.
     pub fn submit(&mut self, mut request: Request) -> Result<Named, Refusal> {
-        let mark = Arc::new(Mark {
+        // The connection's marker, made with its first request and kept for each after, whether
+        // the door took the last or not.
+        let marker = match &self.mark {
+            Some(mark) => Arc::clone(&mark.marker),
+            None => Arc::new(Marker {
+                held: AtomicU64::new(NO_REQUEST),
+                named: AtomicU64::new(NO_REQUEST),
+            }),
+        };
+        let mark = Mark {
             id: self.marking.next.fetch_add(1, Ordering::Relaxed),
-            marked: AtomicBool::new(false),
-            gone: AtomicBool::new(false),
-        });
-        request.mark = Some(Arc::clone(&mark));
+            marker,
+        };
+        // Held from before the node's task can take it, so its job finds its connection holding
+        // it.
+        mark.marker.held.store(mark.id, Ordering::Release);
+        request.mark = Some(mark.clone());
+        self.mark = Some(mark.clone());
         self.send(Asked::Op(Box::new(request)))?;
-        self.mark = Some(Arc::clone(&mark));
         Ok(Named {
             mark,
             marks: self.marks.clone(),
@@ -777,6 +826,46 @@ mod tests {
         let (_fourth, _) = submitted(&mut extra, &mut doorway);
         extra.wake();
         assert!(doorway.missed());
+        assert!(!doorway.missed());
+    }
+
+    /// A connection names each request it serves on one marker, made with its first: what is said
+    /// of a request it let go is that request's alone. A name it gave the last request, still
+    /// waiting when it names its next, keeps no name of the next's back, and the last one's name
+    /// taken lets go of none of the next's, which is named once until its own is taken; the last
+    /// request stays let go as the next is held.
+    #[test]
+    fn a_name_of_a_request_its_connection_let_go_is_that_requests_alone() {
+        let (mut doorway, submitter) = doorway(1, Waker::noop().clone()).unwrap();
+        let mut connection = submitter.clone();
+        let (named, one) = submitted(&mut connection, &mut doorway);
+        let first = connection.mark.clone().unwrap();
+        connection.wake();
+        drop(named);
+        assert!(first.gone(), "its connection let go");
+        let (_named, two) = submitted(&mut connection, &mut doorway);
+        let second = connection.mark.clone().unwrap();
+        assert!(
+            Arc::ptr_eq(&first.marker, &second.marker),
+            "one marker a connection"
+        );
+        assert!(
+            first.gone() && !second.gone(),
+            "the last let go, the next held"
+        );
+        // The next is named though the last one's name waits untaken, and once until taken.
+        connection.wake();
+        connection.wake();
+        assert_eq!(doorway.marked(), Some(one), "named once as it was let go");
+        assert_eq!(doorway.marked(), Some(two));
+        assert_eq!(doorway.marked(), None);
+        // The last one's name taken lets go of no name of the next's.
+        first.taken();
+        connection.wake();
+        assert_eq!(doorway.marked(), None);
+        second.taken();
+        connection.wake();
+        assert_eq!(doorway.marked(), Some(two));
         assert!(!doorway.missed());
     }
 

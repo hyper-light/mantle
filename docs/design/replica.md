@@ -131,7 +131,13 @@ The commands of one entry apply as one engine batch at the entry's index. That k
 engine's applied index at an entry boundary, so replay after a crash starts cleanly at the
 first entry after it (metadata.md §3). Within the entry, each command reads what the
 commands before it wrote, through an overlay that buffers the entry's writes over the
-engine and answers reads from both. A command whose effects the layer refuses, a failed
+engine and answers reads from both. The overlay's index is a skip list over slots and links
+the range keeps from one entry to the next (Pugh 1990, research/59 §1), emptied as each entry's
+batch goes to the engine or a pass is refused, keeping its capacity: once the range has applied
+an entry as large, an entry's overlays allocate nothing for its rows, the keys and values being
+the layer's buffers, moved in and on to the engine. Its bound is one entry's writes, within the
+largest entry a range takes; an outsized entry's capacity is given back by halves over the
+entries after it (research/59 §3). A command whose effects the layer refuses, a failed
 precondition say, answers its refusal and writes nothing. A committed entry that does not
 decode, or whose command breaks the state machine, fences the replica. Every replica applies
 the same log, so the break is in the data. The replica then recovers from its peers, and the

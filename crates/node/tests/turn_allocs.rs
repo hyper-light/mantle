@@ -213,13 +213,17 @@ fn serving(make: fn(u64) -> Sim, seed: u64, ops: u64) -> alloc::Counts {
 /// 24,316 since the node simulation wakes a node once its liveness write is answered and gives
 /// each simulated thread three timers (b497c2e5, 23db1717, merged at d74f91ae): the clients' run
 /// no longer waits out wakes a timer held back, 9,053 fewer; reallocations 2,043. On Linux 24,367,
-/// this Mac's and the 51.
+/// this Mac's and the 51. 23,947 since a range keeps its entries' overlay storage from one entry
+/// to the next (`mantle_meta::apply::Kept`), 369 fewer: each entry made a map for its writes and
+/// one for each command's, a node for every command that wrote and one for every few rows the
+/// entry held; reallocations 2,052, the kept storage's slots and links grown by doubling to the
+/// largest entry each range applies. On Linux 23,998, this Mac's and the 51.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        24_367
+        23_998
     } else {
-        24_316
+        23_947
     };
     let counts = serving(Sim::new, 1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");
@@ -245,13 +249,14 @@ fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
 /// 1,005 fewer, the images the floor's run names; reallocations 2,052 as before. On Linux 32,193.
 /// 23,480 since the node simulation wakes a node once its liveness write is answered and gives
 /// each simulated thread three timers (d74f91ae), 8,662 fewer; reallocations 2,046. On Linux
-/// 23,531.
+/// 23,531. 23,111 since a range keeps its entries' overlay storage (`mantle_meta::apply::Kept`),
+/// the 369 the floor's run names; reallocations 2,055. On Linux 23,162.
 #[test]
 fn a_cell_serving_writes_at_chunked_windows_copies_fewer_datagrams() {
     const CHUNKED: u64 = if cfg!(target_os = "linux") {
-        23_531
+        23_162
     } else {
-        23_480
+        23_111
     };
     let floor = serving(Sim::new, 1, 40);
     let chunked = serving(Sim::chunked, 1, 40);

@@ -14,7 +14,7 @@ use std::collections::TryReserveError;
 
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
 use mantle_codec::{Reader, Writer};
-use mantle_meta::apply::{Layer, apply_entry_with};
+use mantle_meta::apply::{Kept, Layer, apply_entry_with};
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
 use mantle_meta::error::MetaError;
 use mantle_meta::key::{LOCAL, marker};
@@ -208,6 +208,10 @@ pub struct RangeMachine<E> {
     /// Held in memory only, as it derives from the rows: nothing is known at open or after an
     /// install, whose rows may be of any time, until the next entry's scan.
     watermark: Watermark,
+    /// The storage the range's entries are applied in, kept from one entry to the next so an
+    /// entry's overlays allocate nothing once one as large has been applied, its capacity within
+    /// the bound `mantle_meta::overlay::Writes` states.
+    kept: Kept,
     /// The configuration as of the last entry applied.
     configuration: ConfState,
     /// The last entry applied.
@@ -259,6 +263,7 @@ impl<E: Engine> RangeMachine<E> {
             layer,
             rules,
             watermark: Watermark::default(),
+            kept: Kept::default(),
             configuration,
             applied: point,
             persisting: None,
@@ -360,6 +365,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         // Lent to the entry, as the engine is, and kept only once the entry applies.
         let mut watermark = self.watermark;
         let failure = &mut self.failure;
+        let kept = &mut self.kept;
         let mut engine = Termed::new(&mut self.engine, self.applied.term, entry.term);
         engine.now = true;
         if entry.kind != EntryType::EntryNormal {
@@ -384,6 +390,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
                 layer,
                 &rules,
                 &mut watermark,
+                kept,
             );
             let made = match applied {
                 Ok(made) => made,

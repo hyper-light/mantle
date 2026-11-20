@@ -1,6 +1,7 @@
 //! What a metadata message, a row's key and an entry's writes allocate, counted exactly: each
 //! message and each key one buffer, made at its length before a byte of it is written, so none
-//! grows; an entry's overlay takes its rows by move, so none is copied.
+//! grows; an entry's overlay takes its rows by move, so none is copied, into storage kept from
+//! entry to entry, so none allocates for its rows once warm.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -13,7 +14,7 @@
 use hyper_measure::alloc;
 use mantle_meta::engine::{Model, Rows, Write};
 use mantle_meta::key::{self, NameRow};
-use mantle_meta::overlay::Overlay;
+use mantle_meta::overlay::{Overlay, Writes};
 use mantle_meta::record::{
     BlockHeader, ChunkPlace, Extent, FINGERPRINT, FileHeader, Ledgered, PUBLIC_KEY, Referrer,
     Regranted, Rejoin, Target, WrappedKey, Wrapper, WrittenOff,
@@ -192,20 +193,98 @@ fn a_key_is_one_buffer_made_at_its_length() {
     assert_eq!(made, (1, 0));
 }
 
-/// An entry's overlay keeps the rows it is given, moved: writing three rows allocates the one
-/// node its map holds them in, and no copy of any key or value.
+/// An entry's overlay keeps the rows it is given, moved: writing three rows and a deletion into
+/// storage that has held as many allocates its slots and links nothing, and copies no key or
+/// value (before the storage was kept, the one node of the map the overlay made anew).
 #[test]
 fn an_overlay_keeps_its_rows_by_move() {
     let mut engine = Model::default();
-    let writes: Vec<Write> = (0..3u8)
-        .map(|i| Write::Put(vec![b'k', i], vec![b'v'; 64]))
-        .chain([Write::Delete(vec![b'd'])])
-        .collect();
-    let mut overlay = Overlay::new(&mut engine, (usize::MAX, usize::MAX));
+    let writes = || -> Vec<Write> {
+        (0..3u8)
+            .map(|i| Write::Put(vec![b'k', i], vec![b'v'; 64]))
+            .chain([Write::Delete(vec![b'd'])])
+            .collect()
+    };
+    let mut storage = Writes::default();
+    let mut overlay = Overlay::new(&mut engine, (usize::MAX, usize::MAX), &mut storage);
+    overlay.apply(1, writes()).unwrap();
+    assert_eq!(overlay.into_writes().unwrap().len(), 4);
+    let writes = writes();
+    let mut overlay = Overlay::new(&mut engine, (usize::MAX, usize::MAX), &mut storage);
     let (applied, made) = counted(|| overlay.apply(1, writes));
     applied.unwrap();
-    assert_eq!(made, (1, 0));
-    assert_eq!(overlay.into_writes().len(), 4);
+    assert_eq!(made, (0, 0));
+    assert_eq!(overlay.into_writes().unwrap().len(), 4);
+}
+
+/// An engine that keeps the batch it is given, as a range's engine takes an entry's batch.
+#[derive(Default)]
+struct Taking(Vec<Write>);
+
+impl Rows for Taking {
+    fn get(&mut self, _: &[u8]) -> Result<Option<Vec<u8>>, mantle_meta::engine::EngineError> {
+        Ok(None)
+    }
+
+    fn next(
+        &mut self,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<Option<mantle_meta::engine::Row>, mantle_meta::engine::EngineError> {
+        Ok(None)
+    }
+
+    fn apply(
+        &mut self,
+        _: u64,
+        writes: Vec<Write>,
+    ) -> Result<(), mantle_meta::engine::EngineError> {
+        self.0 = writes;
+        Ok(())
+    }
+}
+
+/// `n` commands' single-row puts, each the batch its layer hands the command's overlay.
+fn single_row_puts(n: u8) -> Vec<Vec<Write>> {
+    (0..n)
+        .map(|i| vec![Write::Put(vec![b'k', i.wrapping_mul(37)], vec![b'v'; 16])])
+        .collect()
+}
+
+/// Applies an entry of `n` commands' single-row puts as `apply_entry_with` does: each command over
+/// its own overlay, taken into the entry's, whose batch the engine takes; the overlays' storage
+/// kept from entry to entry, as a range keeps it.
+fn apply_puts(engine: &mut Taking, kept: &mut (Writes, Writes), puts: Vec<Vec<Write>>) {
+    let bound = (usize::MAX, usize::MAX);
+    let (entry, command) = kept;
+    let mut overlay = Overlay::new(engine, bound, entry);
+    for put in puts {
+        let mut own = Overlay::new(&mut overlay, bound, &mut *command);
+        own.apply(1, put).unwrap();
+        overlay.absorb(command).unwrap();
+    }
+    let writes = overlay.into_writes().unwrap();
+    engine.apply(1, writes).unwrap();
+}
+
+/// An entry's overlays allocate nothing for its rows once their storage has held an entry as
+/// large: applying a warmed entry of 1, 8 or 64 commands' single-row puts allocates the engine's
+/// batch alone, one buffer at its length. Before the storage was kept, each overlay was a map
+/// made anew: 3, 10 and 74 allocations, a node for each command's own map and one per few rows
+/// for the entry's, which the entry's batch then freed.
+#[test]
+fn an_entrys_overlays_allocate_nothing_per_row_once_warm() {
+    for n in [1u8, 8, 64] {
+        let mut engine = Taking::default();
+        let mut kept = (Writes::default(), Writes::default());
+        apply_puts(&mut engine, &mut kept, single_row_puts(n));
+        let puts = single_row_puts(n);
+        let ((), made) = counted(|| apply_puts(&mut engine, &mut kept, puts));
+        println!("{n} single-row puts: {made:?}");
+        assert_eq!(made, (1, 0), "{n}");
+        assert_eq!(engine.0.len(), usize::from(n));
+        assert_eq!(engine.0.capacity(), usize::from(n));
+    }
 }
 
 /// The ledger's commands in an entry, its rows and its answers are each one buffer at its length

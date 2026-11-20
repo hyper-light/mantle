@@ -1217,11 +1217,14 @@ impl Pair {
             taken.configured = self.configure(context, granularity);
         }
         // The MTBF is a float division: read only where the margin is renewed.
-        if self.received.configuration.is_none()
-            && let Some(evidence) = context.evidence
-            && self.pool_margin_due(true)
-        {
-            self.pool_margin(evidence, true, granularity, context.exposure.mtbf());
+        if self.received.configuration.is_none() {
+            if self.told && self.received.pooled.is_some() {
+                self.premature_margin(context.evidence, granularity, context.exposure.mtbf());
+            } else if let Some(evidence) = context.evidence
+                && self.pool_margin_due(true)
+            {
+                self.pool_margin(evidence, true, granularity, context.exposure.mtbf());
+            }
         }
         // Its lateness feeds the node's pool as any heartbeat's does: a node alone in its mode has
         // no other evidence, and the node's evidence is never narrower than its widest configured
@@ -1371,7 +1374,7 @@ impl Pair {
     /// one or more too. Imposed at the link's interval alone, one in about a thousand of the
     /// simulation's margins (8 of 6,786) had an unavailability past one. Renewed on the
     /// configuration's doubling schedule: at the first, and once the heartbeats taken have doubled
-    /// since.
+    /// since; and at once where a heartbeat ends a suspicion it told (`premature_margin`).
     pub(crate) fn pool_margin(
         &mut self,
         pool: &Arrivals,
@@ -1379,12 +1382,57 @@ impl Pair {
         granularity: Duration,
         mtbf: Option<Duration>,
     ) {
+        if self.pool_margin_due(measured) {
+            self.impose_pooled(Some(pool), None, measured, granularity, mtbf);
+        }
+    }
+
+    /// A heartbeat taken ended a suspicion that the margin of the node's evidence told: a premature
+    /// one, the peer alive. Chandra and Toueg's eventually perfect detector "increases the length
+    /// of its timeout period" after each premature suspicion (JACM 1996, §9.1, Fig. 10;
+    /// `docs/research/81-learned-link-liveness.md` [10]): the margin is renewed at once, not on the
+    /// doubling schedule, from the behaviour it was imposed from widened by the node's evidence as
+    /// it stands and by the link's latenesses, the one that ended the suspicion among them, and
+    /// never shorter than the margin that suspected. Renewed on the doubling schedule alone, a
+    /// joiner's link to a founder loaded from the join, judged at its node's 4.15 ms at a 120 µs
+    /// interval, suspected the founder again at its next stall, of 17 ms, after it had shown a
+    /// 34.8 ms lateness; renewed at once, to 61.9 ms, it did not (mantle's node simulation at
+    /// b497c2e5, seed 1). The first stall cannot be spared: no lateness had shown it. A link with a
+    /// configuration of its own is not judged by this margin, and the rule does not touch it.
+    /// mantle: vendor/UPSTREAM.md.
+    fn premature_margin(
+        &mut self,
+        evidence: Option<&Arrivals>,
+        granularity: Duration,
+        mtbf: Option<Duration>,
+    ) {
+        let Some((before, _, was)) = self.received.pooled else {
+            return;
+        };
+        self.impose_pooled(
+            evidence,
+            Some(before),
+            was || evidence.is_some(),
+            granularity,
+            mtbf,
+        );
+    }
+
+    /// Imposes the margin of the node's evidence `pool`, scaled to the link's window, widened by
+    /// the behaviour a premature suspicion's margin was imposed from (`before`) and by the link's
+    /// own latenesses, at its costs and its floors (`pool_margin`), the margin in force kept where
+    /// it is longer after a premature suspicion.
+    fn impose_pooled(
+        &mut self,
+        pool: Option<&Arrivals>,
+        before: Option<Arrivals>,
+        measured: bool,
+        granularity: Duration,
+        mtbf: Option<Duration>,
+    ) {
         let (Some(election), Some(mtbf)) = (self.election, mtbf) else {
             return;
         };
-        if !self.pool_margin_due(measured) {
-            return;
-        }
         let taken = self.counts.taken;
         // The floors the link's own configuration would be searched over: the peer's floor and
         // this node's `G` (`configure`).
@@ -1396,7 +1444,8 @@ impl Pair {
         // have no count for an unseen share to stand on, which the node's evidence carries.
         let shown = link.estimator.arrivals_seen();
         let window = link.estimator.estimates().window.length;
-        let Some(behaviour) = wider(Some(scaled(pool, window)), shown) else {
+        let pool = pool.map(|pool| scaled(pool, window));
+        let Some(behaviour) = wider(wider(pool, before), shown) else {
             return;
         };
         let costs = Costs { election, mtbf };
@@ -1413,7 +1462,11 @@ impl Pair {
                 _ => return,
             }
         };
-        link.estimator.impose(detector.margin);
+        let margin = match (before, link.estimator.margin()) {
+            (Some(_), Some(suspected)) => detector.margin.max(suspected),
+            _ => detector.margin,
+        };
+        link.estimator.impose(margin);
         self.received.pooled = Some((behaviour, taken, measured));
         self.received.pooled_ask_ns = ask_ns;
     }
@@ -2133,5 +2186,99 @@ mod tests {
         assert_eq!(link.estimator.margin(), Some(best.margin));
         assert_eq!(pair.received.pooled_ask_ns, nanos(best.interval));
         assert!(best.interval > Duration::from_millis(10));
+    }
+
+    /// A link judged by the margin of the node's evidence, its peer alive through a stall longer
+    /// than that margin, is suspected once: the heartbeat that ends the suspicion, a premature
+    /// one, renews the margin at once from the link's latenesses, the stall's among them
+    /// (`Pair::premature_margin`), where the doubling schedule would have kept the margin that
+    /// suspected until the sixteenth heartbeat taken. The peer's next stall, half as long, is no
+    /// suspicion, and once it falls silent it is suspected at the renewed freshness point, within
+    /// the freshness the pair states.
+    #[test]
+    fn a_premature_suspicion_renews_the_margin_of_the_nodes_evidence_at_once() {
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        let evidence = evidence();
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: Some(&evidence),
+            local: steady(),
+            apart: false,
+        };
+        let mut pair = pair();
+        let take = |pair: &mut Pair, seq: u64, arrival: u64| {
+            let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
+            pair.take(
+                2,
+                &beat(7, seq),
+                arrival,
+                &context,
+                &mut changes,
+                &mut taken,
+            )
+            .unwrap();
+            changes
+        };
+        let margin = |pair: &Pair| {
+            pair.received
+                .link
+                .as_ref()
+                .and_then(|link| link.estimator.margin())
+                .unwrap()
+        };
+        let renewed_at = |pair: &Pair| pair.received.pooled.map(|(_, at, _)| at);
+        // Ten heartbeats on schedule at 10 ms: the margin of the node's evidence is imposed at the
+        // first and renewed as the heartbeats taken double, last at the eighth.
+        for seq in 0..10 {
+            assert_eq!(
+                take(&mut pair, seq, seq * 10 * MS),
+                [None, None, None, None]
+            );
+        }
+        assert_eq!(renewed_at(&pair), Some(8));
+        assert_eq!(pair.configuration(), None, "judged by the node's evidence");
+        let suspected_by = margin(&pair);
+        // The peer stalls for half a second and sends at its slot, skipping the fifty before it,
+        // as a sender behind its schedule does: past the freshness point of the eleventh,
+        // suspected at its arrival, and taking it ends the suspicion.
+        let late = 60 * 10 * MS;
+        let changes = take(&mut pair, 60, late);
+        assert!(
+            matches!(changes[0], Some(Change::Suspected(_))),
+            "{changes:?}"
+        );
+        assert_eq!(
+            changes[2],
+            Some(Change::Trusted {
+                peer: 2,
+                at_ns: late
+            })
+        );
+        // Renewed at once, at the eleventh heartbeat taken, past the lateness that proved the
+        // suspicion premature.
+        assert_eq!(renewed_at(&pair), Some(11));
+        let renewed = margin(&pair);
+        assert!(
+            renewed > suspected_by && renewed > Duration::from_millis(500),
+            "{suspected_by:?} renewed to {renewed:?}"
+        );
+        // The next after a stall of a quarter of a second: no suspicion.
+        let next = 86 * 10 * MS;
+        assert_eq!(take(&mut pair, 86, next), [None, None, None, None]);
+        assert_eq!(renewed_at(&pair), Some(11), "renewed only on its schedule");
+        // Then silence: suspected at the freshness point, within the freshness the pair states.
+        let freshness = pair.freshness().expect("a margin is in force");
+        let point = pair.deadline(&steady(), next).expect("trusted to a point");
+        assert!(
+            point <= next + nanos(freshness),
+            "{point} past {next} + {freshness:?}"
+        );
+        assert_eq!(pair.judge(2, point - 1, &steady()).0, None);
+        assert!(matches!(
+            pair.judge(2, point, &steady()).0,
+            Some(Change::Suspected(_))
+        ));
     }
 }

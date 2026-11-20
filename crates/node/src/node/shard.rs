@@ -1145,7 +1145,7 @@ impl<E: Engine + 'static, S: LogStore> Lanes<E, S> {
 }
 
 /// A range as its shard keeps it.
-struct Kept {
+pub(super) struct Kept {
     group: u128,
     handle: Handle,
     /// The replica's latest wake, held in [`Shard::deadlines`].
@@ -4238,5 +4238,70 @@ mod tests {
                 Err(NodeError::ShardEnded(2))
             ));
         }
+    }
+
+    /// What the node holds inline for each range is what derive counts (`node::slots_bytes`),
+    /// counted by the counting allocator as the node and its shards past the first make it, at 0
+    /// to 4,096 ranges placed over one shard and over three: the node's arena (`Owner::new`, a
+    /// slot, a waker and two places a range), its table of its ranges (`node::Kept`) and the
+    /// spread; the arenas and tables (`Kept`) of the shards past the first, which their ranges
+    /// sum to as each is made at its own; and the node's entries for its far ranges (`Far`) and
+    /// the handles its arena keeps of those that left it (`Here::left`), each pushed one at a
+    /// time, an uninitialised entry of its size standing for each. The replica sits inline in its
+    /// slot, so each arena holds each of its ranges' replicas at full size, emptied or not.
+    #[test]
+    fn a_ranges_slots_hold_what_derive_counts() {
+        use std::mem::MaybeUninit;
+        type Store = Answers<GroupStore<DeviceFile>>;
+        type Machine = RangeMachine<mantle_range::Stored<DeviceFile>>;
+        type Production = Replica<mantle_range::Stored<DeviceFile>, GroupStore<DeviceFile>>;
+        let live = |counts: hyper_measure::alloc::Counts| u64::try_from(counts.live).unwrap();
+        let over = |shards: usize| std::num::NonZeroUsize::new(shards).unwrap();
+        let here = |shards: usize, n: usize| {
+            let waker = Waker::noop().clone();
+            hyper_measure::alloc::begin();
+            let owner = Here::new(Owner::<Store, Machine, Unbounded>::new(vec![waker; n]));
+            let ranges: Vec<super::super::Kept> = Vec::with_capacity(n);
+            let spread = super::super::spread::Spread::over(over(shards), n);
+            let counts = hyper_measure::alloc::end();
+            drop((owner, ranges, spread));
+            live(counts)
+        };
+        let far = |n: usize| {
+            let waker = Waker::noop().clone();
+            hyper_measure::alloc::begin();
+            let owner = Owner::<Store, Machine, Unbounded>::new(vec![waker; n]);
+            let ranges: Vec<Kept> = Vec::with_capacity(n);
+            let mut far: Vec<MaybeUninit<Far>> = Vec::new();
+            let mut left: Vec<MaybeUninit<Handle>> = Vec::new();
+            for _ in 0..n {
+                far.push(MaybeUninit::uninit());
+                left.push(MaybeUninit::uninit());
+            }
+            let counts = hyper_measure::alloc::end();
+            drop((owner, ranges, far, left));
+            live(counts)
+        };
+        for n in [0, 1, 2, 3, 4, 5, 64, 1024, 4096] {
+            let one = crate::node::slots_bytes(over(1), n).unwrap();
+            assert_eq!(here(1, n), one, "{n}");
+            let three = crate::node::slots_bytes(over(3), n).unwrap();
+            assert_eq!(here(3, n) + far(n), three, "{n}");
+        }
+        eprintln!(
+            "a range: {} on the node's shard, {} more past it; its slot {}, the replica {}, its \
+             machine {}, the engine {}, its store {}; the node's entry {}, the shard's {}, the far \
+             range's {}",
+            here(1, 1) - here(1, 0),
+            far(1),
+            size_of::<(u32, Option<Production>, bool, Vec<PeerId>)>(),
+            size_of::<Production>(),
+            size_of::<Machine>(),
+            size_of::<mantle_range::Stored<DeviceFile>>(),
+            size_of::<GroupStore<DeviceFile>>(),
+            size_of::<super::super::Kept>(),
+            size_of::<Kept>(),
+            size_of::<Far>(),
+        );
     }
 }

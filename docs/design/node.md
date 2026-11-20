@@ -509,7 +509,11 @@ measures the second, and derives the rest by these rules:
   room mantle's encoder leaves a proposal; the entries kept ahead of a hole in its log; the
   messages that wait, in the queue and one a write out; the appends its window holds to each
   other member; the reads it is asked; its store's copies of its writes out in the log's form,
-  and the page it reads the log by); and the transport beside its budget
+  and the page it reads the log by) and what the node holds inline for it (`node::slots_bytes`:
+  its replica in its slot of each arena that holds it, 20,800 bytes on macOS arm64 whether the
+  slot holds it or was emptied as it moved to a shard past the first, the arena made once at the
+  ranges the node opens; and its entries in the node's tables and its shard's, at their types'
+  sizes); and the transport beside its budget
   (`derive::transport_bytes_beside`: the endpoint as it opens with its TLS configurations, a slot
   of each exchange in use and of each receive chunk, and the compression of its certificate a
   server's first handshake makes; each connection's QUIC and TLS state and what QUIC keeps to
@@ -521,7 +525,8 @@ measures the second, and derives the rest by these rules:
   `tests/shard_memory.rs` each runtime figure counted apart and the whole runtime and its lanes at
   1 to 10 shards, up to 256 connections and 1,024 control entries,
   `tests/range_memory.rs` over stores that hold nothing of their own, `tests/range_log_memory.rs`
-  over the node's logs, `tests/transport_memory.rs` two endpoints at one, two and four peers and
+  over the node's logs, `node::shard::tests::a_ranges_slots_hold_what_derive_counts` the arenas
+  and tables at 0 to 4,096 ranges, `tests/transport_memory.rs` two endpoints at one, two and four peers and
   at the floor's budget and eight times it).
   *As built (2026-11-18).* What binds the three largest classes, read at the code that enforces
   each (CI run 44349745026: a founder of the membership suite, nine identities, refused at

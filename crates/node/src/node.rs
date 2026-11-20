@@ -129,6 +129,44 @@ pub fn shard_lanes_bytes(capacity: usize) -> Option<u64> {
     u64::try_from(capacity.checked_mul(each)?).ok()
 }
 
+/// What the node holds inline for its `ranges` ranges placed over `shards` shards (§2.9), beside
+/// their members' heaps (`derive::range_bytes`), at the types a node's process runs. For each
+/// range: its replica in its slot of the arena of the node's own task ([`Node::open_on`];
+/// hyper-durable's `Owner::new` makes a slot, a waker and a place in its free list and its queue
+/// for each range the node opens, once, and never grows them: a range past them is refused
+/// `NodeError::Full`), the node's entry for it (`Kept`) and its place in the spread, beside the
+/// spread's count of each shard's ranges. Where the ranges run on shards past the first, each
+/// again: a slot and its places in its shard's arena, made at the ranges placed there as that
+/// shard's task starts (`shard::run`), and that shard's entry for it (`shard::Kept`), while its
+/// slot in the node's arena stays, emptied, as large as when it held the replica; and the node's
+/// entry for it as a far range (`shard::Far`) and the handle the node's arena keeps of it as it
+/// leaves (`shard::Here::leave`), each pushed into a vector that doubles, from four. Pinned by
+/// `node::shard::tests::a_ranges_slots_hold_what_derive_counts`.
+pub fn slots_bytes(shards: NonZeroUsize, ranges: usize) -> Option<u64> {
+    use std::mem::size_of;
+    type Replica = shard::Replica<mantle_range::Stored<DeviceFile>, GroupStore<DeviceFile>>;
+    // hyper-durable's `Slot`, private to it, as its fields in their order lay out: the slot's
+    // generation, its replica, its queued mark and the peers attached for it.
+    let slot = size_of::<(u32, Option<Replica>, bool, Vec<PeerId>)>()
+        .checked_add(size_of::<Waker>())?
+        .checked_add(size_of::<u32>().checked_mul(2)?)?;
+    let here = slot
+        .checked_add(size_of::<Kept>())?
+        .checked_add(size_of::<usize>())?;
+    let mut bytes = ranges
+        .checked_mul(here)?
+        .checked_add(shards.get().checked_mul(size_of::<usize>())?)?;
+    if shards.get() > 1 && ranges > 0 {
+        let grown = ranges.checked_next_power_of_two()?.max(4);
+        bytes = ranges
+            .checked_mul(slot.checked_add(size_of::<shard::Kept>())?)?
+            .checked_add(grown.checked_mul(size_of::<shard::Far>())?)?
+            .checked_add(grown.checked_mul(size_of::<Handle>())?)?
+            .checked_add(bytes)?;
+    }
+    u64::try_from(bytes).ok()
+}
+
 /// What a driving shard's lanes and the vectors beside them hold (node.md §2.9 step 6f,
 /// `node::driving`): for each of the `requests` the lanes take at once, a ring place and a room
 /// place in and out; for each of the `slots` asks the node holds at once, the answers' ring and

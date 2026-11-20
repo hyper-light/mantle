@@ -1889,7 +1889,8 @@ pub enum Class {
     /// extents' allocator apart: each extent's is charged with its metadata from what remains
     /// (`mantle_engine::shard_db::measured_per_extent`).
     Engines,
-    /// Each range's member ([`range_bytes`]).
+    /// Each range's member ([`range_bytes`]) and what the node holds inline for it
+    /// (`node::slots_bytes`).
     Ranges,
     /// The node's shared log ([`log_bytes`]).
     Log,
@@ -2740,7 +2741,11 @@ fn derive_with(
             .reads
             .checked_add(limits.exchanges)
             .ok_or(overflow("a range's reads"))?;
-        let mut ranges_bytes = 0u64;
+        // Each range's member, and what the node holds inline for it: its replica in its arena's
+        // slot and its tables' entries, a second slot and entries where it runs on a shard past
+        // the first.
+        let mut ranges_bytes =
+            crate::node::slots_bytes(placed, hosted.len()).ok_or(overflow("the ranges' slots"))?;
         for hosted in &hosted {
             ranges_bytes = range_bytes(&hosted.range, reads)
                 .and_then(|bytes| ranges_bytes.checked_add(bytes))
@@ -4052,7 +4057,9 @@ fn say_floor(
                 }
                 Class::Ranges => {
                     "each range's member at hyper-raft's limits, its reads the node's own and \
-                     its exchanges' (derive::range_bytes)"
+                     its exchanges' (derive::range_bytes), and what the node holds inline for \
+                     it, its replica in its arenas' slots and its tables' entries \
+                     (node::slots_bytes)"
                 }
                 Class::Log => "the node's shared log (derive::log_bytes)",
                 Class::Transport => {
@@ -5089,7 +5096,7 @@ mod tests {
         );
         assert_eq!(
             said_bytes(&derived, "memory.need"),
-            NEED_96_GIB + crate::node::PIECE
+            need_96_gib() + crate::node::PIECE
         );
         // Its five engines each take a maintenance worker: its need with them is its need and
         // five workers' stacks, cursors, builders and packings, about 90 MB each at the range's
@@ -5117,7 +5124,7 @@ mod tests {
         assert!((80_000_000..100_000_000).contains(&each), "{each}");
         assert_eq!(
             said_bytes(&derived, "memory.need_workers"),
-            NEED_96_GIB + crate::node::PIECE + 5 * (each + STACK)
+            need_96_gib() + crate::node::PIECE + 5 * (each + STACK)
         );
     }
 
@@ -5137,11 +5144,17 @@ mod tests {
     /// Its transport: a receive takes a train from each of the node's three peers and the ten
     /// operations' clients it serves at once ([`runs`]), 1,605,344 bytes more: the buffers of the
     /// 12 trains past the first, 131,072 bytes each, and every train's messages' headers.
-    const NEED_96_GIB: u64 = if cfg!(target_os = "linux") {
-        13_714_102_845 - 32 * STACK + 1_605_344
-    } else {
-        13_714_102_845 - 32 * (STACK - WORKER)
-    };
+    /// And what the node holds inline for its five ranges on its first shard (`node::slots_bytes`),
+    /// each replica in its arena's slot with its entries: 104,808 bytes on macOS aarch64, at its
+    /// types' sizes on each other target.
+    fn need_96_gib() -> u64 {
+        let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
+        if cfg!(target_os = "linux") {
+            13_714_102_845 - 32 * STACK + 1_605_344 + slots
+        } else {
+            13_714_102_845 - 32 * (STACK - WORKER) + slots
+        }
+    }
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
     /// as they were before the caches were wants: a founder of the membership suite's cell holds
@@ -6361,8 +6374,9 @@ mod tests {
         assert_eq!(workers, if cfg!(target_os = "linux") { 0 } else { 256 });
         assert!(need <= memory, "{need}");
         if workers > 0 {
-            assert_eq!(need, 7_259_117_850);
-            assert_eq!(need + workers * (STACK - WORKER), 7_762_434_330);
+            let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
+            assert_eq!(need, 7_259_117_850 + slots);
+            assert_eq!(need + workers * (STACK - WORKER), 7_762_434_330 + slots);
         }
         let given = allowance(Some(need), &machine(memory, None));
         assert_eq!(given.ok(), Some(need));
@@ -6559,8 +6573,9 @@ mod tests {
         assert_eq!(said_bytes(&deepest, "volume.1.depth_taken"), 256);
         if cfg!(not(target_os = "linux")) {
             let at = floor_at_one(founder(2), &runner(2, 256));
-            assert_eq!(at, 7_366_591_259);
-            assert_eq!(at + 256 * (STACK - WORKER), 7_869_907_739);
+            let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
+            assert_eq!(at, 7_366_591_259 + slots);
+            assert_eq!(at + 256 * (STACK - WORKER), 7_869_907_739 + slots);
         }
         // Spread over the shards, the same founder's ranges take a lane from each peer for each
         // shard past the first, and two lanes to the node's shard from each.
@@ -7435,6 +7450,9 @@ mod tests {
     /// Raft frame's bound holds an append of the range's largest entry alone
     /// (`mantle_range::largest_message`), 25 bytes more for each of the 408 Raft frames its
     /// transport holds room for.
+    /// And what the node holds inline for its five ranges on its first shard (`node::slots_bytes`),
+    /// each replica in its arena's slot with its entries: 104,808 bytes on macOS aarch64, at its
+    /// types' sizes on each other target.
     #[test]
     fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
         let founder = repair_founder;
@@ -7472,9 +7490,15 @@ mod tests {
         // Linux's, by derive's model and not measured here: the issuer's 16 workers' stacks fewer
         // (2,097,152 bytes), the kernel holding its transfers, and about 133 KB more for each
         // train past the first a receive takes, its eight peers' and its operation's client's
-        // ([`runs`]).
+        // ([`runs`]). Each with its five ranges' slots and entries at the target's sizes (104,808
+        // bytes on macOS aarch64).
+        let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
         assert!(
-            runs(7_255_000_000..7_260_000_000, 7_257_853_211..7_257_853_212).contains(&founded),
+            runs(
+                7_255_000_000 + slots..7_260_000_000 + slots,
+                7_257_853_211 + slots..7_257_853_212 + slots
+            )
+            .contains(&founded),
             "{founded}"
         );
         // It starts on the runner, every class of its floor its founders'.
@@ -7553,6 +7577,9 @@ mod tests {
     /// measured too. A Raft frame's bound holds an append of the range's largest entry alone
     /// (`mantle_range::largest_message`): 25 bytes more for each of the 408 Raft frames its
     /// transport holds room for, 10,200 in all.
+    /// And what the node holds inline for its five ranges on its first shard (`node::slots_bytes`),
+    /// each replica in its arena's slot with its entries: 104,808 bytes on macOS aarch64, at its
+    /// types' sizes on each other target.
     #[test]
     fn a_repair_founder_measured_deep_on_cis_macos_runner_takes_the_deepest_its_allowance_holds() {
         let measured = repair_runner(240, 436);
@@ -7579,18 +7606,19 @@ mod tests {
         }
         assert_eq!(taken, 240);
         assert_eq!(at_taken, at_measured);
+        let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
         if cfg!(target_os = "linux") {
             // Derive's Linux model, not measured here: the issuer's 240 workers' stacks fewer
             // than macOS's, and about 133 KB more a train ([`runs`]).
             assert!(
-                (7_327_000_000..7_332_000_000).contains(&at_measured),
+                (7_327_000_000 + slots..7_332_000_000 + slots).contains(&at_measured),
                 "{at_measured}"
             );
         } else {
-            assert_eq!(at_measured, 7_359_402_011);
-            assert_eq!((7u64 << 30) - at_measured, 156_790_757);
-            // Its workers at Rust's 2 MiB: CI's refusal and the frames' 10,200 bytes, exactly.
-            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_261_211);
+            assert_eq!(at_measured, 7_359_402_011 + slots);
+            assert_eq!((7u64 << 30) - at_measured, 156_790_757 - slots);
+            // Its workers at Rust's 2 MiB: CI's refusal, the frames' 10,200 bytes and the slots.
+            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_261_211 + slots);
         }
         // Every term that holds the depth holds the one taken: the issuer's workers among the
         // threads, each volume's reads and transfers, and the transport's room for them.

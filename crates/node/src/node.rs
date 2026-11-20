@@ -77,6 +77,7 @@ mod answers;
 mod drivers;
 mod driving;
 mod enrollments;
+mod hold;
 mod host;
 mod keyed;
 mod members;
@@ -1491,6 +1492,10 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// When, on the shard's clock, the askers of the peers' chunks a volume holds were last told
     /// their work is held (`Node::vouch_held`), all at once half a beat apart; none while none is.
     held_vouched_ns: Option<u64>,
+    /// The peers' chunk puts that came while the node had no room for their bytes, held unread on
+    /// their exchanges and read first come first served as room frees (`node::hold`), each with
+    /// its peer and what it is read as.
+    held_puts: hold::Holds<ExchangeId, (PeerId, Arriving)>,
     /// What the node measured of its puts' and its gets' blocks and bodies, the windows each
     /// holds (`crate::window`).
     windows: crate::window::Windows,
@@ -2002,6 +2007,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             parked_most: exchanges,
             parked_vouched_ns: None,
             held_vouched_ns: None,
+            held_puts: hold::Holds::default(),
             windows: crate::window::Windows::default(),
             feeding: host::Feedings::default(),
             piece: Vec::new(),
@@ -3004,6 +3010,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
         self.events = events;
         self.take_stored().await?;
+        self.admit_held(now)?;
         self.take_shards(now)?;
         self.vouch_held(now);
         self.dial(now);
@@ -3200,6 +3207,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.parked_due(now),
             self.repair_due(),
             held,
+            self.held_puts.until_ns(),
         ]
         .into_iter()
         .flatten()
@@ -3645,17 +3653,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     Kind::Command => self.take_request(exchange, Arriving::Command),
                     Kind::Read => self.take_request(exchange, Arriving::Read),
                     Kind::ChunkGet => self.take_chunk_get(exchange),
-                    Kind::ChunkPut => match self.take_chunk_put(exchange, body.unwrap_or(0)) {
-                        Some(what) => what,
-                        // No room for its bytes now: refused before any is read, which its asker
-                        // hears as this node's refusal, not its connection failing.
-                        None => {
-                            self.driver
-                                .endpoint()
-                                .refuse_exchange(exchange, Refusal::Budget);
-                            return Ok(());
+                    Kind::ChunkPut => {
+                        match self.take_chunk_put(exchange, peer, body.unwrap_or(0)) {
+                            Some(what) => what,
+                            // No room for its bytes now: held unread until room frees, or refused.
+                            None => return Ok(()),
                         }
-                    },
+                    }
                     // A Raft message travels on a lane, never on an exchange; an object's is the
                     // host's and an enrollment's the member's, taken above.
                     Kind::Raft | Kind::Object | Kind::Enroll => {
@@ -3719,6 +3723,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 self.give_back(exchange);
                 self.receiving.remove(exchange);
+                // A put held for room whose exchange ended took none: let go of.
+                if !self.held_puts.is_empty() {
+                    self.held_puts.remove(exchange);
+                }
                 self.writing.remove(exchange);
                 if let Some(ask) = self.commanded.on(exchange) {
                     self.commanded.remove(ask);
@@ -4706,8 +4714,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// status it is answered with once its body is read and dropped (no such volume here, a head
     /// that does not decode, a body past the largest chunk the cell's gateways write, which no
     /// room is taken for and no buffer sized to). `None` when the node has no room for its bytes
-    /// now: refused unread.
-    fn take_chunk_put(&mut self, exchange: ExchangeId, body: u64) -> Option<Arriving> {
+    /// now, or holds others that came first: held unread behind them until room frees
+    /// (`node::hold`), or, past the held puts' bound, refused unread, which its asker hears as this
+    /// node's refusal, not its connection failing.
+    fn take_chunk_put(
+        &mut self,
+        exchange: ExchangeId,
+        peer: PeerId,
+        body: u64,
+    ) -> Option<Arriving> {
         let head = self.driver.endpoint().head(exchange).unwrap_or_default();
         let Ok(put) = chunk::Put::decode(head) else {
             return Some(Arriving::ChunkStatus(chunk::Status::Malformed));
@@ -4718,15 +4733,63 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if body > self.chunk_bytes {
             return Some(Arriving::ChunkStatus(chunk::Status::TooLarge));
         }
-        if !self.storage.take_room(body) {
-            return None;
-        }
-        Some(Arriving::ChunkPut {
+        let until_ns = waits_until(hyper_rt::futures::now_ns(), put.remaining_ns);
+        let what = Arriving::ChunkPut {
             slot,
             key: put.key,
             crc32c: put.crc32c,
-            until_ns: waits_until(hyper_rt::futures::now_ns(), put.remaining_ns),
-        })
+            until_ns,
+        };
+        // First come first served: one that came while others are held waits behind them.
+        if self.held_puts.is_empty() && self.storage.take_room(body) {
+            return Some(what);
+        }
+        let held = hold::Held {
+            exchange,
+            body,
+            until_ns,
+            what: (peer, what),
+        };
+        let bounds = (self.storage.transfers(), self.storage.room());
+        if self.held_puts.hold(held, bounds).is_err() {
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::Budget);
+        }
+        None
+    }
+
+    /// Offers the room given back since the held puts were last offered it (`node::hold`) to the
+    /// oldest first, each read as it takes its room, in this turn: the room a volume's answered
+    /// write gave back is taken at the turn that answer came, not at its asker's next beat. Each
+    /// held put whose request stopped waiting is refused `Budget` first, as one with no room was
+    /// refused at once before. Nothing held, or no room given back and no patience passed, nothing
+    /// is visited.
+    fn admit_held(&mut self, now: u64) -> Result<(), NodeError> {
+        let freed = self.storage.freed();
+        if !self.held_puts.due(freed, now) {
+            return Ok(());
+        }
+        let endpoint = self.driver.endpoint();
+        self.held_puts.expire(now, |put| {
+            endpoint.refuse_exchange(put.exchange, Refusal::Budget);
+        });
+        while let Some(put) = self
+            .held_puts
+            .admit(freed, |body| self.storage.take_room(body))
+        {
+            let (peer, what) = put.what;
+            self.receiving.push(Receiving {
+                exchange: put.exchange,
+                peer,
+                body: put.body,
+                read: 0,
+                bytes: Vec::with_capacity(usize::try_from(put.body).unwrap_or(0)),
+                what,
+            });
+            self.read_exchange(put.exchange)?;
+        }
+        Ok(())
     }
 
     /// A chunk get's head: the volume it is asked of, or why it is answered at once.
@@ -4869,10 +4932,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         Ok(())
     }
 
-    /// Tells the askers of the peers' chunks a volume holds, put and not yet durable, that their
-    /// work is held while their requests wait (research/77 D2): a device slow to make a chunk
-    /// durable is waited on as long as its asker's client would wait, and one that never answers
-    /// is given up once that time has passed. All are told at once half a beat apart
+    /// Tells the askers of the peers' chunks a volume holds, put and not yet durable, and of the
+    /// puts held for room (`node::hold`), that their work is held while their requests wait
+    /// (research/77 D2): a device slow to make a chunk durable is waited on as long as its asker's
+    /// client would wait, and one that never answers is given up once that time has passed. All are told at once half a beat apart
     /// (`host::vouch_held`), not each at every turn: a vouch reaches its asker in the next note on
     /// its connection, as a held job's does (`Job::vouch`). A chunk is put as its body is read
     /// whole, at the turn's events, before this: the first held after none is told at its first
@@ -4884,13 +4947,14 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             storage,
             driver,
             held_vouched_ns,
+            held_puts,
             ..
         } = self;
         let endpoint = driver.endpoint();
         host::vouch_held(
             held_vouched_ns,
             (now, beat),
-            storage.held(now),
+            storage.held(now).chain(held_puts.waiting(now)),
             |exchange| {
                 endpoint.working(exchange);
             },

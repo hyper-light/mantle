@@ -87,6 +87,7 @@ use hyper_rt::combine::{Either, race2};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{LocalRuntime, Runtime, RuntimeConfig, interests_for};
 use hyper_rt::sync::{ChannelReceiver, Sender, channel};
+use hyper_transport::Refusal;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer};
 use mantle_cert::{KeyPair, Serial, Validity};
 use mantle_chunk::{ChunkKey, Config as VolumeConfig, Limits as VolumeLimits, Reads};
@@ -659,12 +660,15 @@ enum Order {
 /// the node `at` holds, itself or a peer.
 #[derive(Debug)]
 enum Chunked {
+    /// `patience_ns` is how long the put's request says it waits (`chunk::Put::remaining_ns`):
+    /// zero says nothing, which a node holds to the stock patience.
     Put {
         at: u64,
         volume: u128,
         key: ChunkKey,
         bytes: Vec<u8>,
         crc32c: u32,
+        patience_ns: u64,
     },
     Get {
         at: u64,
@@ -778,14 +782,15 @@ async fn run<E: Engine + Send + 'static>(
                         key,
                         bytes,
                         crc32c,
-                        // The test's own asks serve no request: none waits on them.
-                    } => node.put_chunk(at, volume, key, bytes.into(), (crc32c, 0)),
+                        patience_ns,
+                    } => node.put_chunk(at, volume, key, bytes.into(), (crc32c, patience_ns)),
                     Chunked::Get {
                         at,
                         volume,
                         key,
                         offset,
                         len,
+                        // The test's own gets serve no request: none waits on them.
                     } => node.get_chunk(at, volume, key, (offset, len), 0),
                 };
                 match asked {
@@ -1394,6 +1399,7 @@ impl Cell {
                 key,
                 bytes: bytes.to_vec(),
                 crc32c: mantle_crc::crc32c(bytes),
+                patience_ns: 0,
             },
         );
         self.chunk(tag)
@@ -2613,6 +2619,102 @@ fn chunks_put_on_each_nodes_volume_read_back_whole_and_in_part_from_any_node() {
     cell.close();
 }
 
+/// Puts of 48 KiB on node 2's volume, whose writer queue holds two and not a third
+/// (`Storage::room`, twice its batch's bytes), each put's head coming before the bodies ahead of it
+/// are read, written and flushed, which is when they give their room back. A put that finds no room
+/// is held on its exchange, its body unread, first come first served, and read in the turn a write
+/// ahead of it gives room back (`node::hold`); refused as it came, as every one was before, it was
+/// lost `Budget` to its asker, which asked again only at its next beat.
+///
+/// - Nodes 1 and 3 each put four at once, as many as each keeps out (`CHUNK_ASKS`), each stating a
+///   beat's patience: a held put is stored within it, so it waited for the room the writes ahead
+///   of it gave back, not for a beat. The held puts' bodies take at most the room, two of these, so
+///   past the two the room takes and the two held a put is refused `Budget` as it comes: of eight
+///   at once at least four are stored and the others refused, none lost otherwise. A refused put
+///   was never read: its chunk is not on the volume.
+/// - Node 1 puts four at once stating a nanosecond's patience, no more than the room and the held
+///   puts' bound hold together, so none is refused past the bound: the two the room takes are
+///   stored, and one held is refused `Budget` once its patience has passed, unless room was given
+///   back in the turn it came; none waits on room past its patience, and a refused one is not on
+///   the volume.
+#[test]
+fn chunks_past_their_peers_room_are_held_until_room_frees_or_their_patience_passes() {
+    let mut volume = test_volume();
+    volume.config.limits.batch_bytes = 64 << 10;
+    let mut cell = Cell::start_stored(Engines::Model, volume);
+    let at = cell.volume_of(2);
+    cell.connected(1, 2);
+    cell.connected(3, 2);
+    let beat = u64::try_from(mantle_protocol::bounds::initial_pto().as_nanos()).unwrap();
+    let put = |n: u64| chunk_data(n, 48 << 10);
+    // Asks each `(n, from)`'s put at once, then waits for each one's outcome.
+    let burst = |cell: &mut Cell, puts: &[(u64, u64)], patience_ns: u64| {
+        let began = Instant::now();
+        let tags: Vec<u64> = puts
+            .iter()
+            .map(|&(n, from)| {
+                let bytes = put(n);
+                cell.ask_chunk(
+                    from,
+                    Chunked::Put {
+                        at: 2,
+                        volume: at,
+                        key: chunk_key(n),
+                        crc32c: mantle_crc::crc32c(&bytes),
+                        bytes,
+                        patience_ns,
+                    },
+                )
+            })
+            .collect();
+        let outcomes: Vec<ChunkOutcome> = tags.iter().map(|tag| cell.chunk(*tag)).collect();
+        (outcomes, began.elapsed())
+    };
+    // Each put is stored and reads back whole, or refused `Budget` unread and not on the volume.
+    let check = |cell: &mut Cell, puts: &[(u64, u64)], outcomes: &[ChunkOutcome]| {
+        let mut stored = 0;
+        for (&(n, _), outcome) in puts.iter().zip(outcomes) {
+            let bytes = put(n);
+            let len = u64::try_from(bytes.len()).unwrap();
+            let read = cell.read_back(1, 2, at, chunk_key(n), 0, len);
+            match outcome {
+                ChunkOutcome::Stored => {
+                    assert_eq!(read, ChunkOutcome::Read(bytes), "chunk {n}");
+                    stored += 1;
+                }
+                ChunkOutcome::Lost(Refusal::Budget) => {
+                    assert_eq!(
+                        read,
+                        ChunkOutcome::Refused(ChunkStatus::NotFound),
+                        "chunk {n}"
+                    );
+                }
+                other => panic!("chunk {n}: {other:?}"),
+            }
+        }
+        stored
+    };
+    let both: Vec<(u64, u64)> = (1..=8).map(|n| (n, if n <= 4 { 1 } else { 3 })).collect();
+    let (outcomes, took) = burst(&mut cell, &both, beat);
+    let stored = check(&mut cell, &both, &outcomes);
+    println!(
+        "eight puts past node 2's room, a beat's patience each: {stored} stored, {} refused \
+         past the held puts' bound, answered in {took:?}",
+        8 - stored
+    );
+    assert!(stored >= 4, "{outcomes:?}");
+    let short: Vec<(u64, u64)> = (9..=12).map(|n| (n, 1)).collect();
+    let (outcomes, took) = burst(&mut cell, &short, 1);
+    let stored = check(&mut cell, &short, &outcomes);
+    println!(
+        "four puts, a nanosecond's patience each: {stored} stored, {} refused at their patience, \
+         answered in {took:?}",
+        4 - stored
+    );
+    assert!(stored >= 2, "{outcomes:?}");
+    cell.close();
+}
+
 #[test]
 fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
     // Node 2 is told a chunk bound below what its volume holds, past this test's chunks: a chunk
@@ -2640,6 +2742,7 @@ fn a_chunk_refused_is_answered_why_by_the_node_that_refused_it() {
                 key: chunk_key(at),
                 bytes: bytes.clone(),
                 crc32c: crc ^ 1,
+                patience_ns: 0,
             },
         );
         assert_eq!(

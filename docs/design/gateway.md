@@ -122,7 +122,11 @@ point:
 placement offers that holds none of the block's chunks. When none is left, the PUT fails with
 `503 SlowDown`, a cause that may pass, unless every volume that refused the block's chunks refused
 them as full: then the cell has no room for the object, which outlasts any client's retries, and
-the PUT fails `507 Insufficient Storage` (node.md §4.4, research/75). Either way what it wrote is
+the PUT fails `507 Insufficient Storage` (node.md §4.4, research/75). The placement offers the
+volumes of nodes the cell holds away after every other, so a block too wide for the volumes seen
+asks them rather than failing before any chunk goes (repair.md §5, as built 2026-11-20); a volume
+with no room now, `Busy` or the transport's backpressure, is asked again within the client's
+patience and is never sent on (research/77 D2). Either way what it wrote is
 left to the sweeps: blocks and files never handed over are found and released (metadata.md §2),
 and chunks no block names are reconciled per volume (STATUS).
 

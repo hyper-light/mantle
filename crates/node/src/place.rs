@@ -16,11 +16,14 @@
 //! so a sleeping or absent machine is passed over rather than tried and timed out; and each weighted
 //! by its bytes times its node's measured availability, the share of its enlisted life the cell has
 //! seen it, so a block's chunks go in proportion to the room a volume can be expected to serve
-//! them from, as CRUSH weights a device by its capacity (Weil et al., SC 2006, §3.4).
+//! them from, as CRUSH weights a device by its capacity (Weil et al., SC 2006, §3.4). A new block's
+//! chunks ([`offer_new`]) are offered those, then the active volumes of nodes held away, asked only
+//! where the first are too few for the block or refuse it (repair.md §5, as built 2026-11-20).
 
 use std::collections::BTreeSet;
 
 use mantle_disk::measure::SplitMix64;
+use mantle_meta::record::VolumeStanding;
 use mantle_meta::root::{self, Fact, Placed};
 
 /// The volumes of `table` in the order placement offers them for `block`; a volume of no bytes,
@@ -117,6 +120,35 @@ pub fn offer(block: u128, facts: &[Fact], avoid: &[u128], spread: bool, now_ns: 
         first.extend(shared);
     }
     first
+}
+
+/// The volumes a new block's chunks are offered at `now_ns`: those that take chunks, in [`offer`]'s
+/// order, then the active volumes of nodes the cell holds away, ranked by the same keys, so a node
+/// away is asked only where the volumes that take chunks are too few for the block, or refuse it.
+/// The record of a node away is the root leader's judgment (repair.md §2.1): its NFD-E detector's
+/// suspicion, which a stall longer than the heartbeats' period makes of a peer only slow, a detector
+/// configured from measurement bounding its mistakes and never ruling them out (research/81 [11]
+/// §5.1, §8.1.2), or a connection ended under such a stall and not yet made again. A put's layout
+/// is chosen as it starts, over the domains seen then (`host::Ask`), and its blocks placed as they
+/// fill: placed only around a node held away since, a cell of three volumes for three copies
+/// offered a block two and refused it `Unplaced`, `503 SlowDown`, before any chunk went (CI gates
+/// run 44667404838). A node truly gone refuses its chunk at once, no connection to it
+/// (`Refusal::NotConnected`), and the block fails `Unplaced` as before.
+pub fn offer_new(block: u128, facts: &[Fact], now_ns: u64) -> Vec<u128> {
+    let mut offered = offer(block, facts, &[], false, now_ns);
+    let mut away: Vec<(f64, u128)> = facts
+        .iter()
+        .filter(|f| f.standing == VolumeStanding::Active && !f.presence.present)
+        .map(|f| {
+            (
+                key(block, f.placed.volume, weight(f, now_ns)),
+                f.placed.volume,
+            )
+        })
+        .collect();
+    away.sort_by(|(a, x), (b, y)| b.total_cmp(a).then(x.cmp(y)));
+    offered.extend(away.into_iter().map(|(_, volume)| volume));
+    offered
 }
 
 /// A uniform 64-bit draw for the pair: SplitMix64's output function (Steele, Lea and Flood,
@@ -252,6 +284,42 @@ mod tests {
             assert_eq!(offer(block, &facts, &[11], true, 0), vec![51]);
             // A gone volume avoided holds its domain no more.
             assert_eq!(offer(block, &facts, &[41], true, 0).len(), 3);
+        }
+    }
+
+    /// A new block is offered every volume that takes chunks first, in the cell's order, then the
+    /// active volumes of nodes held away, so a cell of three volumes for three copies with one node
+    /// held away still offers three, the away one last; a volume leaving or gone never; and with a
+    /// volume to spare, the away node's comes after it.
+    #[test]
+    fn a_new_block_is_offered_the_volumes_of_nodes_held_away_after_every_other() {
+        use VolumeStanding::{Active, Gone, Leaving};
+        let three = vec![
+            fact(11, "a", true, Active),
+            fact(21, "b", true, Active),
+            fact(31, "c", false, Active),
+        ];
+        let more = vec![
+            fact(11, "a", true, Active),
+            fact(21, "b", false, Active),
+            fact(31, "c", true, Leaving),
+            fact(41, "d", false, Gone),
+            fact(51, "e", true, Active),
+            fact(61, "f", true, Active),
+        ];
+        for block in 0..500u128 {
+            let seen = offer(block, &three, &[], false, 0);
+            assert_eq!(seen.len(), 2, "the volumes that take chunks");
+            let new = offer_new(block, &three, 0);
+            assert_eq!(new[..2], seen[..], "the seen first, in the cell's order");
+            assert_eq!(new[2..], [31], "the away node's last");
+            let new = offer_new(block, &more, 0);
+            assert_eq!(new[..3], offer(block, &more, &[], false, 0)[..]);
+            assert_eq!(
+                new[3..],
+                [21],
+                "after every volume to spare; none leaving or gone"
+            );
         }
     }
 

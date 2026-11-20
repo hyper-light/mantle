@@ -322,7 +322,15 @@ fn built_and_compacted_branches_write_the_bytes_they_always_have() {
 /// the three whole extents of 32 pages the branches' last extents' unwritten pages had taken.
 /// Before: image 15_994_880 bytes, digest 7_006_228_100_878_491_197, descriptors'
 /// 5_389_280_994_201_789_847.
+///
+/// Since branches share extents by their expected life (`store::Life`): the compaction that drops
+/// tombstones, a leaf's settle and the store's first long-lived branch, begins a fresh extent,
+/// and the compaction after it begins where the short-lived one before the settle ended, not where
+/// the settle did. The nine branches are the
+/// same and each reads back every entry it was built or merged from ([`reads_back`]); the image is
+/// as long, its pages placed elsewhere. Before: digest 11_582_867_096_988_739_259, descriptors'
+/// 6_985_377_092_926_284_530.
 const BRANCHES: usize = 9;
 const IMAGE_BYTES: usize = 15_601_664;
-const IMAGE_DIGEST: u64 = 11_582_867_096_988_739_259;
-const DESCRIPTOR_DIGEST: u64 = 6_985_377_092_926_284_530;
+const IMAGE_DIGEST: u64 = 16_528_363_289_065_166_890;
+const DESCRIPTOR_DIGEST: u64 = 5_213_232_716_757_650_117;

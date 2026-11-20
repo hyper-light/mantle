@@ -313,10 +313,11 @@ pub struct Store<F: BlockFile> {
     /// Freed extents whose pages the cache still holds, forgotten a share at a time
     /// ([`Store::forget_some`]): at most the extents freed.
     forgetting: VecDeque<u64>,
-    /// The extent the last branch built here ended in and its first page left unwritten: the next
-    /// branch built here begins there ([`Store::take_tail`]). None once taken, once that extent is
-    /// no longer held, and at a worker's next job.
-    tail: Option<(u64, u32)>,
+    /// For each expected life, the extent the last branch of that life built here ended in and
+    /// its first page left unwritten: the next branch of that life built here begins there
+    /// ([`Store::take_tail`]). Each is None once taken, once its extent is no longer held, and at
+    /// a worker's next job.
+    tails: Tails,
     /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
     refill: Option<Refill>,
     /// A file grown by segments ([`BlockFile::grow`]): what the allocator may hand out. None for
@@ -338,6 +339,47 @@ pub struct Segments {
     pub admitted: u64,
     /// A segment booked past them and not yet written whole.
     pub pending: Option<Pending>,
+}
+
+/// How long a branch is expected to live, which picks the extent it begins in
+/// ([`Store::take_tail`]). Branches that share an extent keep it held until the last of them
+/// goes, so a branch that dies soon beside one that lives long leaves its pages dead there.
+/// Sprite LFS's cleaner groups blocks of similar age into one segment for the same reason
+/// (Rosenblum and Ousterhout 1992, §3.4, "age sort"; research/34 §6). A leaf's branches, a
+/// settle's parts, live until that leaf settles again; a packing's and an inner node's
+/// compaction's are merged again once flushed (docs/design/engine-structure.md §3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Life {
+    /// A memtable's packing or an inner node's compaction: merged again once flushed below.
+    #[default]
+    Short,
+    /// A leaf's settle: held until that leaf settles again.
+    Long,
+}
+
+/// A store's tail for each expected life ([`Life`]): where the next branch of that life begins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tails {
+    short: Option<(u64, u32)>,
+    long: Option<(u64, u32)>,
+}
+
+impl Tails {
+    fn of(&mut self, life: Life) -> &mut Option<(u64, u32)> {
+        match life {
+            Life::Short => &mut self.short,
+            Life::Long => &mut self.long,
+        }
+    }
+
+    /// The extent freed: its pages left unwritten are no branch's to begin in.
+    fn forget(&mut self, extent: u64) {
+        for tail in [&mut self.short, &mut self.long] {
+            if tail.is_some_and(|(e, _)| e == extent) {
+                *tail = None;
+            }
+        }
+    }
 }
 
 /// The most of each pooled kind a store ever had out at once ([`Store::pool_peaks`]).
@@ -849,7 +891,7 @@ impl<F: BlockFile> Store<F> {
             lists_lent: 0,
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
-            tail: None,
+            tails: Tails::default(),
             timed: false,
             refill: None,
             segments: None,
@@ -937,7 +979,7 @@ impl<F: BlockFile> Store<F> {
             lists_lent: 0,
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
-            tail: None,
+            tails: Tails::default(),
             timed: false,
             refill: None,
             segments: None,
@@ -970,7 +1012,7 @@ impl<F: BlockFile> Store<F> {
         self.alloc.regrant(grant);
         // A job's branches share extents with each other only: the shard counts what they share
         // as it takes them (`trunk::hold_shared`).
-        self.tail = None;
+        self.tails = Tails::default();
         self.job_ordinal = job_ordinal;
         self.end = end;
         self.durable.generation = generation;
@@ -1066,7 +1108,7 @@ impl<F: BlockFile> Store<F> {
                 lists_lent: 0,
                 lists_most_lent: 0,
                 forgetting: VecDeque::new(),
-                tail: None,
+                tails: Tails::default(),
                 timed: false,
                 refill: None,
                 segments,
@@ -1803,17 +1845,18 @@ impl<F: BlockFile> Store<F> {
         self.alloc.retain(extent)
     }
 
-    /// Where the next branch built here begins: the pages the last branch built here left
-    /// unwritten in the extent it ended in, that extent held once more for it. Small branches so
-    /// share extents, and a store's extents bound the pages it holds rather than its branches
-    /// (docs/design/engine-structure.md §3). None where the last branch filled its extent, or the
-    /// extent is no longer held. A worker's allocator keeps no counts: the shard counts the
-    /// reference as it takes the job's branches (`trunk::hold_shared`).
-    pub(crate) fn take_tail(&mut self) -> Result<Option<(u64, u32)>, Error> {
-        let Some((extent, page)) = self.tail else {
+    /// Where the next branch of `life` built here begins: the pages the last branch of that life
+    /// built here left unwritten in the extent it ended in, that extent held once more for it.
+    /// Small branches so share extents, and a store's extents bound the pages it holds rather than
+    /// its branches; branches of one life share them, so a branch's pages die beside pages of
+    /// branches that die about when it does (docs/design/engine-structure.md §3). None where the
+    /// last branch of that life filled its extent, or the extent is no longer held. A worker's
+    /// allocator keeps no counts: the shard counts the reference as it takes the job's branches
+    /// (`trunk::hold_shared`).
+    pub(crate) fn take_tail(&mut self, life: Life) -> Result<Option<(u64, u32)>, Error> {
+        let Some((extent, page)) = self.tails.of(life).take() else {
             return Ok(None);
         };
-        self.tail = None;
         if !self.alloc.is_held(extent) {
             return Ok(None);
         }
@@ -1821,10 +1864,10 @@ impl<F: BlockFile> Store<F> {
         Ok(Some((extent, page)))
     }
 
-    /// A branch built here ended before `page` of `extent`: the pages from there on are the
-    /// next branch's ([`Self::take_tail`]), none where the extent is full.
-    pub(crate) fn set_tail(&mut self, extent: u64, page: u32) {
-        self.tail = if page < self.config.extent_pages {
+    /// A branch of `life` built here ended before `page` of `extent`: the pages from there on are
+    /// the next branch's of that life ([`Self::take_tail`]), none where the extent is full.
+    pub(crate) fn set_tail(&mut self, life: Life, extent: u64, page: u32) {
+        *self.tails.of(life) = if page < self.config.extent_pages {
             Some((extent, page))
         } else {
             None
@@ -1837,8 +1880,8 @@ impl<F: BlockFile> Store<F> {
         self.checkpoint_idle()?;
         self.alloc.release(extent)?;
         // Freed, its pages left unwritten are no branch's to begin in: it may be handed out whole.
-        if !self.alloc.is_held(extent) && self.tail.is_some_and(|(e, _)| e == extent) {
-            self.tail = None;
+        if !self.alloc.is_held(extent) {
+            self.tails.forget(extent);
         }
         // Free from here, or at the next checkpoint, and then written again: a page loaded or
         // loading from it would be read for a page no longer there.

@@ -32,7 +32,7 @@ pub(crate) mod point;
 use crate::error::{Error, Malformed};
 use crate::fst::surf::{Surf, SurfBuilder};
 use crate::fst::trie::{Trie, TrieBuilder, Width};
-use crate::store::{MIN_PAGE, Run, Span, Store};
+use crate::store::{Life, MIN_PAGE, Run, Span, Store};
 use hyper_block::block::BlockFile;
 use std::cmp::Ordering;
 
@@ -705,6 +705,9 @@ pub struct Builder {
     extents: Vec<u64>,
     /// The page of its first extent that is its first page ([`Branch::first`]).
     first: u32,
+    /// How long the branch is expected to live: its first page is where the last branch of that
+    /// life built in the store ended ([`Self::set_life`]).
+    life: Life,
     /// Each level's written page's first key, for its entry in the level above: a buffer a
     /// level, since writing a page may write the level above's in turn.
     firsts: Vec<Vec<u8>>,
@@ -823,6 +826,19 @@ impl Builder {
         self.shared = shared;
         self.keys.share(shared)
     }
+
+    /// States how long the branch is expected to live, before its first page is written: it
+    /// begins where the last branch of that life built in the store ended, so pages that die
+    /// together share extents ([`Store::take_tail`]).
+    pub fn set_life(&mut self, life: Life) -> Result<(), Error> {
+        if self.issued > 0 {
+            return Err(Error::InvalidArgument {
+                what: "a branch's life stated after its first page",
+            });
+        }
+        self.life = life;
+        Ok(())
+    }
 }
 
 impl Builder {
@@ -861,6 +877,7 @@ impl Builder {
             extent: None,
             extents: lists.extents,
             first: 0,
+            life: Life::Short,
             firsts: lists.firsts,
             spare_pages,
             counts: lists.counts,
@@ -896,10 +913,10 @@ impl Builder {
         let tail = match self.extent {
             Some((e, n)) if store.address(e, n).is_ok() => Some((e, n)),
             Some(_) => None,
-            // The branch's first page: where the branch built before it here left its last
-            // extent's pages unwritten, the first of them ([`Store::take_tail`]).
+            // The branch's first page: where the last branch of its life built here left its
+            // last extent's pages unwritten, the first of them ([`Store::take_tail`]).
             None => {
-                let tail = store.take_tail()?;
+                let tail = store.take_tail(self.life)?;
                 if let Some((e, n)) = tail {
                     self.extents.push(e);
                     self.first = n;
@@ -1429,9 +1446,9 @@ impl Builder {
                 what: "a branch taken before its filter was written",
             })?;
         store.give_run(self.run);
-        // The pages left in its last extent are the next branch's built here.
+        // The pages left in its last extent are the next branch's of its life built here.
         if let Some((extent, next)) = self.extent {
-            store.set_tail(extent, next);
+            store.set_tail(self.life, extent, next);
         }
         let filter_bytes =
             u64::try_from(self.filter.bytes()).map_err(|_| corrupt(Malformed::TooLarge))?;

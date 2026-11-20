@@ -16,7 +16,7 @@
 use super::*;
 use crate::branch::filter::Keys;
 use crate::branch::{Builder, Op};
-use crate::store::Config;
+use crate::store::{Config, Life};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use std::collections::BTreeMap;
@@ -56,6 +56,17 @@ fn row(part: usize, k: u64) -> (Vec<u8>, Vec<u8>) {
 /// it, as a packing's worker builds its parts.
 fn part(store: &mut Store<DeviceFile>, part: usize, rows: u64) -> Branch {
     let mut b = Builder::new(store, Keys::Exactly(rows)).unwrap();
+    for k in 0..rows {
+        let (key, value) = row(part, k);
+        b.add(store, &key, Op::Put, &value).unwrap();
+    }
+    b.finish(store).unwrap()
+}
+
+/// Part `part` as a branch of `life`.
+fn part_of(store: &mut Store<DeviceFile>, part: usize, rows: u64, life: Life) -> Branch {
+    let mut b = Builder::new(store, Keys::Exactly(rows)).unwrap();
+    b.set_life(life).unwrap();
     for k in 0..rows {
         let (key, value) = row(part, k);
         b.add(store, &key, Op::Put, &value).unwrap();
@@ -158,6 +169,63 @@ fn the_parts_of_a_packing_take_the_extents_their_pages_fill_not_one_each() {
         .map(|(i, (b, n))| (i, b, n))
         .collect();
     reads_back(&mut store, &each);
+}
+
+/// Branches built in turn with short and long lives, a packing's and a leaf's settle's as the
+/// trunk interleaves them, share extents with branches of their own life alone: each life's take
+/// the extents their own pages fill, and once every short-lived one goes, the extents they took
+/// are free, none held for a dead page beside a long-lived branch, which read back whole.
+#[test]
+fn branches_share_extents_only_with_branches_of_their_own_life() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(file(&dir.path().join("store"), true), CONFIG).unwrap();
+    let map = store.map_extents().to_vec();
+    let life = |i: usize| {
+        if i.is_multiple_of(2) {
+            Life::Short
+        } else {
+            Life::Long
+        }
+    };
+    let built: Vec<_> = PARTS
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| part_of(&mut store, i, n, life(i)))
+        .collect();
+    let of = |l: Life| (0..PARTS.len()).filter(move |&i| life(i) == l);
+    let (short, long) = (
+        named(of(Life::Short).map(|i| &built[i])),
+        named(of(Life::Long).map(|i| &built[i])),
+    );
+    assert!(
+        short.keys().all(|e| !long.contains_key(e)),
+        "an extent holds pages of both lives: {short:?} {long:?}"
+    );
+    let per = u64::from(CONFIG.extent_pages);
+    for (l, extents) in [(Life::Short, &short), (Life::Long, &long)] {
+        let total: u64 = of(l).map(|i| pages(&built[i])).sum();
+        assert_eq!(extents.len() as u64, total.div_ceil(per), "{l:?}");
+        assert!(extents.values().any(|&n| n > 1), "{l:?} shared no extent");
+    }
+    for i in of(Life::Short) {
+        for &e in &built[i].extents {
+            store.release(e).unwrap();
+        }
+    }
+    assert_eq!(
+        held(&store, &map),
+        long,
+        "a short-lived branch's extent is still held"
+    );
+    let each: Vec<_> = of(Life::Long).map(|i| (i, &built[i], PARTS[i])).collect();
+    reads_back(&mut store, &each);
+    // A life stated once a page is written would split the branch's pages between two tails.
+    let mut b = Builder::new(&mut store, Keys::Exactly(PARTS[8])).unwrap();
+    for k in 0..PARTS[8] {
+        let (key, value) = row(8, k);
+        b.add(&mut store, &key, Op::Put, &value).unwrap();
+    }
+    assert!(b.set_life(Life::Long).is_err());
 }
 
 #[test]

@@ -300,4 +300,7 @@ SplinterDB batch does, and begins the next branch built in the same store where 
 ended, as Sprite LFS writes many files' blocks into one segment; an extent is held by each branch
 with a page in it, and is free again when the last of them goes, as a segment whose live count
 falls to zero is reused without cleaning. Mantle copies no live page out of an extent (it has no
-cleaner): an extent with one live branch page in it stays held until that branch goes.
+cleaner): an extent with one live branch page in it stays held until that branch goes. So, as age
+sort groups blocks of similar age, a store begins each branch where the last branch of its
+expected life ended (a leaf's settle's apart from packings' and inner compactions'), so pages
+that die about together share extents.

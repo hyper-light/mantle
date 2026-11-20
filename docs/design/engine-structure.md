@@ -324,16 +324,19 @@ under load, at moderate load and saturated.
   2026-11-20, before small branches shared extents and the rotation kept the largest owed task's
   room, the shard alone met the bound at entry 8,925 of 24,000 and the paced fill with its worker
   at entries 8,800 to 17,625; after, the shard alone at 19,804 and the paced fill at 16,937 to
-  21,726 across runs, its worker's timing varying. *Open:* the whole fill. At the bound the
+  21,726 across runs, its worker's timing varying; with branches placed by their expected life
+  (below), the shard alone at 21,155 and the paced fill at 18,325 and 19,050 in two runs, its
+  worker's jobs each still beginning a fresh extent. *Open:* the whole fill. At the bound the
   shard alone held 186 branches of 729 pages in 240 extents, which hold 183 written densely: an
   extent is held while any branch with a page in it lives, and a short-lived branch (a packing,
   two pages) sharing an extent with a long-lived one (a leaf's, five or six) leaves its pages
-  dead there once compacted (31 extents with one live page, 56 with two, 26 with three). Placing
-  branches by their expected life, as Sprite LFS's cleaner groups live blocks of similar age
-  into new segments (its "age sort", research/34 §6), or copying a mostly dead extent's live
-  pages out, is the next step; so is a worker's job beginning in the extent the job before it
-  left (each job begins a fresh extent: the paced fill held 94 extents with two live pages, a
-  two-page packing each).
+  dead there once compacted (31 extents with one live page, 56 with two, 26 with three). Placed
+  by life, it held 177 branches of 725 pages in 244 extents
+  that hold 182 densely, 55 of them with one live page, 21 with two and 44 with three: a
+  branch's death follows the pivot it waits in, not its kind alone (below). Copying a mostly
+  dead extent's live pages out is the next step; so is a worker's job beginning in the extent
+  the job before it left (each job begins a fresh extent: the paced fill held 94 extents with
+  two live pages, a two-page packing each).
 - **Small branches share extents.** The cell's store met its bound before its bytes were full,
   each branch taking whole extents of its own: on the shard alone at entry 8,925, 108 branches
   of 537 pages held 169 extents of four pages, 66 of them part used, and the branches were two
@@ -363,6 +366,28 @@ under load, at moderate load and saturated.
   a compaction's outputs, are in `⌈P / extent_pages⌉` for `P` pages together, where alone each
   took one at least (`trunk/shared_extents.rs`). Measured on the cell's fill on the shard alone,
   with the rotation's room as above: the bound at entry 19,804 sharing, 13,528 not.
+- **Branches share extents by their expected life.** An extent stays held until the last branch
+  with a page in it goes, so a branch that dies soon beside one that lives long leaves its pages
+  dead there; Sprite LFS groups blocks of similar age into one segment for the same reason (its
+  "age sort", research/34 §6). A store keeps a tail for each of two lives (`store::Life`,
+  `Store::take_tail`, `Builder::set_life`): a leaf's settle's parts, which live until that leaf
+  settles again, begin where the last leaf's branch ended; a packing's parts and an inner node's
+  compaction's, which are merged again once flushed below, begin where the last of those ended
+  (`branch::merge`, by the compaction's dropping tombstones, which only a leaf's does). A tail
+  is a place in memory, never written: the image and the reference counts are as before.
+  Measured on the cell's fill on the shard alone (mantle-node `tests/engine_workers.rs`,
+  deterministic, debug build, 2026-11-20): the bound at entry 21,155 of 24,000, against 19,804
+  with one tail. Two other splits met it sooner: three lives, packings apart from inner
+  compactions, at 19,354, and packings apart from every compaction at 19,779. A kind of branch
+  is not its life: a branch dies when the pivot it waits in is merged, and pivots are merged one
+  at a time, so grouping by that pivot is what would place a branch by the time it dies.
+  *The bound* is unchanged in the worst case: every extent held for branches holds a live page,
+  so the extents held are at most the live pages (at worst `extent_pages − 1` of each extent's
+  pages dead or unwritten), and branches of one life written one after another take
+  `⌈P / extent_pages⌉` extents for their `P` pages while all live, so the two lives take at most
+  one extent more than one tail would (`trunk/shared_extents.rs`). Placement lowers the waste
+  found, not the worst case; copying live pages out of a mostly dead extent is what bounds it
+  lower.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

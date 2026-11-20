@@ -1598,33 +1598,38 @@ impl<F: BlockFile> ShardDb<F> {
         Ok(false)
     }
 
-    /// Checks that the store holds exactly the extents the engine names, each once: the
-    /// superblocks', the allocator map's, the trunk image's and every branch's. Run after
-    /// recovery, it finds an extent leaked or freed while named; a difference is a typed
-    /// corruption.
+    /// Checks that the store holds exactly the extents the engine names, each as often as it is
+    /// named: the superblocks', the allocator map's and the trunk image's once each, and each
+    /// branch's once for every branch naming it, since small branches share extents
+    /// (`Store::take_tail`). Run after recovery, it finds an extent leaked or freed while named; a
+    /// difference is a typed corruption.
     pub fn check_references(&self) -> Result<(), Error> {
         self.trunk.check_idle_counts()?;
-        let mut named = std::collections::BTreeSet::new();
-        named.insert(0u64);
-        let mut once = |e: u64| -> Result<(), Error> {
-            if named.insert(e) {
-                Ok(())
-            } else {
-                Err(Error::Corruption {
-                    what: "the extents a shard names",
-                    why: crate::error::Malformed::CountMismatch,
-                })
-            }
+        let named_twice = || Error::Corruption {
+            what: "the extents a shard names",
+            why: crate::error::Malformed::CountMismatch,
         };
-        for &e in self.store.map_extents() {
-            once(e)?;
+        // The extents named once alone, and how often each extent is named.
+        let mut sole = std::collections::BTreeSet::from([0u64]);
+        for &e in self
+            .store
+            .map_extents()
+            .iter()
+            .chain(self.trunk.image_extents())
+        {
+            if !sole.insert(e) {
+                return Err(named_twice());
+            }
         }
-        for &e in self.trunk.image_extents() {
-            once(e)?;
-        }
+        let mut named: std::collections::BTreeMap<u64, u32> =
+            sole.iter().map(|&e| (e, 1)).collect();
         for b in self.trunk.branches() {
             for &e in &b.extents {
-                once(e)?;
+                if sole.contains(&e) {
+                    return Err(named_twice());
+                }
+                let n = named.entry(e).or_insert(0);
+                *n = n.checked_add(1).ok_or_else(named_twice)?;
             }
         }
         let held = self
@@ -1638,7 +1643,7 @@ impl<F: BlockFile> ShardDb<F> {
             let e = u64::try_from(e).map_err(|_| Error::InvalidArgument {
                 what: "an extent past u64",
             })?;
-            if c != 1 || !named.contains(&e) {
+            if named.get(&e) != Some(&c) {
                 return Err(Error::Corruption {
                     what: "the extents a shard holds",
                     why: crate::error::Malformed::CountMismatch,
@@ -4552,6 +4557,8 @@ impl<F: BlockFile> ShardDb<F> {
                 });
             }
             let parts = std::mem::take(&mut out.parts);
+            // Its parts share extents as the worker wrote them: each holds its own.
+            crate::trunk::hold_shared(&mut self.store, parts.iter().map(|(_, b)| b))?;
             self.store.extend_end(out.end);
             Ok(parts)
         })();

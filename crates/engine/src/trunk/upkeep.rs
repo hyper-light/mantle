@@ -1279,13 +1279,19 @@ impl Trunk {
         Ok(room)
     }
 
-    /// The extents the trunk's owed maintenance asks of the store: each task not begun, as its
-    /// grant or its inline room is sized, and what the inline tasks writing now may still take.
-    /// A rotation leaves them free (`ShardDb::rotation_room`): the compactions they are for give
-    /// extents back, and packings taking their room would fill the store with branches none
-    /// could compact.
+    /// The extents the trunk's owed maintenance needs to go on: what the inline tasks writing now
+    /// may still take, and the largest ask of a task not begun, as its grant or its inline room
+    /// is sized. A rotation leaves them free (`ShardDb::rotation_room`): the compactions they are
+    /// for give extents back, and packings taking their room would fill the store with branches
+    /// none could compact. The largest, not the sum: each task opens only beside its own room, and
+    /// applied it gives its inputs back, free at once or at the checkpoint a range takes for room,
+    /// so the owed tasks run one after another in the room of the largest. Kept for the sum, a
+    /// trunk owing 102 extents of tasks held every entry with 92 free, where each task fit: the
+    /// node suite's cell's fill on the shard alone met its bound at entry 8,925 of 24,000; kept
+    /// for the largest, at 19,804 with small branches sharing extents and 13,528 without
+    /// (mantle-node tests/engine_workers.rs, 2026-11-20).
     pub(crate) fn owed_room<F: BlockFile>(&self, store: &Store<F>) -> Result<u64, Error> {
-        let mut room = self.inline_room(store)?;
+        let mut most = 0u64;
         for t in &self.tasks {
             let asked = match &t.run {
                 Running::Inline(c) if c.opening() => self.inline_asked(store, t)?,
@@ -1295,9 +1301,9 @@ impl Trunk {
                 } => u64::try_from(grant_size(store, task)).unwrap_or(u64::MAX),
                 _ => 0,
             };
-            room = room.saturating_add(asked);
+            most = most.max(asked);
         }
-        Ok(room)
+        Ok(self.inline_room(store)?.saturating_add(most))
     }
 
     /// Steps the inline tasks for up to `budget` units, the root's first: each finished one
@@ -1492,6 +1498,7 @@ impl Trunk {
                     store.adopt_pages(*kept);
                 }
                 store.grant_back(&out.unused)?;
+                super::hold_shared(store, out.parts.iter().map(|(_, b)| b))?;
                 store.extend_end(out.end);
                 // The worker timed its merge: a compacted key's cost, which consolidations are
                 // priced at, measured wherever compactions run; and its reads' waits, what the
@@ -2126,6 +2133,10 @@ mod seat_wait;
 #[cfg(test)]
 #[path = "room.rs"]
 mod room;
+
+#[cfg(test)]
+#[path = "shared_extents.rs"]
+mod shared_extents;
 
 #[cfg(test)]
 mod reuse_tests {

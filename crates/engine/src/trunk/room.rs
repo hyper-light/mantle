@@ -1,7 +1,7 @@
 //! Maintenance at the store's extents: a trunk whose tasks wait for room is saved with its
-//! maintenance owed (image format 8), and opened again it holds every row and every extent it
-//! names once; a compaction that opened its inputs and wrote nothing, dropped for that save,
-//! leaves no extent held.
+//! maintenance owed (image format 8 and on), and opened again it holds every row and every extent
+//! it names, as often as it names it; a compaction that opened its inputs and wrote nothing,
+//! dropped for that save, leaves no extent held.
 #![cfg(test)]
 #![allow(
     clippy::unwrap_used,
@@ -60,7 +60,7 @@ fn branch(store: &mut Store<DeviceFile>, rows: &mut Rows, round: u64) -> Branch 
 }
 
 /// Every row reads back its newest version, and the store holds exactly the extents the
-/// trunk, its image and the allocator's map name, each once.
+/// trunk, its image and the allocator's map name, each as often as it is named.
 fn check(store: &mut Store<DeviceFile>, trunk: &mut Trunk, rows: &Rows) {
     let mut value = Vec::new();
     for (k, v) in rows {
@@ -70,25 +70,33 @@ fn check(store: &mut Store<DeviceFile>, trunk: &mut Trunk, rows: &Rows) {
     assert_eq!(held(store), named(store, trunk));
 }
 
-fn named(store: &Store<DeviceFile>, trunk: &Trunk) -> BTreeSet<u64> {
-    let mut named = BTreeSet::from([0]);
+/// How often each extent is named: by each branch naming it, once by the superblocks, the
+/// allocator's map and the trunk's image, none of which shares one.
+fn named(store: &Store<DeviceFile>, trunk: &Trunk) -> BTreeMap<u64, u32> {
+    let mut named = BTreeMap::from([(0, 1)]);
+    for &e in store.map_extents().iter().chain(trunk.image_extents()) {
+        assert!(named.insert(e, 1).is_none(), "an extent named twice");
+    }
+    let sole: BTreeSet<u64> = named.keys().copied().collect();
     for b in trunk.branches() {
         for &e in &b.extents {
-            assert!(named.insert(e), "an extent named twice");
+            assert!(
+                !sole.contains(&e),
+                "a branch names a map's or an image's extent"
+            );
+            *named.entry(e).or_default() += 1;
         }
     }
-    named.extend(store.map_extents());
-    named.extend(trunk.image_extents());
     named
 }
 
-fn held(store: &Store<DeviceFile>) -> BTreeSet<u64> {
+fn held(store: &Store<DeviceFile>) -> BTreeMap<u64, u32> {
     store
         .refs()
         .iter()
         .enumerate()
         .filter(|(_, c)| **c > 0)
-        .map(|(e, _)| e as u64)
+        .map(|(e, &c)| (e as u64, c))
         .collect()
 }
 

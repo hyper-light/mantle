@@ -280,8 +280,19 @@ impl Allocator {
         Ok(extent)
     }
 
-    /// One more reference to a held extent.
+    /// One more reference to a held extent. A worker's allocator keeps no counts: an extent its
+    /// job wrote is held once more for each further branch of the job naming it as the shard takes
+    /// them (`trunk::hold_shared`).
     pub fn retain(&mut self, extent: u64) -> Result<(), Error> {
+        if self.granted {
+            return if self.held.binary_search(&extent).is_ok() {
+                Ok(())
+            } else {
+                Err(Error::InvalidArgument {
+                    what: "a reference to an extent that is not held",
+                })
+            };
+        }
         let count = self
             .refs
             .get_mut(index(extent)?)

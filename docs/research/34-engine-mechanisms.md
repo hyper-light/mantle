@@ -256,3 +256,48 @@ maplets abstract.
   compaction's need, not by core count.
 - **Unstated:** `ε`, the minimum flush bandwidth, and the pause granularity. Mantle measures them
   (CLAUDE.md §4–5).
+
+## 6. Pages from extents: SplinterDB's mini-allocator, Sprite LFS's segments
+
+What decides how a branch's pages take extents (docs/design/engine-structure.md §3, small
+branches share extents). Sources, read 2026-11-20:
+- SplinterDB's `src/mini_allocator.h` at `vmware/splinterdb@main`, marked **[src]**.
+- Rosenblum and Ousterhout, "The Design and Implementation of a Log-Structured File System", SOSP
+  '91 and ACM Transactions on Computer Systems 10(1), February 1992, marked **[LFS]**; the
+  Berkeley CS262 copy.
+
+**SplinterDB's mini-allocator [src].**
+- "The purpose of the mini allocator is to allocate pages from extents", and "to maintain a list
+  of allocated extents for future bulk operations".
+- "Mini-allocator breaks extents into pages. The pages are fed out of separate batches, so that
+  pages from each batch are contiguous within extents." At most `MINI_MAX_BATCHES` (16) batches.
+- Allocation takes a page (`mini_alloc_page`), an extent (`mini_alloc_extent`) or a run of bytes
+  (`mini_alloc_bytes`) from a batch; a structure's extents are counted by its mini-allocator's
+  metadata, one external reference that `mini_inc_ref` raises and `mini_dec_ref` consumes, and
+  `mini_recover_references` is its recovery counterpart. Finalizing (`mini_release`) "drops unused
+  reserves"; nothing in the header hands a finished structure's unused pages to another.
+- So in SplinterDB a branch's extents are its own, and the pages its last extent leaves unused
+  are at most an extent a batch. Its extents are 128 KiB and its memtables 24 MiB (§1): an
+  extent is about one part in 190 of a packed memtable.
+
+**Sprite LFS's segments [LFS §3.2, §3.6].**
+- "The disk is divided into large fixed-size extents called segments. Any given segment is always
+  written sequentially from its beginning to its end, and all live data must be copied out of a
+  segment before the segment can be rewritten." Segments are 512 KB or 1 MB.
+- Blocks of every file are written into the segment at the log's head, one after another: a
+  segment holds blocks of many files.
+- "For each segment, the table records the number of live bytes in the segment and the most
+  recent modified time of any block in the segment ... the count of live bytes is decremented
+  when files are deleted or blocks are overwritten. If the count falls to zero then the segment
+  can be reused without cleaning."
+- Cleaning copies a segment's live blocks out. Of how to group them: "Another possibility is to
+  sort the blocks by the time they were last modified and group blocks of similar age together
+  into new segments; we call this approach age sort." [LFS §3.4]
+
+**What mantle takes.** A store's extents are reference-counted already (§1, and the allocator's
+map, docs/design/engine-structure.md §3). Mantle writes a branch's pages contiguously, as a
+SplinterDB batch does, and begins the next branch built in the same store where the last one
+ended, as Sprite LFS writes many files' blocks into one segment; an extent is held by each branch
+with a page in it, and is free again when the last of them goes, as a segment whose live count
+falls to zero is reused without cleaning. Mantle copies no live page out of an extent (it has no
+cleaner): an extent with one live branch page in it stays held until that branch goes.

@@ -791,10 +791,10 @@ fn save32(out: &mut Vec<u8>, n: usize) -> Result<(), Error> {
 }
 
 /// A branch descriptor's bytes in an image at most: [`Branch::encode`]'s fixed fields, within
-/// seven u64s, two u32s and the u8 height, and a u64 an extent.
+/// seven u64s, three u32s and the u8 height, and a u64 an extent.
 fn descriptor_bytes(b: &Branch) -> Result<usize, Error> {
     size_of::<[u64; 7]>()
-        .checked_add(size_of::<[u32; 2]>())
+        .checked_add(size_of::<[u32; 3]>())
         .and_then(|n| n.checked_add(size_of::<u8>()))
         .and_then(|n| n.checked_add(b.extents.len().checked_mul(size_of::<u64>())?))
         .ok_or(corrupt())
@@ -918,8 +918,10 @@ enum State {
 /// sparse levels are one sequence. Format 8: each pivot names the first of its node's in-flight
 /// bundles live for it, and each node its in-flight list after its pivots, the root's pending
 /// branches after its own, so a checkpoint saves the trunk without first running its maintenance
-/// to the end (docs/design/engine-structure.md §3).
-const IMAGE_FORMAT: u8 = 8;
+/// to the end (docs/design/engine-structure.md §3). Format 9: each branch's descriptor names its
+/// first page's place in its first extent before its extents, where small branches share extents
+/// (docs/design/engine-structure.md §3).
+const IMAGE_FORMAT: u8 = 9;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
 /// None, in a child or an end key's place.
@@ -955,6 +957,22 @@ fn size_of_branches<'b>(
 fn release<F: BlockFile>(store: &mut Store<F>, b: &Branch) -> Result<(), Error> {
     for &e in &b.extents {
         store.release(e)?;
+    }
+    Ok(())
+}
+
+/// A worker's branches as the shard takes them, each then holding every extent it names once, as
+/// a branch built on the shard does. The job's grant held each extent the job wrote once, and a
+/// worker's allocator keeps no counts, so a branch that began in the pages the one before it in
+/// the same job left (`first` past 0, `Store::take_tail`) holds its first extent once more.
+pub(crate) fn hold_shared<'b, F: BlockFile>(
+    store: &mut Store<F>,
+    branches: impl Iterator<Item = &'b Branch>,
+) -> Result<(), Error> {
+    for b in branches {
+        if b.first > 0 {
+            store.retain(*b.extents.first().ok_or(corrupt())?)?;
+        }
     }
     Ok(())
 }

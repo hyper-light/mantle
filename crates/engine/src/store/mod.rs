@@ -313,6 +313,10 @@ pub struct Store<F: BlockFile> {
     /// Freed extents whose pages the cache still holds, forgotten a share at a time
     /// ([`Store::forget_some`]): at most the extents freed.
     forgetting: VecDeque<u64>,
+    /// The extent the last branch built here ended in and its first page left unwritten: the next
+    /// branch built here begins there ([`Store::take_tail`]). None once taken, once that extent is
+    /// no longer held, and at a worker's next job.
+    tail: Option<(u64, u32)>,
     /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
     refill: Option<Refill>,
     /// A file grown by segments ([`BlockFile::grow`]): what the allocator may hand out. None for
@@ -845,6 +849,7 @@ impl<F: BlockFile> Store<F> {
             lists_lent: 0,
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
+            tail: None,
             timed: false,
             refill: None,
             segments: None,
@@ -932,6 +937,7 @@ impl<F: BlockFile> Store<F> {
             lists_lent: 0,
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
+            tail: None,
             timed: false,
             refill: None,
             segments: None,
@@ -962,6 +968,9 @@ impl<F: BlockFile> Store<F> {
                 limit: u64::MAX,
             })?;
         self.alloc.regrant(grant);
+        // A job's branches share extents with each other only: the shard counts what they share
+        // as it takes them (`trunk::hold_shared`).
+        self.tail = None;
         self.job_ordinal = job_ordinal;
         self.end = end;
         self.durable.generation = generation;
@@ -1057,6 +1066,7 @@ impl<F: BlockFile> Store<F> {
                 lists_lent: 0,
                 lists_most_lent: 0,
                 forgetting: VecDeque::new(),
+                tail: None,
                 timed: false,
                 refill: None,
                 segments,
@@ -1793,11 +1803,43 @@ impl<F: BlockFile> Store<F> {
         self.alloc.retain(extent)
     }
 
+    /// Where the next branch built here begins: the pages the last branch built here left
+    /// unwritten in the extent it ended in, that extent held once more for it. Small branches so
+    /// share extents, and a store's extents bound the pages it holds rather than its branches
+    /// (docs/design/engine-structure.md §3). None where the last branch filled its extent, or the
+    /// extent is no longer held. A worker's allocator keeps no counts: the shard counts the
+    /// reference as it takes the job's branches (`trunk::hold_shared`).
+    pub(crate) fn take_tail(&mut self) -> Result<Option<(u64, u32)>, Error> {
+        let Some((extent, page)) = self.tail else {
+            return Ok(None);
+        };
+        self.tail = None;
+        if !self.alloc.is_held(extent) {
+            return Ok(None);
+        }
+        self.retain(extent)?;
+        Ok(Some((extent, page)))
+    }
+
+    /// A branch built here ended before `page` of `extent`: the pages from there on are the
+    /// next branch's ([`Self::take_tail`]), none where the extent is full.
+    pub(crate) fn set_tail(&mut self, extent: u64, page: u32) {
+        self.tail = if page < self.config.extent_pages {
+            Some((extent, page))
+        } else {
+            None
+        };
+    }
+
     /// One reference fewer; an extent left with none is reused once a checkpoint that no
     /// longer names it is durable.
     pub fn release(&mut self, extent: u64) -> Result<(), Error> {
         self.checkpoint_idle()?;
         self.alloc.release(extent)?;
+        // Freed, its pages left unwritten are no branch's to begin in: it may be handed out whole.
+        if !self.alloc.is_held(extent) && self.tail.is_some_and(|(e, _)| e == extent) {
+            self.tail = None;
+        }
         // Free from here, or at the next checkpoint, and then written again: a page loaded or
         // loading from it would be read for a page no longer there.
         if !self.alloc.is_held(extent) && self.loads() > 0 {

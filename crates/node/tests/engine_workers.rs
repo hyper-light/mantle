@@ -731,10 +731,11 @@ fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
 /// stopped on "range 626c6f636b's engine in its maintenance: the engine is fenced after a failed
 /// write: extents of a store would exceed its bound of 256" (CI run 44721951954): an inline
 /// compaction of the engine's idle step took the store's last extent while 42 the durable
-/// checkpoint named waited for the next checkpoint (held 214, pending 42 at the refusal). Each
-/// small branch takes a whole extent, so the store's extents, not its bytes, bound the fill:
-/// the whole fill waits for small branches to share extents. The cell's key space is taken whole
-/// first.
+/// checkpoint named waited for the next checkpoint (held 214, pending 42 at the refusal). Small
+/// branches share extents, but an extent stays held while any branch with a page in it lives, so
+/// the store's extents, not its bytes, still bound the fill: the whole fill waits for branches
+/// placed by their life (docs/design/engine-structure.md §3, at the bound). The cell's key space
+/// is taken whole first.
 #[test]
 fn a_sustained_fill_of_the_cells_store_waits_at_its_extent_bound_and_never_fences() {
     match fill_to_the_bound(1, true) {

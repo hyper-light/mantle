@@ -105,6 +105,11 @@ pub struct Branch {
     pub count: u64,
     /// The extents holding its pages.
     pub extents: Vec<u64>,
+    /// The page of its first extent that is its first page: the pages before it there are the
+    /// branch's built before it in the same store, whose last extent it shares, so small branches
+    /// share extents (docs/design/engine-structure.md §3). Its pages run on from there through
+    /// its extents in order.
+    pub first: u32,
     /// Its keys' filter.
     pub filter: filter::Filter,
     /// Where the filter's pages start in the branch's pages (counted in extent order), how
@@ -698,6 +703,8 @@ pub struct Builder {
     /// The extent pages are being written into, and the next page in it.
     extent: Option<(u64, u32)>,
     extents: Vec<u64>,
+    /// The page of its first extent that is its first page ([`Branch::first`]).
+    first: u32,
     /// Each level's written page's first key, for its entry in the level above: a buffer a
     /// level, since writing a page may write the level above's in turn.
     firsts: Vec<Vec<u8>>,
@@ -853,6 +860,7 @@ impl Builder {
             levels,
             extent: None,
             extents: lists.extents,
+            first: 0,
             firsts: lists.firsts,
             spare_pages,
             counts: lists.counts,
@@ -885,9 +893,23 @@ impl Builder {
     }
 
     fn page<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<u64, Error> {
-        let (extent, next) = match self.extent {
-            Some((e, n)) if store.address(e, n).is_ok() => (e, n),
-            _ => {
+        let tail = match self.extent {
+            Some((e, n)) if store.address(e, n).is_ok() => Some((e, n)),
+            Some(_) => None,
+            // The branch's first page: where the branch built before it here left its last
+            // extent's pages unwritten, the first of them ([`Store::take_tail`]).
+            None => {
+                let tail = store.take_tail()?;
+                if let Some((e, n)) = tail {
+                    self.extents.push(e);
+                    self.first = n;
+                }
+                tail
+            }
+        };
+        let (extent, next) = match tail {
+            Some(at) => at,
+            None => {
                 let e = store.allocate_extent()?;
                 self.extents.push(e);
                 (e, 0)
@@ -1407,6 +1429,10 @@ impl Builder {
                 what: "a branch taken before its filter was written",
             })?;
         store.give_run(self.run);
+        // The pages left in its last extent are the next branch's built here.
+        if let Some((extent, next)) = self.extent {
+            store.set_tail(extent, next);
+        }
         let filter_bytes =
             u64::try_from(self.filter.bytes()).map_err(|_| corrupt(Malformed::TooLarge))?;
         let branch = Ok(Branch {
@@ -1415,6 +1441,7 @@ impl Builder {
             count: self.count,
             // Exactly sized: the working lists go back to the store for the next builder.
             extents: self.extents.as_slice().to_vec(),
+            first: self.first,
             filter: self.filter,
             filter_start: s.filter_start,
             filter_pages: s.pages,
@@ -1635,6 +1662,7 @@ impl Branch {
             height: self.height,
             count: self.count,
             extents: self.extents.clone(),
+            first: self.first,
             filter: filter::Filter::none(),
             filter_start: self.filter_start,
             filter_pages: self.filter_pages,
@@ -1724,7 +1752,8 @@ impl Branch {
 
 impl Branch {
     /// The branch's descriptor, as a trunk page stores it: root, height, count, the filter's
-    /// place and size, the leaf index's and range filter's sizes, then the extents.
+    /// place and size, the leaf index's and range filter's sizes, its first page's place in its
+    /// first extent, then the extents.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.extend_from_slice(&self.root.to_le_bytes());
         out.push(self.height);
@@ -1734,6 +1763,7 @@ impl Branch {
         out.extend_from_slice(&self.filter_bytes.to_le_bytes());
         out.extend_from_slice(&self.index_bytes.to_le_bytes());
         out.extend_from_slice(&self.range_bytes.to_le_bytes());
+        out.extend_from_slice(&self.first.to_le_bytes());
         let n = u32::try_from(self.extents.len()).map_err(|_| corrupt(Malformed::TooLarge))?;
         out.extend_from_slice(&n.to_le_bytes());
         for e in &self.extents {
@@ -1773,14 +1803,18 @@ impl Branch {
         let filter_bytes = u64_of(take(8)?)?;
         let index_bytes = u64_of(take(8)?)?;
         let range_bytes = u64_of(take(8)?)?;
+        let first = u32_of(take(4)?)?;
         let n = usize::try_from(u32_of(take(4)?)?).map_err(|_| corrupt(Malformed::TooLarge))?;
         let mut extents = Vec::with_capacity(n.min(bytes.len() / 8));
         for _ in 0..n {
             extents.push(u64_of(take(8)?)?);
         }
-        // The filter's pages: its place in the branch's pages, counted in extent order, up to
-        // the range filter's end.
+        // The filter's pages: its place in the branch's pages, counted in extent order from its
+        // first page's place in its first extent, up to the range filter's end.
         let per = u64::from(store.extent_pages());
+        if first >= store.extent_pages() {
+            return Err(corrupt(Malformed::OutOfRange));
+        }
         let held = filter_bytes
             .checked_add(
                 filter_start
@@ -1798,6 +1832,7 @@ impl Branch {
         for i in 0..pages_held {
             let index = filter_start
                 .checked_add(i)
+                .and_then(|p| p.checked_add(u64::from(first)))
                 .ok_or(corrupt(Malformed::TooLarge))?;
             let extent = *extents
                 .get(
@@ -1846,6 +1881,7 @@ impl Branch {
                 height,
                 count,
                 extents,
+                first,
                 filter,
                 filter_start,
                 filter_pages,
@@ -1965,7 +2001,7 @@ impl Branch {
     }
 
     /// The page number of the page at `address`: its extent's place among the branch's extents,
-    /// and its place in the extent.
+    /// and its place in the extent, less its first page's place in its first extent.
     pub(crate) fn page_of<F: BlockFile>(
         &self,
         store: &Store<F>,
@@ -1985,8 +2021,9 @@ impl Branch {
             .ok()
             .and_then(|i| i.checked_mul(per))
             .and_then(|p| p.checked_add(within))
+            .and_then(|p| p.checked_sub(u64::from(self.first)))
             .and_then(|p| u32::try_from(p).ok())
-            .ok_or(corrupt(Malformed::TooLarge))
+            .ok_or(corrupt(Malformed::OutOfRange))
     }
 
     /// The last leaf `key` can fall in, from memory alone: a group's last for a key within it.
@@ -2043,18 +2080,18 @@ impl Branch {
         (pages, keys)
     }
 
-    /// The address of page `page_no`, counted through the branch's extents in order.
+    /// The address of page `page_no`, counted through the branch's extents in order from its
+    /// first page's place in its first extent.
     pub fn page_address<F: BlockFile>(&self, store: &Store<F>, page_no: u64) -> Result<u64, Error> {
         let per = u64::from(store.extent_pages());
-        let extent = usize::try_from(
-            page_no
-                .checked_div(per)
-                .ok_or(corrupt(Malformed::TooLarge))?,
-        )
-        .ok()
-        .and_then(|i| self.extents.get(i))
-        .ok_or(corrupt(Malformed::OutOfRange))?;
-        let within = u32::try_from(page_no.checked_rem(per).unwrap_or(0))
+        let at = page_no
+            .checked_add(u64::from(self.first))
+            .ok_or(corrupt(Malformed::TooLarge))?;
+        let extent = usize::try_from(at.checked_div(per).ok_or(corrupt(Malformed::TooLarge))?)
+            .ok()
+            .and_then(|i| self.extents.get(i))
+            .ok_or(corrupt(Malformed::OutOfRange))?;
+        let within = u32::try_from(at.checked_rem(per).unwrap_or(0))
             .map_err(|_| corrupt(Malformed::TooLarge))?;
         store.address(*extent, within)
     }
@@ -2444,11 +2481,16 @@ impl RunCursor {
             self.loaded = Some(address);
             // A compaction's span reads the next extents ahead while this one is merged.
             let per = u64::from(store.extent_pages());
-            let extent = page.checked_div(per).unwrap_or(0);
+            let first = u64::from(branch.first);
+            let extent = page
+                .checked_add(first)
+                .and_then(|p| p.checked_div(per))
+                .unwrap_or(0);
             for k in 1..=u64::try_from(self.span.ahead_extents()).unwrap_or(1) {
                 let next = extent
                     .checked_add(k)
                     .and_then(|e| e.checked_mul(per))
+                    .and_then(|p| p.checked_sub(first))
                     .filter(|&p| p < branch.filter_start);
                 let Some(next) = next else {
                     break;

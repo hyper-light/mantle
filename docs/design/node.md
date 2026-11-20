@@ -1713,9 +1713,16 @@ becomes:
   holds back: on a native exchange the stream's flow-control window, smaller than a block, so
   every block's writing waits on its client (`host::Drain`); on the S3 door, whose reply's channel
   holds whole blocks, the connection's socket, which the connection times as it writes each piece,
-  from when the socket first took less than it was offered to the piece's last octet written, and
-  tells the node through the door (`listener::io::Drained`, `door::Doorway::drained`), so a client
-  that drains faster than the reads is paced as one slower is. Timed from the reply's channel
+  from when the socket first took less than it was offered or refused an offer whole to the
+  piece's last octet written, and tells the node through the door (`listener::io::Drained`,
+  `door::Doorway::drained`), so a client that drains faster than the reads is paced as one slower
+  is. A Windows socket takes all of a send while it is under its quota, which follows TCP's ideal
+  send backlog up to 16 MB, and one more past it while it holds a single send, then refuses
+  (research/72 [8, 9, 10]): offered whole blocks, it took a get's first two at once and never a
+  part, so no plain connection's client on Windows was paced, and once refused it took a whole
+  block for the little room its client made. A plain connection there offers its
+  socket a record's plaintext at a time, as a TLS one does on every platform, and reads a refusal
+  as full (`listener::io::offer`). Timed from the reply's channel
   instead, a block held behind the one its connection had just begun, a client faster than the
   reads never filled the channel and its gets kept the window they were admitted with. Each is
   smoothed with the same gain. A get's object's size is known only once its

@@ -94,6 +94,42 @@ found no pooled connection free opened one past the budget, which the listener c
 That fits the last row; it was not reproduced on the cell, whose nodes did not finish starting
 within the check's bound.
 
+[8] Microsoft, "Send data segment over TCP by using Winsock" (KB214397),
+https://learn.microsoft.com/en-us/troubleshoot/windows/win32/data-segment-tcp-winsock: "Winsock
+copies data buffers from application send calls to a Winsock kernel buffer ... You can change the
+amount of Winsock kernel buffer allocated to the socket using the `SO_SNDBUF` option ... If
+necessary, Winsock can buffer more than the `SO_SNDBUF` buffer size." Its rules for a send's
+completion: "If the socket is still within SO_SNDBUF quota, Winsock copies the data from the
+application send and indicates the send completion to the application"; "If the socket is beyond
+`SO_SNDBUF` quota and there's only one previously buffered send still in the stack kernel buffer,
+Winsock copies the data from the application send and indicates the send completion to the
+application"; beyond the quota with more than one send buffered, it does not complete the send
+until enough are sent.
+
+[9] Microsoft, "SIO_IDEAL_SEND_BACKLOG_QUERY Control Code",
+https://learn.microsoft.com/en-us/windows/win32/winsock/sio-ideal-send-backlog-query, Remarks:
+"For the blocking and non-blocking send method, the send buffer limit determines how much data is
+kept outstanding in TCP"; the ideal send backlog "is a function of the bandwidth-delay product of
+the TCP connection and the receiver's advertised receive window" and "can theoretically vary from
+0 to a maximum of 16 megabytes"; "Dynamic send buffering for TCP was added on Windows 7 and Windows
+Server 2008 R2. By default, dynamic send buffering for TCP is enabled unless an application sets
+the SO_SNDBUF socket option on the stream socket."
+
+[10] Microsoft, "send function (winsock2.h)",
+https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-send: "On nonblocking
+stream oriented sockets, the number of bytes written can be between 1 and the requested length,
+depending on buffer availability on both the client and server computers"; `WSAEWOULDBLOCK`: "The
+socket is marked as nonblocking and the requested operation would block."
+
+[11] J. Davies, "The Cable Guy: TCP Receive Window Auto-Tuning", TechNet Magazine, January 2007,
+https://learn.microsoft.com/en-us/previous-versions/technet-magazine/cc162519(v=msdn.10): the
+receive window is sized "by measuring the BDP and the application retrieve rate", "allowing up to
+a 16MB maximum receive window size"; `SO_RCVBUF` set the maximum before Vista.
+
+[12] `write(2)`, macOS and FreeBSD: "When using non-blocking I/O on objects, such as sockets, that
+are subject to flow control, write() and writev() may write fewer bytes than requested"; Linux
+`socket(7)`, `SO_SNDBUF`: "Sets or gets the maximum socket send buffer in bytes."
+
 ## What the sources settle
 
 **A floor of ten connections.** botocore keeps at most ten connections to an endpoint by default
@@ -130,6 +166,19 @@ comes. RFC 9112 bounds that reading by no time [4]; the listener bounds it by oc
 request's body may run to (`MAX_BODY`: S3's largest single object [6, research/05 §4.3] framed as
 aws-chunked in S3's least chunks), and by the same patience between octets, past either of which
 it closes.
+
+**When a GET's socket is full.** A Linux or macOS socket takes no more of a non-blocking write
+than its send buffer has room for and says how much it took [12], so a write it took in part says
+the socket is full, and what it takes after is what its client made room for. A Windows socket
+takes all of a send while it is under its quota, and all of one more past it while it holds a
+single send, then refuses until enough is sent [8, 10]; the quota follows the ideal send backlog,
+up to 16 MB, unless the socket sets `SO_SNDBUF` [9]. Offered whole blocks, it takes a get's first
+two whole and never a part: no part says it is full, and once a send was refused, the next takes
+a whole block for whatever room its client made. So the plain connection reads a refused send as
+full on every platform, and on Windows offers its socket a record's plaintext at a time, as the
+TLS connection does everywhere, so the socket takes at most two records past its client's room.
+The receive window on the client's side follows its retrieve rate [11], so a slow client's stays
+small however long its get.
 
 ## Open
 

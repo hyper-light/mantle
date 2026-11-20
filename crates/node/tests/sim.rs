@@ -1471,22 +1471,35 @@ fn a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_i
     }
 }
 
+/// The live founder's suspicions the joiner may make while it takes [`FOUNDER_HEARTBEATS`] of the
+/// heartbeats of a founder loaded only from after the join: the count measured on seed 1 at
+/// e0da1049 with hyper-liveness's `Pair::premature_configured` (2), where it was 60 without it.
+const FOUNDER_LIVE_SUSPICIONS: u64 = 2;
+
 /// The same cell, its founder loaded only from after the join: the joiner's detector meets the
-/// founder's stalls with nothing of the load in what judges the founder's link, and the times it
-/// suspects the live founder are counted here, not refused. Cut off, the founder is suspected
-/// within the patience the joiner states (`Status::patience`). On seed 1 (measured over
-/// f41d8344) the link had its own configuration from the 312th heartbeat it took, a 5.3 ms margin
-/// from latenesses that knew nothing of the load, kept until they double: it suspected the live
-/// founder 60 times while the joiner took 100 of its heartbeats, none of them by the margin of the
-/// node's evidence, which a premature suspicion lengthens at once (hyper-liveness
-/// `Pair::premature_margin`), and the cut-off founder 41.2 ms after the cut, its patience 90.5 ms.
-/// The live founder's suspicions are not yet bounded. Seeds 2 and 3, regional paths, reach the
-/// join only after minutes of an unloaded founder's turns (`MANTLE_NODE_SIM_SEEDS`,
-/// `MANTLE_NODE_SIM_SEED`).
+/// founder's stalls with nothing of the load in what judges the founder's link, so it suspects the
+/// live founder at its first stalls at least, and each suspicion a heartbeat proves premature
+/// lengthens the margin that made it at once (hyper-liveness `Pair::premature_margin` for the
+/// margin of the node's evidence, `Pair::premature_configured` for the link's own). Cut off, the
+/// founder is suspected within the patience the joiner states (`Status::patience`). On seed 1
+/// (macOS arm64, debug build) the link had its own configuration from the 312th heartbeat it
+/// took, a 5.3 ms margin from latenesses that knew nothing of the load, renewed by Chen et al.'s
+/// schedule only once they double: at e0da1049 it suspected the live founder 60 times while the
+/// joiner took 100 of its heartbeats, and the cut-off founder 41.2 ms after the cut, its patience
+/// 90.5 ms; with each premature suspicion lengthening the link's own margin at once, 2 times
+/// ([`FOUNDER_LIVE_SUSPICIONS`], the bound held here), and the cut-off founder 54.4 ms after the
+/// cut, its patience 129.4 ms. Seeds 2 and 3, regional paths, reach the join only after minutes of
+/// an unloaded founder's turns (`MANTLE_NODE_SIM_SEEDS`, `MANTLE_NODE_SIM_SEED`); their counts
+/// with the rule are not measured yet, so the bound is seed 1's.
 #[test]
 fn a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_it_cut_off() {
     for seed in seeds(&[1]) {
-        loaded_founder(seed, true);
+        let suspicions = loaded_founder(seed, true);
+        assert!(
+            suspicions <= FOUNDER_LIVE_SUSPICIONS,
+            "seed {seed}: the joiner suspected its live founder {suspicions} times while it took \
+             {FOUNDER_HEARTBEATS} of its heartbeats, past {FOUNDER_LIVE_SUSPICIONS}"
+        );
     }
 }
 

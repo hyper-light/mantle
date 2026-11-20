@@ -1688,10 +1688,40 @@ seed 1 the joiner suspected its live founder 60 times while it took 100 of its h
 rule and without it alike. The link had its own configuration from the 312th heartbeat it took,
 before the founder's first stall: Chen et al.'s, from latenesses that knew nothing of the load, a
 5.3 ms margin renewed only once they double, which none of the 100 did; each of the 60 suspicions
-was that margin's, and the rule never ran. Lengthening a configured link's margin after a premature
-suspicion, which Chandra and Toueg's rule asks of any timeout, is not built: the live founder's
-suspicions are not bounded yet. Cut off, the founder is suspected within the patience the joiner
-states, on seed 1 41.2 ms after the cut against 90.5 ms (`tests/sim.rs`,
+was that margin's, and the rule never ran. Cut off, the founder is suspected within the patience
+the joiner states, on seed 1 41.2 ms after the cut against 90.5 ms (`tests/sim.rs`,
+`a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_it_cut_off`).
+
+*A premature suspicion lengthens a configured link's margin too (2026-11-20).* A heartbeat that
+ends a suspicion the link's own configuration told renews that margin at once (hyper-liveness
+`Pair::premature_configured`), not once the latenesses double: past the lateness that proved the
+suspicion premature by RFC 6298's bound past a sample, `max(G, 4σ)` with `σ` the deviation of the
+link's latenesses as they stand (research/81 [5] (2.3)), so that a stall as long is no suspicion
+again however the expected arrival it is measured from moves with its window; where that promises
+nothing, the configurator's margin over what the link has seen, the late heartbeat among it, at
+the interval its next heartbeat is expected at; never shorter than the margin that suspected.
+Chen et al.'s schedule renews it, down as well as up, as before, and the configuration's
+`current` states the margin renewed, the detector the election law reads. Chandra and Toueg's
+detector sets `Δp(q) ← Δp(q) + 1` at each premature time-out, and its proof lets the time-out grow
+unbounded where the mistakes never stop (research/81 [10] Fig. 10, pp. 256–257). The margin here
+is bounded instead, by the rule every configuration is held to: a margin whose expected
+unavailability is one or more promises nothing (hyper-timing `Refusal::Unavailable`), and that
+unavailability grows with the margin through the time to detect a crash, `(E(D) + α + η +
+T_E)/MTBF` (a crash detected within `E(D) + α + η`, then an election, once per MTBF), so no margin
+past `MTBF − (E(D) + η + T_E)` is imposed, and a lengthening past what promises anything leaves the
+margin in force. A peer whose stalls pass that ceiling for good is suspected at each of them: the
+detector is eventually perfect only for a link whose latenesses come to stay below it. The ceiling
+is the cell's MTBF less a detection, hours in a cell that has run for days: a partition that heals
+ends a premature suspicion too, and lengthens the margin past the partition, to that ceiling at
+most, until the latenesses double. The patience a node states (`Status::patience`) is read from
+the margin in force, so it follows the lengthening, and a peer cut off is suspected within it.
+
+Measured on seed 1 at e0da1049 (macOS arm64, debug build), the founder loaded from after the
+join: the joiner suspected its live founder 60 times while it took 100 of its heartbeats without
+the rule, 2 with it; the 100 heartbeats came in 1.913 s of simulated time, at most 35.4 ms apart,
+alike in both. The cut-off founder was suspected 41.2 ms after the cut against a patience of
+90.5 ms without the rule, 54.4 ms against 129.4 ms with it, the margin in force longer. The test
+holds 2 as its bound (`tests/sim.rs`,
 `a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_it_cut_off`).
 
 A range hosted by no node still elects on ticks with focal's counts, as above (replica.md §3). SWIM's place (§3.5) does not

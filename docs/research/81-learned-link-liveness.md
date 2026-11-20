@@ -256,6 +256,18 @@ partially synchronous system, measuring time "by counting the number of steps th
 §9.1, Fig. 10, Thm. 9.1], and in practice it suffices that accuracy holds "for periods that are
 'long enough'" [10 §1].
 
+Figure 10 states the rule exactly (read 2026-11-20 from the copy named at [10], p. 256): when p
+receives "q-is-alive" from a q it suspects, "{p knows that it prematurely timed-out on q}", and it
+does two things, "output_p ← output_p − {q}" ("p repents on q") and "Δp(q) ← Δp(q) + 1" ("p
+increases its time-out period for q"); the prose says the same, "p knows that its previous time-out
+on q was premature. In this case, p removes q from its list of suspects and increases its time-out
+period Δp(q)" [10 p. 256]. The proof of Theorem 9.1 asks nothing of the increment but that it
+repeats: a q timed out infinitely often has Δp(q) "increased" each time, so "Δp(q) grows
+unbounded", and once it "is larger than the correct time-out based on these bounds", "p cannot
+time-out on q any more" [10 p. 257]. The step's size is free, and the time-out grows without bound
+only where the premature time-outs never stop; where the bounds hold after GST it stops at the
+first time-out past them.
+
 Lifeguard found that "slow processing by the failure detector module itself is the primary cause of
 the false positives that SWIM's Suspicion mechanism fails to suppress", since "an episode of slow
 message processing at a given group member is likely to impact multiple of its interactions" [17

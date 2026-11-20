@@ -50,6 +50,45 @@ lacks entries).
 being made, and the core asks again. A snapshot made at compaction "in case" is not what the
 contract asks for.
 
+## 2a. Once storage holds what it said it did not, the owner has the core send it
+
+Read on 2026-11-20 in raft-rs at `8e4cef172421bf77b2ae1c26628a9531b0be41f0`, the pin hyper-raft's
+differential runs raft-rs at (vendor/hyper-raft/ORIGIN.md).
+
+[RAFT-RS] `Storage::entries`, `src/storage.rs`:
+
+> Entries are supported to be fetched asynchronously depending on the context. Async is optional.
+> Storage should check context.can_async() first and decide whether to fetch entries asynchronously
+> based on its own implementation. If the entries are fetched asynchronously, storage should return
+> LogTemporarilyUnavailable, and application needs to call `on_entries_fetched(context)` to trigger
+> re-fetch of the entries after the storage finishes fetching the entries.
+
+[RAFT-RS] `RawNode::on_entries_fetched`, `src/raw_node.rs`, "A callback when entries are fetched
+asynchronously": for a context of `GetEntriesFor::SendAppend { to, term, aggressively }` it returns
+when "term or leadership has changed" or "the peer has been removed", and otherwise calls
+`self.raft.send_append(to)`.
+
+[RAFT-RS] `RawNode` has no such call for a snapshot (none of its public methods at that commit
+takes one made): the core's next try is its next send to the member, as on the member's answer
+to a heartbeat (`handle_heartbeat_response`, `src/raft.rs`):
+
+> if pr.matched < self.r.raft_log.last_index() || pr.pending_request_snapshot != INVALID_INDEX
+> {
+>     self.r.send_append(m.from, pr, &mut self.msgs);
+> }
+
+hyper-raft's `RawNode::send_append(member)` is `on_entries_fetched`'s call: "A leader sends
+`member` what follows its progress, if it may be sent now: what its owner asks once storage has
+read the entries it said it did not hold yet (`StorageError::LogTemporarilyUnavailable`, which
+leaves the member's progress as it was), as raft-rs's `on_entries_fetched` does. Any other role
+sends nothing." (`vendor/hyper-raft/src/node.rs`). hyper-durable's catch-up from the log's file
+calls it for each member whose page the store has read (`Replica::stream_catch_up`).
+
+**Finding 4 [Analysis].** A snapshot answered temporarily unavailable leaves the member's
+progress as it was (§2), the same state a page answered `LogTemporarilyUnavailable` leaves, so
+the same call sends it once made: the owner need not wait for the core's next try, which is a
+heartbeat's answer away, and never comes where nothing beats.
+
 ## 3. TiKV makes the image on demand, in a worker
 
 [TIKV] `PeerStorage::snapshot`, when no snapshot is ready and the requesting peer is in the
@@ -85,6 +124,8 @@ machine that does not need it.
 - `Held::snapshot` serves a held snapshot only if it reaches the core's `request_index` and the
   log's start; else it records the index needed and answers `SnapshotTemporarilyUnavailable`.
 - The replica's next drive makes the image then (`Replica::make_wanted`), at the point the
-  machine applied, with the configuration held there; the core sends it at its next try.
+  machine applied, with the configuration held there, and in the same drive asks the core to send
+  it to each member behind the log's start it may send to now (`Replica::send_made`, through
+  `RawNode::send_append`; Finding 4), not at the core's next try.
 - Open: the image is still made in one step on the node's shard when it is asked for. The next
   step is TiKV's shape: build it off the shard, or in bounded slices (docs/design/replica.md §7).

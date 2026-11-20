@@ -22,8 +22,9 @@ pub struct Held<L> {
     pub(crate) snapshot: Option<Snapshot>,
     /// The index a snapshot the core asked for must reach, when none held did: the replica takes
     /// it and makes the image at its next drive, and the core, told until then that a snapshot
-    /// is temporarily unavailable, sends it at its next try (raft-rs's `Storage::snapshot`,
-    /// mantle docs/research/91-snapshots-on-demand.md). A cell, as the core asks through `&self`.
+    /// is temporarily unavailable, is asked by that drive to send it (raft-rs's
+    /// `Storage::snapshot` and `on_entries_fetched`, mantle
+    /// docs/research/91-snapshots-on-demand.md). A cell, as the core asks through `&self`.
     pub(crate) wanted: Cell<Option<u64>>,
     /// The bytes of one page the core walks storage by: the store reads at most this much at a
     /// time when the core looks at entries without taking them.

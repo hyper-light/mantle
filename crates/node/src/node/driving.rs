@@ -66,7 +66,8 @@ use hyper_transport::Refusal;
 use mantle_meta::apply::Layer;
 
 use super::host::{
-    GatewaySettings, Handover, Host, JobAsk, Native, Outcome, Pending, Serve, Table, Taken, taken,
+    Caller, Calls, GatewaySettings, Handover, Host, JobAsk, Native, Outcome, Pending, Serve, Table,
+    Taken, taken,
 };
 use super::keyed::{Key, Keyed};
 use super::{ChunkOutcome, NodeError, Wall};
@@ -174,8 +175,10 @@ pub(crate) struct Lanes {
     /// The node's chunk asks in `chunks` a piece of which moved since the lanes were last served,
     /// each once: at most the asks in `chunks`.
     pieces: Vec<u64>,
-    /// The shard's word that a door of its jobs moved, which its task waits on.
-    doors: Arc<Notify>,
+    /// The node's task's end of the shard's host's calls, which names the job whose door it moved
+    /// and wakes the shard's task by its word that a door of its jobs moved, which its task waits
+    /// on (`host::Calls`), so the shard's step wakes that job alone.
+    caller: Arc<Caller>,
     /// The bytes the shard's jobs moved since its task started, as it last said.
     moved: u64,
 }
@@ -191,14 +194,17 @@ impl Lanes {
         let (into, taken) = channel(room)?;
         let (answers, answered) = channel(slots)?;
         let (given, from) = channel(room)?;
-        let doors = Arc::new(Notify::new()?);
-        let woken = Arc::clone(&doors);
+        let woken = Arc::new(Notify::new()?);
+        // Room for twice the requests its lane takes at once, the exchanges its jobs come on.
+        let calls = Calls::new(room, Some(Arc::clone(&woken)))
+            .ok_or_else(|| NodeError::Bounds("a driving shard's calls".into()))?;
+        let caller = calls.caller();
         hyper_rt::runtime::submit_to_holder(holder, async move {
             // A shard that refuses it drops the task with its lanes' ends, which the node reads as
             // the shard's end (`NodeError::ShardEnded`).
             let _ = hyper_rt::futures::spawn_detached_as(
                 hyper_rt::coop::Class::Normal,
-                run((taken, answered, given), woken, start),
+                run((taken, answered, given), (woken, calls), start),
             );
         })?;
         Ok(Self {
@@ -217,7 +223,7 @@ impl Lanes {
             found: Vec::with_capacity(slots),
             chunks: std::collections::HashMap::with_capacity(chunk_asks),
             pieces: Vec::with_capacity(chunk_asks),
-            doors,
+            caller,
             moved: 0,
         })
     }
@@ -234,10 +240,10 @@ impl Lanes {
         hyper_rt::watch::stalls(self.holder).is_some_and(|stalls| !stalls.stalled)
     }
 
-    /// The shard's word that a door of its jobs moved, which a handed request's door carries for
-    /// the node's task to tell.
-    pub(crate) fn doors(&self) -> Arc<Notify> {
-        Arc::clone(&self.doors)
+    /// The caller of the shard's host, which a handed request's door carries for the node's task
+    /// to name its job by and wake the shard's task with (`host::Caller`).
+    pub(crate) fn caller(&self) -> Arc<Caller> {
+        Arc::clone(&self.caller)
     }
 
     /// The bytes the shard's jobs moved since its task started, as it last said: summed into the
@@ -734,7 +740,7 @@ async fn run(
         ChannelReceiver<(u64, Outcome)>,
         Sender<Out>,
     ),
-    doors: Arc<Notify>,
+    (doors, calls): (Arc<Notify>, Calls),
     start: Start,
 ) {
     let Ok(slots) = start.slots() else {
@@ -752,6 +758,9 @@ async fn run(
     } = start;
     // A driving shard's host keeps no doors: each job's half rides its end to the node's task.
     let mut host = Host::new(0, Some(gateway));
+    // The node's task names each job whose door it moves on these, which the host's step takes
+    // first, so it steps those jobs alone among the jobs waiting on their doors.
+    host.calling(Some(calls));
     let mut served = Served {
         gave: Vec::with_capacity(slots),
         answers: Keyed::with_capacity(slots),
@@ -883,6 +892,9 @@ pub(super) mod tests {
         let (into, taken) = channel(requests).unwrap();
         let (answers, answered) = channel(slots).unwrap();
         let (given, from) = channel(requests).unwrap();
+        let caller = Calls::new(requests, Some(Arc::new(Notify::new().unwrap())))
+            .unwrap()
+            .caller();
         let lanes = Lanes {
             shard: 1,
             holder,
@@ -899,7 +911,7 @@ pub(super) mod tests {
             found: Vec::with_capacity(slots),
             chunks: std::collections::HashMap::with_capacity(slots),
             pieces: Vec::with_capacity(slots),
-            doors: Arc::new(Notify::new().unwrap()),
+            caller,
             moved: 0,
         };
         (lanes, (taken, answered, given))

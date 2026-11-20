@@ -234,33 +234,41 @@ impl Job {
 
     /// Whether its turn has nothing to do until an event that wakes it comes (`Host::wake`,
     /// node.md §2.9 step 6d): one of its own asks answered, room offered it, its bound, its put's
-    /// renewal due, or its S3 connection naming it (`door::Mark`) as it sends a piece of its body,
-    /// takes an answer of its reply or lets go. Its turn would feed it nothing, ask nothing and
+    /// renewal due, its S3 connection naming it (`door::Mark`) as it sends a piece of its body,
+    /// takes an answer of its reply or lets go, or the node's task naming its native job
+    /// (`Call`) as it gives a piece of its body or lets go of it, takes or writes whole an answer
+    /// of its reply, or lets go of its reply. Its turn would feed it nothing, ask nothing and
     /// answer nothing where it holds no request for want of the node's room and no chunk for want
     /// of a volume's, and:
     ///
     /// - a put or a get reads its bucket's row or its version, or its get has no bytes to give
     ///   while its reads are out;
     /// - a put not over whose driver takes none of its body now waits on its asks;
-    /// - a put whose driver wants its body found its S3 door's channel empty, or a get or its last
-    ///   answers found no room in its S3 door's reply: the connection names it as it sends or
-    ///   takes more.
+    /// - a put whose driver wants its body found its door's channel empty, or a get or its last
+    ///   answers found no room in its door's reply, a native one's until the node's task wrote
+    ///   the last whole: the door names it as more comes or room frees.
     ///
-    /// A native job its door could move, a body's bytes or a reply's room, is turned at every
-    /// step: the node's task names no job to its host (`Native::mark` names its exchange to the
-    /// node's task alone).
+    /// A job whose door names it not, made with no mark or call, is turned at every step.
     fn rests(&self) -> bool {
         let asking = !self.pending.is_empty();
-        // One whose connection let go waits on it no more: its channels close as it goes.
-        let named = match &self.door {
-            Door::Local(local) => local
-                .mark
-                .as_ref()
-                .filter(|mark| !mark.gone())
-                .map(|_| local.as_ref()),
-            Door::Native(..) => None,
+        // What its door gives it next comes named: whether its body's channel was found empty,
+        // nothing of it ended, and whether its reply has no room for the next answer, a native
+        // one's until the node's task wrote the last whole. One whose connection or reply was let
+        // go waits on its door no more: its channels close as it goes.
+        let (dry, roomless) = match &self.door {
+            Door::Local(local) if local.mark.as_ref().is_some_and(|mark| !mark.gone()) => (
+                local
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.dry && body.ended.is_none()),
+                !local.pending.is_empty(),
+            ),
+            Door::Native(_, native) if native.called() => (
+                native.body.dry && native.body.ended.is_none(),
+                !native.written(),
+            ),
+            Door::Local(_) | Door::Native(..) => (false, false),
         };
-        let roomless = named.is_some_and(|local| !local.pending.is_empty());
         match &self.work {
             Work::Put(putting) => match putting.put.as_ref() {
                 None => asking,
@@ -269,12 +277,7 @@ impl Job {
                 Some(put) if !put.wants_body() => asking,
                 // What it carried over of its last piece is fed before any more is read.
                 Some(_) if !putting.carry.is_empty() => false,
-                Some(_) => named.is_some_and(|local| {
-                    local
-                        .body
-                        .as_ref()
-                        .is_some_and(|body| body.dry && body.ended.is_none())
-                }),
+                Some(_) => dry,
             },
             Work::Get(getting) => match getting.get.as_ref() {
                 None => asking,
@@ -452,6 +455,16 @@ pub(crate) struct Host {
     /// Its S3 jobs' slots by their requests' names (`door::Mark`), one a job: the job its
     /// connection named found in one probe (`Host::take_marks`), kept as `exchanges` is.
     named: Slots<u64>,
+    /// Where the node's task names its native jobs as it moves their doors ([`Calls`]), taken at
+    /// each step before any job is stepped (`Host::take_calls`); none for a host no node's task
+    /// names jobs to, whose jobs never rest on their doors.
+    calls: Option<Calls>,
+    /// Its native jobs' slots by the names their calls name them by (`Native::name`), one a job:
+    /// the job named found in one probe, kept as `named` is.
+    called: Slots<u64>,
+    /// The name the next native request its node's task takes is given (`Native::name`): one a
+    /// request, from a `u64` count no node's requests wrap.
+    next_name: u64,
     /// The slots of the jobs a turn's answers are for (`Host::step`), kept from turn to turn so a
     /// turn makes none: at most the asks answered at once, each a job's, which `asks` bounds.
     answered: Vec<usize>,
@@ -751,6 +764,9 @@ impl Host {
             exchanges: Slots::default(),
             asks: Slots::default(),
             named: Slots::default(),
+            calls: None,
+            called: Slots::default(),
+            next_name: 0,
             answered: Vec::new(),
             beats: Earliest::default(),
             renewals: Earliest::default(),
@@ -763,6 +779,7 @@ impl Host {
         let at = self.jobs.len();
         self.exchanges.hold(job.door.exchange(), at);
         self.named.hold(job.door.named(), at);
+        self.called.hold(job.door.called(), at);
         self.asks
             .hold(job.pending.iter().map(|(pending, _)| *pending), at);
         self.jobs.push(job);
@@ -782,6 +799,7 @@ impl Host {
         let job = self.jobs.swap_remove(at);
         self.exchanges.release(job.door.exchange());
         self.named.release(job.door.named());
+        self.called.release(job.door.called());
         self.asks
             .release(job.pending.iter().map(|(pending, _)| *pending));
         self.beats.swap_remove(at);
@@ -789,6 +807,7 @@ impl Host {
         if let Some(moved) = self.jobs.get(at) {
             self.exchanges.hold(moved.door.exchange(), at);
             self.named.hold(moved.door.named(), at);
+            self.called.hold(moved.door.called(), at);
             self.asks
                 .hold(moved.pending.iter().map(|(pending, _)| *pending), at);
         }
@@ -851,6 +870,66 @@ impl Host {
         }
     }
 
+    /// Takes `calls` for its native jobs ([`Calls`]): the node's task names each job on them as it
+    /// moves its door.
+    pub(crate) fn calling(&mut self, calls: Option<Calls>) {
+        self.calls = calls;
+    }
+
+    /// The caller that names its jobs to this host, where it has calls.
+    pub(super) fn caller(&self) -> Option<std::sync::Arc<Caller>> {
+        self.calls.as_ref().map(Calls::caller)
+    }
+
+    /// A name for the next native request the node's task takes (`Native::name`).
+    fn name_next(&mut self) -> u64 {
+        let name = self.next_name;
+        self.next_name = self.next_name.wrapping_add(1);
+        name
+    }
+
+    /// The native jobs the node's task named since the last step ([`Calls`]), each one's word let
+    /// go, then the job woken: the step that follows sees what moved its door before the word was
+    /// let go, and what moves it after names it again, so no move is lost and at most one step
+    /// repeats. At most the calls' room a step, as `take_marks` takes the S3 door's names; where a
+    /// name found no room, every native job is woken, its word let go. A name whose job ended or
+    /// went to another host finds none.
+    fn take_calls(&mut self) {
+        let Some(calls) = self.calls.as_mut() else {
+            return;
+        };
+        let missed = calls
+            .caller
+            .missed
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if missed {
+            for job in &mut self.jobs {
+                if let Door::Native(_, native) = &job.door {
+                    native
+                        .handed
+                        .called
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    job.resting = false;
+                }
+            }
+        }
+        for _ in 0..calls.room {
+            let Some(name) = calls.taken.try_recv().ok().flatten() else {
+                break;
+            };
+            let Some(job) = self.called.get(&name).and_then(|at| self.jobs.get_mut(at)) else {
+                continue;
+            };
+            if let Door::Native(_, native) = &job.door {
+                native
+                    .handed
+                    .called
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            job.resting = false;
+        }
+    }
+
     /// Job `at`'s keys from its state at `now`, the shard's clock: its beat or bound where its work
     /// is held (`Job::due_ns`), and its put's next renewal (`Job::renewal_ns`). Set as it is
     /// pushed, as its turn ends and as a piece of a chunk it asked moves: between its turns nothing
@@ -904,6 +983,11 @@ impl Host {
             window,
             driven,
         } = *handed;
+        // Named to the host it came from, or to none, before: its first step here, which comes as
+        // it is pushed, sees what moved its door, and what moves it after names it here.
+        half.handed
+            .called
+            .store(false, std::sync::atomic::Ordering::Release);
         let label = Some(labels::host(&op));
         let now = hyper_rt::futures::now_ns();
         self.push(
@@ -1105,6 +1189,15 @@ impl Door {
             Self::Native(..) => None,
         }
     }
+
+    /// The name a native job's calls name it by (`Call`), its door's half's, which a job handed
+    /// to a driving shard carries; none for the S3 listener's.
+    fn called(&self) -> Option<u64> {
+        match self {
+            Self::Native(_, native) => native.name,
+            Self::Local(_) => None,
+        }
+    }
 }
 
 /// A native job's ends of its exchange's channels (node.md §2.9 step 6c): a put's body as the
@@ -1136,6 +1229,10 @@ pub(crate) struct Native {
     /// The marker is kept with the door, the exchange taken with each request.
     exchange: Option<ExchangeId>,
     marker: Option<Marker>,
+    /// Its name on the calls of the host that runs it ([`Call`]), given as the node's task takes
+    /// its request, unique for the node's life, and carried to a driving shard with the job; none
+    /// for a job no node's task names.
+    name: Option<u64>,
 }
 
 /// What a native job tells the node's task to write to its exchange, in order, as an S3 job tells
@@ -1206,6 +1303,14 @@ struct Handed {
     dropped: std::sync::atomic::AtomicBool,
     cut: std::sync::atomic::AtomicBool,
     marked: std::sync::atomic::AtomicBool,
+    /// The other way ([`Call`]): whether the node's task names the job to the host that runs it as
+    /// it moves its door, so the job's turns pass it by while it waits on its door alone
+    /// (`Job::rests`); and whether the node's task named it since that host took the last name, so
+    /// it names it once however much it moves the door meanwhile.
+    calls: std::sync::atomic::AtomicBool,
+    called: std::sync::atomic::AtomicBool,
+    /// The job's name on those calls (`Native::name`), which the node's task names it by.
+    name: std::sync::atomic::AtomicU64,
     /// The oracle's counts, each moved after the job's mark: the answers on the reply's channel
     /// not yet taken, and the pieces of the body the job took since its feeding last looked
     /// (`Writes::audit`, `Feedings::audit`).
@@ -1264,6 +1369,12 @@ impl Native {
     /// Whether the node's task let go of its reply: nothing it gives will be written.
     fn gone(&self) -> bool {
         self.handed.gone.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether the node's task names its job as it moves its door ([`Call`]) and holds its reply
+    /// still: what the door gives it next wakes it.
+    fn called(&self) -> bool {
+        self.handed.calls.load(std::sync::atomic::Ordering::Acquire) && !self.gone()
     }
 
     /// Says its work is held: the node's task vouches for it at its next write, woken where it
@@ -1409,6 +1520,7 @@ fn native_door() -> Option<(Native, Replies)> {
             node: None,
             exchange: None,
             marker: None,
+            name: None,
         },
         Replies {
             told,
@@ -1418,7 +1530,7 @@ fn native_door() -> Option<(Native, Replies)> {
             out: None,
             drain: Drain::default(),
             room: None,
-            driving: None,
+            call: None,
         },
     ))
 }
@@ -1536,11 +1648,12 @@ impl Doors {
         native.moved = 0;
         native.node = None;
         native.exchange = None;
+        native.name = None;
         replies.drained = None;
         replies.out = None;
         replies.drain = Drain::default();
         replies.room = None;
-        replies.driving = None;
+        replies.call = None;
         let handed = &native.handed;
         handed
             .unwritten
@@ -1552,6 +1665,8 @@ impl Doors {
             &handed.dropped,
             &handed.cut,
             &handed.marked,
+            &handed.calls,
+            &handed.called,
         ] {
             word.store(false, std::sync::atomic::Ordering::Release);
         }
@@ -1607,11 +1722,12 @@ pub(crate) struct Replies {
     /// apart meanwhile (`vouch_every`), its node's turn due at its next vouch (research/77 D1, D2;
     /// `Node::host_due`); past it, its exchange refused `Budget`.
     room: Option<(u64, u64)>,
-    /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
-    /// of its moved (`driving::Lanes::doors`), told as the node's task takes what the job gave or
-    /// writes it whole, or lets go of the reply, so the job gives its next or ends; none where the
-    /// node's task runs the job, which it steps in its own turn.
-    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+    /// The caller of the host that runs its job, the node's own or a driving shard's
+    /// ([`Caller`]): told as the node's task takes what the job gave or writes it whole, or lets
+    /// go of the reply, so the job gives its next or ends, it names the job to that host and wakes
+    /// a driving shard's task (node.md §2.9 step 6f); none for a job no host is told of, which its
+    /// host steps at every turn.
+    call: Option<std::sync::Arc<Caller>>,
 }
 
 /// What a native get's client took of a piece the node's task held whole, timed from when the
@@ -1755,14 +1871,25 @@ impl Replies {
             .map(|(bound, vouched)| bound.min(vouched.saturating_add(vouch_every(beat))))
     }
 
-    /// Wakes the driving shard its job runs on, where one does and the job has not ended: its door
-    /// moved.
+    /// Names its job to the host that runs it and wakes the driving shard it runs on, where one
+    /// does, while the job has not ended: its door moved.
     fn wake_job(&self) {
-        if let Some(driving) = &self.driving
-            && !self.handed.ended.load(std::sync::atomic::Ordering::Acquire)
-        {
-            driving.notify_one();
+        if self.handed.ended.load(std::sync::atomic::Ordering::Acquire) {
+            return;
         }
+        if let Some(call) = &self.call {
+            call.name(&self.handed);
+        }
+    }
+
+    /// Names its job to `call`'s host from here, as its feeding does where it holds the same: the
+    /// job rests on its door only where one does (`Job::rests`). A name given another host before
+    /// is let go as the host that takes the job pushes it (`Host::take_handed`).
+    fn call_by(&mut self, call: Option<std::sync::Arc<Caller>>) {
+        self.handed
+            .calls
+            .store(call.is_some(), std::sync::atomic::Ordering::Release);
+        self.call = call;
     }
 
     /// Writes what the job gave, as [`Replies::write_told`] does, and wakes the driving shard its
@@ -2332,6 +2459,81 @@ impl Marks {
     }
 }
 
+/// A host's calls (node.md §2.9 step 6d): the native jobs whose door the node's task moved since
+/// the host's step took the last, each named by its name (`Native::name`) as the node's task gives
+/// a piece of its body or lets go of it, takes or writes whole an answer of its reply, or lets go
+/// of its reply ([`Caller`]), so the step wakes those jobs alone (`Host::take_calls`), where it
+/// stepped every native job at every turn; and the word that a name found no room, on which every
+/// native job is woken. The S3 door's names are the same rule for its connections (`door::Mark`).
+/// Bound: the channel's room, twice the exchanges the host's jobs come on at once
+/// ([`Calls::new`]), each job named once while its door's word stands (`Handed::called`); none
+/// made where the channel cannot be, on which no door names its job and none rests on its door.
+pub(crate) struct Calls {
+    taken: ChannelReceiver<u64>,
+    caller: std::sync::Arc<Caller>,
+    room: usize,
+}
+
+/// The node's task's end of a host's calls, one a host, shared by the doors of the jobs it runs:
+/// the channel's sender, the word a name with no room sets, and, for a driving shard's host, that
+/// shard's word that a door of its jobs moved, which its task waits on (`driving::Lanes::doors`),
+/// so one pointer a door both names its job and wakes the task that steps it.
+pub(crate) struct Caller {
+    calls: Sender<u64>,
+    missed: std::sync::atomic::AtomicBool,
+    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+}
+
+impl Calls {
+    /// Calls with room for twice `exchanges`, the exchanges the host's jobs come on at once, at
+    /// least one: a job is named once until its host takes the name, and once more where its door
+    /// is kept and taken by a new request first, its old name waiting, which the host passes
+    /// over, as the node's marks ([`Marks::new`]); `driving` the word of the driving shard whose
+    /// host takes them. None where the channel cannot be made.
+    pub(crate) fn new(
+        exchanges: usize,
+        driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+    ) -> Option<Self> {
+        let room = exchanges.saturating_mul(2).max(1);
+        let (calls, taken) = hyper_rt::sync::channel(room).ok()?;
+        Some(Self {
+            taken,
+            caller: std::sync::Arc::new(Caller {
+                calls,
+                missed: std::sync::atomic::AtomicBool::new(false),
+                driving,
+            }),
+            room,
+        })
+    }
+
+    /// The node's task's end.
+    pub(crate) fn caller(&self) -> std::sync::Arc<Caller> {
+        std::sync::Arc::clone(&self.caller)
+    }
+}
+
+impl Caller {
+    /// Names the job whose door `handed` is, once until its host takes the name (`handed`'s
+    /// word), a name with no room setting the word on which the host wakes every native job, and
+    /// wakes the driving shard's task where one runs the job.
+    fn name(&self, handed: &Handed) {
+        if !handed
+            .called
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let name = handed.name.load(std::sync::atomic::Ordering::Acquire);
+            if self.calls.try_send(name).is_err() {
+                self.missed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        if let Some(driving) = &self.driving {
+            driving.notify_one();
+        }
+    }
+}
+
 /// The beat a reply waiting for room is vouched for by, half of it apart (`vouch_every`): the
 /// probe timeout before any sample (`bounds::initial_pto`, RFC 9002 §6.2.1), a constant.
 fn room_beat() -> u64 {
@@ -2403,10 +2605,9 @@ pub(crate) struct Feeding {
     /// Whether the job let go of the body: the rest is read and dropped, so its exchange ends whole
     /// for its reply.
     dropping: bool,
-    /// While its job runs on a driving shard (node.md §2.9 step 6f), that shard's word that a door
-    /// of its moved, told as a piece or the end is given or the feeding is let go, so the job takes
-    /// it; its door's (`Replies::driving`).
-    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+    /// Its door's caller (`Replies::call`), told as a piece or the end is given or the feeding is
+    /// let go, so the job takes it.
+    call: Option<std::sync::Arc<Caller>>,
 }
 
 /// What became of a body the node's task fed at a turn.
@@ -2539,10 +2740,11 @@ impl Feeding {
         self.pieces
     }
 
-    /// Wakes the driving shard its job runs on, where one does: its body moved.
+    /// Names its job to the host that runs it and wakes the driving shard it runs on, where one
+    /// does: its body moved.
     fn wake_job(&self) {
-        if let Some(driving) = &self.driving {
-            driving.notify_one();
+        if let Some(call) = &self.call {
+            call.name(&self.handed);
         }
     }
 
@@ -2578,13 +2780,13 @@ fn body_of(op: &Op) -> Option<(u64, Option<checksum::Algorithm>)> {
 /// §2.9 step 6c): of its object's length and its trailer's algorithm, from its first byte on its
 /// door's channel of one piece, the least that moves a body (`door::Depth::FIRST`), `pieces` the
 /// sender its door lent and `handed` what its door's halves share, from the feeding, which the node's task keeps, to its door's receiver, which the
-/// put's job takes from, the trailer's value past the object's bytes the feeding's; `driving` the
-/// word of the driving shard its job runs on, none where the node's task runs it.
+/// put's job takes from, the trailer's value past the object's bytes the feeding's; `call` the
+/// caller of the host that runs its job ([`Caller`]), none where none is told.
 fn feed(
     (length, trailing): (u64, Option<checksum::Algorithm>),
     pieces: Sender<Piece>,
     handed: std::sync::Arc<Handed>,
-    driving: Option<std::sync::Arc<hyper_rt::sync::Notify>>,
+    call: Option<std::sync::Arc<Caller>>,
 ) -> Feeding {
     let width = trailing.map_or(0, checksum::Algorithm::width);
     Feeding {
@@ -2597,7 +2799,7 @@ fn feed(
         trailer: Vec::new(),
         empty: length == 0 && width == 0,
         dropping: false,
-        driving,
+        call,
     }
 }
 
@@ -3860,7 +4062,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // the host kept from a request before it, or one made (6d): one that cannot be made leaves
         // nothing to reply on, so the exchange is refused, as an owner past what it holds refuses
         // one, which its asker asks again after.
-        let Some((mut native, replies)) = self.host.doors.take() else {
+        let Some((mut native, mut replies)) = self.host.doors.take() else {
             self.driver
                 .endpoint()
                 .refuse_exchange(exchange, Refusal::Budget);
@@ -3903,6 +4105,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if admitted_ns.is_some() {
             self.charge_admitted(charge);
         }
+        // And the node's task names the job to the host as it moves its door, so the host's step
+        // passes the job by while it waits on its door alone (`Call`).
+        let name = self.host.name_next();
+        native.name = Some(name);
+        native
+            .handed
+            .name
+            .store(name, std::sync::atomic::Ordering::Release);
+        replies.call_by(self.host.caller());
         self.replies.push((exchange, replies));
         self.host.push(
             Job {
@@ -4171,11 +4382,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // A request placed on a shard a driving task runs on is handed there with its operation
         // (node.md §2.9 step 6e), the shard making its work; its door carries that shard's word
         // and the node's task's waker, each side waking the other as it moves the door (6f).
+        // Its job named to that shard's host, and that shard's task woken, as the node's task moves
+        // its door (`Caller`).
         let driving = job.driven.and_then(|shard| {
             self.driving
                 .iter()
                 .find(|lanes| lanes.shard() == shard)
-                .map(super::driving::Lanes::doors)
+                .map(super::driving::Lanes::caller)
         });
         job.work = match op {
             Err(_) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
@@ -4204,23 +4417,23 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         let lends = body.is_some();
         let held = self.replies.change(exchange, |replies| {
-            if handing {
-                replies.driving = driving;
+            if handing && driving.is_some() {
+                replies.call_by(driving);
             }
             if !lends {
                 return None;
             }
-            Some((replies.body.take()?, replies.driving.clone()))
+            Some((replies.body.take()?, replies.call.clone()))
         });
         if handing && held.is_some() {
             native.node = Some(self.waker.clone());
         }
         if let Some(body) = body {
             match held.flatten() {
-                Some((pieces, driving)) => {
+                Some((pieces, call)) => {
                     let handed = std::sync::Arc::clone(&native.handed);
                     self.feeding
-                        .push((exchange, feed(body, pieces, handed, driving)));
+                        .push((exchange, feed(body, pieces, handed, call)));
                 }
                 None => job.work = Work::Draining(Box::new(Reply::slowed(door::Slowed::Door))),
             }
@@ -4339,10 +4552,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 }
                 request.half.node = None;
                 if let Some(exchange) = exchange {
+                    // Named to the node's own host from here, as it was before it was handed.
+                    let call = self.host.caller();
                     self.replies
-                        .change(exchange, |replies| replies.driving = None);
+                        .change(exchange, |replies| replies.call_by(call.clone()));
                     if let Some((_, feeding)) = self.feeding.get_mut(exchange) {
-                        feeding.driving = None;
+                        feeding.call = call;
                     }
                 }
                 self.host.take_handed(request, exchange);
@@ -5074,6 +5289,9 @@ impl Host {
     /// where it stepped none (`crate::labels`): a long poll of the task is counted under the
     /// operation that cost it most. Only a step that did work is timed ([`Timing`]).
     pub(super) fn step<N: Serve>(&mut self, node: &mut N) -> Result<(), NodeError> {
+        // The jobs whose doors the node's task moved, woken before any is stepped, so a step sees
+        // each move named before it (`Host::take_calls`).
+        self.take_calls();
         if self.jobs.is_empty() {
             labels::set(None);
             return Ok(());
@@ -9763,6 +9981,268 @@ pub(super) mod tests {
         }
     }
 
+    /// A native request's job of `work`, handed with its fields read (`handed_job`), named `name`
+    /// to `host` where it has calls, as the node's task names one it takes: the node's task's half
+    /// of its door, which names it as it moves the door (`Call`), beside it.
+    fn called_job(host: &Host, work: Work, now: u64, charge: u64, name: u64) -> (Job, Replies) {
+        let (mut job, mut replies) = handed_job(work, now, charge);
+        if let Door::Native(_, native) = &mut job.door {
+            native.name = Some(name);
+            native
+                .handed
+                .name
+                .store(name, std::sync::atomic::Ordering::Release);
+        }
+        replies.call_by(host.caller());
+        (job, replies)
+    }
+
+    /// A native door's node's task's half, the exchange it writes to, and whether its reply is
+    /// over.
+    type Written = (Replies, Seen, bool);
+
+    /// The steps each of `turns` turns of `host` took, the node's task writing each reply not over
+    /// as far as its exchange takes it after the host's step, as `Node::write_replies` follows
+    /// `Node::step_host`.
+    fn native_turns(
+        host: &mut Host,
+        stub: &mut Stub,
+        doors: &mut [Written],
+        now: u64,
+        turns: usize,
+    ) -> Vec<u64> {
+        let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
+        (0..turns)
+            .map(|_| {
+                let _ = clock_reads();
+                host.step(stub).unwrap();
+                let (_, steps) = clock_reads();
+                for (replies, seen, over) in doors.iter_mut().filter(|(_, _, over)| !*over) {
+                    *over = replies.write(seen, true, now, &mut moved, &mut slowed) == Wrote::Over;
+                }
+                steps
+            })
+            .collect()
+    }
+
+    /// 64 native GETs of an empty object whose exchanges take none of their replies' fields for
+    /// 32 turns, then half take them, then the rest: the steps of each turn, every get answered
+    /// `Done` with no bytes and its exchange ended. Named to their host where `calling`, as the
+    /// node's task names each (`Call`); else, as before, a native job is never passed by for its
+    /// door.
+    fn native_gets(calling: bool) -> Vec<u64> {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        if calling {
+            host.calling(Calls::new(64, None));
+        }
+        let read = scheming_gateway().charges.read(1);
+        let mut doors = Vec::new();
+        for name in 0..64 {
+            let (job, replies) = called_job(&host, work(get_op(), None), now, read, name);
+            host.push(job, now);
+            doors.push((replies, Seen::default(), false));
+        }
+        let mut stub = put_and_get_stub();
+        // Its version asked; read, its head given; its head taken, its fields not.
+        let mut steps = native_turns(&mut host, &mut stub, &mut doors, now, 3);
+        // Its exchange takes nothing.
+        steps.extend(native_turns(&mut host, &mut stub, &mut doors, now, 32));
+        // Half the exchanges take their fields whole, the node's task naming their gets, which
+        // give their ends; then the rest.
+        for (_, seen, _) in doors.iter_mut().take(32) {
+            seen.credit = usize::MAX;
+        }
+        steps.extend(native_turns(&mut host, &mut stub, &mut doors, now, 2));
+        for (_, seen, _) in doors.iter_mut().skip(32) {
+            seen.credit = usize::MAX;
+        }
+        steps.extend(native_turns(&mut host, &mut stub, &mut doors, now, 2));
+        assert!(host.idle(), "every get ended");
+        assert_eq!(stub.asked, 64, "each get's one read");
+        for (_, seen, over) in &doors {
+            assert!(*over && seen.ended && !seen.refused);
+            let reply = reply_seen(seen);
+            assert_eq!((reply.status, reply.size), (Status::Done, 0));
+        }
+        steps
+    }
+
+    /// Steps native GETs waiting on their exchanges: 64 gets of an empty object, each named to its
+    /// host as the node's task takes or writes whole an answer of its reply (`Call`). Each get is
+    /// stepped as it asks its version, as the version comes, its head given, and as the node's
+    /// task takes its head, whose fields its exchange takes none of; then 32 turns pass every get
+    /// by (`Job::rests`), where each turn stepped every get; and as each exchange takes its fields
+    /// whole, its get alone is stepped, giving its end and ending. 256 steps over 39 turns, four a
+    /// get, where every turn stepped every get, 2,432, 37 or 38 a get; each answered `Done` with
+    /// no bytes and its exchange ended, no wake lost.
+    #[test]
+    fn a_native_get_waiting_on_its_exchange_is_stepped_only_as_the_node_names_it() {
+        let named = native_gets(true);
+        let walked = native_gets(false);
+        assert_eq!(named.len(), 39);
+        assert_eq!(named[..3], [64, 64, 64]);
+        assert_eq!(named[3..35].iter().sum::<u64>(), 0, "{named:?}");
+        assert_eq!(named[35..], [0, 32, 0, 32]);
+        assert_eq!(named.iter().sum::<u64>(), 256);
+        assert_eq!(walked.iter().sum::<u64>(), 2_432, "{walked:?}");
+    }
+
+    /// 64 native puts of an empty body whose bodies come 32 turns late: the steps of each turn,
+    /// every put answered `Done` with its version. Named to their host where `calling`, as
+    /// [`native_gets`].
+    fn native_puts(calling: bool) -> Vec<u64> {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        if calling {
+            host.calling(Calls::new(64, None));
+        }
+        let mut doors = Vec::new();
+        let mut feedings = Vec::new();
+        for name in 0..64 {
+            let mut putting = native_put(0);
+            putting.trailing = None;
+            let (job, mut replies) = called_job(&host, Work::Put(putting), now, 7, name);
+            let handed = std::sync::Arc::clone(&replies.handed);
+            let call = replies.call.clone();
+            feedings.push(feed((0, None), replies.body.take().unwrap(), handed, call));
+            host.push(job, now);
+            let seen = Seen {
+                credit: usize::MAX,
+                ..Seen::default()
+            };
+            doors.push((replies, seen, false));
+        }
+        let mut stub = put_and_get_stub();
+        // Its driver wants its body, which has not come; then 32 turns more.
+        let mut steps = native_turns(&mut host, &mut stub, &mut doors, now, 33);
+        // The node's task gives each body's end, naming its put: its end taken and its commit
+        // asked; then its commit answered, its reply given.
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        for feeding in &mut feedings {
+            assert_eq!(feeding.send(Piece::End(Some(crc.clone()))), Fed::Moved);
+        }
+        steps.extend(native_turns(&mut host, &mut stub, &mut doors, now, 2));
+        assert!(host.idle(), "every put ended");
+        assert_eq!(stub.asked, 64, "each put's one commit");
+        for (_, seen, over) in &doors {
+            assert!(*over && seen.ended && !seen.refused);
+            let reply = reply_seen(seen);
+            assert_eq!((reply.status, reply.version.as_str()), (Status::Done, "v"));
+        }
+        steps
+    }
+
+    /// Steps native puts waiting on their bodies: 64 puts of an empty body, each named to its host
+    /// as the node's task gives a piece of its body (`Call`). Each put is stepped at its first
+    /// turn, finding its body's channel empty; 32 turns then pass every put by (`Job::rests`),
+    /// where every turn stepped every put; and as the node's task gives each body's end, each put
+    /// alone is stepped, taking its end and asking its commit, and again as its commit is
+    /// answered. 192 steps over 35 turns, three a put, where every turn stepped every put, 2,240,
+    /// 35 a put; each answered `Done` with its version, no wake lost.
+    #[test]
+    fn a_native_put_waiting_on_its_body_is_stepped_only_as_the_node_names_it() {
+        let named = native_puts(true);
+        let walked = native_puts(false);
+        assert_eq!(named.len(), 35);
+        assert_eq!(named[0], 64);
+        assert_eq!(named[1..33].iter().sum::<u64>(), 0, "{named:?}");
+        assert_eq!(named[33..], [64, 64]);
+        assert_eq!(walked.iter().sum::<u64>(), 2_240, "{walked:?}");
+    }
+
+    /// The node's task names a native job once until its host takes the name, however often it
+    /// moves the job's door meanwhile; the host lets the name go before it steps the job, so a
+    /// move after names it again; a job handed to another host is named there afresh; and a name
+    /// past the calls' room is missed, on which the host wakes every native job, read once.
+    #[test]
+    fn the_node_names_a_native_job_once_until_its_host_takes_the_name() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(2, Some(std::sync::Arc::new(scheming_gateway())));
+        host.calling(Calls::new(1, None));
+        let done = || Work::Draining(Box::new(Reply::status(Status::Done)));
+        let (job, replies) = called_job(&host, done(), now, 0, 7);
+        let handed = std::sync::Arc::clone(&replies.handed);
+        assert!(handed.calls.load(std::sync::atomic::Ordering::Acquire));
+        let call = replies.call.clone().unwrap();
+        call.name(&handed);
+        call.name(&handed);
+        let calls = host.calls.as_mut().unwrap();
+        assert_eq!(calls.taken.try_recv().unwrap(), Some(7));
+        assert_eq!(calls.taken.try_recv().unwrap(), None, "named once");
+        // Taken but not let go: named no more.
+        call.name(&handed);
+        assert_eq!(calls.taken.try_recv().unwrap(), None, "named no more");
+        // Let go of as the host takes it before a step: the job woken, and named again after.
+        handed
+            .called
+            .store(false, std::sync::atomic::Ordering::Release);
+        host.push(job, now);
+        host.jobs[0].resting = true;
+        call.name(&handed);
+        host.take_calls();
+        assert!(!host.jobs[0].resting, "woken by its name");
+        assert!(!handed.called.load(std::sync::atomic::Ordering::Acquire));
+        call.name(&handed);
+        host.take_calls();
+        assert!(!handed.called.load(std::sync::atomic::Ordering::Acquire));
+        // A third and fourth job's names past the room of two: missed, every native job woken.
+        let (other, other_replies) = called_job(&host, done(), now, 0, 8);
+        host.push(other, now);
+        let (third, third_replies) = called_job(&host, done(), now, 0, 9);
+        host.push(third, now);
+        for job in &mut host.jobs {
+            job.resting = true;
+        }
+        for replies in [&replies, &other_replies, &third_replies] {
+            replies.call.as_ref().unwrap().name(&replies.handed);
+        }
+        assert!(
+            host.calls
+                .as_ref()
+                .unwrap()
+                .caller
+                .missed
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        host.take_calls();
+        assert!(host.jobs.iter().all(|job| !job.resting), "every one woken");
+        assert!(
+            !host
+                .calls
+                .as_ref()
+                .unwrap()
+                .caller
+                .missed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "read once"
+        );
+        // Handed to another host with its word still set: let go as it is pushed there.
+        handed
+            .called
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (native, _) = native_door().unwrap();
+        let mut half = Box::new(native);
+        half.handed = std::sync::Arc::clone(&handed);
+        half.name = Some(7);
+        let mut there = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        there.take_handed(
+            Box::new(Handover {
+                half,
+                principal: "o".into(),
+                op: get_op(),
+                block: None,
+                deadline_ns: None,
+                admitted_ns: None,
+                charge: 0,
+                window: 1,
+                driven: Some(1),
+            }),
+            None,
+        );
+        assert!(!handed.called.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     /// A gateway of the rates and target `mantle init`'s cells state (crates/mantle/tests/support).
     fn scheming_gateway() -> GatewaySettings {
         GatewaySettings {
@@ -13280,8 +13760,8 @@ pub(super) mod tests {
         let (get_half, mut get_replies) = doors.take().unwrap();
         // Each reply carries the shard's word, as the node's task gives it to a request it hands
         // (`Node::read_fields`): its write tells the shard as it takes an answer or writes it whole.
-        put_replies.driving = Some(lanes.doors());
-        get_replies.driving = Some(lanes.doors());
+        put_replies.call = Some(lanes.caller());
+        get_replies.call = Some(lanes.caller());
         // The put's body as the node's task gives it: empty, whole.
         let body = put_replies.body.as_ref().unwrap();
         assert!(body.try_send(Piece::End(None)).is_ok());
@@ -13453,7 +13933,7 @@ pub(super) mod tests {
         let (mut moved, mut slowed) = (0, [0; door::Slowed::ALL.len()]);
         for at in 0..GETS {
             let (half, mut replies) = doors.take().unwrap();
-            replies.driving = Some(lanes[0].doors());
+            replies.call = Some(lanes[0].caller());
             let get = Op::Get {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -13771,10 +14251,10 @@ pub(super) mod tests {
         // The put's body as the node's task feeds it, from the sender its door lends, its door
         // carrying the shard's word as `Node::read_fields` gives it.
         let (put_half, mut put_replies) = doors.take().unwrap();
-        put_replies.driving = Some(lanes.doors());
+        put_replies.call = Some(lanes.caller());
         let pieces = put_replies.body.take().unwrap();
         let handed = std::sync::Arc::clone(&put_replies.handed);
-        let driving = put_replies.driving.clone();
+        let driving = put_replies.call.clone();
         let mut feeding = Some(feed(body_of(&put).unwrap(), pieces, handed, driving));
         assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
         let mut cell = Cell::new();
@@ -13827,7 +14307,7 @@ pub(super) mod tests {
             // The get, once the put is answered, of the bytes it wrote.
             if put_over && get_replies.is_none() {
                 let (get_half, mut replies) = doors.take().unwrap();
-                replies.driving = Some(lanes.doors());
+                replies.call = Some(lanes.caller());
                 let get = Op::Get {
                     bucket: "b".into(),
                     key: "k".into(),
@@ -13944,10 +14424,10 @@ pub(super) mod tests {
             };
             let now = hyper_rt::futures::now_ns();
             let (put_half, mut put_replies) = doors.take().unwrap();
-            put_replies.driving = Some(lanes.doors());
+            put_replies.call = Some(lanes.caller());
             let pieces = put_replies.body.take().unwrap();
             let handed = std::sync::Arc::clone(&put_replies.handed);
-            let driving = put_replies.driving.clone();
+            let driving = put_replies.call.clone();
             let mut feeding = Some(feed(body_of(&put).unwrap(), pieces, handed, driving));
             assert!(lanes.hand(handover(put_half, put, 7, now)).is_none());
             let mut put_seen = Seen {
@@ -13991,7 +14471,7 @@ pub(super) mod tests {
                 per_put = Some(gave);
             }
             let (get_half, mut get_replies) = doors.take().unwrap();
-            get_replies.driving = Some(lanes.doors());
+            get_replies.call = Some(lanes.caller());
             let get = Op::Get {
                 bucket: "b".into(),
                 key: "k".into(),

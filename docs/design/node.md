@@ -1430,6 +1430,55 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   records its engines applied and had not made durable when its host stopped, a start's first
   liveness write found no room, and each start found the log as full again
   (`tests/sim.rs`, `a_node_whose_log_fills_with_live_records_waits_for_its_ranges_to_compact_and_starts_again`).
+  A proof is taken in the turn after the log answers it, whatever else the node waits for. In the
+  simulation (§9.1) the log answers a liveness write in no simulated time, and the harness wakes the
+  node's task once the clock has passed the ask, as a device's completion wakes it through the
+  write's waker (`run_node`). That wake is a sleep, and the simulated shards had two timers, both
+  held while the node waited: its wait's own sleep and its QUIC driver's. A sleep that finds no
+  timer free arms only once one frees (hyper-rt's `Sleep`, counted in `Counters::timer_waits`), so
+  the answer was taken at the node's next wake of its own. On seed 1 of the loaded founder's test
+  (`tests/sim.rs`,
+  `a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off`) the
+  joiner, cut off from its founder, asked a proof 4.1 ms after the cut and submitted it in the same
+  turn, the log answered it at once, and the joiner took it 443.7 ms later, at its stream's next
+  wake, its shard counting one more sleep that waited for a timer at each proof. Its stream judged
+  nothing meanwhile, and the wait, past the margin it held the founder to, gave the founder that
+  margin again from its end (hyper-liveness, "A judge whose own proof stalls"; research/81 L3), so
+  the founder was suspected 801 ms after the cut, past the 552 ms patience the joiner stated.
+  Nothing of it was the log's ordering (raft-log.md §3) or the node's: the stream's ask was
+  submitted in the turn that made it. The simulated shards now have the three timers a node's task
+  waits on at once, as hyper-rt derives a shard's bound from its tasks' concurrent waits
+  (`hyper_rt::futures::within`). Over the run the joiner's proofs had waited a median 8.5 ms and
+  up to 1.5 s for the wake; now each is taken a timer tick, 100 µs, after it was asked, and the
+  joiner suspects the cut-off founder 88.2 ms after the cut, within the 92.0 ms patience it states,
+  which the test now holds it to. A node's real log wakes its task through the write's waker, which takes
+  no timer (`NodeLog::write_liveness`).
+  Proofs taken at once exposed an owed write that waited for good. A refused write was asked again
+  only once a range's write became durable or the ranges applied more, and a node idle when the
+  log refused it does neither. Nor does the log hold it a slot of its own: hyper-log keeps a waiter
+  only for room in its queue, which `submit_waking` waits for already and refuses `Busy` only past
+  the waiters it holds, and it frees a full file's segments at a sweep after its groups compact,
+  which it tells no submitter of (raft-log.md §3, §5). The stream asks no other proof while one is
+  out (hyper-liveness's `Liveness::poll`), so a node whose log refused its write as it went idle
+  held its heartbeats for as long as it idled, and its peers suspected it as one whose disk stalls.
+  On seed 1 of `a_liveness_write_the_log_refuses_for_room_is_owed_and_the_node_goes_on` the leader
+  and a follower counted 2 of their 3 refusals while the clients ran; the third came after they
+  finished, and the cell stood still 3.1 s until the test failed. An owed write is now asked
+  again, whatever else moved, one of the stream's shortest sending intervals after its refusal
+  (`Node::liveness_retry_at`, a deadline of the task's wait): the cadence at which the stream of a
+  node that writes nothing else asks its proofs (this item: one per shortest interval among its
+  pairs), since a heartbeat leaves only on a durable write made after the previous one was due and
+  the stream asks one when none came in time (hyper-liveness's flush proof; research/81 L3, "A
+  judge whose own proof stalls"). A proof so waits no longer than the stream itself waits between
+  proofs, which the patience a node states already holds (`Status::patience`: its longest sending
+  interval and its mean flush), and the log is asked no more often than the stream asks it: each
+  retry refused asks one compaction of every range, as each refusal did. A slot in the log woken
+  by the sweep that frees a segment would answer sooner; hyper-log has no such event to give.
+  `an_idle_node_whose_liveness_write_the_log_refused_proves_itself_again` (`tests/sim.rs`) refuses
+  an idle follower's next two writes: it counts both and takes its proof 0.2 ms after the second
+  on seed 1, within the 4.8 ms patience it states (seed 2, on regional paths: 240 ms, within
+  1.73 s). Without the retry it counted both, the first refusal's compaction having written, then
+  took no proof, and the cell stood still 3.1 s until the test failed.
 - (6) Each range's next wake and the stream's are the task's deadlines, and a wait that ends at
   or past the stream's wake is reported (`Liveness::on_wait`).
 - (7) The root range keeps each enlisted node's history: the time it has run over all its runs and

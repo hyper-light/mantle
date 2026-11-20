@@ -913,7 +913,15 @@ impl Sim {
             &RuntimeConfig {
                 shards: u16::try_from(shards).unwrap(),
                 tasks_per_shard: 1,
-                timers_per_shard: 2,
+                // A node's task holds three timers at once while it waits: its wait's sleep
+                // (`Node::wait`), its QUIC driver's (`Driver::event`), and the answer wake of its
+                // stream's write (`run_node`). The bound covers the task's concurrent waits, as
+                // hyper-rt derives it (`hyper_rt::futures::within`): with two, the answer wake found
+                // none free and armed only once the node's wait ended for something else, so on
+                // seed 1 of `a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_
+                // suspects_it_cut_off` the joiner took its proofs a median 8.5 ms and up to 1.5 s
+                // after the log answered them, at its own next wakes (node.md §2.4, item 5).
+                timers_per_shard: 3,
                 interests_per_shard: interests_for(1).max(2 * 2 * shards),
                 ring_entries: 1,
                 step_budget_ns: 1_000_000_000,

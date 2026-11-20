@@ -150,7 +150,27 @@ simulation, whose members have one update out at a time and so never return with
 
 A group's updates become durable in the order submitted. An update that waits for a frame
 with room holds its group's later updates behind it for that frame, so a newer hard state
-never lands before an older one.
+never lands before an older one. Room admits a group's submissions in arrival order (only its
+oldest waiter may take room), the writer takes them in that order and keeps a group's later
+update behind its earlier one in every frame's order (`writer::order`), and it checks each
+against the group as published, when the update is laid into a frame, after every frame
+before is published: so an update's entries follow those of every earlier update of its group
+the log took, and one whose first entry lies past the group's last plus one is refused
+`Invalid` ("entries past the last leave a gap"). A refusal keeps the order: every write a
+group's handle sent before it took a refusal is refused `Behind`, wherever it waits, and a
+write it sends after is of its next epoch, which the log takes. hyper-durable's store splits a
+write larger than a frame into parts and tells its replica of a part's refusal only once the
+write's last part is answered, while the handle has taken the refusal at once: so the store
+sends nothing in between, has no room, and refuses a write submitted then `Behind` itself.
+Before, it sent such a write in the handle's next epoch, past the refused write's parts, and
+the log refused it for the gap, which fenced a member of a three-node cell at the start of a
+PUT phase (perf-10k `0603268e`;
+`vendor/hyper-durable/tests/hyperlog.rs`,
+`a_write_submitted_while_a_refused_writes_parts_are_out_is_refused_with_it`). Six groups
+keeping up to six parts out on a log small enough to refuse 5,691 writes `Full`, 10 for their
+bound, 23,058 `Busy` and 50,919 `Behind` over 39 seeds, each writing again from what its handle
+holds once every write out was answered, had no write refused for a gap
+(`vendor/hyper-log/tests/order.rs`).
 
 A replica cannot have its update refused: once the core has handed over a `Ready`, it takes
 no other call until the `Ready` is made durable (07 §1.2). So a replica submits by waiting

@@ -870,3 +870,99 @@ fn a_group_stopped_with_its_compaction_out_opens_again_at_once() {
         );
     }
 }
+
+/// A write sent while the store holds a refusal its caller has not taken is refused with it,
+/// never laid past it. Before, a write in parts whose first part the log refused stayed out until
+/// its last part's answer came, while the handle had already taken the refusal and moved to its
+/// next epoch, which the log takes: a write submitted meanwhile went out in that epoch, the log
+/// refused the refused write's last part `Behind` and laid the new write past it, and refused it
+/// `Invalid`, "entries past the last leave a gap", which fences a replica (mantle, perf-10k
+/// 0603268e: a three-node cell stopped a member at the start of a PUT phase). Do: under
+/// `Waits::Told`, a group at its retained bound; five writes of a hard state alone, then a write
+/// in two parts, whose second waits in the store with the handle full; a cut refuses the first
+/// part `Backlog`; the first hard state's answer is taken and a write submitted, which sends the
+/// second part and waits in the store itself; the refusal is taken with the second part out; a
+/// write is then submitted, and a cut lays what is out. Expect: the store has no room while the
+/// refusal waits for its caller; the write in parts is refused for room, and the two after it
+/// `Behind`; the log still ends where it did.
+#[test]
+fn a_write_submitted_while_a_refused_writes_parts_are_out_is_refused_with_it() {
+    let log = Log::create(
+        sim_file(43),
+        Config {
+            waits: Waits::Told,
+            ..config(16, 4)
+        },
+        1,
+    )
+    .unwrap();
+    let mut store = GroupStore::claim(&log, 1).unwrap();
+    let (waker, woken) = store_waker();
+    let cut = |log: &Log<SimFile>| log.cut().unwrap().wait().unwrap();
+    let held = entries_of(1, 4, 1);
+    store.submit(&write_of(1, &held), &waker).unwrap();
+    cut(&log);
+    answer_of(&mut store, &woken);
+    let hard = hyper_durable::Write {
+        hard_state: Some(hyper_raft::proto::HardState {
+            term: 1,
+            ..hyper_raft::proto::HardState::default()
+        }),
+        ..hyper_durable::Write::default()
+    };
+    for _ in 0..5 {
+        store.submit(&hard, &waker).unwrap();
+    }
+    let room = log.frame_room().unwrap();
+    let big: Vec<_> = (5..=6)
+        .map(|index| hyper_raft::proto::Entry {
+            index,
+            term: 1,
+            data: vec![index as u8; room * 2 / 3],
+            ..hyper_raft::proto::Entry::default()
+        })
+        .collect();
+    store.submit(&write_of(5, &big), &waker).unwrap();
+    assert!(
+        !store.room(),
+        "the write in parts did not wait in the store"
+    );
+    cut(&log);
+    answer_of(&mut store, &woken);
+    // The second part goes out as the handle has room again, before the refusal is taken.
+    let next = entries_of(7, 7, 1);
+    store.submit(&write_of(7, &next), &waker).unwrap();
+    for _ in 0..4 {
+        answer_of(&mut store, &woken);
+    }
+    assert!(
+        store.poll().is_none(),
+        "the write in parts was answered with a part out"
+    );
+    let room_while_refused = store.room();
+    let after = entries_of(8, 8, 1);
+    store.submit(&write_of(8, &after), &waker).unwrap();
+    cut(&log);
+    let mut answers = Vec::new();
+    while answers.len() < 3 {
+        match store.poll() {
+            Some(answer) => answers.push(answer),
+            None => {
+                woken.recv().unwrap();
+            }
+        }
+    }
+    assert!(
+        matches!(answers[0], Err(hyper_durable::Fault::Room(_))),
+        "the write in parts: {:?}",
+        answers[0]
+    );
+    for answer in &answers[1..] {
+        assert_eq!(answer, &Err(hyper_durable::Fault::Behind));
+    }
+    assert_eq!(store.handle().view().unwrap().unwrap().last, 4);
+    assert!(
+        !room_while_refused,
+        "a store holding a refusal its caller has not taken has room"
+    );
+}

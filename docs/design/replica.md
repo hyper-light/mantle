@@ -371,12 +371,26 @@ the log only to claim its group (measurements/2026-10-01-group-log.md).
 The engine makes applied state durable on its own schedule. A compaction makes it durable
 (`compact`) and writes its durable index to the log as the group's new start, keeping a window
 of entries behind it for followers that lag, never past what the log holds durably nor a start
-still out; the log then frees the entries before it (raft-log.md §5; 06 §C.b.2). A member that
-needs entries from before the start is sent a snapshot instead: every row of the range as of
-the last entry the leader applied, made on demand, with the configuration the group held there
-(hyper-raft `docs/durable.md` §2.3). A snapshot's index is at or past the log's start, so the
-member continues from the entries after it. A member installs one before its log records the
-new start, its engine's rows durable first, so the log never starts past what the engine holds.
+still out; the log then frees the entries before it (raft-log.md §5; 06 §C.b.2). A compaction
+reads no rows: the engine is the range's durable state, so making it durable is what lets the
+log go, and an image is needed only to send a member too far behind (research/91 §4, the
+dissertation's §5.2). A member that needs entries from before the start is sent a snapshot
+instead: every row of the range as of the last entry the leader applied when the core asked for
+it, with the configuration the group held there (hyper-raft `docs/durable.md` §2.3). The core asks
+storage for one (`Storage::snapshot`); none held reaches what it needs, so storage notes the
+index needed and answers that a snapshot is temporarily unavailable, the replica's next drive
+makes the image, and the core sends it at its next try, the member's next answer to a heartbeat:
+raft-rs's and etcd's storage contract, and TiKV's shape (research/91 §2–§3). A snapshot's index
+is at or past the log's start, so the member continues from the entries after it; one a later
+compaction passed serves no member and is let go of. Until this, every compaction imaged the
+range, read and encoded every row on the node's shard whether or not any member was behind: 2%
+of that thread's time in a profile of a three-node cell on one Mac Studio taking one-byte PUTs at
+about 5,500 a second, and a cost that grew with every object stored.
+`a_compaction_with_no_member_behind_makes_no_image`,
+`a_member_behind_the_start_catches_up_by_an_image_made_when_asked` and
+`an_image_made_for_a_member_is_of_the_point_applied_when_asked` (`crates/range/tests/group.rs`)
+hold this. A member installs one before its log records the new start, its engine's rows
+durable first, so the log never starts past what the engine holds.
 For now the rows travel inside the snapshot message. The production engine will move its files
 out of band instead (12 §6.3).
 
@@ -669,11 +683,11 @@ damages a member's last frame holding a proposal: its open answers `Damaged`, th
 on, the rebuilt member catches up and replaces it, and every entry any member applied is
 held, with its answers, on every member after.
 
-The snapshot a replica prepares for lagging members names the configuration it was prepared
-at, and a member refuses a snapshot that does not name it. A member added after the leader
-last compacted could therefore never be caught up by that snapshot. When an applied change
-names a member the prepared snapshot does not, the replica prepares the snapshot again at the
-change. Membership changes are rare, so this costs one image each.
+The snapshot a member is sent names the configuration the leader held when the core asked for
+it (§4), so a member added after the leader last compacted is named in the image made for it.
+A member takes a snapshot that does not name it all the same (thesis §4.1; hyper-raft
+`docs/raft.md` §3.4), so one made before the change still serves it.
+`a_member_added_after_compaction_catches_up_and_replaces_a_lost_one` holds this.
 
 ## 7. Open
 
@@ -703,6 +717,10 @@ change. Membership changes are rare, so this costs one image each.
   quarter of a frame until it does.
 - The window of entries kept for lagging followers before one is sent a snapshot, and
   moving snapshots out of band with the production engine.
+- The image a member behind the log's start is sent is made in one step on the node's shard
+  when the core asks for it (§4): rare, as only a member that far behind asks, but O(rows) when
+  it comes. The next step is TiKV's (research/91 §3): build it off the shard, or in bounded
+  slices, storage answering "temporarily unavailable" until the last slice is made.
 - Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed
   by ReadIndex rounds (§3) until then.
 - The session lifetime and the sessions a range holds, from how long gateways go between

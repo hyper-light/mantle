@@ -283,9 +283,10 @@ enum Kind {
     Ready(u64),
     /// The commit alone.
     Commit,
-    /// A compaction's start, and the bytes of the image it was made with: what the compaction
-    /// rule weighs the log against once the start is durable ([`Compaction`]).
-    Start(u64),
+    /// A compaction's start, and the bytes its machine stated an image of its state there takes,
+    /// if it states them ([`StateMachine::image_bytes`]): what the compaction rule weighs the log
+    /// against once the start is durable ([`Compaction`]). No image is made for a compaction.
+    Start(Option<u64>),
 }
 
 /// Where a write is.
@@ -368,10 +369,13 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     sizes: VecDeque<u32>,
     /// The index of the entry whose count `sizes` holds first.
     sizes_from: u64,
-    /// The bytes of the image the log was last compacted to: the one this member made or
-    /// installed, or at open, the image of what it opened with; none from a machine that keeps
-    /// no image.
+    /// The bytes of the image the log was last compacted to, as the machine states them
+    /// ([`StateMachine::image_bytes`]), or of the one this member installed; at open, of what it
+    /// opened with; none from a machine that states none.
     imaged: Option<u64>,
+    /// The images made for members behind the log's start since the member opened
+    /// ([`Replica::images_made`]).
+    images_made: u64,
     /// What the core was last told was applied.
     told_applied: u64,
     /// The index of the entry that made the configuration.
@@ -561,6 +565,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             sizes: VecDeque::new(),
             sizes_from: durable.index.saturating_add(1),
             imaged: None,
+            images_made: 0,
             told_applied: durable.index,
             conf_index: durable.index,
             fence: None,
@@ -587,18 +592,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             waiting: Vec::new(),
             catching_up: false,
         };
-        // A log compacted before the restart serves a lagging member only by snapshot, and its
-        // image is what the compaction rule weighs the log against; a log never compacted is
-        // weighed against the image of what the member opened with, as its machine states it.
-        replica.imaged = if view.start.index > 0 {
-            let prepared = replica.prepare().map_err(|e| match e {
-                ReplicaError::Fenced(Cause::Machine(fatal)) => OpenError::Machine(fatal),
-                _ => OpenError::Core(hyper_raft::Error::Invariant("a snapshot at open")),
-            })?;
-            Some(prepared)
-        } else {
-            replica.machine.image_bytes()
-        };
+        // The log is weighed against the image of what the member opened with, as its machine
+        // states it. None is made here: a log compacted before the restart serves a lagging
+        // member by an image made when the core asks for one ([`Replica::make_wanted`]).
+        replica.imaged = replica.machine.image_bytes();
         replica
             .count_applied(view.start.index)
             .map_err(|e| OpenError::Core(hyper_raft::Error::Storage(e)))?;
@@ -1647,6 +1644,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.quiet_commit(now, waker)?;
                 r.stream_catch_up(waker, out)?;
             }
+            r.make_wanted()?;
             r.release_reads(out);
             r.keep();
             r.settle();
@@ -1773,11 +1771,22 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             if let Kind::Start(imaged) = write.kind {
                 // The log starts past what it compacted only now: a start refused changed
                 // nothing, and is the owner's to ask again (`Replica::make_again`).
-                self.imaged = Some(imaged);
+                if imaged.is_some() {
+                    self.imaged = imaged;
+                }
                 let start = self.node.store().log.bounds().map(|(start, _)| start.index);
                 let start =
                     start.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
                 self.let_go_through(start);
+                // A snapshot behind the start serves no member: it would need entries the log
+                // no longer holds. Its bytes go now, not at the next member that falls behind.
+                let held = &mut self.node.store_mut().snapshot;
+                if held
+                    .as_ref()
+                    .is_some_and(|s| proto::snapshot_index(s) < start)
+                {
+                    *held = None;
+                }
                 if let Some(stall) = self.stall.as_mut() {
                     stall.freed = true;
                 }
@@ -2642,25 +2651,42 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
     }
 
-    /// Prepares the snapshot the core serves to members behind the log's start: the state
-    /// machine's image, with the configuration the group held at its point. Not the
-    /// configuration applied since: a member installing it applies the changes after the
-    /// image's point from the log, each once. Its bytes.
-    fn prepare(&mut self) -> Result<u64, ReplicaError> {
+    /// Makes the snapshot the core asked for, when none held reached what it needs
+    /// ([`Held::wanted`]): the state machine's image, with the configuration the group held at
+    /// its point. Not the configuration applied since: a member installing it applies the
+    /// changes after the image's point from the log, each once. The core, told the snapshot was
+    /// temporarily unavailable, sends it at its next try, the member's next answer to a
+    /// heartbeat. An image is made only here, so only for a member behind the log's start,
+    /// never for a compaction (raft-rs's `Storage::snapshot`, TiKV's `PeerStorage::snapshot`;
+    /// Ongaro's thesis §5.2; mantle docs/research/91-snapshots-on-demand.md). None is made before
+    /// the machine applied through what is needed: the core asks again, and one made now would
+    /// not reach it.
+    fn make_wanted(&mut self) -> Result<(), ReplicaError> {
+        let Some(wanted) = self.node.store().wanted.take() else {
+            return Ok(());
+        };
+        if self.applied.index < wanted {
+            return Ok(());
+        }
         let mut data = Vec::new();
         let imaged = self.machine.image(&mut data);
         let (point, configuration) = self.machine_did(imaged)?;
-        let snapshot = Snapshot {
+        self.images_made = self.images_made.saturating_add(1);
+        self.node.store_mut().snapshot = Some(Snapshot {
             data,
             metadata: Some(SnapshotMetadata {
                 conf_state: Some(configuration),
                 index: point.index,
                 term: point.term,
             }),
-        };
-        let imaged = bytes(snapshot.data.len());
-        self.node.store_mut().snapshot = Some(snapshot);
-        Ok(imaged)
+        });
+        Ok(())
+    }
+
+    /// The images this member made of its state machine for members behind its log's start since
+    /// it opened ([`Replica::make_wanted`]): a compaction makes none.
+    pub fn images_made(&self) -> u64 {
+        self.images_made
     }
 
     /// Makes the state machine's applied state durable and lets the log free what is before it,
@@ -2685,8 +2711,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             }
             let term = r.node.store().log.term(index);
             let term = term.map_err(|e| r.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
-            // The image a member behind the new start is sent, ready before the start moves.
-            let imaged = r.prepare()?;
+            // No image: a member behind the new start is sent one made when the core asks for it
+            // ([`Replica::make_wanted`]). Imaged here, every compaction read and encoded every
+            // row on the thread that drives the group, whether or not any member was behind.
+            let imaged = r.machine.image_bytes();
             // The log is compacted only through what it states committed, stated with it.
             let hard = (index > r.issued.commit).then_some(HardState {
                 commit: index,

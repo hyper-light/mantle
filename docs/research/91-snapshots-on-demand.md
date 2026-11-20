@@ -1,0 +1,90 @@
+# 91 — Snapshots made when a member needs one, not at compaction
+
+Status: research note, 2026-11-20, for docs/design/replica.md §4. It gathers what the primary
+sources say about when a Raft replica should make the image it sends a member behind its log's
+start: at log compaction, or only when the core asks for one. Quotations from code were read in
+the sources' own text on 2026-11-20 at the branches named (line by line, as the files state
+them); the dissertation is paraphrased, its section given. Analysis is marked as such.
+
+## 1. Sources
+
+- **[RAFT-RS]** tikv/raft-rs, branch `master`: `src/storage.rs` (trait `Storage`, `fn snapshot`)
+  and `src/raft.rs` (`prepare_send_snapshot`). hyper-raft keeps raft-rs's wire and storage
+  contract (research/32).
+- **[ETCD]** etcd-io/raft, branch `main`, `storage.go` (`ErrSnapshotTemporarilyUnavailable`,
+  `Storage.Snapshot`): the contract raft-rs ported.
+- **[TIKV]** tikv/tikv, branch `master`, `components/raftstore/src/store/peer_storage.rs`
+  (`PeerStorage::snapshot`, which `impl Storage for PeerStorage` calls).
+- **[DISS]** D. Ongaro, "Consensus: Bridging Theory and Practice", PhD dissertation, Stanford
+  University, 2014, ch. 5 ("Log compaction"); §5.1.2's rule is quoted in hyper-durable's
+  `src/compaction.rs`.
+
+## 2. The storage contract: a snapshot may be temporarily unavailable
+
+[RAFT-RS] `Storage::snapshot(&self, request_index: u64, to: u64)`:
+
+> Returns the most recent snapshot.
+> If snapshot is temporarily unavailable, it should return SnapshotTemporarilyUnavailable,
+> so raft state machine could know that Storage needs some time to prepare
+> snapshot and call snapshot later.
+> A snapshot's index must not be less than the `request_index`.
+> `to` indicates which peer is requesting the snapshot.
+
+[RAFT-RS] `prepare_send_snapshot`, on that error: it logs at debug, "failed to send snapshot to
+{} because snapshot is temporarily unavailable", and returns `false`. Nothing is sent and the
+member's progress is left as it was, so the leader tries again at its next send to that member
+(Analysis, from the same function).
+
+[ETCD] states the same: `ErrSnapshotTemporarilyUnavailable` "is returned by the Storage interface
+when the required snapshot is temporarily unavailable", and `Snapshot()` "returns the most recent
+snapshot. If snapshot is temporarily unavailable, it should return
+ErrSnapshotTemporarilyUnavailable, so raft state machine could know that Storage needs some time
+to prepare snapshot and call Snapshot later."
+
+hyper-raft keeps the contract: `Outbox::snapshot` (`vendor/hyper-raft/src/raft.rs`) answers
+`Ok(false)` on `StorageError::SnapshotTemporarilyUnavailable`, and a member's next answer to a
+heartbeat sends to it again (`handle_heartbeat_response` calls `Outbox::append` while the member
+lacks entries).
+
+**Finding 1.** The core does not need a snapshot ready before it asks: storage may say it is
+being made, and the core asks again. A snapshot made at compaction "in case" is not what the
+contract asks for.
+
+## 3. TiKV makes the image on demand, in a worker
+
+[TIKV] `PeerStorage::snapshot`, when no snapshot is ready and the requesting peer is in the
+region, sets `*snap_state = SnapState::Generating { .. }`, builds `GenSnapTask::new(..)` and
+hands it off with `self.set_gen_snap_task(task)`; while it is generating (`TryRecvError::Empty`
+on its receiver) and at the end of the call, it returns
+`raft::StorageError::SnapshotTemporarilyUnavailable`. Not read for this note, and to be checked
+against the source before it is quoted: that the task runs on a worker apart from the raftstore
+thread, and that TiKV's log garbage collection (its `CompactLog` admin command) makes no snapshot.
+
+**Finding 2.** A production Raft store with a disk-resident state machine images only for a
+member that asks: its `Storage::snapshot` starts the image and answers "temporarily
+unavailable" until it is made.
+
+## 4. Snapshotting and log truncation are separate for a disk-based state machine
+
+[DISS] §5.1 describes snapshotting for state machines held in memory, where the snapshot is what
+lets the log be truncated. §5.2 ("Snapshotting disk-based state machines") treats a state machine
+whose state of record is on disk: applying an entry changes the on-disk state, so once the state
+machine's writes are on disk the entries before them may be discarded from the log, and a
+consistent image of that state is needed only to send to a follower that is too far behind
+(paraphrase).
+
+**Finding 3 [Analysis].** Mantle's range engine is a disk-based state machine (a persisted engine
+whose checkpoint is its durable index), so its compaction is §5.2's: make applied state durable,
+then move the log's start. Imaging the state at every compaction is §5.1's cost paid by a
+machine that does not need it.
+
+## 5. What hyper-durable does with it (Analysis)
+
+- A compaction persists the machine and moves the log's start; it reads no rows. The compaction
+  rule's image size comes from `StateMachine::image_bytes`, which reads no state.
+- `Held::snapshot` serves a held snapshot only if it reaches the core's `request_index` and the
+  log's start; else it records the index needed and answers `SnapshotTemporarilyUnavailable`.
+- The replica's next drive makes the image then (`Replica::make_wanted`), at the point the
+  machine applied, with the configuration held there; the core sends it at its next try.
+- Open: the image is still made in one step on the node's shard when it is asked for. The next
+  step is TiKV's shape: build it off the shard, or in bounded slices (docs/design/replica.md §7).

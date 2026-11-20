@@ -303,7 +303,8 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     }
 
     /// Every row as of the last entry applied, under the configuration held there: the image is
-    /// made on demand, so it is of everything applied (docs/design/replica.md §4). It is made at
+    /// made when the core asks for a snapshot for a member behind the log's start, never for a
+    /// compaction, so it is of everything applied then (docs/design/replica.md §4). It is made at
     /// its length and moved into `into`, not copied.
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         let rows = self
@@ -314,10 +315,11 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         Ok((self.applied, self.configuration.clone()))
     }
 
-    /// The bytes `image` would write now. Asked once, when a member opens on a log never compacted
-    /// (`hyper_durable::Compaction`); an engine that cannot give its rows then, or rows past what
-    /// the image counts, gives none, so the log is not weighed against an image until its first
-    /// compaction makes one.
+    /// The bytes `image` would write now. Asked when a member opens and at each compaction
+    /// (`hyper_durable::Compaction`), so only from what the engine counts without reading its
+    /// rows; an engine that cannot, or rows past what the image counts, gives none, and the log is
+    /// not weighed against an image until the member installs one. Mantle compacts on its log's
+    /// room, not by that rule (node.md §6.2).
     fn image_bytes(&self) -> Option<u64> {
         let (rows, bytes) = self.engine.image_size()?;
         image::encoded_len_of(rows, bytes)

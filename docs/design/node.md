@@ -1707,8 +1707,9 @@ past `MTBF − (E(D) + η + T_E)` is imposed, and a lengthening past what promis
 margin in force. A peer whose stalls pass that ceiling for good is suspected at each of them: the
 detector is eventually perfect only for a link whose latenesses come to stay below it. The ceiling
 is the cell's MTBF less a detection, hours in a cell that has run for days: a partition that heals
-ends a premature suspicion too, and lengthens the margin past the partition, to that ceiling at
-most, until the latenesses double. The patience a node states (`Status::patience`) is read from
+ends a premature suspicion too, and lengthened the margin past the partition, to that ceiling at
+most, until the latenesses doubled; the node now caps the renewal at the silence it lets a peer
+keep (below). The patience a node states (`Status::patience`) is read from
 the margin in force, so it follows the lengthening, and a peer cut off is suspected within it.
 
 Measured on seed 1 at e0da1049 (macOS arm64, debug build), the founder loaded from after the
@@ -1718,6 +1719,40 @@ alike in both. The cut-off founder was suspected 41.2 ms after the cut against a
 90.5 ms without the rule, 54.4 ms against 129.4 ms with it, the margin in force longer. The test
 holds 2 as its bound (`tests/sim.rs`,
 `a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_it_cut_off`).
+
+*A premature suspicion lengthens a margin no further than the node lets a peer stay silent
+(2026-11-20).* Under the MTBF's ceiling alone, a partition of 30 s that heals ends a suspicion with a
+heartbeat 30 s late and lengthened the link's margin past 30 s, kept until the latenesses double,
+tens of minutes on a long-lived link at 10 Hz; a crash of that peer meanwhile went unsuspected for
+30 s rather than a margin and an interval, and everything a suspicion drives waited as long, a GET
+reading a chunk from a dead node before it asks another replica among them
+(`ChunkOutcome::Suspected`). The node states the longest a live peer may go silent: its transport's
+idle timeout (`bounds::idle_timeout`, 3.072 s), past which a silent connection is discarded, every
+exchange on it ends `Lost(Closed)` and the plane's keys for the peer go, so the stream can no longer
+hear it (RFC 9000 §10.1; research/81, "The question"). It is the cell's quiet period as built: the
+floor of the quiet period the simulation gives each heartbeat of the loaded founder (`Sim::quiet`,
+the serve period), and the one part of it not read from the margin itself, since the patience a node
+states (`Status::patience`) follows the margin in force and would cap nothing. A premature
+suspicion's renewal of a configured link's margin is capped at that silence less the link's interval
+(hyper-liveness `Liveness::set_silence`, `Pair::premature_configured`): Chen et al.'s configuration
+of NFD-E sets `α = T_D^u − η`, the margin all that the bound on detection leaves past the interval
+(research/81 [11] §6.2, Step 3, p. 572), so a crash is suspected within the silence the node already
+lets a peer keep. Where the lateness that ended the suspicion was within the cap, a renewal past it
+renews to it, the longest margin the bound leaves. Where the lateness itself passed the cap, nothing
+is renewed and the margin stays: the node takes a peer that silent for failed anyway, so the
+suspicion was no mistake by its own bound, and no margin within the cap would have spared it.
+Renewed to the cap instead, a healed partition would slow every crash's detection to about 3 s
+until the latenesses doubled, for a margin that spares no partition. Chen et al.'s schedule renews
+the margin as before, down as well as up and past the cap where the link's latenesses call for it;
+the cap holds a premature suspicion's renewal alone, and the margin of the node's evidence, which
+judges a link with no configuration of its own (above), is not capped by it. The rule is held by a
+unit test (hyper-liveness
+`a_premature_suspicion_never_lengthens_a_configured_margin_past_its_owners_silence`): a 107.5 ms
+margin that a 30 s partition renewed to 36.9 s without the cap stays at 107.5 ms, and a crash
+after it is suspected within the cap and an interval; a 2.98 s stall that renewed the margin to
+5.98 s without it renews to the cap less the interval. The owner called 3.072 s arbitrary (research/81, its opening);
+the cap is whatever the transport states, and moves with the idle timeout when research/81's design
+replaces it.
 
 A range hosted by no node still elects on ticks with focal's counts, as above (replica.md §3). SWIM's place (§3.5) does not
 change with it: SWIM's word stays a hint for routing and repair, and the stream's is what a

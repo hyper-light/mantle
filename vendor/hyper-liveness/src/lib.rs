@@ -452,6 +452,9 @@ pub struct Liveness {
     /// Whether each peer's process is judged apart from its disk
     /// ([`set_disk_apart`](Self::set_disk_apart)).
     apart: bool,
+    /// The longest a live peer may go silent, past which the owner takes it for failed whatever
+    /// the stream says ([`set_silence`](Self::set_silence)).
+    silence: Option<Duration>,
     /// The latest time the stream judged its peers at, a poll's or a heartbeat's arrival: what the
     /// trust it shows is stated at.
     judged_ns: u64,
@@ -678,6 +681,7 @@ impl Liveness {
             flushing: false,
             stall: None,
             apart: false,
+            silence: None,
             judged_ns: 0,
             exposure: settings.history,
             last_poll_ns: None,
@@ -715,6 +719,18 @@ impl Liveness {
     /// ([`set_disk_apart`](Self::set_disk_apart)).
     pub fn disk_apart(&self) -> bool {
         self.apart
+    }
+
+    /// The longest a live peer may go silent: past it the owner takes a silent peer for failed
+    /// whatever this stream says (mantle: its transport's idle timeout, past which a silent
+    /// connection is discarded and every exchange on it ends, RFC 9000 §10.1). No premature
+    /// suspicion's renewal lengthens a configured link's margin past it less the link's interval,
+    /// Chen et al.'s `α = T_D^u − η` (`Pair::premature_configured`), and a heartbeat late past that
+    /// ends a suspicion the owner's own bound upholds, which lengthens nothing: a renewal never
+    /// makes a crash's detection slower than the owner already lets a silent peer be. Set before
+    /// the first poll; none by default, a renewal then held to the unavailability ceiling alone.
+    pub fn set_silence(&mut self, silence: Duration) {
+        self.silence = Some(silence);
     }
 
     /// What the node has measured of its links, which judges a link with no configuration of its
@@ -982,6 +998,7 @@ impl Liveness {
             evidence: self.evidence.as_ref(),
             local,
             apart: self.apart,
+            silence: self.silence,
         };
         let mut changes = [None, None, None, None];
         let mut taken = pair::Taken::default();

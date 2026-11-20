@@ -1838,7 +1838,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         };
         // And at least one for each node the node may keep.
         let pairs = range_pairs.max(node_peers);
-        let liveness = Liveness::new(hyper_liveness::Settings {
+        let mut liveness = Liveness::new(hyper_liveness::Settings {
             local: settings.id,
             run,
             max_peers: pairs.max(1),
@@ -1849,6 +1849,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             resolution: Duration::from_nanos(resolution_ns),
         })
         .map_err(|e| at(Step::Network)(NodeError::Liveness(e)))?;
+        // A peer silent past the idle timeout has its connection discarded, every exchange on it
+        // ended and its plane keys dropped (RFC 9000 §10.1; research/81): the node takes it for
+        // failed whatever its stream says, so no premature suspicion lengthens a margin past it
+        // (node.md §2.4).
+        liveness.set_silence(limits.idle_timeout);
 
         let mut tls = Tls::mutual(&settings.credentials, true).map_err(at(Step::Identity))?;
         // A written-off node asks a member for its new identity on the enrollment protocol, beside

@@ -294,6 +294,41 @@ branches share extents). Sources, read 2026-11-20:
   sort the blocks by the time they were last modified and group blocks of similar age together
   into new segments; we call this approach age sort." [LFS §3.4]
 
+**Sprite LFS's cleaning policies [LFS §3.4-3.6], read 2026-11-20 from the same copy.**
+- Four policy issues: "When should the segment cleaner execute?", "How many segments should it
+  clean at a time?", "Which segments should be cleaned? An obvious choice is the ones that are
+  most fragmented, but this turns out not to be the best choice.", and "How should the live
+  blocks be grouped when they are written out?" [§3.4]
+- When and how many: "Sprite LFS starts cleaning segments when the number of clean segments drops
+  below a threshold value (typically a few tens of segments). It cleans a few tens of segments at
+  a time until the number of clean segments surpasses another threshold value (typically 50-100
+  clean segments)." Performance "does not seem to be very sensitive to the exact choice of the
+  threshold values"; which segments and how to group are "the primary factors". [§3.4]
+- Write cost, the bytes moved per byte of new data: cleaning N segments of utilization u reads N,
+  writes N*u live and frees N*(1-u), so write cost = (N + N*u + N*(1-u)) / (N*(1-u)) = 2/(1-u)
+  (formula 1); a segment with no live blocks need not be read, write cost 1.0. "the segments
+  cleaned must have a utilization of less than .8" for LFS to outperform the Unix FFS of the
+  day. [§3.4]
+- "The key to achieving high performance at low cost in a log-structured file system is to force
+  the disk into a bimodal segment distribution where most of the segments are nearly full, a few
+  are empty or nearly empty, and the cleaner can almost always work with the empty segments."
+  [§3.4]
+- Greedy (always the least-utilized segments) under a hot-and-cold load, live blocks sorted by
+  age: "locality and 'better' grouping result in worse performance than a system with no
+  locality!", since "a segment doesn't get cleaned until it becomes the least utilized of all
+  segments", and cold segments linger just above the cleaning point. [§3.5]
+- Cost-benefit: "benefit/cost = free space generated * age of data / cost = (1-u)*age/(1+u)",
+  with "the most recent modified time of any block in the segment (ie. the age of the youngest
+  block) as an estimate of how long the space is likely to stay free", and "The cost of cleaning
+  the segment is 1+u (one unit of cost to read the segment, u to write back the live data)."
+  Under it, "The cleaning policy cleans cold segments at about 75% utilization but waits until
+  hot segments reach a utilization of about 15% before cleaning them", and write cost falls "by
+  as much as 50% over the greedy policy". [§3.5]
+- The segment usage table: "For each segment, the table records the number of live bytes in the
+  segment and the most recent modified time of any block in the segment", set when the segment is
+  written and decremented as blocks die; "If the count falls to zero then the segment can be
+  reused without cleaning." [§3.6]
+
 **What mantle takes.** A store's extents are reference-counted already (§1, and the allocator's
 map, docs/design/engine-structure.md §3). Mantle writes a branch's pages contiguously, as a
 SplinterDB batch does, and begins the next branch built in the same store where the last one

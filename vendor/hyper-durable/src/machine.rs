@@ -52,17 +52,21 @@ pub trait StateMachine {
     /// An image of the machine's state at a point it applied, written into `into`, with the
     /// point and the configuration the group held there, which a snapshot carries with it
     /// (Ongaro and Ousterhout 2014, §7): what a leader sends a member that lacks entries
-    /// its log no longer holds. A machine that images on demand gives everything applied, under
-    /// [`StateMachine::configuration`]; one that keeps its owner's checkpoints, as focal's does,
-    /// gives the latest, which may be behind what it applied and is never behind the log's
-    /// start, for a compaction never passes [`StateMachine::durable`] (I8).
+    /// its log no longer holds. Asked only when the core asks for a snapshot for such a member,
+    /// never for a compaction (mantle docs/research/91-snapshots-on-demand.md). A machine that images on demand gives
+    /// everything applied, under [`StateMachine::configuration`]; one that keeps its owner's
+    /// checkpoints, as focal's does, gives the latest, which may be behind what it applied and
+    /// is never behind the log's start, for a compaction never passes [`StateMachine::durable`]
+    /// (I8).
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal>;
 
-    /// The bytes [`StateMachine::image`] would write now, or none for a machine that keeps no
-    /// image. Asked when a member opens on a log never compacted: the compaction rule weighs the
-    /// log against the image it was last compacted to ([`crate::Compaction`]), and before the
-    /// first, against the state the member opened with, which a group formed with state (a range
-    /// split from another) holds already. A machine that keeps none is never due.
+    /// The bytes [`StateMachine::image`] would write now, or none for a machine that cannot say
+    /// without reading its state. Asked when a member opens and at each compaction, on the
+    /// thread that drives the group, so it reads no state: the compaction rule weighs the log
+    /// against the image of the state it was last compacted to ([`crate::Compaction`]), and
+    /// before the first, against the state the member opened with, which a group formed with
+    /// state (a range split from another) holds already. A machine that states none is never due
+    /// until it installs a snapshot.
     fn image_bytes(&self) -> Option<u64>;
 
     /// Replaces the machine's state with `image`, which is of `at` under `configuration`, and

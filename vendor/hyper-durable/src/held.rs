@@ -1,7 +1,7 @@
 //! The core's storage: the group's durable log as its [`LogStore`] answers for it, with what the
-//! replica keeps beside it — the configuration it opened at and the snapshot it prepared for
-//! members that lag behind the log's start.
-use std::cell::RefCell;
+//! replica keeps beside it — the configuration it opened at and the snapshot it made, when the
+//! core asked for one, for members that lag behind the log's start.
+use std::cell::{Cell, RefCell};
 
 use hyper_raft::proto::{ConfState, Entry, HardState, Snapshot};
 use hyper_raft::{InitialState, Storage, StorageError};
@@ -16,8 +16,15 @@ pub struct Held<L> {
     pub(crate) configuration: ConfState,
     /// The hard state the log held when the member opened.
     pub(crate) opened: HardState,
-    /// The snapshot prepared for a member that needs entries the log no longer holds.
+    /// The snapshot made for a member that needs entries the log no longer holds: made only when
+    /// the core asks for one and none held reaches what it needs ([`Held::wanted`]), or the one
+    /// this member installed. It is let go of once a start passes it, as it then serves no one.
     pub(crate) snapshot: Option<Snapshot>,
+    /// The index a snapshot the core asked for must reach, when none held did: the replica takes
+    /// it and makes the image at its next drive, and the core, told until then that a snapshot
+    /// is temporarily unavailable, sends it at its next try (raft-rs's `Storage::snapshot`,
+    /// mantle docs/research/91-snapshots-on-demand.md). A cell, as the core asks through `&self`.
+    pub(crate) wanted: Cell<Option<u64>>,
     /// The bytes of one page the core walks storage by: the store reads at most this much at a
     /// time when the core looks at entries without taking them.
     pub(crate) page: u64,
@@ -33,6 +40,7 @@ impl<L: LogStore> Held<L> {
             configuration,
             opened,
             snapshot: None,
+            wanted: Cell::new(None),
             page,
             scratch: RefCell::new(Entry::default()),
         }
@@ -102,12 +110,20 @@ impl<L: LogStore> Storage for Held<L> {
         Ok(self.log.bounds()?.1)
     }
 
+    /// The snapshot held, if it reaches `request_index` and the log's start: one behind the start
+    /// would leave its member needing entries the log no longer holds. Else the index it must
+    /// reach is left for the replica ([`Held::wanted`]), and the core is told to try again.
     fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot, StorageError> {
+        let needed = request_index.max(self.log.bounds()?.0.index);
         match &self.snapshot {
-            Some(snapshot) if hyper_raft::proto::snapshot_index(snapshot) >= request_index => {
+            Some(snapshot) if hyper_raft::proto::snapshot_index(snapshot) >= needed => {
                 Ok(snapshot.clone())
             }
-            _ => Err(StorageError::SnapshotTemporarilyUnavailable),
+            _ => {
+                let wanted = self.wanted.get().map_or(needed, |held| held.max(needed));
+                self.wanted.set(Some(wanted));
+                Err(StorageError::SnapshotTemporarilyUnavailable)
+            }
         }
     }
 }

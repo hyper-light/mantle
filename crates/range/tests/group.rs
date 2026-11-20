@@ -2356,3 +2356,156 @@ fn a_group_stalled_for_room_under_heavy_writes_and_an_install_fences_no_member()
     assert!(stalls > 0, "no write was refused for room");
     assert!(installs > 0, "no member was caught up by a snapshot");
 }
+
+/// A snapshot a member was sent: its index, its term and the voters it names.
+type Sent = (u64, u64, Vec<u64>);
+
+/// Drives every node but `away` until no message is left in flight, delivering in order and
+/// dropping what goes to `away`, and records each snapshot sent.
+fn exchange(nodes: &mut [Node], away: Option<u64>, sent: &mut Vec<Sent>) {
+    let mut wire: VecDeque<Message> = VecDeque::new();
+    for _ in 0..10_000 {
+        for n in nodes.iter_mut().filter(|n| Some(n.replica.id()) != away) {
+            wire.extend(drive(&mut n.replica, true).0.messages);
+        }
+        let Some(m) = wire.pop_front() else {
+            return;
+        };
+        if let Some(meta) = m.snapshot.as_ref().and_then(|s| s.metadata.as_ref()) {
+            let mut voters = meta.conf_state.as_ref().unwrap().voters.clone();
+            voters.sort_unstable();
+            sent.push((meta.index, meta.term, voters));
+        }
+        if Some(m.to) != away {
+            let _ = nodes[usize::try_from(m.to).unwrap() - 1].replica.step(m);
+        }
+    }
+    panic!("the group never settled");
+}
+
+/// A group of three led by member 1, with `entries` entries applied by every member.
+fn led(entries: u64) -> Vec<Node> {
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, id)).collect();
+    nodes[0].replica.campaign().unwrap();
+    let mut sent = Vec::new();
+    exchange(&mut nodes, None, &mut sent);
+    for serial in 0..entries {
+        nodes[0].replica.propose(&registration(serial)).unwrap();
+        exchange(&mut nodes, None, &mut sent);
+    }
+    assert!(
+        sent.is_empty(),
+        "a snapshot went to a member holding the log"
+    );
+    nodes
+}
+
+/// The rows of `m` but the configuration's, which an install writes and a member that never
+/// applied a change does not hold: the configuration itself is compared on its own.
+fn rows_applied(m: &mut Model) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let configuration = [
+        mantle_meta::key::LOCAL,
+        mantle_meta::key::marker::CONFIGURATION,
+    ];
+    let mut out = rows(m);
+    out.retain(|(k, _)| k[..] != configuration);
+    out
+}
+
+/// Heartbeats from member 1 until `member` applied what it did, within `rounds` heartbeats.
+fn beat_until_caught_up(nodes: &mut [Node], member: u64, rounds: u32, sent: &mut Vec<Sent>) {
+    let at = usize::try_from(member).unwrap() - 1;
+    for _ in 0..rounds {
+        if nodes[at].replica.applied() == nodes[0].replica.applied() {
+            return;
+        }
+        for _ in 0..SETTINGS.heartbeat_tick {
+            nodes[0].replica.tick().unwrap();
+        }
+        exchange(nodes, None, sent);
+    }
+    panic!(
+        "member {member} never caught up: {}",
+        nodes[0].replica.describe()
+    );
+}
+
+/// A compaction makes no image: with every member holding what the leader applied, none is
+/// behind the new start, the core asks for no snapshot, and no member reads its engine's rows
+/// for one, through heartbeats after as well (docs/design/replica.md §4). Imaged at compaction,
+/// as it was, every compaction read and encoded every row on the node's shard.
+#[test]
+fn a_compaction_with_no_member_behind_makes_no_image() {
+    let mut nodes = led(4);
+    let mut sent = Vec::new();
+    assert!(nodes[0].replica.compact(0, 0, Waker::noop()).unwrap());
+    for n in &mut nodes[1..] {
+        n.replica.compact(0, 0, Waker::noop()).unwrap();
+    }
+    exchange(&mut nodes, None, &mut sent);
+    for _ in 0..3 {
+        for _ in 0..SETTINGS.heartbeat_tick {
+            nodes[0].replica.tick().unwrap();
+        }
+        exchange(&mut nodes, None, &mut sent);
+    }
+    assert!(sent.is_empty(), "a snapshot went out: {sent:?}");
+    for n in &nodes {
+        assert_eq!(n.replica.images_made(), 0, "member {}", n.replica.id());
+    }
+}
+
+/// A member away while the leader compacts past what it holds is behind the log's start: when
+/// it answers again, the core asks for a snapshot, is told none is ready, and the leader makes
+/// the image then, once, for the core to send at its next try; the member installs it and holds
+/// the leader's rows.
+#[test]
+fn a_member_behind_the_start_catches_up_by_an_image_made_when_asked() {
+    let mut nodes = led(1);
+    let mut sent = Vec::new();
+    for serial in 1..4 {
+        nodes[0].replica.propose(&registration(serial)).unwrap();
+        exchange(&mut nodes, Some(3), &mut sent);
+    }
+    assert!(nodes[0].replica.compact(0, 0, Waker::noop()).unwrap());
+    exchange(&mut nodes, Some(3), &mut sent);
+    assert_eq!(nodes[0].replica.images_made(), 0, "the compaction made one");
+    assert!(nodes[2].replica.applied() < nodes[0].replica.applied());
+
+    beat_until_caught_up(&mut nodes, 3, 20, &mut sent);
+    assert_eq!(nodes[0].replica.images_made(), 1);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let leader = rows_applied(nodes[0].replica.engine_mut());
+    assert_eq!(rows_applied(nodes[2].replica.engine_mut()), leader);
+    let mut voters = nodes[2].replica.configuration().voters.clone();
+    voters.sort_unstable();
+    assert_eq!(voters, vec![1, 2, 3]);
+}
+
+/// The image is of the point the leader applied when the core asked for it, with the
+/// configuration held there, not of the compaction's start: entries applied after the
+/// compaction and before the member answered are in it, and the member continues from its
+/// point.
+#[test]
+fn an_image_made_for_a_member_is_of_the_point_applied_when_asked() {
+    let mut nodes = led(1);
+    let mut sent = Vec::new();
+    nodes[0].replica.propose(&registration(1)).unwrap();
+    exchange(&mut nodes, Some(3), &mut sent);
+    assert!(nodes[0].replica.compact(0, 0, Waker::noop()).unwrap());
+    exchange(&mut nodes, Some(3), &mut sent);
+    let start = nodes[0].replica.applied();
+    for serial in 2..5 {
+        nodes[0].replica.propose(&registration(serial)).unwrap();
+        exchange(&mut nodes, Some(3), &mut sent);
+    }
+    let asked = nodes[0].replica.applied();
+    assert!(asked > start);
+
+    beat_until_caught_up(&mut nodes, 3, 20, &mut sent);
+    let term = nodes[0].replica.term();
+    assert_eq!(sent, vec![(asked, term, vec![1, 2, 3])]);
+    assert_eq!(nodes[0].replica.images_made(), 1);
+    let leader = rows_applied(nodes[0].replica.engine_mut());
+    assert_eq!(rows_applied(nodes[2].replica.engine_mut()), leader);
+}

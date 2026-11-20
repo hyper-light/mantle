@@ -648,4 +648,11 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
             .compact(keep, now, waker)
             .map_err(|e| refused(self.shell.machine(), e))
     }
+
+    /// The images of its engine this member made since it opened: one each time the core asked
+    /// for a snapshot for a member behind the log's start and none held reached it, never for a
+    /// compaction (docs/design/replica.md §4).
+    pub fn images_made(&self) -> u64 {
+        self.shell.images_made()
+    }
 }

@@ -153,7 +153,8 @@ update is answered when it is durable whatever the power. The log does not overl
 on a device whose flush measured free (measurement.md §9, C2), where the chunk store does
 (chunk-store.md §4): a frame's persist record states that the frame before it was flushed, and
 recovery's rule that a valid later frame proves every earlier one acknowledged (§2, §6) rests on
-each frame being written only after the one before is flushed.
+each frame being written only after the one before is flushed. A log of depth past one keeps
+several frames in flight and narrows that rule to the frames outside each frame's window (§3.3).
 
 A replica that leads may send its appends to followers before its own flush completes;
 followers answer only after theirs (06 §C.c, item 2). The log lets both happen: a
@@ -280,6 +281,120 @@ bounded the waits of large cold updates (the third mix) but not the share.
 Integrated Services Packet Switching Networks." SIGCOMM '96, pp. 157–168.
 http://conferences.sigcomm.org/sigcomm/1996/papers/goyal.pdf
 
+### 3.3 Frames in flight past one
+
+One frame's flush on the device at a time leaves the device's flush concurrency unused. On the
+gate machine, an Apple M3 Ultra whose full flush is `F_FULLFSYNC`, 4 KiB writes each flushed on a
+file of its own ran 207 flushes a second from one flusher, 278 from 4, 441 from 8 and 503 from 16,
+at a median of 4.3, 13.6, 14.1 and 18.6 ms (the owner's measurement, 2026-11-20); btrfs ran 124 a
+second from one writer and 466–478 from 6 to 16 (research/71; node.md §2.9). A writer that keeps
+the writes and flushes of up to `K` frames on the device at once, the log's depth, commits up to
+`K` frames' groups in the time of about one flush. This section states what that can leave on the
+device after a crash and the rules that keep every answered write and take no unanswered one.
+Depth 1 is the log as §3 and §6 describe it, and is the setting's default.
+
+**What a crash can leave.** A flush makes durable the writes that completed before it was issued,
+not those still in flight (research/02 [M14]: an `IORING_OP_FSYNC` "does not wait for earlier
+writes"), and a drive may keep later writes and lose earlier ones (research/02 §3.8, quoting
+fsync(2) on macOS: "later writes may be present, while earlier writes are not"). With two frames
+in flight, frame `N+1`'s write can complete before `N`'s and its flush end while `N`'s write is
+still going, and flushes can end in either order. A crash can then leave `N+1` whole and `N` lost
+or torn. At depth 1 that cannot happen: `N+1` is written only after `N`'s flush, so a valid `N+1`
+proves `N` was durable (§6, step 4).
+
+**The window.** The writer lays frames in sequence order and lays frame `M` only while fewer than
+`K` frames are unapplied. It applies completions in sequence order: a frame whose flush ends before
+an earlier frame's waits for it, and its place in the window is freed when it is applied, not when
+its flush ends. So when `M` is laid, every frame through `M−K` has been flushed and applied, and
+the frames that can share the device with `M` are `M−K+1` to `M−1`. `M`'s header records the depth
+it was laid at, in the first of the header's three padding bytes, as `K−1`: zero, which every frame
+written before depth existed holds, is depth 1. Recovery reads the window from each frame, never
+from the setting of the binary that opens the log, which may have changed since.
+
+**Answers.** A frame is answered only once it and every frame before it are flushed, applied in
+order, and a durable persist record says so. A record's `confirms` is the highest frame applied
+when the record was laid, so it rises with the sequence, and a frame is answered once a record
+whose `confirms` reaches it is durable: the record of a frame laid after it was applied, or its own
+confirmation written on its own (§6, step 5). At depth 1 this is the rule of §3 and §6: frame
+`N+1`'s record confirms `N`. No frame is answered earlier than at depth 1. The owner's decision of
+2026-11-20, that a frame on a write-back device is answered only once confirmed
+(`AtFlush::DECIDED`, `WriteBackFrames::Confirmed`; durability.md §7), holds at every depth. A log
+that answers frames at their own flush (durability.md §7.5) keeps depth 1: answered at its flush,
+a frame of a lost frame's window was answered if the lost frame had been applied, and nothing on
+the device tells whether it had, so recovery takes such a record past the gap for damage.
+
+**Records.** A frame's record goes in a slot before its flush (§6, step 5). At depth `K` the area
+holds `K+1` slots, the record of `M` in slot `M mod (K+1)`, which writes over the record of
+`M−K−1`. Every frame through `M−K` was applied when `M` was laid, so the record of `M−K` is
+durable, and it and each later record confirm at least what the overwritten one did. So at every
+moment some slot holds a durable record that confirms every answered frame. Two slots do not
+suffice past depth 1: the records of two frames in flight can both tear, taking the only
+confirmation of the frames answered before them, and an answered frame damaged at rest, followed
+by one of its window, would then be cut as a crash. At depth 1, `K+1` is today's two slots.
+
+**Recovery: a frame past a gap is never taken.** Recovery walks the frames to the first that does
+not read, `G`, the frame after the last valid one. For each valid frame `M` past it in its
+segment:
+
+- `M ≥ G + depth(M)`: every frame through `G` was applied before `M` was laid, so `G` was durable
+  and the acknowledged state was damaged. The log reports it, as §6, step 4 says.
+- `G < M < G + depth(M)`: `M` is in `G`'s window and may have shared the device with it. Answering
+  `M` needed `G` applied and a record confirming it, so `M` was answered only if `G` was durable.
+  The records tell: a readable record whose `confirms` reaches `G` proves `G` was applied, and its
+  loss is damage, reported. With none, `G` was never confirmed (records, above), so neither `G` nor
+  any frame after it was answered, and the crash cut the log at `G`. Recovery replays through
+  `G−1`, takes no frame of the window, and writes zeros over each window frame's first block before
+  any write, flushed with step 6's erasure. Left whole, a window frame keeps its segment's identity
+  and a checksum that holds, and the walk would take it once a later frame ended where it begins.
+  So does each frame of the segment past `G` whose header reads and whose checksum fails: a torn
+  frame of the window, which a later write torn over it could complete, as step 6 says of the
+  block at `G`.
+- Any other valid frame past the stop, one of `G`'s own sequence elsewhere in the segment, is
+  damage.
+
+At depth 1 the window is empty and every valid frame past the stop is damage, which is §6, step 4.
+An answered frame `F` survives: every frame through `F` was applied and a record confirming `F` was
+durable when `F` was answered, and that record or a later one still reads, so a lost frame at or
+before `F` is reported rather than cut, and with none lost `F` is replayed. An unanswered frame is
+never taken: recovery takes no frame past `G`, and cuts at `G` only once the records show `G` was
+never answered, so no frame after it was either. This is protocol-aware recovery's rule, that a
+crash is told from a corruption by what the protocol could have acknowledged (AGL+18 §3.3.3;
+research/97 §2), with the window in place of the one frame before.
+
+**Segments and sweeps.** A segment's header is flushed with its first frame, and recovery's search
+for frames of a header that no longer reads rests on that (§6, step 4). So the frame that opens a
+segment is laid alone: the writer lets the window drain before it and lays nothing after it until
+it is applied, and every window lies within one segment. A sweep, which reads the tail and moves
+what is live, also runs alone. A confirmation written on its own takes a place in the window as a
+frame does, and writes only its own frame's slot.
+
+**Choosing K.** `K` is the device's knee: the depth past which more flushes in flight add latency
+faster than they add flushes a second. On the gate machine two flushers ran no more flushes a
+second than one (210 against 207) at twice the latency, eight ran 2.1 times as many (441), their
+median flat at 13–14 ms from three to eight, and sixteen ran 14% more than eight (503) at 32% more
+latency (18.6 ms against 14.1). Those flushers each flushed a file of their own; a log flushes one,
+and whether one file's flushes overlap on the device, on APFS, ext4, XFS and NTFS, is for the
+calibration to measure (§5, mantle CLAUDE.md §5). The knee is the device's, shared by every log on
+it: where a cell runs three nodes on one SSD, as on the gate machine, three flushes are in flight
+at depth 1, and each log's share of the knee is what its depth may take. Until hyper-block's calibration measures concurrent flushes of
+one file, `K` is a stated setting, default 1, and at most 16, the most either measurement ran;
+neither says what lies past it. Each frame in flight holds its room (§3.1), so the queue's byte
+bound becomes `(K+2)·(F+97)`: the `K` frames in flight, the one gathering while they run, and the
+one flushed and awaiting its confirmation, today's three at `K = 1`.
+
+Steps, each built and tested before the next:
+
+1. This section, and recovery's rule that a frame past a gap is never taken: a frame's header reads
+   its overlap; a frame past the gap by more than its overlap is damage, reported; one within it
+   is cut and erased, unless a record confirms the gap or says a frame from the gap on was
+   answered at its flush, which is damage (hyper-log `recover.rs`, `tests/log.rs`). Every frame
+   written so far is depth 1, so every log opens as before.
+2. The persist area's `K+1` slots, laid again on open when the depth changes, as the move to pieces
+   lays it (durability.md §7.7); the open reads every slot.
+3. The setting, the writer's window and the device's `K` jobs, completions applied in order, the
+   opening and the sweep alone; the queue's bound at `K`.
+4. The depth from calibration, measured on one file, where hyper-block measures it.
+
 ## 4. What a group holds in memory
 
 Each group has its hard state and where it was written, the point its log starts after,
@@ -397,7 +512,9 @@ up to its quota, to hold twice that, the same headroom the chunk store's cleanin
    sequence follows it, anywhere after it in its segment or in a later one: it was never
    acknowledged, so the log is cut there. If a later frame does follow, the acknowledged
    state was damaged, as protocol-aware recovery tells a crash from corruption (06 §A3;
-   chunk-store.md §3.2). The same holds one level up: a segment's header is flushed with
+   chunk-store.md §3.2); in a log of depth past one, a later frame within its own window of the
+   stop proves nothing of it, and is cut unless a record confirms the stop (§3.3). The same
+   holds one level up: a segment's header is flushed with
    its first frame, so a slot whose header no longer reads but which holds this log's
    frames past the first, from a segment newer than any whose header reads, lost a header
    that was durable. The log reports the damage, writes nothing, and its replicas recover

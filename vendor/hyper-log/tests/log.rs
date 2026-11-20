@@ -4942,3 +4942,261 @@ fn the_record_says_answered_at_its_flush_only_where_every_update_allows_it() {
     );
     assert!(records.iter().all(|r| !r.at_flush));
 }
+
+/// What a crash left of a frame, or of a persist record, in the window of a log of depth 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Left {
+    /// All of it.
+    Whole,
+    /// Its first sector alone: the header, and its checksum failing.
+    Torn,
+    /// None of it.
+    Lost,
+}
+
+/// Sets the overlap byte of the frame at `at` in `file` to `overlap` and its checksum to match,
+/// as a writer of that depth lays it (mantle docs/design/raft-log.md §3.3).
+fn set_overlap(file: &SimFile, at: u64, overlap: u8) {
+    let mut buf = AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap()).unwrap();
+    buf.set_len(BLOCK).unwrap();
+    file.read_exact_at(buf.as_mut_slice(), at).unwrap();
+    let block = buf.as_mut_slice();
+    let header = hyper_log::format::FrameHeader::decode(block).unwrap();
+    block[5] = overlap;
+    let end = header.mac_at().unwrap();
+    let crc = crc32c::crc32c_append(crc32c::crc32c(&block[..64]), &block[68..end]);
+    block[64..68].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(
+        hyper_log::format::FrameHeader::decode(block).map(|h| h.overlap),
+        Some(overlap)
+    );
+    file.write_all_at(buf.as_slice(), at).unwrap();
+    file.sync_data().unwrap();
+}
+
+/// Leaves of the one-block frame at `at` what `left` says.
+fn leave_frame(file: &SimFile, at: u64, left: Left) {
+    let keep = match left {
+        Left::Whole => return,
+        Left::Torn => 512,
+        Left::Lost => 0,
+    };
+    let mut buf = AlignedBuf::zeroed(BLOCK, Alignment::new(BLOCK).unwrap()).unwrap();
+    buf.set_len(BLOCK).unwrap();
+    file.read_exact_at(buf.as_mut_slice(), at).unwrap();
+    buf.as_mut_slice()[keep..].fill(0);
+    file.write_all_at(buf.as_slice(), at).unwrap();
+    file.sync_data().unwrap();
+}
+
+/// Lays `record` in pieces in the slot at `at`, or leaves the slot empty where it was `Lost`.
+fn leave_record(file: &SimFile, at: u64, record: &hyper_log::format::Persist, left: Left) {
+    let pieces = hyper_log::format::Pieces::new(Alignment::new(512).unwrap(), false).unwrap();
+    let mut slot = vec![0u8; 8_192];
+    if left != Left::Lost {
+        let bytes = pieces.encode(record).unwrap();
+        slot[..bytes.len()].copy_from_slice(&bytes);
+    }
+    write_flushed(file, &slot, at);
+}
+
+/// The file a log of depth 2 leaves when power fails with frames 3 and 4 in flight (mantle
+/// docs/design/raft-log.md §3.3): frames 1 and 2 applied and answered, frames 3 and 4 laid
+/// together once frame 2 was applied, each at overlap 1, and each one's record confirming frame
+/// 2, in slots `3 mod 2` and `4 mod 2`. A crash then leaves of each frame and each record what
+/// `left` says, in that order. The writer keeps one frame in flight, so the log of depth 1 lays
+/// the same frames one at a time and the test gives them the overlap and the records the window
+/// leaves. Each update's entry takes 2,000 bytes, so each frame takes one block and spans five of
+/// the device's sectors, and a torn one fails its checksum. Returns the file and frame 4's offset.
+fn two_in_flight(seed: u64, left: [Left; 4]) -> (SimFile, u64) {
+    let log = Log::create(sim(seed), config(16, 8), ID).unwrap();
+    for index in 1..=4u64 {
+        let entry = Entry {
+            term: 1,
+            bytes: vec![index as u8; 2_000],
+        };
+        let update = Update {
+            entries: Some(Entries {
+                first: index,
+                entries: vec![entry],
+            }),
+            ..Update::default()
+        };
+        log.write(1, update).unwrap();
+    }
+    let file = closed(log);
+    let frames = valid_frames(&file.durable_image().unwrap());
+    assert_eq!(
+        frames.len(),
+        5,
+        "the empty first frame, and one frame an update"
+    );
+    let at = |sequence: u64| frames.iter().find(|f| f.2 == sequence).unwrap().0;
+    let (third, fourth) = (at(3), at(4));
+    let records = [record_of_frame(&file, 3), record_of_frame(&file, 4)];
+    set_overlap(&file, third, 1);
+    set_overlap(&file, fourth, 1);
+    for (record, left) in records.into_iter().zip([left[2], left[3]]) {
+        let slot = PIECES_SLOTS[(record.sequence % 2) as usize];
+        let laid = hyper_log::format::Persist {
+            confirms: 2,
+            ..record
+        };
+        leave_record(&file, slot, &laid, left);
+    }
+    leave_frame(&file, third, left[0]);
+    leave_frame(&file, fourth, left[1]);
+    (file, fourth)
+}
+
+/// A crash with frame 3 lost and frame 4, in its window, durable recovers to frame 2, the last
+/// answered: frame 4 is never taken, though it reads (mantle docs/design/raft-log.md §3.3). The
+/// open erases it, so a new frame 3 written where the lost one lay, of the same length, ends
+/// where frame 4 begins and still the walk finds nothing past it.
+#[test]
+fn a_frame_past_a_lost_one_in_its_window_is_never_taken() {
+    let cfg = config(16, 8);
+    let (file, fourth) = two_in_flight(60, [Left::Lost, Left::Whole, Left::Whole, Left::Whole]);
+    assert!(
+        valid_frames(&file.durable_image().unwrap())
+            .iter()
+            .any(|f| f.0 == fourth && f.2 == 4)
+    );
+    let (log, recovery) = Log::open(file, cfg, ID).unwrap();
+    assert_eq!(
+        recovery.tail,
+        Tail::Undetermined {
+            sequence: 3,
+            at_flush: false
+        }
+    );
+    assert_eq!(log.view(1).unwrap().unwrap().last, 2);
+    log.write(
+        1,
+        Update {
+            entries: Some(entries(3, &[2])),
+            ..Update::default()
+        },
+    )
+    .unwrap();
+    let file = closed(log);
+    let frames = valid_frames(&file.durable_image().unwrap());
+    assert!(!frames.iter().any(|f| f.2 == 4), "frame 4 was erased");
+    let (log, _) = Log::open(file, cfg, ID).unwrap();
+    let view = log.view(1).unwrap().unwrap();
+    assert_eq!(view.last, 3);
+}
+
+/// A frame past a lost one by more than its overlap was laid once the lost one was applied: the
+/// lost frame was durable and is damaged, which the open reports, as it reports any frame past a
+/// lost one in a log of depth 1 (mantle docs/design/raft-log.md §3.3, §6 step 4).
+#[test]
+fn a_frame_past_a_lost_one_beyond_its_window_is_damage() {
+    let cfg = config(16, 8);
+    // Depth 1: frame 4 laid only once frame 3 was flushed.
+    let (file, fourth) = two_in_flight(61, [Left::Lost, Left::Whole, Left::Whole, Left::Whole]);
+    set_overlap(&file, fourth, 0);
+    assert!(matches!(
+        Log::open(file, cfg, ID).map(|_| ()),
+        Err(LogError::Damaged(_))
+    ));
+    // Depth 2: frame 2 lost, frame 3 in its window, frame 4 past it by two.
+    let (file, _) = two_in_flight(62, [Left::Whole; 4]);
+    let frames = valid_frames(&file.durable_image().unwrap());
+    let second = frames.iter().find(|f| f.2 == 2).unwrap().0;
+    leave_frame(&file, second, Left::Lost);
+    assert!(matches!(
+        Log::open(file, cfg, ID).map(|_| ()),
+        Err(LogError::Damaged(_))
+    ));
+}
+
+/// A frame of the window proves nothing of the lost frame before it, but a record confirming
+/// that frame proves it was applied, so durable: it is damaged, and the open reports it rather
+/// than cut an answered frame as a crash (mantle docs/design/raft-log.md §3.3).
+#[test]
+fn a_record_confirming_a_lost_frame_makes_its_window_damage() {
+    let cfg = config(16, 8);
+    let (file, _) = two_in_flight(63, [Left::Lost, Left::Whole, Left::Whole, Left::Whole]);
+    let record = record_of_frame(&file, 4);
+    let confirming = hyper_log::format::Persist {
+        confirms: 3,
+        ..record
+    };
+    leave_record(&file, PIECES_SLOTS[0], &confirming, Left::Whole);
+    assert!(matches!(
+        Log::open(file, cfg, ID).map(|_| ()),
+        Err(LogError::Damaged(_))
+    ));
+}
+
+/// A frame answered at its own flush in a lost frame's window was answered if the lost frame had
+/// been applied, which nothing on the device tells, so a record saying so past the gap is damage:
+/// a log of depth past one never answers at the flush (mantle docs/design/raft-log.md §3.3).
+#[test]
+fn a_record_answered_at_its_flush_past_a_lost_frame_makes_its_window_damage() {
+    let cfg = config(16, 8);
+    let (file, _) = two_in_flight(64, [Left::Lost, Left::Whole, Left::Whole, Left::Whole]);
+    let record = record_of_frame(&file, 4);
+    let answered = hyper_log::format::Persist {
+        at_flush: true,
+        ..record
+    };
+    leave_record(&file, PIECES_SLOTS[0], &answered, Left::Whole);
+    assert!(record_of_frame(&file, 4).at_flush);
+    assert!(matches!(
+        Log::open(file, cfg, ID).map(|_| ()),
+        Err(LogError::Damaged(_))
+    ));
+}
+
+/// Power fails at every point of two frames in flight together, frames 3 and 4 of a log of depth
+/// 2, each frame whole, torn or lost and each record whole or lost: the open recovers to the
+/// frames that read in order from the first, takes no frame past one that does not, loses neither
+/// answered frame, and finds no damage. A frame cut is gone for good: the next frame written
+/// lands where it lay and the open after finds nothing past it (mantle docs/design/raft-log.md
+/// §3.3).
+#[test]
+fn a_crash_at_every_point_of_two_frames_in_flight_recovers_in_order() {
+    let cfg = config(16, 8);
+    let states = [Left::Whole, Left::Torn, Left::Lost];
+    let mut seed = 70;
+    for third in states {
+        for fourth in states {
+            for records in [Left::Whole, Left::Lost] {
+                for record in [Left::Whole, Left::Lost] {
+                    seed += 1;
+                    let left = [third, fourth, records, record];
+                    let (file, at) = two_in_flight(seed, left);
+                    let expected = match (third, fourth) {
+                        (Left::Whole, Left::Whole) => 4,
+                        (Left::Whole, _) => 3,
+                        _ => 2,
+                    };
+                    let (log, _) =
+                        Log::open(file, cfg, ID).unwrap_or_else(|e| panic!("{left:?}: {e:?}"));
+                    let view = log.view(1).unwrap().unwrap();
+                    assert_eq!(view.last, expected, "{left:?}");
+                    // Frame 4's header outlives the open only where the open took it: whole or
+                    // torn, a frame cut is erased.
+                    let image = log.with_file(|f| f.durable_image().unwrap()).unwrap();
+                    let block = &image[at as usize..at as usize + BLOCK];
+                    let header = hyper_log::format::FrameHeader::decode(block);
+                    assert_eq!(header.is_some(), expected == 4, "{left:?} erased");
+                    log.write(
+                        1,
+                        Update {
+                            entries: Some(entries(expected + 1, &[2])),
+                            ..Update::default()
+                        },
+                    )
+                    .unwrap();
+                    let (log, _) = Log::open(closed(log), cfg, ID)
+                        .unwrap_or_else(|e| panic!("{left:?} reopened: {e:?}"));
+                    let view = log.view(1).unwrap().unwrap();
+                    assert_eq!(view.last, expected + 1, "{left:?} reopened");
+                }
+            }
+        }
+    }
+}

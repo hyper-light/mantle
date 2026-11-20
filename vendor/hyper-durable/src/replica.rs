@@ -2023,10 +2023,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// bounded by what the store holds could pass it before that write, which the store then
     /// refuses below its start (the shell's simulation, seed 9785 of its fourth shape: a leader
     /// applying ahead of its write applied what its followers took from that `Ready`, and
-    /// compacted while the `Ready`'s write stalled).
+    /// compacted while the `Ready`'s write stalled). Nor while a compaction waits on the
+    /// machine's checkpoint or for room ([`Replica::persisting`]): that compaction is what frees
+    /// the room, and made before it the writes would only be refused again, and the compaction's
+    /// start, sent behind them, refused with them.
     fn make_again(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let freed = self.stall.as_ref().is_some_and(|stall| stall.freed);
-        if !freed || !self.writes.is_empty() || !self.node.store().log.room() {
+        if !freed
+            || !self.writes.is_empty()
+            || self.persisting.is_some()
+            || !self.node.store().log.room()
+        {
             return Ok(());
         }
         let Some(stall) = self.stall.take() else {
@@ -2858,7 +2865,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// start moves now, and the compaction waits on the checkpoint, each drive asking the machine
     /// again and moving the start at the one that finds it durable ([`Replica::persisting`]), so
     /// the thread that drives the group waits on no flush. Asked meanwhile, the machine goes on
-    /// with the checkpoint out and begins no other.
+    /// with the checkpoint out and begins no other. A compaction the replica cannot write now (a
+    /// start out, or no slot) waits so too, the machine asked only at a drive that can write it.
     pub fn compact(&mut self, keep: u64, now: u64, waker: &Waker) -> Result<bool, ReplicaError> {
         self.guarded(|r| r.compact_through(keep, now, waker))
     }
@@ -2878,6 +2886,21 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         now: u64,
         waker: &Waker,
     ) -> Result<bool, ReplicaError> {
+        // A start a write out moves is not yet in the store's bounds: a compaction behind it
+        // would move the start back. A snapshot's start refused for room is made again past
+        // any compaction now: the state machine stands at it, so none passes it. Such a
+        // compaction, or one the store has no room for (a write past the core's depth out, or a
+        // refusal it holds that the replica has yet to take), waits for a drive that can write
+        // it, its checkpoint left as it stands: asked of the machine now, a checkpoint found
+        // durable here was let go with the compaction, and nothing asked it again. A stalled
+        // replica's refused writes then waited for room no compaction would free, refusing
+        // every message meanwhile, its owner asking again only once its ranges moved (mantle's
+        // end-to-end runs through a leader's failure, replica.md §2).
+        let moving = self.writes.iter().any(|w| w.start);
+        if moving || !self.has_slot() {
+            self.persisting = Some(keep);
+            return Ok(false);
+        }
         let persisted = self.machine.persist();
         if !self.machine_did(persisted)? {
             self.persisting = Some(keep);
@@ -2889,11 +2912,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let (start, last) =
             bounds.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
         let index = durable.saturating_sub(keep).min(last);
-        // A start a write out moves is not yet in the store's bounds: a compaction behind it
-        // would move the start back. A snapshot's start refused for room is made again past
-        // any compaction now: the state machine stands at it, so none passes it.
-        let moving = self.writes.iter().any(|w| w.start);
-        if index <= start.index || moving || !self.has_slot() {
+        if index <= start.index {
             return Ok(false);
         }
         let term = self.node.store().log.term(index);

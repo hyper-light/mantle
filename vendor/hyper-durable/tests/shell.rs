@@ -318,6 +318,82 @@ fn a_compaction_waits_on_the_machines_checkpoint_and_moves_the_start_once_it_is_
     assert_eq!(r.applied().index, begun_at + 4);
 }
 
+/// A compaction whose machine's checkpoint is durable at a drive that has no room for its start
+/// (here the store full; in hyper-log's store, a refusal it holds that the replica has yet to take)
+/// waits for the drive that has, and moves the start then to the checkpoint's index. It was let go
+/// at that drive, and nothing asked it again: a stalled replica's refused writes then waited for
+/// room no compaction would free, and the replica refused every message meanwhile, a new leader's
+/// votes among them (mantle's end-to-end runs through a leader's failure; replica.md §2).
+#[test]
+fn a_compaction_whose_checkpoint_is_durable_while_the_store_has_no_room_moves_the_start_once_it_has()
+ {
+    let mut r = sole(3, Unbounded, |_| {});
+    for i in 0..4u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    let begun_at = r.applied().index;
+    let start = r.log_mut().disk.start.index;
+    assert!(begun_at > start);
+    r.machine_mut().held = true;
+    assert!(!r.compact(0, now(), waker()).unwrap());
+    assert!(r.persisting());
+    // The checkpoint is durable, and the store has no room for the start.
+    r.log_mut().full = true;
+    r.machine_mut().held = false;
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(
+        !r.log_mut().start_out(),
+        "a start written past the store's room"
+    );
+    assert!(r.persisting(), "the compaction was let go");
+    // Room comes: the drive that has it moves the start to the checkpoint's index.
+    r.log_mut().full = false;
+    pump(&mut r);
+    assert!(!r.persisting());
+    assert_eq!(r.machine().durable.applied.index, begun_at);
+    assert_eq!(r.log_mut().disk.start.index, begun_at);
+}
+
+/// A replica stalled for room whose owner asks a compaction that waits on the machine's
+/// checkpoint, and then says room may be free (as mantle's node does when a stalled range's
+/// compaction started nothing), makes its refused write again only after that compaction's start
+/// is durable: made before, it would be refused again, and the start sent behind it with it.
+#[test]
+fn a_stalled_replicas_refused_write_is_made_again_after_the_compaction_its_checkpoint_waits_on() {
+    let mut r = sole(3, Unbounded, |_| {});
+    for i in 0..4u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    let begun_at = r.applied().index;
+    r.propose(Vec::new(), b"refused".to_vec()).unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    r.log_mut().make_durable();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled());
+    r.machine_mut().held = true;
+    assert!(!r.compact(0, now(), waker()).unwrap());
+    r.resume();
+    let submits = r.log_mut().events.submits;
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert_eq!(
+        r.log_mut().events.submits,
+        submits,
+        "a refused write made again before the compaction that frees its room"
+    );
+    assert!(r.is_stalled());
+    r.machine_mut().held = false;
+    let out = pump(&mut r);
+    assert!(!r.is_stalled());
+    assert_eq!(r.log_mut().disk.start.index, begun_at);
+    let applied: Vec<u64> = out.answers.iter().map(|(index, _)| *index).collect();
+    assert_eq!(applied, vec![begun_at + 1]);
+}
+
 /// A compaction asked again while the machine's checkpoint is out begins no other checkpoint: the
 /// machine goes on with the one out, of what was applied when it began, and the start moves to
 /// that once it is durable.

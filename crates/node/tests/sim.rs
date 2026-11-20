@@ -448,6 +448,47 @@ fn a_leader_deaf_before_it_judges_its_links_steps_down_and_the_others_elect_one_
     cell.leader();
 }
 
+/// The leader of a cell of five voters loses power half way through the clients' operations, its
+/// log full of their puts, and is started again three quarters through, as the end-to-end suite's
+/// leader of five voters killed and started again is. The other four elect one of themselves in a
+/// later term and the clients go on through it, each wait within the cell's quiet period; the node
+/// started again comes back a follower and keeps no one from leading. Every history is
+/// linearizable and every node, the one started again among them, applies as far as the others.
+/// Seeds 2, 4 and 6: a cell of five on each profile of paths.
+#[test]
+fn a_leader_of_five_voters_whose_power_is_cut_under_load_is_succeeded_and_started_again_follows() {
+    for seed in seeds(&[2, 4, 6]) {
+        leader_restarted(seed);
+    }
+}
+
+fn leader_restarted(seed: u64) {
+    let mut cell = Sim::new(seed);
+    assert_eq!(cell.nodes, 5, "seed {seed} makes no cell of five");
+    let leader = cell.leader();
+    cell.open_bucket();
+    let ops = (2 * (log_config().group_entries + 1)).div_ceil(CLIENTS);
+    let stops = cell.start_workload(ops);
+    cell.done_by(ops, 2);
+    let term = cell.members[&leader].status.unwrap().term;
+    cell.crash(leader);
+    others_elect(&mut cell, leader, term);
+    cell.done_by(ops, 3);
+    cell.restart(leader);
+    cell.done_by(ops, 4);
+    drop(stops);
+    cell.until("every client's part", |c| {
+        if c.parts.len() == usize::try_from(CLIENTS).unwrap() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    let parts: Vec<(u64, Part)> = std::mem::take(&mut cell.parts).into_iter().collect();
+    check_histories(parts.iter().flat_map(|(_, part)| part.iter().cloned()));
+    cell.converged();
+}
+
 /// The commands an entry of puts carries, as a node's entry carries the commands its operations
 /// wait on, as many as fit its bytes: four, which the simulated range's entry of 1 KiB holds.
 const BATCH: u64 = 4;

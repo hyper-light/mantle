@@ -32,7 +32,7 @@ use std::mem::size_of;
 use crate::branch::merge::Compaction;
 use crate::branch::{Branch, Op};
 use crate::error::{Error, Malformed};
-use crate::store::{Run, Store};
+use crate::store::{Life, Run, Store, Tail};
 use hyper_block::block::BlockFile;
 use pool::{Output, Owner, Pool, Task, Ticket, Work};
 
@@ -978,6 +978,34 @@ pub(crate) fn hold_shared<'b, F: BlockFile>(
             store.retain(*b.extents.first().ok_or(corrupt())?)?;
         }
     }
+    Ok(())
+}
+
+/// A worker's branches held ([`hold_shared`]): the hold the shard took on the tail it handed the
+/// job goes back, the job's first branch now holding that extent.
+pub(crate) fn take_job_tail_back<F: BlockFile>(
+    store: &mut Store<F>,
+    out: &Output,
+) -> Result<(), Error> {
+    if let Some(e) = out.given {
+        store.release(e)?;
+    }
+    Ok(())
+}
+
+/// A job never sent: its grant went back, and the hold on the tail it was handed goes back too,
+/// the task's list of what it holds left empty.
+pub(crate) fn give_tail_back<F: BlockFile>(
+    store: &mut Store<F>,
+    grant: &mut Vec<u64>,
+    tail: Option<Tail>,
+) -> Result<(), Error> {
+    // Only the tail's hold is left to give back: a refused release leaves it named.
+    grant.retain(|&e| tail.is_some_and(|t| t.extent == e));
+    if let Some(t) = tail {
+        store.release(t.extent)?;
+    }
+    grant.clear();
     Ok(())
 }
 

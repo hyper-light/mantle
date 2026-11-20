@@ -30,7 +30,7 @@ use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
 use crate::store::superblock::Superblock;
-use crate::store::{Config, IntoFile, Store};
+use crate::store::{Config, IntoFile, Life, Store};
 use crate::trunk::pool::{
     self, Back, Growth, Job, Load, Owner, Pool, SortPack, Spawn, Ticket, Work,
 };
@@ -1317,6 +1317,7 @@ impl<F: BlockFile> ShardDb<F> {
             file_end: self.store.end(),
             generation: self.store.generation(),
             keep: None,
+            tail: None,
         });
         let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
             what: "a checkpoint's flush with no workers",
@@ -3120,6 +3121,7 @@ impl<F: BlockFile> ShardDb<F> {
                 file_end: self.store.end(),
                 generation: self.store.generation(),
                 keep: None,
+                tail: None,
             });
             let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
                 what: "a page's load with no workers",
@@ -4095,6 +4097,7 @@ impl<F: BlockFile> ShardDb<F> {
             file_end: self.store.end(),
             generation: self.store.generation(),
             keep: None,
+            tail: None,
         });
         let sent = pool.send_growth(&mut self.store, job);
         match sent {
@@ -4462,6 +4465,11 @@ impl<F: BlockFile> ShardDb<F> {
                     back.topped.retain(|held| !out.unused.contains(held));
                     out.unused.clear();
                 }
+                // The next job begins where this one ended, the memtable's grant holding that
+                // extent until its parts do ([`Store::adopt_tail`]).
+                if let Some(t) = out.tail.take() {
+                    self.store.adopt_tail(t);
+                }
             }
             f.back = Some(back);
             given_back?;
@@ -4559,6 +4567,9 @@ impl<F: BlockFile> ShardDb<F> {
             let parts = std::mem::take(&mut out.parts);
             // Its parts share extents as the worker wrote them: each holds its own.
             crate::trunk::hold_shared(&mut self.store, parts.iter().map(|(_, b)| b))?;
+            crate::trunk::take_job_tail_back(&mut self.store, out)?;
+            // The hold on the tail it was handed is given back: no longer the memtable's.
+            f.grant.retain(|&e| out.given != Some(e));
             self.store.extend_end(out.end);
             Ok(parts)
         })();
@@ -4749,6 +4760,7 @@ impl<F: BlockFile> ShardDb<F> {
             file_end: self.store.end(),
             generation: self.store.generation(),
             keep: None,
+            tail: None,
         });
         match pool.send(job, Owner::Index, true) {
             Ok(Ok(_)) => {
@@ -5698,12 +5710,17 @@ impl<F: BlockFile> ShardDb<F> {
             let pages = usize::try_from(self.store.extent_pages()).unwrap_or(usize::MAX);
             self.store.lend_pages(extents.saturating_mul(pages))
         };
+        // Its first part begins where the shard's last short-lived branch ended, that extent held
+        // once for the job and named with the memtable's grant, so a failed packing gives the hold
+        // back with the rest ([`Self::retire`]).
+        let tail = self.store.take_job_tail(Life::Short)?;
         let job = Box::new(Job {
             work: Work::Sort(pack),
             grant: grant.clone(),
             file_end: self.store.end(),
             generation: self.store.generation(),
             keep,
+            tail,
         });
         let sent = match pool.send(job, Owner::Pack, true) {
             Ok(sent) => sent,
@@ -5713,6 +5730,9 @@ impl<F: BlockFile> ShardDb<F> {
                     self.store.unlend_pages(*kept);
                 }
                 self.store.grant_back(&job.grant)?;
+                if let Some(t) = job.tail {
+                    self.store.release(t.extent)?;
+                }
                 return Err(error);
             }
         };
@@ -5724,6 +5744,9 @@ impl<F: BlockFile> ShardDb<F> {
                     self.store.unlend_pages(*kept);
                 }
                 self.store.grant_back(&job.grant)?;
+                if let Some(t) = job.tail {
+                    self.store.release(t.extent)?;
+                }
                 let Job { work, .. } = job;
                 let Work::Sort(pack) = work else {
                     return Err(Error::InvalidArgument {
@@ -5733,6 +5756,8 @@ impl<F: BlockFile> ShardDb<F> {
                 return Ok(Some((full, pack)));
             }
         };
+        let mut grant = grant;
+        grant.extend(tail.map(|t| t.extent));
         self.frozen.push_back(Frozen {
             mem: full,
             ticket,
@@ -6504,6 +6529,10 @@ mod room_seats;
 #[cfg(test)]
 #[path = "shard_db/worker_need.rs"]
 mod worker_need;
+
+#[cfg(test)]
+#[path = "shard_db/job_tails.rs"]
+mod job_tails;
 
 #[cfg(test)]
 #[path = "shard_db/read_rent.rs"]

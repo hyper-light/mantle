@@ -39,7 +39,7 @@ use crate::branch::{Branch, Builder};
 use crate::error::Error;
 use crate::memtable::hashed::Sorter;
 use crate::store::cache::Kept;
-use crate::store::{Ask, Config, IntoFile, Refill, Store, TopUp};
+use crate::store::{Ask, Config, IntoFile, Refill, Store, Tail, TopUp};
 use hyper_block::block::BlockFile;
 
 /// A compaction for a worker: `inputs` newest first, the descriptors a merge reads (no filters),
@@ -140,8 +140,10 @@ pub struct Growth {
 }
 
 /// A job: its work, written into `grant`, with reads up to `file_end`, its pages sealed for the
-/// checkpoint after `generation`; and the shard's cache's memory lent for the pages it writes
-/// (`Kept`), which comes back with its result whatever the result.
+/// checkpoint after `generation`; the shard's cache's memory lent for the pages it writes
+/// (`Kept`), which comes back with its result whatever the result; and the shard's tail its
+/// first branch begins in (`Store::take_job_tail`), its extent held once for the job as its grant
+/// is, so small jobs share extents as the shard's own branches do.
 #[derive(Debug)]
 pub struct Job {
     pub work: Work,
@@ -149,6 +151,7 @@ pub struct Job {
     pub file_end: u64,
     pub generation: u64,
     pub keep: Option<Box<Kept>>,
+    pub tail: Option<Tail>,
 }
 
 /// A job's result: the branches made, each with its first key, in key order; the granted
@@ -169,6 +172,12 @@ pub struct Output {
     /// The pages kept in the cache's loan, held with the result until its branches are applied:
     /// set by the owner from the job's [`Back`].
     pub kept: Option<Box<Kept>>,
+    /// The extent of the tail the job was handed ([`Job::tail`]), held once for it: the shard
+    /// gives that hold back once it holds the job's branches.
+    pub given: Option<u64>,
+    /// Where the job's last branch ended: the shard's next branch of its life begins there
+    /// (`Store::adopt_tail`).
+    pub tail: Option<Tail>,
 }
 
 /// Who a job's result goes back to: the trunk's maintenance, the shard's packing, the shard's
@@ -427,6 +436,8 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                 units,
                 read_wait_ns: store.read_wait_ns().saturating_sub(waited),
                 kept: None,
+                given: job.tail.map(|t| t.extent),
+                tail: store.tail_left(),
             })
         });
         // A sorted packing's buffers, an index job's index and a load's page go back with its
@@ -514,6 +525,9 @@ fn run_guarded<F: BlockFile>(
 /// Runs `job`: the branches made, and the work units a compaction merged (none for a packing).
 fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64), Error> {
     store.begin_job(&job.grant, job.file_end, job.generation)?;
+    if let Some(tail) = job.tail {
+        store.continue_in(tail)?;
+    }
     let mut units = 0u64;
     let parts = match &mut job.work {
         Work::Compact(t) => {
@@ -1649,6 +1663,8 @@ impl Pool {
                             units: 0,
                             read_wait_ns: 0,
                             kept: None,
+                            given: None,
+                            tail: None,
                         }),
                         kept: None,
                         physical_error,

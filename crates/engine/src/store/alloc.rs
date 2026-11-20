@@ -30,6 +30,9 @@ pub struct Allocator {
     /// A worker's extents written so far, ascending: its counts, which `refs` keeps for the
     /// shard's whole file.
     held: Vec<u64>,
+    /// A worker's extent its job begins in, part written by the shard's branches and held once
+    /// for the job by the shard ([`Self::hold_given`]): never handed out whole, nor freed here.
+    given: Option<u64>,
 }
 
 fn corrupt(why: Malformed) -> Error {
@@ -69,6 +72,7 @@ impl Allocator {
             limit: limit.max(1),
             granted: false,
             held: Vec::new(),
+            given: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl Allocator {
             limit,
             granted: false,
             held: Vec::new(),
+            given: None,
         })
     }
 
@@ -116,6 +121,7 @@ impl Allocator {
             limit: 0,
             granted: true,
             held: Vec::new(),
+            given: None,
         }
     }
 
@@ -123,7 +129,24 @@ impl Allocator {
     pub fn regrant(&mut self, grant: &[u64]) {
         self.held.clear();
         self.free.clear();
+        self.given = None;
         self.grant_more(grant);
+    }
+
+    /// A worker's job begins in `extent`, which the shard's branches hold and the shard holds
+    /// once more for the job: held here, so the job's branches may name it, and never handed out
+    /// whole or freed, since its first pages are another branch's.
+    pub fn hold_given(&mut self, extent: u64) -> Result<(), Error> {
+        if !self.granted {
+            return Err(Error::InvalidArgument {
+                what: "an extent given to a store that is not a worker's",
+            });
+        }
+        if let Err(at) = self.held.binary_search(&extent) {
+            self.held.insert(at, extent);
+        }
+        self.given = Some(extent);
+        Ok(())
     }
 
     /// More extents granted a worker's job.
@@ -324,7 +347,10 @@ impl Allocator {
                     what: "a release of an extent that is not held",
                 });
             }
-            self.free.push(extent);
+            // The extent the job was given holds the shard's pages: the shard counts it.
+            if self.given != Some(extent) {
+                self.free.push(extent);
+            }
             return Ok(());
         }
         let count = self

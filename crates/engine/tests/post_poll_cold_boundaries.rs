@@ -209,6 +209,7 @@ fn post_poll_pool_startup_refuses_and_returns_the_exact_job() {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     });
     let pointer = (&*job as *const Job) as usize;
     let grant = job.grant.clone();

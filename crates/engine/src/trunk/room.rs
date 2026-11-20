@@ -168,7 +168,7 @@ fn a_compaction_dropped_after_opening_its_inputs_holds_no_extent_or_read_buffer(
             trunk.add(branch(&mut store, &mut rows, round));
         }
         trunk.step(&mut store, u64::MAX).unwrap();
-        at = trunk.tasks.iter().position(|t| {
+        at = trunk.tasks.find(|t| {
             matches!(&t.run, Running::Inline(c) if c.opening() && !c.holds_inputs())
                 && task_inputs(&trunk.nodes[t.node], &t.what).unwrap().count() > 1
         });
@@ -181,15 +181,17 @@ fn a_compaction_dropped_after_opening_its_inputs_holds_no_extent_or_read_buffer(
     // One unit of its step, as the shard's would be given before the room ran short: its
     // first input opened, its opening not done, nothing written.
     let Trunk { nodes, tasks, .. } = &mut trunk;
+    let mut task = tasks.get_mut(at).unwrap();
     let NodeTask {
         node, what, run, ..
-    } = &mut tasks[at];
+    } = &mut *task;
     let Running::Inline(c) = run else {
         panic!("the task found runs inline")
     };
     c.step(&mut store, task_inputs(&nodes[*node], what).unwrap(), 1)
         .unwrap();
     assert!(c.holds_inputs() && c.opening());
+    drop(task);
     assert_ne!(store.lent(), lent, "the opened input lent no buffer");
     trunk.step(&mut store, u64::MAX).unwrap();
     assert!(

@@ -170,3 +170,94 @@ fn a_compaction_no_seat_takes_waits_for_a_workers_message() {
     drop(trunk);
     drop(issuer);
 }
+
+/// A task planned for a worker of `units` entries, ready, or out on `ticket`: its inputs none,
+/// since no seat takes it and no result names it.
+fn job(node: usize, ticket: Option<Ticket>, units: u64) -> NodeTask {
+    let state = match ticket {
+        Some(ticket) => State::Out(ticket),
+        None => State::Ready(Box::new(Task {
+            inputs: Vec::new(),
+            from: Vec::new(),
+            end: None,
+            drop_tombstones: false,
+            per: 1,
+            pages: 0,
+        })),
+    };
+    NodeTask {
+        node,
+        what: What::Compact {
+            key: Vec::new(),
+            start: 0,
+            covered: 0,
+        },
+        run: Running::Remote {
+            grant: Vec::new(),
+            state,
+        },
+        units,
+        reuse: Reuse::default(),
+    }
+}
+
+/// Do: a pool of one seat, held by a job the trunk does not own; 10 tasks ready for a worker
+/// and 10 out on one, whose tickets name no job, so none comes back; one paced step. Then 1,000
+/// of each, and another.
+/// Expect: each step looks at the same two tasks however many wait: the first ready one, which
+/// finds every seat held, as it tends the workers and again as its pass ends. The shard is told
+/// to wait for a worker's message, and the debt is every waiting task's units, as filed.
+#[test]
+fn a_step_with_every_seat_held_looks_at_two_tasks_however_many_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut store = Store::create(open(&path, true), CONFIG).unwrap();
+    let issuer = Issuer::start_for(&path, 1, 1).unwrap();
+    let relays = Relays::leak();
+    let worker_path = path.clone();
+    let mut pool = Pool::new(
+        relay::spawn(move || Ok(open(&worker_path, false)), CONFIG, relays),
+        1,
+    )
+    .unwrap();
+    pool.set_attach(issuer.attacher().unwrap(), 1);
+    relays.hold_job(Kind::Index);
+    let holder = Box::new(Job {
+        work: Work::Index(Box::default()),
+        grant: Vec::new(),
+        file_end: store.end(),
+        generation: store.generation(),
+        keep: None,
+    });
+    pool.send(holder, Owner::Index, true).unwrap().unwrap();
+    let mut trunk = Trunk::new(TRUNK).unwrap();
+    trunk.set_pool(pool);
+    let _open = OpenOnDrop(relays);
+    let seat = relays
+        .until("the holder on its seat", |s| s.held_jobs.len() == 1)
+        .held_jobs[0];
+    let root = trunk.root;
+    let mut planned = 0u64;
+    for n in [10u64, 1_000] {
+        for i in planned..n {
+            let ticket = Ticket {
+                worker: 0,
+                job: u64::MAX - i,
+            };
+            trunk.tasks.push(job(root, None, 3), root).unwrap();
+            trunk.tasks.push(job(root, Some(ticket), 5), root).unwrap();
+        }
+        planned = n;
+        trunk.clear_io_wait();
+        trunk.tasks.take_visits();
+        trunk.step_paced(&mut store, KEYS).unwrap();
+        assert_eq!(trunk.tasks.take_visits(), 2, "{n} tasks ready and {n} out");
+        assert!(trunk.waiting_for_worker(), "{n} of each");
+        assert_eq!(trunk.debt(), n * (3 + 5), "{n} of each");
+        trunk.check_tasks().unwrap();
+    }
+    // The holder goes on, so the pool's teardown joins its worker.
+    relays.release_job(seat);
+    drop(trunk);
+    drop(issuer);
+}

@@ -42,7 +42,7 @@ UNSAFE_ALLOWED = {
     "crates/node/src/descriptors/macos.rs": "sysctlbyname (kern.maxfilesperproc, macOS's per-process descriptor ceiling)",
     "crates/node/src/secret/windows.rs": "CreateFileW with a protected DACL and GetKernelObjectSecurity (owner-only key files)",
     "crates/mantle/tests/support/hold.rs": "CreateToolhelp32Snapshot, OpenThread, SuspendThread and ResumeThread (a test holding a node's process still on Windows, which has no stopping signal)",
-    "crates/engine/src/port/mmap.rs": "mmap/munmap and CreateFileMappingW/MapViewOfFile (the memtable arena's lazily zeroed blocks); mmap/munmap/madvise for the cache's page buffers on huge-page boundaries (Linux); glibc's mallopt (freed large blocks back to the OS)",
+    "crates/engine/src/port/mmap.rs": "mmap/munmap and CreateFileMappingW/MapViewOfFile (the memtable arena's lazily zeroed blocks); mmap/munmap/madvise for the cache's page buffers on huge-page boundaries (Linux), the global allocator's zeroed blocks for them elsewhere, taken into use unwritten; glibc's mallopt (freed large blocks back to the OS)",
 }
 
 # The vendored crates a PUT's path runs on (docs/measurements/2026-11-12-arbitrary-values-audit.md):

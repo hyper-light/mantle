@@ -1501,6 +1501,7 @@ impl Trunk {
                 }
                 store.grant_back(&out.unused)?;
                 super::hold_shared(store, out.parts.iter().map(|(_, b)| b))?;
+                super::take_job_tail_back(store, &out)?;
                 store.extend_end(out.end);
                 // The worker timed its merge: a compacted key's cost, which consolidations are
                 // priced at, measured wherever compactions run; and its reads' waits, what the
@@ -1761,13 +1762,19 @@ impl Trunk {
             let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
                 continue;
             };
+            // The job's first branch begins where the shard's last branch of its life ended, that
+            // extent held once for the job and named in the task's grant, so a task dropped gives
+            // the hold back with the rest (`abandon_tasks`).
+            let tail = store.take_job_tail(Life::of_compaction(task.drop_tombstones))?;
             grant.clone_from(&given);
+            grant.extend(tail.map(|t| t.extent));
             let job = Box::new(pool::Job {
                 work: Work::Compact(*task),
                 grant: given,
                 file_end: store.end(),
                 generation: store.generation(),
                 keep: store.lend_pages(pages),
+                tail,
             });
             let pool = self.pool.as_mut().ok_or(no_pool())?;
             let sent = match pool.send(job, Owner::Trunk, admit) {
@@ -1784,7 +1791,7 @@ impl Trunk {
                     // Restoration precedes cleanup: a refused grant return keeps both the task
                     // and its owned extent list available to terminal handling.
                     store.grant_back(&job.grant)?;
-                    grant.clear();
+                    super::give_tail_back(store, grant, job.tail)?;
                     return Err(error);
                 }
             };
@@ -1803,7 +1810,7 @@ impl Trunk {
                     };
                     *state = State::Ready(Box::new(task));
                     store.grant_back(&job.grant)?;
-                    grant.clear();
+                    super::give_tail_back(store, grant, job.tail)?;
                     pool.want_message();
                     return Ok(());
                 }
@@ -1860,6 +1867,11 @@ impl Trunk {
                     if given_back.is_ok() {
                         grant.retain(|held| !out.unused.contains(held));
                         out.unused.clear();
+                    }
+                    // The next job of its life begins where this one ended, the task's grant
+                    // holding that extent until its branches do (`Store::adopt_tail`).
+                    if let Some(t) = out.tail.take() {
+                        store.adopt_tail(t);
                     }
                     out.kept = back.kept;
                     *state = State::Done(out);

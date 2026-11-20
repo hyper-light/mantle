@@ -732,10 +732,10 @@ fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
 /// write: extents of a store would exceed its bound of 256" (CI run 44721951954): an inline
 /// compaction of the engine's idle step took the store's last extent while 42 the durable
 /// checkpoint named waited for the next checkpoint (held 214, pending 42 at the refusal). Small
-/// branches share extents, each beginning where the last branch of its expected life ended, but
-/// an extent stays held while any branch with a page in it lives, so the store's extents, not its
-/// bytes, still bound the fill: the whole fill waits for a worker's job to begin in the extent
-/// the job before it left and for mostly dead extents' live pages to be copied out
+/// branches share extents, each beginning where the last branch of its expected life ended, a
+/// worker's job where the shard hands it, but an extent stays held while any branch with a page in
+/// it lives, so the store's extents, not its bytes, still bound the fill: the whole fill waits for
+/// branches grouped by the pivot they wait in, or mostly dead extents' live pages copied out
 /// (docs/design/engine-structure.md §3, at the bound). The cell's key space is taken whole
 /// first.
 #[test]

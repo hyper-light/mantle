@@ -102,6 +102,7 @@ fn a_compaction_no_seat_takes_waits_for_a_workers_message() {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     });
     let ticket = pool.send(job, Owner::Index, true).unwrap().unwrap();
     let mut trunk = Trunk::new(TRUNK).unwrap();
@@ -228,6 +229,7 @@ fn a_step_with_every_seat_held_looks_at_two_tasks_however_many_wait() {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     });
     pool.send(holder, Owner::Index, true).unwrap().unwrap();
     let mut trunk = Trunk::new(TRUNK).unwrap();

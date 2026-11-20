@@ -208,6 +208,7 @@ fn run(call: Call) {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     });
     pool.send(job, Owner::Pack, true).unwrap().unwrap();
     held.recv().unwrap(); // An actual worker write is now held before the runtime call.

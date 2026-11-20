@@ -355,6 +355,7 @@ fn case(gate: &'static Gate) -> (Case, Store<Grown>, Pool) {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     });
     let ticket = pool.send(job, Owner::Trunk, true).unwrap().unwrap();
     let case = Case {
@@ -460,6 +461,7 @@ async fn shard(
                 file_end: s.end(),
                 generation: s.generation(),
                 keep: None,
+                tail: None,
             });
             let ticket = match pool.send_growth(s, growth) {
                 Ok(Ok(ticket)) => ticket,
@@ -516,6 +518,7 @@ async fn shard(
             file_end: s.end(),
             generation: s.generation(),
             keep: None,
+            tail: None,
         });
         let sent = pool.send(index, Owner::Index, true).unwrap().unwrap();
         for _ in 0..MESSAGES {
@@ -983,6 +986,7 @@ fn a_growth_handed_by_an_unprepared_pool_in_a_runtime_is_refused_untouched() {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     });
     pool.send(job, Owner::Trunk, true).unwrap().unwrap();
     // A growth accepted by a broken refusal would write through the gate: open, and opened again
@@ -1002,6 +1006,7 @@ fn a_growth_handed_by_an_unprepared_pool_in_a_runtime_is_refused_untouched() {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     });
     let runtime = runtime();
     let _open = OpenOnDrop(gate);

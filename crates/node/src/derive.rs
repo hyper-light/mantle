@@ -5671,10 +5671,10 @@ mod tests {
         // Each worker as the floor counts it, at the least buffer, one within 80 to 100 MB and an
         // engine's two its two pools and three packings' buffers, and the pages its range's
         // reads hold loaded on them: twice the sources at a trunk's root, 34 pages of 24,576 bytes
-        // and 384 of records each, a memtable at the least holding no page's bytes
-        // (`shard_db::loads_bytes`). Computed on macOS aarch64 and the same on every 64-bit
-        // target, its records' types holding nothing a target sizes apart; no allocation is
-        // measured in it.
+        // and 400 of records each, a memtable at the least holding no page's bytes
+        // (`shard_db::loads_bytes`; 384 until a job named the tail it begins in, 16 bytes of its
+        // `Job`). Computed on macOS aarch64 and the same on every 64-bit target, its records'
+        // types holding nothing a target sizes apart; no allocation is measured in it.
         let least = engine_least(c);
         let key = c.rules.max_key_bytes;
         let one = workers_bytes(&least, key, 1).unwrap();
@@ -5686,7 +5686,7 @@ mod tests {
             least.memtable_bytes,
         )
         .unwrap();
-        assert_eq!(loads, 848_640);
+        assert_eq!(loads, 849_184);
         assert_eq!(
             said_bytes(&derived, "memory.need_workers"),
             need_96_gib() + crate::node::PIECE + 5 * (each + loads + ENGINE_WORKERS as u64 * STACK)

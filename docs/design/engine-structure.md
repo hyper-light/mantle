@@ -326,7 +326,9 @@ under load, at moderate load and saturated.
   at entries 8,800 to 17,625; after, the shard alone at 19,804 and the paced fill at 16,937 to
   21,726 across runs, its worker's timing varying; with branches placed by their expected life
   (below), the shard alone at 21,155 and the paced fill at 18,325 and 19,050 in two runs, its
-  worker's jobs each still beginning a fresh extent. *Open:* the whole fill. At the bound the
+  worker's jobs each still beginning a fresh extent; with a job beginning in the tail the shard
+  hands it (below), the paced fill at 20,901 to 24,000 run alone, its worker's timing varying.
+  *Open:* the whole fill. At the bound the
   shard alone held 186 branches of 729 pages in 240 extents, which hold 183 written densely: an
   extent is held while any branch with a page in it lives, and a short-lived branch (a packing,
   two pages) sharing an extent with a long-lived one (a leaf's, five or six) leaves its pages
@@ -334,9 +336,8 @@ under load, at moderate load and saturated.
   by life, it held 177 branches of 725 pages in 244 extents
   that hold 182 densely, 55 of them with one live page, 21 with two and 44 with three: a
   branch's death follows the pivot it waits in, not its kind alone (below). Copying a mostly
-  dead extent's live pages out is the next step; so is a worker's job beginning in the extent
-  the job before it left (each job begins a fresh extent: the paced fill held 94 extents with
-  two live pages, a two-page packing each).
+  dead extent's live pages out, or grouping branches by the pivot they wait in, is the next
+  step.
 - **Small branches share extents.** The cell's store met its bound before its bytes were full,
   each branch taking whole extents of its own: on the shard alone at entry 8,925, 108 branches
   of 537 pages held 169 extents of four pages, 66 of them part used, and the branches were two
@@ -353,7 +354,7 @@ under load, at moderate load and saturated.
   when the last of them goes, as a segment whose live bytes fall to zero is reused without
   cleaning. The pages left are handed out at a branch's first page, so a builder that writes
   none holds none; the extent freed, they are forgotten (`Store::release`). A worker's job
-  shares its own extents only, beginning a fresh one: its allocator keeps no counts, so the
+  begins in the tail the shard hands it, if any (below): its allocator keeps no counts, so the
   shard holds a job's branch that began in an earlier branch's pages (its `first` past 0) its
   first extent once more as it takes the job's branches (`trunk::hold_shared`, from a
   compaction's apply and a packing's retire). A checkpoint persists the counts as they are and
@@ -388,6 +389,31 @@ under load, at moderate load and saturated.
   one extent more than one tail would (`trunk/shared_extents.rs`). Placement lowers the waste
   found, not the worst case; copying live pages out of a mostly dead extent is what bounds it
   lower.
+- **A worker's job begins in the tail the shard hands it.** Each job began a fresh extent, its
+  allocator holding its grant alone, so a two-page packing on a worker left two pages of its
+  extent unwritten for as long as it lived: the paced fill held 94 extents with two live pages, a
+  packing each. The shard now hands a job its tail of the job's life with its grant
+  (`Store::take_job_tail`, `pool::Job::tail`): the extent is held once more for the job, as each
+  extent of its grant is, and named in the task's or the frozen memtable's list of what it holds,
+  so a job never sent, failed or dropped gives the hold back with its grant (`give_tail_back`,
+  `abandon_tasks`, `ShardDb::retire`). The worker's allocator holds that extent without handing it
+  out whole or freeing it (`Allocator::hold_given`), and the job's first branch begins there
+  (`Store::continue_in`). As the result arrives, the shard's next branch of the job's life begins
+  where the job's last ended (`pool::Output::tail`, `Store::adopt_tail`), that extent held by the
+  job's grant until its branches hold it; once the shard holds the job's branches
+  (`trunk::hold_shared`), the hold it took for the job goes back (`trunk::take_job_tail_back`), the
+  job's first branch now holding the extent. A checkpoint is taken with no job out (a save needs
+  no task, `Trunk::saveable`, and the memtables packed), so every count a checkpoint persists is
+  exact (`shard_db/job_tails.rs`: a fill on a worker with checkpoints and deletes, every extent
+  held as often as it is named at each checkpoint, after the drain and after reopening, every row
+  read back). The bound is the one above: a job's branches are a branch run on from where the last
+  of its life ended. Measured on the cell's paced fill with its worker (mantle-node
+  `tests/engine_workers.rs`, debug build, 2026-11-20): before, 18,325 and 19,050 in two runs;
+  after, 20,901, 22,743 and 24,000 (the whole fill) run alone, and 16,276 to 18,550 in three runs
+  side by side on a loaded machine. In the run that took the whole fill, 1,788 of 3,500 jobs
+  found a tail to begin in. Adopted only as the shard applied a job's branches, at a pass's end,
+  the tail reached fewer jobs, and the fill met its bound at 18,850. The shard alone, which runs no
+  job, still meets its bound at 21,155.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

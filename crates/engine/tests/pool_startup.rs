@@ -79,6 +79,7 @@ fn job(store: &mut Store<DeviceFile>) -> Box<Job> {
         file_end: store.end(),
         generation: store.generation(),
         keep: None,
+        tail: None,
     })
 }
 fn spawn(path: &Path, starts: Arc<AtomicUsize>) -> Spawn {

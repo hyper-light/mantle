@@ -318,6 +318,8 @@ pub struct Store<F: BlockFile> {
     /// ([`Store::take_tail`]). Each is None once taken, once its extent is no longer held, and at
     /// a worker's next job.
     tails: Tails,
+    /// Workers' jobs handed a tail ([`Store::tails_handed`]).
+    tails_handed: u64,
     /// A worker's way to more extents once its grant is spent ([`Store::set_refill`]).
     refill: Option<Refill>,
     /// A file grown by segments ([`BlockFile::grow`]): what the allocator may hand out. None for
@@ -355,6 +357,30 @@ pub enum Life {
     Short,
     /// A leaf's settle: held until that leaf settles again.
     Long,
+}
+
+impl Life {
+    /// A compaction's parts' life: tombstones are dropped where nothing older lies below, a leaf's
+    /// settle, whose parts live until that leaf settles again; an inner node's parts are merged
+    /// again once flushed.
+    pub fn of_compaction(drop_tombstones: bool) -> Self {
+        if drop_tombstones {
+            Self::Long
+        } else {
+            Self::Short
+        }
+    }
+}
+
+/// Where a branch of `life` begins: page `page` of `extent`, the pages before it there another
+/// branch's of that life. The shard hands a worker's job its tail, held once for the job, so the
+/// job's first branch begins there rather than in an extent of its own
+/// ([`Store::take_job_tail`], [`Store::continue_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tail {
+    pub life: Life,
+    pub extent: u64,
+    pub page: u32,
 }
 
 /// A store's tail for each expected life ([`Life`]): where the next branch of that life begins.
@@ -892,6 +918,7 @@ impl<F: BlockFile> Store<F> {
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
             tails: Tails::default(),
+            tails_handed: 0,
             timed: false,
             refill: None,
             segments: None,
@@ -980,6 +1007,7 @@ impl<F: BlockFile> Store<F> {
             lists_most_lent: 0,
             forgetting: VecDeque::new(),
             tails: Tails::default(),
+            tails_handed: 0,
             timed: false,
             refill: None,
             segments: None,
@@ -1109,6 +1137,7 @@ impl<F: BlockFile> Store<F> {
                 lists_most_lent: 0,
                 forgetting: VecDeque::new(),
                 tails: Tails::default(),
+                tails_handed: 0,
                 timed: false,
                 refill: None,
                 segments,
@@ -1872,6 +1901,58 @@ impl<F: BlockFile> Store<F> {
         } else {
             None
         };
+    }
+
+    /// A worker's job of `life` begins where the last branch of that life built here ended: that
+    /// tail, its extent held once more for the job as its grant is, and no longer this store's.
+    /// The shard gives the hold back once it holds the job's branches, or as it drops the job
+    /// (docs/design/engine-structure.md §3).
+    pub(crate) fn take_job_tail(&mut self, life: Life) -> Result<Option<Tail>, Error> {
+        let tail = self
+            .take_tail(life)?
+            .map(|(extent, page)| Tail { life, extent, page });
+        if tail.is_some() {
+            self.tails_handed = self.tails_handed.saturating_add(1);
+        }
+        Ok(tail)
+    }
+
+    /// Workers' jobs handed a tail to begin in since the store was opened
+    /// ([`Self::take_job_tail`]): jobs that shared an extent with branches written before them.
+    pub fn tails_handed(&self) -> u64 {
+        self.tails_handed
+    }
+
+    /// A worker's job begins in the tail the shard handed it: its first branch begins there, the
+    /// extent held here so the job's branches may name it, never handed out whole.
+    pub fn continue_in(&mut self, tail: Tail) -> Result<(), Error> {
+        self.alloc.hold_given(tail.extent)?;
+        *self.tails.of(tail.life) = Some((tail.extent, tail.page));
+        Ok(())
+    }
+
+    /// Where a worker's job's last branch ended, for the shard to begin the next branch of its
+    /// life in ([`Self::adopt_tail`]); a job builds branches of one life.
+    pub fn tail_left(&self) -> Option<Tail> {
+        let Tails { short, long } = self.tails;
+        long.map(|(extent, page)| Tail {
+            life: Life::Long,
+            extent,
+            page,
+        })
+        .or(short.map(|(extent, page)| Tail {
+            life: Life::Short,
+            extent,
+            page,
+        }))
+    }
+
+    /// A worker's job's branches, now held here, ended at `tail`: the next branch of its life
+    /// begins there, once the extent is still held.
+    pub(crate) fn adopt_tail(&mut self, tail: Tail) {
+        if self.alloc.is_held(tail.extent) {
+            self.set_tail(tail.life, tail.extent, tail.page);
+        }
     }
 
     /// One reference fewer; an extent left with none is reused once a checkpoint that no

@@ -1871,7 +1871,8 @@ pub enum Class {
     /// extents' allocator apart: each extent's is charged with its metadata from what remains
     /// (`mantle_engine::shard_db::measured_per_extent`).
     Engines,
-    /// Each range's member ([`range_bytes`]).
+    /// Each range's member ([`range_bytes`]) and what the node holds inline for it
+    /// (`node::slots_bytes`).
     Ranges,
     /// The node's shared log ([`log_bytes`]).
     Log,
@@ -2721,7 +2722,11 @@ fn derive_with(
             .reads
             .checked_add(limits.exchanges)
             .ok_or(overflow("a range's reads"))?;
-        let mut ranges_bytes = 0u64;
+        // Each range's member, and what the node holds inline for it: its replica in its arena's
+        // slot and its tables' entries, a second slot and entries where it runs on a shard past
+        // the first.
+        let mut ranges_bytes =
+            crate::node::slots_bytes(placed, hosted.len()).ok_or(overflow("the ranges' slots"))?;
         for hosted in &hosted {
             ranges_bytes = range_bytes(&hosted.range, reads)
                 .and_then(|bytes| ranges_bytes.checked_add(bytes))
@@ -4029,7 +4034,9 @@ fn say_floor(
                 }
                 Class::Ranges => {
                     "each range's member at hyper-raft's limits, its reads the node's own and \
-                     its exchanges' (derive::range_bytes)"
+                     its exchanges' (derive::range_bytes), and what the node holds inline for \
+                     it, its replica in its arenas' slots and its tables' entries \
+                     (node::slots_bytes)"
                 }
                 Class::Log => "the node's shared log (derive::log_bytes)",
                 Class::Transport => {
@@ -5030,7 +5037,7 @@ mod tests {
         );
         assert_eq!(
             said_bytes(&derived, "memory.need"),
-            NEED_96_GIB + crate::node::PIECE
+            need_96_gib() + crate::node::PIECE
         );
         // Its five engines each take a maintenance worker: its need with them is its need and
         // five workers' stacks, cursors, builders and packings, about 90 MB each at the range's
@@ -5058,7 +5065,7 @@ mod tests {
         assert!((80_000_000..100_000_000).contains(&each), "{each}");
         assert_eq!(
             said_bytes(&derived, "memory.need_workers"),
-            NEED_96_GIB + crate::node::PIECE + 5 * (each + STACK)
+            need_96_gib() + crate::node::PIECE + 5 * (each + STACK)
         );
     }
 
@@ -5074,12 +5081,19 @@ mod tests {
     /// (`Issuer::device_threads`), 32 stacks fewer. Its transport: a receive takes a train from
     /// each of the node's three peers and the ten operations' clients it serves at once
     /// ([`runs`]), 1,605,344 bytes more: the buffers of the 12 trains past the first, 131,072
-    /// bytes each, and every train's messages' headers.
-    const NEED_96_GIB: u64 = if cfg!(target_os = "linux") {
-        13_714_100_270 - 32 * STACK + 1_605_344
-    } else {
-        13_714_100_270
-    };
+    /// bytes each, and every train's messages' headers. And on each, what the node holds inline
+    /// for its five ranges on its first shard (`node::slots_bytes`), each replica in its arena's
+    /// slot with its entries, which the floor did not count: 104,808 bytes more on macOS aarch64,
+    /// five ranges of 20,960 and its one shard's count of 8, 13,714,205,078 in all; at its types'
+    /// sizes on each other target.
+    fn need_96_gib() -> u64 {
+        let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
+        if cfg!(target_os = "linux") {
+            13_714_100_270 - 32 * STACK + 1_605_344 + slots
+        } else {
+            13_714_100_270 + slots
+        }
+    }
 
     /// On CI's macOS arm64 runner, three cores and 7 GiB, rule D's order keeps the capacity wants
     /// as they were before the caches were wants: a founder of the membership suite's cell holds
@@ -7357,8 +7371,10 @@ mod tests {
     /// transport 974,293,070, where a founder's are 4,102,904,425, 2,177,077,666 and 562,407,499.
     /// Each node counted once ([`nodes_named`]), by derive and by the node as it opens its
     /// transport (`NodeSettings::stated`), it derives its founders' settings, rules and transport,
-    /// and its floor is theirs, 7,289,300,291 bytes at one operation, 226,892,477 within the
-    /// machine: it starts.
+    /// and its floor is theirs, 7,289,405,099 bytes at one operation, 226,787,669 within the
+    /// machine: it starts. Of those, 104,808 are its five ranges' slots and entries
+    /// (`node::slots_bytes`), which the floor counts since each replica was found held inline in
+    /// its arena uncounted; on Linux, at its types' sizes there.
     #[test]
     fn a_rejoined_founder_counts_each_identity_of_its_cell_once() {
         let founder = repair_founder;
@@ -7396,9 +7412,15 @@ mod tests {
         // Linux's, by derive's model and not measured here: the issuer's 16 workers' stacks fewer
         // (33,554,432 bytes), the kernel holding its transfers, and about 133 KB more for each
         // train past the first a receive takes, its eight peers' and its operation's client's
-        // ([`runs`]).
+        // ([`runs`]). Each with its five ranges' slots and entries at the target's sizes (104,808
+        // bytes on macOS aarch64).
+        let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
         assert!(
-            runs(7_255_000_000..7_260_000_000, 7_289_300_291..7_289_300_292).contains(&founded),
+            runs(
+                7_255_000_000 + slots..7_260_000_000 + slots,
+                7_289_300_291 + slots..7_289_300_292 + slots
+            )
+            .contains(&founded),
             "{founded}"
         );
         // It starts on the runner, every class of its floor its founders'.
@@ -7461,18 +7483,20 @@ mod tests {
     /// A founder of the repair suite's cell on CI's 7 GiB macOS runner whose device measured 240
     /// deep and its shards 436 control entries, as one did at its first start in gates run
     /// 44596668868 (macos-aarch64, `Cell::made_partly`, repair.rs:809), was refused at its threads
-    /// at 7,831,251,011 bytes, CI's exactly, its floor at that depth. Every byte past its floor at
-    /// 16 deep and 64 entries, 7,289,300,291, is what its depth and its ring hold: the device's
-    /// issuer carries each transfer on a worker of its own where a pool carries them (macOS,
-    /// Windows; `Issuer::device_threads`), 224 more threads' 2 MiB stacks, 469,762,048 bytes; its
-    /// two volumes take 448 more transfers at once, whose exchanges the transport holds,
-    /// 34,843,648, and whose reads the ranges hold, 37,273,600; and three shards' rings 372 entries
-    /// longer, 71,424. Its floor grows 2,419,104 bytes a transfer, so the deepest its allowance
-    /// holds is 109, 7,514,348,387 bytes at one operation, 1,844,381 within, and 110 is past it. It
-    /// takes 109 and starts: its issuer's workers, its volumes' reads and transfers and the
-    /// transport's room for them all at the depth taken. Where the kernel holds the transfers on
-    /// the issuer's one thread (Linux), its threads are 16 stacks at any depth, and it takes the
-    /// 240 measured.
+    /// at 7,831,251,011 bytes, CI's exactly, its floor at that depth, 7,831,355,819 now its five
+    /// ranges' slots are counted (`node::slots_bytes`: 104,808 bytes on macOS aarch64, each
+    /// replica inline in its arena with its entries; its types' sizes elsewhere, which every
+    /// figure here adds). Every byte past its floor at 16 deep and 64 entries, 7,289,405,099 with
+    /// them, is what its depth and its ring hold: the device's issuer carries each transfer on a
+    /// worker of its own where a pool carries them (macOS, Windows; `Issuer::device_threads`), 224
+    /// more threads' 2 MiB stacks, 469,762,048 bytes; its two volumes take 448 more transfers at
+    /// once, whose exchanges the transport holds, 34,843,648, and whose reads the ranges hold,
+    /// 37,273,600; and three shards' rings 372 entries longer, 71,424. Its floor grows 2,419,104
+    /// bytes a transfer, so the deepest its allowance holds is 109, 7,514,453,195 bytes at one
+    /// operation, 1,739,573 within, and 110 is past it. It takes 109 and starts: its issuer's
+    /// workers, its volumes' reads and transfers and the transport's room for them all at the
+    /// depth taken. Where the kernel holds the transfers on the issuer's one thread (Linux), its
+    /// threads are 16 stacks at any depth, and it takes the 240 measured.
     #[test]
     fn a_repair_founder_measured_deep_on_cis_macos_runner_takes_the_deepest_its_allowance_holds() {
         let measured = repair_runner(240, 436);
@@ -7497,20 +7521,21 @@ mod tests {
                 taken
             );
         }
+        let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
         if cfg!(target_os = "linux") {
             assert_eq!(taken, 240);
             // Derive's Linux model, not measured here: the issuer's 240 workers' stacks fewer
             // than macOS's, and about 133 KB more a train ([`runs`]).
             assert_eq!(at_taken, at_measured);
             assert!(
-                (7_327_000_000..7_332_000_000).contains(&at_measured),
+                (7_327_000_000 + slots..7_332_000_000 + slots).contains(&at_measured),
                 "{at_measured}"
             );
         } else {
-            assert_eq!(at_measured, 7_831_251_011);
+            assert_eq!(at_measured, 7_831_251_011 + slots);
             assert_eq!(taken, 109);
-            assert_eq!(at_taken, 7_514_348_387);
-            assert_eq!((7u64 << 30) - at_taken, 1_844_381);
+            assert_eq!(at_taken, 7_514_348_387 + slots);
+            assert_eq!((7u64 << 30) - at_taken, 1_844_381 - slots);
             assert!(floor_at_one(repair_founder(), &repair_runner(110, 436)) > 7 << 30);
         }
         // Every term that holds the depth holds the one taken: the issuer's workers among the

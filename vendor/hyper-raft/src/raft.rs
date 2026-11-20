@@ -2720,6 +2720,19 @@ impl<S: Storage> Raft<S> {
         ));
         Ok(())
     }
+    /// A sole voter's round to the other members it sends to, which its beats are timed on while
+    /// it leads with work in flight and has no timing ([`Raft::set_timing`]): a beat is what
+    /// recovers a lost answer, its heartbeat's answer saying where the member's log ends (raft-rs
+    /// resumes a probe at a heartbeat's answer; Ongaro's dissertation §3.5, an RPC lost is retried).
+    pub fn set_reach(&mut self, reach: std::time::Duration) -> Result<()> {
+        self.watch_mut()?.reach = Some(nanos(reach));
+        Ok(())
+    }
+    /// The reach the owner last gave, if any.
+    pub fn reach(&self) -> Option<std::time::Duration> {
+        let reach = self.watch.as_ref()?.reach?;
+        Some(std::time::Duration::from_nanos(reach))
+    }
     /// The timing the owner last gave, if any.
     pub fn timing(&self) -> Option<Timing> {
         let (span, round, election) = self.watch.as_ref()?.timing?;
@@ -2857,6 +2870,9 @@ impl<S: Storage> Raft<S> {
         let active = self.active()?;
         let watch = self.watch_mut()?;
         let (round, beat, transfer) = (watch.round(), watch.beat, watch.transfer);
+        // A sole voter has no timing and beats on its reach: the beat recovers what was lost on
+        // its way to a learner, as it does to a voter.
+        let beat_round = round.or(watch.reach);
         watch.campaign = Arm::Off;
         let transfer = match (self.lead_transferee, transfer, round) {
             (None, ..) => Arm::Off,
@@ -2872,7 +2888,7 @@ impl<S: Storage> Raft<S> {
             }
             (Some(_), _, None) => Arm::Unset { round: false },
         };
-        let beat = match (active, beat, round) {
+        let beat = match (active, beat, beat_round) {
             (false, ..) => Arm::Off,
             (true, _, None) => Arm::Unset { round: false },
             (true, Arm::At(at), Some(round)) if now >= at => {

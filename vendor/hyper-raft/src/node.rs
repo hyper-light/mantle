@@ -684,6 +684,10 @@ impl<S: Storage> RawNode<S> {
     pub fn set_timing(&mut self, timing: crate::Timing) -> Result<()> {
         self.raft.set_timing(timing)
     }
+    /// What the owner's measurements give a sole voter's beats ([`Raft::set_reach`]).
+    pub fn set_reach(&mut self, reach: std::time::Duration) -> Result<()> {
+        self.raft.set_reach(reach)
+    }
     /// The last index this member, leading, may take from the fast track
     /// at ([`Raft::cap_takes`]).
     pub fn cap_takes(&mut self, through: Option<u64>) -> Result<()> {

@@ -89,6 +89,35 @@ progress as it was (§2), the same state a page answered `LogTemporarilyUnavaila
 the same call sends it once made: the owner need not wait for the core's next try, which is a
 heartbeat's answer away, and never comes where nothing beats.
 
+## 2b. After a snapshot, the member's answer, and a heartbeat's when it is lost
+
+Read on 2026-11-20 in raft-rs at `8e4cef172421bf77b2ae1c26628a9531b0be41f0` (as §2a).
+
+[RAFT-RS] `RawNode::report_snapshot`, `src/raw_node.rs`: "ReportSnapshot reports the status of
+the sent snapshot." It steps a `MsgSnapStatus` from the member, `reject` set for
+`SnapshotStatus::Failure`.
+
+[RAFT-RS] `handle_snapshot_status`, `src/raft.rs`: a progress in the snapshot state becomes a
+probe either way (`pr.become_probe()`, after `pr.snapshot_failure()` on a failure), then:
+
+> // If snapshot finish, wait for the msgAppResp from the remote node before sending
+> // out the next msgAppend.
+> // If snapshot failure, wait for a heartbeat interval before next try
+> pr.pause();
+> pr.pending_request_snapshot = INVALID_INDEX;
+
+[RAFT-RS] `handle_heartbeat_response`, `src/raft.rs`: every heartbeat's answer resumes the
+member's progress (`pr.recent_active = true; pr.resume();`) and, while it lacks entries, sends to
+it (§2a's quote).
+
+**Finding 5.** A member sent a snapshot is replicated to again on its answer, and the answer may
+be lost as any message may (Ongaro's dissertation §3.5: Raft retries a lost RPC); what recovers
+it is the leader's heartbeat, whose answer resumes the paused probe. A leader that never beats
+leaves the probe paused for good once that answer is lost. hyper-raft's answers to heartbeats say
+where the member's log ends (`HeartbeatAnswers::Position`) and are taken as an append's answer, so
+one beat recovers it; under elections by suspicion a leader beats only on a round its owner gave
+(`Raft::wake_leader`), and a sole voter was given none (mantle docs/design/replica.md §4).
+
 ## 3. TiKV makes the image on demand, in a worker
 
 [TIKV] `PeerStorage::snapshot`, when no snapshot is ready and the requesting peer is in the

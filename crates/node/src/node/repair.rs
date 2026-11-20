@@ -1111,7 +1111,10 @@ fn chunk_answer(outcome: ChunkOutcome, get: bool) -> Answer {
     }
     match taken(&outcome) {
         Taken::Stored => Answer::Stored,
-        Taken::Refused => Answer::Refused { full: false },
+        // A rebuild's chunk lost with its connection is sent on as one refused is: a repair has
+        // its block's other places beside it, and a repair left no volume is planned again at the
+        // next pass.
+        Taken::Refused | Taken::Lost => Answer::Refused { full: false },
         Taken::Full => Answer::Refused { full: true },
         // No room now: a repair has no client whose patience would bound a wait, and holds the
         // operations' memory it took from the host's admission meanwhile (`Running::charge`),

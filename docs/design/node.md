@@ -4149,7 +4149,21 @@ deadline or patience, and one whose operation, learned from its fields, holds mo
 host has room for; the CLI prints its words after `SlowDown: `. The node counts each cause it
 answers on either door, the listener as it answers and the host as a native reply goes, and says
 each count as it changes, `slowed CAUSE COUNT`, at most once a cause each half serve period, as
-`moved` is said, so a refusal storm says at most twelve lines a half period. 2. `mantle_s3::route` names the bucket by the path at the endpoint's stated names, its
+`moved` is said, so a refusal storm says at most twelve lines a half period. *As built
+(2026-11-20).* A put's `Unplaced` and `Patience` name a path, not which cause on it answered, and
+CI gates run 44667404838's three `Unplaced` PUTs were judged by code path for want of more
+(d1970571). Each host of a node now counts the cause of every put it answers so
+(`node::refusals`, a fixed array of counts shared by the node's hosts as its gateway settings are):
+placement short of the block's width, by the table's presence and standing as placement read it (a
+node held away, a volume leaving or gone, or every volume active and seen, the cell narrower than
+its layout); the block's last chunk, no volume left, refused by its volume, by the volume's status,
+or by the transport for a cause of the peer's, by its refusal; lost with its connection after its
+one resend (gateway.md §2), by the transport's last word; its volume gone from the table; and a
+put past its client's patience, a chunk of it waiting for room or an ask of its own out. The node
+says each count as it changes, `refused CAUSE COUNT`, as `slowed` is, and every count in its
+`counts` answer, `refused_CAUSE COUNT`; the end-to-end harness echoes each `refused` line to the
+test's standard error as it hears it, so a test whose put is answered `SlowDown` names its cause.
+2. `mantle_s3::route` names the bucket by the path at the endpoint's stated names, its
 addresses and `localhost`, and by the host under one of its names; any other host is
 `InvalidURI`. 3. `mantle_s3::sigv4` checks the signature, its header's or a presigned URL's,
 against the cell's access keys; who asks is the account the key acts for, and a mutation's identity

@@ -532,6 +532,10 @@ pub(crate) enum Line {
     /// The bytes the node's transfers moved, said as they move, and its transport's serve period:
     /// the longest an exchange it carries may go without moving before the transport refuses it.
     Moved(u64, Duration),
+    /// A cause the node answered puts `SlowDown` for, and how many it so answered since it began
+    /// (`refused CAUSE COUNT`, said as the count changes): echoed to the test's standard error as
+    /// heard, so a test that fails a put `SlowDown` names the cause the node counted.
+    Refused(String, u64),
     /// The node began its orderly stop at a signal.
     Stopping,
     /// Its orderly stop began to hand a range's lead over: the range's group, and the voter it goes
@@ -753,6 +757,7 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             "1" => true,
             _ => return None,
         })),
+        ["refused", cause, count] => Some(Line::Refused((*cause).to_owned(), count.parse().ok()?)),
         ["moved", bytes, serve] => Some(Line::Moved(
             bytes.parse().ok()?,
             Duration::from_nanos(serve.parse().ok()?),
@@ -836,6 +841,7 @@ pub(crate) fn movement(line: &Line) -> Option<Movement> {
         | Line::History(..)
         | Line::Basis(..)
         | Line::Moved(..)
+        | Line::Refused(..)
         | Line::Stopping
         | Line::Handing(..)
         | Line::Handed(..)
@@ -2318,6 +2324,7 @@ impl Cell {
                 | Line::History(..)
                 | Line::Basis(..)
                 | Line::Moved(..)
+                | Line::Refused(..)
                 | Line::Stopping
                 | Line::Handing(..)
                 | Line::Handed(..)
@@ -2725,6 +2732,12 @@ impl Cell {
                     }
                     // Bytes moving are the cell moving, though no range moves with them: a block's
                     // chunks crossing to the nodes that store them commit nothing until all land.
+                    // A put the node answered `SlowDown`, its cause named where the test's own
+                    // failure, a client's `503`, names none (gateway.md §2).
+                    Line::Refused(cause, count) => {
+                        eprintln!("node {id} answered puts SlowDown for {cause}: {count} so far");
+                        return;
+                    }
                     Line::Moved(bytes, serve) => {
                         let was = self.transfers.insert(id, (bytes, serve));
                         if was.is_some_and(|(before, _)| before == bytes) {

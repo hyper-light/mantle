@@ -50,6 +50,7 @@ use mantle_s3::range::{self, CopyRangeError, Span};
 use mantle_s3::seal::{DataKey, WrappingKey};
 
 use super::keyed::Key;
+use super::refusals::Cause;
 use super::{ChunkAsk, ChunkOutcome, Node, NodeError, NodeLog, PIECE, shard, take_done};
 use crate::ask::{CommandAsk, CommandOutcome, ReadAsk, ReadOutcome, Wait};
 use crate::chunk;
@@ -100,6 +101,9 @@ pub struct GatewaySettings {
     /// and the annual loss probability allowed (durability.md; `mantle_ec::durability::choose`).
     pub rates: Rates,
     pub target: f64,
+    /// What answered the node's puts `SlowDown`, counted by every host these settings are shared
+    /// with: the node's own and each driving shard's ([`super::refusals`]).
+    pub refusals: super::refusals::Refusals,
 }
 
 /// A native object request parked until the host has room for it (`Node::take_parked`), its body
@@ -3783,6 +3787,18 @@ fn complete_status(error: &CompleteError) -> Status {
     }
 }
 
+/// How long a put's chunk lost with its connection, no other volume left, waits before it is asked
+/// again of the same volume (`put::Answer::Lost`): a beat, the probe timeout at the initial
+/// estimates (RFC 9002 §6.2.1, §6.2.2), at which the host offers room to a chunk waiting for it
+/// (`Host::step`). A node dials a peer again on its transport's word that the connection closed,
+/// backing off from the measured probe timeout (node.md §3), a round trip and a handshake within a
+/// cell, so a node alive is connected again within the initial estimate's beat; a node truly gone
+/// costs the put that one beat before it is refused `NotConnected` again, and the stock client's
+/// patience, 60 s (`bounds::STOCK_PATIENCE`), holds some sixty of them.
+fn resend_beat_ns() -> u64 {
+    u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// The reply a put's failure is answered with (node.md §4.4): a block no volume offered took,
 /// `SlowDown` for that cause.
 fn put_failed(error: &PutError) -> Reply {
@@ -5964,7 +5980,19 @@ impl Host {
             return Ok(());
         }
         match job.bounded(now) {
-            Bounded::SlowDown => self.slow_job(node, at, door::Slowed::Patience)?,
+            Bounded::SlowDown => {
+                // A put's is counted by what held it: a chunk waiting for room, or its own asks.
+                if matches!(job.work, Work::Put(_) | Work::Copy(_))
+                    && let Some(gateway) = self.gateway.as_deref()
+                {
+                    gateway.refusals.count(if job.waits_for_room() {
+                        Cause::PatienceRoom
+                    } else {
+                        Cause::PatienceHeld
+                    });
+                }
+                self.slow_job(node, at, door::Slowed::Patience)?;
+            }
             // The job says so on its door, twice a beat or as its work moves, and the node's
             // task tells its exchange's asker (`Replies::write`).
             Bounded::Held => job.vouch(now, beat),
@@ -6152,9 +6180,16 @@ impl Host {
                 (None, _) => return self.fail_job(node, at, Status::Failed),
                 (Some(id), outcome) => {
                     // An answer the driver refuses ends it with that outcome, which its next
-                    // turn replies: a precondition or a lock the Name range judged, say.
+                    // turn replies: a precondition or a lock the Name range judged, say. A block
+                    // failed `Unplaced` is counted by its last chunk's outcome.
                     if let Some(put) = putting.put.as_mut() {
-                        let _ = put.answer(id, put_answer(outcome));
+                        let cause = unplaced_cause(&outcome);
+                        let failed = put.answer(id, put_answer(outcome));
+                        if let (Err(PutError::Unplaced(_)), Some(cause), Some(gateway)) =
+                            (failed, cause, self.gateway.as_deref())
+                        {
+                            gateway.refusals.count(cause);
+                        }
                     }
                 }
             },
@@ -6280,7 +6315,13 @@ impl Host {
                     }
                     (Driver::Put, id) => {
                         if let Some(put) = copying.put.as_mut() {
-                            let _ = put.answer(id, put_answer(outcome));
+                            let cause = unplaced_cause(&outcome);
+                            let failed = put.answer(id, put_answer(outcome));
+                            if let (Err(PutError::Unplaced(_)), Some(cause), Some(gateway)) =
+                                (failed, cause, self.gateway.as_deref())
+                            {
+                                gateway.refusals.count(cause);
+                            }
                         }
                     }
                 },
@@ -6648,6 +6689,7 @@ impl Host {
         let holding = Holding {
             handover_ns: gateway.handover_ns,
             window: self.jobs.get(at).map_or(gateway.window, |job| job.window),
+            beat_ns: resend_beat_ns(),
         };
         let made = (|| {
             let data = DataKey::generate().ok()?;
@@ -6911,9 +6953,18 @@ impl Host {
                     self.fail_job(node, at, Status::Failed)?;
                     return Ok(None);
                 };
-                // Refused, the driver ends with that outcome, which its next turn replies.
-                if let Some(put) = self.put_of(at) {
-                    let _ = put.answer(id, put::Answer::Volumes(volumes));
+                // Refused, the driver ends with that outcome, which its next turn replies; one
+                // offered too few volumes is counted by the table's presence and standing as
+                // placement read them.
+                let short = self.put_of(at).is_some_and(|put| {
+                    matches!(
+                        put.answer(id, put::Answer::Volumes(volumes)),
+                        Err(PutError::Unplaced(_))
+                    )
+                });
+                if short && let (Ok(table), Some(gateway)) = (node.table(), self.gateway.as_deref())
+                {
+                    gateway.refusals.count(Cause::short(&table.facts));
                 }
                 return Ok(None);
             }
@@ -6929,8 +6980,14 @@ impl Host {
                 };
                 let Some(holder) = holder else {
                     // A volume the table no longer holds refuses it: the next is asked.
-                    if let Some(put) = self.put_of(at) {
-                        let _ = put.answer(id, put::Answer::Refused { full: false });
+                    let unplaced = self.put_of(at).is_some_and(|put| {
+                        matches!(
+                            put.answer(id, put::Answer::Refused { full: false }),
+                            Err(PutError::Unplaced(_))
+                        )
+                    });
+                    if unplaced && let Some(gateway) = self.gateway.as_deref() {
+                        gateway.refusals.count(Cause::Untabled);
                     }
                     return Ok(None);
                 };
@@ -8501,6 +8558,7 @@ impl Host {
         let holding = Holding {
             handover_ns: gateway.handover_ns,
             window: writes,
+            beat_ns: resend_beat_ns(),
         };
         let get = Get::new(version.file, size, span, Box::new(keyring), reads);
         let put = Put::new(commit, body, keys, layout, holding, Box::new(Random), now);
@@ -9571,6 +9629,15 @@ pub(crate) enum Outcome {
     Chunk(ChunkOutcome),
 }
 
+/// What a put's block failing `Unplaced` at `outcome`, its last chunk's, is counted as
+/// ([`Cause::of`]); none for an outcome no chunk's.
+fn unplaced_cause(outcome: &Outcome) -> Option<Cause> {
+    match outcome {
+        Outcome::Chunk(chunk) => Cause::of(chunk),
+        Outcome::Command(_) | Outcome::Read(_) => None,
+    }
+}
+
 /// A put's driver's answer for what its request came to.
 fn put_answer(outcome: Outcome) -> put::Answer {
     match outcome {
@@ -9578,6 +9645,7 @@ fn put_answer(outcome: Outcome) -> put::Answer {
             Taken::Stored => put::Answer::Stored,
             Taken::Room => put::Answer::Busy,
             Taken::Refused => put::Answer::Refused { full: false },
+            Taken::Lost => put::Answer::Lost,
             Taken::Full => put::Answer::Refused { full: true },
             Taken::Failed => put::Answer::Failed,
         },
@@ -9600,6 +9668,11 @@ pub(super) enum Taken {
     Room,
     /// This volume does not take it, and another may: the next volume offered is asked.
     Refused,
+    /// Its connection to the volume's node closed under it, or none was up: a put may have landed
+    /// (node.md §5.2), and the node may take it once a connection is made again, so another volume
+    /// offered is asked, or, none left, the same one once more a beat later (`put::Answer::Lost`);
+    /// a read is asked of another place, as a refused one is.
+    Lost,
     /// The volume has no room, and cleaning can make none.
     Full,
     /// No volume takes it as it was sent: the put cannot go on.
@@ -9671,12 +9744,13 @@ pub(super) fn taken(outcome: &ChunkOutcome) -> Taken {
             | Refusal::Busy
             | Refusal::Unsent
             | Refusal::Stalled => Taken::Room,
-            // This peer, not the chunk: not the one the directory names, no connection up to it,
-            // its connection closed or the exchange ended unanswered, the bytes damaged on the way,
-            // its connection's QUIC refused, or a refusal this side does not know.
+            // Its connection, not the peer or the chunk: none up to it, or closed or the exchange
+            // ended unanswered, as a stall past the idle timeout closes one to a node alive.
+            Refusal::NotConnected | Refusal::Closed => Taken::Lost,
+            // This peer, not the chunk: not the one the directory names, the exchange unknown to
+            // its transport, the bytes damaged on the way, its connection's QUIC refused, or a
+            // refusal this side does not know.
             Refusal::Identity
-            | Refusal::NotConnected
-            | Refusal::Closed
             | Refusal::UnknownExchange
             | Refusal::Corrupt
             | Refusal::Quic
@@ -9743,7 +9817,7 @@ fn get_answer(outcome: Outcome) -> get::Answer {
             // the chunk not found there, past its end or corrupt, its head or a put's status
             // answering, or its peer gone or not the one named. Another place that holds them
             // is read, or the block decoded.
-            Taken::Refused | Taken::Full => get::Answer::Unreadable,
+            Taken::Refused | Taken::Lost | Taken::Full => get::Answer::Unreadable,
             // No volume serves it as it was asked (the node's role, its frame bound, the
             // exchange's order, identifiers or settings), or a put's outcome answering a get:
             // the node crossed its asks.
@@ -9770,6 +9844,14 @@ pub(super) mod tests {
         pub(super) static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         /// The wall clock's reads this thread's stubs of the node gave ([`Stub`]'s `wall_ns`).
         pub(super) static WALL_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The wall clock this thread's stubs of the node give ([`Stub`]'s `wall_ns`), which a
+        /// test moves on.
+        pub(super) static WALL_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The chunk puts this thread's stubs were asked of node 3, the one held away, and how
+        /// the first of them is lost ([`lost_once`]).
+        pub(super) static AWAY_ASKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        pub(super) static LOSING: std::cell::Cell<Option<Refusal>> =
+            const { std::cell::Cell::new(None) };
         /// The probes this thread made of a host's slots ([`Slots::get`]).
         pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The keys this thread's hosts compared in their heaps ([`Earliest::less`]).
@@ -11230,6 +11312,7 @@ pub(super) mod tests {
                 repair: 0.041_666_666_666_666_664,
             },
             target: 1e-11,
+            refusals: super::super::refusals::Refusals::default(),
         }
     }
 
@@ -11536,6 +11619,7 @@ pub(super) mod tests {
                 repair: 0.041_666_666_666_666_664,
             },
             target: 1e-11,
+            refusals: super::super::refusals::Refusals::default(),
         };
         let charge = |window| charges().write(window, length);
         assert!(charge(learned) > gateway.objects_bytes);
@@ -11578,6 +11662,7 @@ pub(super) mod tests {
                 repair: 0.041_666_666_666_666_664,
             },
             target: 1e-11,
+            refusals: super::super::refusals::Refusals::default(),
         };
         let mut learned = crate::window::Windows::default();
         let admitted = sized(Some(&gateway), &learned, Moves::Read);
@@ -11649,6 +11734,7 @@ pub(super) mod tests {
                 repair: 0.041_666_666_666_666_664,
             },
             target: 1e-11,
+            refusals: super::super::refusals::Refusals::default(),
         };
         let source = mantle_s3::copy::Source {
             bucket: "b".into(),
@@ -11730,6 +11816,7 @@ pub(super) mod tests {
                 repair: 0.041_666_666_666_666_664,
             },
             target: 1e-11,
+            refusals: super::super::refusals::Refusals::default(),
         };
         let admitted = charges().copy(1, 1, mantle_s3::body::MAX_UPLOAD);
         let admission = |budget: u64, others: u64| {
@@ -11945,6 +12032,7 @@ pub(super) mod tests {
         let holding = Holding {
             handover_ns: 1,
             window: 1,
+            beat_ns: resend_beat_ns(),
         };
         putting.put =
             Some(Put::new(commit, body, keys, layout, holding, Box::new(Random), 0).unwrap());
@@ -13259,7 +13347,7 @@ pub(super) mod tests {
 
         fn wall_ns(&self) -> u64 {
             WALL_READS.with(|reads| reads.set(reads.get() + 1));
-            0
+            WALL_NS.with(std::cell::Cell::get)
         }
 
         fn freed(&mut self) -> bool {
@@ -13470,6 +13558,7 @@ pub(super) mod tests {
         let holding = Holding {
             handover_ns: 1,
             window: 1,
+            beat_ns: resend_beat_ns(),
         };
         let layout = Layout::new(durability::Scheme::Copies(3)).unwrap();
         let mut put = Put::new(commit, body, keys, layout, holding, Box::new(Random), 0).unwrap();
@@ -13671,10 +13760,24 @@ pub(super) mod tests {
     }
 
     /// A native put of one byte, its blocks three copies, through a host whose node's table holds
-    /// three volumes in three domains with the third's node held away, each chunk put answered by
-    /// `answer`: the put's answer, and how many chunk puts it asked.
-    fn put_with_a_node_held_away(answer: fn(&JobAsk) -> Outcome) -> (door::Answer, u64) {
-        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+    /// three volumes in three domains with the third's node held away, each ask answered by
+    /// `answer`, the wall clock a beat on at each turn: the put's answer, how many asks it made,
+    /// and the node's counts of what answered its puts `SlowDown` (`refusals`).
+    fn put_with_a_node_held_away(
+        answer: fn(&JobAsk) -> Outcome,
+    ) -> (door::Answer, u64, [u64; super::super::refusals::CAUSES]) {
+        let mut table = Table::volumes(1);
+        table.facts.last_mut().unwrap().presence.present = false;
+        put_placed_by(table, answer)
+    }
+
+    /// As [`put_with_a_node_held_away`], its blocks placed by `table`.
+    fn put_placed_by(
+        table: Table,
+        answer: fn(&JobAsk) -> Outcome,
+    ) -> (door::Answer, u64, [u64; super::super::refusals::CAUSES]) {
+        let gateway = std::sync::Arc::new(scheming_gateway());
+        let mut host = Host::new(1, Some(std::sync::Arc::clone(&gateway)));
         let (body, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
         let (reply, mut answers) = hyper_rt::sync::channel(door::Replying::FIRST_ANSWERS).unwrap();
         let (mut job, _, _) = local_job(Work::Put(native_put(1)), 0, 0);
@@ -13690,8 +13793,6 @@ pub(super) mod tests {
             mark: None,
         }));
         host.push(job, 0);
-        let mut table = Table::volumes(1);
-        table.facts.last_mut().unwrap().presence.present = false;
         let mut stub = Stub {
             answer,
             table: Some(table),
@@ -13709,7 +13810,7 @@ pub(super) mod tests {
         for _ in 0..64 {
             match answers.try_recv().unwrap() {
                 Some(door::Answer::Ready) => ready = true,
-                Some(answer) => return (answer, stub.asked),
+                Some(answer) => return (answer, stub.asked, gateway.refusals.counts()),
                 None => {}
             }
             if ready
@@ -13719,8 +13820,118 @@ pub(super) mod tests {
                 pieces.push_front(piece);
             }
             host.step(&mut stub).unwrap();
+            WALL_NS.with(|wall| wall.set(wall.get() + resend_beat_ns()));
         }
         panic!("the put was never answered");
+    }
+
+    /// A put's chunk answered at node 3 lost as `LOSING` says the first time it is asked and
+    /// `Stored` after, every other chunk stored and every command written, as the commands' ranges
+    /// answer them.
+    fn lost_once(ask: &JobAsk) -> Outcome {
+        let answered = |answer| Outcome::Command(CommandOutcome::Answered(answer));
+        match ask {
+            JobAsk::Put { at: 3, .. } => {
+                let asked = AWAY_ASKS.with(|asks| asks.replace(asks.get() + 1));
+                match LOSING.with(std::cell::Cell::get) {
+                    Some(refusal) if asked == 0 => Outcome::Chunk(ChunkOutcome::Lost(refusal)),
+                    _ => Outcome::Chunk(ChunkOutcome::Stored),
+                }
+            }
+            JobAsk::Put { .. } => Outcome::Chunk(ChunkOutcome::Stored),
+            JobAsk::Command(_, Command::Block(_)) => {
+                answered(Answer::Block(mantle_meta::block::Outcome::Written {
+                    deadline_ns: u64::MAX,
+                }))
+            }
+            JobAsk::Command(_, Command::File(_)) => {
+                answered(Answer::File(mantle_meta::file::Outcome::Written {
+                    deadline_ns: u64::MAX,
+                }))
+            }
+            JobAsk::Command(_, Command::Name(_)) => answered(Answer::Name(name::Outcome::Put {
+                version: "v".into(),
+            })),
+            _ => panic!("an ask a put does not make"),
+        }
+    }
+
+    /// A chunk put whose connection a stall closed under it (`Lost(Closed)`), in a cell of three
+    /// whose block's copies take every volume, so none is left to send it on to: asked again of the
+    /// same volume once, a beat later, with the same key and bytes (node.md §5.2: a put lost may
+    /// have landed, and the volume answers the same key and bytes put again as done), it lands and
+    /// the put is answered `Done`. Before, the put failed `Unplaced`, `503 SlowDown`, at once,
+    /// though the node's transport made the connection again within the beat (d1970571, Open). So
+    /// too a put whose connection was not up yet as it went (`Lost(NotConnected)`).
+    #[test]
+    fn a_chunk_lost_with_its_connection_is_asked_again_a_beat_later_and_the_put_lands() {
+        for lost in [Refusal::Closed, Refusal::NotConnected] {
+            AWAY_ASKS.with(|asks| asks.set(0));
+            LOSING.with(|losing| losing.set(Some(lost)));
+            let (answer, _, refused) = put_with_a_node_held_away(lost_once);
+            let door::Answer::Head(reply) = answer else {
+                panic!("{lost:?}: the put was answered {answer:?}");
+            };
+            assert_eq!(reply.status, Status::Done, "{lost:?}");
+            assert_eq!(
+                AWAY_ASKS.with(std::cell::Cell::get),
+                2,
+                "{lost:?}: asked again once"
+            );
+            assert_eq!(refused, [0; super::super::refusals::CAUSES], "{lost:?}");
+        }
+    }
+
+    /// A put's chunk lost with its connection is asked again of the same volume, with the same key
+    /// and bytes, only once its beat has passed since the put first saw it lost, and once only:
+    /// lost again, the block, no volume left, fails `Unplaced`. Where another volume is left, it is
+    /// sent on at once, as a refused chunk is.
+    #[test]
+    fn a_lost_chunk_waits_its_beat_and_is_asked_again_of_its_volume_once() {
+        for lost in [Refusal::Closed, Refusal::NotConnected] {
+            let outcome = Outcome::Chunk(ChunkOutcome::Lost(lost));
+            let (mut put, chunks) = put_of_copies(3);
+            let (id, volume, key) = chunks[0];
+            put.answer(id, put_answer(outcome)).unwrap();
+            assert!(put.outcome().is_none() && put.poll().is_none(), "{lost:?}");
+            assert!(!put.waits_for_room(), "{lost:?}: no room is waited for");
+            // The tick that sees it lost sets its beat.
+            put.tick(10).unwrap();
+            assert_eq!(put.due_ns(), Some(10 + resend_beat_ns()), "{lost:?}");
+            put.tick(9 + resend_beat_ns()).unwrap();
+            assert!(
+                put.poll().is_none(),
+                "{lost:?}: asked again before its beat"
+            );
+            put.tick(10 + resend_beat_ns()).unwrap();
+            let Some((
+                again,
+                put::Request::Chunk {
+                    volume: v, key: k, ..
+                },
+            )) = put.poll()
+            else {
+                panic!("{lost:?}: not asked again at its beat");
+            };
+            assert_eq!((v, k), (volume, key), "{lost:?}");
+            assert_eq!(put.due_ns(), None, "{lost:?}");
+            let failed = put.answer(again, put_answer(Outcome::Chunk(ChunkOutcome::Lost(lost))));
+            assert!(
+                matches!(failed, Err(PutError::Unplaced(_))),
+                "{lost:?}: {failed:?}"
+            );
+            // A volume to spare: sent on at once.
+            let (mut put, chunks) = put_of_copies(4);
+            put.answer(
+                chunks[0].0,
+                put_answer(Outcome::Chunk(ChunkOutcome::Lost(lost))),
+            )
+            .unwrap();
+            let Some((_, put::Request::Chunk { volume: v, .. })) = put.poll() else {
+                panic!("{lost:?}: not sent on");
+            };
+            assert_eq!(v, 3, "{lost:?}");
+        }
     }
 
     /// A put whose layout was chosen while the cell saw its three nodes, its block placed once the
@@ -13734,7 +13945,7 @@ pub(super) mod tests {
     /// answered `InsufficientStorage` only where all three were asked.
     #[test]
     fn a_block_placed_while_one_of_three_nodes_is_held_away_asks_its_volume_last() {
-        let (answer, asked) = put_with_a_node_held_away(|_| {
+        let (answer, asked, refused) = put_with_a_node_held_away(|_| {
             Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Full))
         });
         let door::Answer::Head(reply) = answer else {
@@ -13742,19 +13953,80 @@ pub(super) mod tests {
         };
         assert_eq!(reply.status, Status::InsufficientStorage);
         assert_eq!(asked, 3, "each copy asked of a volume of its own");
+        assert_eq!(refused, [0; super::super::refusals::CAUSES], "no SlowDown");
     }
 
     /// Where the node held away is truly gone, its copy is refused at once, no connection to it,
-    /// and the block, no volume left, fails `Unplaced`, `503 SlowDown`, as it did before the away
-    /// node's volume was offered: a cell short of volumes now, which a node back or a joiner mends.
+    /// asked again a beat later and refused so again, and the block, no volume left, fails
+    /// `Unplaced`, `503 SlowDown`, as it did before the away node's volume was offered: a cell short
+    /// of volumes now, which a node back or a joiner mends. The node counts it as lost with its
+    /// connection, by the transport's last word.
     #[test]
-    fn a_block_whose_node_held_away_is_gone_fails_unplaced_at_once() {
-        let (answer, asked) = put_with_a_node_held_away(|ask| match ask {
+    fn a_block_whose_node_held_away_is_gone_fails_unplaced_once_its_resend_is_refused() {
+        let (answer, asked, refused) = put_with_a_node_held_away(|ask| match ask {
             JobAsk::Put { at: 3, .. } => Outcome::Chunk(ChunkOutcome::Lost(Refusal::NotConnected)),
             _ => Outcome::Chunk(ChunkOutcome::Stored),
         });
         assert_eq!(answer, door::Answer::Slowed(door::Slowed::Unplaced));
-        assert_eq!(asked, 3);
+        assert_eq!(asked, 4, "each copy asked once, the gone node's once more");
+        let mut counted = [0; super::super::refusals::CAUSES];
+        counted[Cause::Lost(Refusal::NotConnected).slot()] = 1;
+        assert_eq!(refused, counted);
+    }
+
+    /// Each path that answers a put `SlowDown` counts its cause on the node, where the client's
+    /// `503` names only `Unplaced` or `Patience`: placement short of the block's width, by the
+    /// table's presence and standing (a node held away, a volume leaving, or a cell narrower than
+    /// its layout); the block's last chunk refused by its volume, by the volume's status; lost with
+    /// its connection, by the transport's word (above); and a chunk waiting for room past its
+    /// client's patience.
+    #[test]
+    fn each_path_that_answers_a_put_slowdown_counts_its_cause() {
+        let slowed = |table: Table, answer: fn(&JobAsk) -> Outcome, cause: Cause| {
+            let (reply, _, refused) = put_placed_by(table, answer);
+            assert_eq!(
+                reply,
+                door::Answer::Slowed(door::Slowed::Unplaced),
+                "{cause:?}"
+            );
+            let mut counted = [0; super::super::refusals::CAUSES];
+            counted[cause.slot()] = 1;
+            assert_eq!(refused, counted, "{cause:?}");
+        };
+        let stored = |_: &JobAsk| Outcome::Chunk(ChunkOutcome::Stored);
+        let mut narrow = Table::volumes(1);
+        narrow.facts.pop();
+        slowed(narrow, stored, Cause::ShortNarrow);
+        let mut away = Table::volumes(1);
+        away.facts.pop();
+        away.facts.last_mut().unwrap().presence.present = false;
+        slowed(away, stored, Cause::ShortAway);
+        let mut leaving = Table::volumes(1);
+        leaving.facts.last_mut().unwrap().standing = mantle_meta::record::VolumeStanding::Leaving;
+        slowed(leaving, stored, Cause::ShortInactive);
+        slowed(
+            Table::volumes(1),
+            |ask| match ask {
+                JobAsk::Put { at: 3, .. } => {
+                    Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Fenced))
+                }
+                _ => Outcome::Chunk(ChunkOutcome::Stored),
+            },
+            Cause::Volume(chunk::Status::Fenced),
+        );
+        // A put whose chunk waits for room past its client's patience.
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let gateway = std::sync::Arc::new(scheming_gateway());
+        let mut host = Host::new(1, Some(std::sync::Arc::clone(&gateway)));
+        let (mut put, chunks) = put_of_copies(3);
+        put.answer(chunks[0].0, put::Answer::Busy).unwrap();
+        host.push(put_job(put), 0);
+        let mut stub = Stub::chunks();
+        host.bound_job(&mut stub, 0, patience + 1, resend_beat_ns())
+            .unwrap();
+        let mut counted = [0; super::super::refusals::CAUSES];
+        counted[Cause::PatienceRoom.slot()] = 1;
+        assert_eq!(gateway.refusals.counts(), counted);
     }
 
     /// Every outcome that says no room now, at the volume or in the transport toward it, here or at
@@ -13813,9 +14085,11 @@ pub(super) mod tests {
     }
 
     /// A volume that cannot take the chunk (fenced, closing, not on the node asked, its records
-    /// damaged, the bytes changed on the way, its node unreachable or its connection closed) and a
-    /// full one still send it on to the next volume offered, and a block left none still fails
-    /// `Unplaced` or `Full`; a chunk no volume takes as it was sent (this node's role may not send
+    /// damaged, the bytes changed on the way) and a full one still send it on to the next volume
+    /// offered, and a block left none still fails `Unplaced` or `Full` (a chunk lost with its
+    /// connection is sent on too, but asked again of its volume before a block fails:
+    /// `a_lost_chunk_waits_its_beat_and_is_asked_again_of_its_volume_once`); a chunk no volume
+    /// takes as it was sent (this node's role may not send
     /// it, past its class's frame bound, its exchange out of order, the node's exchange identifiers
     /// spent, its settings invalid, or its asks crossed) fails the put at once.
     #[test]
@@ -13827,8 +14101,6 @@ pub(super) mod tests {
             ChunkOutcome::Refused(chunk::Status::Corrupt),
             ChunkOutcome::Refused(chunk::Status::Checksum),
             ChunkOutcome::Refused(chunk::Status::Failed),
-            ChunkOutcome::Lost(Refusal::NotConnected),
-            ChunkOutcome::Lost(Refusal::Closed),
             ChunkOutcome::Lost(Refusal::Corrupt),
             ChunkOutcome::Lost(Refusal::Unknown),
             ChunkOutcome::Refused(chunk::Status::Full),

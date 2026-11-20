@@ -81,6 +81,7 @@ mod hold;
 mod host;
 mod keyed;
 mod members;
+pub mod refusals;
 mod repair;
 mod shard;
 mod spread;
@@ -2842,6 +2843,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             }
         }
         counts
+    }
+
+    /// The puts this node answered `SlowDown` since it opened, a count for each cause in
+    /// [`refusals::names`]' order, as every host of the node counted them ([`refusals::Refusals`]);
+    /// none on a node that hosts no objects.
+    pub fn put_refusals(&self) -> [u64; refusals::CAUSES] {
+        self.gateway
+            .as_ref()
+            .map_or([0; refusals::CAUSES], |gateway| gateway.refusals.counts())
     }
 
     /// The entries this node's members proposed as their ranges' leader since it opened, and the

@@ -831,6 +831,19 @@ Mac under load, 2026-10-07; benches/shard_db.rs `attribute`):
 - So the remedy is the part named above: runs out sized from the device's measured write
   latency and the memory the node spares the shard, not a larger constant.
 
+**A node's engines' workers** (as built 2026-11-20; node.md §1.2). A shard's pool admits its
+compactions within its measured need, Little's law over its workers' busy time and its shard's
+(`trunk::pool`), unless they are urgent (`Trunk::admit`: a pending branch, a full root, a step
+that waits, a consolidation), and its packings, page loads, checkpoint flushes and index jobs up
+to its most (`Pool::send` with `waiting`), so a compaction not yet urgent leaves the shard's own
+jobs a seat once the most is past the need. A node gives each range's engine a most of two
+(`derive::ENGINE_WORKERS`: a hot range's one worker measured 82% busy at 6,184 small PUTs a second
+needs 1.33 at 10,000), within the node's cores less one shared among its ranges and the memory
+its allowance holds (`derive::engine_workers`, `derive::derive`). A pool serves its own engine's
+file alone (`trunk::pool::serve`), so no engine's work takes another's seats; one pool for every
+engine on a node, which node.md §1.2 states and which would charge the node's need once rather
+than each range's most, is open there.
+
 ## 7. Crash and recovery
 
 - **Order of a checkpoint.**

@@ -1195,17 +1195,39 @@ pub fn engine_within(engine: Engine, metadata: u64) -> Result<Engine, DeriveErro
     })
 }
 
-/// The maintenance workers each range's engine runs its packings and compactions on
-/// (`ShardDb::set_workers_within`), where the allowance holds the node's need with them
-/// ([`derive`]): one, the least a pool holds. Measured: at 4,000 to 6,000 small PUTs a second the
-/// leader's shard spent 31% of its busy time packing and compacting its five ranges inline
-/// (`Trunk::run` 26%, the memtable's packing 5%; macOS `sample` of `mantle bench doors --sizes 1
-/// --kinds PUT,GET --load open:12000`, 2026-11-19), a need of one worker for all five by Little's
-/// law, as an engine's pool measures its need (`trunk::pool`); each worker more costs a
-/// compaction's statement, about 90 MB at the range's longest keys ([`workers_bytes`]). A pool
-/// serves one engine's file (`trunk::pool::serve`), so the node's engines cannot share one, and its
-/// five ranges hold five workers, where node.md §1.2 states the engines' pools shared.
-pub const ENGINE_WORKERS: usize = 1;
+/// The most maintenance workers each range's engine's pool holds (`ShardDb::set_workers_within`),
+/// where the node's cores and its allowance hold them ([`engine_workers`], [`derive`]): two. A pool
+/// admits the compactions its own measured need asks, by Little's law its workers' busy time over
+/// its shard's (L = λW; Little, Operations Research 9(3), 1961; `trunk::pool`), and its packings,
+/// page loads, checkpoint flushes and index jobs up to this most. Measured: a three-node cell on
+/// the Mac Studio (M3 Ultra, 32 cores) took a million 1-byte PUTs from 2,048 clients at 6,184 a
+/// second through the native door (perf-10k 8b64f8d3, 2026-11-20), and a macOS `sample` of one node
+/// 100 s in found its hot range's one worker 82% busy (`pwrite` 25%, `memmove` 13%, `pread` 7%,
+/// building tries and branches most of the rest), the busiest thread on the node, while its four
+/// other ranges' workers were nearly idle. At the 10,000 PUTs a second a cell is to serve (node.md
+/// §2.9, the owner's decision of 2026-11-18), the same maintenance a PUT asks needs 0.82 × 10,000 /
+/// 6,184 = 1.33 workers, so two: a packing beside a compaction. The need of 2026-11-19, under one
+/// for all five ranges, was the shard's inline share (31% of its busy time) before maintenance left
+/// it and each range's write buffer grew from 20,840 to 561,885 bytes. Each worker more costs its
+/// range a compaction's statement and a packing's buffers ([`workers_bytes`]), about 90 MB at the
+/// range's longest keys, and a stack. A pool serves one engine's file (`trunk::pool::serve`), so
+/// each range holds its own, where node.md §1.2 states the engines' pools shared: a node of five
+/// ranges is charged ten, though a pool starts a worker only for a job no worker is free for
+/// (`Pool::send`), so a cold range's second never starts.
+pub const ENGINE_WORKERS: usize = 2;
+
+/// The most maintenance workers each of `ranges` ranges' engines holds on a node of `cores` CPUs:
+/// [`ENGINE_WORKERS`], at most the node's cores less one shared among its ranges, so that with
+/// every range's maintenance busy at once each worker has a core beside one shard's (as an
+/// engine's pool takes the cores the OS reports less its shard's, `Pool::cores`), and at least
+/// one, the least a pool holds (`Pool::new`).
+pub fn engine_workers(cores: usize, ranges: usize) -> usize {
+    cores
+        .saturating_sub(1)
+        .checked_div(ranges)
+        .unwrap_or(0)
+        .clamp(1, ENGINE_WORKERS.max(1))
+}
 
 /// The entries a sorter's two lists, a kept key's hash and offset, and a radix sort's counts take
 /// a memtable's packing (`mantle_engine::memtable::hashed::Sorter`, `mantle_engine::kept::KeyList`):
@@ -1762,7 +1784,7 @@ pub fn descriptor_operations(limit: u64, fixed: u64, each: u64) -> u64 {
 /// depth, the kernel holding its transfers, and elsewhere that thread and a worker for each read
 /// its profile measured at the device at once (`Issuer::device_threads`); and for each volume its
 /// writer and its cleaner, and its scrubber where it scrubs; and its ranges' engines' `workers`
-/// maintenance workers, all of them ([`ENGINE_WORKERS`] each). `devices` are those devices'
+/// maintenance workers, all of them (at most [`engine_workers`] each). `devices` are those devices'
 /// depths, `volumes` whether each scrubs.
 pub fn threads(shards: usize, devices: &[usize], volumes: &[bool], workers: usize) -> Option<u64> {
     // The node's own, its standard input's and output's, its log's and its log's device's, and
@@ -2480,12 +2502,12 @@ fn layer_name(layer: Layer) -> &'static str {
 ///   not open below (`Store::open`). An engine's page cache takes no share: its want, every page
 ///   of its rows at most its store's ([`engine_cache_wants_for`]), is the most it may hold, and
 ///   the node gives it none until it lends the cache bytes no operation holds.
-/// - each engine's maintenance workers ([`ENGINE_WORKERS`]), their stacks among the floor's
-///   threads and their cursors, builders and packings among its engines ([`workers_bytes`]),
-///   where the allowance holds the node's need with them, said as `memory.need_workers`; else
-///   none, each engine packing and compacting on its shard, as at `memory.need`, which every want
-///   whole needs: a compaction's statement at the range's longest keys is about 90 MB, and CI's
-///   7 GiB macOS runner holds no five of them past a founder's need.
+/// - each engine's maintenance workers, the most of [`engine_workers`] down to one where the
+///   allowance holds the node's need with them, said as `memory.need_workers`, their stacks among
+///   the floor's threads and their cursors, builders and packings among its engines
+///   ([`workers_bytes`]); else none, each engine packing and compacting on its shard, as at
+///   `memory.need`, which every want whole needs: a compaction's statement at the range's longest
+///   keys is about 90 MB, and CI's 7 GiB macOS runner holds no five of them past a founder's need.
 ///
 /// `stores` reads range `group`'s store as it stands, its superblocks read at the page a new store
 /// would take or the one they name (`Store::shape`): none before its first start.
@@ -2496,16 +2518,21 @@ pub fn derive(
 ) -> Result<Derived, DeriveError> {
     let allowed = allowance(stated.ceiling, &measured.memory)?;
     let (bare, need, depth) = deepest_held(&stated, measured, stores)?;
-    match derive_with(
-        stated,
-        measured,
-        stores,
-        (ENGINE_WORKERS, Some(need)),
-        depth,
-    ) {
-        Ok((derived, needed)) if needed <= allowed => Ok(derived),
-        _ => Ok(bare),
+    // The most workers an engine may hold first, one fewer each step: at most ENGINE_WORKERS steps.
+    let most = engine_workers(measured.cores, stated.ranges.len());
+    for workers in (1..=most).rev() {
+        if let Ok((derived, needed)) = derive_with(
+            stated.clone(),
+            measured,
+            stores,
+            (workers, Some(need)),
+            depth,
+        ) && needed <= allowed
+        {
+            return Ok(derived);
+        }
     }
+    Ok(bare)
 }
 
 /// [`derive`] with no maintenance workers at the deepest transfers each device's issuer may keep
@@ -3077,9 +3104,10 @@ fn derive_with(
             needed,
             Kind::Derived,
             "memory.need with each engine's maintenance workers, their stacks and their cursors, \
-             builders and packings (derive::ENGINE_WORKERS, derive::workers_bytes), and the pages \
-             an entry's reads hold loaded on them (mantle_engine::shard_db::loads_bytes): a node \
-             allowed less runs none, its engines packing and compacting on its shard",
+             builders and packings (engine.workers, derive::workers_bytes), and the pages an \
+             entry's reads hold loaded on them (mantle_engine::shard_db::loads_bytes): a node \
+             allowed less runs fewer, and one allowed less than one each runs none, its engines \
+             packing and compacting on its shard",
         );
     }
     // The bytes of every class at `held` with `objects_bytes` for the operations.
@@ -3417,12 +3445,15 @@ fn derive_with(
         workers,
         Kind::Derived,
         "the most maintenance workers each range's engine packs and compacts on, so an apply on \
-         the node's shard writes none of their pages: one, the least a pool holds, the measured \
-         need of all five ranges' maintenance under small PUTs (derive::ENGINE_WORKERS); their \
-         stacks among the floor's threads, their cursors, builders and packings and the pages \
-         an entry's reads hold loaded on them among its engines (derive::workers_bytes, \
-         mantle_engine::shard_db::loads_bytes); none where the \
-         allowance does not hold the node's need with them, each engine then packing and \
+         the node's shard writes none of their pages: two, a packing beside a compaction, the \
+         need Little's law gives a hot range's worker measured 82% busy at 6,184 small PUTs a \
+         second scaled to 10,000 (derive::ENGINE_WORKERS), at most the node's cores less one \
+         shared among its ranges (derive::engine_workers), and fewer, down to one, where the \
+         allowance holds no more; each engine's pool admits compactions within its own measured \
+         need (mantle_engine::trunk::pool); their stacks among the floor's threads, their \
+         cursors, builders and packings and the pages an entry's reads hold loaded on them among \
+         its engines (derive::workers_bytes, mantle_engine::shard_db::loads_bytes); none where \
+         the allowance does not hold the node's need with one, each engine then packing and \
          compacting on its shard",
     );
     let config = log_config;
@@ -4656,8 +4687,17 @@ mod tests {
         // most entries the memtable holds (`entries_of`, 112,375 at 5 bytes each), each trie's
         // labels at its bytes, 561,885 (`Built::of`), computed on macOS aarch64 and the same on
         // every target, no allocation measured in it. Charged the densest rows' count at the
-        // longest key's labels, 51,080 entries of 256 index labels each, it was 174,508,244.
-        assert_eq!(whole, 34_986_486);
+        // longest key's labels, 51,080 entries of 256 index labels each, it was 174,508,244 at
+        // one worker; one worker's is 34,986,486, and each worker more adds its builders and a
+        // packing's buffers, 28,602,155, so two hold 63,588,641.
+        let one = |e: &Engine| buffers_bytes(e, key, 1).unwrap();
+        let at_want = Engine {
+            memtable_bytes: want,
+            ..least
+        };
+        assert_eq!(one(&at_want) - one(&least), 34_986_486);
+        assert_eq!(ENGINE_WORKERS, 2);
+        assert_eq!(whole, 63_588_641);
         for part in [0, 1, whole / 3, whole / 2, whole - 1, whole, u64::MAX] {
             let e = write_buffer(least, want, part, key, ENGINE_WORKERS).unwrap();
             assert_eq!(e.trunk, least.trunk);
@@ -5343,7 +5383,8 @@ mod tests {
         // Every client's shares at a chunk is its want, and the transport holds it whole.
         assert_eq!(want, (3 + clients) * 3 * (chunk - initial));
         assert_eq!(bytes - floor, want);
-        // 62,382 on macOS; Linux's range holds its estimate, 62,234, derived and not yet run there.
+        // 61,960 on macOS, 422 fewer than one worker an engine left (62,382); Linux's range holds
+        // its estimate, 61,812, its one worker's 62,234 less as many, derived and not yet run there.
         let operations = said_bytes(&derived, "gateway.objects");
         assert!(
             runs(61_350..63_350, 61_500..63_500).contains(&operations),
@@ -5353,9 +5394,11 @@ mod tests {
             said_bytes(&derived, "memory.need"),
             need_96_gib() + crate::node::PIECE
         );
-        // Its five engines each take a maintenance worker: its need with them is its need and
-        // five workers' stacks, cursors, builders and packings, about 90 MB each at the range's
-        // longest keys, which its operations' bytes give up.
+        // Its five engines each take two maintenance workers, its 32 cores less one holding six a
+        // range (`engine_workers`): its need with them is its need and ten workers' stacks,
+        // cursors, builders and packings, about 90 MB each at the range's longest keys, which its
+        // operations' bytes give up.
+        assert_eq!(engine_workers(32, 5), ENGINE_WORKERS);
         assert_eq!(
             said_bytes(&derived, "engine.workers"),
             ENGINE_WORKERS as u64
@@ -5380,22 +5423,25 @@ mod tests {
         let objects = said_bytes(&derived, "engine.objects");
         let metadata = engine_wants_for(&engine, objects).unwrap();
         assert_eq!(said_bytes(&derived, "engine.metadata_bytes"), metadata);
-        assert_eq!(buffers_past(&derived), 34_986_486);
+        assert_eq!(buffers_past(&derived), 63_588_641);
         assert_eq!(
             said_bytes(&derived, "memory.remaining"),
             said_bytes(&derived, "volume.1.index_bytes")
                 + 5 * metadata
                 + 5 * buffers_past(&derived)
         );
-        // Each worker as the floor counts it, at the least buffer, and the pages its range's
-        // reads hold loaded on it: twice the sources at a trunk's root, 34 pages of 24,576 bytes
+        // Each worker as the floor counts it, at the least buffer, one within 80 to 100 MB and an
+        // engine's two its two pools and three packings' buffers, and the pages its range's
+        // reads hold loaded on them: twice the sources at a trunk's root, 34 pages of 24,576 bytes
         // and 384 of records each, a memtable at the least holding no page's bytes
         // (`shard_db::loads_bytes`). Computed on macOS aarch64 and the same on every 64-bit
         // target, its records' types holding nothing a target sizes apart; no allocation is
         // measured in it.
         let least = engine_least(c);
-        let each = workers_bytes(&least, c.rules.max_key_bytes, ENGINE_WORKERS).unwrap();
-        assert!((80_000_000..100_000_000).contains(&each), "{each}");
+        let key = c.rules.max_key_bytes;
+        let one = workers_bytes(&least, key, 1).unwrap();
+        assert!((80_000_000..100_000_000).contains(&one), "{one}");
+        let each = workers_bytes(&least, key, ENGINE_WORKERS).unwrap();
         let loads = mantle_engine::shard_db::loads_bytes(
             &least.trunk,
             least.store.page_size,
@@ -5405,8 +5451,63 @@ mod tests {
         assert_eq!(loads, 848_640);
         assert_eq!(
             said_bytes(&derived, "memory.need_workers"),
-            need_96_gib() + crate::node::PIECE + 5 * (each + loads + STACK)
+            need_96_gib() + crate::node::PIECE + 5 * (each + loads + ENGINE_WORKERS as u64 * STACK)
         );
+    }
+
+    /// An engine's workers are the most of `engine_workers` the allowance holds the node's need
+    /// with, one fewer at a time: the 96 GiB founder allowed its need with one worker a range, and
+    /// not two, runs one, and allowed a byte less runs none, as a node allowed less than one did
+    /// before. Each range's workers are bounded by the node's cores less one shared among its
+    /// ranges, and a pool holds at least one.
+    #[test]
+    fn an_engine_holds_the_most_workers_its_cores_and_the_allowance_hold() {
+        assert_eq!(engine_workers(32, 5), 2);
+        assert_eq!(engine_workers(11, 5), 2);
+        assert_eq!(engine_workers(10, 5), 1);
+        assert_eq!(engine_workers(4, 5), 1);
+        assert_eq!(engine_workers(1, 5), 1);
+        assert_eq!(engine_workers(8, 0), 1);
+        let founder = || {
+            let mut founder = Stated {
+                s3: s3(),
+                ..stated(1)
+            };
+            founder.volumes[0].1 = VolumeBytes::Stated(32 << 30);
+            founder
+        };
+        let mut measured = facts(1);
+        measured.memory = machine(96 << 30, None);
+        measured.cores = 32;
+        let two = derive(founder(), &measured, &mut fresh).unwrap();
+        let c = &two.config;
+        let least = engine_least(c);
+        let key = c.rules.max_key_bytes;
+        let loads = mantle_engine::shard_db::loads_bytes(
+            &least.trunk,
+            least.store.page_size,
+            least.memtable_bytes,
+        )
+        .unwrap();
+        let need = said_bytes(&two, "memory.need");
+        let with = |workers: usize| {
+            need + 5 * (workers_bytes(&least, key, workers).unwrap() + loads)
+                + 5 * workers as u64 * STACK
+        };
+        assert_eq!(said_bytes(&two, "memory.need_workers"), with(2));
+        let allowed = |ceiling: u64| {
+            let stated = Stated {
+                ceiling: Some(ceiling),
+                ..founder()
+            };
+            derive(stated, &measured, &mut fresh).unwrap()
+        };
+        let one = allowed(with(2) - 1);
+        assert_eq!(said_bytes(&one, "engine.workers"), 1);
+        assert_eq!(said_bytes(&one, "memory.need_workers"), with(1));
+        let none = allowed(with(1) - 1);
+        assert_eq!(said_bytes(&none, "engine.workers"), 0);
+        assert_eq!(said_bytes(&none, "memory.need"), need);
     }
 
     /// The need of a ladder founder on 96 GiB and 32 cores at 36ad012b, rule D's order before

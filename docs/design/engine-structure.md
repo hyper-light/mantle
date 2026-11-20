@@ -572,9 +572,11 @@ cache did meanwhile, and a page held or loading is never loaded again. Held page
 when their reader is done (`release_loaded`). An extent whose last reference goes
 (`Store::release`) drops its held pages and marks its loads out stale, whose pages are dropped when
 they come back: a freed extent is written again, and a held copy would outlive its page. The pages
-held and loading are at most twice the sources a read's path opens (`ShardDb::loads_most`,
-`TrunkConfig::sources_most`), or a memtable's bytes' worth where that is more; past it, and off a
-runtime task,
+held and loading are at most twice the sources a read's path opens at a trunk's root
+(`shard_db::loads_most`, `TrunkConfig::sources_most` of one level), or a memtable's bytes' worth
+where that is more: fixed by the configuration rather than the trunk's height as it stands, so a
+node counts them in its floor at that bound (`shard_db::loads_bytes`; node.md §1.4). Past it, and
+off a runtime task,
 without workers or with the issuer attached (whose own reads `get_async` makes), the read is made
 as before. A page the OS holds is read in place as the inline path reads it (research/41): the
 worker is for the read that would wait on the device (research/03 HL23-F3, F7).
@@ -772,7 +774,12 @@ counted budget; no task waits on another node's:
   bundle; below, a pivot's live bundles and its bundle), a compaction merges at most `4F + 2`, the
   shard holds two compactions' and a worker one, each building a branch of at most a leaf's limit,
   and the shard's packing builds one more (`TrunkConfig::cursors_most`, `builders_most`,
-  `built_most`); `shard_db::pooled_bytes` states their bytes.
+  `built_within`); `shard_db::pooled_bytes` states their bytes. A packing's builder is bounded by
+  its memtable's bytes, not by a leaf's limit at the longest key: at most the entries a memtable
+  holds (`memtable::hashed::most_entries`, each entry's head three bytes at least though its insert
+  asks room for nine), and each of its tries at most a label a byte of the keys, which lie within
+  the arena (`branch::Built::of`); a pool's builder is charged the larger of each part of the two,
+  as its lists keep the most they grew to (`tests/builder_memory.rs`, a memtable's worst mixes).
 
 Reads are unchanged: every apply runs on the shard's thread between steps, so a read sees each
 node either before or after a task, never half of one. A checkpoint saves the nodes as they are;

@@ -221,25 +221,55 @@ pub fn page_bytes(capacity: usize) -> Option<usize> {
     capacity.checked_add(entries.checked_mul(std::mem::size_of::<u64>())?)
 }
 
+/// What a branch builder takes at most, the parts its statement grows with: its branch's
+/// entries, and the labels of its two tries, its range filter's and its leaf index's ([`Built::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Built {
+    pub entries: u64,
+    pub range_labels: u64,
+    pub index_labels: u64,
+}
+
+impl Built {
+    /// A branch of at most `entries` entries whose keys are at most `key` bytes each and at most
+    /// `key_bytes` bytes in all. Each trie holds the bytes every key shares once (at most a
+    /// key's) and past them at most its depth a key or a leaf, a leaf an entry at least
+    /// ([`crate::store::RANGE_FILTER_DEPTH`], [`crate::store::LEAF_INDEX_DEPTH`]); and a key gives
+    /// a trie at most a label a byte of it, a range filter's entry or a leaf's separator being a
+    /// prefix of a key it was cut from, each leaf's of its own first key: so at most the keys'
+    /// bytes in all. `key_bytes` binds a memtable's packing, whose keys lie within its arena
+    /// (`crate::memtable::hashed::most_entries`); a compaction's keys are bounded by their count
+    /// alone, `u64::MAX`.
+    pub fn of(key: usize, entries: u64, key_bytes: u64) -> Option<Self> {
+        let key = u64::try_from(key).ok()?;
+        let labels = |depth: usize| -> Option<u64> {
+            let depth = u64::try_from(depth).ok()?.min(key);
+            Some(
+                key.checked_add(entries.checked_mul(depth)?)?
+                    .min(entries.checked_mul(key)?)
+                    .min(key_bytes),
+            )
+        };
+        Some(Self {
+            entries,
+            range_labels: labels(crate::store::RANGE_FILTER_DEPTH)?,
+            index_labels: labels(crate::store::LEAF_INDEX_DEPTH)?,
+        })
+    }
+
+    /// The larger of each part: what a builder's lists hold reused for either, a store's pool
+    /// keeping each list at the most it grew to (`Store::take_lists`).
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            entries: self.entries.max(other.entries),
+            range_labels: self.range_labels.max(other.range_labels),
+            index_labels: self.index_labels.max(other.index_labels),
+        }
+    }
+}
+
 /// The most bytes a branch builder holds while it builds a branch of at most `entries` entries
-/// whose keys are at most `key` bytes, at pages of `capacity` payload bytes and extents of
-/// `extent` bytes, its range filter keeping `range_bits` bits a key. Its levels number at most
-/// the height of a tree of `entries` leaves, each index page holding two entries at least
-/// ([`fits`]), and one more a write may open above; each level is a page being filled
-/// ([`page_bytes`]), its record in the level lists twice over for their doubling, and its first
-/// key's buffer. It keeps the last key added; each key buffer grows to at most twice the longest.
-/// It holds a page's payload to encode into and an extent's run to write with, its filter for
-/// `entries` keys ([`filter::most_bytes`]), and each page's entry count and each extent's number
-/// (at most one a page, a page holding an entry at least: so at most twice as many pages as
-/// entries, the index pages above them counted), in lists grown at most twice over and copied
-/// once exactly into the branch. Its two tries, the range filter of its keys and its leaves'
-/// index, hold a level a key byte ([`trie::builder_bytes`]) and labels the bytes every key shares
-/// once (at most a key's) and past them at most their depth a key or a leaf, a leaf an entry at
-/// least (`fst::surf`, [`crate::store::RANGE_FILTER_DEPTH`],
-/// [`crate::store::LEAF_INDEX_DEPTH`]); the range filter's values its suffix bits. The seal
-/// finishes each and encodes it beside its builder, each again at most its builder's bytes. A
-/// separator cut short is kept, a key buffer more. Pinned by `tests/builder_memory.rs` at the
-/// densest keys and the longest.
+/// whose keys are at most `key` bytes, bounded by their count alone ([`builder_bytes_of`]).
 pub fn builder_bytes(
     capacity: usize,
     extent: usize,
@@ -247,7 +277,41 @@ pub fn builder_bytes(
     entries: u64,
     range_bits: u32,
 ) -> Option<u64> {
+    builder_bytes_of(
+        capacity,
+        extent,
+        key,
+        Built::of(key, entries, u64::MAX)?,
+        range_bits,
+    )
+}
+
+/// The most bytes a branch builder holds while it builds a branch of at most `built` ([`Built`])
+/// whose keys are at most `key` bytes, at pages of `capacity` payload bytes and extents of
+/// `extent` bytes, its range filter keeping `range_bits` bits a key. Its levels number at most
+/// the height of a tree of `built.entries` leaves, each index page holding two entries at least
+/// ([`fits`]), and one more a write may open above; each level is a page being filled
+/// ([`page_bytes`]), its record in the level lists twice over for their doubling, and its first
+/// key's buffer. It keeps the last key added; each key buffer grows to at most twice the longest.
+/// It holds a page's payload to encode into and an extent's run to write with, its filter for
+/// its entries ([`filter::most_bytes`]), and each page's entry count and each extent's number
+/// (at most one a page, a page holding an entry at least: so at most twice as many pages as
+/// entries, the index pages above them counted), in lists grown at most twice over and copied
+/// once exactly into the branch. Its two tries, the range filter of its keys and its leaves'
+/// index, hold a level a key byte ([`trie::builder_bytes`]) and `built`'s labels, a leaf an entry
+/// at least (`fst::surf`); the range filter's values its suffix bits. The seal finishes each and
+/// encodes it beside its builder, each again at most its builder's bytes. A separator cut short
+/// is kept, a key buffer more. Pinned by `tests/builder_memory.rs` at the densest keys and the
+/// longest, and at a memtable's worst mixes.
+pub fn builder_bytes_of(
+    capacity: usize,
+    extent: usize,
+    key: usize,
+    built: Built,
+    range_bits: u32,
+) -> Option<u64> {
     let bytes = |n: usize| u64::try_from(n).ok();
+    let entries = built.entries;
     let key_buffer = bytes(key)?.checked_mul(2)?;
     let levels = u64::from(entries.max(2).ilog2()).checked_add(3)?;
     let level = bytes(page_bytes(capacity)?)?
@@ -257,7 +321,7 @@ pub fn builder_bytes(
     let pages = entries.checked_mul(2)?;
     let lists = pages.checked_mul(30)?;
     // A leaf holds an entry at least: as many separators as entries at most.
-    let tries = tries_bytes(key, entries, entries, range_bits)?.checked_mul(3)?;
+    let tries = tries_bytes_of(key, built, entries, range_bits)?.checked_mul(3)?;
     levels
         .checked_mul(level)?
         .checked_add(key_buffer)?
@@ -271,35 +335,35 @@ pub fn builder_bytes(
 
 /// The most bytes a branch's two tries take, built or as their builders hold them: its range
 /// filter over `entries` keys of at most `key` bytes keeping `range_bits` suffix bits, and its
-/// leaf index over `leaves` separators, its values pages up to 32 bits. Each holds a level a key
-/// byte at most and as labels the bytes every key shares once (at most a key's) and past them at
-/// most its depth a key or a separator, never past the key
-/// ([`crate::store::RANGE_FILTER_DEPTH`], [`crate::store::LEAF_INDEX_DEPTH`];
-/// [`trie::builder_bytes`]). Below the data its branch holds for any keys: a key's or a leaf's
-/// share is bounded by the depth, not by the key's length (research/67). Pinned by
-/// `tests/branch_tries.rs`.
+/// leaf index over `leaves` separators, its values pages up to 32 bits, each its labels as
+/// [`Built::of`] bounds them by their count ([`tries_bytes_of`]). Below the data its branch holds
+/// for any keys: a key's or a leaf's share is bounded by the depth, not by the key's length
+/// (research/67). Pinned by `tests/branch_tries.rs`.
 pub fn tries_bytes(key: usize, entries: u64, leaves: u64, range_bits: u32) -> Option<u64> {
-    let bytes = |n: usize| u64::try_from(n).ok();
-    let labels = |n: u64, depth: usize| -> Option<u64> {
-        let past = n.checked_mul(bytes(depth.min(key))?)?;
-        Some(
-            bytes(key)?
-                .checked_add(past)?
-                .min(n.checked_mul(bytes(key)?)?),
-        )
-    };
-    crate::fst::trie::builder_bytes(
+    let range = Built::of(key, entries, u64::MAX)?;
+    let index = Built::of(key, leaves, u64::MAX)?;
+    tries_bytes_of(
         key,
-        labels(entries, crate::store::RANGE_FILTER_DEPTH)?,
-        entries,
-        range_bits,
-    )?
-    .checked_add(crate::fst::trie::builder_bytes(
-        key,
-        labels(leaves, crate::store::LEAF_INDEX_DEPTH)?,
+        Built {
+            index_labels: index.index_labels,
+            ..range
+        },
         leaves,
-        u32::BITS,
-    )?)
+        range_bits,
+    )
+}
+
+/// The most bytes a branch's two tries take for `built`'s entries and labels ([`Built`]) and
+/// `leaves` separators, keys at most `key` bytes: each holds a level a key byte at most, its
+/// labels and its values ([`trie::builder_bytes`]).
+fn tries_bytes_of(key: usize, built: Built, leaves: u64, range_bits: u32) -> Option<u64> {
+    crate::fst::trie::builder_bytes(key, built.range_labels, built.entries, range_bits)?
+        .checked_add(crate::fst::trie::builder_bytes(
+            key,
+            built.index_labels,
+            leaves,
+            u32::BITS,
+        )?)
 }
 
 /// The most entries a leaf of `capacity` payload bytes holds: past its head, each takes at least

@@ -219,9 +219,11 @@ any more drops its held pages and marks its loads out stale before it can be wri
 (`Store::release`), so no held page outlives the page it copied.
 
 A pass stops at its first missing page and sends at most one load, and the pages held and loading
-for a range are at most twice the sources a read's path opens through the trunk as it stands
-(`ShardDb::loads_most`, `TrunkConfig::sources_most`: each source's leaf and the index page a get
-reads above it), or a memtable's bytes' worth of pages where that is more: past it the read is
+for a range are at most twice the sources a read's path opens at a trunk's root
+(`shard_db::loads_most`, `TrunkConfig::sources_most` of one level: each source's leaf and the
+index page a get reads above it), or a memtable's bytes' worth of pages where that is more, a bound
+the configuration fixes so the node's floor counts it (`shard_db::loads_bytes`, node.md §1.4); it
+followed the trunk's height as it stood until then, which no floor could count: past it the read is
 made on the shard as before, so an entry whose reads span more pages than the bound still
 applies. An extent's pages, the first bound tried, were two in a node's engines, fewer than a
 one-row scan over three branches lands: the test below caught that scan reading on the shard. A read off a runtime

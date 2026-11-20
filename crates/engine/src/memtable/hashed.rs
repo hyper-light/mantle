@@ -635,6 +635,23 @@ pub fn entry_bytes(key: usize, value: usize) -> Option<usize> {
     ENTRY_HEAD_MAX.checked_add(key)?.checked_add(value)
 }
 
+/// The least bytes an entry's head takes in the arena: the operation and the key's and the
+/// value's lengths, a byte each below 128 ([`HashMem::insert_hashed`]).
+const ENTRY_HEAD_LEAST: usize = 3;
+
+/// The most entries a memtable of `limit` bytes holds whose keys are at least `key` bytes: an
+/// entry is taken while the arena has room for it at its head's most ([`entry_bytes`]), and
+/// takes its head at its least, three bytes, with its key and value; so every entry but the last
+/// takes `3 + key` bytes at least, and the last `9 + key` of room. Its keys hold at most `limit`
+/// bytes in all, each within the arena past its head.
+pub fn most_entries(limit: usize, key: usize) -> Option<u64> {
+    let Some(past) = limit.checked_sub(entry_bytes(key, 0)?) else {
+        return Some(0);
+    };
+    let each = ENTRY_HEAD_LEAST.checked_add(key)?;
+    u64::try_from(past.checked_div(each)?.checked_add(1)?).ok()
+}
+
 impl HashMem {
     /// An empty memtable whose arena holds at most `limit` bytes, at most 4 GiB (offsets are 32
     /// bits).

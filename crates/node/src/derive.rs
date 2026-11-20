@@ -1005,18 +1005,38 @@ pub fn engine(block: usize, share: u64, rules: &Rules) -> Result<Engine, DeriveE
     })
 }
 
-/// The most rows a memtable of `bytes` holds: rows of the shortest key and no value
-/// (`key::least_bytes`), each its head with them (`mantle_engine::memtable::hashed::entry_bytes`).
+/// A leaf's rows: those of a memtable of `bytes` at the room its insert asks of each, rows of the
+/// shortest key and no value (`key::least_bytes`), each its head at its most with them
+/// (`mantle_engine::memtable::hashed::entry_bytes`). A shape, kept in a trunk's image; the most
+/// entries a memtable holds, which its memory is counted at, are [`entries_of`].
 fn rows_of(bytes: usize) -> Option<u64> {
     let least = mantle_engine::memtable::hashed::entry_bytes(key::least_bytes(), 0)?;
     u64::try_from(bytes.checked_div(least)?).ok()
 }
 
+/// The most entries a memtable of `bytes` holds, each of a key of the shortest
+/// (`key::least_bytes`) at its head's least (`mantle_engine::memtable::hashed::most_entries`).
+fn entries_of(bytes: usize) -> Option<u64> {
+    mantle_engine::memtable::hashed::most_entries(bytes, key::least_bytes())
+}
+
 /// What each range's engine holds beside its resident metadata and its cache, with `workers`
 /// maintenance workers, at keys of at most `key` bytes: its configured buffers, two memtables'
 /// arenas, its store's page buffers and its allocator's at no extent
-/// (`mantle_engine::shard_db::bounded_bytes`), and what its workers hold ([`workers_bytes`]).
+/// (`mantle_engine::shard_db::bounded_bytes`), what its workers hold ([`workers_bytes`]), and the
+/// pages its entries' reads hold loaded on them until the entry applies, at most
+/// `mantle_engine::shard_db::loads_most` (`loads_bytes`; none without workers, whose reads are
+/// made on the shard).
 pub fn buffers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64> {
+    let loads = if workers == 0 {
+        0
+    } else {
+        mantle_engine::shard_db::loads_bytes(
+            &engine.trunk,
+            engine.store.page_size,
+            engine.memtable_bytes,
+        )?
+    };
     mantle_engine::shard_db::bounded_bytes(
         &StoreConfig {
             max_extents: 0,
@@ -1024,7 +1044,8 @@ pub fn buffers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64>
         },
         engine.memtable_bytes,
     )?
-    .checked_add(workers_bytes(engine, key, workers)?)
+    .checked_add(workers_bytes(engine, key, workers)?)?
+    .checked_add(loads)
 }
 
 /// The write buffer each range's engine wants, `least`'s raised to a node's share of the engines'
@@ -1043,10 +1064,13 @@ pub fn buffers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64>
 ///   past it fills only where its rows take more bytes than the entries that wrote them;
 /// - at most 4 GiB, past which a memtable's 32-bit offsets refuse it (`HashMem::new`).
 ///
-/// No more than the entry: each byte of a memtable is charged hundreds of bytes in its workers'
-/// builders, the densest rows' count at the longest key's (`TrunkConfig::built_most`,
-/// `mantle_engine::branch::builder_bytes`), so a buffer past it takes from the operations what
-/// the measurements have not yet shown it gives back.
+/// No more than the entry, though its workers' builders are charged now for the entries and key
+/// bytes a memtable's bytes hold ([`workers_bytes`]): the share comes before the operations past
+/// those served (rule D's order, [`derive`]), and each byte of a memtable still costs about 65 in
+/// its sorter's and builders' lists at its most entries, so the retention, 18,671,880 bytes on a
+/// cell of three, took 7,153 of the Mac Studio's 62,382 operations, 10,035 of a 16 GiB host's
+/// 10,830 and all but the 10 a 7 GiB runner serves at least (`derive::tests`, 2026-11-20), for
+/// rotations past an entry's that no measurement has yet shown cost the node anything.
 pub fn write_buffer_want(least: &Engine, settings: &Settings, log: &LogConfig) -> Option<usize> {
     let entry = usize::try_from(settings.max_entry_bytes).ok()?;
     let retained = usize::try_from(log.group_bytes).unwrap_or(usize::MAX);
@@ -1191,26 +1215,30 @@ const SORT_COUNTS_BYTES: u64 = 8 * 256 * 4;
 
 /// What `workers` maintenance workers of `engine`'s hold beside their threads' stacks, at keys of
 /// at most `key` bytes: each worker's store keeps its pools at a compaction's most, a cursor over
-/// each of its inputs (`TrunkConfig::inputs_most`) and two builders of at most a leaf's limit
-/// (`TrunkConfig::built_most`), its reads one at a time with no issuer and the store's range
-/// filter (`mantle_engine::shard_db::pooled_bytes`, a packing's one builder within them); and a
-/// packing's buffers for each worker and the active memtable, which keeps the copy of its arena a
-/// worker sorts (`SortPack`): an arena of the memtable's bytes, and the sorter's lists, the kept
-/// keys and a cut at each of the root's pivots for its entries, every row its memtable holds
-/// ([`rows_of`]), a packing's builder as many (`TrunkConfig::built_most`). None for none: without
-/// workers a memtable keeps no copy.
+/// each of its inputs (`TrunkConfig::inputs_most`) and two builders, its reads one at a time with
+/// no issuer and the store's range filter (`mantle_engine::shard_db::pooled_bytes`, a packing's
+/// one builder within them); each builder's lists at the larger of a compaction's, a leaf's limit
+/// of entries at the longest key, and a packing's, the entries its memtable holds at most
+/// ([`entries_of`]) whose keys lie within its bytes, which bound each trie's labels too
+/// (`TrunkConfig::built_within`, `mantle_engine::branch::Built`); and a packing's buffers for each
+/// worker and the active memtable, which keeps the copy of its arena a worker sorts
+/// (`SortPack`): an arena of the memtable's bytes, and the sorter's lists, the kept keys and a cut
+/// at each of the root's pivots for its entries, every entry its memtable holds. None for none:
+/// without workers a memtable keeps no copy.
 pub fn workers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64> {
     if workers == 0 {
         return Some(0);
     }
     let trunk = &engine.trunk;
-    let rows = rows_of(engine.memtable_bytes)?;
+    let rows = entries_of(engine.memtable_bytes)?;
+    let packing =
+        mantle_engine::branch::Built::of(key, rows, u64::try_from(engine.memtable_bytes).ok()?)?;
     let pooled = mantle_engine::shard_db::pooled_bytes(
         &engine.store,
         trunk.inputs_most(),
         2,
         key,
-        trunk.built_most(rows),
+        trunk.built_within(key, packing)?,
         1,
         mantle_engine::store::RANGE_FILTER_BITS,
     )?;
@@ -3049,7 +3077,8 @@ fn derive_with(
             needed,
             Kind::Derived,
             "memory.need with each engine's maintenance workers, their stacks and their cursors, \
-             builders and packings (derive::ENGINE_WORKERS, derive::workers_bytes): a node \
+             builders and packings (derive::ENGINE_WORKERS, derive::workers_bytes), and the pages \
+             an entry's reads hold loaded on them (mantle_engine::shard_db::loads_bytes): a node \
              allowed less runs none, its engines packing and compacting on its shard",
         );
     }
@@ -3390,8 +3419,9 @@ fn derive_with(
         "the most maintenance workers each range's engine packs and compacts on, so an apply on \
          the node's shard writes none of their pages: one, the least a pool holds, the measured \
          need of all five ranges' maintenance under small PUTs (derive::ENGINE_WORKERS); their \
-         stacks among the floor's threads, their cursors, \
-         builders and packings among its engines (derive::workers_bytes); none where the \
+         stacks among the floor's threads, their cursors, builders and packings and the pages \
+         an entry's reads hold loaded on them among its engines (derive::workers_bytes, \
+         mantle_engine::shard_db::loads_bytes); none where the \
          allowance does not hold the node's need with them, each engine then packing and \
          compacting on its shard",
     );
@@ -4622,9 +4652,12 @@ mod tests {
             memtable_bytes: want,
             ..least
         }) - base;
-        // A worker's builders take the most bytes past the least: their packing's entries at the
-        // densest rows, each at the longest key's statement.
-        assert_eq!(whole, 174_508_244);
+        // A worker's sorter and builders take the most bytes past the least: their lists at the
+        // most entries the memtable holds (`entries_of`, 112,375 at 5 bytes each), each trie's
+        // labels at its bytes, 561,885 (`Built::of`), computed on macOS aarch64 and the same on
+        // every target, no allocation measured in it. Charged the densest rows' count at the
+        // longest key's labels, 51,080 entries of 256 index labels each, it was 174,508,244.
+        assert_eq!(whole, 34_986_486);
         for part in [0, 1, whole / 3, whole / 2, whole - 1, whole, u64::MAX] {
             let e = write_buffer(least, want, part, key, ENGINE_WORKERS).unwrap();
             assert_eq!(e.trunk, least.trunk);
@@ -5269,10 +5302,14 @@ mod tests {
     /// the operations served, and the piece the node's task reads every native body into, which
     /// step 6 counts in the transport's floor (`node::PIECE`, node.md §2.9 step 6c). What its
     /// operations hold beside their charges is counted at their count: it ran 62,502 on macOS and
-    /// 62,354 on Linux ([`runs`]) with each range's write buffer at its least, and runs 61,897 on
+    /// 62,354 on Linux ([`runs`]) with each range's write buffer at its least, and runs 62,382 on
     /// macOS with each at an entry of the range's largest, 561,885 bytes, its five engines holding
-    /// 872,541,220 bytes past their least buffers ([`write_buffer`]); every byte past its capacity
-    /// wants and those is its operations', so each engine's metadata is its want. Charged the
+    /// 174,932,430 bytes past their least buffers ([`write_buffer`]), their packings' builders
+    /// charged for the entries and key bytes a memtable holds; on Linux about 62,234, estimated as
+    /// the 120 fewer macOS runs, not yet run there. Charged each builder the densest rows' count at
+    /// the longest key's labels, the engines held 872,541,220 and it ran 61,897 on macOS. Every
+    /// byte past its capacity wants and those is its operations', so each engine's metadata is its
+    /// want. Charged the
     /// difference from one operation to two, it
     /// ran 59,412 and 54,591 (c1589e30): each of the 58,391 and 53,570 past the receive batch's
     /// 1,024 trains was charged a train no batch holds, 65,592 bytes on macOS and 197,752 on Linux
@@ -5306,6 +5343,7 @@ mod tests {
         // Every client's shares at a chunk is its want, and the transport holds it whole.
         assert_eq!(want, (3 + clients) * 3 * (chunk - initial));
         assert_eq!(bytes - floor, want);
+        // 62,382 on macOS; Linux's range holds its estimate, 62,234, derived and not yet run there.
         let operations = said_bytes(&derived, "gateway.objects");
         assert!(
             runs(61_350..63_350, 61_500..63_500).contains(&operations),
@@ -5342,20 +5380,32 @@ mod tests {
         let objects = said_bytes(&derived, "engine.objects");
         let metadata = engine_wants_for(&engine, objects).unwrap();
         assert_eq!(said_bytes(&derived, "engine.metadata_bytes"), metadata);
-        assert_eq!(buffers_past(&derived), 174_508_244);
+        assert_eq!(buffers_past(&derived), 34_986_486);
         assert_eq!(
             said_bytes(&derived, "memory.remaining"),
             said_bytes(&derived, "volume.1.index_bytes")
                 + 5 * metadata
                 + 5 * buffers_past(&derived)
         );
-        // Each worker as the floor counts it, at the least buffer.
+        // Each worker as the floor counts it, at the least buffer, and the pages its range's
+        // reads hold loaded on it: twice the sources at a trunk's root, 34 pages of 24,576 bytes
+        // and 384 of records each, a memtable at the least holding no page's bytes
+        // (`shard_db::loads_bytes`). Computed on macOS aarch64 and the same on every 64-bit
+        // target, its records' types holding nothing a target sizes apart; no allocation is
+        // measured in it.
         let least = engine_least(c);
         let each = workers_bytes(&least, c.rules.max_key_bytes, ENGINE_WORKERS).unwrap();
         assert!((80_000_000..100_000_000).contains(&each), "{each}");
+        let loads = mantle_engine::shard_db::loads_bytes(
+            &least.trunk,
+            least.store.page_size,
+            least.memtable_bytes,
+        )
+        .unwrap();
+        assert_eq!(loads, 848_640);
         assert_eq!(
             said_bytes(&derived, "memory.need_workers"),
-            need_96_gib() + crate::node::PIECE + 5 * (each + STACK)
+            need_96_gib() + crate::node::PIECE + 5 * (each + loads + STACK)
         );
     }
 
@@ -5379,7 +5429,9 @@ mod tests {
     /// each replica in its arena's slot with its entries: 104,808 bytes on macOS aarch64, at its
     /// types' sizes on each other target.
     fn need_96_gib() -> u64 {
-        // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
+        // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`,
+        // 689d7afb), run on macOS; Linux's 80 are derived alike, not yet run there. Its engines'
+        // workers, whose builders and held pages `memory.need_workers` counts, are not in it.
         let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
         if cfg!(target_os = "linux") {
             13_714_102_925 - 32 * STACK + 1_605_344 + slots
@@ -6558,10 +6610,13 @@ mod tests {
     /// calibration measure with every want whole, holds the issuer's threads at 256 deep, and their
     /// stacks decide where it stands (`Issuer::device_threads`): where a pool's worker carries each
     /// transfer (macOS, Windows) its 256 workers' stacks took it past the machine while each
-    /// counted Rust's 2 MiB, 7,762,434,330 bytes, and no memory it stated started it there. Each
-    /// is spawned with 128 KiB (hyper-block `WORKER_STACK`), and its need is 7,259,117,850 bytes,
+    /// counted Rust's 2 MiB, 7,762,434,410 bytes, and no memory it stated started it there. Each
+    /// is spawned with 128 KiB (hyper-block `WORKER_STACK`), and its need is 7,259,117,930 bytes,
     /// within the machine as where the kernel holds the transfers on the issuer's one thread
-    /// (Linux), 7,227,826,162 bytes (c1589e30): a node given it starts on every platform.
+    /// (Linux), 7,227,826,162 bytes (c1589e30): a node given it starts on every platform. Both
+    /// macOS figures count each of its five ranges' members at 1,688 bytes (`MEMBER_BYTES`), 80
+    /// more in all than at 1,672 before 689d7afb; its engines' workers, whose builders and held
+    /// pages `memory.need_workers` counts, are not in its need.
     #[test]
     fn a_membership_founder_on_cis_macos_runner_starts_at_its_issuers_stacks() {
         let founder = || {
@@ -6682,9 +6737,10 @@ mod tests {
     /// where a pool's worker carries each transfer (macOS, Windows): 7,518,023,644 bytes at 113,
     /// 7,863,584,860 at 256, refused at their threads, as their ranges, log and transport grow with
     /// their transfers and the issuer's workers' stacks with the depth, each Rust's 2 MiB then.
-    /// Spawned with 128 KiB (hyper-block `WORKER_STACK`), two volumes at 256 hold 7,366,591,259
-    /// bytes, where 2 MiB a worker would hold 7,869,907,739 now, and start at the depth measured on
-    /// every platform.
+    /// Spawned with 128 KiB (hyper-block `WORKER_STACK`), two volumes at 256 hold 7,366,591,339
+    /// bytes, where 2 MiB a worker would hold 7,869,907,819 now, and start at the depth measured on
+    /// every platform: on macOS, each of its five ranges' members at 1,688 bytes (`MEMBER_BYTES`),
+    /// 80 more in all than at 1,672 before 689d7afb.
     #[test]
     fn a_repair_founder_on_cis_macos_runner_starts_at_the_lanes_its_ranges_open() {
         let founder = |volumes: usize| {
@@ -7173,9 +7229,12 @@ mod tests {
     /// want whole, every operation's client's windows at a receive chunk, and the operations
     /// everything past those, no more on the smaller host: on 16 GiB 10,999 on macOS and 10,860 on
     /// Linux ([`runs`]), 1.77 GB past the transport's floor, and each engine's metadata its want.
-    /// Each range's write buffer at an entry of the range's largest takes 872,541,220 bytes past
-    /// the least before the transport and the operations past those served ([`write_buffer`]):
-    /// 10,151 on macOS, and on Linux a range as far below its 10,860, not yet run there.
+    /// Each range's write buffer at an entry of the range's largest takes 174,932,430 bytes past
+    /// the least before the transport and the operations past those served ([`write_buffer`]),
+    /// its packings' builders charged for the entries and key bytes a memtable holds: 10,830 on
+    /// macOS, and on Linux about 10,691, estimated as the 169 fewer macOS runs, not yet run there
+    /// ([`runs`]). Charged each builder the densest rows' count at the longest key's labels, the
+    /// buffers took 872,541,220 and it ran 10,151 on macOS.
     /// Charged the difference from one operation to two, it ran 10,396 and 9,264 (c1589e30):
     /// each of the 9,375 and 8,243 past the receive batch's 1,024 trains was charged a train no
     /// batch holds, 65,592 bytes on macOS and 197,752 on Linux
@@ -7228,9 +7287,10 @@ mod tests {
         assert_eq!(bytes - floor, want_past);
         let (_, roomy_want, _) = transport(&roomy);
         assert_eq!(roomy_bytes - roomy_floor, roomy_want);
+        // 10,830 on macOS; Linux's range holds its estimate, 10,691, derived and not yet run there.
         let operations = said_bytes(&small, "gateway.objects");
         assert!(
-            runs(9_500..10_500, 9_650..10_650).contains(&operations),
+            runs(10_350..11_350, 10_500..11_500).contains(&operations),
             "{operations}"
         );
         assert!(operations <= said_bytes(&roomy, "gateway.objects"));
@@ -7683,8 +7743,10 @@ mod tests {
     /// transport 974,293,070, where a founder's are 4,102,904,425, 2,177,077,666 and 562,407,499.
     /// Each node counted once ([`nodes_named`]), by derive and by the node as it opens its
     /// transport (`NodeSettings::stated`), it derives its founders' settings, rules and transport,
-    /// and its floor is theirs, 7,257,853,211 bytes at one operation, 258,339,557 within the
-    /// machine: it starts. Its issuer's 16 workers each count the 128 KiB they are spawned with
+    /// and its floor is theirs, 7,257,853,291 bytes at one operation on macOS, 258,339,477 within
+    /// the machine, each of its five ranges' members at 1,688 bytes (`MEMBER_BYTES`, 80 more in
+    /// all than at 1,672 before 689d7afb): it starts. Its issuer's 16 workers each count the
+    /// 128 KiB they are spawned with
     /// (hyper-block `WORKER_STACK`), where at Rust's 2 MiB its floor was 7,289,310,491 bytes; a
     /// Raft frame's bound holds an append of the range's largest entry alone
     /// (`mantle_range::largest_message`), 25 bytes more for each of the 408 Raft frames its
@@ -7804,13 +7866,15 @@ mod tests {
     /// at 7,831,251,011 bytes, CI's exactly, its floor at that depth while each of its issuer's
     /// workers counted Rust's 2 MiB stack, and took 109. Each is spawned with 128 KiB (hyper-block
     /// `WORKER_STACK`, sized by measuring a worker's paths). Every
-    /// byte past its floor at 16 deep and 64 entries, 7,257,843,011, is what its depth and its ring
+    /// byte past its floor at 16 deep and 64 entries, 7,257,843,091, is what its depth and its ring
     /// hold: the device's issuer carries each transfer on a worker of its own where a pool carries
     /// them (macOS, Windows; `Issuer::device_threads`), 224 more workers' stacks, 29,360,128
     /// bytes; its two volumes take 448 more transfers at once, whose exchanges the transport holds,
     /// 34,843,648, and whose reads the ranges hold, 37,273,600; and three shards' rings 372 entries
     /// longer, 71,424. Its floor grows 453,024 bytes a transfer, where it grew 2,419,104, and at 240
-    /// is 7,359,402,011 bytes at one operation, 156,790,757 within the machine: it takes the 240
+    /// is 7,359,402,091 bytes at one operation on macOS, 156,790,677 within the machine, each of
+    /// its five ranges' members at 1,688 bytes (`MEMBER_BYTES`, 80 more in all than at 1,672
+    /// before 689d7afb): it takes the 240
     /// measured and starts, its issuer's workers, its volumes' reads and transfers and the
     /// transport's room for them all at that depth. Where the kernel holds the transfers on the
     /// issuer's one thread (Linux), its threads are 16 stacks at any depth, and it takes the 240

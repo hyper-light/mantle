@@ -128,11 +128,17 @@ impl TrunkConfig {
         compactions.saturating_mul(2).saturating_add(1)
     }
 
-    /// The most entries a builder's branch holds: a memtable's packing, at most
-    /// `memtable_entries`; a settle's part and a pivot's compaction, at most a leaf's limit
-    /// ([`Self::leaf_limit`]), as a compaction's inputs are bounded (`Trunk::plan_compact`).
-    pub fn built_most(&self, memtable_entries: u64) -> u64 {
-        self.leaf_limit().max(memtable_entries)
+    /// What a builder takes at most ([`crate::branch::Built`]) at keys of at most `key` bytes: a
+    /// memtable's packing, at most `packing`; a settle's part and a pivot's compaction, at most a
+    /// leaf's limit of entries ([`Self::leaf_limit`]), as a compaction's inputs are bounded
+    /// (`Trunk::plan_compact`), each at most the longest key; each part the larger of the two, as
+    /// a store's pool keeps a builder's lists at the most they grew to for either.
+    pub fn built_within(
+        &self,
+        key: usize,
+        packing: crate::branch::Built,
+    ) -> Option<crate::branch::Built> {
+        Some(crate::branch::Built::of(key, self.leaf_limit(), u64::MAX)?.max(packing))
     }
 }
 
@@ -2876,11 +2882,9 @@ impl Trunk {
         m
     }
 
-    /// The most sources a read's path opens through the trunk as it stands
-    /// ([`TrunkConfig::sources_most`] at its height).
-    pub(crate) fn sources_most(&self) -> Result<usize, Error> {
-        let (height, _, _) = self.shape()?;
-        Ok(self.config.sources_most(height))
+    /// The trunk's shape as configured.
+    pub(crate) fn config(&self) -> TrunkConfig {
+        self.config
     }
 
     /// The trunk's shape: its height (1 for a lone leaf), its nodes, and its leaves.

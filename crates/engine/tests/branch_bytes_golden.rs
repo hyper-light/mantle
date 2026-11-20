@@ -161,6 +161,57 @@ fn compact(
         .collect()
 }
 
+/// The entries a merge of `inputs` (newest first) over `[from, end)` keeps: each key's newest
+/// entry, tombstones dropped when `drop_tombstones`.
+fn merged(inputs: &[&Entries], from: &[u8], end: Option<&[u8]>, drop_tombstones: bool) -> Entries {
+    let mut out = Entries::new();
+    for input in inputs.iter().rev() {
+        for (k, e) in input.range(from.to_vec()..) {
+            if end.is_some_and(|end| k.as_slice() >= end) {
+                break;
+            }
+            out.insert(k.clone(), e.clone());
+        }
+    }
+    if drop_tombstones {
+        out.retain(|_, (op, _)| *op == Op::Put);
+    }
+    out
+}
+
+/// `b`'s descriptor decodes to `b`, and through it every entry of `expected` reads back, by a
+/// get and by a scan in page order, and nothing more: what checks a branch that begins part way
+/// into an extent another branch began (docs/design/engine-structure.md §3).
+fn reads_back(store: &mut Store<SimFile>, b: &Branch, expected: &Entries) {
+    let mut descriptor = Vec::new();
+    b.encode(&mut descriptor).unwrap();
+    let (decoded, used) = Branch::decode(store, &descriptor).unwrap();
+    assert_eq!((&decoded, used), (b, descriptor.len()));
+    assert_eq!(decoded.count, expected.len() as u64);
+    let mut value = Vec::new();
+    for (k, (op, v)) in expected {
+        assert_eq!(decoded.get(store, k, &mut value).unwrap(), Some(*op));
+        if *op == Op::Put {
+            assert_eq!(&value, v);
+        }
+    }
+    let mut c = decoded.seek(store, b"").unwrap();
+    let mut scanned = expected.iter();
+    while c.valid() {
+        let (k, (op, v)) = scanned.next().expect("a scan past the entries written");
+        assert_eq!((c.key(), c.op()), (k.as_slice(), *op));
+        if *op == Op::Put {
+            assert_eq!(c.value(), v.as_slice());
+        }
+        c.next(&decoded, store).unwrap();
+    }
+    assert!(
+        scanned.next().is_none(),
+        "a scan short of the entries written"
+    );
+    c.give_back(store);
+}
+
 /// Do: in one store, branches of the bench's entries (two, the newer overwriting and deleting
 /// some of the older's keys), of path keys, of binary keys and of half-page values; then a
 /// merge of the two bench branches whole, keeping tombstones, one of a range of them dropping
@@ -216,6 +267,29 @@ fn built_and_compacted_branches_write_the_bytes_they_always_have() {
         b.encode(&mut descriptor).unwrap();
         descriptors = fnv(&descriptor, descriptors);
     }
+    // Every branch, decoded from its descriptor, reads back what it was built or merged from.
+    let wanted = [
+        older.clone(),
+        newer.clone(),
+        path.clone(),
+        bin.clone(),
+        half.clone(),
+        merged(&[&newer, &older], b"", None, false),
+        merged(
+            &[&newer, &older],
+            b"0000000000010000",
+            Some(b"0000000000040000"),
+            true,
+        ),
+        merged(&[&path], b"bucket-1/", Some(b"bucket-2/dir020/"), false),
+        merged(&[&bin, &path], b"", None, false),
+    ];
+    assert_eq!(branches.len(), wanted.len());
+    let shared = branches.iter().filter(|b| b.first > 0).count();
+    assert!(shared > 0, "no branch began in another's extent");
+    for (b, expected) in branches.iter().zip(&wanted) {
+        reads_back(&mut store, b, expected);
+    }
     let root = branches[0].root;
     store.checkpoint(Some(root), 1).unwrap();
     let (file, finished) = finished_file(store.into_file());
@@ -239,7 +313,16 @@ fn built_and_compacted_branches_write_the_bytes_they_always_have() {
 /// descriptors and of the built branches' the same. Main 9ccd216's: image digest
 /// 9_631_384_443_531_559_731, descriptors' 996_053_338_898_882_066; data-layer 340e1324's
 /// 7_087_373_757_083_078_770 and 4_726_997_388_655_653_146.
+///
+/// Since extent-share (image format 9): small branches share extents, a branch beginning in the
+/// pages the branch built before it in the store left unwritten in its last extent, and each
+/// descriptor names that page (`Branch::first`, four bytes before its extents). The nine branches
+/// are the same, each decoding from its descriptor and reading back every entry it was built or
+/// merged from, by gets and a scan ([`reads_back`]); the image is 393,216 bytes shorter, 96 pages,
+/// the three whole extents of 32 pages the branches' last extents' unwritten pages had taken.
+/// Before: image 15_994_880 bytes, digest 7_006_228_100_878_491_197, descriptors'
+/// 5_389_280_994_201_789_847.
 const BRANCHES: usize = 9;
-const IMAGE_BYTES: usize = 15_994_880;
-const IMAGE_DIGEST: u64 = 7_006_228_100_878_491_197;
-const DESCRIPTOR_DIGEST: u64 = 5_389_280_994_201_789_847;
+const IMAGE_BYTES: usize = 15_601_664;
+const IMAGE_DIGEST: u64 = 11_582_867_096_988_739_259;
+const DESCRIPTOR_DIGEST: u64 = 6_985_377_092_926_284_530;

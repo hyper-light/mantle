@@ -14,7 +14,7 @@
 mod file_outcome;
 use file_outcome::finished_file;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -181,23 +181,31 @@ fn build(store: &mut Store<Gated>, entries: &Entries) -> Branch {
     builder.finish(store).unwrap()
 }
 
+/// The store holds exactly the extents the trunk names: each branch's counted once for every
+/// branch naming it, since small branches share extents (docs/design/engine-structure.md §3), and
+/// the superblocks', the allocator map's and the trunk image's once, which no branch names.
 fn check_refs(store: &Store<Gated>, trunk: &Trunk) {
-    let mut expected = BTreeSet::from([0]);
-    let mut branches = BTreeSet::new();
+    let mut expected: BTreeMap<u64, u32> = BTreeMap::new();
     for branch in trunk.branches() {
         for extent in branch.extents {
-            assert!(branches.insert(extent), "branch extent named twice");
+            *expected.entry(extent).or_default() += 1;
         }
     }
-    expected.extend(branches);
-    expected.extend(store.map_extents());
-    expected.extend(trunk.image_extents());
-    let held: BTreeSet<_> = store
+    let sole = std::iter::once(&0)
+        .chain(store.map_extents())
+        .chain(trunk.image_extents());
+    for &extent in sole {
+        assert!(
+            expected.insert(extent, 1).is_none(),
+            "extent {extent} named by a branch and by the store or the image"
+        );
+    }
+    let held: BTreeMap<u64, u32> = store
         .refs()
         .iter()
         .enumerate()
         .filter(|(_, count)| **count > 0)
-        .map(|(extent, _)| extent as u64)
+        .map(|(extent, &count)| (extent as u64, count))
         .collect();
     assert_eq!(held, expected);
 }

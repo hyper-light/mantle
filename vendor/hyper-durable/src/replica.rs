@@ -401,6 +401,16 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// The image's next slice waits on the machine's own work, which wakes the owner
     /// ([`Imaged::Waits`]): the drive asks for no other turn meanwhile.
     image_waits: bool,
+    /// The index a compaction moves the log's start no further while this member leads: the
+    /// point of the image made for the members behind the log's start, until each holds it, or,
+    /// while it is under way, the machine's durable index as it began, which no image it makes
+    /// is behind. A member that installs it is sent what follows from the log, not a second image
+    /// (CockroachDB's raft log queue, its pending snapshot index; mantle
+    /// docs/research/100-holding-the-log-for-an-image.md). Let go when every other member holds
+    /// it, at a transfer reported failed, at the lead's loss, and at a stall, on this group or,
+    /// at its owner's word, another on the same log: its bound is the log's room
+    /// ([`Replica::hold_for_image`], [`Replica::let_go_of_image`]).
+    held_for_image: Option<u64>,
     /// The entries to keep of a compaction that waits on the state machine's checkpoint out
     /// ([`StateMachine::persist`] answered false): each drive asks the machine again, and the
     /// start moves at the one that finds it durable ([`Replica::persisting`]).
@@ -597,6 +607,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             images_made: 0,
             imaging: None,
             image_waits: false,
+            held_for_image: None,
             persisting: None,
             told_applied: durable.index,
             conf_index: durable.index,
@@ -1683,6 +1694,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     fn take_report(&mut self, to: u64, arrived: bool) -> Result<(), ReplicaError> {
+        // A transfer that failed lets go of the log's hold for the image, as CockroachDB lets go
+        // of a snapshot's truncation constraint once its send ends, whether or not it succeeded:
+        // the member is likely gone, and the image is sent again, holding the log again, if the
+        // log's start still reaches it, or made again if not ([`Replica::held_for_image`]).
+        if !arrived {
+            self.held_for_image = None;
+        }
         let status = if arrived {
             SnapshotStatus::Finish
         } else {
@@ -1742,7 +1760,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.quiet_commit(now, waker)?;
                 r.stream_catch_up(waker, out)?;
                 r.make_wanted(out)?;
+                // A snapshot dropped as it was sent, its point passed (`drop_passed`), is told the
+                // core as failed in the drive that dropped it, so the core's next try asks again.
+                r.take_reports()?;
             }
+            r.hold_for_image();
             r.release_reads(out);
             r.keep();
             r.settle();
@@ -2784,8 +2806,53 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// (`RawNode::recycle_messages`), so the queue's room is not grown again for every ready taken
     /// ahead.
     fn emit(&mut self, mut messages: Vec<Message>, out: &mut Output<M::Answer>) {
+        if messages
+            .iter()
+            .any(|m| m.msg_type == MessageType::MsgSnapshot)
+        {
+            self.drop_passed(&mut messages);
+        }
         out.messages.append(&mut messages);
         self.node.recycle_messages(messages);
+    }
+
+    /// Drops each snapshot in `messages` whose point the log's start has passed, and holds the
+    /// log's start at the point of each that leaves ([`Replica::held_for_image`]). One dropped was
+    /// queued in the core while its leader was stalled ([`Replica::send_made`]), whose hold the
+    /// stall let go ([`Replica::image_hold`]), so the compaction that ended the stall passed it.
+    /// Installed, its member would need entries the log no longer holds, and be sent a second
+    /// image once the first's transfer ended (TiKV cancels an image being made once its
+    /// compaction passes it, mantle docs/research/100 §4). Its snapshot is reported failed
+    /// instead, kept with the reports and taken at the end of the drive, so the core probes the
+    /// member again at its next try, as after any failed transfer (raft-rs's
+    /// `handle_snapshot_status`), and asks storage, whose snapshot no longer reaches the log's
+    /// start, for a fresh image ([`Held::snapshot`]). One report a member, as the core sends
+    /// only to the members it tracks.
+    fn drop_passed(&mut self, messages: &mut Vec<Message>) {
+        let Ok((start, _)) = self.node.store().log.bounds() else {
+            return;
+        };
+        let reports = &mut self.reports;
+        let mut held = self.held_for_image;
+        messages.retain(|m| {
+            let Some(point) = m.snapshot.as_ref().map(|s| proto::snapshot_index(s)) else {
+                return true;
+            };
+            if m.msg_type != MessageType::MsgSnapshot {
+                return true;
+            }
+            if point < start.index {
+                match reports.iter_mut().find(|(member, _)| *member == m.to) {
+                    Some(report) => report.1 = false,
+                    None => reports.push((m.to, false)),
+                }
+                return false;
+            }
+            // One that leaves holds the log's start at its point until its member holds it.
+            held = Some(held.map_or(point, |held| held.min(point)));
+            true
+        });
+        self.held_for_image = held;
     }
 
     /// Reads confirmed and now applied far enough leave.
@@ -2831,6 +2898,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             Some(data) if self.is_leader() => data,
             Some(_) => {
                 self.node.store().wanted.take();
+                self.held_for_image = None;
                 return self.image_ended(out);
             }
             None => {
@@ -2841,6 +2909,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                     self.node.store().wanted.take();
                     return Ok(());
                 }
+                // Its point is not known until it is made, and is not behind what the machine
+                // holds durably now: no compaction passes that meanwhile.
+                self.held_for_image = Some(self.machine.durable().index);
                 Vec::new()
             }
         };
@@ -2865,7 +2936,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         });
         // An image short of what was asked, a machine's last checkpoint behind what it applied,
         // waits for the core's next try: sent at once, the core would ask again at once, and
-        // every drive would image again until the machine checkpoints past it.
+        // every drive would image again until the machine checkpoints past it. Sent, the log
+        // keeps what follows its point until its members hold it ([`Replica::held_for_image`]).
+        self.held_for_image = (point.index >= wanted).then_some(point.index);
         if point.index >= wanted {
             self.send_made(out)?;
         }
@@ -2932,6 +3005,57 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.images_made
     }
 
+    /// The index a compaction moves the log's start no further ([`Replica::held_for_image`]),
+    /// while the hold stands: this member leads and is not stalled, the log's start has not
+    /// passed it, and its image is under way or another member does not hold its point yet. A
+    /// member's install is acknowledged by its answer at the image's point, which the core takes
+    /// as the member's match; a member removed leaves the core's tracker, and so the hold; a lost
+    /// one, or a transfer reported failed (the image held is sent again, as it still reaches the
+    /// log's start), holds it to its bound. The bound is the group's room in the log: the hold
+    /// keeps every entry past the point while writes come, until one is refused for room, which
+    /// stalls the member and lets the hold go, so the compaction the stall waits for frees the
+    /// room as it would with no image (mantle docs/design/replica.md §4).
+    fn image_hold(&self) -> Option<u64> {
+        let point = self.held_for_image?;
+        let raft = &self.node.raft;
+        if self.stall.is_some() || raft.state() != StateRole::Leader {
+            return None;
+        }
+        let start = self.node.store().log.bounds().map(|(start, _)| start.index);
+        if start.is_ok_and(|start| start > point) {
+            return None;
+        }
+        let id = raft.id();
+        let needed = self.imaging.is_some()
+            || raft
+                .tracker()
+                .iter()
+                .any(|(member, progress)| member != id && progress.matched < point);
+        needed.then_some(point)
+    }
+
+    /// Lets go of the hold for an image once it no longer stands ([`Replica::image_hold`]), for
+    /// good: a hold let go at a stall does not stand again once the stall clears, its point then
+    /// passed by the compaction that cleared it.
+    fn hold_for_image(&mut self) {
+        self.held_for_image = self.image_hold();
+    }
+
+    /// The index the log's start is held at for an image's members, if a hold stands
+    /// ([`Replica::image_hold`]).
+    pub fn image_held(&self) -> Option<u64> {
+        self.image_hold()
+    }
+
+    /// Lets go of the log's hold for an image ([`Replica::held_for_image`]) at its owner's word:
+    /// another group on the same log is stalled for room, which this group's compaction may free.
+    /// The hold's bound is the log's room, the group's own and what every group on the log
+    /// shares, so a stall anywhere on it lets every hold go and no stalled group waits on
+    /// another's hold.
+    pub fn let_go_of_image(&mut self) {
+        self.held_for_image = None;
+    }
+
     /// Whether an image is under way for a member behind the log's start, made a slice a drive
     /// ([`Replica::make_wanted`]): its owner drives the replica at its next turn, and one whose
     /// next slice waits on the machine's own work ([`Imaged::Waits`]) when that work wakes it,
@@ -2984,6 +3108,19 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.persisting = Some(keep);
             return Ok(false);
         }
+        // A start held where it stands for an image's members moves nothing, and asks the machine
+        // for no checkpoint: the owner compacts again once the hold is let go, as it is due.
+        self.hold_for_image();
+        let held = self.held_for_image;
+        if let Some(held) = held {
+            let bounds = self.node.store().log.bounds();
+            let (start, _) =
+                bounds.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+            if start.index >= held {
+                self.persisting = None;
+                return Ok(false);
+            }
+        }
         let persisted = self.machine.persist();
         if !self.machine_did(persisted)? {
             self.persisting = Some(keep);
@@ -2995,6 +3132,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let (start, last) =
             bounds.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
         let index = durable.saturating_sub(keep).min(last);
+        let index = held.map_or(index, |held| index.min(held));
         if index <= start.index {
             return Ok(false);
         }
@@ -3046,6 +3184,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         // A start out is a compaction or an install under way, and [`Replica::compact`] waits
         // for it; so is a compaction waiting on the machine's checkpoint.
         if self.persisting.is_some() || self.writes.iter().any(|w| w.start) {
+            return false;
+        }
+        // Nor while an image's members hold the start where it stands ([`Replica::image_hold`]).
+        let start = self.node.store().log.bounds().map(|(start, _)| start.index);
+        if self
+            .image_hold()
+            .is_some_and(|held| start.is_ok_and(|start| start >= held))
+        {
             return false;
         }
         let raft = &self.node.raft;

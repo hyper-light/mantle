@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::Waker;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use hyper_log::{
     Class as LogClass, Config as LogConfig, Log, LogError, LogStats, Tail, Update, View, Waits,
 };
 use hyper_raft::StorageError;
-use hyper_rt::combine::{Either, race2};
+use hyper_rt::combine::{Either, Either3, race3};
 use hyper_rt::machine::facts::Facts;
 use hyper_rt::runtime::{RuntimeConfig, interests_for};
 use hyper_rt::sim::{PPM, SimLoss, SimPath, SimRuntime};
@@ -168,6 +168,10 @@ struct SimLog {
     /// The stream's next writes the test wants refused for room, whatever the log holds.
     refusals: mpsc::Receiver<u64>,
     refusing: Cell<u64>,
+    /// When the stream's latest liveness write is answered, on the shard's clock, until the node
+    /// takes the answer; zero when none is out. The node's task is woken then (`run_node`), as a
+    /// device's completion wakes it through the waker the write was given.
+    answer: &'static AtomicU64,
 }
 
 impl SimLog {
@@ -192,11 +196,19 @@ impl SimLog {
 struct Answered {
     answer: Cell<Option<Result<(), LogError>>>,
     given_ns: u64,
+    /// When the node's task is woken for the answer (`SimLog::answer`): no longer, once taken.
+    told: &'static AtomicU64,
 }
 
 impl Written for Answered {
     fn poll(&self) -> Option<Result<(), LogError>> {
         if hyper_rt::futures::now_ns() > self.given_ns {
+            let _ = self.told.compare_exchange(
+                self.given_ns + 1,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             self.answer.take()
         } else {
             None
@@ -342,9 +354,12 @@ impl NodeLog for SimLog {
         hyper_measure::alloc::aside();
         let answer = pending.wait();
         hyper_measure::alloc::back();
+        let given_ns = hyper_rt::futures::now_ns();
+        self.answer.store(given_ns + 1, Ordering::SeqCst);
         Ok(Answered {
             answer: Cell::new(Some(answer)),
-            given_ns: hyper_rt::futures::now_ns(),
+            given_ns,
+            told: self.answer,
         })
     }
 
@@ -524,6 +539,9 @@ enum Report {
     OwnRead(u64, u64, bool),
     /// A node's own command under the test's tag, ended: its outcome, or why the node took it not.
     OwnCommand(u64, u64, Result<CommandOutcome, String>),
+    /// The times a node's detectors came to suspect a peer so far (`Link::suspected`), as it moves:
+    /// the node, the peer, the count.
+    Suspected(u64, u64, u64),
 }
 
 /// A node's task: opens the node on its log, reports where it listens, then turns it, each turn
@@ -533,6 +551,8 @@ async fn run_node(
     log: SimLog,
     mut orders: ChannelReceiver<Order>,
     reports: mpsc::Sender<Report>,
+    load: &'static AtomicU64,
+    answer: &'static AtomicU64,
 ) {
     let id = settings.id;
     let opened = Node::open_on(settings, log)
@@ -556,16 +576,49 @@ async fn run_node(
         }
     };
     let mut told: Option<Status> = None;
+    // The suspicions of each peer last reported.
+    let mut suspicions: Vec<(u64, u64)> = Vec::new();
+    let mut drawn = id.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     let mut own_reads: Vec<(u64, u64)> = Vec::new();
     let mut own_commands: Vec<(u64, u64)> = Vec::new();
     loop {
+        // The stream's liveness write answered, its task woken for it as the log's waker wakes it.
+        let due = answer.load(Ordering::SeqCst);
         let ended = {
             let turn = pin!(node.turn());
             let order = pin!(orders.recv());
-            race2(turn, order).await
+            let answered = pin!(async {
+                if due == 0 {
+                    std::future::pending::<()>().await;
+                }
+                let wait = due.saturating_sub(hyper_rt::futures::now_ns());
+                let _ = hyper_rt::futures::sleep(wait).await;
+            });
+            match race3(turn, order, answered).await {
+                Either3::First(turned) => Either::First(turned),
+                Either3::Second(order) => Either::Second(order),
+                Either3::Third(()) => {
+                    let _ = answer.compare_exchange(due, 0, Ordering::SeqCst, Ordering::SeqCst);
+                    continue;
+                }
+            }
         };
         match ended {
-            Either::First(Ok(())) => {}
+            // A loaded node's turn runs `load` past its work ([`Sim::load`]): nothing of the
+            // node runs meanwhile, as nothing of a process whose turn is busy elsewhere does.
+            Either::First(Ok(())) => {
+                let most = load.load(Ordering::SeqCst);
+                // Each turn's excess drawn anew, up to `load`: a loaded host stretches some turns
+                // more than others (xorshift64, Marsaglia 2003, from the node's id).
+                drawn ^= drawn << 13;
+                drawn ^= drawn >> 7;
+                drawn ^= drawn << 17;
+                let busy = if most > 0 { drawn % (most + 1) } else { 0 };
+                if busy > 0 && hyper_rt::futures::sleep(busy).await.is_err() {
+                    let _ = reports.send(Report::Failed(id, "a loaded turn's sleep".into()));
+                    return;
+                }
+            }
             Either::First(Err(error)) => {
                 let _ = match node.close().await {
                     Ok((log, engines)) => {
@@ -666,6 +719,24 @@ async fn run_node(
                 return;
             }
         }
+        for link in node.links() {
+            let at = match suspicions.iter().position(|(peer, _)| *peer == link.peer) {
+                Some(at) => at,
+                None => {
+                    suspicions.push((link.peer, 0));
+                    suspicions.len() - 1
+                }
+            };
+            if suspicions[at].1 != link.suspected {
+                suspicions[at].1 = link.suspected;
+                if reports
+                    .send(Report::Suspected(id, link.peer, link.suspected))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
         let status = node.status(GROUP);
         if status != told
             && let Some(now) = status
@@ -696,6 +767,10 @@ pub struct Member {
     /// While set, its ranges are given no answer to their writes ([`Sim::hold_writes`]): leaked
     /// once a member, for each store its log claims to read, through its starts.
     hold: &'static AtomicBool,
+    /// How long past its work each of its turns runs ([`Sim::load`]), leaked as `hold` is.
+    load: &'static AtomicU64,
+    /// When its stream's liveness write is answered (`SimLog::answer`), leaked as `hold` is.
+    answer: &'static AtomicU64,
     /// While set, its next write of a range's entries is torn ([`Sim::tear_next_entry`]), leaked
     /// as `hold` is.
     tear: &'static AtomicBool,
@@ -757,6 +832,8 @@ pub struct Sim {
     starts: u64,
     /// The transport budget each node holds, from its statement.
     budget: Budget,
+    /// The times each node's detectors came to suspect each peer, by (node, peer), as reported.
+    pub suspected: BTreeMap<(u64, u64), u64>,
 }
 
 /// A node's transport budget from its statement: its floor (`bounds::least_transport`) or with
@@ -874,6 +951,8 @@ impl Sim {
                     refusals: None,
                     armed: false,
                     hold: Box::leak(Box::new(AtomicBool::new(false))),
+                    load: Box::leak(Box::new(AtomicU64::new(0))),
+                    answer: Box::leak(Box::new(AtomicU64::new(0))),
                     tear: Box::leak(Box::new(AtomicBool::new(false))),
                 },
             );
@@ -910,6 +989,7 @@ impl Sim {
             own_commands: Vec::new(),
             starts: 0,
             budget,
+            suspected: BTreeMap::new(),
         };
         for id in 1..=nodes {
             let file = SimFile::new(
@@ -944,6 +1024,7 @@ impl Sim {
             faults: armed,
             refusals: refused,
             refusing: Cell::new(0),
+            answer: self.members[&id].answer,
         };
         let member = self.members.get_mut(&id).unwrap();
         member.orders = Some(orders);
@@ -1001,9 +1082,10 @@ impl Sim {
         settings.transport_bytes = (self.budget)(&settings.stated().unwrap()).unwrap();
         self.starts += 1;
         let shard = member.shard;
+        let (load, answer) = (member.load, member.answer);
         let tell = self.tell.clone();
         self.rt
-            .spawn_on(shard, run_node(settings, log, taken, tell))
+            .spawn_on(shard, run_node(settings, log, taken, tell, load, answer))
             .unwrap();
     }
 
@@ -1143,6 +1225,13 @@ impl Sim {
     /// liveness writes are answered as before.
     pub fn hold_writes(&mut self, id: u64, held: bool) {
         self.members[&id].hold.store(held, Ordering::SeqCst);
+    }
+
+    /// Loads node `id`: each of its turns runs up to `ns` past its work, drawn anew each turn, its
+    /// task doing nothing of the node meanwhile, as a process whose turns a loaded host stretches
+    /// does; zero unloads it.
+    pub fn load(&mut self, id: u64, ns: u64) {
+        self.members[&id].load.store(ns, Ordering::SeqCst);
     }
 
     /// The simulated clock now.
@@ -1304,6 +1393,9 @@ impl Sim {
                 }
                 Report::Part(id, part) => {
                     self.parts.insert(id, part);
+                }
+                Report::Suspected(id, peer, count) => {
+                    self.suspected.insert((id, peer), count);
                 }
             }
         }

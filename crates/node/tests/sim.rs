@@ -1360,3 +1360,86 @@ fn commands_refused_for_room_wait_for_the_room_not_a_pause() {
         }
     }
 }
+
+/// How far past its work each turn of the loaded founder runs, at most, drawn anew each turn
+/// ([`Sim::load`]).
+const FOUNDER_LOAD_NS: u64 = 20_000_000;
+/// The loaded founder's heartbeats the joiner takes, each a judgment, while the test watches for a
+/// suspicion of it.
+const FOUNDER_HEARTBEATS: u64 = 100;
+
+/// A cell of one voter grows to two under the clients' load, its founder loaded from before the
+/// join, each of its turns running up to [`FOUNDER_LOAD_NS`] past its work, as on a host whose other
+/// processes hold its CPU. The node that just joined, its detectors meeting
+/// the founder at the join, suspects the live founder never; cut off from it, it suspects it within
+/// the cell's quiet period (`Sim::quiet`). Seen in CI gates run 44619550115 (macOS): at the "2 nodes" step of
+/// `crates/mantle/tests/membership.rs`, the node that had just joined suspected the founder five
+/// times while it served, and a read through it of a block only the founder held failed.
+#[test]
+fn a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off() {
+    for seed in seeds(&[1, 2]) {
+        loaded_founder(seed);
+    }
+}
+
+fn loaded_founder(seed: u64) {
+    let mut cell = Sim::with_spare(seed, 1);
+    cell.until("the founder leads", |c| {
+        if c.members[&1].status.is_some_and(|s| s.leader == 1) {
+            Some(())
+        } else {
+            None
+        }
+    });
+    cell.open_bucket();
+    let ops = 2 * (log_config().group_entries + 1);
+    let stops = cell.start_workload(ops);
+    cell.done_by(ops, 1);
+    cell.load(1, FOUNDER_LOAD_NS);
+    cell.replace(cell.nodes + 1, 2);
+    cell.until("the spare joins", |c| {
+        if c.replaced.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    });
+    // Judged at each of the founder's heartbeats the joiner takes: run until it took
+    // `FOUNDER_HEARTBEATS` more of them, the founder alive throughout, each taken a judgment that
+    // could have been a suspicion. A founder whose heartbeats stopped coming fails the test by the
+    // cell's quiet period, twenty of which the run is given.
+    let heartbeats = |c: &Sim| c.members[&2].status.map_or(0, |s| s.heartbeats);
+    let (from, began, given) = (heartbeats(&cell), cell.now_ns(), 20 * cell.quiet());
+    while heartbeats(&cell) < from + FOUNDER_HEARTBEATS {
+        assert!(
+            cell.now_ns() - began <= given,
+            "seed {seed}: the joiner took {} of the loaded founder's heartbeats in {given} ns; \
+             suspicions {:?}",
+            heartbeats(&cell) - from,
+            cell.suspected
+        );
+        cell.run_for(cell.step_ns());
+    }
+    let suspected = |c: &Sim| c.suspected.get(&(2, 1)).copied().unwrap_or(0);
+    assert_eq!(
+        suspected(&cell),
+        0,
+        "seed {seed}: the joiner suspected its live founder while it took {FOUNDER_HEARTBEATS} of \
+         its heartbeats; suspicions {:?}",
+        cell.suspected
+    );
+    // The cell's quiet period at the cut: the longest any node states it may go without moving
+    // while its peers live, its patience among it (`Sim::quiet`).
+    let (cut, bound) = (cell.now_ns(), cell.quiet());
+    cell.isolate(1, true);
+    let at = cell.until("the joiner suspects its cut-off founder", |c| {
+        (suspected(c) > 0).then(|| c.now_ns())
+    });
+    assert!(
+        at - cut <= bound,
+        "seed {seed}: the joiner suspected its cut-off founder {} ns after the cut, past the \
+         cell's quiet period of {bound} ns",
+        at - cut
+    );
+    drop(stops);
+}

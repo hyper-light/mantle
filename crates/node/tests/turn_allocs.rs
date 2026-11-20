@@ -88,12 +88,17 @@ fn at_rest(seed: u64) -> alloc::Counts {
 /// are the same on every host, the receive ring and the connections' state held apart before them
 /// (`bounds::ring_growth`, `bounds::connections_state`); with those held apart, the hand-stated
 /// budget had held no chunk on Linux since the ring was, nor here since the state was.
+/// 103,327 since the node simulation wakes a node's task once its liveness write is answered and
+/// gives each simulated thread three timers, the waits a node holds at once (b497c2e5, 23db1717,
+/// merged at d74f91ae): a proof is taken as its write is answered, not at the next wake that
+/// something else brought, so the stream's schedule of proofs and heartbeats runs at its own pace
+/// over the ten seconds, 7,559 allocations more, reallocations 0 both. No allocation site changed.
 #[test]
 fn a_cell_at_rest_turns_without_remaking_what_a_turn_keeps() {
     let counts = at_rest(1);
     assert_eq!(
         (counts.allocations, counts.reallocations),
-        (95_768, 0),
+        (103_327, 0),
         "{counts:?}"
     );
 }
@@ -205,12 +210,16 @@ fn serving(make: fn(u64) -> Sim, seed: u64, ops: u64) -> alloc::Counts {
 /// 981 fewer since a compaction makes no image (dcaf3f68): the clients' run compacts its ranges'
 /// logs, and each compaction imaged its range, every row read and encoded, whether or not a member
 /// was behind; reallocations 2,055 as before. On Linux 33,420, this Mac's and the 51.
+/// 24,316 since the node simulation wakes a node once its liveness write is answered and gives
+/// each simulated thread three timers (b497c2e5, 23db1717, merged at d74f91ae): the clients' run
+/// no longer waits out wakes a timer held back, 9,053 fewer; reallocations 2,043. On Linux 24,367,
+/// this Mac's and the 51.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        33_420
+        24_367
     } else {
-        33_369
+        24_316
     };
     let counts = serving(Sim::new, 1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");
@@ -234,12 +243,15 @@ fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
 /// where this Mac counted 40,678, the 51 above it. 33,147 since the reads' index by group, the 4
 /// the floor's run names; on Linux 33,198. 32,142 since a compaction makes no image (dcaf3f68),
 /// 1,005 fewer, the images the floor's run names; reallocations 2,052 as before. On Linux 32,193.
+/// 23,480 since the node simulation wakes a node once its liveness write is answered and gives
+/// each simulated thread three timers (d74f91ae), 8,662 fewer; reallocations 2,046. On Linux
+/// 23,531.
 #[test]
 fn a_cell_serving_writes_at_chunked_windows_copies_fewer_datagrams() {
     const CHUNKED: u64 = if cfg!(target_os = "linux") {
-        32_193
+        23_531
     } else {
-        32_142
+        23_480
     };
     let floor = serving(Sim::new, 1, 40);
     let chunked = serving(Sim::chunked, 1, 40);

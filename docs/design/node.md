@@ -2626,6 +2626,70 @@ still walks every job for its cheap checks: whether any waits for room (`offer_r
 and vouch (`bound_jobs`), and its resting flag and keys (`Host::step`'s pass-by, `rekey`), where
 the earliest-deadline heap (`beats`) could find the few due and a ready set the few woken.
 
+*As built (2026-11-20): a native job waiting on its exchange rests, the node's task naming it*
+(`crates/node/src/node/host.rs`, `crates/node/src/node/driving.rs`). The open part of the note
+above, for the native door. A native job's body and reply go through its door's channels, which
+the node's task moves (6c): it gives a put's body piece by piece as its exchange's bytes arrive
+(`Feeding`), and takes and writes a reply's answers as the exchange takes them (`Replies`). It
+woke a driving shard's task at each of those moves (`Replies::wake_job`, `Feeding::wake_job`, the
+shard's `Notify`), but named no job, so the host that runs the job, the node's own or a driving
+shard's, stepped every native job at every turn its door could move it. The node's task now names
+the job at those same moves, the other way to the job's own marks (`Native::mark`), by the rule
+the S3 door's connections name theirs (research/99 [1], [2]):
+
+| Native job | What moves it | How it is woken |
+| --- | --- | --- |
+| put taking its body | the node's task gives a piece or the end | `Feeding::send` names it (`Caller`) |
+| put taking its body | the node's task lets go of the body, its exchange failed or read whole | `Feeding::let_go` names it |
+| get, or last answers | the node's task takes an answer from its reply's channel, or writes one whole | `Replies::write` names it |
+| any | the node's task lets go of its reply, its exchange ended or refused | `give_replies`, `Replies`' drop |
+
+- **Each native request is named as the node's task takes it** (`Native::name`, a `u64` count of
+  the node's host, unique for its life, kept too in what its door's halves share,
+  `Handed::name`), carried with the job's half of its door to whichever host runs it. The node's
+  task's halves of the door hold the caller of that host (`Caller`, one a host, shared by its
+  doors): the node's own host's at first, a driving shard's once the job is handed there
+  (`Lanes::caller`), the node's own again where the shard's lane refuses it (`Node::hand_off`). A
+  driving shard's caller carries the shard's word its task waits on, which each door held before,
+  so one pointer a door both names its job and wakes the task that steps it. A door kept for the
+  next request lets its name and caller go (`Doors::keep`).
+- **Named once until the host takes the name** (`Handed::called`, beside the job's own mark word
+  `marked`): a bounded channel of twice the exchanges the host's jobs come on, the transport's for
+  the node's host and the lane's room for a driving shard's (`Calls::new`), one name a job and one
+  more where its door is kept and taken by a new request first; a name with no room sets `missed`,
+  and the host wakes every native job, as a mark with no room visits every reply.
+- **The host takes the names first in its step** (`Host::take_calls`), each one's job found in one
+  probe of slots by name (`Host::called`, one a job), its word let go, then woken: a move before the
+  word is let go is seen by the step, one after names the job again, so none is lost and at most
+  one step repeats. A job handed to another host has its word let go as that host pushes it
+  (`Host::take_handed`), its first step there seeing every move before.
+- **A native job rests on its door** (`Job::rests`) only where its door holds a call
+  (`Handed::calls`) and its reply is not let go: a put whose driver wants its body found its
+  channel empty (`Pieces::dry`), nothing carried over; a get, or a job's last answers, whose reply
+  has an answer waiting for room in its channel or a piece the node's task has yet to write whole
+  (`Native::written`), as a get gives its next piece only then. A native job whose door holds no
+  call is stepped at every turn as before.
+
+Bound: the names a step takes are at most the calls' room; the host's slots by name, one a job,
+are bounded by its job table, and a name whose job ended or went to another host finds none.
+
+Tested (`node::host`, each count without calls measured by the same test run with none, the rule
+before): 64 native gets of an empty object whose exchanges take none of their fields for 32 turns
+are stepped as they ask their version, as it comes and as the node's task takes each head (64 each),
+then not at all for 32 turns, then 32 and 32 as half the exchanges and then the rest take their
+fields whole: 256 steps over 39 turns where the rule before took 2,432; each answered `Done` with
+no bytes, its exchange ended. 64 native puts whose bodies come 32 turns late are stepped at their
+first turn (64), not at all for 32 turns, then as the node's task gives each body's end (64) and as
+each commit is answered (64): 192 steps over 35 turns, where the rule before took 2,240; each
+answered `Done` with its version. The node's task names a job once until its host lets the name
+go, again after, afresh on the host a job is handed to, and a name past the room is missed, every
+native job woken, the word read once.
+
+Open: commands, bucket and admin operations, single reads, batch deletes, completions and copies
+are still stepped at every turn, and a job on either door still is while it reads its fields or
+drains its body; and each turn still walks every job for whether any waits for room
+(`offer_room`), its bound and vouch (`bound_jobs`), and its resting flag and keys.
+
 *As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
 The node's task reads every native body, so it reads them as upload-stall's job did, never into a
 piece of the endpoint's budget: a job's fields straight into their buffer, made at their length as

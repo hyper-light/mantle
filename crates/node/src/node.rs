@@ -1996,10 +1996,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             // A door kept for each operation the host runs at most, as the memory floor counts
             // one an operation (`host::record_bytes`), and never past the exchanges the transport
             // holds, each door out being one's.
-            host: host::Host::new(
-                exchanges.min(gateway.as_ref().map_or(0, |g| g.objects)),
-                gateway.clone(),
-            ),
+            // Its calls have room for twice the exchanges the transport holds, each a native job's
+            // at most, and wake no other task: the node's task steps its jobs (`host::Calls`).
+            host: {
+                let mut host = host::Host::new(
+                    exchanges.min(gateway.as_ref().map_or(0, |g| g.objects)),
+                    gateway.clone(),
+                );
+                host.calling(host::Calls::new(exchanges, None));
+                host
+            },
             driving: Vec::new(),
             driving_table: None,
             gateway,

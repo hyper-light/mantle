@@ -198,7 +198,8 @@ under load, at moderate load and saturated.
   over its contents and its own address, so a page read from the wrong place fails like a
   corrupt one.
 - **Immutability.** Pages of branches and trunk nodes are immutable once written:
-  copy-on-write, reference-counted per extent.
+  copy-on-write, reference-counted per extent, an extent held once by each branch with a page in
+  it (below, small branches share extents).
 - **Superblock.** Two alternating copies at fixed places, each with a generation and a
   checksum, written only after the data it names is durable; open takes the newest valid copy
   (research/34 §1, atomicity).
@@ -272,9 +273,17 @@ under load, at moderate load and saturated.
   2026-11-20).
 - **Rotations and entries wait with maintenance.** A rotation needs, in extents the store may
   hand out once grown (`Store::room_most`), the checkpoint's room and image, a packing more and
-  the room the owed maintenance asks (`ShardDb::rotation_room`, `Trunk::owed_room`): the
-  compactions owed are what give extents back, and packings taking their room would fill the
-  store with branches none could compact. While maintenance waits for room every entry waits too
+  the room the owed maintenance needs to go on (`ShardDb::rotation_room`, `Trunk::owed_room`):
+  the compactions owed are what give extents back, and packings taking their room would fill the
+  store with branches none could compact. That room is the largest owed task's ask beside what
+  the inline tasks writing now may still take, not the sum of every owed task's: each task opens
+  only beside its own room and, applied, gives its inputs back, free at once or at the checkpoint
+  a range takes for room (below), so the owed tasks run one after another in the room of the
+  largest. Kept for the sum, a rotation needing 110 extents, most of them the owed tasks' asks
+  added up, held every entry with 92 free, and the cell's fill on the shard alone met that wait
+  at entry 8,925 of 24,000; kept for the largest it met the bound, the store then full, at
+  19,804 with small branches sharing extents (below) and at 13,528 without (mantle-node
+  `tests/engine_workers.rs`, 2026-11-20). While maintenance waits for room every entry waits too
   (`ShardDb::room_now` answers no room), even into a memtable with room, which that checkpoint
   would pack into extents its room keeps for the memtable already there, filling the store a
   memtable a checkpoint. A replicated range's entry so waits committed and unapplied, as for any
@@ -297,8 +306,10 @@ under load, at moderate load and saturated.
   index into them, its branches, oldest first), and the root its pending branches after its own
   list, newest last, as they would enter it. Opened, the nodes holding in-flight bundles are
   queued, so their compactions are planned anew (`trunk/room.rs`: a trunk saved owing
-  maintenance opens with every row and every extent named once, then drains). A format 7 image
-  is refused, as every earlier format was once the format moved.
+  maintenance opens with every row and every extent counted as often as it is named, then
+  drains). A format 7 image is refused, as every earlier format was once the format moved.
+  Format 9 names each branch's first page's place in its first extent (below); a format 8 image
+  is refused likewise.
 - **A range checkpoints for room.** While the engine waits for room and the durable checkpoint
   names extents freed since (`ShardDb::wants_checkpoint`), a range checkpoints with nothing
   applied since its last, at the index it has applied (`Stored::persist`, `Stored::persist_now`).
@@ -309,15 +320,49 @@ under load, at moderate load and saturated.
   nothing is pending a checkpoint and every task left waits for room, no task begun and no
   memtable frozen or packing (`ShardDb::at_extent_bound`), the engine stays in that wait: an
   entry is answered no room now, never a fence, and every acknowledged row reads back, before and
-  after the store is opened again (mantle-node `tests/engine_workers.rs`, both fills; on
-  2026-11-20 the shard alone met the bound at entry 8,925 of 24,000 and the paced fill with its
-  worker at entry 17,625). A
-  small store reaches it before its bytes are full, since each small branch takes a whole
-  extent: the node suite's cell (256 extents of four 4 KiB pages, 4 KiB memtables) held about
-  175–190 branches in 238–240 extents at the stall of a sustained fill over 3,000 keys, where
-  the same 4 MiB as 512 extents of two pages took the whole fill (2026-11-20, mantle-node
-  `tests/engine_workers.rs`). *Open:* small branches sharing extents, so a store's extents bound
-  the bytes it holds rather than its branches.
+  after the store is opened again (mantle-node `tests/engine_workers.rs`, both fills). On
+  2026-11-20, before small branches shared extents and the rotation kept the largest owed task's
+  room, the shard alone met the bound at entry 8,925 of 24,000 and the paced fill with its worker
+  at entries 8,800 to 17,625; after, the shard alone at 19,804 and the paced fill at 16,937 to
+  21,726 across runs, its worker's timing varying. *Open:* the whole fill. At the bound the
+  shard alone held 186 branches of 729 pages in 240 extents, which hold 183 written densely: an
+  extent is held while any branch with a page in it lives, and a short-lived branch (a packing,
+  two pages) sharing an extent with a long-lived one (a leaf's, five or six) leaves its pages
+  dead there once compacted (31 extents with one live page, 56 with two, 26 with three). Placing
+  branches by their expected life, as Sprite LFS's cleaner groups live blocks of similar age
+  into new segments (its "age sort", research/34 §6), or copying a mostly dead extent's live
+  pages out, is the next step; so is a worker's job beginning in the extent the job before it
+  left (each job begins a fresh extent: the paced fill held 94 extents with two live pages, a
+  two-page packing each).
+- **Small branches share extents.** The cell's store met its bound before its bytes were full,
+  each branch taking whole extents of its own: on the shard alone at entry 8,925, 108 branches
+  of 537 pages held 169 extents of four pages, 66 of them part used, and the branches were two
+  to seven pages (a packing of a 4 KiB memtable two, a leaf's of 96 entries five or six), so a
+  branch of five to seven pages left one to three of its second extent's unwritten
+  (2026-11-20, mantle-node `tests/engine_workers.rs`). A branch now begins where the branch
+  built before it in the same store ended: in the pages that one left unwritten in its last
+  extent, held once more for it (`Store::take_tail`, `Store::set_tail`), and its descriptor
+  names that page (`Branch::first`; image format 9), from which its pages run on through its
+  extents in order (`Branch::page_address`, `page_of`). A branch's pages stay contiguous, as a
+  SplinterDB mini-allocator batch's are within its extents, and one extent holds the pages of
+  branches written one after another, as a Sprite LFS segment holds many files' blocks
+  (research/34 §6). Each branch holds every extent it has a page in once, and an extent is free
+  when the last of them goes, as a segment whose live bytes fall to zero is reused without
+  cleaning. The pages left are handed out at a branch's first page, so a builder that writes
+  none holds none; the extent freed, they are forgotten (`Store::release`). A worker's job
+  shares its own extents only, beginning a fresh one: its allocator keeps no counts, so the
+  shard holds a job's branch that began in an earlier branch's pages (its `first` past 0) its
+  first extent once more as it takes the job's branches (`trunk::hold_shared`, from a
+  compaction's apply and a packing's retire). A checkpoint persists the counts as they are and
+  open reads them back; `ShardDb::check_references` now counts each extent as often as branches
+  name it. *The waste bound:* a branch holds only the extents its pages are in, so every extent
+  held for branches holds at least one live page, and the extents held are at most the live
+  pages, as before: at worst `extent_pages − 1` of each extent's pages are dead or unwritten. A
+  branch of `p` pages that begins `f` pages into an extent is in `⌈(f + p) / extent_pages⌉`
+  extents, at most one more than alone; branches written one after another, a packing's parts or
+  a compaction's outputs, are in `⌈P / extent_pages⌉` for `P` pages together, where alone each
+  took one at least (`trunk/shared_extents.rs`). Measured on the cell's fill on the shard alone,
+  with the rotation's room as above: the bound at entry 19,804 sharing, 13,528 not.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

@@ -1647,6 +1647,31 @@ hosts, and they elect by suspicion over it; items 1, 2, 4, 5, 6 and 7 are built,
   `docs/measurements/2026-10-25-roll-on-a-busy-host.md`). A node that enlists nothing keeps no
   history of its own and starts from the cell's where it hosts the root range.
 
+*A premature suspicion lengthens the margin that made it (2026-11-20).* A link that has no
+configuration of its own is judged by the margin of its node's evidence (hyper-raft
+`docs/timing.md` §3, item 10), renewed as the heartbeats it took double. A heartbeat that ends a
+suspicion that margin told proves the suspicion premature, and the margin is renewed at once from
+the behaviour it was imposed from, the node's evidence as it stands and the link's latenesses with
+that heartbeat's among them, never shorter than the margin that suspected (hyper-liveness
+`Pair::premature_margin`): Chandra and Toueg's eventually perfect detector "increases the length of
+its timeout period" after each premature suspicion (research/81 [10] §9.1). Measured at b497c2e5
+on the node simulation's joiner, its founder loaded from the join (seed 1): the link judged at its
+node's 4.15 ms at a 120 µs interval suspected the founder at its first stall, 34.8 ms, and, the
+margin kept until the heartbeats doubled, again at its next, 17 ms; renewed at once, to 61.9 ms,
+it suspected the first stall alone while its node's evidence judged it. The first stall cannot be
+spared: no lateness had shown it.
+
+The rule is the evidence margin's alone, and over f41d8344 it changes no count of that run: on
+seed 1 the joiner suspected its live founder 60 times while it took 100 of its heartbeats, with the
+rule and without it alike. The link had its own configuration from the 312th heartbeat it took,
+before the founder's first stall: Chen et al.'s, from latenesses that knew nothing of the load, a
+5.3 ms margin renewed only once they double, which none of the 100 did; each of the 60 suspicions
+was that margin's, and the rule never ran. Lengthening a configured link's margin after a premature
+suspicion, which Chandra and Toueg's rule asks of any timeout, is not built: the live founder's
+suspicions are not bounded yet. Cut off, the founder is suspected within the patience the joiner
+states, on seed 1 41.2 ms after the cut against 90.5 ms (`tests/sim.rs`,
+`a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_it_cut_off`).
+
 A range hosted by no node still elects on ticks with focal's counts, as above (replica.md §3). SWIM's place (§3.5) does not
 change with it: SWIM's word stays a hint for routing and repair, and the stream's is what a
 group's elections take.

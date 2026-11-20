@@ -1462,11 +1462,39 @@ const FOUNDER_HEARTBEATS: u64 = 100;
 #[test]
 fn a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off() {
     for seed in seeds(&[1, 2]) {
-        loaded_founder(seed);
+        let suspicions = loaded_founder(seed, false);
+        assert_eq!(
+            suspicions, 0,
+            "seed {seed}: the joiner suspected its live founder while it took \
+             {FOUNDER_HEARTBEATS} of its heartbeats"
+        );
     }
 }
 
-fn loaded_founder(seed: u64) {
+/// The same cell, its founder loaded only from after the join: the joiner's detector meets the
+/// founder's stalls with nothing of the load in what judges the founder's link, and the times it
+/// suspects the live founder are counted here, not refused. Cut off, the founder is suspected
+/// within the patience the joiner states (`Status::patience`). On seed 1 (measured over
+/// f41d8344) the link had its own configuration from the 312th heartbeat it took, a 5.3 ms margin
+/// from latenesses that knew nothing of the load, kept until they double: it suspected the live
+/// founder 60 times while the joiner took 100 of its heartbeats, none of them by the margin of the
+/// node's evidence, which a premature suspicion lengthens at once (hyper-liveness
+/// `Pair::premature_margin`), and the cut-off founder 41.2 ms after the cut, its patience 90.5 ms.
+/// The live founder's suspicions are not yet bounded. Seeds 2 and 3, regional paths, reach the
+/// join only after minutes of an unloaded founder's turns (`MANTLE_NODE_SIM_SEEDS`,
+/// `MANTLE_NODE_SIM_SEED`).
+#[test]
+fn a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_it_cut_off() {
+    for seed in seeds(&[1]) {
+        loaded_founder(seed, true);
+    }
+}
+
+/// Runs the cell of [`a_node_that_just_joined_never_suspects_its_live_loaded_founder_and_suspects_it_cut_off`],
+/// its founder loaded from before the join or, `after_join`, from after it; checks that the joiner
+/// suspects the cut-off founder within the patience it states, and gives the times it suspected
+/// its live founder while it took [`FOUNDER_HEARTBEATS`] of its heartbeats.
+fn loaded_founder(seed: u64, after_join: bool) -> u64 {
     let mut cell = Sim::with_spare(seed, 1);
     cell.until("the founder leads", |c| {
         if c.members[&1].status.is_some_and(|s| s.leader == 1) {
@@ -1479,7 +1507,9 @@ fn loaded_founder(seed: u64) {
     let ops = 2 * (log_config().group_entries + 1);
     let stops = cell.start_workload(ops);
     cell.done_by(ops, 1);
-    cell.load(1, FOUNDER_LOAD_NS);
+    if !after_join {
+        cell.load(1, FOUNDER_LOAD_NS);
+    }
     cell.replace(cell.nodes + 1, 2);
     cell.until("the spare joins", |c| {
         if c.replaced.is_empty() {
@@ -1488,6 +1518,9 @@ fn loaded_founder(seed: u64) {
             Some(())
         }
     });
+    if after_join {
+        cell.load(1, FOUNDER_LOAD_NS);
+    }
     // Judged at each of the founder's heartbeats the joiner takes: run until it took
     // `FOUNDER_HEARTBEATS` more of them, the founder alive throughout, each taken a judgment that
     // could have been a suspicion. They come at the interval the joiner's detector chose for the
@@ -1498,11 +1531,22 @@ fn loaded_founder(seed: u64) {
     // Each is given the patience the joiner states when it took the one before (`Status::patience`):
     // the longest its evidence of the founder may go unmoved, that interval and its margin, then
     // its own proof's wait, an election and a round. A founder whose heartbeats stopped coming fails
-    // the test by it, as one the joiner never suspected.
+    // the test by it, as one the joiner never suspected. Loaded only from after the join, the
+    // founder stalls past that patience while the joiner's link to it knows nothing of the load,
+    // and is suspected at its first stall at least: each heartbeat is then given the cell's quiet
+    // period, as `Sim::until` gives anything to come, and the suspicions are counted, not refused.
     let heartbeats = |c: &Sim| c.members[&2].status.map_or(0, |s| s.heartbeats);
     let patience = |c: &Sim| {
+        if after_join {
+            return c.quiet();
+        }
         let stated = c.members[&2].status.and_then(|s| s.patience).unwrap();
         u64::try_from(stated.as_nanos()).unwrap()
+    };
+    let given_as = if after_join {
+        "the cell's quiet period"
+    } else {
+        "the patience the joiner stated"
     };
     let (from, began) = (heartbeats(&cell), cell.now_ns());
     let (mut taken, mut moved, mut given) = (from, began, patience(&cell));
@@ -1519,8 +1563,7 @@ fn loaded_founder(seed: u64) {
         assert!(
             cell.now_ns() - moved <= given,
             "seed {seed}: the joiner took none of the loaded founder's heartbeats for {} ns, past \
-             the patience of {given} ns it stated, {} of {FOUNDER_HEARTBEATS} taken; suspicions \
-             {:?}",
+             {given_as}, {given} ns, {} of {FOUNDER_HEARTBEATS} taken; suspicions {:?}",
             cell.now_ns() - moved,
             taken - from,
             cell.suspected
@@ -1528,35 +1571,30 @@ fn loaded_founder(seed: u64) {
     }
     eprintln!(
         "seed {seed}: the joiner took {FOUNDER_HEARTBEATS} of the loaded founder's heartbeats in {} \
-         ns, at most {longest} ns apart, the patience it stated then {bound} ns",
+         ns, at most {longest} ns apart, {given_as} then {bound} ns",
         cell.now_ns() - began
     );
     let suspected = |c: &Sim| c.suspected.get(&(2, 1)).copied().unwrap_or(0);
-    assert_eq!(
-        suspected(&cell),
-        0,
-        "seed {seed}: the joiner suspected its live founder while it took {FOUNDER_HEARTBEATS} of \
-         its heartbeats; suspicions {:?}",
-        cell.suspected
-    );
+    let live = suspected(&cell);
     // The patience the joiner states at the cut: the longest its evidence of the founder may go
     // unmoved, its own proof's wait, then an election and a round (`Status::patience`).
     let stated = cell.members[&2].status.and_then(|s| s.patience).unwrap();
     let (cut, bound) = (cell.now_ns(), u64::try_from(stated.as_nanos()).unwrap());
     cell.isolate(1, true);
     let at = cell.until("the joiner suspects its cut-off founder", |c| {
-        (suspected(c) > 0).then(|| c.now_ns())
+        (suspected(c) > live).then(|| c.now_ns())
     });
     eprintln!(
         "seed {seed}: the joiner suspected its cut-off founder {} ns after the cut; patience \
-         {bound} ns",
+         {bound} ns; suspicions of it live: {live}",
         at - cut
     );
     assert!(
         at - cut <= bound,
         "seed {seed}: the joiner suspected its cut-off founder {} ns after the cut, past the \
-         patience of {bound} ns it stated",
+         patience of {bound} ns it stated; suspicions of it live: {live}",
         at - cut
     );
     drop(stops);
+    live
 }

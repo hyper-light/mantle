@@ -167,27 +167,62 @@ impl<'a, F: BlockFile> Reader<'a, F> {
         }
     }
 
-    /// Whether `segment` holds a valid frame after the block at `from`, up to `end`, with a
-    /// sequence past `after`.
-    fn later_frame(
+    /// The frames of `segment` after the block at `from`, up to `end`, with a sequence past
+    /// `after`, the last valid frame's, where each valid one is a frame of the window of the frame
+    /// after that one, the gap: laid while the gap may still have been in flight, past it by no
+    /// more than its own overlap, so it proves nothing of it (mantle docs/design/raft-log.md
+    /// §3.3). Any other valid one was laid once the gap was applied, so the gap was durable and is
+    /// damaged, and so is any valid one where `after` is `None` or `windows` is false: no window
+    /// lies there. A window holds one frame of each sequence, of the 255 an overlap reaches at
+    /// most; a second of one is damage too. Each is given by its offset and whether it verified:
+    /// one of the segment's that does not proves nothing, but is erased with the window, as step
+    /// 6's block is. They are at most the segment's blocks.
+    fn past_stop(
         &mut self,
         segment: Segment,
         from: u64,
         end: u64,
         after: Option<u64>,
-    ) -> Result<bool, LogError> {
+        windows: bool,
+    ) -> Result<Vec<(u64, bool)>, LogError> {
         let block = block_of(self.align)?;
+        let gap = after.and_then(|seq| seq.checked_add(1)).filter(|_| windows);
+        let mut window: Vec<(u64, u64, bool)> = Vec::new();
         let mut offset = from;
         loop {
             offset = match offset.checked_add(block) {
                 Some(next) if next < end => next,
-                _ => return Ok(false),
+                _ => return Ok(window.into_iter().map(|(at, _, ok)| (at, ok)).collect()),
             };
-            if let Found::Frame(header, ..) = self.frame_at(segment, offset, end)?
-                && after.is_none_or(|seq| header.sequence > seq)
-            {
-                return Ok(true);
+            let header = match self.frame_at(segment, offset, end)? {
+                Found::Frame(header, ..) => header,
+                Found::End => continue,
+                Found::Invalid => {
+                    if gap.is_some()
+                        && let Some(header) = self.header(offset)?
+                        && after.is_some_and(|seq| header.sequence > seq)
+                    {
+                        window.push((offset, header.sequence, false));
+                    }
+                    continue;
+                }
+            };
+            if after.is_some_and(|seq| header.sequence <= seq) {
+                continue;
             }
+            let within = gap.is_some_and(|gap| {
+                header
+                    .sequence
+                    .checked_sub(gap)
+                    .is_some_and(|past| past > 0 && past <= u64::from(header.overlap))
+            });
+            let seen = window
+                .iter()
+                .any(|&(_, seq, ok)| ok && seq == header.sequence);
+            if !within || seen {
+                return Err(LogError::Damaged("an acknowledged frame does not verify"));
+            }
+            window.push((offset, header.sequence, true));
         }
     }
 
@@ -1137,11 +1172,14 @@ fn frames_of<F: BlockFile>(
 }
 
 /// 2. The last valid frame, in the highest segment that holds one.
+///
+/// Also the frames of the window past it, which are never taken, each by its offset and whether
+/// it verified (mantle docs/design/raft-log.md §3.3).
 fn last_frame<F: BlockFile>(
     reader: &mut Reader<'_, F>,
     shape: &Shape,
     heads: &Headers,
-) -> Result<Last, LogError> {
+) -> Result<(Last, Vec<(u64, bool)>), LogError> {
     let mut inc = heads.highest;
     loop {
         let mut found: Option<Last> = None;
@@ -1161,18 +1199,20 @@ fn last_frame<F: BlockFile>(
                 Ok(())
             },
         )?;
-        // A frame is written only after the one before it is flushed, so a valid frame past
-        // the point where the frames stop proves the frame there was acknowledged, whatever
-        // part of it no longer reads: its checksum, or its magic, format or identity
-        // (06 §A3). Only with none past it is the stop the log's end.
+        // A frame is laid only once every frame through its overlap before it is applied, so a
+        // valid frame past the point where the frames stop, by more than its overlap, proves
+        // the frame there was acknowledged, whatever part of it no longer reads: its checksum,
+        // or its magic, format or identity (06 §A3). One within its overlap, in the frame's
+        // window, proves nothing of it (raft-log.md §3.3). A window lies only in the newest
+        // segment: a segment's opening is laid once every frame before it is applied. Only with
+        // none past it, or only its window, is the stop the log's end.
         let slot = heads.slot(inc)?;
         let end = shape.end_of(slot)?;
         let after = found.map(|f| f.sequence);
-        if reader.later_frame(heads.segment(shape.id, slot, inc), stop, end, after)? {
-            return Err(LogError::Damaged("an acknowledged frame does not verify"));
-        }
+        let segment = heads.segment(shape.id, slot, inc);
+        let window = reader.past_stop(segment, stop, end, after, inc == heads.highest)?;
         if let Some(last) = found {
-            return Ok(last);
+            return Ok((last, window));
         }
         inc = inc
             .checked_sub(1)
@@ -1403,7 +1443,7 @@ fn erase<F: BlockFile>(
     file: &F,
     (shape, area): (&Shape, &Area),
     heads: &Headers,
-    last: &Last,
+    (last, window): (&Last, &[(u64, bool)]),
     copy: Option<RecordCopy>,
     sealer: Option<&Sealer>,
 ) -> Result<u64, LogError> {
@@ -1423,10 +1463,16 @@ fn erase<F: BlockFile>(
     // flushed before that opening was written, and no longer reads: the lost frame. Left in
     // the tail, a sweep of that segment took it for a live frame damaged, and the restore's
     // own frame fenced the log (mantle docs/design/raft-log.md §6, step 6).
-    let mut erasures = vec![(head_offset, shape.end_of(head_slot)?)];
+    let head_end = shape.end_of(head_slot)?;
+    let mut erasures = vec![(head_offset, head_end)];
     if heads.highest != last.incarnation {
         erasures.push((last.after, shape.end_of(heads.slot(last.incarnation)?)?));
     }
+    // A frame of the window past the last frame, in the head segment, keeps its segment's
+    // identity and a checksum that holds: left whole, the walk takes it once a later frame ends
+    // where it begins, and one torn may be completed by a later write torn over it. Its first
+    // block erased, it never reads again (raft-log.md §3.3).
+    erasures.extend(window.iter().map(|&(at, _)| (at, head_end)));
     let align = file.layout_block();
     let mut zeros = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
     zeros
@@ -1462,7 +1508,7 @@ pub(crate) fn open<F: BlockFile>(
     let heads = headers(file, &shape, sealer.as_deref_mut())?;
     let mac = sealer.as_deref().map(Sealer::frame_mac);
     let mut reader = Reader::new(file, file.layout_block(), shape.segment, mac)?;
-    let last = last_frame(&mut reader, &shape, &heads)?;
+    let (last, window) = last_frame(&mut reader, &shape, &heads)?;
     lost_headers(&mut reader, &shape, &heads)?;
     if last.tail > last.incarnation {
         return Err(LogError::Damaged(
@@ -1475,6 +1521,27 @@ pub(crate) fn open<F: BlockFile>(
     // records moves to pieces of the device's unit where its area holds them, carrying its
     // records (durability.md §7.7).
     let area = laid_area(file, config, (id, sealer.as_deref()), device.unit())?;
+    // A frame of the window past the last frame proves nothing of the frame after the last, but
+    // a record that confirms that frame proves it was applied: durable, and damaged since. A
+    // record of it or of a frame past it that says it was answered at its own flush, which a
+    // log of depth past one never does, leaves nothing to tell a crash from damage by, so it is
+    // damage too (raft-log.md §3.3). The area read is the one laid above, which carried every
+    // record where it laid the area again.
+    if window.iter().any(|&(_, verified)| verified) {
+        let gap = last
+            .sequence
+            .checked_add(1)
+            .ok_or(LogError::Damaged("sequences past u64"))?;
+        let records = records(file, &area, id, sealer.as_deref())?;
+        if records
+            .iter()
+            .any(|(_, p)| p.confirms >= gap || (p.sequence >= gap && p.at_flush))
+        {
+            return Err(LogError::Damaged(
+                "a frame that may have been answered does not verify",
+            ));
+        }
+    }
     // A log that answers frames at their flush sets its mark's bit, and flushes it, before the
     // first such frame, the restore included: a binary from before then refuses the log rather
     // than cut such a frame as the torn tail (durability.md §7.7, step 4). A mark that has it
@@ -1516,7 +1583,7 @@ pub(crate) fn open<F: BlockFile>(
         file,
         (&shape, &area),
         &heads,
-        &last,
+        (&last, &window),
         copy,
         sealer.as_deref(),
     )?;
@@ -1667,12 +1734,7 @@ fn restores<F: BlockFile>(
     let Some(sequence) = last.checked_add(1) else {
         return Ok((Vec::new(), None, Tail::Torn));
     };
-    let mut records = Vec::with_capacity(2);
-    for at in [area.at(0), area.at(1)] {
-        if let Some(p) = area.read(file, at, id, sealer)? {
-            records.push((at, p));
-        }
-    }
+    let records = records(file, area, id, sealer)?;
     let confirmed = records.iter().any(|(_, p)| p.confirms >= sequence);
     // Only the frame's own records say how it was answered: the other slot's record of the frame
     // before says nothing of this one, so a crash between two frames never marks the earlier
@@ -1728,6 +1790,22 @@ fn restores<F: BlockFile>(
         out.extend(restore);
     }
     Ok((out, copy, tail))
+}
+
+/// The records that read in the area's slots, each with its slot's offset.
+fn records<F: BlockFile>(
+    file: &F,
+    area: &Area,
+    id: u128,
+    sealer: Option<&Sealer>,
+) -> Result<Vec<(u64, format::Persist)>, LogError> {
+    let mut records = Vec::with_capacity(2);
+    for at in [area.at(0), area.at(1)] {
+        if let Some(p) = area.read(file, at, id, sealer)? {
+            records.push((at, p));
+        }
+    }
+    Ok(records)
 }
 
 /// An unconfirmed frame's group: the torn tail, keeping only a later term or a vote given, at

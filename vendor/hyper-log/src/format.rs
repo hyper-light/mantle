@@ -58,7 +58,7 @@ pub const KEY_RECORD_LEN: usize = RECORD_HEADER_LEN + KEY_FRAME_LEN;
 
 /// Bytes of a segment header before its padding.
 pub const SEGMENT_HEADER_LEN: usize = 52;
-/// Bytes of a frame header; the payload follows: magic 4, format 1, padding 3, log 16,
+/// Bytes of a frame header; the payload follows: magic 4, format 1, overlap 1, padding 2, log 16,
 /// incarnation, nonce, sequence and tail 8 each, payload length and record count 4 each, CRC 4.
 pub const FRAME_HEADER_LEN: usize = 68;
 /// [`FRAME_HEADER_LEN`] as a file offset.
@@ -204,6 +204,11 @@ pub struct FrameHeader {
     pub crc: u32,
     /// Whether the frame is a sealed log's (format 4): a MAC follows its payload.
     pub sealed: bool,
+    /// Frames before this one that may have been in flight with it when it was laid: the log's
+    /// depth then, less one, in the first byte after the format (mantle
+    /// docs/design/raft-log.md §3.3). Zero, a depth of one, in every frame written before a log
+    /// had a depth.
+    pub overlap: u8,
 }
 
 impl FrameHeader {
@@ -273,6 +278,7 @@ impl Frame {
         let mut out = [0u8; FRAME_HEADER_LEN];
         let mut w = Fixed::new(&mut out);
         w.bytes(&FRAME_MAGIC)?;
+        // The overlap byte is zero: the writer keeps one frame in flight (raft-log.md §3.3).
         w.bytes(&[if self.sealed { FORMAT_SEALED } else { FORMAT }, 0, 0, 0])?;
         w.bytes(&self.log.to_le_bytes())?;
         w.bytes(&self.incarnation.to_le_bytes())?;
@@ -325,7 +331,8 @@ impl FrameHeader {
             FORMAT_SEALED => true,
             _ => return None,
         };
-        r.take(3)?;
+        let overlap = r.u8()?;
+        r.take(2)?;
         Some(Self {
             log: r.u128()?,
             incarnation: r.u64()?,
@@ -336,6 +343,7 @@ impl FrameHeader {
             records: r.u32()?,
             crc: r.u32()?,
             sealed,
+            overlap,
         })
     }
 

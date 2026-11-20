@@ -5468,3 +5468,55 @@ mod checkpoint_tests {
         assert_eq!(value, b"durable before abort");
     }
 }
+
+#[cfg(test)]
+mod load_tests {
+    use super::checkpoint_sim::SharedSim;
+    use super::*;
+
+    /// A page's load out on a worker owns its page until it comes back (`Work::Load`), and one
+    /// that comes back after its extent was let go holds bytes the address may no longer have:
+    /// it is dropped, never held for a read, while a load of an extent still held is.
+    #[test]
+    fn a_load_back_after_its_extent_is_let_go_is_dropped() {
+        let config = Config {
+            page_size: 4096,
+            extent_pages: 4,
+            max_extents: 64,
+        };
+        let file = SharedSim::new(
+            Alignment::new(config.page_size).unwrap(),
+            Alignment::new(512).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut store = Store::create(file, config).unwrap();
+        let freed = store.allocate_extent().unwrap();
+        let gone = store.address(freed, 0).unwrap();
+        store
+            .write_page(gone, b"the page the load was for")
+            .unwrap();
+        let held = store.allocate_extent().unwrap();
+        let kept = store.address(held, 0).unwrap();
+        store.write_page(kept, b"a page still held").unwrap();
+        store.load_out(1, gone).unwrap();
+        store.load_out(2, kept).unwrap();
+        store.release(freed).unwrap();
+        store.hold_loaded(1, Ok(vec![0xA5; 64])).unwrap();
+        store
+            .hold_loaded(2, Ok(b"a page still held".to_vec()))
+            .unwrap();
+        assert_eq!(store.loads_out(), 0);
+        assert_eq!(store.loads(), 1);
+        assert!(!store.loads_page(gone));
+        let mut out = Vec::new();
+        assert!(!store.loaded_page(gone, &mut out));
+        assert!(out.is_empty());
+        assert!(store.loaded_page(kept, &mut out));
+        assert_eq!(out, b"a page still held");
+        assert!(matches!(
+            store.hold_loaded(3, Ok(Vec::new())),
+            Err(Error::InvalidArgument { .. })
+        ));
+    }
+}

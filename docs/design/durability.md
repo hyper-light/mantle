@@ -357,7 +357,10 @@ answered. Two cases reach it:
   one write's latency, not a flush; and a device whose atomic write unit holds a frame and its
   record (`RWF_ATOMIC`, research/02 §2.10) cannot tear one. On any other device the simulation's
   power cuts count the groups left waiting (§7.6), and the owner decides from that count whether
-  frames there are answered at their flush or once confirmed. Until then they are confirmed.
+  frames there are answered at their flush or once confirmed. The owner decided on 2026-11-20,
+  from the count below (one group of eight left waiting under fault (b)) and with nothing yet to
+  free a group left so, that they stay confirmed, forgoing the 18% more native PUTs a second
+  answering at the flush measured on the Mac Studio, whose three nodes share one power feed.
 
 The OS's word on the cache is not enough on its own (CLAUDE.md §5). Linux's `write_cache` is the
 kernel's view: "Writing to this file can change the kernels view of the device, but it doesn't

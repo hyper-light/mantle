@@ -5,7 +5,7 @@
 use super::filter::Keys;
 use super::{Branch, Builder, Initial, Op, RunCursor};
 use crate::error::Error;
-use crate::store::Store;
+use crate::store::{Life, Store};
 use crate::util::keys;
 use hyper_block::block::BlockFile;
 
@@ -587,6 +587,14 @@ impl Compaction {
                         // keys, shares with it what it shares with that bound.
                         let bound = merge.end.as_deref().unwrap_or(ceiling.as_slice());
                         b.set_shared(crate::util::keys::common_prefix(key, bound))?;
+                        // Tombstones are dropped where nothing older lies below: a leaf's
+                        // settle, whose parts live until that leaf settles again. An inner
+                        // node's parts are merged again once flushed.
+                        b.set_life(if *drop_tombstones {
+                            Life::Long
+                        } else {
+                            Life::Short
+                        })?;
                         building.insert((key.to_vec(), b, 0))
                     }
                 };

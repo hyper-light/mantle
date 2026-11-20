@@ -156,8 +156,8 @@ pub trait Engine: Rows {
     /// [`Engine::next_now`], past which such a read is made waiting on its device: a confirmed
     /// read that has sent as many loads is read so, as an entry's read past it is
     /// (docs/design/replica.md §3). An engine that never loads: none.
-    fn loads_most(&mut self) -> Result<usize, EngineError> {
-        Ok(0)
+    fn loads_most(&self) -> usize {
+        0
     }
 
     /// A reader of [`Engine::get_now`] and [`Engine::next_now`] is done: the pages loaded for

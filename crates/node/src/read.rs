@@ -675,11 +675,7 @@ impl Query {
                     // Saturating: the count is checked against the bound below, and stops there.
                     *loads = loads.saturating_add(1);
                 }
-                let most = match engine.loads_most() {
-                    Ok(most) => most,
-                    Err(e) => return Some(Err(ReadError::Meta(e.to_string()))),
-                };
-                if *loads < most {
+                if *loads < engine.loads_most() {
                     return None;
                 }
                 self.answer(engine, max_bytes)
@@ -1767,8 +1763,8 @@ mod tests {
         fn loads_sent(&self) -> u64 {
             self.sent
         }
-        fn loads_most(&mut self) -> Result<usize, EngineError> {
-            Ok(self.most)
+        fn loads_most(&self) -> usize {
+            self.most
         }
         fn reads_done(&mut self) {
             self.released += 1;

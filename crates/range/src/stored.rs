@@ -410,8 +410,8 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
     }
 
     /// `ShardDb::loads_most`.
-    fn loads_most(&mut self) -> Result<usize, EngineError> {
-        self.db.loads_most().map_err(|e| fenced(&mut self.fault, e))
+    fn loads_most(&self) -> usize {
+        self.db.loads_most()
     }
 
     /// The pages loaded for the reader go to the cache (`ShardDb::release_loaded`).

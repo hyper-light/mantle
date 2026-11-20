@@ -2091,6 +2091,150 @@ fn a_snapshot_carries_the_configuration_held_at_its_images_point() {
     );
 }
 
+/// An image under way for a member behind the log's start is made on, a slice a drive, while a
+/// write the log refused for room stalls its leader, which sends nothing meanwhile: the image
+/// holds every apply, and only what is applied is compacted, which is what frees the log's room.
+/// Paused while stalled, the image held the applies, the applies the compaction, and the
+/// compaction the stall, for good: the shape a stalled replica's applying ended for entries
+/// waiting for room in the machine (replica.md §2, §4). Made, the entries it held apply, the
+/// compaction passes them and the refused write is made again; the snapshot leaves with the first
+/// drive after the stall, the learner catches up, and every entry committed applies.
+#[test]
+fn an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader() {
+    let mut r = sole(3, Unbounded, |_| {});
+    r.machine_mut().sliced = true;
+    for i in 0..16u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    r.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, 2))
+        .unwrap();
+    let probe = pump(&mut r)
+        .messages
+        .into_iter()
+        .find(|m| m.to == 2 && m.msg_type == MessageType::MsgAppend)
+        .expect("a probe of the learner");
+    // The log starts at what is applied: what the learner needs is gone, and a compaction frees
+    // only what is applied past it.
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let imaged = r.applied();
+    // The learner, which holds nothing, refuses the probe, and the next drive begins the image.
+    r.step(Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: probe.term,
+        index: probe.index,
+        reject: true,
+        reject_hint: 0,
+        ..Message::default()
+    })
+    .unwrap();
+    let mut out = Output::default();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.imaging());
+    // Two entries commit while it is under way and wait unapplied; the next write is refused for
+    // room, which stalls the leader with the image still under way.
+    for i in 16..18u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    r.drive(now(), waker(), &mut out).unwrap();
+    while r.log_mut().make_durable() {}
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.durable_commit() >= imaged.index + 2);
+    r.propose(Vec::new(), b"refused".to_vec()).unwrap();
+    r.drive(now(), waker(), &mut out).unwrap();
+    r.log_mut().refuse = Some(Fault::Room("the group's retained bound"));
+    r.log_mut().make_durable();
+    r.drive(now(), waker(), &mut out).unwrap();
+    assert!(r.is_stalled() && r.imaging());
+    assert_eq!(r.applied(), imaged, "applied under the image");
+    assert!(
+        !r.compact(0, now(), waker()).unwrap(),
+        "nothing applied to free"
+    );
+    // The owner drives it and compacts it once its applied index moved, as mantle's node does a
+    // stalled range (`Node::compact_if_stalled`). A counted bound: the image's slices, a page of
+    // the entries it held, and the compaction and the write made again after them.
+    let mut tried = r.applied();
+    let mut drives = 0;
+    let mut made_stalled = false;
+    let mut to_learner = Vec::new();
+    while r.is_stalled() {
+        assert!(
+            drives < 64,
+            "the stall never cleared: applied {:?}, imaging {}",
+            r.applied(),
+            r.imaging()
+        );
+        drives += 1;
+        out.clear();
+        r.drive(now(), waker(), &mut out).unwrap();
+        // A drive that ends stalled sends nothing; the one whose writes are made again sends
+        // what the core queued meanwhile.
+        if r.is_stalled() {
+            assert!(out.messages.is_empty(), "a stalled replica sent {out:?}");
+            made_stalled |= r.images_made() == 1;
+        }
+        to_learner.extend(out.messages.drain(..).filter(|m| m.to == 2));
+        if r.applied() != tried {
+            tried = r.applied();
+            r.compact(0, now(), waker()).unwrap();
+        }
+        while r.log_mut().make_durable() {}
+    }
+    assert!(made_stalled, "the image was not made while stalled");
+    assert!(!r.imaging() && r.images_made() == 1);
+    assert!(r.applied().index >= imaged.index + 2);
+    // The snapshot leaves once the stall ends, of the point the image began at.
+    to_learner.extend(pump(&mut r).messages.into_iter().filter(|m| m.to == 2));
+    let sent = to_learner
+        .iter()
+        .find(|m| m.msg_type == MessageType::MsgSnapshot)
+        .expect("the snapshot made while stalled");
+    let metadata = sent.snapshot.as_ref().and_then(|s| s.metadata.as_ref());
+    assert_eq!(metadata.unwrap().index, imaged.index);
+    // The learner installs it, and is sent what follows: the compaction that cleared the stall
+    // passed the image's point, so a second image, made unstalled.
+    let mut learner: Sim = Replica::open(
+        &settings(2, 7),
+        SimStore::new(1),
+        Kv::new(voters(&[1]), false),
+        Unbounded,
+    )
+    .unwrap();
+    for _ in 0..64 {
+        for m in to_learner.drain(..) {
+            let snapshot = m.msg_type == MessageType::MsgSnapshot;
+            learner.step(m).unwrap();
+            if snapshot {
+                r.report_snapshot(2, true).unwrap();
+            }
+        }
+        for m in pump(&mut learner).messages {
+            if m.to == 1 {
+                r.step(m).unwrap();
+            }
+        }
+        to_learner.extend(pump(&mut r).messages.into_iter().filter(|m| m.to == 2));
+        if to_learner.is_empty() && learner.applied() == r.applied() {
+            break;
+        }
+    }
+    assert_eq!(
+        r.applied().index,
+        r.durable_commit(),
+        "every entry committed applied"
+    );
+    assert_eq!(learner.applied(), r.applied());
+    assert_eq!(learner.machine().now.entries, r.machine().now.entries);
+    assert_eq!(r.images_made(), 2, "the second image, past the compaction");
+    let entries = r.machine().now.entries.iter();
+    let refused = entries.filter(|(_, _, data)| data == b"refused").count();
+    assert_eq!(refused, 1, "the refused write made again and applied once");
+}
+
 /// The bytes the core counts for what `out` answered: each entry applied, as `EntryRef` counts it.
 fn applied_bytes(out: &Output<(u64, Vec<u8>)>) -> u64 {
     out.answers

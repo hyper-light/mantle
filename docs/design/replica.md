@@ -571,8 +571,8 @@ has the core send entries its storage fetched after answering them temporarily u
 the snapshot goes out by the core's own path. Left to the core's next try, it went at the
 member's next answer to a heartbeat, a round later, and never where nothing beat: the node's
 `a_far_ranges_snapshot_is_sent_and_installed_through_the_lanes`, whose network is the test's
-thread, waited out its deadline. A stalled member takes no part in the group (§3), so it makes
-the image once the stall ends, in the drive that sends it. An image short of what was asked, a
+thread, waited out its deadline. A stalled member takes no part in the group (§3), so it begins
+no image while stalled; one under way goes on (below). An image short of what was asked, a
 machine's last checkpoint behind what it applied, waits for the core's next try: sent at once,
 the core would ask again at once and every drive image again.
 
@@ -591,7 +591,21 @@ owner drives the range again behind every other range queued, and the shard's ow
 between. The slices read one point because nothing is applied while the image is under way:
 committed entries wait unapplied, as they wait for room (§2), the core giving no more
 (`pause_apply`), and apply once the last slice is made, or once the image is dropped with the lead,
-as only a leader sends one. The engine offers no view that outlives a write to read from instead:
+as only a leader sends one. An image under way is made on while its leader is stalled for room
+(§3), a slice a drive, as a stalled replica applies (§2): only what is applied is compacted, which
+is what frees the log's room, so paused by the stall the image held the applies, the applies the
+compaction, and the compaction the refused write, for good, the deadlock §2 ended for entries
+waiting for room. It is the likely stall at a million objects: an image of many slices under
+sustained writes fills the log with the entries it holds. Its snapshot is queued in the core
+(`RawNode::send_append`) and leaves with the first drive after the stall, as a leader's queued
+messages leave while its term and vote are durable (hyper-raft's I1, I2): it is of applied, so
+committed, state and depends on no refused write, and a stalled replica still sends nothing.
+Dropping the image at the stall instead lets the entries apply, but an image that outlasts what
+the log's room holds of writes fills it again, is dropped again, and is never made: a livelock,
+where making it on is bounded by its slices. The compaction that ends such a stall passes the
+image's point, so the member installs it and is sent a second image, made unstalled
+(hyper-durable's `an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader`). The
+engine offers no view that outlives a write to read from instead:
 its scans page as S3's listings do, no scan state living across writes (`ShardDb::scan`), and it
 is one owner's, so another thread reads none of it; a checkpoint is durable, but its extents are
 reused once a later one is, and no reader holds them (research/91 §6). The range's writes so wait
@@ -1011,8 +1025,10 @@ A member takes a snapshot that does not name it all the same (thesis §4.1; hype
   the member in chunks, each bounded and checksummed, with the production engine's files moved
   out of band (§6). The range's writes wait while it is made, its committed entries held
   unapplied, bounded by the log's room as entries waiting for room in the engine are (§2); the
-  image pauses while its member is stalled for room (§3), as an entry's apply does, so a log
-  filled by one range's held entries waits on another's compaction. A view of the engine that
+  image is made on while its leader is stalled for room (§4), so a log filled by one range's held
+  entries is freed by that range's compaction once it is made; that compaction passes the image's
+  point, so a member behind a range whose writes fill the log within one image's time is sent
+  image after image and catches up from none. A view of the engine that
   outlives writes (a checkpoint whose extents a reader holds) would let the range apply
   meanwhile and the image be read off the shard.
 - Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed

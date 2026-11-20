@@ -1150,6 +1150,11 @@ impl Pool {
         self.held() > 0
     }
 
+    /// The workers' seats: each holds at most one job out.
+    pub(crate) fn seats(&self) -> usize {
+        self.workers.len()
+    }
+
     /// Workers with a job out whose result is not taken yet.
     fn held(&self) -> usize {
         self.workers

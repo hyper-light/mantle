@@ -20,9 +20,18 @@ pub trait StateMachine {
     /// What applying an entry answers its callers.
     type Answer;
 
-    /// Applies a committed entry that changes no configuration, appending what it answers.
-    fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Self::Answer>)
-    -> Result<(), Fatal>;
+    /// Applies a committed entry that changes no configuration, appending what it answers: true.
+    /// False when the machine has no room for the entry without waiting on work of its own (an
+    /// engine's maintenance): nothing of the entry is applied or answered, the replica stops
+    /// before it with the entry committed and unapplied, and gives it again at its next drive. A
+    /// machine that answers false has arranged for its owner to be woken once the room may have
+    /// come, by the work it waits on and not by a timer, and its owner drives the replica then
+    /// ([`crate::Replica::waits_for_room`]).
+    fn apply(
+        &mut self,
+        entry: &EntryRef<'_>,
+        answers: &mut Vec<Self::Answer>,
+    ) -> Result<bool, Fatal>;
 
     /// A committed change of configuration at `at`, as its entry stated it (`change`, its
     /// context among it), left the group with `configuration`, which the machine keeps with its

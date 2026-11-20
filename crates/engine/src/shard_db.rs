@@ -5181,6 +5181,65 @@ impl<F: BlockFile> ShardDb<F> {
     /// remains unapplied, and every old memtable remains reachable by reads.
     fn rotate_paced(&mut self, keys: u64) -> Result<bool, Error> {
         self.require_async_backend()?;
+        self.rotate_step(keys)
+    }
+
+    /// Whether the active memtable takes `bytes` more of entries with no wait on a job out on a
+    /// maintenance worker: what a replicated range asks before any write of an entry, so that it
+    /// applies all of the entry's writes or none (`mantle_range::stored`), and a node's shard,
+    /// which serves its consensus and transport too, never waits on its engine's workers
+    /// (docs/design/node.md §1.2). True when the memtable has the room, or holds nothing (an
+    /// entry larger than a whole memtable rotates inline as [`Self::put`] does, nothing reading
+    /// between its writes), or its rotation finished now. True as well with no worker, or none
+    /// with a job out: the rotation then waits on nothing, its work the shard's own, which
+    /// [`Self::put`] does inline. False when the rotation waits on a job out: it is begun, as
+    /// [`Self::rotate_paced`] begins it with `keys` units of the shard's share, nothing of the
+    /// caller's is applied, and the runtime task polling now is woken by the workers' next
+    /// message ([`Pool::wake_on_message`](crate::trunk::pool::Pool)), not by a timer.
+    pub fn room_now(&mut self, bytes: usize, keys: u64) -> Result<bool, Error> {
+        // A rotation begun here ends only by its swap, which leaves the memtable it filled
+        // packing; one found with the memtable empty was overtaken by a flush or a checkpoint that
+        // packed it, and resumed it would swap an empty memtable.
+        if self.mem.is_empty() {
+            self.rotation = None;
+            return Ok(true);
+        }
+        if self.rotation.is_none() && self.mem.room() >= bytes {
+            return Ok(true);
+        }
+        // A put the trunk's metadata has no room for is refused at its rotation, typed, as
+        // [`Self::put`] refuses it: that path decides.
+        if self.rotation.is_none() && self.metadata_full() {
+            return Ok(true);
+        }
+        self.no_worker_failure()?;
+        self.no_checkpoint_mutation()?;
+        self.trunk.clear_io_wait();
+        // A message taken as the step looked may hold what the rotation waits on: each pass
+        // takes at most one, and no more can be out than the pool has workers, each with one job.
+        let passes = self.trunk.pool_mut().map_or(0, |pool| pool.seats());
+        for _ in 0..=passes {
+            if self.trunk.pool_mut().is_none() || self.rotate_step(keys)? {
+                break;
+            }
+            let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.busy()) else {
+                break;
+            };
+            match pool.wake_on_message(&mut self.store)? {
+                Some(false) => return Ok(false),
+                Some(true) => {}
+                None => break,
+            }
+        }
+        // Whatever still holds the rotation waits on no job out (or no task could be woken for
+        // one): the blocking rotation does it inline at the put that needs it, so the paced one
+        // begun is dropped rather than resumed later over a memtable that is not full.
+        self.rotation = None;
+        Ok(true)
+    }
+
+    /// [`Self::rotate_paced`]'s steps, on a store of either backend.
+    fn rotate_step(&mut self, keys: u64) -> Result<bool, Error> {
         if self.rotation.is_none() {
             self.rebudget();
             self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
@@ -5305,6 +5364,9 @@ impl<F: BlockFile> ShardDb<F> {
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
     /// trunk's maintenance when its root has no room for more branches.
     fn rotate(&mut self) -> Result<(), Error> {
+        // A paced rotation begun ([`Self::room_now`]) is this one, done whole here: resumed after,
+        // it would swap the memtable this one gives the puts.
+        self.rotation = None;
         self.rebudget();
         self.flush_stats.rotations = self.flush_stats.rotations.saturating_add(1);
         let now = std::time::Instant::now();

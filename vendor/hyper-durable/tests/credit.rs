@@ -48,12 +48,12 @@ struct Noted {
 impl StateMachine for Noted {
     type Answer = ();
 
-    fn apply(&mut self, entry: &EntryRef<'_>, _: &mut Vec<()>) -> Result<(), Fatal> {
+    fn apply(&mut self, entry: &EntryRef<'_>, _: &mut Vec<()>) -> Result<bool, Fatal> {
         self.at = Point {
             index: entry.index,
             term: entry.term,
         };
-        Ok(())
+        Ok(true)
     }
 
     fn apply_change(

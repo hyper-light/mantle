@@ -579,6 +579,12 @@ ran. The shard now does that work a slice at a time on its own worker
   (research/40 §4); the shard orders a memtable only for the scans that read it. Without
   workers, or with none free when a rotation must finish it, the shard packs it itself, its
   order and walk paid a slice at a time.
+- **A rotation no one waits on.** A replicated range asks for the room an entry takes before
+  any of its writes (`ShardDb::room_now`): a full memtable's rotation is begun and paid in the
+  paced rotation's slices, and one that would wait on a job out on a worker answers no room,
+  the task that asked woken by the worker's next message (`Pool::wake_on_message`); the entry
+  waits committed and unapplied, not the node's shard (replica.md §2). With no worker, or none
+  with a job out, the rotation waits on nothing and runs inline at the put that needs it.
 - **Pending branches.** A packed memtable waits as pending, read before the tree. The next
   cascade takes every pending branch into the root together, so `k` waiting memtables are
   merged in one compaction instead of `k`.

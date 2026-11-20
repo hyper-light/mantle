@@ -457,6 +457,9 @@ pub struct Kv {
     pub acted: Vec<u64>,
     /// Each change applied since the member opened, by index, with the context its entry stated.
     pub changes: Vec<(u64, Vec<u8>)>,
+    /// Has no room for an entry: each is answered unapplied, as an engine whose maintenance it
+    /// would wait on answers it.
+    pub roomless: bool,
 }
 
 /// What a fenced entry's data begins with: a member acts on it at its next start.
@@ -478,6 +481,7 @@ impl Kv {
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
+            roomless: false,
         }
     }
     /// What a crash leaves.
@@ -492,6 +496,7 @@ impl Kv {
             fenced_applied: Vec::new(),
             acted: Vec::new(),
             changes: Vec::new(),
+            roomless: false,
         }
     }
 }
@@ -521,9 +526,12 @@ impl StateMachine for Kv {
         &mut self,
         entry: &EntryRef<'_>,
         answers: &mut Vec<Self::Answer>,
-    ) -> Result<(), Fatal> {
+    ) -> Result<bool, Fatal> {
         if entry.index != self.now.applied.index + 1 {
             return Err(Fatal("applied out of order"));
+        }
+        if self.roomless {
+            return Ok(false);
         }
         if self.acts_at_start(entry) {
             self.fenced_applied.push(entry.index);
@@ -540,7 +548,7 @@ impl StateMachine for Kv {
             term: entry.term,
         };
         answers.push((entry.index, entry.data.to_vec()));
-        Ok(())
+        Ok(true)
     }
     fn apply_change(
         &mut self,

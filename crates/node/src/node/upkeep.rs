@@ -35,13 +35,36 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             let Some(kept) = ranges.get(at) else {
                 return Ok((0, false));
             };
-            match owner.get_mut(kept.handle) {
-                Some(replica) => step(kept.group, replica.machine_mut().engine_mut(), units),
-                None => Ok((0, false)),
-            }
+            step_range(owner, kept.handle, kept.group, units)
         })?;
         Ok(())
     }
+}
+
+/// Steps the engine of the range at `handle` in `owner` ([`step`]). Maintenance that did work
+/// for a range whose entries wait for room in its engine may have taken the worker's message
+/// that was to wake the shard for it, and made the room (`ShardDb::room_now`): the range is
+/// queued, so the next turn drives it and comes at once (`Owner::has_work`), and a drive that
+/// finds no room yet leaves the wake asked again.
+pub(super) fn step_range<E: Engine + 'static, S: mantle_range::LogStore>(
+    owner: &mut hyper_durable::Owner<
+        super::answers::Answers<S>,
+        mantle_range::RangeMachine<E>,
+        hyper_durable::Unbounded,
+    >,
+    handle: hyper_durable::Handle,
+    group: u128,
+    units: u64,
+) -> Result<(u64, bool), NodeError> {
+    let Some(replica) = owner.get_mut(handle) else {
+        return Ok((0, false));
+    };
+    let waits = replica.waits_for_room();
+    let stepped = step(group, replica.machine_mut().engine_mut(), units)?;
+    if waits && stepped.0 > 0 {
+        owner.schedule(handle);
+    }
+    Ok(stepped)
 }
 
 /// A shard's maintenance of its ranges' engines, a turn's budget at a time.
@@ -550,6 +573,237 @@ mod tests {
                 "maintenance checkpointed or flushed"
             );
         }
+    }
+
+    /// A gate a maintenance worker's writes wait at while it is shut: what holds a job out on the
+    /// worker for as long as a test needs. Opened when dropped, so a failed test ends its worker.
+    #[derive(Default)]
+    struct Gate {
+        open: std::sync::Mutex<bool>,
+        opened: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn pass(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    struct Opens(std::sync::Arc<Gate>);
+
+    impl Drop for Opens {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// A store's file whose writes on a worker's handle pass the gate first.
+    struct Gated {
+        file: hyper_block::file::DeviceFile,
+        gate: Option<std::sync::Arc<Gate>>,
+    }
+
+    impl hyper_block::block::BlockFile for Gated {
+        fn alignment(&self) -> hyper_block::buf::Alignment {
+            self.file.alignment()
+        }
+        fn layout_block(&self) -> hyper_block::buf::Alignment {
+            self.file.layout_block()
+        }
+        fn writes_reach_device(&self) -> bool {
+            self.file.writes_reach_device()
+        }
+        fn len(&self) -> Result<u64, hyper_block::DiskError> {
+            self.file.len()
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+            self.file.read_exact_at(buf, offset)
+        }
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+            if let Some(gate) = &self.gate {
+                gate.pass();
+            }
+            self.file.write_all_at(buf, offset)
+        }
+        fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+            self.file.sync_data()
+        }
+        fn fills_new_space(&self) -> bool {
+            self.file.fills_new_space()
+        }
+        fn grows_by_segments(&self) -> bool {
+            self.file.grows_by_segments()
+        }
+        fn grow(&self, len: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+            self.file.grow(len)
+        }
+        fn segment_end(&self, offset: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+            self.file.segment_end(offset)
+        }
+    }
+
+    /// Entry `i`'s rows: eight of 16-byte keys and 100-byte values, as a range's entry of several
+    /// commands writes several rows.
+    fn entry_rows(i: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..8u8)
+            .map(|w| (format!("k{i:08}-{w:06}").into_bytes(), vec![w; 100]))
+            .collect()
+    }
+
+    /// Entry `i`'s batch: its rows put.
+    fn batch(i: u64) -> Vec<mantle_meta::engine::Write> {
+        let put = |(key, value)| mantle_meta::engine::Write::Put(key, value);
+        entry_rows(i).into_iter().map(put).collect()
+    }
+
+    /// Whether `e` holds none of entry `i`'s rows, or all of them with their values.
+    fn whole(e: &mut mantle_range::Stored<Gated>, i: u64) -> Option<bool> {
+        use mantle_meta::engine::Rows;
+        let mut found = Vec::new();
+        for (key, value) in entry_rows(i) {
+            match e.get(&key).unwrap() {
+                Some(got) => {
+                    assert_eq!(got, value);
+                    found.push(true);
+                }
+                None => found.push(false),
+            }
+        }
+        if found.iter().all(|f| *f) {
+            Some(true)
+        } else if found.iter().all(|f| !*f) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// A range's engine whose memtable's rotation must wait for its maintenance worker, held at
+    /// the gate with a packing out: the entry that needs the rotation is answered unapplied at
+    /// once (`Engine::apply_now`), the shard's thread never waiting on the worker, and no read
+    /// sees any of the entry's eight rows while every entry before it reads whole. With the gate open, the worker's message wakes the
+    /// task (no timer: the wait's bound is the node's idle timeout, and a wait that reaches it
+    /// fails the test as a lost wake), and the entry applied again at each wake applies whole.
+    #[test]
+    fn an_entry_waits_unapplied_for_the_workers_message_and_applies_whole_after_it() {
+        use hyper_block::buf::Alignment;
+        use hyper_block::file::{CachingRequest, DeviceFile};
+        use hyper_rt::machine::facts::Facts;
+        use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
+        use mantle_meta::engine::Engine;
+        std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("range.store");
+            mantle_engine::store::permit_blocking();
+            let (_, rules) = crate::derive::cell(3).unwrap();
+            let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
+            // A memtable of about 16 entries, its rows counted at their largest (`entry_bytes`),
+            // so that a few memtables fill before the held packing stops the next rotation.
+            let row = mantle_engine::memtable::hashed::entry_bytes(16, 100).unwrap();
+            let memtable = row * (8 * 16 + 3);
+            let mut shard = LocalRuntime::new(&RuntimeConfig {
+                shards: 1,
+                tasks_per_shard: 1,
+                timers_per_shard: 2,
+                interests_per_shard: interests_for(1),
+                ring_entries: 1,
+                step_budget_ns: 1_000_000_000,
+                timer_tick_ns: 100_000,
+                batch: 1,
+                pin: false,
+                cores: Vec::new(),
+                page_bytes: usize::try_from(Facts::query().page.base).unwrap(),
+                spin_ns: 0,
+                wake_tracking: None,
+                latency_objective_ns: None,
+            })
+            .unwrap();
+            shard
+                .block_on(async move {
+                    let open = move |path: &std::path::Path, create: bool| {
+                        DeviceFile::open(
+                            path,
+                            create,
+                            CachingRequest::Buffered,
+                            Alignment::new(4096).unwrap(),
+                        )
+                    };
+                    let file = Gated {
+                        file: open(&path, true).unwrap(),
+                        gate: None,
+                    };
+                    let mut e =
+                        mantle_range::Stored::create(file, engine.store, memtable, engine.trunk)
+                            .unwrap();
+                    let gate = std::sync::Arc::new(Gate::default());
+                    let opens = Opens(gate.clone());
+                    let again = path.clone();
+                    e.set_workers(
+                        move || {
+                            let file =
+                                open(&again, false).map_err(|e| mantle_engine::Error::Io {
+                                    op: "open",
+                                    detail: e.to_string(),
+                                })?;
+                            Ok(Gated {
+                                file,
+                                gate: Some(gate.clone()),
+                            })
+                        },
+                        1,
+                    )
+                    .unwrap();
+                    // Each memtable takes 16 entries; the worker's first packing never ends
+                    // while the gate is shut, so a rotation soon waits on it.
+                    let mut waited = None;
+                    for i in 1..=16 * 64 {
+                        if !e.apply_now(i, batch(i)).unwrap() {
+                            waited = Some(i);
+                            break;
+                        }
+                    }
+                    let i = waited.expect("no rotation waited on the held worker");
+                    assert_eq!(e.applied(), i - 1);
+                    assert_eq!(whole(&mut e, i), Some(false), "entry {i} applied in part");
+                    for before in 1..i {
+                        assert_eq!(whole(&mut e, before), Some(true), "entry {before}");
+                    }
+                    // Asked again with the worker still held: refused again, still waiting.
+                    assert!(!e.apply_now(i, batch(i)).unwrap());
+                    assert_eq!(whole(&mut e, i), Some(false), "entry {i} applied in part");
+                    drop(opens);
+                    let bound = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap();
+                    let mut wakes = 0;
+                    loop {
+                        assert!(wait_for_wake(bound).await, "a wake was lost: entry {i}");
+                        wakes += 1;
+                        if e.apply_now(i, batch(i)).unwrap() {
+                            break;
+                        }
+                        assert!(
+                            wakes < 64,
+                            "entry {i} waited past 64 of the worker's messages"
+                        );
+                    }
+                    assert_eq!(e.applied(), i);
+                    assert_eq!(whole(&mut e, i), Some(true), "entry {i}");
+                    e.persist().unwrap();
+                    for before in 1..=i {
+                        assert_eq!(whole(&mut e, before), Some(true), "entry {before}");
+                    }
+                })
+                .unwrap();
+        })
+        .join()
+        .unwrap();
     }
 
     /// A failed engine stops the turn with the node's error, fenced.

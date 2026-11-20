@@ -3176,7 +3176,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // its workers again, with no await between that and this wait.
         if self.upkeep.waiting() {
             self.upkeep_ranges(std::time::Instant::now())?;
-            if self.upkeep.owed() {
+            // A range whose entries waited for room in an engine that took the result is queued
+            // to apply them (`upkeep::step_range`).
+            if self.upkeep.owed() || self.owner.has_work() {
                 hyper_rt::futures::yield_now().await;
                 return Ok(());
             }

@@ -38,7 +38,7 @@ use pool::{Output, Owner, Pool, Task, Ticket, Work};
 
 pub mod pool;
 mod upkeep;
-use upkeep::{Change, NodeTask};
+use upkeep::{Change, Tasks};
 
 /// The bytes a trunk's branches hold in memory ([`Trunk::memory`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -625,9 +625,13 @@ pub struct Trunk {
     /// Packed memtables not yet in the tree, oldest first: read before it, and moved into the
     /// root once the root takes no change ([`upkeep`]).
     pending: Vec<Pending>,
+    /// The pending branches' entries, counted as they come and go: the share of
+    /// [`Self::debt`] a put asks for, saturating as that sum does.
+    pending_entries: u64,
     /// Maintenance in progress (CLAUDE.md §10): at most one compaction a pivot and one settle a
-    /// node, so bounded by the trunk's size ([`upkeep`]).
-    tasks: Vec<NodeTask>,
+    /// node, so bounded by the trunk's size ([`upkeep`]); filed by where each stands, so a pass
+    /// costs the tasks it acts on ([`Tasks`]).
+    tasks: Tasks,
     /// Nodes to look at for work, each queued once until looked at.
     looking: VecDeque<usize>,
     /// The nodes whose in-flight list holds a bundle, and those that want a change: counted as
@@ -922,7 +926,8 @@ impl Trunk {
             saving: Saving::default(),
             stats: TrunkStats::default(),
             pending: Vec::new(),
-            tasks: Vec::new(),
+            pending_entries: 0,
+            tasks: Tasks::default(),
             looking: VecDeque::new(),
             abandoning: None,
             timed: false,
@@ -1740,6 +1745,7 @@ impl Trunk {
     /// next step ([`Self::step`]). Its references are the trunk's from here.
     pub fn add(&mut self, mut branch: Branch) {
         self.stamp(&mut branch);
+        self.pending_entries = self.pending_entries.saturating_add(branch.count);
         self.pending.push(Pending {
             cuts: Vec::new(),
             parts: vec![(0, branch)],
@@ -1762,6 +1768,7 @@ impl Trunk {
     ) {
         for (_, b) in &mut parts {
             self.stamp(b);
+            self.pending_entries = self.pending_entries.saturating_add(b.count);
         }
         self.pending.push(Pending { cuts, parts, kept });
     }
@@ -2580,7 +2587,8 @@ impl Trunk {
             saving: Saving::default(),
             stats: TrunkStats::default(),
             pending: Vec::new(),
-            tasks: Vec::new(),
+            pending_entries: 0,
+            tasks: Tasks::default(),
             looking: VecDeque::new(),
             abandoning: None,
             timed: false,

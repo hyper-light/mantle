@@ -655,4 +655,11 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     pub fn images_made(&self) -> u64 {
         self.shell.images_made()
     }
+
+    /// Whether an image of its engine is under way for a member behind the log's start, made a
+    /// slice a drive, nothing applied meanwhile (hyper-durable's `Replica::imaging`,
+    /// docs/design/replica.md §4).
+    pub fn imaging(&self) -> bool {
+        self.shell.imaging()
+    }
 }

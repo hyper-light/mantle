@@ -20,8 +20,9 @@ mod support;
 use std::task::Waker;
 
 use hyper_durable::{
-    Budget, Bytes, Cause, Compaction, EntryRef, Fatal, Fault, LogStore, OpenError, Output, Owner,
-    Point, RamStore, Replica, ReplicaError, Settings, StateMachine, StoreView, Unbounded, Write,
+    Budget, Bytes, Cause, Compaction, EntryRef, Fatal, Fault, Imaged, LogStore, OpenError, Output,
+    Owner, Point, RamStore, Replica, ReplicaError, Settings, StateMachine, StoreView, Unbounded,
+    Write,
 };
 use hyper_raft::StorageError;
 use hyper_raft::proto::{
@@ -1066,8 +1067,8 @@ impl StateMachine for Boom {
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
         self.0.acts_at_start(entry)
     }
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
-        self.0.image(into)
+    fn image(&mut self, into: &mut Vec<u8>, bytes: u64) -> Result<Imaged, Fatal> {
+        self.0.image(into, bytes)
     }
     fn image_bytes(&self) -> Option<u64> {
         self.0.image_bytes()
@@ -2215,7 +2216,7 @@ fn a_write_made_again_never_starts_the_log_past_the_state_machine() {
     }
     leader.now.applied = Point { index: 8, term: 1 };
     let mut data = Vec::new();
-    leader.image(&mut data).unwrap();
+    leader.image(&mut data, u64::MAX).unwrap();
     r.step(Message {
         msg_type: MessageType::MsgSnapshot,
         from: 1,
@@ -2394,7 +2395,7 @@ fn entry_of(data: usize) -> u64 {
 /// nothing was applied since.
 fn image_of(r: &mut Sim) -> u64 {
     let mut image = Vec::new();
-    r.machine_mut().image(&mut image).unwrap();
+    r.machine_mut().image(&mut image, u64::MAX).unwrap();
     image.len() as u64
 }
 
@@ -2796,7 +2797,7 @@ fn a_member_that_installs_an_image_weighs_its_log_against_it() {
     }
     leader.now.applied = Point { index: 64, term: 1 };
     let mut data = Vec::new();
-    leader.image(&mut data).unwrap();
+    leader.image(&mut data, u64::MAX).unwrap();
     let image = data.len() as u64;
     r.step(Message {
         msg_type: MessageType::MsgSnapshot,
@@ -2871,7 +2872,7 @@ fn a_compaction_behind_an_install_made_again_counts_from_the_image() {
     }
     leader.now.applied = Point { index: 12, term: 1 };
     let mut data = Vec::new();
-    leader.image(&mut data).unwrap();
+    leader.image(&mut data, u64::MAX).unwrap();
     r.step(Message {
         msg_type: MessageType::MsgSnapshot,
         from: 1,

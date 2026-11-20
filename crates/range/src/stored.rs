@@ -29,7 +29,7 @@ use mantle_engine::rows::Rows as EngineRows;
 use mantle_engine::shard_db::{FlushStats, ShardDb};
 use mantle_engine::store::{Config, IoStats};
 use mantle_engine::trunk::{TrunkConfig, TrunkStats};
-use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
+use mantle_meta::engine::{EachRow, Engine, EngineError, Row, Rows, Write};
 use mantle_meta::session::Rules;
 
 /// Whether an engine of pages of `page_size` bytes and a memtable of `memtable_bytes` holds a row
@@ -336,6 +336,27 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
             .iter()
             .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect())
+    }
+
+    /// A page of the image read from memory (`ShardDb::scan_rows_ready`), or
+    /// [`EngineError::Unloaded`] as [`Engine::next_now`]: the range images its rows a page a drive
+    /// on the node's shard (docs/design/replica.md §4).
+    fn image_page(
+        &mut self,
+        from: &[u8],
+        rows: usize,
+        each: &mut EachRow<'_>,
+    ) -> Result<bool, EngineError> {
+        self.rows.clear();
+        let filled = self
+            .db
+            .scan_rows_ready(from, None, rows, &mut self.rows)
+            .map_err(|e| fenced(&mut self.fault, e))?
+            .ok_or(EngineError::Unloaded)?;
+        for (k, v) in self.rows.iter() {
+            each(k, v)?;
+        }
+        Ok(filled)
     }
 
     /// The engine counts no rows apart from reading them.

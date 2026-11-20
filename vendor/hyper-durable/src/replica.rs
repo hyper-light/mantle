@@ -52,7 +52,7 @@ use hyper_timing::{Ballot, Flushes, Span, Trust, inflight_window};
 use crate::budget::{Budget, Unbounded};
 use crate::compaction::Compaction;
 use crate::held::Held;
-use crate::machine::{Fatal, StateMachine};
+use crate::machine::{Fatal, Imaged, StateMachine};
 use crate::patience::{self, Patience};
 use crate::store::{Entries, EntryRef, Fault, Health, LogStore, Point, Write};
 
@@ -328,6 +328,9 @@ enum Wait {
     /// Room in the state machine, which wakes the owner for the drive that applies them
     /// ([`StateMachine::apply`]).
     Room,
+    /// The image under way ([`Replica::make_wanted`]): every slice reads the state of one point,
+    /// so nothing is applied until the last is made, or the image is dropped.
+    Image,
 }
 
 /// Where a walk of committed entries stopped.
@@ -391,6 +394,13 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// The images made for members behind the log's start since the member opened
     /// ([`Replica::images_made`]).
     images_made: u64,
+    /// The image being made a slice a drive for a member behind the log's start, what its slices
+    /// wrote so far ([`Replica::make_wanted`]): at most one, as the core asks for one snapshot at
+    /// a time and one serves every member behind. While it is under way nothing is applied.
+    imaging: Option<Vec<u8>>,
+    /// The image's next slice waits on the machine's own work, which wakes the owner
+    /// ([`Imaged::Waits`]): the drive asks for no other turn meanwhile.
+    image_waits: bool,
     /// The entries to keep of a compaction that waits on the state machine's checkpoint out
     /// ([`StateMachine::persist`] answered false): each drive asks the machine again, and the
     /// start moves at the one that finds it durable ([`Replica::persisting`]).
@@ -585,6 +595,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             sizes_from: durable.index.saturating_add(1),
             imaged: None,
             images_made: 0,
+            imaging: None,
+            image_waits: false,
             persisting: None,
             told_applied: durable.index,
             conf_index: durable.index,
@@ -1739,14 +1751,16 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     fn driven(&mut self) -> Driven {
         let slot = self.has_slot();
         let paged = self.wait == Wait::Page && self.fence.is_some();
+        let slicing = self.imaging.is_some() && !self.image_waits;
         // A page held is applied at the next drive, stalled or not (`drive`).
         let more = paged
             || (self.stall.is_none()
-                && slot
-                && (self.ready_due()
-                    || self
-                        .behind_fence()
-                        .is_some_and(|(_, last)| !self.fence_covered(last))));
+                && (slicing
+                    || (slot
+                        && (self.ready_due()
+                            || self
+                                .behind_fence()
+                                .is_some_and(|(_, last)| !self.fence_covered(last))))));
         Driven {
             more,
             out: self.writes.len(),
@@ -2427,8 +2441,10 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// A snapshot was installed at `point`: it replaces whatever page waited behind the fence,
-    /// which it covers.
+    /// which it covers, and any image under way, of a state it replaced.
     fn installed(&mut self, point: Point) {
+        self.imaging = None;
+        self.image_waits = false;
         self.applied = point;
         self.conf_index = point.index;
         // The log starts at the image's point, holding nothing applied past it.
@@ -2532,6 +2548,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         if self.wait == Wait::Commit && first > self.durable_commit() {
             return Ok(());
         }
+        if self.wait == Wait::Image && self.imaging.is_some() {
+            return Ok(());
+        }
         self.fence = None;
         self.wait = Wait::Commit;
         self.node.resume_apply();
@@ -2547,6 +2566,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         last: u64,
         out: &mut Output<M::Answer>,
     ) -> Result<(), ReplicaError> {
+        // An image under way reads the state of the point it began at: what is committed waits,
+        // as it waits for room, bounded by the core's committed page and the log's room.
+        if self.imaging.is_some() {
+            self.hold(first, last, Wait::Image);
+            return Ok(());
+        }
         let mut next = first;
         while next <= last {
             match self.walk(next, last, out) {
@@ -2778,20 +2803,46 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// temporarily unavailable, is then asked to send it ([`Replica::send_made`]). An image is
     /// made only here, so only for a member behind the log's start, never for a compaction
     /// (raft-rs's `Storage::snapshot`, TiKV's `PeerStorage::snapshot`; Ongaro's thesis §5.2;
-    /// mantle docs/research/91-snapshots-on-demand.md). None is made before the machine applied
+    /// mantle docs/research/91-snapshots-on-demand.md). None is begun before the machine applied
     /// through what is needed: the core asks again, and one made now would not reach it. Not
     /// while stalled: a stalled member takes no part in the group, and the image waits to be
     /// made, of what the machine applied by then, at the drive that sends it.
+    ///
+    /// The image is made a slice a drive, each about the bytes of entries a drive applies at
+    /// most, its committed page, the quantum the owner's round robin is fair within
+    /// ([`StateMachine::image`]), so a drive's cost is bounded whatever the machine holds: made whole on the owner's thread, an image of a million rows held every
+    /// group the thread drives for seconds (mantle docs/design/replica.md §4). Nothing is applied
+    /// while it is under way ([`Wait::Image`]), so its slices read the state of the point it
+    /// began at; the entries held apply once it is made, or dropped with the lead, as only a
+    /// leader sends one.
     fn make_wanted(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
-        let Some(wanted) = self.node.store().wanted.take() else {
-            return Ok(());
+        let mut data = match self.imaging.take() {
+            Some(data) if self.is_leader() => data,
+            Some(_) => {
+                self.node.store().wanted.take();
+                return self.image_ended(out);
+            }
+            None => {
+                let Some(wanted) = self.node.store().wanted.get() else {
+                    return Ok(());
+                };
+                if self.applied.index < wanted {
+                    self.node.store().wanted.take();
+                    return Ok(());
+                }
+                Vec::new()
+            }
         };
-        if self.applied.index < wanted {
-            return Ok(());
-        }
-        let mut data = Vec::new();
-        let imaged = self.machine.image(&mut data);
-        let (point, configuration) = self.machine_did(imaged)?;
+        let imaged = self.machine.image(&mut data, self.page);
+        let (point, configuration) = match self.machine_did(imaged)? {
+            Imaged::Made(point, configuration) => (point, configuration),
+            part @ (Imaged::Slice | Imaged::Waits) => {
+                self.image_waits = part == Imaged::Waits;
+                self.imaging = Some(data);
+                return Ok(());
+            }
+        };
+        let wanted = self.node.store().wanted.take().unwrap_or(point.index);
         self.images_made = self.images_made.saturating_add(1);
         self.node.store_mut().snapshot = Some(Snapshot {
             data,
@@ -2804,10 +2855,20 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         // An image short of what was asked, a machine's last checkpoint behind what it applied,
         // waits for the core's next try: sent at once, the core would ask again at once, and
         // every drive would image again until the machine checkpoints past it.
-        if point.index < wanted {
-            return Ok(());
+        if point.index >= wanted {
+            self.send_made(out)?;
         }
-        self.send_made(out)
+        self.image_ended(out)
+    }
+
+    /// The image under way is made or dropped: the entries it held apply now, a page of them, as
+    /// a drive's release of its fence applies them.
+    fn image_ended(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
+        self.image_waits = false;
+        if self.fence.is_some() && self.wait == Wait::Image {
+            self.release_fence(out)?;
+        }
+        Ok(())
     }
 
     /// Has the core send the snapshot just made (`RawNode::send_append`) to each member behind the
@@ -2855,6 +2916,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// it opened ([`Replica::make_wanted`]): a compaction makes none.
     pub fn images_made(&self) -> u64 {
         self.images_made
+    }
+
+    /// Whether an image is under way for a member behind the log's start, made a slice a drive
+    /// ([`Replica::make_wanted`]): its owner drives the replica at its next turn, and one whose
+    /// next slice waits on the machine's own work ([`Imaged::Waits`]) when that work wakes it,
+    /// as for an entry that waits for room.
+    pub fn imaging(&self) -> bool {
+        self.imaging.is_some()
     }
 
     /// Makes the state machine's applied state durable and lets the log free what is before it,

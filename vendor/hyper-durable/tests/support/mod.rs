@@ -25,7 +25,7 @@ pub mod device;
 use std::task::Waker;
 
 use hyper_durable::{
-    EntryRef, Fatal, Fault, Health, LogStore, Point, StateMachine, StoreView, Write,
+    EntryRef, Fatal, Fault, Health, Imaged, LogStore, Point, StateMachine, StoreView, Write,
 };
 use hyper_raft::StorageError;
 use hyper_raft::proto::{ConfChangeV2, ConfState, Entry, HardState};
@@ -587,7 +587,7 @@ impl StateMachine for Kv {
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
         self.control || entry.data.starts_with(ACTS)
     }
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
+    fn image(&mut self, into: &mut Vec<u8>, _: u64) -> Result<Imaged, Fatal> {
         let state = if self.checkpoints {
             &self.durable
         } else {
@@ -600,7 +600,7 @@ impl StateMachine for Kv {
             put(into, data.len() as u64);
             into.extend_from_slice(data);
         }
-        Ok((state.applied, state.configuration.clone()))
+        Ok(Imaged::Made(state.applied, state.configuration.clone()))
     }
     fn image_bytes(&self) -> Option<u64> {
         // As `image` writes it: the count, then each entry's index, term and length, and its data.

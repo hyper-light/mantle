@@ -31,7 +31,7 @@ use hyper_block::block::BlockFile;
 use crate::device::{self, Carrier, Lines};
 use crate::format::{HardState, Start};
 use crate::owner::{Message, Query};
-use crate::room::GROUP_SUBMISSIONS;
+use crate::room::{GROUP_ADMITS, GROUP_SUBMISSIONS};
 use crate::state::resolves;
 use crate::ticket::{self, Answer, Waiting};
 use crate::writer::{self, Submission};
@@ -39,9 +39,14 @@ use crate::{
     Class, Entries, Entry, Fetched, LogError, Marks, Page, Params, Proposal, Update, View,
 };
 
-/// Writes a handle keeps out at most: the group's own room in the log's queue and the waiters
-/// it may have beyond it (`room.rs`), past which the log would refuse it `Busy` too.
-const OUT: usize = GROUP_SUBMISSIONS.saturating_mul(2);
+/// Writes a handle keeps out at most: what its group's own room in the log's queue admits
+/// whatever their bytes ([`GROUP_ADMITS`]) and the waiters it may have beyond it
+/// ([`GROUP_SUBMISSIONS`]; `room.rs`), past which the log would refuse it `Busy` too. Twice
+/// `GROUP_SUBMISSIONS`, the bound once, counted the group's whole count as its own room: two
+/// frame-sized parts fill the group's share of the queue's bytes, three more wait, and a sixth
+/// was refused `Busy` though nothing but its own group held the queue, a refusal for room that
+/// stalls a replica until its owner frees room (mantle docs/design/raft-log.md §3.1).
+const OUT: usize = GROUP_ADMITS.saturating_add(GROUP_SUBMISSIONS);
 
 /// A group's state as its answered writes left it.
 #[derive(Debug, Clone)]

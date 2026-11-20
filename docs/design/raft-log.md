@@ -259,6 +259,20 @@ past that share the group waits for its own room, so one group never holds the l
 that the others need. With two submissions a group the count alone kept the share; three
 full-frame submissions would hold all of `B`.
 
+So a group's own room admits two submissions whatever their size, `GROUP_ADMITS`, and the third
+only while the bytes fit the share. A group's handle keeps out at most five (`OUT`): those two
+and the three that may wait beyond them, past which the log refuses `Busy`. Six, twice the
+count, took the group's whole count for its own room, which the share made untrue for large
+parts: a write in frame-sized parts had two admitted and three waiting, all its own group's, and
+its sixth part was refused `Busy`. That is a refusal for room, on which a replica stalls, the
+refused write's messages held with it, until its owner says room was freed; with nothing else
+holding the queue no other group's answer frees it. A range's leader that took 179,803 entries
+while cut off, on a log of its own, wrote them in parts of 565,177 bytes, had its sixth refused,
+and never committed them (mantle-node `tests/range_log_memory.rs`, 1,000,000 rounds;
+`vendor/hyper-log/tests/log.rs`,
+`a_handles_frame_sized_parts_wait_for_their_groups_room_never_refused`). The queue's own bound
+still refuses a handle whose parts wait behind other groups', as it always has.
+
 ### 3.2 Sharing a full frame
 
 A frame takes at most one update of a group, as before. When the updates waiting do not all

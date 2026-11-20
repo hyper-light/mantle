@@ -878,13 +878,13 @@ fn a_group_stopped_with_its_compaction_out_opens_again_at_once() {
 /// refused the refused write's last part `Behind` and laid the new write past it, and refused it
 /// `Invalid`, "entries past the last leave a gap", which fences a replica (mantle, perf-10k
 /// 0603268e: a three-node cell stopped a member at the start of a PUT phase). Do: under
-/// `Waits::Told`, a group at its retained bound; five writes of a hard state alone, then a write
-/// in two parts, whose second waits in the store with the handle full; a cut refuses the first
-/// part `Backlog`; the first hard state's answer is taken and a write submitted, which sends the
-/// second part and waits in the store itself; the refusal is taken with the second part out; a
-/// write is then submitted, and a cut lays what is out. Expect: the store has no room while the
-/// refusal waits for its caller; the write in parts is refused for room, and the two after it
-/// `Behind`; the log still ends where it did.
+/// `Waits::Told`, a group at its retained bound; four writes of a hard state alone, then a write
+/// in two parts, whose second waits in the store with the handle full (it keeps five out,
+/// hyper-log's `OUT`); a cut refuses the first part `Backlog`; the first hard state's answer is
+/// taken and a write submitted, which sends the second part and waits in the store itself; the
+/// refusal is taken with the second part out; a write is then submitted, and a cut lays what is
+/// out. Expect: the store has no room while the refusal waits for its caller; the write in parts
+/// is refused for room, and the two after it `Behind`; the log still ends where it did.
 #[test]
 fn a_write_submitted_while_a_refused_writes_parts_are_out_is_refused_with_it() {
     let log = Log::create(
@@ -910,7 +910,7 @@ fn a_write_submitted_while_a_refused_writes_parts_are_out_is_refused_with_it() {
         }),
         ..hyper_durable::Write::default()
     };
-    for _ in 0..5 {
+    for _ in 0..4 {
         store.submit(&hard, &waker).unwrap();
     }
     let room = log.frame_room().unwrap();
@@ -932,7 +932,7 @@ fn a_write_submitted_while_a_refused_writes_parts_are_out_is_refused_with_it() {
     // The second part goes out as the handle has room again, before the refusal is taken.
     let next = entries_of(7, 7, 1);
     store.submit(&write_of(7, &next), &waker).unwrap();
-    for _ in 0..4 {
+    for _ in 0..3 {
         answer_of(&mut store, &woken);
     }
     assert!(

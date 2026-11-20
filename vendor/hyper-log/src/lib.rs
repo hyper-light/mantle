@@ -1050,11 +1050,12 @@ impl<F: BlockFile + 'static> Log<F> {
         let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(u64::try_from(PIPELINE_FRAMES).ok()?))
             .ok_or(LogError::Config("a queue of three frames past u64"))?;
-        // One group's share: the queue's bytes less one frame's worth (mantle
+        // One group's share: the queue's bytes less one frame's worth, `room::GROUP_ADMITS` frames
+        // of the largest charge, so its own room admits that many whatever their bytes (mantle
         // docs/design/raft-log.md §3.1).
         let group_bytes = writer::charge(room_bytes)
-            .and_then(|largest| queue_bytes.checked_sub(largest))
-            .ok_or(LogError::Config("a queue of no frame"))?;
+            .and_then(|largest| largest.checked_mul(u64::try_from(room::GROUP_ADMITS).ok()?))
+            .ok_or(LogError::Config("a group's share past u64"))?;
         let p = Params {
             id,
             config,

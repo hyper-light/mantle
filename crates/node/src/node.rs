@@ -3697,6 +3697,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             Event::BodyReady { exchange } if self.hosts(exchange) => {
                 self.feeding.mark(exchange);
                 self.replies.mark(exchange);
+                // A job resting on its fields read what had arrived of them: more has
+                // (`Job::rests`).
+                if let Some(at) = self.host.job_of(exchange) {
+                    self.host.arrived(at);
+                }
                 Ok(())
             }
             Event::BodyReady { exchange } => self.read_exchange(exchange),

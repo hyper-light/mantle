@@ -1071,11 +1071,56 @@ pub fn buffers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64>
 /// cell of three, took 7,153 of the Mac Studio's 62,382 operations, 10,035 of a 16 GiB host's
 /// 10,830 and all but the 10 a 7 GiB runner serves at least (`derive::tests`, 2026-11-20), for
 /// rotations past an entry's that no measurement has yet shown cost the node anything.
-pub fn write_buffer_want(least: &Engine, settings: &Settings, log: &LogConfig) -> Option<usize> {
-    let entry = usize::try_from(settings.max_entry_bytes).ok()?;
+///
+/// With a restart budget stated and a replay rate measured, the recovery-time bound takes the
+/// entry's place: `replay`, each range's part of the bytes a restart replays within its budget
+/// ([`replay_bound`]), within the retention and the offsets, at least the least, as research/11
+/// §9.3 checkpoints at the smaller of the space and recovery-time bounds.
+pub fn write_buffer_want(
+    least: &Engine,
+    settings: &Settings,
+    log: &LogConfig,
+    replay: Option<u64>,
+) -> Option<usize> {
+    let want = match replay {
+        Some(bound) => usize::try_from(bound).unwrap_or(usize::MAX),
+        None => usize::try_from(settings.max_entry_bytes).ok()?,
+    };
     let retained = usize::try_from(log.group_bytes).unwrap_or(usize::MAX);
     let offsets = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
-    Some(entry.min(retained).min(offsets).max(least.memtable_bytes))
+    Some(want.min(retained).min(offsets).max(least.memtable_bytes))
+}
+
+/// The fewest entries a replay at open re-applies for its rate to be taken ([`replay_rate`]):
+/// Wilks' 59, the fewest readings hyper-rt's measuring harness accepts of an operation
+/// (`hyper_rt::machine::bench::MIN_SAMPLES`; S. S. Wilks, Ann. Math. Statist. 12(1), 1941), each
+/// entry's apply a reading of the replay's cost.
+pub const REPLAY_LEAST: usize = MIN_SAMPLES;
+
+/// Bytes a second `replayed` re-applied: its bytes over its span (`Replayed::nanos`), where it
+/// re-applied at least [`REPLAY_LEAST`] entries, of some bytes, over a span the clock measured;
+/// `None` below, where a few entries' fixed costs would stand for a whole replay's.
+pub fn replay_rate(replayed: &mantle_range::Replayed) -> Option<u64> {
+    let least = u64::try_from(REPLAY_LEAST).ok()?;
+    let nanos = replayed.nanos();
+    if replayed.entries < least || replayed.bytes == 0 || nanos == 0 {
+        return None;
+    }
+    let rate = u128::from(replayed.bytes)
+        .checked_mul(1_000_000_000)?
+        .checked_div(u128::from(nanos))?;
+    Some(u64::try_from(rate).unwrap_or(u64::MAX))
+}
+
+/// Each of `ranges` ranges' part of what a restart replays within `budget` at `rate` bytes a
+/// second, the engines' write buffers' node total at most `rate × budget` (node.md §2.6;
+/// research/12 §6.2: "bytes ≤ measured replay rate × target restart time"), the same part each.
+pub fn replay_bound(rate: u64, budget: Duration, ranges: usize) -> Option<u64> {
+    let total = u128::from(rate)
+        .checked_mul(budget.as_nanos())?
+        .checked_div(1_000_000_000)?;
+    let each = total.checked_div(u128::try_from(ranges.max(1)).ok()?)?;
+    Some(u64::try_from(each).unwrap_or(u64::MAX))
 }
 
 /// `least` with the largest write buffer of at most `want` bytes whose buffers
@@ -2320,6 +2365,9 @@ pub struct Measured {
     /// The most descriptors the process may hold open at once, raised at its start and read back
     /// (`crate::descriptors`).
     pub descriptors: u64,
+    /// The last replay at open large enough to time, kept in the node's directory
+    /// (`process::replay`), `None` before one ([`replay_rate`]).
+    pub replay: Option<mantle_range::Replayed>,
 }
 
 /// A volume's bytes as its `volume` line states them (docs/design/membership.md §3.1).
@@ -2367,6 +2415,10 @@ pub struct Stated {
     pub repair: Option<f64>,
     /// The orderly stop's bound, where its operator states it.
     pub stop: Option<Duration>,
+    /// How long a restart may take to replay its ranges' logs, where its operator states it
+    /// (node.md §1.4; research/11 §9.4, §18 item 4): with a measured replay rate it bounds the
+    /// engines' write buffers ([`write_buffer_want`]).
+    pub restart_budget: Option<Duration>,
     /// The S3 endpoint, where its operator states it (node.md §4).
     pub s3: Option<S3Stated>,
     /// The shards the node places its ranges over, where its operator states them (node.md §2.9).
@@ -3209,8 +3261,17 @@ fn derive_with(
     // spare then leave.
     let key_most = rules.max_key_bytes;
     let ranges_count = u64::try_from(ranges).map_err(|_| overflow("the ranges"))?;
-    let buffer_want =
-        write_buffer_want(&made, &settings, &log_config).ok_or(overflow("a write buffer"))?;
+    // With a restart budget stated and a replay rate measured, each range's part of what a
+    // restart replays within the budget (node.md §2.6); without both, an entry of its largest.
+    let rate = measured.replay.as_ref().and_then(replay_rate);
+    let replay = match (rate, stated.restart_budget) {
+        (Some(rate), Some(budget)) => {
+            Some(replay_bound(rate, budget, ranges).ok_or(overflow("the replay bound"))?)
+        }
+        _ => None,
+    };
+    let buffer_want = write_buffer_want(&made, &settings, &log_config, replay)
+        .ok_or(overflow("a write buffer"))?;
     let least_buffers =
         buffers_bytes(&made, key_most, workers).ok_or(overflow("a write buffer"))?;
     let buffers_past = |engine: &Engine| {
@@ -3439,6 +3500,12 @@ fn derive_with(
         (metadata, cache),
         held_extents,
         shapes.iter().any(Option::is_some),
+    );
+    say_replay(
+        &mut said,
+        measured.replay.as_ref(),
+        stated.restart_budget,
+        replay,
     );
     said.add(
         "engine.workers",
@@ -4493,12 +4560,14 @@ fn say_engine(
         "engine.memtable_bytes",
         engine.memtable_bytes,
         Kind::Derived,
-        "each range's write buffer: the least, one row at the range's bounds whole \
+        "each range's write buffer, the engines' node total min(memory share, replay rate × \
+         restart budget): the least, one row at the range's bounds whole \
          (mantle_engine::memtable::hashed::entry_bytes), which the floor counts, raised toward its \
-         want, an entry of the range's largest within the bytes its log group retains, by its \
-         part of what remains past the capacity wants and the operations served, the largest \
-         whose engine holds no more past the least than that part (derive::write_buffer_want, \
-         derive::write_buffer; node.md §2.6)",
+         want, within the bytes its log group retains, by its part of what remains past the \
+         capacity wants and the operations served, the largest whose engine holds no more past \
+         the least than that part (derive::write_buffer_want, derive::write_buffer; node.md \
+         §2.6); its want is replay.bound where restart_budget_ms is stated and a replay rate \
+         measured, else an entry of the range's largest (replay.bound says which)",
     );
     said.add(
         "engine.fanout",
@@ -4514,6 +4583,89 @@ fn say_engine(
          shortest key and no value (mantle_meta::key::least_bytes), the same on every member and \
          at every open, as a trunk keeps it in its image",
     );
+}
+
+/// The restart budget, the replay rate and what they bound (node.md §2.6): the budget where
+/// stated; the last replay at open kept in the node's directory, its rate where it re-applied
+/// enough to time ([`replay_rate`]); and each range's part of what a restart replays within the
+/// budget at that rate, the engines' write buffers' want, or none where either is missing, the
+/// want then an entry of the range's largest.
+fn say_replay(
+    said: &mut Said,
+    replayed: Option<&mantle_range::Replayed>,
+    budget: Option<Duration>,
+    bound: Option<u64>,
+) {
+    if let Some(budget) = budget {
+        said.add(
+            "restart_budget_ms",
+            budget.as_millis(),
+            Kind::Stated,
+            "how long a restart may take to replay its ranges' logs, an availability target \
+             storage cannot derive (node.md §1.4; research/11 §9.4, §18 item 4)",
+        );
+    }
+    let rate = replayed.and_then(replay_rate);
+    match (replayed, rate) {
+        (Some(replayed), Some(rate)) => said.add(
+            "replay.rate",
+            rate,
+            Kind::Measured,
+            &format!(
+                "bytes a second the node re-applied at its last open of the entries its ranges' \
+                 logs held past their engines' durable indexes, {} entries of {} bytes in {} ns \
+                 from the first range's first apply to the last one's last, kept in its \
+                 directory's replay record (research/11 §9.3's ρ; mantle_range::Replayed)",
+                replayed.entries,
+                replayed.bytes,
+                replayed.nanos()
+            ),
+        ),
+        (Some(replayed), None) => said.add(
+            "replay.rate",
+            0,
+            Kind::Bound,
+            &format!(
+                "none taken: the last replay at open re-applied {} entries in {} ns, fewer than \
+                 Wilks' {} or a span the clock did not measure (derive::REPLAY_LEAST)",
+                replayed.entries,
+                replayed.nanos(),
+                REPLAY_LEAST
+            ),
+        ),
+        (None, _) => said.add(
+            "replay.rate",
+            0,
+            Kind::Bound,
+            "none measured: no replay at open large enough to time is kept in the node's \
+             directory (derive::REPLAY_LEAST)",
+        ),
+    }
+    match bound {
+        Some(bound) => said.add(
+            "replay.bound",
+            bound,
+            Kind::Derived,
+            "each range's part of the bytes a restart replays within restart_budget_ms at \
+             replay.rate, the engines' write buffers' node total at most rate × budget, each \
+             range's want this within its log group's retention (derive::replay_bound, \
+             derive::write_buffer_want; node.md §2.6; research/12 §6.2)",
+        ),
+        None => said.add(
+            "replay.bound",
+            0,
+            Kind::Bound,
+            if budget.is_none() {
+                "none: no restart_budget_ms is stated, so each range's write buffer wants an \
+                 entry of its largest within its log group's retention, the space bound \
+                 (node.md §2.6; research/11 §9.3)"
+            } else {
+                "none: no replay rate is measured, so each range's write buffer wants an entry \
+                 of its largest within its log group's retention, the space bound (node.md §2.6; \
+                 research/11 §9.3)"
+            },
+        ),
+    }
 }
 
 /// The transport's budget, `bytes`: its `floor` and the part of its `want` past it that what
@@ -4672,7 +4824,7 @@ mod tests {
         let (settings, rules) = cell(3).unwrap();
         let least = engine(4096, 1 << 30, &rules).unwrap();
         let log = log(Alignment::new(4096).unwrap(), &settings, 5).unwrap();
-        let want = write_buffer_want(&least, &settings, &log).unwrap();
+        let want = write_buffer_want(&least, &settings, &log, None).unwrap();
         assert_eq!(want as u64, settings.max_entry_bytes);
         assert_eq!(want, 561_885);
         assert!(log.group_bytes > settings.max_entry_bytes);
@@ -4725,6 +4877,92 @@ mod tests {
                 .memtable_bytes,
             want
         );
+    }
+
+    /// A replay at open gives a rate only past Wilks' 59 entries, of some bytes, over a span the
+    /// clock measured. With a restart budget stated and a rate measured, each range's write buffer
+    /// wants its part of what a restart replays within the budget, rate × budget over the ranges,
+    /// within its log group's retention; without either, an entry of its largest, and the basis
+    /// says which.
+    #[test]
+    fn a_restart_budget_and_a_measured_replay_rate_bound_the_write_buffers() {
+        let replayed = |entries: u64, bytes: u64, nanos: u64| mantle_range::Replayed {
+            entries,
+            bytes,
+            began_ns: 7,
+            ended_ns: 7 + nanos,
+        };
+        let second = 1_000_000_000;
+        assert_eq!(
+            replay_rate(&replayed(59, 1_000_000, second)),
+            Some(1_000_000)
+        );
+        assert_eq!(replay_rate(&replayed(59, 3, 2)), Some(1_500_000_000));
+        assert_eq!(replay_rate(&replayed(58, 1_000_000, second)), None);
+        assert_eq!(replay_rate(&replayed(59, 0, second)), None);
+        assert_eq!(replay_rate(&replayed(59, 1_000_000, 0)), None);
+        assert_eq!(
+            replay_bound(1_000_000, Duration::from_millis(500), 5),
+            Some(100_000)
+        );
+
+        let (settings, rules) = cell(3).unwrap();
+        let least = engine(4096, 1 << 30, &rules).unwrap();
+        let log = log(Alignment::new(4096).unwrap(), &settings, 5).unwrap();
+        let entry = usize::try_from(settings.max_entry_bytes).unwrap();
+        let retained = usize::try_from(log.group_bytes).unwrap();
+        let want = |bound| write_buffer_want(&least, &settings, &log, bound).unwrap();
+        assert_eq!(want(None), entry);
+        assert_eq!(want(Some(100_000)), 100_000);
+        assert_eq!(want(Some(1)), least.memtable_bytes);
+        assert_eq!(want(Some(u64::MAX)), retained);
+
+        let derived = |budget: Option<u64>, replay| {
+            let stated = Stated {
+                restart_budget: budget.map(Duration::from_millis),
+                ..stated(1)
+            };
+            let measured = Measured { replay, ..facts(1) };
+            derive(stated, &measured, &mut fresh).unwrap()
+        };
+        let basis = |derived: &Derived, key: &str| {
+            derived
+                .bases
+                .iter()
+                .find(|b| b.key == key)
+                .map(|b| (b.kind, b.why.clone()))
+        };
+        // Both: the bound binds, below an entry, and each range's buffer is its want whole.
+        let both = derived(Some(500), Some(replayed(59, 1_000_000, second)));
+        assert_eq!(said_bytes(&both, "restart_budget_ms"), 500);
+        assert_eq!(said_bytes(&both, "replay.rate"), 1_000_000);
+        assert_eq!(basis(&both, "replay.rate").unwrap().0, Kind::Measured);
+        assert_eq!(said_bytes(&both, "replay.bound"), 100_000);
+        assert_eq!(basis(&both, "replay.bound").unwrap().0, Kind::Derived);
+        assert_eq!(said_bytes(&both, "engine.memtable_bytes"), 100_000);
+        // No budget stated: an entry of the range's largest, as before, and the basis says so.
+        let unstated = derived(None, Some(replayed(59, 1_000_000, second)));
+        assert!(basis(&unstated, "restart_budget_ms").is_none());
+        let (kind, why) = basis(&unstated, "replay.bound").unwrap();
+        assert_eq!(kind, Kind::Bound);
+        assert!(why.contains("no restart_budget_ms is stated"), "{why}");
+        assert_eq!(
+            said_bytes(&unstated, "engine.memtable_bytes"),
+            settings.max_entry_bytes
+        );
+        // A budget and no rate, or a replay too small to time: the same, and said so.
+        for replay in [None, Some(replayed(58, 1_000_000, second))] {
+            let unmeasured = derived(Some(500), replay);
+            assert_eq!(said_bytes(&unmeasured, "restart_budget_ms"), 500);
+            assert_eq!(basis(&unmeasured, "replay.rate").unwrap().0, Kind::Bound);
+            let (kind, why) = basis(&unmeasured, "replay.bound").unwrap();
+            assert_eq!(kind, Kind::Bound);
+            assert!(why.contains("no replay rate is measured"), "{why}");
+            assert_eq!(
+                said_bytes(&unmeasured, "engine.memtable_bytes"),
+                settings.max_entry_bytes
+            );
+        }
     }
 
     /// The engine derived holds a row at the range's bounds, and a page one write unit smaller
@@ -6316,6 +6554,7 @@ mod tests {
                 })
                 .collect(),
             descriptors: 1 << 20,
+            replay: None,
         }
     }
 
@@ -6394,6 +6633,7 @@ mod tests {
             },
             ceiling: None,
             stop: None,
+            restart_budget: None,
             target: None,
             s3: None,
             range_shards: None,

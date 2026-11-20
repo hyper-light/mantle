@@ -572,6 +572,9 @@ pub(crate) struct Seen {
     pub(crate) trusted_quorum: bool,
     /// The voter the member hands its lead to, while it does (`Raft::lead_transferee`).
     pub(crate) transferee: Option<u64>,
+    /// Where the member's replay at open stands (`RangeMachine::replay`): what it re-applied of
+    /// the entries past its engine's durable index, and over what span.
+    pub(crate) replay: mantle_range::Replay,
 }
 
 impl Seen {
@@ -597,6 +600,7 @@ impl Seen {
                 .campaign_state()
                 .is_none_or(|state| state.trusted_quorum),
             transferee: raft.lead_transferee(),
+            replay: replica.machine().replay(),
         }
     }
 }

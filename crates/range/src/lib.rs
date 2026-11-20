@@ -27,7 +27,7 @@ pub use hyper_raft::proto::{
     ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
     Message, MessageType,
 };
-pub use machine::{Applied, Failure, RangeMachine};
+pub use machine::{Applied, Failure, RangeMachine, Replay, Replayed, clock_ns};
 pub use replica::{
     Output, Range, Replica, Settings, Shell, claim, largest_message, limits, open_shell,
     propose_encoded, propose_entry, ready_bytes, ready_held, refused, remove,

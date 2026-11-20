@@ -274,7 +274,8 @@ largest entry for each range with work, the engines' minimum write buffers, one 
 peer. That floor is computed from the settings, and the node refuses to start, naming the class,
 when it exceeds its allowance: the operator's ceiling, else the limit the operating system sets
 for the process, else physical memory. What remains past the floor sizes the volumes' indexes and
-the engines' resident metadata.
+the engines' resident metadata, then, past the operations the node serves at least, each range's
+write buffer past its least (§2.6, *Write buffers*).
 Independent defaults, each safe alone, add up past a laptop's memory: the chunk store's pools
 alone can keep 96 MiB per volume (audit §12.3). A laptop needs the smallest population that
 serves its work (audit §6.3), and more is granted by stating a ceiling.
@@ -720,7 +721,7 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
 | `engine.cache_bytes` | derived | the most each range's engine's page cache holds, its want: every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`), at most its store's pages. No share of the split: each engine opens with no cache (`process::engine`) and borrows its part of the operations' bytes no running operation holds, giving it back at once before one is charged it (`admit::cache_part`, `host::lend`, `Engine::lend_cache`; rule B for the caches, research/87 §4) |
-| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | the least write buffer, one row at the range's bounds whole (`memtable::hashed::entry_bytes`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row one memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so) |
+| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | each range's write buffer, its share of the engines' write buffers (§2.6): the least, one row at the range's bounds whole (`memtable::hashed::entry_bytes`), which the floor counts; raised toward its want, an entry of the range's largest (`range.max_entry_bytes`) within the bytes its log group retains, by what remains past the capacity wants and the operations served, the largest buffer whose engine holds no more than its part (`derive::write_buffer_want`, `derive::write_buffer`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row the least memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so), the same on every member and at every open since a trunk keeps its leaf's entries in its image and a snapshot carries them |
 | `engine.workers`, `memory.need_workers` | derived, measured | the maintenance workers each range's engine packs and compacts on, so an apply on the node's shard writes none of their pages: one, the least a pool holds, Little's law's need for all five ranges at once at the measured load (the leader's shard 31% busy packing and compacting inline at 4,000 to 6,000 small PUTs a second, macOS `sample`, 2026-11-19; `derive::ENGINE_WORKERS`). Their stacks are among the floor's threads and their pools among its engines (`derive::workers_bytes`); `memory.need_workers` is `memory.need` with them, and a node whose allowance holds less runs none (`derive::derive`): a founder on CI's 7 GiB macOS runner holds no five past its need. `memory.need` stays the need without them, at which every want is whole |
 | `transport_bytes` | derived | the transport's floor (`transport.floor`): what it holds besides QUIC's windows, the connections' state at the most connections it holds (`bounds::connections_state`) and the receive ring's growth at its most (`bounds::ring_growth`) among it, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`); and past it its want whole (`transport.want`, each share at a receive chunk, `bounds::chunked_transport`) where what remains past the capacity wants and the operations the node serves holds those operations' connections at a chunk, every operation more costing its client's windows at a chunk; short of it, the operations are those served and its budget is its floor and what remains, each share's window past the initial window by it over the shares (`bounds::limits`) |
 | `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
@@ -1500,7 +1501,7 @@ cancellation, never by a timeout that leaves the work running.
 | A device's read depth | where throughput stops growing | calibration | chunk-store.md §7 |
 | Background shares on a device | the largest share that keeps measured foreground latency within its bound; raised while blocks have lost redundancy | foreground latency under cleaning, scrubbing and repair | 11 §18 item 7; 04 R3 item 4; 10 §1 item 10 |
 | The log file's size | twice the live bytes: append rate times the engine's durable lag | both, measured by the log | raft-log.md §5 |
-| Engine write buffers, node total | `min(memory share, replay rate × restart budget)` | replay rate at each open | 12 §6.2, §6.6 |
+| Engine write buffers, node total | `min(memory share, replay rate × restart budget)`; with no restart budget stated, the space bound, each range's log group's retention; each range an entry of its largest at most, within its part of what remains past the capacity wants and the operations served (*Write buffers*, below) | replay rate at each open (*open*: not measured) | 12 §6.2, §6.6; 11 §9.3 |
 | A range's `max_entry_bytes` | the largest command a gateway sends: a completion of 10,000 parts, 561,804 bytes | `mantle_meta::wire::largest_entry_bytes` | replica.md §7; audit §16.5 |
 | Sessions a range holds | the gateway incarnations that may hold a live session (§5.3) | the cell's membership and its gateways' restarts | replica.md §1 |
 | A PUT's block window `w` | `w = ⌈R·T/B⌉`: the rate the upload is entitled to, `R = min(body rate, the principal's fair share over the authorities it uses)`, times the block chain's latency over a block's bytes, capped by memory; recomputed at each block | the body's arrival rate, the principal's share (§2.7), each chain's latency | gateway.md §2; audit §16.3; research/27 §6.1, D7 |
@@ -1513,6 +1514,48 @@ cancellation, never by a timeout that leaves the work running.
 
 Every row changes as its inputs are measured again. None is a constant in the code, and each
 appears in constants.md as derived, with its model.
+
+*Write buffers* (2026-11-20, `derive::write_buffer_want`, `derive::write_buffer`). The engines'
+write buffers, node total, are `min(memory share, replay rate × restart budget)`, each range's the
+same part of it, as built:
+
+- **The restart budget** is the operator's to state (§1.4; research/11 §9.4 and §18 item 4, an
+  availability target with no model storage can supply). None is stated today.
+- **The replay rate** is timed at each open in the model (research/11's `ρ`) and is not measured
+  yet: hyper-log's recovery counts the frames it replays, and the time a range's engine takes to
+  apply them past its checkpoint is where it would be measured. *Open.*
+- **So the space bound binds**, as research/11 §9.3 checkpoints at the smaller of the space and
+  recovery-time bounds: a range's log group retains two cadences and a `Ready` past its engine's
+  checkpoint (`log.group_bytes`) and refuses a write past them until the node asks that
+  checkpoint (§6.2), so a restart replays at most that much of a range, and a memtable past it
+  fills only where its rows take more bytes than the entries that wrote them. It does not bind
+  today: 18,671,880 bytes on a cell of three, past the want below.
+- **The want** is an entry of the range's largest, 561,885 bytes (`range.max_entry_bytes`), so an
+  entry's writes apply within one memtable rather than rotating it inline past its bound
+  (`Stored::apply_now`): at the least, one row at the bounds, 20,840 bytes, an entry of 1-byte
+  PUTs carried about 187 commands and nearly every one overflowed its memtable, each rotation a
+  packing on the range's one worker, and the node's shard waited on rotations 12% to 57% of its
+  time (macOS `sample`, 2026-11-20). No more than the entry: each byte of a memtable is charged
+  hundreds in its worker's builders, the densest rows' count at the longest key's statement
+  (`TrunkConfig::built_most`, `branch::builder_bytes`), 174,508,244 bytes a range past the least
+  at the want, so a larger buffer would take from the operations what no measurement has yet
+  shown it gives back.
+- **The memory share** comes in rule D's order (research/87 §4) after the capacity wants and the
+  operations served, before the transport's growth and the operations past those: a write buffer
+  is held whole once written and gives its rows back only by a packing, so it takes a share where
+  a cache borrows. Each range's is its want whole while what remains holds every range's, else the
+  same part each, the largest buffer whose engine holds no more past the least. The floor counts
+  the least (§1.4) and the need does not count the share, as with the transport's growth: a node
+  given only its need runs the least buffers.
+- **The leaves stay the least buffer's**: a leaf holding every row the least memtable gives it, on
+  every member and at every open alike, since a trunk keeps its leaf's entries in its image and a
+  snapshot carries them to a follower whose memory may differ. A packing's builder takes every
+  row of the larger memtable (`TrunkConfig::built_most`, as the engine already bounds it).
+
+On a founder of the ladder's cell on the Mac Studio's 96 GiB and 32 cores (`derive::tests`, macOS
+aarch64), each range's buffer is its want whole, 561,885 bytes, its five engines holding
+872,541,220 bytes past the least, and the operations 61,897 where they were 62,502; on a 16 GiB
+host also whole, the operations 10,151 where they were 10,999.
 
 ### 2.7 Scheduling: no upload dominates, every upload as fast as it can be
 

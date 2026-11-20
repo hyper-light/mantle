@@ -969,9 +969,12 @@ pub struct Engine {
 ///   range's bounds (`mantle_engine::branch::least_page`), and extents of the least pages the
 ///   store takes, as many as the share holds;
 /// - the least write buffer, one row at the bounds whole
-///   (`mantle_engine::memtable::hashed::entry_bytes`);
-/// - SplinterDB's fanout, and a leaf holding every row one memtable gives it, the most a
-///   memtable holds being rows of the shortest key and no value (`key::least_bytes`).
+///   (`mantle_engine::memtable::hashed::entry_bytes`), which [`write_buffer`] raises within its
+///   share of memory;
+/// - SplinterDB's fanout, and a leaf holding every row the least memtable gives it, the most a
+///   memtable holds being rows of the shortest key and no value (`key::least_bytes`): the same on
+///   every member of the cell and at every open, as a trunk keeps the leaf's entries it was made
+///   with in its image (`Trunk::load`) and a snapshot carries them to its follower.
 pub fn engine(block: usize, share: u64, rules: &Rules) -> Result<Engine, DeriveError> {
     let (key, value) = (rules.max_key_bytes, rules.max_value_bytes);
     let page_size = mantle_engine::branch::least_page(block, key, value)
@@ -987,12 +990,7 @@ pub fn engine(block: usize, share: u64, rules: &Rules) -> Result<Engine, DeriveE
     if max_extents < 2 {
         return Err(DeriveError::Extents { share, extent });
     }
-    let least = mantle_engine::memtable::hashed::entry_bytes(key::least_bytes(), 0)
-        .ok_or(DeriveError::Overflow("a memtable's entry"))?;
-    let leaf_entries = memtable_bytes
-        .checked_div(least)
-        .and_then(|rows| u64::try_from(rows).ok())
-        .ok_or(DeriveError::Overflow("a leaf's entries"))?;
+    let leaf_entries = rows_of(memtable_bytes).ok_or(DeriveError::Overflow("a leaf's entries"))?;
     Ok(Engine {
         store: StoreConfig {
             page_size,
@@ -1005,6 +1003,94 @@ pub fn engine(block: usize, share: u64, rules: &Rules) -> Result<Engine, DeriveE
             leaf_entries,
         },
     })
+}
+
+/// The most rows a memtable of `bytes` holds: rows of the shortest key and no value
+/// (`key::least_bytes`), each its head with them (`mantle_engine::memtable::hashed::entry_bytes`).
+fn rows_of(bytes: usize) -> Option<u64> {
+    let least = mantle_engine::memtable::hashed::entry_bytes(key::least_bytes(), 0)?;
+    u64::try_from(bytes.checked_div(least)?).ok()
+}
+
+/// What each range's engine holds beside its resident metadata and its cache, with `workers`
+/// maintenance workers, at keys of at most `key` bytes: its configured buffers, two memtables'
+/// arenas, its store's page buffers and its allocator's at no extent
+/// (`mantle_engine::shard_db::bounded_bytes`), and what its workers hold ([`workers_bytes`]).
+pub fn buffers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64> {
+    mantle_engine::shard_db::bounded_bytes(
+        &StoreConfig {
+            max_extents: 0,
+            ..engine.store
+        },
+        engine.memtable_bytes,
+    )?
+    .checked_add(workers_bytes(engine, key, workers)?)
+}
+
+/// The write buffer each range's engine wants, `least`'s raised to a node's share of the engines'
+/// write buffers, `min(memory share, replay rate × restart budget)` (node.md §2.6; research/12
+/// §6.2, §6.6), in bytes of its memtable:
+///
+/// - an entry of the range's largest (`range.max_entry_bytes`), so an entry's writes apply within
+///   one memtable rather than rotating it inline past its bound (`Stored::apply_now`), and never
+///   less than the least, a row at the bounds whole ([`engine`]);
+/// - at most the bytes of log its group retains past its engine's checkpoint
+///   (`LogConfig::group_bytes`, two cadences and a `Ready`), what a restart replays of the range
+///   at most. No restart budget is stated (node.md §1.4) and no replay rate measured (research/11
+///   §18 item 4), so the recovery-time bound is open and the space bound binds, as research/11
+///   §9.3 triggers a checkpoint at the smaller of the two: the log refuses a write past the
+///   retention (`Backlog`) and the node asks the engine's checkpoint (node.md §6.2), so a memtable
+///   past it fills only where its rows take more bytes than the entries that wrote them;
+/// - at most 4 GiB, past which a memtable's 32-bit offsets refuse it (`HashMem::new`).
+///
+/// No more than the entry: each byte of a memtable is charged hundreds of bytes in its workers'
+/// builders, the densest rows' count at the longest key's (`TrunkConfig::built_most`,
+/// `mantle_engine::branch::builder_bytes`), so a buffer past it takes from the operations what
+/// the measurements have not yet shown it gives back.
+pub fn write_buffer_want(least: &Engine, settings: &Settings, log: &LogConfig) -> Option<usize> {
+    let entry = usize::try_from(settings.max_entry_bytes).ok()?;
+    let retained = usize::try_from(log.group_bytes).unwrap_or(usize::MAX);
+    let offsets = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
+    Some(entry.min(retained).min(offsets).max(least.memtable_bytes))
+}
+
+/// `least` with the largest write buffer of at most `want` bytes whose buffers
+/// ([`buffers_bytes`]) take at most `part` bytes past `least`'s, its leaves as `least`'s
+/// ([`engine`]): found by halving the bytes between the least and `want`, at most a step a bit of
+/// a `usize`, as what a buffer takes grows with its bytes. None past what a `u64` counts.
+pub fn write_buffer(
+    least: Engine,
+    want: usize,
+    part: u64,
+    key: usize,
+    workers: usize,
+) -> Option<Engine> {
+    let at = |memtable_bytes| Engine {
+        memtable_bytes,
+        ..least
+    };
+    let base = buffers_bytes(&least, key, workers)?;
+    let fits = |bytes: usize| -> Option<bool> {
+        let held = buffers_bytes(&at(bytes), key, workers)?;
+        Some(held.checked_sub(base).is_some_and(|past| past <= part))
+    };
+    let (mut fit, mut past) = (least.memtable_bytes, want.max(least.memtable_bytes));
+    if fits(past)? {
+        return Some(at(past));
+    }
+    for _ in 0..usize::BITS {
+        let span = past.checked_sub(fit)?;
+        if span <= 1 {
+            break;
+        }
+        let mid = fit.checked_add(span.checked_div(2)?)?;
+        if fits(mid)? {
+            fit = mid;
+        } else {
+            past = mid;
+        }
+    }
+    Some(at(fit))
 }
 
 /// What `engine`'s resident metadata takes at its device's full share: each extent its share
@@ -1110,20 +1196,21 @@ const SORT_COUNTS_BYTES: u64 = 8 * 256 * 4;
 /// filter (`mantle_engine::shard_db::pooled_bytes`, a packing's one builder within them); and a
 /// packing's buffers for each worker and the active memtable, which keeps the copy of its arena a
 /// worker sorts (`SortPack`): an arena of the memtable's bytes, and the sorter's lists, the kept
-/// keys and a cut at each of the root's pivots for its entries, at most a leaf's
-/// (`TrunkConfig::leaf_entries`, every row a memtable holds). None for none: without workers a
-/// memtable keeps no copy.
+/// keys and a cut at each of the root's pivots for its entries, every row its memtable holds
+/// ([`rows_of`]), a packing's builder as many (`TrunkConfig::built_most`). None for none: without
+/// workers a memtable keeps no copy.
 pub fn workers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64> {
     if workers == 0 {
         return Some(0);
     }
     let trunk = &engine.trunk;
+    let rows = rows_of(engine.memtable_bytes)?;
     let pooled = mantle_engine::shard_db::pooled_bytes(
         &engine.store,
         trunk.inputs_most(),
         2,
         key,
-        trunk.built_most(trunk.leaf_entries),
+        trunk.built_most(rows),
         1,
         mantle_engine::store::RANGE_FILTER_BITS,
     )?;
@@ -1132,7 +1219,7 @@ pub fn workers_bytes(engine: &Engine, key: usize, workers: usize) -> Option<u64>
         .checked_mul(u64::try_from(key.checked_add(size_of::<Vec<u8>>())?).ok()?)?;
     let packing = u64::try_from(engine.memtable_bytes)
         .ok()?
-        .checked_add(trunk.leaf_entries.checked_mul(SORT_ENTRY_BYTES)?)?
+        .checked_add(rows.checked_mul(SORT_ENTRY_BYTES)?)?
         .checked_add(SORT_COUNTS_BYTES)?
         .checked_add(cuts)?;
     let workers = u64::try_from(workers).ok()?;
@@ -2814,17 +2901,9 @@ fn derive_with(
     let all_workers = workers
         .checked_mul(ranges)
         .ok_or(overflow("the engines' workers"))?;
-    let engines_bytes = mantle_engine::shard_db::bounded_bytes(
-        &StoreConfig {
-            max_extents: 0,
-            ..made.store
-        },
-        made.memtable_bytes,
-    )
-    .zip(workers_bytes(&made, rules.max_key_bytes, workers))
-    .and_then(|(each, held)| each.checked_add(held))
-    .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
-    .ok_or(overflow("the engines' buffers"))?;
+    let engines_bytes = buffers_bytes(&made, rules.max_key_bytes, workers)
+        .and_then(|each| each.checked_mul(u64::try_from(ranges).ok()?))
+        .ok_or(overflow("the engines' buffers"))?;
     // A device's issuer, one a device the OS names, started by its first volume.
     let depths: Vec<usize> = devices_of(&running, issuer_depth)
         .into_iter()
@@ -3021,12 +3100,13 @@ fn derive_with(
     };
     // Rule D's order (research/87 §4): (1) the capacity wants, whole while the memory past the
     // floor holds them; (2) the operations the node serves at least ([`served`]), the one the
-    // floor holds and the rest at what each adds; (3) the transport's growth past its floor to a
-    // receive chunk each share for the connections those operations open, whole while what
-    // remains holds it; (4) every operation more that what remains then holds, each with its
-    // client's windows at a receive chunk. No page cache takes a share: each engine's borrows the
-    // operations' idle bytes (`admit::cache_part`, `node::host::lend`), at most its want,
-    // `engine.cache_bytes`.
+    // floor holds and the rest at what each adds; (2b) each range's write buffer past its least,
+    // whole while what remains holds them all, else each the same part; (3) the transport's
+    // growth past its floor to a receive chunk each share for the connections those operations
+    // open, whole while what remains holds it; (4) every operation more that what remains then
+    // holds, each with its client's windows at a receive chunk. No page cache takes a share: each
+    // engine's borrows the operations' idle bytes (`admit::cache_part`, `node::host::lend`), at
+    // most its want, `engine.cache_bytes`.
     let (each, floor_one, one) = if hosts { one_at(initial)? } else { (0, 0, 0) };
     let base = if hosts {
         floor_one
@@ -3055,10 +3135,46 @@ fn derive_with(
     } else {
         0
     };
-    let transport_room = allowed
+    let room = allowed
         .saturating_sub(base)
         .saturating_sub(wanted)
         .saturating_sub(served_past);
+    // (2b): a write buffer is held whole once written, its rows given back only by a packing, so
+    // it takes a share where a cache borrows. It comes before the transport's growth and the
+    // operations past those served: under small PUTs a range at its least buffer rotated its
+    // memtable at nearly every entry, each rotation a packing on its one worker, and the node's
+    // shard waited on rotations 12% to 57% of its time (macOS `sample`, 2026-11-20). Each
+    // range's the same, its want ([`write_buffer_want`]) and its part of what remains, the
+    // largest buffer whose engine holds no more past the least ([`write_buffer`]); what they take
+    // is what the engines hold past the least at it, which the operations and the metadata's
+    // spare then leave.
+    let key_most = rules.max_key_bytes;
+    let ranges_count = u64::try_from(ranges).map_err(|_| overflow("the ranges"))?;
+    let buffer_want =
+        write_buffer_want(&made, &settings, &log_config).ok_or(overflow("a write buffer"))?;
+    let least_buffers =
+        buffers_bytes(&made, key_most, workers).ok_or(overflow("a write buffer"))?;
+    let buffers_past = |engine: &Engine| {
+        buffers_bytes(engine, key_most, workers)
+            .and_then(|held| held.checked_sub(least_buffers))
+            .ok_or(overflow("a write buffer"))
+    };
+    let buffers_wanted = buffers_past(&Engine {
+        memtable_bytes: buffer_want,
+        ..made
+    })?;
+    let buffers_part = buffers_wanted
+        .checked_mul(ranges_count)
+        .ok_or(overflow("the write buffers"))?
+        .min(room)
+        .checked_div(ranges_count)
+        .unwrap_or(0);
+    let made = write_buffer(made, buffer_want, buffers_part, key_most, workers)
+        .ok_or(overflow("a write buffer"))?;
+    let buffers_taken = buffers_past(&made)?
+        .checked_mul(ranges_count)
+        .ok_or(overflow("the write buffers"))?;
+    let transport_room = room.saturating_sub(buffers_taken);
     // The transport's growth for the connections the served operations open, each share from
     // QUIC's initial window to a receive chunk: its windows and the pool's chunks in its budget,
     // and what QUIC keeps to send beside it, at most a peer's window.
@@ -3091,6 +3207,7 @@ fn derive_with(
         let slack = allowed
             .saturating_sub(floor_one)
             .saturating_sub(wanted)
+            .saturating_sub(buffers_taken)
             .saturating_sub(part);
         let share = most_charged(&charges)
             .checked_add(each)
@@ -3195,7 +3312,12 @@ fn derive_with(
     // the rows no volume bounds, an empty object's, a delete marker's, an upload's in progress.
     let spare = u64::try_from(ranges)
         .ok()
-        .and_then(|ranges| remaining.checked_sub(taken)?.checked_div(ranges))
+        .and_then(|ranges| {
+            remaining
+                .checked_sub(taken)?
+                .saturating_sub(buffers_taken)
+                .checked_div(ranges)
+        })
         .unwrap_or(0);
     let most = engine_wants(&made).ok_or(overflow("an engine's metadata"))?;
     let metadata = metadata
@@ -4308,8 +4430,12 @@ fn say_engine(
         "engine.memtable_bytes",
         engine.memtable_bytes,
         Kind::Derived,
-        "the least write buffer, one row at the range's bounds whole \
-         (mantle_engine::memtable::hashed::entry_bytes)",
+        "each range's write buffer: the least, one row at the range's bounds whole \
+         (mantle_engine::memtable::hashed::entry_bytes), which the floor counts, raised toward its \
+         want, an entry of the range's largest within the bytes its log group retains, by its \
+         part of what remains past the capacity wants and the operations served, the largest \
+         whose engine holds no more past the least than that part (derive::write_buffer_want, \
+         derive::write_buffer; node.md §2.6)",
     );
     said.add(
         "engine.fanout",
@@ -4321,8 +4447,9 @@ fn say_engine(
         "engine.leaf_entries",
         engine.trunk.leaf_entries,
         Kind::Derived,
-        "every row one memtable gives a leaf, the most a memtable holds being rows of the \
-         shortest key and no value (mantle_meta::key::least_bytes)",
+        "every row the least memtable gives a leaf, the most a memtable holds being rows of the \
+         shortest key and no value (mantle_meta::key::least_bytes), the same on every member and \
+         at every open, as a trunk keeps it in its image",
     );
 }
 
@@ -4469,6 +4596,59 @@ mod tests {
         assert!(
             frame <= bound,
             "the append of the largest entry, a frame of {frame} bytes, past the bound {bound}"
+        );
+    }
+
+    /// Each range's write buffer is the largest its part of memory holds past its least: none past
+    /// the least for no part, its want whole for the bytes its want holds, and between them a
+    /// buffer a byte larger than the one found holds more than its part. Its leaves are the least
+    /// buffer's at any size, so every member of a cell and every open keep one trunk's shape. The
+    /// want is an entry of the range's largest, 561,885 bytes, within its log group's retention.
+    #[test]
+    fn a_ranges_write_buffer_is_the_largest_its_part_of_memory_holds() {
+        let (settings, rules) = cell(3).unwrap();
+        let least = engine(4096, 1 << 30, &rules).unwrap();
+        let log = log(Alignment::new(4096).unwrap(), &settings, 5).unwrap();
+        let want = write_buffer_want(&least, &settings, &log).unwrap();
+        assert_eq!(want as u64, settings.max_entry_bytes);
+        assert_eq!(want, 561_885);
+        assert!(log.group_bytes > settings.max_entry_bytes);
+        let key = rules.max_key_bytes;
+        let held = |e: &Engine| buffers_bytes(e, key, ENGINE_WORKERS).unwrap();
+        let base = held(&least);
+        let whole = held(&Engine {
+            memtable_bytes: want,
+            ..least
+        }) - base;
+        // A worker's builders take the most bytes past the least: their packing's entries at the
+        // densest rows, each at the longest key's statement.
+        assert_eq!(whole, 174_508_244);
+        for part in [0, 1, whole / 3, whole / 2, whole - 1, whole, u64::MAX] {
+            let e = write_buffer(least, want, part, key, ENGINE_WORKERS).unwrap();
+            assert_eq!(e.trunk, least.trunk);
+            assert_eq!(e.store, least.store);
+            assert!(e.memtable_bytes >= least.memtable_bytes);
+            assert!(e.memtable_bytes <= want);
+            assert!(held(&e) - base <= part, "{part}");
+            if e.memtable_bytes < want {
+                let more = Engine {
+                    memtable_bytes: e.memtable_bytes + 1,
+                    ..e
+                };
+                assert!(held(&more) - base > part, "{part}");
+            }
+        }
+        assert_eq!(
+            write_buffer(least, want, 0, key, ENGINE_WORKERS)
+                .unwrap()
+                .memtable_bytes,
+            least.memtable_bytes
+        );
+        assert_eq!(
+            write_buffer(least, want, whole, key, ENGINE_WORKERS)
+                .unwrap()
+                .memtable_bytes,
+            want
         );
     }
 
@@ -5047,6 +5227,38 @@ mod tests {
         }
     }
 
+    /// The engine of `c` at its least write buffer, a row at the bounds whole, as the floor counts
+    /// it ([`engine`]).
+    fn engine_least(c: &ProcessConfig) -> Engine {
+        let made = engine(4096, 1 << 30, &c.rules).unwrap();
+        Engine {
+            store: c.store,
+            memtable_bytes: made.memtable_bytes,
+            trunk: made.trunk,
+        }
+    }
+
+    /// What each range's engine of `derived` holds past what it holds at its least write buffer, a
+    /// row at the bounds whole ([`write_buffer`], [`buffers_bytes`]).
+    fn buffers_past(derived: &Derived) -> u64 {
+        let c = &derived.config;
+        let (key, workers) = (c.rules.max_key_bytes, c.engine_workers);
+        let at = Engine {
+            store: c.store,
+            memtable_bytes: c.memtable_bytes,
+            trunk: c.trunk,
+        };
+        let least = Engine {
+            memtable_bytes: mantle_engine::memtable::hashed::entry_bytes(
+                key,
+                c.rules.max_value_bytes,
+            )
+            .unwrap(),
+            ..at
+        };
+        buffers_bytes(&at, key, workers).unwrap() - buffers_bytes(&least, key, workers).unwrap()
+    }
+
     /// A founder of the ladder's cell (three founders, each a 32 GiB volume and its S3 endpoint)
     /// on the Mac Studio's 96 GiB and 32 cores gives its transport its want whole: every share,
     /// each operation's client's among them, at a receive chunk, so each datagram is cut from a
@@ -5054,9 +5266,12 @@ mod tests {
     /// the transport's floor on macOS; the need is 36ad012b's, which holds the capacity wants and
     /// the operations served, and the piece the node's task reads every native body into, which
     /// step 6 counts in the transport's floor (`node::PIECE`, node.md §2.9 step 6c). What its
-    /// operations hold beside their charges is counted at their count: it runs 62,502 on macOS and
-    /// 62,354 on Linux ([`runs`]), and every byte past its capacity wants is its operations', so
-    /// each engine's metadata is its want. Charged the difference from one operation to two, it
+    /// operations hold beside their charges is counted at their count: it ran 62,502 on macOS and
+    /// 62,354 on Linux ([`runs`]) with each range's write buffer at its least, and runs 61,897 on
+    /// macOS with each at an entry of the range's largest, 561,885 bytes, its five engines holding
+    /// 872,541,220 bytes past their least buffers ([`write_buffer`]); every byte past its capacity
+    /// wants and those is its operations', so each engine's metadata is its want. Charged the
+    /// difference from one operation to two, it
     /// ran 59,412 and 54,591 (c1589e30): each of the 58,391 and 53,570 past the receive batch's
     /// 1,024 trains was charged a train no batch holds, 65,592 bytes on macOS and 197,752 on Linux
     /// ([`a_receive_batch_holds_a_train_a_client_to_its_cap_and_no_more`]), and each past the
@@ -5111,16 +5326,30 @@ mod tests {
             memtable_bytes: c.memtable_bytes,
             trunk: c.trunk,
         };
-        // What remains past the floor is the capacity wants whole and nothing more: the
-        // operations took the rest, so no engine's metadata takes what no want does.
+        // Each range's write buffer is its want whole, an entry of the range's largest, its leaves
+        // the least buffer's.
+        assert_eq!(
+            c.memtable_bytes as u64,
+            said_bytes(&derived, "range.max_entry_bytes")
+        );
+        assert_eq!(c.memtable_bytes, 561_885);
+        assert_eq!(c.trunk, engine_least(c).trunk);
+        // What remains past the floor is the capacity wants and the write buffers past their
+        // least whole, and nothing more: the operations took the rest, so no engine's metadata
+        // takes what no want does.
         let objects = said_bytes(&derived, "engine.objects");
         let metadata = engine_wants_for(&engine, objects).unwrap();
         assert_eq!(said_bytes(&derived, "engine.metadata_bytes"), metadata);
+        assert_eq!(buffers_past(&derived), 174_508_244);
         assert_eq!(
             said_bytes(&derived, "memory.remaining"),
-            said_bytes(&derived, "volume.1.index_bytes") + 5 * metadata
+            said_bytes(&derived, "volume.1.index_bytes")
+                + 5 * metadata
+                + 5 * buffers_past(&derived)
         );
-        let each = workers_bytes(&engine, c.rules.max_key_bytes, ENGINE_WORKERS).unwrap();
+        // Each worker as the floor counts it, at the least buffer.
+        let least = engine_least(c);
+        let each = workers_bytes(&least, c.rules.max_key_bytes, ENGINE_WORKERS).unwrap();
         assert!((80_000_000..100_000_000).contains(&each), "{each}");
         assert_eq!(
             said_bytes(&derived, "memory.need_workers"),
@@ -6925,9 +7154,11 @@ mod tests {
             index_wants(align, 8 << 30).unwrap()
         );
         assert_eq!(derived.config.volumes[0].config.max_fragments, fragments);
-        // The engines take the rest, each its metadata's want and an equal part of what no want
-        // took; the caches take no share.
-        let given = bytes("volume.1.index_bytes") + 5 * bytes("engine.metadata_bytes");
+        // The engines take the rest, each its write buffer past its least, its metadata's want
+        // and an equal part of what no want took; the caches take no share.
+        let given = bytes("volume.1.index_bytes")
+            + 5 * bytes("engine.metadata_bytes")
+            + 5 * buffers_past(&derived);
         let remaining = bytes("memory.remaining");
         assert!(given <= remaining && remaining - given < 5);
     }
@@ -6937,6 +7168,9 @@ mod tests {
     /// want whole, every operation's client's windows at a receive chunk, and the operations
     /// everything past those, no more on the smaller host: on 16 GiB 10,999 on macOS and 10,860 on
     /// Linux ([`runs`]), 1.77 GB past the transport's floor, and each engine's metadata its want.
+    /// Each range's write buffer at an entry of the range's largest takes 872,541,220 bytes past
+    /// the least before the transport and the operations past those served ([`write_buffer`]):
+    /// 10,151 on macOS, and on Linux a range as far below its 10,860, not yet run there.
     /// Charged the difference from one operation to two, it ran 10,396 and 9,264 (c1589e30):
     /// each of the 9,375 and 8,243 past the receive batch's 1,024 trains was charged a train no
     /// batch holds, 65,592 bytes on macOS and 197,752 on Linux
@@ -6991,7 +7225,7 @@ mod tests {
         assert_eq!(roomy_bytes - roomy_floor, roomy_want);
         let operations = said_bytes(&small, "gateway.objects");
         assert!(
-            runs(10_350..11_350, 10_500..11_500).contains(&operations),
+            runs(9_500..10_500, 9_650..10_650).contains(&operations),
             "{operations}"
         );
         assert!(operations <= said_bytes(&roomy, "gateway.objects"));

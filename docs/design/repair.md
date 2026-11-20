@@ -215,6 +215,26 @@ wake. Chosen over every domain not written off instead, as first built, a sleepi
 cell as wide as its blocks left too few volumes to place a block on, and every write was refused
 until it woke; the E2E test of a sleeping node found exactly that.
 
+*As built (2026-11-20).* A new block's chunks (`place::offer_new`) are offered the volumes that take
+chunks, as above, and after them the active volumes of nodes held away, asked only where the first
+are too few for the block or refuse it. A put's layout is chosen as it starts and its blocks are
+placed as they fill, so a put begun while the cell saw three nodes and placed once the root range
+held one away needed three volumes where two took chunks: offered only those, it failed `Unplaced`,
+`503 SlowDown`, before any chunk went (CI gates run 44667404838: three end-to-end tests on three
+platforms, a cell of three healthy under light load; host test
+`a_block_placed_while_one_of_three_nodes_is_held_away_asks_its_volume_last`). A node is held away on
+one node's judgment (§2.1), an NFD-E detector's suspicion or a connection ended, and a detector
+configured from measurement bounds its mistakes but never rules them out, a stall longer than the
+heartbeats' period breaking its model (research/81 [11] §5.1, §8.1.2): a loaded host holds a peer
+only slow away, as a GET reads a suspected place last rather than taking it for lost (gateway.md §3,
+amended 2026-11-19). The away node's volume is still passed over wherever another takes the chunk,
+so nothing waits on a sleeping machine that need not; where none other is left, asking it costs a
+refusal at once for a node truly gone, no connection to it (`Refusal::NotConnected`,
+`Taken::Refused`), and the block fails `Unplaced` as before, a cause that may pass
+(`a_block_whose_node_held_away_is_gone_fails_unplaced_at_once`); a node alive takes its chunk.
+Repair's rebuilds (`place::offer`) still take only volumes that take chunks: a rebuild has its
+block's other places to wait beside.
+
 ## 6. Failures of several machines
 
 - **Metadata.** Each range is a Raft group of `2f + 1` voters (architecture §11); while a quorum of

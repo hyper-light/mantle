@@ -6900,11 +6900,13 @@ impl Host {
         };
         let asked = match &request {
             put::Request::Place { block, .. } => {
-                // Only volumes that take chunks now, their nodes seen, weighted by measured
-                // availability (docs/design/repair.md §5), at the turn's wall clock.
+                // The volumes that take chunks now, their nodes seen, weighted by measured
+                // availability (docs/design/repair.md §5), at the turn's wall clock; then those of
+                // nodes held away, asked only where the first are too few or refuse
+                // (`place::offer_new`).
                 let Ok(volumes) = node
                     .table()
-                    .map(|t| place::offer(*block, &t.facts, &[], false, wall))
+                    .map(|t| place::offer_new(*block, &t.facts, wall))
                 else {
                     self.fail_job(node, at, Status::Failed)?;
                     return Ok(None);
@@ -13666,6 +13668,93 @@ pub(super) mod tests {
         host.step(&mut stub).unwrap();
         assert!(host.idle(), "the job ended once its answer was read");
         assert_eq!(answers.try_recv().unwrap(), Some(door::Answer::End));
+    }
+
+    /// A native put of one byte, its blocks three copies, through a host whose node's table holds
+    /// three volumes in three domains with the third's node held away, each chunk put answered by
+    /// `answer`: the put's answer, and how many chunk puts it asked.
+    fn put_with_a_node_held_away(answer: fn(&JobAsk) -> Outcome) -> (door::Answer, u64) {
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let (body, pieces) = hyper_rt::sync::channel(door::Depth::FIRST).unwrap();
+        let (reply, mut answers) = hyper_rt::sync::channel(door::Replying::FIRST_ANSWERS).unwrap();
+        let (mut job, _, _) = local_job(Work::Put(native_put(1)), 0, 0);
+        job.door = Door::Local(Box::new(Local {
+            body: Some(Pieces {
+                pieces,
+                ended: None,
+                dry: false,
+            }),
+            reply,
+            pending: VecDeque::new(),
+            ready: false,
+            mark: None,
+        }));
+        host.push(job, 0);
+        let mut table = Table::volumes(1);
+        table.facts.last_mut().unwrap().presence.present = false;
+        let mut stub = Stub {
+            answer,
+            table: Some(table),
+            ..Stub::chunks()
+        };
+        let paced = door::Paced {
+            sent: std::time::Instant::now(),
+            delivered_ns: None,
+        };
+        let mut pieces = VecDeque::from([
+            Piece::Bytes(Bytes::from_static(b"x"), paced),
+            Piece::End(None),
+        ]);
+        let mut ready = false;
+        for _ in 0..64 {
+            match answers.try_recv().unwrap() {
+                Some(door::Answer::Ready) => ready = true,
+                Some(answer) => return (answer, stub.asked),
+                None => {}
+            }
+            if ready
+                && let Some(piece) = pieces.pop_front()
+                && let Err(SyncError::Full(piece)) = body.try_send(piece)
+            {
+                pieces.push_front(piece);
+            }
+            host.step(&mut stub).unwrap();
+        }
+        panic!("the put was never answered");
+    }
+
+    /// A put whose layout was chosen while the cell saw its three nodes, its block placed once the
+    /// root range held one of them away, as its leader's detectors hold a peer only slow on a
+    /// loaded host (repair.md §2.1): placed only around the away node, the block was offered two
+    /// volumes for its three copies and failed `Unplaced` before any chunk went, `503 SlowDown`
+    /// (CI gates run 44667404838: `s3.rs`'s `at-once/6` on linux-x86_64-2cpu-busy, `repair.rs`'s
+    /// `before-4` on linux-aarch64, `serve.rs`'s object 2 on windows-aarch64). Offered the away
+    /// node's volume after the two seen (`place::offer_new`), each copy is asked of a volume of
+    /// its own, the away one among them; here every volume refuses its copy full, so the put is
+    /// answered `InsufficientStorage` only where all three were asked.
+    #[test]
+    fn a_block_placed_while_one_of_three_nodes_is_held_away_asks_its_volume_last() {
+        let (answer, asked) = put_with_a_node_held_away(|_| {
+            Outcome::Chunk(ChunkOutcome::Refused(chunk::Status::Full))
+        });
+        let door::Answer::Head(reply) = answer else {
+            panic!("the put was answered {answer:?}");
+        };
+        assert_eq!(reply.status, Status::InsufficientStorage);
+        assert_eq!(asked, 3, "each copy asked of a volume of its own");
+    }
+
+    /// Where the node held away is truly gone, its copy is refused at once, no connection to it,
+    /// and the block, no volume left, fails `Unplaced`, `503 SlowDown`, as it did before the away
+    /// node's volume was offered: a cell short of volumes now, which a node back or a joiner mends.
+    #[test]
+    fn a_block_whose_node_held_away_is_gone_fails_unplaced_at_once() {
+        let (answer, asked) = put_with_a_node_held_away(|ask| match ask {
+            JobAsk::Put { at: 3, .. } => Outcome::Chunk(ChunkOutcome::Lost(Refusal::NotConnected)),
+            _ => Outcome::Chunk(ChunkOutcome::Stored),
+        });
+        assert_eq!(answer, door::Answer::Slowed(door::Slowed::Unplaced));
+        assert_eq!(asked, 3);
     }
 
     /// Every outcome that says no room now, at the volume or in the transport toward it, here or at

@@ -557,6 +557,28 @@ none, and every page a get or a one-row lookup needed was a `pread` on the node'
 repeated gets of 1,100 Name-sized rows read 100 pages, and none with the derived cache
 (`derive::tests::a_range_opened_as_the_node_opens_it_reads_its_pages_from_its_derived_cache`).
 
+### Reads that may not wait, their pages loaded on a worker, as built
+
+A replicated range's entry reads its rows on the node's shard, which serves its consensus and
+transport too, and a page the cache missed was a `pread` there that stopped them all (replica.md
+§2, measured). `ShardDb::get_ready` and `scan_rows_ready` read as `get_now` and `scan_now` do,
+under `Store::begin_no_wait`; a read refused names the page it wanted (`Store::refused_page`), and
+that page is handed to a maintenance worker (`Work::Load`, `Owner::Load`), which reads it through
+its own handle on the file and verifies it (`Store::read_page`), the workers' next message asked to
+wake the task. The page comes back with the job's result and the store holds it by address
+(`Store::hold_loaded`): every read the cache misses takes a held page before the device
+(`read_page_uncached`, `read_page_ahead_timed`), so the read made again finds it whatever the
+cache did meanwhile, and a page held or loading is never loaded again. Held pages go to the cache
+when their reader is done (`release_loaded`). An extent whose last reference goes
+(`Store::release`) drops its held pages and marks its loads out stale, whose pages are dropped when
+they come back: a freed extent is written again, and a held copy would outlive its page. The pages
+held and loading are at most twice the sources a read's path opens (`ShardDb::loads_most`,
+`TrunkConfig::sources_most`), or a memtable's bytes' worth where that is more; past it, and off a
+runtime task,
+without workers or with the issuer attached (whose own reads `get_async` makes), the read is made
+as before. A page the OS holds is read in place as the inline path reads it (research/41): the
+worker is for the read that would wait on the device (research/03 HL23-F3, F7).
+
 ## 6. Scheduling flush and compaction
 
 Each shard schedules its replicas' flushes and compactions against foreground I/O, as SILK does

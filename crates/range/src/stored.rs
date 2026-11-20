@@ -18,7 +18,10 @@
 //! first, waiting on no maintenance worker, and the batch applied only once it is
 //! (`ShardDb::room_now`). With none, nothing of the batch is applied, so no read sees part of an
 //! entry, and the entry waits committed and unapplied, its range driven again when the worker's
-//! message wakes the shard's task (docs/design/replica.md §2).
+//! message wakes the shard's task (docs/design/replica.md §2). The rows an entry's commands read
+//! are read so too ([`Engine::get_now`], [`Engine::next_now`]): from memory, or refused with the
+//! page they need loading on a maintenance worker (`ShardDb::get_ready`), the entry waiting as it
+//! waits for room.
 
 use hyper_block::block::BlockFile;
 use mantle_engine::memtable::hashed::entry_bytes;
@@ -154,6 +157,12 @@ impl<F: BlockFile + 'static> Stored<F> {
             .scan_rows(from, to, usize::MAX, &mut self.rows)
             .map_err(|e| fenced(&mut self.fault, e))?;
         Ok(())
+    }
+
+    /// The pages loaded and loading for reads that may not wait, and the loads out on a worker
+    /// (`ShardDb::loads`).
+    pub fn loads(&self) -> (usize, usize) {
+        self.db.loads()
     }
 
     /// The checkpoint begun at `at` ([`Engine::persist_now`]) is durable.
@@ -364,7 +373,35 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
             return Ok(false);
         }
         self.apply(index, writes)?;
+        // The entry's reads are done: the pages loaded for them go to the cache.
+        self.db.release_loaded();
         Ok(true)
+    }
+
+    /// The value from memory (`ShardDb::get_ready`), or [`EngineError::Unloaded`] with its page
+    /// loading on a maintenance worker, whose message wakes the task.
+    fn get_now(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        self.value.clear();
+        let found = self
+            .db
+            .get_ready(key, &mut self.value)
+            .map_err(|e| fenced(&mut self.fault, e))?
+            .ok_or(EngineError::Unloaded)?;
+        Ok(found.then(|| std::mem::take(&mut self.value)))
+    }
+
+    /// The row from memory (`ShardDb::scan_rows_ready`), or [`EngineError::Unloaded`] as
+    /// [`Engine::get_now`].
+    fn next_now(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+        if from >= to {
+            return Ok(None);
+        }
+        self.rows.clear();
+        self.db
+            .scan_rows_ready(from, Some(to), 1, &mut self.rows)
+            .map_err(|e| fenced(&mut self.fault, e))?
+            .ok_or(EngineError::Unloaded)?;
+        Ok(self.rows.get(0).map(|(k, v)| (k.to_vec(), v.to_vec())))
     }
 
     /// The engine's idle step that waits for nothing (`ShardDb::idle_step_now`), in SILK's order:
@@ -383,6 +420,8 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
     }
 
     fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
+        // The entry that waited on them is passed by the image.
+        self.db.release_loaded();
         self.clear(&[], None)?;
         for (k, v) in &rows {
             self.db.put(k, v).map_err(|e| fenced(&mut self.fault, e))?;

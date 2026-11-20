@@ -2876,6 +2876,13 @@ impl Trunk {
         m
     }
 
+    /// The most sources a read's path opens through the trunk as it stands
+    /// ([`TrunkConfig::sources_most`] at its height).
+    pub(crate) fn sources_most(&self) -> Result<usize, Error> {
+        let (height, _, _) = self.shape()?;
+        Ok(self.config.sources_most(height))
+    }
+
     /// The trunk's shape: its height (1 for a lone leaf), its nodes, and its leaves.
     pub fn shape(&self) -> Result<(usize, usize, usize), Error> {
         let mut height = 1usize;

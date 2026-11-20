@@ -58,7 +58,7 @@ pub struct Task {
 }
 
 /// A worker's work: a compaction, a full memtable to sort and pack into one branch, a growth
-/// of the shard's file, or a flush of it to the device.
+/// of the shard's file, a flush of it to the device, or a read of one of its pages.
 #[derive(Debug)]
 pub enum Work {
     Compact(Task),
@@ -71,6 +71,19 @@ pub enum Work {
     /// before handing it out, the handle being the same file's, and the shard's thread, which a
     /// node's consensus and transport share, never waits on the device for it.
     Sync,
+    /// A page of the shard's file read and verified through the worker's own handle on it
+    /// (`Store::read_page`), for a read on the shard that may not wait (`ShardDb::get_ready`,
+    /// `ShardDb::scan_rows_ready`): it comes back with its result, the page in it, and the shard
+    /// holds it for the read made again (`Store::hold_loaded`).
+    Load(Box<Load>),
+}
+
+/// A page to read off the shard's thread ([`Work::Load`]): its address, and its payload once
+/// read, verified against its checksum and address as every page read is.
+#[derive(Debug, Default)]
+pub struct Load {
+    pub address: u64,
+    pub page: Vec<u8>,
 }
 
 /// The index over the memtables a shard keeps for gets (`crate::kept`, research/51 §7), out on a
@@ -159,7 +172,7 @@ pub struct Output {
 }
 
 /// Who a job's result goes back to: the trunk's maintenance, the shard's packing, the shard's
-/// file's growth, its kept memtables' index, or its checkpoint's flush.
+/// file's growth, its kept memtables' index, its checkpoint's flush, or a page its reads wait for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
     Trunk,
@@ -168,6 +181,8 @@ pub enum Owner {
     Index,
     /// A checkpoint's flush ([`Work::Sync`]).
     Sync,
+    /// A page a read that may not wait found missing ([`Work::Load`]).
+    Load,
 }
 
 /// A job handed to a worker: the worker, and the job's number among every job the pool has
@@ -197,6 +212,8 @@ pub struct Back {
     pub sorted: Option<SortPack>,
     /// An index job's index and lists, back.
     pub indexed: Option<Box<IndexJob>>,
+    /// A page's load, its page read, back.
+    pub loaded: Option<Box<Load>>,
 }
 
 /// What a worker tells the shard: its grant is spent and it waits for `n` more extents, or its
@@ -219,6 +236,7 @@ pub(crate) enum Message {
         kept: Option<Box<Kept>>,
         sorted: Option<Box<SortPack>>,
         indexed: Option<Box<IndexJob>>,
+        loaded: Option<Box<Load>>,
     },
     /// Terminal native attachment result, after the owner's last Done was consumed.
     Retired {
@@ -350,6 +368,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                     kept: None,
                     sorted: None,
                     indexed: None,
+                    loaded: None,
                 }
             };
             drop(back.blocking_send(message));
@@ -410,11 +429,13 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
                 kept: None,
             })
         });
-        // A sorted packing's buffers, and an index job's index, go back with its result.
-        let (sorted, indexed) = match job.work {
-            Work::Sort(pack) => (Some(Box::new(pack)), None),
-            Work::Index(index) => (None, Some(index)),
-            _ => (None, None),
+        // A sorted packing's buffers, an index job's index and a load's page go back with its
+        // result.
+        let (sorted, indexed, loaded) = match job.work {
+            Work::Sort(pack) => (Some(Box::new(pack)), None, None),
+            Work::Index(index) => (None, Some(index), None),
+            Work::Load(load) => (None, None, Some(load)),
+            _ => (None, None, None),
         };
         let done = Message::Done {
             worker: id,
@@ -423,6 +444,7 @@ pub fn serve<F: BlockFile + 'static>(file: F, config: Config, seat: Seat) {
             kept,
             sorted,
             indexed,
+            loaded,
         };
         if unwound {
             // Close admission before Done: its owner can immediately try this same seat.
@@ -592,6 +614,11 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
         }
         Work::Sync => {
             store.flush_device()?;
+            Vec::new()
+        }
+        Work::Load(load) => {
+            load.page.clear();
+            store.read_page(load.address, &mut load.page)?;
             Vec::new()
         }
         Work::Index(job) => {
@@ -1204,6 +1231,7 @@ impl Pool {
                 topped: Vec::new(),
                 sorted: None,
                 indexed: None,
+                loaded: None,
             },
         ));
     }
@@ -1627,6 +1655,7 @@ impl Pool {
                         topped: Vec::new(),
                         sorted: None,
                         indexed: None,
+                        loaded: None,
                     },
                 ));
                 if self.closing {
@@ -1654,6 +1683,7 @@ impl Pool {
                 kept,
                 sorted,
                 indexed,
+                loaded,
             } => {
                 // A canceled request can consume Done before closing starts. Physical
                 // failures and worker unwinds stay terminal even after that Back is taken.
@@ -1687,6 +1717,7 @@ impl Pool {
                         topped,
                         sorted: sorted.map(|pack| *pack),
                         indexed,
+                        loaded,
                     },
                 ));
             }

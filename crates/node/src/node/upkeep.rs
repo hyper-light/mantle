@@ -627,12 +627,15 @@ mod tests {
     }
 
     /// A store's file whose writes on a worker's handle pass the gate first, and whose flushes
-    /// pass `held` first; `flushes` counts the flushes made through this handle.
+    /// pass `held` first; `flushes` counts the flushes made through this handle. Its reads pass
+    /// `read_gate` first, and `reads` counts the reads made through this handle.
     struct Gated {
         file: hyper_block::file::DeviceFile,
         gate: Option<std::sync::Arc<Gate>>,
         held: Option<std::sync::Arc<Gate>>,
         flushes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        read_gate: Option<std::sync::Arc<Gate>>,
     }
 
     impl hyper_block::block::BlockFile for Gated {
@@ -649,6 +652,10 @@ mod tests {
             self.file.len()
         }
         fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+            if let Some(gate) = &self.read_gate {
+                gate.pass();
+            }
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.file.read_exact_at(buf, offset)
         }
         fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
@@ -770,6 +777,8 @@ mod tests {
                         gate: None,
                         held: None,
                         flushes: std::sync::Arc::default(),
+                        reads: std::sync::Arc::default(),
+                        read_gate: None,
                     };
                     let mut e =
                         mantle_range::Stored::create(file, engine.store, memtable, engine.trunk)
@@ -789,6 +798,8 @@ mod tests {
                                 gate: Some(gate.clone()),
                                 held: None,
                                 flushes: std::sync::Arc::default(),
+                                reads: std::sync::Arc::default(),
+                                read_gate: None,
                             })
                         },
                         1,
@@ -892,6 +903,8 @@ mod tests {
                         gate: None,
                         held: None,
                         flushes: here.clone(),
+                        reads: std::sync::Arc::default(),
+                        read_gate: None,
                     };
                     let mut e =
                         mantle_range::Stored::create(file, engine.store, memtable, engine.trunk)
@@ -910,6 +923,8 @@ mod tests {
                                 gate: None,
                                 held: Some(worker_held.clone()),
                                 flushes: std::sync::Arc::default(),
+                                reads: std::sync::Arc::default(),
+                                read_gate: None,
                             })
                         },
                         1,
@@ -1025,6 +1040,8 @@ mod tests {
                 gate: None,
                 held: None,
                 flushes: std::sync::Arc::default(),
+                reads: std::sync::Arc::default(),
+                read_gate: None,
             };
             let (_, rules) = crate::derive::cell(3).unwrap();
             let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
@@ -1066,6 +1083,8 @@ mod tests {
                 gate: None,
                 held: None,
                 flushes: std::sync::Arc::default(),
+                reads: std::sync::Arc::default(),
+                read_gate: None,
             };
             let (_, rules) = crate::derive::cell(3).unwrap();
             let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
@@ -1125,6 +1144,151 @@ mod tests {
                 "the checkpoint its entry waited for"
             );
             assert_eq!(e.durable(), 8);
+        });
+    }
+
+    /// A range's engine opened again over rows only its store's file holds, its cache empty: an
+    /// entry's read of a row (`Engine::get_now`, `Engine::next_now`, as the range's state
+    /// machine reads them) is answered not in memory at once, the shard's own handle reading
+    /// nothing, and the page it needs is read on the maintenance worker's handle, held at a gate.
+    /// Asked again while the worker is held, it is refused again and no second load goes out.
+    /// With the gate open, each worker's message wakes the task (no timer: the wait's bound is
+    /// the node's idle timeout, and one that reaches it fails the test as a lost wake), the read
+    /// made again takes the loaded page and the next missing one, if any, loads, until the row
+    /// reads whole; the shard's handle read nothing throughout, the worker's one read a page
+    /// loaded. The entry that read it then applies whole and lets the loaded pages go.
+    #[test]
+    fn an_entrys_reads_load_their_pages_on_the_worker_and_the_shard_reads_none() {
+        use mantle_meta::engine::{Engine, EngineError, Rows};
+        on_a_shard_with_a_held_flush(|mut e, _held, _here, path| async move {
+            // Three memtables' entries, each packed by a checkpoint: a get reads the branch its
+            // key's filter passes, and a scan merges every branch on its path.
+            for i in 1..=3 * 64 {
+                e.apply(i, batch(i)).unwrap();
+                if i % 64 == 0 {
+                    e.persist().unwrap();
+                }
+            }
+            drop(e);
+            let (_, rules) = crate::derive::cell(3).unwrap();
+            let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
+            let row = mantle_engine::memtable::hashed::entry_bytes(16, 100).unwrap();
+            let shard_reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let file = Gated {
+                file: open_store(&path, false).unwrap(),
+                gate: None,
+                held: None,
+                flushes: std::sync::Arc::default(),
+                reads: shard_reads.clone(),
+                read_gate: None,
+            };
+            let mut e =
+                mantle_range::Stored::open(file, engine.store, row * (8 * 64 + 3), engine.trunk)
+                    .unwrap();
+            let gate = std::sync::Arc::new(Gate::default());
+            let opens = Opens(gate.clone());
+            let worker_reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (again, worker_gate, counted) = (path.clone(), gate.clone(), worker_reads.clone());
+            e.set_workers(
+                move || {
+                    let file = open_store(&again, false).map_err(|e| mantle_engine::Error::Io {
+                        op: "open",
+                        detail: e.to_string(),
+                    })?;
+                    Ok(Gated {
+                        file,
+                        gate: None,
+                        held: None,
+                        flushes: std::sync::Arc::default(),
+                        reads: counted.clone(),
+                        read_gate: Some(worker_gate.clone()),
+                    })
+                },
+                1,
+            )
+            .unwrap();
+            let reads = |n: &std::sync::Arc<std::sync::atomic::AtomicU64>| {
+                n.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            let opened = reads(&shard_reads);
+            let (key, value) = entry_rows(33).swap_remove(3);
+            let bound = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap();
+            // The first read refused: its page goes out to the worker, held at the gate.
+            gate.tell_task();
+            assert_eq!(e.get_now(&key), Err(EngineError::Unloaded));
+            assert_eq!(reads(&shard_reads), opened, "the shard read the device");
+            assert_eq!(e.loads(), (1, 1));
+            for _ in 0..64 {
+                if gate.came() > 0 {
+                    break;
+                }
+                assert!(
+                    wait_for_wake(bound).await,
+                    "the load never reached the worker"
+                );
+            }
+            assert_eq!(gate.came(), 1);
+            // Asked again with the worker held: refused, the same load out, none other sent.
+            assert_eq!(e.get_now(&key), Err(EngineError::Unloaded));
+            assert_eq!((gate.came(), e.loads()), (1, (1, 1)));
+            drop(opens);
+            let mut refusals = 1u64;
+            let got = loop {
+                assert!(
+                    wait_for_wake(bound).await,
+                    "a wake was lost: {refusals} refused"
+                );
+                match e.get_now(&key) {
+                    Ok(got) => break got,
+                    Err(EngineError::Unloaded) => refusals += 1,
+                    Err(other) => panic!("{other}"),
+                }
+                assert!(
+                    refusals < 64,
+                    "the get waited past 64 of the worker's messages"
+                );
+            };
+            assert_eq!(got, Some(value.clone()));
+            assert_eq!(reads(&shard_reads), opened, "the shard read the device");
+            // The one-row scan of the same row, as `name::current` reads a name: the pages held
+            // serve it, and any other it needs loads as the get's did.
+            let row = loop {
+                match e.next_now(&key, b"l") {
+                    Ok(row) => break row,
+                    Err(EngineError::Unloaded) => refusals += 1,
+                    Err(other) => panic!("{other}"),
+                }
+                assert!(
+                    refusals < 64,
+                    "the scan waited past 64 of the worker's messages"
+                );
+                assert!(
+                    wait_for_wake(bound).await,
+                    "a wake was lost: {refusals} refused"
+                );
+            };
+            assert_eq!(row, Some((key.clone(), value)));
+            assert_eq!(reads(&shard_reads), opened, "the shard read the device");
+            // Each page loaded once, on the worker: as many reads there as pages held, a read
+            // refused while its page was still out sending none.
+            let (held, out) = e.loads();
+            assert_eq!(out, 0);
+            assert!(held >= 1 && u64::try_from(held).unwrap() <= refusals);
+            assert_eq!(reads(&worker_reads), u64::try_from(held).unwrap());
+            // The entry that read it applies whole and lets its pages go.
+            assert!(e.apply_now(3 * 64 + 1, batch(3 * 64 + 1)).unwrap());
+            assert_eq!(e.loads(), (0, 0));
+            assert_eq!(whole(&mut e, 3 * 64 + 1), Some(true));
+            // The read as an entry made it before, which waits on the device: a row another
+            // entry wrote, cold, is read on the shard's own handle.
+            let (cold, _) = entry_rows(1).swap_remove(0);
+            assert!(e.get(&cold).unwrap().is_some());
+            let before = reads(&shard_reads) - opened;
+            println!(
+                "shard reads: {before} by a waiting get, none by the ready reads; worker reads: \
+                 {held} for {refusals} refused"
+            );
+            assert!(before > 0, "a cold get read nothing on the shard");
         });
     }
 

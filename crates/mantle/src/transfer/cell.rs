@@ -125,6 +125,12 @@ pub struct Counted {
     pub checkpoints: Option<u64>,
     pub engine_syncs: Option<u64>,
     pub chunk_puts: Option<u64>,
+    /// The node's replay at open (`mantle_node::node::Node::replayed`; node.md §2.6): the entries
+    /// its ranges re-applied past their engines' durable indexes, their bytes and the span, none
+    /// while a range replays or where none had any.
+    pub replay_entries: Option<u64>,
+    pub replay_bytes: Option<u64>,
+    pub replay_ns: Option<u64>,
     pub slow: Option<Vec<Slow>>,
     pub stalls: Option<Vec<Option<u64>>>,
 }
@@ -248,6 +254,9 @@ impl Counted {
                 "checkpoints" => counted.checkpoints = unsigned(),
                 "engine_syncs" => counted.engine_syncs = unsigned(),
                 "chunk_puts" => counted.chunk_puts = unsigned(),
+                "replay_entries" => counted.replay_entries = unsigned(),
+                "replay_bytes" => counted.replay_bytes = unsigned(),
+                "replay_ns" => counted.replay_ns = unsigned(),
                 _ => {}
             }
         }

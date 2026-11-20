@@ -637,6 +637,9 @@ pub struct Status {
     /// ended with nothing here showing the range move ([`Room`]), and the longest any waited from
     /// its refusal to its asking again.
     pub room: RoomWaits,
+    /// Where the member's replay at open stands: the entries past its engine's durable index it
+    /// re-applied, their bytes and the span it took (`mantle_range::Replayed`; node.md §2.6).
+    pub replay: mantle_range::Replay,
 }
 
 /// What the node's own commands and reads refused for room waited ([`Status::room`]).
@@ -2761,7 +2764,36 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 timed: self.room_timed,
                 longest: Duration::from_nanos(self.room_longest_ns),
             },
+            replay: seen.replay,
         })
+    }
+
+    /// The node's replay at open, once every range that had entries past its engine's durable
+    /// index to re-apply has (node.md §2.6): their entries and bytes, from the first range's
+    /// first apply to the last one's last, so ranges replaying at once on one shard or on several
+    /// are timed as the node replayed them. `None` while one replays, or where none had any.
+    pub fn replayed(&self) -> Option<mantle_range::Replayed> {
+        let mut all: Option<mantle_range::Replayed> = None;
+        let near = self
+            .ranges
+            .iter()
+            .filter_map(|kept| self.owner.get(kept.handle))
+            .map(|replica| replica.machine().replay());
+        for replay in near.chain(self.far.iter().map(|far| far.seen.replay)) {
+            match replay {
+                mantle_range::Replay::None => {}
+                mantle_range::Replay::Due { .. } => return None,
+                mantle_range::Replay::Done(one) => {
+                    all = Some(all.map_or(one, |sum| mantle_range::Replayed {
+                        entries: sum.entries.saturating_add(one.entries),
+                        bytes: sum.bytes.saturating_add(one.bytes),
+                        began_ns: sum.began_ns.min(one.began_ns),
+                        ended_ns: sum.ended_ns.max(one.ended_ns),
+                    }));
+                }
+            }
+        }
+        all
     }
 
     /// How long `group`'s member may go without moving while its peers live, by the node's own law

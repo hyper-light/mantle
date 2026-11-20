@@ -325,7 +325,13 @@ pub fn open_shell<L: LogStore, E: Engine>(
         // decision of its own, not taken here.
         disk: hyper_durable::Disk::Flushed,
     };
-    hyper_durable::Replica::open(&settings, store, machine, Unbounded).map_err(opened)
+    let mut shell =
+        hyper_durable::Replica::open(&settings, store, machine, Unbounded).map_err(opened)?;
+    // The entries its log holds past the engine's durable index, through the commit its durable
+    // state states, are re-applied as it is driven: timed, the replay rate (node.md §2.6).
+    let to = shell.durable_commit();
+    shell.machine_mut().replay_to(to);
+    Ok(shell)
 }
 
 /// Proposes an entry of commands to `shell`, refused past the range's bound on an entry: only a
@@ -454,6 +460,12 @@ impl<L: LogStore, E: Engine> Replica<L, E> {
     /// committed: a member that could vote now without a quorum waiting on it to catch up.
     pub fn caught_up(&self, member: u64) -> bool {
         self.shell.caught_up(member)
+    }
+
+    /// Where the member's replay at open of the entries past its engine's durable index stands
+    /// (`RangeMachine::replay`).
+    pub fn replay(&self) -> crate::Replay {
+        self.shell.machine().replay()
     }
 
     /// Whether the member's log may lack entries it acknowledged (docs/design/replica.md §4).

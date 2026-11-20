@@ -28,7 +28,8 @@ use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
 use mantle_meta::wire::{Answer, Command, ENTRY_HEAD_BYTES, Entry, Sessioned};
 use mantle_range::{
-    ConfState, Driven, Message, MessageType, Range, Replica, ReplicaError, Settings,
+    ConfState, Driven, Message, MessageType, Range, Replay, Replayed, Replica, ReplicaError,
+    Settings,
 };
 use store::Synchronous;
 
@@ -648,6 +649,81 @@ fn a_member_added_after_compaction_catches_up_and_replaces_a_lost_one() {
         assert_eq!(conf, want, "member {id}");
         assert_eq!(rows(r.engine_mut()), first, "member {id}");
     }
+}
+
+/// A member that crashes with entries applied past its engine's checkpoint re-applies them as
+/// it opens again, through the commit its log kept, and times the replay: every entry past the
+/// checkpoint counted, their bytes, over a span its clock measured (docs/design/node.md §2.6).
+/// A member with nothing past its checkpoint has no replay to time.
+#[test]
+fn a_member_reopened_past_its_checkpoint_times_its_replay() {
+    use hyper_block::sim::Crash;
+
+    let mut nodes: Vec<Node> = (1..=3).map(|id| node(id, id)).collect();
+    let mut answers = Vec::new();
+    assert_eq!(nodes[1].replica.replay(), Replay::None);
+    nodes[0].replica.campaign().unwrap();
+    settle(&mut nodes, &mut answers);
+    let mut bytes = 0u64;
+    for serial in 0..5 {
+        let entry = registration(serial);
+        bytes += u64::try_from(entry.encode().unwrap().len()).unwrap();
+        nodes[0].replica.propose(&entry).unwrap();
+        settle(&mut nodes, &mut answers);
+    }
+    let applied = nodes[1].replica.applied();
+
+    // Its engine loses what it had not made durable; its log keeps every entry and the commit.
+    let old = std::mem::replace(&mut nodes[1], node(9, 9));
+    let mut engine = old.replica.into_engine();
+    engine.crash();
+    let file = close(old.log);
+    file.crash(Crash::Random).unwrap();
+    let (log, recovery) = Log::open(file, log_config(), 0x6c6f67 + 2).unwrap();
+    assert!(recovery.damaged.is_empty());
+    let replica = open(2, &log, engine, &range(), 2).unwrap();
+    let checkpoint = replica.applied();
+    let to = replica.durable_commit();
+    assert!(
+        checkpoint < to,
+        "nothing past the checkpoint {checkpoint} to {to}"
+    );
+    assert_eq!(
+        replica.replay(),
+        Replay::Due {
+            to,
+            so_far: Replayed::default()
+        }
+    );
+    assert!(to <= applied, "{to} past {applied}");
+    nodes[1] = Node { replica, log };
+    // It re-applies through the commit its log kept on its own; the rest its leader tells it.
+    drive(&mut nodes[1].replica, true);
+    assert_eq!(nodes[1].replica.applied(), to);
+    let Replay::Done(replayed) = nodes[1].replica.replay() else {
+        panic!("the replay is not done: {:?}", nodes[1].replica.replay());
+    };
+    eprintln!("replayed {replayed:?}, {} ns", replayed.nanos());
+    assert_eq!(replayed.entries, to - checkpoint);
+    // The registrations through that commit, the leader's empty entry counting none.
+    assert!(
+        replayed.bytes > 0 && replayed.bytes <= bytes,
+        "{replayed:?} of {bytes}"
+    );
+    assert!(replayed.began_ns > 0);
+    assert!(replayed.ended_ns >= replayed.began_ns);
+
+    // Opened again at its checkpoint made now, it has nothing to replay.
+    nodes[1]
+        .replica
+        .compact(u64::MAX, 0, Waker::noop())
+        .unwrap();
+    let old = std::mem::replace(&mut nodes[1], node(9, 9));
+    let engine = old.replica.into_engine();
+    let file = close(old.log);
+    let (log, _) = Log::open(file, log_config(), 0x6c6f67 + 2).unwrap();
+    let replica = open(2, &log, engine, &range(), 2).unwrap();
+    assert_eq!(replica.replay(), Replay::None);
 }
 
 /// A member whose engine made its rows durable past the commit its log kept reopens and

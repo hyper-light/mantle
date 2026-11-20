@@ -67,6 +67,48 @@ pub struct Applied {
     pub answer: Answer,
 }
 
+/// What a member re-applied as it opened of the entries its log holds past its engine's durable
+/// index, through the commit its durable state stated (docs/design/node.md §2.6, the replay rate
+/// research/11 §9.3 calls `ρ`; research/12 §6.2): the entries, their bytes, and the clock's
+/// readings ([`clock_ns`]) at the first one's apply asked and the last one's applied, so a node
+/// takes its ranges' replays together over the span from the first to begin to the last to end.
+/// The span holds whatever re-applying them waited on: pages loaded, a memtable's room, the
+/// drives between.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Replayed {
+    pub entries: u64,
+    pub bytes: u64,
+    pub began_ns: u64,
+    pub ended_ns: u64,
+}
+
+impl Replayed {
+    /// The nanoseconds from the first entry's apply asked to the last one's applied.
+    pub fn nanos(&self) -> u64 {
+        self.ended_ns.saturating_sub(self.began_ns)
+    }
+}
+
+/// Where a member's replay at open stands ([`RangeMachine::replay`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replay {
+    /// No entry past the engine's durable index was due at open, or an image replaced what
+    /// was being replayed.
+    None,
+    /// Entries through `to` are still to apply; what has been is `so_far`.
+    Due { to: u64, so_far: Replayed },
+    /// Every entry due was re-applied.
+    Done(Replayed),
+}
+
+/// The process's monotonic clock in nanoseconds from its first reading: one clock for every
+/// range's replay, so their spans compare. Saturates past `u64`'s 584 years.
+pub fn clock_ns() -> u64 {
+    static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let anchor = ANCHOR.get_or_init(std::time::Instant::now);
+    u64::try_from(anchor.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// The error a step of the machine met where it failed, which the [`Fatal`] it answers the shell
 /// names only by the step. The shell fences the replica on the first and asks the machine nothing
 /// more until the member opens again, so the machine keeps that one alone
@@ -180,6 +222,8 @@ pub struct RangeMachine<E> {
     durable: Point,
     /// The error of the step that failed the machine, the first ([`Failure`]).
     failure: Option<Failure>,
+    /// The replay of the entries past the engine's durable index at open ([`Replay`]).
+    replay: Replay,
 }
 
 impl<E: Engine> RangeMachine<E> {
@@ -220,7 +264,59 @@ impl<E: Engine> RangeMachine<E> {
             persisting: None,
             durable: point,
             failure: None,
+            replay: Replay::None,
         })
+    }
+
+    /// Times the replay of the entries through `to`, the commit the member's durable state
+    /// states as it opens, past what the engine applied: none where it applied them all.
+    pub fn replay_to(&mut self, to: u64) {
+        self.replay = if to > self.applied.index {
+            Replay::Due {
+                to,
+                so_far: Replayed::default(),
+            }
+        } else {
+            Replay::None
+        };
+    }
+
+    /// Where the replay at open stands.
+    pub fn replay(&self) -> Replay {
+        self.replay
+    }
+
+    /// The entry at `index` asked to apply: the replay's clock starts at the first it re-applies.
+    fn replay_asked(&mut self, index: u64) {
+        if let Replay::Due { to, so_far } = &mut self.replay
+            && index <= *to
+            && so_far.began_ns == 0
+        {
+            so_far.began_ns = clock_ns().max(1);
+        }
+    }
+
+    /// The entry at `index`, of `bytes`, applied: counted while the replay is due, which ends
+    /// at its last.
+    fn replay_applied(&mut self, index: u64, bytes: usize) {
+        let Replay::Due { to, mut so_far } = self.replay else {
+            return;
+        };
+        if index > to {
+            return;
+        }
+        so_far.entries = so_far.entries.saturating_add(1);
+        so_far.bytes = so_far
+            .bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        self.replay = if index == to {
+            Replay::Done(Replayed {
+                ended_ns: clock_ns(),
+                ..so_far
+            })
+        } else {
+            Replay::Due { to, so_far }
+        };
     }
 
     pub fn engine(&self) -> &E {
@@ -259,6 +355,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     /// buffers the entry's writes in an overlay and hands the engine its batch only after its
     /// last read, so a read refused part way leaves nothing of the entry behind.
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Applied>) -> Result<bool, Fatal> {
+        self.replay_asked(entry.index);
         let (layer, rules) = (self.layer, self.rules);
         // Lent to the entry, as the engine is, and kept only once the entry applies.
         let mut watermark = self.watermark;
@@ -316,6 +413,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
             index: entry.index,
             term: entry.term,
         };
+        self.replay_applied(entry.index, entry.data.len());
         Ok(true)
     }
 
@@ -328,12 +426,15 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         _change: &ConfChangeV2,
         configuration: &ConfState,
     ) -> Result<(), Fatal> {
+        self.replay_asked(at.index);
         let bytes = conf::encode(configuration).ok_or(Fatal("a configuration past u32 members"))?;
         Termed::new(&mut self.engine, self.applied.term, at.term)
             .apply(at.index, vec![Write::Put(conf::ROW.to_vec(), bytes)])
             .map_err(|e| failed(&mut self.failure, "the engine refused a change", e))?;
         self.configuration = configuration.clone();
         self.applied = at;
+        // A change's entry is counted, its bytes not: the shell gives it decoded.
+        self.replay_applied(at.index, 0);
         Ok(())
     }
 
@@ -380,6 +481,10 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         // The image's sessions may have been used at any time, and an install that fails part
         // way leaves rows of both.
         self.watermark = Watermark::default();
+        // What was being replayed is replaced, so no replay is timed.
+        if matches!(self.replay, Replay::Due { .. }) {
+            self.replay = Replay::None;
+        }
         let mut rows = image::decode(image).ok_or(Fatal("a snapshot's rows do not decode"))?;
         let conf = conf::encode(configuration).ok_or(Fatal("a configuration past u32 members"))?;
         rows.retain(|(k, _)| k.as_slice() != conf::ROW && k.as_slice() != TERM);

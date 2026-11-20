@@ -773,8 +773,9 @@ pub const REPEATED: &[&str] = &[
 /// The keys `mantle serve`'s file states once each, its operator's alone (node.md §1.4's first
 /// column): every other value is measured or derived, and a key of those is refused. `memory`
 /// is the most the node may hold, `durability.target` a block's annual chance of loss at most, and
-/// `durability.repair_rate` the cell's repairs an hour (docs/design/repair.md §2), each where
-/// stated.
+/// `durability.repair_rate` the cell's repairs an hour (docs/design/repair.md §2), and
+/// `restart_budget_ms` how long a restart may take to replay its ranges' logs (node.md §2.6), each
+/// where stated.
 pub const STATED_KEYS: &[&str] = &[
     "id",
     "dir",
@@ -793,6 +794,7 @@ pub const STATED_KEYS: &[&str] = &[
     "durability.target",
     "durability.repair_rate",
     "stop_ms",
+    "restart_budget_ms",
     "range_shards",
     "native_shards",
     "s3",
@@ -2326,6 +2328,13 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
             "repairs an hour, more than none".into(),
         ));
     }
+    let restart_budget = lines.maybe::<u64>("restart_budget_ms")?;
+    if restart_budget == Some(0) {
+        return Err(ProcessError::Value(
+            "restart_budget_ms",
+            "milliseconds, more than none".into(),
+        ));
+    }
     Ok(Stated {
         id: lines.get("id")?,
         dir: lines.path(lines.text("dir")?),
@@ -2345,6 +2354,7 @@ pub fn read_stated(path: &Path) -> Result<Stated, ProcessError> {
         keys: root_keys(&lines)?,
         ceiling: lines.maybe("memory")?,
         stop: lines.maybe("stop_ms")?.map(Duration::from_millis),
+        restart_budget: restart_budget.map(Duration::from_millis),
         target,
         repair,
         s3: s3_stated(&lines)?,
@@ -2543,6 +2553,7 @@ fn measure(stated: &Stated) -> Result<Measured, ProcessError> {
         volumes,
         descriptors: crate::descriptors::limit()
             .map_err(|e| ProcessError::Runtime(e.to_string()))?,
+        replay: replay(&stated.dir),
     })
 }
 
@@ -2598,6 +2609,50 @@ pub fn calibration(dir: &Path, budget: Duration) -> Result<Calibration, ProcessE
             .map_err(|e| ProcessError::Device(path.clone(), e.to_string()))?;
     }
     Ok(calibration)
+}
+
+/// The node's last replay at open large enough to time, its record's file in the node's
+/// directory (node.md §1.6, §2.6), kept as the machine's calibration is: whole or not at all, with
+/// its CRC-32C (`hyper_block::record`).
+pub const REPLAY: &str = "replay";
+
+/// A replay record: its version, then the entries, bytes and nanoseconds of the replay, each a
+/// little-endian `u64`.
+const REPLAY_VERSION: u8 = 1;
+const REPLAY_BYTES: usize = 1 + 3 * 8;
+
+/// The replay kept in the node's directory `dir` ([`keep_replay`]): `None` where none was kept, or
+/// where its record does not read, as a calibration record that does not read is measured again.
+pub fn replay(dir: &Path) -> Option<mantle_range::Replayed> {
+    let record = hyper_block::record::read(&dir.join(REPLAY), REPLAY_BYTES)
+        .ok()
+        .flatten()?;
+    let (version, rest) = record.split_first()?;
+    if *version != REPLAY_VERSION || rest.len() != REPLAY_BYTES - 1 {
+        return None;
+    }
+    let word = |at: usize| -> Option<u64> {
+        let bytes = rest.get(at..at.checked_add(8)?)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    };
+    Some(mantle_range::Replayed {
+        entries: word(0)?,
+        bytes: word(8)?,
+        began_ns: 0,
+        ended_ns: word(16)?,
+    })
+}
+
+/// `replayed` kept in the node's directory `dir`, in place of the last, durable when this returns.
+pub fn keep_replay(dir: &Path, replayed: &mantle_range::Replayed) -> Result<(), ProcessError> {
+    let mut record = Vec::with_capacity(REPLAY_BYTES);
+    record.push(REPLAY_VERSION);
+    for word in [replayed.entries, replayed.bytes, replayed.nanos()] {
+        record.extend_from_slice(&word.to_le_bytes());
+    }
+    let path = dir.join(REPLAY);
+    hyper_block::record::write(&path, &record)
+        .map_err(|e| ProcessError::Device(path.clone(), e.to_string()))
 }
 
 /// The timers the node's task holds at once, one for each sleep pending: its turn's wait, its
@@ -3007,6 +3062,8 @@ async fn serve(
     // The log's refusals for room as last said: the node's rounds of compaction and the liveness
     // stream's writes it refused for room, none before the first saying.
     let mut said_room: Option<(u64, u64)> = None;
+    // Whether the node's replay at open was said, once a run.
+    let mut replay_said = false;
     // The cell's repair on this node as last said, none before the first saying.
     let mut said_repair: Option<crate::node::RepairStatus> = None;
     // The longest poll of the node's shard as last said, 0 before the first saying.
@@ -3113,6 +3170,19 @@ async fn serve(
                         // it as their gateway (replica.md §2; node.md §5.6).
                         write!(line, " corrupt_commands {}", node.corrupt_commands())
                             .map_err(wrote)?;
+                        // The node's replay at open, `-` while a range replays or where none had
+                        // entries to (node.md §2.6).
+                        match node.replayed() {
+                            Some(replayed) => write!(
+                                line,
+                                " replay_entries {} replay_bytes {} replay_ns {}",
+                                replayed.entries,
+                                replayed.bytes,
+                                replayed.nanos()
+                            ),
+                            None => write!(line, " replay_entries - replay_bytes - replay_ns -"),
+                        }
+                        .map_err(wrote)?;
                         flush_counts(
                             &mut line,
                             (log.confirmations, log.fills),
@@ -3470,6 +3540,24 @@ async fn serve(
         if said_room != Some(room) {
             writeln!(lines, "room {} {}", room.0, room.1).map_err(wrote)?;
             said_room = Some(room);
+        }
+        // The node's replay at open, once every range that had entries past its engine's durable
+        // index has re-applied them: said once, `replayed ENTRIES BYTES NS`, and kept in its
+        // directory where it re-applied enough to time (`derive::replay_rate`), so the next start
+        // derives its write buffers from it (node.md §2.6). One record's write a run, flushed.
+        if !replay_said && let Some(replayed) = node.replayed() {
+            replay_said = true;
+            writeln!(
+                lines,
+                "replayed {} {} {}",
+                replayed.entries,
+                replayed.bytes,
+                replayed.nanos()
+            )
+            .map_err(wrote)?;
+            if crate::derive::replay_rate(&replayed).is_some() {
+                keep_replay(&config.dir, &replayed)?;
+            }
         }
         // The log the ranges share, once after the statuses that moved.
         if said {
@@ -4596,6 +4684,7 @@ mod tests {
             reading: 0,
             commanded: 0,
             room: crate::node::RoomWaits::default(),
+            replay: mantle_range::Replay::None,
         };
         let turn = |lines: &mut String| {
             lines.clear();
@@ -4658,6 +4747,7 @@ mod tests {
             reading: 0,
             commanded: 0,
             room: crate::node::RoomWaits::default(),
+            replay: mantle_range::Replay::None,
         };
         let (mut before, mut after) = (String::new(), String::new());
         status_line(&mut before, 0x2a, &status(54)).unwrap();
@@ -5027,6 +5117,31 @@ mod tests {
             lookup(3, &at("127.0.0.1:7100"), v6),
             Err(ProcessError::Resolve(3, _, _))
         ));
+    }
+
+    /// A replay kept in the node's directory reads back as its entries, bytes and span; none is
+    /// read where none was kept, or where its record is damaged.
+    #[test]
+    fn a_replay_is_kept_in_the_node_directory_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(replay(dir.path()), None);
+        let replayed = mantle_range::Replayed {
+            entries: 812,
+            bytes: 18_671_880,
+            began_ns: 1_000,
+            ended_ns: 41_001_000,
+        };
+        keep_replay(dir.path(), &replayed).unwrap();
+        let read = replay(dir.path()).unwrap();
+        assert_eq!(
+            (read.entries, read.bytes, read.nanos()),
+            (812, 18_671_880, 41_000_000)
+        );
+        let path = dir.path().join(REPLAY);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[3] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(replay(dir.path()), None);
     }
 
     /// The machine's calibration is kept in the node's directory and taken again while the

@@ -399,7 +399,7 @@ operations, each under a permit.
 | the failures to survive, `f`, and the domain level they are counted at (architecture §11) | each peer's round-trip time and delivery rate, from the transport | the members a range needs and where they go (§6.5) |
 | the durability target: unless stated, a block's annual chance of loss at most 10⁻¹¹, S3's eleven nines applied per block (durability.md §1) | flush, apply, snapshot and scheduling delays; an idle engine instance's cost (12 §6.1) | what the node reports it can survive |
 | where the root key comes from: a key file or a key service (encryption.md §2) | the cost of sealing, hashing and coding a segment or a block (`mantle bench hash`, `mantle bench ec`) | |
-| optionally: a memory ceiling, the share of a caller's deadline a queue may take, and a restart-time budget (11 §18 items 3–4) | | |
+| optionally: a memory ceiling, the share of a caller's deadline a queue may take, and a restart-time budget, `restart_budget_ms` (11 §18 items 3–4) | the replay rate at open: the bytes a second the node re-applied of its ranges' logs past their engines' durable indexes (§2.6) | |
 
 The two policy shares have no model that storage can supply (11 §18). Until a deployment states
 them, a queue is bounded at the lower bound its own service time sets, and checkpoints are
@@ -863,7 +863,9 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
 | `engine.cache_bytes` | derived | the most each range's engine's page cache holds, its want: every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`), at most its store's pages. No share of the split: each engine opens with no cache (`process::engine`) and borrows its part of the operations' bytes no running operation holds, giving it back at once before one is charged it (`admit::cache_part`, `host::lend`, `Engine::lend_cache`; rule B for the caches, research/87 §4) |
-| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | each range's write buffer, its share of the engines' write buffers (§2.6): the least, one row at the range's bounds whole (`memtable::hashed::entry_bytes`), which the floor counts; raised toward its want, an entry of the range's largest (`range.max_entry_bytes`) within the bytes its log group retains, by what remains past the capacity wants and the operations served, the largest buffer whose engine holds no more than its part (`derive::write_buffer_want`, `derive::write_buffer`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row the least memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so), the same on every member and at every open since a trunk keeps its leaf's entries in its image and a snapshot carries them |
+| `restart_budget_ms` | stated | how long a restart may take to replay its ranges' logs, an availability target storage cannot derive (research/11 §9.4, §18 item 4); with `replay.rate` it bounds the engines' write buffers (§2.6). Unstated, none, and the space bound binds |
+| `replay.rate`, `replay.bound` | measured, derived, bound | the bytes a second the node re-applied at its last open of the entries its ranges' logs held past their engines' durable indexes, from the first range's first apply to the last one's last, each range's replay timed by its state machine (`mantle_range::Replayed`), kept in the node's directory's `replay` record (§1.6) where it re-applied at least Wilks' 59 entries, the fewest readings hyper-rt's harness accepts, of some bytes, over a span the clock measured (`derive::replay_rate`, `derive::REPLAY_LEAST`), said `bound` and 0 before one; and each range's part of what a restart replays within `restart_budget_ms` at that rate (`derive::replay_bound`), said `bound` and 0 without both |
+| `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | each range's write buffer, its share of the engines' write buffers (§2.6): the least, one row at the range's bounds whole (`memtable::hashed::entry_bytes`), which the floor counts; raised toward its want, `replay.bound` where a budget is stated and a rate measured, else an entry of the range's largest (`range.max_entry_bytes`), within the bytes its log group retains, by what remains past the capacity wants and the operations served, the largest buffer whose engine holds no more than its part (`derive::write_buffer_want`, `derive::write_buffer`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row the least memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so), the same on every member and at every open since a trunk keeps its leaf's entries in its image and a snapshot carries them |
 | `engine.workers`, `memory.need_workers` | derived, measured | the maintenance workers each range's engine packs and compacts on, so an apply on the node's shard writes none of their pages: two, Little's law's need for a hot range at the 10,000 PUTs a second a cell is to serve from its one worker measured 82% busy at 6,184 (macOS `sample`, perf-10k `8b64f8d3`, 2026-11-20; `derive::ENGINE_WORKERS`; one before, the leader's shard 31% busy packing and compacting inline, 2026-11-19), at most the node's cores less one shared among its ranges (`derive::engine_workers`), and the most of those the allowance holds the node's need with, one fewer at a time (`derive::derive`); each pool admits compactions within its own measured need (`trunk::pool`, §1.2). Their stacks are among the floor's threads, and their pools and the pages an entry's reads hold loaded on them among its engines (`derive::workers_bytes`, `shard_db::loads_bytes`); `memory.need_workers` is `memory.need` with them, and a node whose allowance holds less than one each runs none: a founder on CI's 7 GiB macOS runner holds no five past its need. `memory.need` stays the need without them, at which every want is whole |
 | `transport_bytes` | derived | the transport's floor (`transport.floor`): what it holds besides QUIC's windows, the connections' state at the most connections it holds (`bounds::connections_state`) and the receive ring's growth at its most (`bounds::ring_growth`) among it, and each share at QUIC's initial window, below which its limits refuse (`bounds::least_transport`); and past it its want whole (`transport.want`, each share at a receive chunk, `bounds::chunked_transport`) where what remains past the capacity wants and the operations the node serves holds those operations' connections at a chunk, every operation more costing its client's windows at a chunk; short of it, the operations are those served and its budget is its floor and what remains, each share's window past the initial window by it over the shares (`bounds::limits`) |
 | `volume.*` layout | derived | checksum blocks of the volume's block, at most CRC-32C's verified 16 KiB, so a read at the device's alignment verifies no byte it did not ask for (research 11 §8.2); the least segment holding a record of the largest chunk whole, smaller segments cleaning better (research 11 §7.3–§7.4); the standard layout, or the compact one where the standard leaves fewer than two segments (chunk-store.md §2); batches of every chunk waiting that a segment's room holds at a block each, within the records a batch's frame holds (`layout::most_batch_requests`), so they share one flush where batches of one flushed each chunk alone (research/71, step 9; research/87 §1), a segment's room in bytes, and one fragment a chunk, as the node puts chunks whole; as many fragments as the volume's share of memory holds at the index's measured peak (`index::most_bytes`) and the volume holds at a block each, the least a fragment takes standing for the chunk sizes research 11 §6.2 learns from; a volume laid out already keeps its block, segment and checksum blocks, and holds no more fragments than its log was laid out for (`Geometry::holds`); research 03 §15.9's week a scrub (`derive::volume`) |
@@ -1074,7 +1076,10 @@ reads it. `mantle init` adds to the node's directory its `config`, `identity/` (
 certificate, the authority's certificate, each pinned peer's certificate under `peers/`, and the S3
 endpoint's key and certificate), `keys/` (one root-key file a generation, and `s3/`, the cell's
 access keys) and, for a cell of one, `calibration`, hyper-rt's record, which `mantle serve` and
-`mantle node` keep there too and take again while the machine's key matches it. The directory's own
+`mantle node` keep there too and take again while the machine's key matches it. A node keeps
+`replay` there as well (2026-11-20): its last replay at open large enough to time, its entries,
+bytes and nanoseconds, a hyper-block record written whole and flushed, which `mantle serve`
+derives its write buffers from at its next start (§2.6, *Write buffers*). The directory's own
 `LOCK`, held as the volumes' are, since its log and stores admit one process as a volume does, is
 taken at the start's locks step and held while the process runs (2026-10-24). `meta/` on a metadata
 device, `DEVICE` and `map` wait for the storage graph (§1.7 step 3) and the cell map (architecture
@@ -1692,7 +1697,7 @@ cancellation, never by a timeout that leaves the work running.
 | A device's read depth | where throughput stops growing | calibration | chunk-store.md §7 |
 | Background shares on a device | the largest share that keeps measured foreground latency within its bound; raised while blocks have lost redundancy | foreground latency under cleaning, scrubbing and repair | 11 §18 item 7; 04 R3 item 4; 10 §1 item 10 |
 | The log file's size | twice the live bytes: append rate times the engine's durable lag | both, measured by the log | raft-log.md §5 |
-| Engine write buffers, node total | `min(memory share, replay rate × restart budget)`; with no restart budget stated, the space bound, each range's log group's retention; each range an entry of its largest at most, within its part of what remains past the capacity wants and the operations served, its packings' builders charged for what its bytes hold (*Write buffers*, below) | replay rate at each open (*open*: not measured) | 12 §6.2, §6.6; 11 §9.3 |
+| Engine write buffers, node total | `min(memory share, replay rate × restart budget)`, each range the same part, within its log group's retention; without a restart budget stated or a replay rate measured, the space bound, each range an entry of its largest at most; within its part of what remains past the capacity wants and the operations served, its packings' builders charged for what its bytes hold (*Write buffers*, below) | the replay rate at each open, kept in the node's directory (`replay`); the restart budget, stated (`restart_budget_ms`) | 12 §6.2, §6.6; 11 §9.3 |
 | A range's `max_entry_bytes` | the largest command a gateway sends: a completion of 10,000 parts, 561,804 bytes | `mantle_meta::wire::largest_entry_bytes` | replica.md §7; audit §16.5 |
 | Sessions a range holds | the gateway incarnations that may hold a live session (§5.3) | the cell's membership and its gateways' restarts | replica.md §1 |
 | A PUT's block window `w` | `w = ⌈R·T/B⌉`: the rate the upload is entitled to, `R = min(body rate, the principal's fair share over the authorities it uses)`, times the block chain's latency over a block's bytes, capped by memory; recomputed at each block | the body's arrival rate, the principal's share (§2.7), each chain's latency | gateway.md §2; audit §16.3; research/27 §6.1, D7 |
@@ -1711,11 +1716,36 @@ write buffers, node total, are `min(memory share, replay rate × restart budget)
 same part of it, as built:
 
 - **The restart budget** is the operator's to state (§1.4; research/11 §9.4 and §18 item 4, an
-  availability target with no model storage can supply). None is stated today.
-- **The replay rate** is timed at each open in the model (research/11's `ρ`) and is not measured
-  yet: hyper-log's recovery counts the frames it replays, and the time a range's engine takes to
-  apply them past its checkpoint is where it would be measured. *Open.*
-- **So the space bound binds**, as research/11 §9.3 checkpoints at the smaller of the space and
+  availability target with no model storage can supply): `restart_budget_ms` in `mantle serve`'s
+  configuration (2026-11-20), more than none, said `stated`.
+- **The replay rate** is timed at each open (research/11's `ρ`, §9.4: "timed at every open";
+  research/12 §6.2: "bytes ≤ measured replay rate × target restart time"), as built 2026-11-20.
+  A member opens at its engine's durable index and re-applies the entries its log holds past it,
+  through the commit its durable state states (`mantle_range::open_shell`,
+  `RangeMachine::replay_to`); its state machine counts them and their bytes as they apply, and
+  reads one process-wide monotonic clock at the first one's apply asked and the last one's
+  applied (`mantle_range::Replayed`), so the span holds whatever re-applying them waited on:
+  pages loaded, a memtable's room, the drives between. The node takes its ranges' replays
+  together once every range that had one is done (`Node::replayed`): their entries and bytes over
+  the span from the first range's first apply to the last one's last, so ranges replaying at once
+  on one shard, or on several, are timed as the node replayed them. Each range's stands in its
+  status (`Status::replay`), and the node's in its `counts` answer (`replay_entries`,
+  `replay_bytes`, `replay_ns`) and a `replayed ENTRIES BYTES NS` line said once. A replay of fewer
+  than Wilks' 59 entries, the fewest readings hyper-rt's measuring harness accepts of an operation
+  (`hyper_rt::machine::bench::MIN_SAMPLES`; Wilks, Ann. Math. Statist. 12(1), 1941), of no bytes or
+  over a span the clock did not measure is not used (`derive::replay_rate`): a few entries' fixed
+  costs would stand for a whole replay's. One that is used is kept in the node's directory
+  (`replay`, §1.6), replacing the last, and `mantle serve` reads it at its next start, as it reads
+  the machine's calibration; a record that does not read is taken as none. Wall-clock time can
+  only lengthen a replay's span (a preemption, a wait), so the rate errs low and the buffers
+  small, the side the restart budget is safe on.
+- **With both**, the engines' write buffers, node total, are at most `rate × budget`, each
+  range's want its part of it (`derive::replay_bound`, said `replay.bound`), within its log
+  group's retention and at least the least buffer (`derive::write_buffer_want`), then raised
+  within the memory share as below: `min(memory share, replay rate × restart budget)`. The entry
+  no longer caps the want, since the recovery-time bound now prices what a larger buffer costs a
+  restart.
+- **Without both, the space bound binds**, as research/11 §9.3 checkpoints at the smaller of the space and
   recovery-time bounds: a range's log group retains two cadences and a `Ready` past its engine's
   checkpoint (`log.group_bytes`) and refuses a write past them until the node asks that
   checkpoint (§6.2), so a restart replays at most that much of a range, and a memtable past it
@@ -1748,8 +1778,9 @@ same part of it, as built:
   most entries. Past the entry a buffer saves rotations, each a packing on the range's one worker
   and a branch for its trunk to merge (SplinterDB packs 24 MiB a branch, research/34 §1), but no
   measurement yet shows those rotations cost the node what the operations would give up. A
-  replay rate measured and a restart budget stated, or the rotations' cost measured past an
-  entry, reopen it; the retention bounds it whatever they show.
+  replay rate measured and a restart budget stated take the entry's place (above), and the
+  basis says which binds (`replay.bound`); the rotations' cost measured past an entry would
+  reopen it for a node with neither; the retention bounds it whatever they show.
 - **The memory share** comes in rule D's order (research/87 §4) after the capacity wants and the
   operations served, before the transport's growth and the operations past those: a write buffer
   is held whole once written and gives its rows back only by a packing, so it takes a share where

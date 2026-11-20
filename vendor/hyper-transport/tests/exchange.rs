@@ -3481,6 +3481,72 @@ fn an_owner_reading_without_polling_holds_one_body_ready() {
     ));
 }
 
+/// An owner that reads a body only as it is told, its request and then each `BodyReady`, and
+/// each time until a read takes none, reads it whole and verified: every arrival after a read
+/// that took what had come is said, as edge-triggered epoll(7) says one after a read returns
+/// `EAGAIN` (mantle's research/99). The owner's reads hold the sender back, so the body comes in
+/// many arrivals, each of which a lost `BodyReady` would leave unread for good.
+#[test]
+fn an_owner_reading_only_as_it_is_told_reads_the_whole_body() {
+    let pair = Pair::new();
+    let mut net = connected::<Mantle, Mantle>(&pair, limits(), 256 << 20);
+    let body = 4 << 20;
+    let mut asker = Asker::new();
+    asker
+        .ask(
+            &mut net.a,
+            net.now,
+            2,
+            (Kind::Put, Class::Request),
+            1,
+            Some(body),
+            PERIOD,
+        )
+        .unwrap();
+    let (mut served, mut read, mut told) = (None, 0u64, 0u64);
+    for _ in 0..TURNS {
+        let mut wake = false;
+        for event in events(&mut net.b) {
+            match event {
+                Event::Request { exchange, .. } => {
+                    served = Some(exchange);
+                    wake = true;
+                }
+                Event::BodyReady { exchange } if Some(exchange) == served => {
+                    told += 1;
+                    wake = true;
+                }
+                _ => {}
+            }
+        }
+        if let (true, Some(exchange)) = (wake, served) {
+            loop {
+                let mut into = net.b.reserve(Class::Request, PIECE as u64).unwrap();
+                let got = net.b.read_body(exchange, &mut into).unwrap() as u64;
+                net.b.release(into);
+                read += got;
+                if got == 0 {
+                    break;
+                }
+            }
+        }
+        if served.is_some_and(|exchange| net.b.body_complete(exchange)) {
+            break;
+        }
+        asker.drive(&mut net.a);
+        if !net.exchange() {
+            net.advance();
+        }
+    }
+    assert_eq!(read, body);
+    assert!(
+        net.b.body_complete(served.unwrap()),
+        "read whole and verified"
+    );
+    // Each piece the window let through was said: far more than one arrival.
+    assert!(told > body / (1 << 20), "told {told} times");
+}
+
 /// A peer that goes and comes back while the owner polls nothing waits as one event: its latest
 /// state, with its epoch.
 #[test]

@@ -237,7 +237,8 @@ impl Job {
     /// renewal due, its S3 connection naming it (`door::Mark`) as it sends a piece of its body,
     /// takes an answer of its reply or lets go, or the node's task naming its native job
     /// (`Call`) as it gives a piece of its body or lets go of it, takes or writes whole an answer
-    /// of its reply, or lets go of its reply. Its turn would feed it nothing, ask nothing and
+    /// of its reply, or lets go of its reply, or waking one reading its fields as more of its
+    /// body arrives (`Host::arrived`). Its turn would feed it nothing, ask nothing and
     /// answer nothing where it holds no request for want of the node's room and no chunk for want
     /// of a volume's, and:
     ///
@@ -252,10 +253,15 @@ impl Job {
     ///   reading a row, version or mark, at once; a batch delete with none refused for the
     ///   node's room; a completion or a running copy with no request held for it and no outcome
     ///   to answer, a copy's get holding nothing its put takes now. None of these reads its door.
+    /// - a native job reading its fields read what had arrived of them until a read took none
+    ///   (`Node::read_fields`), the transport's `EAGAIN`: the transport says the next arrival
+    ///   (`Event::BodyReady`), and the node's task wakes the job as it does (`Host::arrived`).
     ///
     /// A job whose door names it not, made with no mark or call, is turned at every step.
     fn rests(&self) -> bool {
         let asking = !self.pending.is_empty();
+        // Whether the node's task names it as its door moves, holding its reply still.
+        let called = matches!(&self.door, Door::Native(_, native) if native.called());
         // What its door gives it next comes named: whether its body's channel was found empty,
         // nothing of it ended, and whether its reply has no room for the next answer, a native
         // one's until the node's task wrote the last whole. One whose connection or reply was let
@@ -333,7 +339,12 @@ impl Job {
                     && copying.get_waiting.is_empty()
                     && copying.put_waiting.is_empty()
             }
-            Work::Fields(..) | Work::Handing(_) | Work::Draining(_) => false,
+            // Its step leaves it reading its fields only where its last read took none of them:
+            // each read of a body arriving lets the transport say the next arrival
+            // (hyper-transport's `ready_sent`), and its fields are the body's first bytes
+            // (`object::Head::decode`), so they are arriving while any is owed.
+            Work::Fields(..) => called,
+            Work::Handing(_) | Work::Draining(_) => false,
         }
     }
 
@@ -998,8 +1009,9 @@ impl Host {
 
     /// Job `at` woken, so the host's next turn steps it: each event that can give a resting job
     /// work wakes it as it comes, an answer to one of its asks (`answer_job`), a reply given it
-    /// (`reply_job`), room offered it (`offer_room`) and its put's renewal coming due
-    /// (`Host::step`); nothing else moves a job that rests (`Job::rests`).
+    /// (`reply_job`), room offered it (`offer_room`), its put's renewal coming due
+    /// (`Host::step`) and more of its fields arriving (`Host::arrived`); nothing else moves a job
+    /// that rests (`Job::rests`).
     ///
     /// A job woken is kept with the jobs awake (`ready`), keyed by its wake, and keeps its key
     /// where it was awake already: the first woken is stepped first.
@@ -1011,6 +1023,22 @@ impl Host {
         if self.ready.key(at).is_none() {
             self.ready.set(at, Some(self.woken));
             self.woken = self.woken.wrapping_add(1);
+        }
+    }
+
+    /// More of the body of job `at`'s request arrived (`Event::BodyReady`, taken by the node's
+    /// task before the host's step): the job woken where it reads its fields, which it does on
+    /// the node's own host alone, before any is handed to a driving shard. Any other job's body
+    /// comes through its feeding, which names it as it gives a piece (`Feeding::send`).
+    pub(super) fn arrived(&mut self, at: usize) {
+        if matches!(
+            self.jobs.get(at),
+            Some(Job {
+                work: Work::Fields(..),
+                ..
+            })
+        ) {
+            self.wake(at);
         }
     }
 
@@ -11017,6 +11045,77 @@ pub(super) mod tests {
         assert_eq!(walked.iter().sum::<u64>(), 2_240, "{walked:?}");
     }
 
+    /// 64 native GETs of an empty object whose fields arrive in two halves, the second 32 turns
+    /// after the first: the steps of each turn, every get answered `Done` with no bytes and its
+    /// exchange ended. Each is woken as the rest arrives, as the node's task wakes a job on its
+    /// exchange's `BodyReady` (`Host::arrived`); and named to its host where `calling`, else, as
+    /// before, a job reading its fields is never passed by.
+    fn native_fields(calling: bool) -> Vec<u64> {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        if calling {
+            host.calling(Calls::new(64, None));
+        }
+        let (head, fields) = get_op().encode().unwrap();
+        let length = u64::try_from(fields.len()).unwrap();
+        let half = fields.len() / 2;
+        assert!(half > 0, "fields in two halves");
+        let read = scheming_gateway().charges.read(1);
+        let mut stub = put_and_get_stub();
+        let mut doors = Vec::new();
+        for name in 0..64 {
+            let head = Head::decode(&head, Some(length)).unwrap();
+            let work = Work::Fields(head, Vec::with_capacity(fields.len()));
+            let (job, replies) = called_job(&host, work, now, read, name);
+            host.push(job, now);
+            stub.arrived.push((name, fields[..half].to_vec(), 0));
+            let seen = Seen {
+                credit: usize::MAX,
+                ..Seen::default()
+            };
+            doors.push((replies, seen, false));
+        }
+        // Each reads the first half of its fields; then 32 turns more.
+        let mut steps = native_turns(&mut host, &mut stub, &mut doors, now, 33);
+        // The rest arrives, and the node's task wakes each job reading its fields: each reads them
+        // whole and its get asks its version, read, its head given and written, its end given.
+        for (_, arrived, _) in &mut stub.arrived {
+            arrived.extend_from_slice(&fields[half..]);
+        }
+        for at in 0..host.jobs.len() {
+            host.arrived(at);
+        }
+        steps.extend(native_turns(&mut host, &mut stub, &mut doors, now, 5));
+        assert!(host.idle(), "every get ended");
+        assert_eq!(stub.asked, 64, "each get's one read");
+        for (_, seen, over) in &doors {
+            assert!(*over && seen.ended && !seen.refused);
+            let reply = reply_seen(seen);
+            assert_eq!((reply.status, reply.size), (Status::Done, 0));
+        }
+        steps
+    }
+
+    /// Steps native jobs reading their fields: 64 GETs whose fields arrive in two halves 32 turns
+    /// apart. Each is stepped at its first turn, reading the first half; 32 turns then pass every
+    /// job by (`Job::rests`), where each turn stepped every job; and as the rest arrives each is
+    /// woken (`Host::arrived`), reads its fields whole, then asks its version, gives its head as
+    /// the version comes and its end as the head is written. 320 steps over 38 turns, five a job,
+    /// where the rule before took 2,368, 37 a job, 33 of them reading its fields; each answered
+    /// `Done` with no bytes and its exchange ended, no wake lost.
+    #[test]
+    fn a_native_job_reading_its_fields_is_stepped_only_as_they_arrive() {
+        let named = native_fields(true);
+        let walked = native_fields(false);
+        assert_eq!(named.len(), 38);
+        assert_eq!(named[0], 64);
+        assert_eq!(named[1..33].iter().sum::<u64>(), 0, "{named:?}");
+        assert_eq!(named[33..], [64, 64, 64, 64, 0]);
+        assert_eq!(named.iter().sum::<u64>(), 320);
+        assert_eq!(walked[..33], [64; 33], "{walked:?}");
+        assert_eq!(walked.iter().sum::<u64>(), 2_368, "{walked:?}");
+    }
+
     /// The node's task names a native job once until its host takes the name, however often it
     /// moves the job's door meanwhile; the host lets the name go before it steps the job, so a
     /// move after names it again; a job handed to another host is named there afresh; and a name
@@ -13096,6 +13195,10 @@ pub(super) mod tests {
         /// the last it took.
         takes_halves: bool,
         half: Option<Box<Native>>,
+        /// What arrived of each native job's request, by the job's name, and how much of it the
+        /// job read, as its exchange holds it (`Serve::read_fields`); none where its jobs come
+        /// typed.
+        arrived: Vec<(u64, Vec<u8>, usize)>,
     }
 
     impl Serve for Stub {
@@ -13165,8 +13268,30 @@ pub(super) mod tests {
             0
         }
 
-        fn read_fields(&mut self, _: &mut Job) -> Result<bool, NodeError> {
-            panic!("a local door's work comes typed")
+        /// As `Node::read_fields`: what arrived of the job's fields read until a read takes none,
+        /// and once whole, the work they name.
+        fn read_fields(&mut self, job: &mut Job) -> Result<bool, NodeError> {
+            let Door::Native(_, native) = &job.door else {
+                panic!("a local door's work comes typed")
+            };
+            let name = native.name;
+            let Work::Fields(head, fields) = &mut job.work else {
+                return Ok(false);
+            };
+            let (_, arrived, read) = self
+                .arrived
+                .iter_mut()
+                .find(|(of, ..)| Some(*of) == name)
+                .expect("its request arrives");
+            let wanted = usize::try_from(head.fields()).unwrap();
+            let took = (arrived.len() - *read).min(wanted - fields.len());
+            fields.extend_from_slice(&arrived[*read..*read + took]);
+            *read += took;
+            if fields.len() < wanted {
+                return Ok(false);
+            }
+            job.work = work(head.op(fields).unwrap(), None);
+            Ok(false)
         }
 
         fn took(&mut self, _: door::Paced) {}
@@ -13218,6 +13343,7 @@ pub(super) mod tests {
                 abandoned: 0,
                 takes_halves: false,
                 half: None,
+                arrived: Vec::new(),
             }
         }
     }
@@ -14421,6 +14547,7 @@ pub(super) mod tests {
             abandoned: 0,
             takes_halves: false,
             half: None,
+            arrived: Vec::new(),
         }
     }
 
@@ -15407,6 +15534,7 @@ pub(super) mod tests {
             abandoned: 0,
             takes_halves: false,
             half: None,
+            arrived: Vec::new(),
         };
         assert_eq!(host.due(&stub), None, "no job, no wait");
         let get = work(
@@ -15491,6 +15619,7 @@ pub(super) mod tests {
             abandoned: 0,
             takes_halves: false,
             half: None,
+            arrived: Vec::new(),
         }
     }
 

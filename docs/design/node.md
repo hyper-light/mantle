@@ -2815,6 +2815,46 @@ asked again* (`crates/node/src/node/host.rs`).
   job refused room is. Tested: a DeleteObject whose row comes without room asks its delete at the
   first turn with room and is answered `Done`; by the rule before it had no reply in 1,000 turns.
 
+*As built (2026-11-20): a native job reading its fields rests until more of them arrives*
+(`crates/node/src/node/host.rs`, `crates/node/src/node.rs`). The open part of the note on every
+kind of job resting. A native job's first steps read its request's fields from its exchange
+(`Node::read_fields`), on the node's own host, before its work is made or handed to a driving
+shard; `Job::rests` said no for it, so a request whose fields came in more than one arrival was
+stepped at every turn until the last came, each step reading nothing.
+- **The transport says each arrival after a read that took what had come**, the edge-triggered
+  contract of epoll(7) (research/99 [1]). hyper-transport's `Core::read_body` clears the exchange's
+  `ready_sent` at every read of a body arriving, and each STREAM frame QUIC takes for the stream
+  says `Readable` (hyper-quic's `StreamsState::received`), on which `Core::read_step` says
+  `BodyReady` where `ready_sent` is clear, then sets it. A request's fields are its body's first
+  bytes (`object::Head::decode` holds the fields, the put's length and the trailer to the body's),
+  so its exchange is reading its body throughout. Held by a test of its own
+  (`tests/exchange.rs`, `an_owner_reading_only_as_it_is_told_reads_the_whole_body`, a test-only
+  row in `vendor/UPSTREAM.md`): an owner that reads a 4 MiB body only at its request and at each
+  `BodyReady`, each time until a read takes none, reads it whole and verified, where with the
+  clear of `ready_sent` taken out (run once, not kept) it read 13,110 of its 4,194,304 bytes and
+  was told no more; before it, the suites' servers read every exchange at every turn, and no test
+  held the contract.
+- **The job's step reads until a read takes none** (`Node::read_fields`, unchanged): it ends with
+  its fields whole, its asker gone, or a read that took nothing, the transport's `EAGAIN`. A job
+  still reading its fields after its step rests where its door holds a call, as every native job
+  resting on its door does (`Job::rests`).
+- **The node's task wakes it as more arrives** (`Node::on_event`, `Host::arrived`): the
+  exchange's `BodyReady`, taken before the host's step, wakes its job where it reads its fields,
+  found by its exchange in one probe (`Host::job_of`), as it marks the exchange's feeding and
+  reply. The step that follows reads what arrived; an arrival after that read is said again. An
+  exchange that ends ends its job (`Node::job_lost`), resting or not.
+
+Tested (`node::host`, the rule before measured by the same test run with no calls, on which no
+native job rests on its door): 64 native GETs whose fields arrive in two halves 32 turns apart
+are stepped at their first turn, reading the first half (64), not at all for 32 turns, then as
+the rest arrives and each is woken (64), and as each get asks its version, gives its head and
+gives its end (64 each): 320 steps over 38 turns, five a job, where the rule before took 2,368,
+37 a job, 33 of them reading its fields; each answered `Done` with no bytes, its exchange ended.
+
+Open: a copy whose get has given its last bytes, held because its put takes none of them now, is
+stepped at every turn until its put's next answer (`Job::rests`' `got` waits for the copy's end
+given, `Copying::ended`).
+
 *As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
 The node's task reads every native body, so it reads them as upload-stall's job did, never into a
 piece of the endpoint's budget: a job's fields straight into their buffer, made at their length as

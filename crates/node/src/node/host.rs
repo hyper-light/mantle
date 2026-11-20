@@ -246,7 +246,12 @@ impl Job {
     /// - a put not over whose driver takes none of its body now waits on its asks;
     /// - a put whose driver wants its body found its door's channel empty, or a get or its last
     ///   answers found no room in its door's reply, a native one's until the node's task wrote
-    ///   the last whole: the door names it as more comes or room frees.
+    ///   the last whole: the door names it as more comes or room frees;
+    /// - any other kind has an ask of its own out and nothing more to ask or feed until one is
+    ///   answered: a single read, a command, a bucket's or an operator's request, or a copy
+    ///   reading a row, version or mark, at once; a batch delete with none refused for the
+    ///   node's room; a completion or a running copy with no request held for it and no outcome
+    ///   to answer, a copy's get holding nothing its put takes now. None of these reads its door.
     ///
     /// A job whose door names it not, made with no mark or call, is turned at every step.
     fn rests(&self) -> bool {
@@ -285,7 +290,50 @@ impl Job {
                 Some(get) => roomless || (asking && !get.ready() && get.outcome().is_none()),
             },
             Work::Answering(_) => roomless,
-            _ => false,
+            // One read, one command, a bucket's coordinator's next request, an operator's
+            // request, and a copy's row, version or mark: its step asks nothing while an ask of
+            // its own is out.
+            Work::Read(_) | Work::Command(_) | Work::Bucket(_) | Work::Admin(_) => asking,
+            Work::Copy(copying) if copying.stage != CopyStage::Run => asking,
+            // Its deletes out to its share of the node's commands, or every one asked: only an
+            // answer lets it ask the next.
+            Work::Deletes(deleting) => asking && !deleting.held,
+            // Its driver asks the next request as an answer moves it, none held for want of the
+            // node's room.
+            Work::Complete(completing) => {
+                asking
+                    && completing.waiting.is_empty()
+                    && completing
+                        .completion
+                        .as_ref()
+                        .is_none_or(|completion| completion.outcome().is_none())
+            }
+            // Its get and its put each wait on their asks, as a get and a put do: the get holds no
+            // plaintext the put could take, or the put takes none now, and neither driver has
+            // a request held for want of room or an outcome to answer.
+            Work::Copy(copying) => {
+                let (Some(get), Some(put)) = (copying.get.as_ref(), copying.put.as_ref()) else {
+                    return false;
+                };
+                let fed = match &copying.carry {
+                    Some((bytes, took)) => bytes.len() > *took && !put.wants_body(),
+                    None => !get.ready(),
+                };
+                let got = match get.outcome() {
+                    None => true,
+                    Some(Ok(())) => copying.ended,
+                    Some(Err(_)) => false,
+                };
+                asking
+                    && fed
+                    && got
+                    && put.outcome().is_none()
+                    && !put.waits_for_room()
+                    && !get.waits_for_room()
+                    && copying.get_waiting.is_empty()
+                    && copying.put_waiting.is_empty()
+            }
+            Work::Fields(..) | Work::Handing(_) | Work::Draining(_) => false,
         }
     }
 
@@ -483,6 +531,11 @@ pub(crate) struct Host {
     /// here as it is woken (`Host::wake`) and taken out as its turn leaves it resting
     /// (`Host::rest`). Bound: one a job.
     ready: Earliest,
+    /// Its jobs whose fields were read for a driving shard (`Work::Handing`), each keyed by when,
+    /// on the shard's clock, it was first keyed so: the node's task hands these alone, the first
+    /// first (`Host::handing`, `Node::hand_off`), where a pass of every job looked for them at
+    /// each turn. Kept as each job is keyed (`Host::rekey`). Bound: one a job.
+    handovers: Earliest,
     /// Wakes counted, the key of the next job woken (`Host::wake`): from a `u64` count no node's
     /// wakes wrap.
     woken: u64,
@@ -861,6 +914,7 @@ impl Host {
             room_offered_ns: 0,
             rooms: Earliest::default(),
             ready: Earliest::default(),
+            handovers: Earliest::default(),
             woken: 0,
             due: Vec::new(),
             offered: Vec::new(),
@@ -891,6 +945,7 @@ impl Host {
         self.renewals.grow();
         self.rooms.grow();
         self.ready.grow();
+        self.handovers.grow();
         if !resting {
             self.wake(at);
         }
@@ -915,6 +970,7 @@ impl Host {
         self.renewals.swap_remove(at);
         self.rooms.swap_remove(at);
         self.ready.swap_remove(at);
+        self.handovers.swap_remove(at);
         if let Some(moved) = self.jobs.get(at) {
             self.exchanges.hold(moved.door.exchange(), at);
             self.named.hold(moved.door.named(), at);
@@ -1106,9 +1162,12 @@ impl Host {
         let waiting = job
             .waits_for_room()
             .then(|| self.rooms.key(at).unwrap_or(now));
+        let handing =
+            matches!(job.work, Work::Handing(_)).then(|| self.handovers.key(at).unwrap_or(now));
         self.beats.set(at, due);
         self.renewals.set(at, renewal);
         self.rooms.set(at, waiting);
+        self.handovers.set(at, handing);
     }
 
     /// The slot of the job of the native request on `exchange`.
@@ -1168,18 +1227,14 @@ impl Host {
         );
     }
 
-    /// The first native job from slot `from` on whose fields were read for a driving shard
-    /// (`Work::Handing`), taken out to be handed there: its request and its exchange. `from` is
-    /// left at its slot, where the job moved into it is looked at next, so a turn's handing passes
-    /// each job once, not every job again for each one handed.
-    fn handing(&mut self, from: &mut usize) -> Option<(Box<Handover>, Option<ExchangeId>)> {
-        let at = self
-            .jobs
-            .get(*from..)?
-            .iter()
-            .position(|job| matches!(job.work, Work::Handing(_)))?
-            .checked_add(*from)?;
-        *from = at;
+    /// The first native job whose fields were read for a driving shard (`Work::Handing`), taken
+    /// out to be handed there: its request and its exchange. Found among the handovers alone
+    /// (`handovers`), so a turn's handing reads the jobs it hands and no other, where a pass of
+    /// every job looked for them at each turn the node drives shards.
+    fn handing(&mut self) -> Option<(Box<Handover>, Option<ExchangeId>)> {
+        let (_, at) = self.handovers.least()?;
+        #[cfg(test)]
+        tests::READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let job = self.remove(at)?;
         let (Door::Native(exchange, half), Work::Handing(handing)) = (job.door, job.work) else {
             return None;
@@ -3064,6 +3119,8 @@ pub(crate) struct Deleting {
     next: usize,
     /// Deletes asked and not yet answered.
     out: usize,
+    /// The node had no room for its next delete at its last turn: asked again at the next.
+    held: bool,
     results: Vec<Option<Deleted>>,
 }
 
@@ -3279,6 +3336,10 @@ struct Commanding {
     then: Then,
     /// The command asked.
     asked: bool,
+    /// The bucket's row, read and kept while the node has no room for the command made from it:
+    /// made and asked at a later turn, as a completion's and a put's requests wait, so nothing of
+    /// the request is spent on an ask the node refuses.
+    row: Option<Bucket>,
 }
 
 /// The command a bucket's row is read for.
@@ -4688,10 +4749,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.driving.is_empty() {
             return;
         }
-        // Each job passed once: one handed leaves its slot to the job moved into it, and one its
-        // lane refuses runs here as a job pushed last, not handed.
-        let mut from = 0;
-        while let Some((request, exchange)) = self.host.handing(&mut from) {
+        // Each handover taken once: one its lane refuses runs here as a job pushed last, its work
+        // made from its operation, not handed again.
+        while let Some((request, exchange)) = self.host.handing() {
             let lanes = self
                 .driving
                 .iter()
@@ -7330,6 +7390,22 @@ impl Host {
         if !pending.is_empty() || commanding.asked {
             return Ok(false);
         }
+        if let Some(Job {
+            work: Work::Command(commanding),
+            ..
+        }) = self.jobs.get_mut(at)
+            && let Some(row) = commanding.row.take()
+        {
+            self.command_read(node, at, Read::Bucket(Some(row)))?;
+            return self.moved_on(at);
+        }
+        let Some(Job {
+            work: Work::Command(commanding),
+            ..
+        }) = self.jobs.get(at)
+        else {
+            return Ok(true);
+        };
         let Some(group) = node.group_of(Layer::Bucket) else {
             self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
@@ -7369,6 +7445,13 @@ impl Host {
         else {
             return Ok(());
         };
+        // A command the node has no room for is refused before it is asked (`Node::command`),
+        // its value given up: the row is kept and the command made at a later turn, where one
+        // made and refused was never asked again and its job, holding no ask, had no bound.
+        if !node.command_room() {
+            commanding.row = Some(row);
+            return Ok(());
+        }
         let (group, command) = match &mut commanding.then {
             Then::Delete {
                 key,
@@ -7727,6 +7810,7 @@ impl Host {
             let asked = node.ask(JobAsk::Read(group, query));
             return self.asked(node, at, asked, None);
         };
+        deleting.held = false;
         let Some(group) = node.group_of(Layer::Name) else {
             self.fail_job(node, at, Status::Failed)?;
             return self.drain_job(at);
@@ -7804,7 +7888,16 @@ impl Host {
                     }
                 }
                 // The node holds as many commands as it keeps: the rest are asked at a later turn.
-                Err(NodeError::Asks) => break,
+                Err(NodeError::Asks) => {
+                    if let Some(Job {
+                        work: Work::Deletes(deleting),
+                        ..
+                    }) = self.jobs.get_mut(at)
+                    {
+                        deleting.held = true;
+                    }
+                    break;
+                }
                 Err(_) => {
                     self.fail_job(node, at, Status::Failed)?;
                     return self.drain_job(at);
@@ -8884,6 +8977,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                     named,
                 },
                 asked: false,
+                row: None,
             })),
         },
         Op::PutVersioning {
@@ -8895,6 +8989,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                 mantle_s3::body::Versioning::Suspended => Versioning::Suspended,
             }),
             asked: false,
+            row: None,
         })),
         Op::GetVersioning { bucket } => Work::Read(Box::new(Single::Versioning(bucket))),
         // A checksum type its algorithm does not have: a full-object hash or a composite
@@ -8924,6 +9019,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                 metadata,
             },
             asked: false,
+            row: None,
         })),
         Op::UploadPart { length, .. } if length > name::MAX_PART => {
             Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
@@ -8983,6 +9079,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
             bucket,
             then: Then::Abort { key, upload },
             asked: false,
+            row: None,
         })),
         // A native upload's object is held to a CRC, which combines from its runs' (05 §3.3).
         Op::Open { checksum, .. } if !checksum.full_object() => {
@@ -9012,6 +9109,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                         metadata,
                     },
                     asked: false,
+                    row: None,
                 })),
                 // No run fits: an object past what 10,000 runs of S3's largest part hold, or a
                 // buffer below its least part or too small for the length's runs.
@@ -9162,6 +9260,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
                 row: None,
                 next: 0,
                 out: 0,
+                held: false,
                 results,
             }))
         }
@@ -9682,6 +9781,7 @@ pub(super) mod tests {
             self.renewals.audit(self.jobs.len(), "renewal");
             self.rooms.audit(self.jobs.len(), "room");
             self.ready.audit(self.jobs.len(), "wake");
+            self.handovers.audit(self.jobs.len(), "handover");
             for (at, job) in self.jobs.iter().enumerate() {
                 assert_eq!(
                     self.ready.key(at).is_some(),
@@ -9726,6 +9826,11 @@ pub(super) mod tests {
                     self.rooms.key(at).is_some(),
                     job.waits_for_room(),
                     "job {at} among the waiters for room"
+                );
+                assert_eq!(
+                    self.handovers.key(at).is_some(),
+                    matches!(job.work, Work::Handing(_)),
+                    "job {at} among the handovers exactly where it is handed"
                 );
                 beats.extend(key);
             }
@@ -10321,6 +10426,425 @@ pub(super) mod tests {
                 "{answers:?}"
             );
         }
+    }
+
+    /// Runs 64 jobs of `work` through the S3 door on a stub answering each ask with `answer`, each
+    /// answer given 32 turns after its ask, as a range's log answers many turns of a loaded node's
+    /// task later: the turns they took, the steps, and each one's answers on its door.
+    fn held_jobs(
+        work: impl Fn() -> Work,
+        answer: fn(&JobAsk) -> Outcome,
+    ) -> (u64, u64, Vec<Vec<door::Answer>>) {
+        const JOBS: usize = 64;
+        const LATE: u64 = 32;
+        let now = hyper_rt::futures::now_ns();
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        let mut host = Host::new(JOBS, Some(std::sync::Arc::new(gateway)));
+        let mut replies = Vec::new();
+        for _ in 0..JOBS {
+            let (job, _, answers) = local_job(work(), now, 1);
+            host.push(job, now);
+            replies.push(answers);
+        }
+        let mut stub = put_and_get_stub();
+        stub.answer = answer;
+        stub.table = Some(Table::empty(0));
+        let mut held: VecDeque<(u64, (Pending, Outcome))> = VecDeque::new();
+        let _ = clock_reads();
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 1_000, "the jobs never ended");
+            while held.front().is_some_and(|(asked, _)| asked + LATE <= turns) {
+                let (_, answer) = held.pop_front().unwrap();
+                stub.answers.push(answer);
+            }
+            host.step(&mut stub).unwrap();
+            held.extend(stub.answers.drain(..).map(|answer| (turns, answer)));
+        }
+        let (_, steps) = clock_reads();
+        (turns, steps, replies.iter_mut().map(answered).collect())
+    }
+
+    /// Whether `answers` are a reply of `status` and its end, the reply as `reply` holds.
+    fn replied(answers: &[door::Answer], status: Status, reply: impl Fn(&Reply) -> bool) -> bool {
+        matches!(answers, [door::Answer::Head(head), door::Answer::End]
+            if head.status == status && reply(head))
+    }
+
+    /// 64 HeadBuckets whose bucket's row is read 32 turns after it is asked take 128 steps, each
+    /// stepped as it asks and as it is answered, where every turn stepped every one, 2,112, 33 a
+    /// job; each answered `Done`.
+    #[test]
+    fn a_single_read_is_stepped_only_as_it_is_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || Work::Read(Box::new(Single::HeadBucket("b".into()))),
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                _ => panic!("an ask a HeadBucket does not make"),
+            },
+        );
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::Done, |_| true), "{answers:?}");
+        }
+    }
+
+    /// 64 DeleteObjects of three keys each, its bucket's row read first, then one delete out at a
+    /// time (the stub's one command, an operation's share), each answer 32 turns after its ask:
+    /// 320 steps, five a job, its row and three deletes asked and its reply given, where every turn
+    /// stepped every one, 8,256, 129 a job; each answered `Done` listing its three keys deleted.
+    #[test]
+    fn a_batch_delete_is_stepped_only_as_its_deletes_are_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                let objects: Vec<Target> = ["a", "b", "c"]
+                    .into_iter()
+                    .map(|key| Target {
+                        key: key.into(),
+                        version: None,
+                        etag: None,
+                    })
+                    .collect();
+                Work::Deletes(Box::new(Deleting {
+                    bucket: "b".into(),
+                    results: vec![None; objects.len()],
+                    objects,
+                    quiet: false,
+                    row: None,
+                    next: 0,
+                    out: 0,
+                    held: false,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                    Answer::Name(name::Outcome::Deleted {
+                        marker: false,
+                        version: None,
+                    }),
+                )),
+                _ => panic!("an ask a DeleteObjects does not make"),
+            },
+        );
+        assert_eq!(turns, 129, "its row and three deletes, each 32 turns");
+        assert_eq!(
+            steps,
+            5 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::Done, |reply| matches!(
+                    &reply.listing,
+                    Some(Listing::Deleted(deleted)) if deleted.len() == 3
+                        && deleted.iter().all(|d| d.status == Status::Done)
+                )),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// 64 CompleteMultipartUploads of one part, each ask answered 32 turns after it is asked: the
+    /// bucket's row, then the driver's upload row, which finds none, then its Complete asked as a
+    /// retry of one that may have committed, which the Name range answers `NoSuchUpload`: 256
+    /// steps, four a job, where every turn stepped every one, 6,208, 97 a job; each answered
+    /// `NoSuchUpload`, its driver's outcome.
+    #[test]
+    fn a_completion_is_stepped_only_as_its_driver_is_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Complete(Box::new(Completing {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    upload: "0123456789ABC".into(),
+                    listed: vec![(1, "0".repeat(32))],
+                    native: None,
+                    preconditions: Preconditions::default(),
+                    completion: None,
+                    waiting: VecDeque::new(),
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Read(_, Query::Upload { .. }) => {
+                    Outcome::Read(ReadOutcome::Read(Box::new(Read::Upload(None))))
+                }
+                JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                    Answer::Name(name::Outcome::NoSuchUpload),
+                )),
+                _ => panic!("an ask a completion of no upload does not make"),
+            },
+        );
+        assert_eq!(
+            turns, 97,
+            "its row, its upload and its Complete, each 32 turns"
+        );
+        assert_eq!(
+            steps,
+            4 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::NoSuchUpload, |_| true),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// 64 CopyObjects of an empty source, each read answered 32 turns after it is asked: the
+    /// destination's bucket's row, the source's version, then its put's commit: 256 steps, four
+    /// a job, where every turn stepped every one, 6,208, 97 a job; each answered `Done` with the
+    /// version committed. And 64 whose source is gone take three steps each, 192, where every
+    /// turn stepped every one, 4,160; each answered `NoSuchKey`.
+    #[test]
+    fn a_copy_is_stepped_only_as_its_reads_and_its_drivers_are_answered() {
+        fn copy() -> Work {
+            work(
+                Op::Copy(Box::new(object::Copy {
+                    bucket: "b".into(),
+                    key: "k2".into(),
+                    id: 1,
+                    source: mantle_s3::copy::Source {
+                        bucket: "b".into(),
+                        key: "k".into(),
+                        version: None,
+                    },
+                    conditions: Headers::default(),
+                    headers: Headers::default(),
+                    directive: Directive::Copy,
+                    metadata: Vec::new(),
+                    checksum: None,
+                })),
+                None,
+            )
+        }
+        let (turns, steps, replies) = held_jobs(copy, |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Current(Some((1, empty_version()))),
+            ))),
+            JobAsk::Command(_, Command::Name(_)) => {
+                Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                    version: mantle_meta::key::version_id(1),
+                })))
+            }
+            _ => panic!("an ask a copy of an empty source does not make"),
+        });
+        assert_eq!(
+            turns, 97,
+            "its row, its source and its commit, each 32 turns"
+        );
+        assert_eq!(
+            steps,
+            4 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::Done, |reply| reply.version
+                    == mantle_meta::key::version_id(1)),
+                "{answers:?}"
+            );
+        }
+        let (turns, steps, replies) = held_jobs(copy, |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Read(_, Query::Current { .. }) => {
+                Outcome::Read(ReadOutcome::Read(Box::new(Read::Current(None))))
+            }
+            _ => panic!("an ask a copy of no source does not make"),
+        });
+        assert_eq!(turns, 65, "its row and its source, each 32 turns");
+        assert_eq!(
+            steps,
+            3 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::NoSuchKey, |_| true), "{answers:?}");
+        }
+    }
+
+    /// 64 DeleteBuckets of a bucket gone, its row read for its owner 32 turns after it is asked,
+    /// take 128 steps, where every turn stepped every one, 2,112; each answered `NoSuchBucket`.
+    #[test]
+    fn a_bucket_operation_is_stepped_only_as_it_is_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Bucket(Box::new(Coordinating {
+                    bucket: "b".into(),
+                    delete: true,
+                    owned: false,
+                    coordinator: None,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => {
+                    Outcome::Read(ReadOutcome::Read(Box::new(Read::Bucket(None))))
+                }
+                _ => panic!("an ask a DeleteBucket of no bucket does not make"),
+            },
+        );
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(
+                replied(answers, Status::NoSuchBucket, |_| true),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// 64 DeleteObjects, each its bucket's row read and then its delete, each answered 32 turns
+    /// after it is asked: 192 steps, three a job, where every turn stepped every one, 4,160, 65 a
+    /// job; each answered `Done`. And 64 ListPrincipals, an operator's read of the root range: 128
+    /// steps, where every turn stepped every one, 2,112; each answered `Done`.
+    #[test]
+    fn a_command_and_an_operators_request_are_stepped_only_as_they_are_answered() {
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Command(Box::new(Commanding {
+                    bucket: "b".into(),
+                    then: Then::Delete {
+                        key: "k".into(),
+                        if_match: None,
+                        named: None,
+                    },
+                    asked: false,
+                    row: None,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Bucket(Some(bucket_row()))),
+                )),
+                JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                    Answer::Name(name::Outcome::Deleted {
+                        marker: false,
+                        version: None,
+                    }),
+                )),
+                _ => panic!("an ask a DeleteObject does not make"),
+            },
+        );
+        assert_eq!(turns, 65, "its row and its delete, each 32 turns");
+        assert_eq!(
+            steps,
+            3 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::Done, |_| true), "{answers:?}");
+        }
+        let (turns, steps, replies) = held_jobs(
+            || {
+                Work::Admin(Box::new(Administering {
+                    asking: Admin::Read {
+                        query: Query::Principals {
+                            after: None,
+                            max: 10,
+                        },
+                        one: false,
+                    },
+                    asked: false,
+                    issued: None,
+                }))
+            },
+            |ask| match ask {
+                JobAsk::Read(_, Query::Principals { .. }) => Outcome::Read(ReadOutcome::Read(
+                    Box::new(Read::Principals(Principals::default())),
+                )),
+                _ => panic!("an ask a ListPrincipals does not make"),
+            },
+        );
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each stepped as it asks and as it is answered"
+        );
+        for answers in &replies {
+            assert!(replied(answers, Status::Done, |_| true), "{answers:?}");
+        }
+    }
+
+    /// A DeleteObject whose bucket's row comes while the node has no room for its delete keeps
+    /// the row and asks the delete at its next turn with room, answered `Done`; where the delete
+    /// was made, refused and never asked again, the job held no ask and no bound and was stepped
+    /// for good (measured: no reply in 1,000 turns). It does not rest meanwhile.
+    #[test]
+    fn a_command_the_node_has_no_room_for_is_asked_at_a_later_turn() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
+        let (job, _, mut answers) = local_job(
+            Work::Command(Box::new(Commanding {
+                bucket: "b".into(),
+                then: Then::Delete {
+                    key: "k".into(),
+                    if_match: None,
+                    named: None,
+                },
+                asked: false,
+                row: None,
+            })),
+            now,
+            1,
+        );
+        host.push(job, now);
+        let mut stub = put_and_get_stub();
+        stub.answer = |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                Answer::Name(name::Outcome::Deleted {
+                    marker: false,
+                    version: None,
+                }),
+            )),
+            _ => panic!("an ask a DeleteObject does not make"),
+        };
+        host.step(&mut stub).unwrap();
+        assert_eq!(stub.asked, 1, "its row asked");
+        // Its row comes while the node holds as many commands as it keeps.
+        stub.no_room = true;
+        for _ in 0..4 {
+            host.step(&mut stub).unwrap();
+            assert!(!host.jobs[0].resting, "a job holding no ask does not rest");
+        }
+        assert_eq!(stub.asked, 1, "no command asked without room");
+        stub.no_room = false;
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 1_000, "the delete was never asked");
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(stub.asked, 2, "its row, then its delete");
+        let answers = answered(&mut answers);
+        assert!(replied(&answers, Status::Done, |_| true), "{answers:?}");
     }
 
     /// A native request's job of `work`, handed with its fields read (`handed_job`), named `name`
@@ -12576,6 +13100,9 @@ pub(super) mod tests {
 
     impl Serve for Stub {
         fn ask(&mut self, ask: JobAsk) -> Result<Pending, NodeError> {
+            if self.no_room {
+                return Err(NodeError::Asks);
+            }
             let pending = match &ask {
                 JobAsk::Command(..) => Pending::Command(self.asked),
                 JobAsk::Read(..) => Pending::Read(self.asked),
@@ -12614,7 +13141,7 @@ pub(super) mod tests {
         }
 
         fn command_room(&self) -> bool {
-            true
+            !self.no_room
         }
 
         fn room(&self, _: &JobAsk) -> bool {
@@ -15863,12 +16390,13 @@ pub(super) mod tests {
         assert_eq!(most, 512, "the run reached its most jobs");
     }
 
-    /// A turn's handing passes each job once (`Host::handing`, `Node::hand_off`): with 2,048 jobs,
-    /// every other one's fields read for a driving shard, each of those is taken out and the rest
-    /// stay, the jobs looked at at most the jobs and the ones handed, where a search of every job
-    /// from the first for each one handed looked at about an eighth of the jobs' square.
+    /// A turn's handing reads the handovers alone (`Host::handing`, `Node::hand_off`): with 2,048
+    /// jobs, every other one's fields read for a driving shard, each of those is taken out and
+    /// read once, 1,024 reads, and the rest stay; a turn with none to hand reads none. The pass
+    /// before looked at every job at each turn the node drives shards: 2,048 jobs at this turn
+    /// (`looked <= JOBS + handed`, its test), and 2,048 again at each turn with none to hand.
     #[test]
-    fn a_turns_handing_passes_each_job_once() {
+    fn a_turns_handing_reads_the_handovers_alone() {
         const JOBS: usize = 2048;
         let mut host = Host::new(1, Some(std::sync::Arc::new(scheming_gateway())));
         let mut halves = Vec::new();
@@ -15888,37 +16416,26 @@ pub(super) mod tests {
             host.push(job, 0);
             halves.push(half);
         }
-        let (mut from, mut looked, mut searched, mut handed) = (0, 0, 0, 0);
-        loop {
-            let before = from;
-            let taken = host.handing(&mut from);
-            match taken {
-                Some(_) => {
-                    // This call looked at the jobs from `before` to the one taken; a search from
-                    // the first would have looked at every one up to it.
-                    looked += from - before + 1;
-                    searched += from + 1;
-                    handed += 1;
-                }
-                None => {
-                    looked += host.jobs.len() - before;
-                    searched += host.jobs.len();
-                    break;
-                }
-            }
+        let _ = reads();
+        let mut handed = 0;
+        while let Some((handover, _)) = host.handing() {
+            assert!(matches!(handover.op, Op::Get { .. }));
+            handed += 1;
         }
-        println!(
-            "{handed} handed of {JOBS} jobs: {looked} looked at, {searched} by a search of each"
-        );
         assert_eq!(handed, JOBS / 2);
+        assert_eq!(
+            reads(),
+            (JOBS / 2) as u64,
+            "each handover read once, no other job"
+        );
+        assert!(host.handing().is_none());
+        assert_eq!(reads(), 0, "a turn with none to hand reads none");
         assert_eq!(host.jobs.len(), JOBS / 2);
         assert!(
             host.jobs
                 .iter()
                 .all(|job| !matches!(job.work, Work::Handing(_)))
         );
-        // Each job looked at once, and a job moved into a slot handed from looked at there again.
-        assert!(looked <= JOBS + handed, "{looked} looked at");
-        host.audit();
+        host.audit_keys(0);
     }
 }

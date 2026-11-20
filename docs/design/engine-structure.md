@@ -902,6 +902,21 @@ counted budget; no task waits on another node's:
   asks room for nine), and each of its tries at most a label a byte of the keys, which lie within
   the arena (`branch::Built::of`); a pool's builder is charged the larger of each part of the two,
   as its lists keep the most they grew to (`tests/builder_memory.rs`, a memtable's worst mixes).
+- **Filed by where each stands.** The queue keeps its tasks in plan order, each filed by state:
+  the inline and the ready ones the root's first, each in plan order, the order a pass steps and
+  hands them out in; those out by their job's ticket; the done ones in plan order, the order they
+  apply in; and every one by its node (`trunk::tasks`). A pass so costs the tasks it acts on: a
+  step with every seat held looks at the first ready task alone, a worker's result finds its task
+  by ticket, and the done ones apply without moving the rest. A rotation's owed room and whether
+  any task has begun (`Trunk::owed_room`, `Trunk::none_begun`) read the inline and the ready ones
+  alone, the only ones that may not have begun, and the room checks each task's step makes first
+  are the same, in the same order. The debt is a running total, each task's share (an inline
+  compaction's work left, a worker's job's planned entries) counted again whenever the task
+  changes, and the pending branches' entries as they come and go, so a put asks for it without a
+  walk. An index holds a task at most once, so the queue's bound is theirs.
+  Walking the whole queue for these was about 35% of the busy samples of a node's first shard
+  thread in a three-node cell taking 1-byte puts to a million objects (macOS `sample` on the Mac
+  Studio, 2026-11-20).
 
 Reads are unchanged: every apply runs on the shard's thread between steps, so a read sees each
 node either before or after a task, never half of one. A checkpoint saves the nodes as they are,

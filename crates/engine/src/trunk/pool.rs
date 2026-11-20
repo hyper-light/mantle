@@ -189,7 +189,7 @@ pub enum Owner {
 /// handed out. A worker freed while its result waits
 /// for its owner can take that owner's next job, so only the number tells two of an owner's jobs
 /// apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ticket {
     pub worker: usize,
     pub job: u64,

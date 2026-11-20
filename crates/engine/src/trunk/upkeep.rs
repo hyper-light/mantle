@@ -7,6 +7,10 @@
 
 use super::*;
 
+#[path = "tasks.rs"]
+mod tasks;
+pub(super) use tasks::Tasks;
+
 /// A change a node wants (CLAUDE.md §10's exclusivity): a leaf's settle into `parts` leaves, or
 /// an index node's split into nodes of at most `fanout` pivots. While a node wants a change that
 /// splits it, its parent's pivot for it plans no compaction and flushes its bundle down once, so
@@ -104,29 +108,6 @@ enum Running {
     Remote { grant: Vec<u64>, state: State },
 }
 
-impl Running {
-    fn done(&self) -> bool {
-        matches!(
-            self,
-            Running::Finished(_)
-                | Running::Remote {
-                    state: State::Done(_),
-                    ..
-                }
-        )
-    }
-
-    fn out(&self) -> bool {
-        matches!(
-            self,
-            Running::Remote {
-                state: State::Out(_),
-                ..
-            }
-        )
-    }
-}
-
 /// What a pivot does with its bundle now ([`Trunk::flush_due`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flush {
@@ -221,14 +202,11 @@ impl Trunk {
     /// so none gives extents back ([`Self::stalled_for_room`]).
     pub(crate) fn none_begun(&self) -> bool {
         self.abandoning.is_none()
-            && self.tasks.iter().all(|t| match &t.run {
-                Running::Inline(c) => c.opening(),
-                Running::Remote {
-                    state: State::Ready(_),
-                    ..
-                } => true,
-                _ => false,
-            })
+            && self.tasks.inline_or_ready()
+            && self
+                .tasks
+                .inline()
+                .all(|t| matches!(&t.run, Running::Inline(c) if c.opening()))
     }
 
     /// Whether maintenance or a rotation waits for extents the store does not have free beside
@@ -262,7 +240,7 @@ impl Trunk {
                 what: "unstarted tasks dropped beside one begun",
             });
         }
-        for mut t in std::mem::take(&mut self.tasks) {
+        for mut t in self.tasks.take_all() {
             if let Running::Inline(c) = &mut t.run {
                 c.cancel_opening(store);
             }
@@ -321,24 +299,30 @@ impl Trunk {
     }
 
     /// The maintenance estimate, in work units: the pending branches' entries, what inline
-    /// compactions have left, and the planned entries of those on the workers.
+    /// compactions have left, and the planned entries of those on the workers. Both are kept as
+    /// running totals (`pending_entries`, [`Tasks`]): every put asks for it, and the sum over
+    /// every task each ask took was 4.4% of a busy shard thread's samples (macOS `sample`,
+    /// 2026-11-20).
     pub fn debt(&self) -> u64 {
+        self.pending_entries.saturating_add(self.tasks.owed())
+    }
+
+    /// The pending branches' entries and the tasks' indices and debt, against a look at each: a
+    /// corruption if they differ.
+    #[cfg(test)]
+    pub(crate) fn check_tasks(&self) -> Result<(), Error> {
         let pending = self
             .pending
             .iter()
             .map(super::Pending::entries)
             .fold(0, u64::saturating_add);
-        self.tasks
-            .iter()
-            .map(|t| match &t.run {
-                Running::Inline(c) => c.remaining(),
-                Running::Remote {
-                    state: State::Ready(_) | State::Out(_),
-                    ..
-                } => t.units,
-                _ => 0,
-            })
-            .fold(pending, u64::saturating_add)
+        if pending != self.pending_entries {
+            return Err(Error::Corruption {
+                what: "the trunk's count of pending entries",
+                why: Malformed::CountMismatch,
+            });
+        }
+        self.tasks.check(self.root)
     }
 
     /// Runs maintenance, waiting on the workers, until the root has room for more branches.
@@ -482,6 +466,8 @@ impl Trunk {
             self.dispatch_tasks(store)?;
         }
         self.end_consolidation();
+        #[cfg(test)]
+        self.check_tasks()?;
         Ok(used)
     }
 
@@ -500,6 +486,7 @@ impl Trunk {
             p.period_started();
         }
         let root = self.root;
+        self.pending_entries = 0;
         for p in std::mem::take(&mut self.pending) {
             let entries = p.entries();
             self.entered = self.entered.saturating_add(entries);
@@ -767,9 +754,9 @@ impl Trunk {
 
     /// Whether a compaction of node `n`'s pivot keyed `key` is planned or out.
     fn compacting(&self, n: usize, key: &[u8]) -> bool {
-        self.tasks.iter().any(|t| {
-            t.node == n && matches!(&t.what, What::Compact { key: k, .. } if k.as_slice() == key)
-        })
+        self.tasks
+            .on(n)
+            .any(|t| matches!(&t.what, What::Compact { key: k, .. } if k.as_slice() == key))
     }
 
     /// Whether `pivot`'s child wants a change that splits it: the pivot then plans no
@@ -962,17 +949,21 @@ impl Trunk {
             )))
         };
         let key = pivot.key.clone();
-        self.tasks.push(NodeTask {
-            node: n,
-            what: What::Compact {
-                key,
-                start,
-                covered,
+        let root = self.root;
+        self.tasks.push(
+            NodeTask {
+                node: n,
+                what: What::Compact {
+                    key,
+                    start,
+                    covered,
+                },
+                run,
+                units,
+                reuse,
             },
-            run,
-            units,
-            reuse,
-        });
+            root,
+        )?;
         self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
         Ok(())
     }
@@ -1023,7 +1014,7 @@ impl Trunk {
     /// splits. A change that splits queues the parent, whose pivot flushes down to it.
     fn want_change(&mut self, n: usize) -> Result<(), Error> {
         let fanout = self.config.fanout;
-        let busy = self.tasks.iter().any(|t| t.node == n);
+        let busy = self.tasks.busy(n);
         let node = self.node(n)?;
         if node.wants.is_some() {
             return Ok(());
@@ -1068,7 +1059,7 @@ impl Trunk {
         let Some(change) = self.node(n)?.wants else {
             return Ok(());
         };
-        if change.started || self.tasks.iter().any(|t| t.node == n) {
+        if change.started || self.tasks.busy(n) {
             return Ok(());
         }
         let node = self.node(n)?;
@@ -1219,18 +1210,22 @@ impl Trunk {
         } else {
             Cause::Size
         };
-        self.tasks.push(NodeTask {
-            node: n,
-            what: What::Settle {
-                extents,
-                cause,
-                start,
-                covered,
+        let root = self.root;
+        self.tasks.push(
+            NodeTask {
+                node: n,
+                what: What::Settle {
+                    extents,
+                    cause,
+                    start,
+                    covered,
+                },
+                run,
+                units: count,
+                reuse,
             },
-            run,
-            units: count,
-            reuse,
-        });
+            root,
+        )?;
         if let Some(c) = self.node_mut(n)?.wants.as_mut() {
             c.started = true;
         }
@@ -1271,7 +1266,7 @@ impl Trunk {
     /// [`Self::inline_asked`], counted whole, so a grant never takes room one of them writes into.
     pub(crate) fn inline_room<F: BlockFile>(&self, store: &Store<F>) -> Result<u64, Error> {
         let mut room = 0u64;
-        for t in &self.tasks {
+        for t in self.tasks.inline() {
             if matches!(&t.run, Running::Inline(c) if c.holds_inputs() && !c.is_done()) {
                 room = room.saturating_add(self.inline_asked(store, t)?);
             }
@@ -1291,17 +1286,21 @@ impl Trunk {
     /// for the largest, at 19,804 with small branches sharing extents and 13,528 without
     /// (mantle-node tests/engine_workers.rs, 2026-11-20).
     pub(crate) fn owed_room<F: BlockFile>(&self, store: &Store<F>) -> Result<u64, Error> {
+        // A task not begun asks: an inline one still opening, or a worker's job not handed out.
         let mut most = 0u64;
-        for t in &self.tasks {
-            let asked = match &t.run {
-                Running::Inline(c) if c.opening() => self.inline_asked(store, t)?,
-                Running::Remote {
-                    state: State::Ready(task),
-                    ..
-                } => u64::try_from(grant_size(store, task)).unwrap_or(u64::MAX),
-                _ => 0,
-            };
-            most = most.max(asked);
+        for t in self.tasks.inline() {
+            if matches!(&t.run, Running::Inline(c) if c.opening()) {
+                most = most.max(self.inline_asked(store, t)?);
+            }
+        }
+        for t in self.tasks.ready() {
+            if let Running::Remote {
+                state: State::Ready(task),
+                ..
+            } = &t.run
+            {
+                most = most.max(u64::try_from(grant_size(store, task)).unwrap_or(u64::MAX));
+            }
         }
         Ok(self.inline_room(store)?.saturating_add(most))
     }
@@ -1317,129 +1316,133 @@ impl Trunk {
         // The merging timed where it runs, a clock read a task's step, so a step with no inline
         // task reads none: a compacted key's measured cost ([`Trunk::note_merge`]).
         let mut merge_ns = 0u64;
-        let root = self.root;
-        // Two passes, the root's tasks first: they free room for pending branches.
-        'passes: for roots in [true, false] {
-            // One task of a pass holds its inputs open at a time: one holding none opens only
-            // while no other of its pass holds any, so the shard holds two compactions' cursors
-            // and builders at most, the root's and one below (`shard_db::pooled_bytes`). Tasks
-            // step in the order they were planned, so the one holding them is the first of its
-            // pass, unless a lack of room for its output passed it over.
-            let mut holding = self.tasks.iter().any(|t| {
-                (t.node == root) == roots
-                    && matches!(&t.run, Running::Inline(c) if c.holds_inputs())
-            });
-            for at in 0..self.tasks.len() {
-                if self.tasks.get(at).is_none_or(|t| (t.node == root) != roots) {
-                    continue;
-                }
-                if used >= budget || self.io_waiting {
-                    break 'passes;
-                }
-                let yield_io = self.yield_io;
-                let Some(task) = self.tasks.get_mut(at) else {
-                    break 'passes;
-                };
-                let Running::Inline(c) = &mut task.run else {
-                    continue;
-                };
-                let opens = !c.holds_inputs();
-                if opens && holding {
-                    continue;
-                }
-                let opening = c.opening();
-                // A task about to write takes its output's room first, as a worker's job takes
-                // its grant (`dispatch_tasks`): the inputs' extents and one more a part, beside
-                // what the inline tasks writing now may still take and the room the next
-                // checkpoint takes ([`Self::room_kept`]); the file grown in place where the shard
-                // may, else asked of the shard's growth and the task stepped once it has grown.
-                // A store without that room holds the task: it waits for a job out or done to
-                // give extents back, or for the checkpoint that frees those the one before
-                // names. Begun without it, it took the store's last extent part way and fenced
-                // the store: a sustained fill of the node suite's 256-extent cell held 214 and
-                // had 42 waiting for the next checkpoint (mantle-node tests/engine_workers.rs).
-                if opening {
-                    let asked = self.inline_asked(store, self.tasks.get(at).ok_or(corrupt())?)?;
-                    let kept = self.room_kept(store)?;
-                    let need = asked
-                        .saturating_add(kept)
-                        .saturating_add(self.inline_room(store)?);
-                    if store.segments().is_some() && store.capacity() < need {
-                        if store.grows_in_place() {
-                            store.grow_now(need)?;
-                        }
-                        if store.capacity() < need {
-                            self.capacity_wanted = self.capacity_wanted.max(need);
-                            if store.room_most() < need {
-                                self.note_room_short(need);
-                            }
-                            continue;
-                        }
+        // Two passes, the root's tasks first: they free room for pending branches. The inline
+        // tasks are filed in that order ([`Tasks::next_inline`]), and a step plans none and makes
+        // none inline, so those filed when it begins bound the loop.
+        let mut pass = None;
+        let mut holding = false;
+        let mut last = None;
+        for _ in 0..self.tasks.inline_count() {
+            let Some((below, seq)) = self.tasks.next_inline(last) else {
+                break;
+            };
+            last = Some((below, seq));
+            if pass != Some(below) {
+                pass = Some(below);
+                // One task of a pass holds its inputs open at a time: one holding none opens only
+                // while no other of its pass holds any, so the shard holds two compactions'
+                // cursors and builders at most, the root's and one below
+                // (`shard_db::pooled_bytes`). Tasks step in the order they were planned, so the
+                // one holding them is the first of its pass, unless a lack of room for its output
+                // passed it over.
+                holding = self
+                    .tasks
+                    .inline_of(below)
+                    .any(|t| matches!(&t.run, Running::Inline(c) if c.holds_inputs()));
+            }
+            if used >= budget || self.io_waiting {
+                break;
+            }
+            let yield_io = self.yield_io;
+            let Some(task) = self.tasks.get(seq) else {
+                break;
+            };
+            let Running::Inline(c) = &task.run else {
+                continue;
+            };
+            let opens = !c.holds_inputs();
+            if opens && holding {
+                continue;
+            }
+            let opening = c.opening();
+            // A task about to write takes its output's room first, as a worker's job takes its
+            // grant (`dispatch_tasks`): the inputs' extents and one more a part, beside what the
+            // inline tasks writing now may still take and the room the next checkpoint takes
+            // ([`Self::room_kept`]); the file grown in place where the shard may, else asked of
+            // the shard's growth and the task stepped once it has grown. A store without that
+            // room holds the task: it waits for a job out or done to give extents back, or for
+            // the checkpoint that frees those the one before names. Begun without it, it took
+            // the store's last extent part way and fenced the store: a sustained fill of the node
+            // suite's 256-extent cell held 214 and had 42 waiting for the next checkpoint
+            // (mantle-node tests/engine_workers.rs).
+            if opening {
+                let asked = self.inline_asked(store, task)?;
+                let kept = self.room_kept(store)?;
+                let need = asked
+                    .saturating_add(kept)
+                    .saturating_add(self.inline_room(store)?);
+                if store.segments().is_some() && store.capacity() < need {
+                    if store.grows_in_place() {
+                        store.grow_now(need)?;
                     }
                     if store.capacity() < need {
-                        self.note_room_short(need);
+                        self.capacity_wanted = self.capacity_wanted.max(need);
+                        if store.room_most() < need {
+                            self.note_room_short(need);
+                        }
                         continue;
                     }
                 }
-                let Some(task) = self.tasks.get_mut(at) else {
-                    break 'passes;
-                };
-                let Running::Inline(c) = &mut task.run else {
+                if store.capacity() < need {
+                    self.note_room_short(need);
                     continue;
-                };
-                let node = self.nodes.get(task.node).ok_or(corrupt())?;
-                c.set_yield(yield_io);
-                let left = budget.saturating_sub(used);
-                let merging = std::time::Instant::now();
-                let step = c.step(store, task_inputs(node, &task.what)?, left);
-                merge_ns = merge_ns.saturating_add(ns_since(Some(merging)));
-                let spent = match step {
-                    Ok(spent) => spent,
-                    Err(error) => {
-                        // Opening was canceled before any output was built: the task stays, so a
-                        // caller can repair the read and resume. A later merge error may have
-                        // consumed output and is not restartable: the task goes and is planned anew.
-                        if !c.opening() {
-                            let task = self.tasks.remove(at);
-                            if let What::Settle { .. } = task.what
-                                && let Some(c) = self.node_mut(task.node)?.wants.as_mut()
-                            {
-                                c.started = false;
-                            }
-                            self.queue(task.node);
+                }
+            }
+            let Some(mut task) = self.tasks.get_mut(seq) else {
+                break;
+            };
+            let NodeTask {
+                node, what, run, ..
+            } = &mut *task;
+            let Running::Inline(c) = &mut *run else {
+                continue;
+            };
+            let node = self.nodes.get(*node).ok_or(corrupt())?;
+            c.set_yield(yield_io);
+            let left = budget.saturating_sub(used);
+            let merging = std::time::Instant::now();
+            let step = c.step(store, task_inputs(node, what)?, left);
+            merge_ns = merge_ns.saturating_add(ns_since(Some(merging)));
+            let spent = match step {
+                Ok(spent) => spent,
+                Err(error) => {
+                    // Opening was canceled before any output was built: the task stays, so a
+                    // caller can repair the read and resume. A later merge error may have
+                    // consumed output and is not restartable: the task goes and is planned anew.
+                    if !c.opening() {
+                        drop(task);
+                        let task = self.tasks.remove(seq).ok_or(corrupt())?;
+                        if let What::Settle { .. } = task.what
+                            && let Some(c) = self.node_mut(task.node)?.wants.as_mut()
+                        {
+                            c.started = false;
                         }
-                        return Err(error);
+                        self.queue(task.node);
                     }
-                };
-                used = used.saturating_add(spent);
-                self.io_waiting |= c.waiting();
-                holding = c.holds_inputs() && !c.is_done();
-                if opens && holding {
-                    self.note_opened();
+                    return Err(error);
                 }
-                let Some(task) = self.tasks.get_mut(at) else {
-                    break 'passes;
+            };
+            used = used.saturating_add(spent);
+            self.io_waiting |= c.waiting();
+            holding = c.holds_inputs() && !c.is_done();
+            if c.is_done() {
+                let Running::Inline(c) = std::mem::replace(run, Running::Finished(Vec::new()))
+                else {
+                    return Err(corrupt());
                 };
-                let Running::Inline(c) = &mut task.run else {
-                    continue;
-                };
-                if c.is_done() {
-                    let Running::Inline(c) =
-                        std::mem::replace(&mut task.run, Running::Finished(Vec::new()))
-                    else {
-                        return Err(corrupt());
-                    };
-                    let finishing = std::time::Instant::now();
-                    let parts = (*c).finish(store)?;
-                    let ns = ns_since(Some(finishing));
-                    merge_ns = merge_ns.saturating_add(ns);
-                    if self.timed {
-                        self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns);
-                    }
-                    if let Some(task) = self.tasks.get_mut(at) {
-                        task.run = Running::Finished(parts);
-                    }
+                let finishing = std::time::Instant::now();
+                let parts = (*c).finish(store)?;
+                let ns = ns_since(Some(finishing));
+                merge_ns = merge_ns.saturating_add(ns);
+                if self.timed {
+                    self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns);
                 }
+                *run = Running::Finished(parts);
+            }
+            // Let go, the task is filed as it now stands before the count below looks.
+            drop(task);
+            if opens && holding {
+                self.note_opened();
             }
         }
         self.note_merge(merge_ns, used);
@@ -1450,7 +1453,7 @@ impl Trunk {
     fn note_opened(&mut self) {
         let open = self
             .tasks
-            .iter()
+            .inline()
             .filter(|t| matches!(&t.run, Running::Inline(c) if c.holds_inputs() && !c.is_done()))
             .count();
         self.stats.open_most = self
@@ -1461,14 +1464,13 @@ impl Trunk {
 
     /// Applies every finished task, in plan order: each changes only its own node (and, for a
     /// settle that splits, its parent's pivot, held empty for it), and queues what it changed.
+    /// An apply plans and finishes none, so the done tasks when it begins bound the loop.
     fn apply_done<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
-        let mut at = 0usize;
-        while let Some(task) = self.tasks.get(at) {
-            if !task.run.done() {
-                at = at.saturating_add(1);
-                continue;
-            }
-            let task = self.tasks.remove(at);
+        for _ in 0..self.tasks.done_count() {
+            let Some(seq) = self.tasks.first_done() else {
+                break;
+            };
+            let task = self.tasks.remove(seq).ok_or(corrupt())?;
             self.apply_task(store, task)?;
         }
         Ok(())
@@ -1645,167 +1647,165 @@ impl Trunk {
             return Ok(());
         }
         let admit = self.admit();
-        let root = self.root;
         // Whether a job is out or done: its result gives back the grant it did not write as it is
         // taken, and its task frees its inputs as it applies.
-        let mut others = self.tasks.iter().any(|t| t.run.out() || t.run.done());
+        let mut others = self.tasks.out_or_done();
         // The inline tasks writing now take extents as they write: a grant leaves them room.
         let inline_room = self.inline_room(store)?;
-        // Two passes, the root's jobs first: they free room for pending branches.
-        for roots in [true, false] {
-            for at in 0..self.tasks.len() {
-                if self.tasks.get(at).is_none_or(|t| (t.node == root) != roots) {
-                    continue;
+        // Two passes, the root's jobs first: they free room for pending branches. The ready
+        // tasks are filed in that order ([`Tasks::next_ready`]), and a hand-out plans none and
+        // makes none ready, so those filed when it begins bound the loop: with every seat held,
+        // the first ends it.
+        let mut last = None;
+        for _ in 0..self.tasks.ready_count() {
+            let Some(key) = self.tasks.next_ready(last) else {
+                break;
+            };
+            last = Some(key);
+            let Some(NodeTask {
+                run: Running::Remote { state, .. },
+                ..
+            }) = self.tasks.get(key.1)
+            else {
+                continue;
+            };
+            let State::Ready(task) = state else {
+                continue;
+            };
+            let Some(pool) = self.pool.as_mut() else {
+                return Ok(());
+            };
+            if !pool.can_take(store, admit)? {
+                // Every seat held: only a worker's message frees one, so the shard waits for it
+                // rather than pass again.
+                pool.want_message();
+                return Ok(());
+            }
+            let mut landed = true;
+            for b in &task.inputs {
+                if wait {
+                    store.settle_extents(&b.extents)?;
+                } else if !store.landed(&b.extents)? {
+                    landed = false;
+                    break;
                 }
-                let Some(NodeTask {
-                    run: Running::Remote { state, .. },
-                    ..
-                }) = self.tasks.get_mut(at)
-                else {
-                    continue;
-                };
-                let State::Ready(task) = &*state else {
-                    continue;
-                };
-                let Some(pool) = self.pool.as_mut() else {
-                    return Ok(());
-                };
-                if !pool.can_take(store, admit)? {
-                    // Every seat held: only a worker's message frees one, so the shard waits for
-                    // it rather than pass again.
-                    pool.want_message();
-                    return Ok(());
+            }
+            if !landed {
+                continue;
+            }
+            // A pivot's compaction reads its slice of inputs that span the node: its grant is the
+            // extents the pages it writes at most fill, or all its inputs' extents when that is
+            // less, and the cache lends room for as many pages.
+            let pages = task.pages;
+            let needed = grant_size(store, task);
+            #[cfg(test)]
+            let needed = self.compact_most.map_or(needed, |most| needed.min(most));
+            let asked = u64::try_from(needed).unwrap_or(u64::MAX);
+            // And the next checkpoint's room ([`Self::room_kept`]), counted once a pass.
+            let need = asked.saturating_add(self.room_kept(store)?);
+            if store.segments().is_some() && store.capacity() < need {
+                if store.grows_in_place() {
+                    // Where the shard may wait, its file grows by the grant here.
+                    store.grow_now(need)?;
                 }
-                let mut landed = true;
-                for b in &task.inputs {
-                    if wait {
-                        store.settle_extents(&b.extents)?;
-                    } else if !store.landed(&b.extents)? {
-                        landed = false;
-                        break;
+                if store.capacity() < need {
+                    // The file's admitted extents cannot hold it yet: the shard grows the file by
+                    // at least this much, and the job goes out once they can.
+                    self.capacity_wanted = self.capacity_wanted.max(need);
+                    if store.room_most() < need {
+                        self.note_room_short(need);
                     }
-                }
-                if !landed {
                     continue;
                 }
-                // A pivot's compaction reads its slice of inputs that span the node: its grant is
-                // the extents the pages it writes at most fill, or all its inputs' extents when
-                // that is less, and the cache lends room for as many pages.
-                let pages = task.pages;
-                let needed = grant_size(store, task);
-                #[cfg(test)]
-                let needed = self.compact_most.map_or(needed, |most| needed.min(most));
-                let asked = u64::try_from(needed).unwrap_or(u64::MAX);
-                // And the next checkpoint's room ([`Self::room_kept`]), counted once a pass.
-                let need = asked.saturating_add(self.room_kept(store)?);
-                let Some(NodeTask {
-                    run: Running::Remote { grant, state },
-                    ..
-                }) = self.tasks.get_mut(at)
-                else {
-                    continue;
-                };
-                if store.segments().is_some() && store.capacity() < need {
-                    if store.grows_in_place() {
-                        // Where the shard may wait, its file grows by the grant here.
-                        store.grow_now(need)?;
-                    }
-                    if store.capacity() < need {
-                        // The file's admitted extents cannot hold it yet: the shard grows the
-                        // file by at least this much, and the job goes out once they can.
-                        self.capacity_wanted = self.capacity_wanted.max(need);
-                        if store.room_most() < need {
-                            self.note_room_short(need);
-                        }
-                        continue;
-                    }
-                }
-                if store.capacity() < need.saturating_add(inline_room) {
-                    // The store's extents hold no grant this size beside those held, the room
-                    // the inline tasks writing now still take and the next checkpoint's
-                    // ([`Self::room_kept`]). It waits while a job out or done may give extents
-                    // back; with none, it is handed to the shard, whose inline task takes the
-                    // same room first, or waits for the checkpoint that frees the extents the one
-                    // before names (`step_inline`). A grant so never takes room the store lacks
-                    // or an inline task writes into (a 10,200-row install fenced so, a grant of 4
-                    // out beside an inline compaction that then found none: mantle-node
-                    // tests/engine_workers.rs).
-                    if others {
-                        self.note_room_short(need.saturating_add(inline_room));
-                        continue;
-                    }
-                    let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
-                        continue;
-                    };
-                    let Task {
-                        from,
-                        end,
-                        drop_tombstones,
-                        per,
-                        ..
-                    } = *task;
-                    let t = self.tasks.get_mut(at).ok_or(corrupt())?;
-                    let node = self.nodes.get(t.node).ok_or(corrupt())?;
-                    let inline = Compaction::prepare(
-                        task_inputs(node, &t.what)?,
-                        from,
-                        end,
-                        drop_tombstones,
-                        per,
-                    );
-                    t.run = Running::Inline(Box::new(inline));
-                    continue;
-                }
-                let given = store.grant(needed)?;
+            }
+            // The store's extents hold no grant this size beside those held, the room the inline
+            // tasks writing now still take and the next checkpoint's ([`Self::room_kept`]). It
+            // waits while a job out or done may give extents back; with none, it is handed to the
+            // shard, whose inline task takes the same room first, or waits for the checkpoint that
+            // frees the extents the one before names (`step_inline`). A grant so never takes room
+            // the store lacks or an inline task writes into (a 10,200-row install fenced so, a
+            // grant of 4 out beside an inline compaction that then found none: mantle-node
+            // tests/engine_workers.rs).
+            let short = store.capacity() < need.saturating_add(inline_room);
+            if short && others {
+                self.note_room_short(need.saturating_add(inline_room));
+                continue;
+            }
+            let Some(mut t) = self.tasks.get_mut(key.1) else {
+                continue;
+            };
+            let NodeTask {
+                node, what, run, ..
+            } = &mut *t;
+            let Running::Remote { grant, state } = &mut *run else {
+                continue;
+            };
+            if short {
                 let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
                     continue;
                 };
-                grant.clone_from(&given);
-                let job = Box::new(pool::Job {
-                    work: Work::Compact(*task),
-                    grant: given,
-                    file_end: store.end(),
-                    generation: store.generation(),
-                    keep: store.lend_pages(pages),
-                });
-                let pool = self.pool.as_mut().ok_or(no_pool())?;
-                let sent = match pool.send(job, Owner::Trunk, admit) {
-                    Ok(sent) => sent,
-                    Err((error, job)) => {
-                        let job = *job;
-                        if let Some(kept) = job.keep {
-                            store.unlend_pages(*kept);
-                        }
-                        let Work::Compact(task) = job.work else {
-                            return Err(corrupt());
-                        };
-                        *state = State::Ready(Box::new(task));
-                        // Restoration precedes cleanup: a refused grant return keeps both the task
-                        // and its owned extent list available to terminal handling.
-                        store.grant_back(&job.grant)?;
-                        grant.clear();
-                        return Err(error);
+                let Task {
+                    from,
+                    end,
+                    drop_tombstones,
+                    per,
+                    ..
+                } = *task;
+                let node = self.nodes.get(*node).ok_or(corrupt())?;
+                let inline =
+                    Compaction::prepare(task_inputs(node, what)?, from, end, drop_tombstones, per);
+                *run = Running::Inline(Box::new(inline));
+                continue;
+            }
+            let given = store.grant(needed)?;
+            let State::Ready(task) = std::mem::replace(state, State::Dropped) else {
+                continue;
+            };
+            grant.clone_from(&given);
+            let job = Box::new(pool::Job {
+                work: Work::Compact(*task),
+                grant: given,
+                file_end: store.end(),
+                generation: store.generation(),
+                keep: store.lend_pages(pages),
+            });
+            let pool = self.pool.as_mut().ok_or(no_pool())?;
+            let sent = match pool.send(job, Owner::Trunk, admit) {
+                Ok(sent) => sent,
+                Err((error, job)) => {
+                    let job = *job;
+                    if let Some(kept) = job.keep {
+                        store.unlend_pages(*kept);
                     }
-                };
-                match sent {
-                    Ok(ticket) => {
-                        *state = State::Out(ticket);
-                        others = true;
+                    let Work::Compact(task) = job.work else {
+                        return Err(corrupt());
+                    };
+                    *state = State::Ready(Box::new(task));
+                    // Restoration precedes cleanup: a refused grant return keeps both the task
+                    // and its owned extent list available to terminal handling.
+                    store.grant_back(&job.grant)?;
+                    grant.clear();
+                    return Err(error);
+                }
+            };
+            match sent {
+                Ok(ticket) => {
+                    *state = State::Out(ticket);
+                    others = true;
+                }
+                Err(job) => {
+                    let job = *job;
+                    if let Some(kept) = job.keep {
+                        store.unlend_pages(*kept);
                     }
-                    Err(job) => {
-                        let job = *job;
-                        if let Some(kept) = job.keep {
-                            store.unlend_pages(*kept);
-                        }
-                        let Work::Compact(task) = job.work else {
-                            return Err(corrupt());
-                        };
-                        *state = State::Ready(Box::new(task));
-                        store.grant_back(&job.grant)?;
-                        grant.clear();
-                        pool.want_message();
-                        return Ok(());
-                    }
+                    let Work::Compact(task) = job.work else {
+                        return Err(corrupt());
+                    };
+                    *state = State::Ready(Box::new(task));
+                    store.grant_back(&job.grant)?;
+                    grant.clear();
+                    pool.want_message();
+                    return Ok(());
                 }
             }
         }
@@ -1820,7 +1820,7 @@ impl Trunk {
         // planned or applied here: the tasks bound it, and a last loop finds none out.
         for _ in 0..=self.tasks.len() {
             self.dispatch_tasks(store)?;
-            if !self.tasks.iter().any(|t| t.run.out()) {
+            if !self.tasks.has_out() {
                 return Ok(());
             }
             let wait = match self.wait {
@@ -1839,17 +1839,16 @@ impl Trunk {
                 return Ok(());
             };
             taken = taken.saturating_add(1);
-            let task = self.tasks.iter_mut().find(|t| {
-                matches!(&t.run, Running::Remote { state: State::Out(k), .. } if *k == back.ticket)
+            let mut task = self
+                .tasks
+                .out(back.ticket)
+                .and_then(|seq| self.tasks.get_mut(seq));
+            let remote = task.as_deref_mut().and_then(|t| match &mut t.run {
+                Running::Remote { grant, state } => Some((grant, state)),
+                _ => None,
             });
-            match (task, back.result) {
-                (
-                    Some(NodeTask {
-                        run: Running::Remote { grant, state },
-                        ..
-                    }),
-                    Ok(mut out),
-                ) => {
+            match (remote, back.result) {
+                (Some((grant, state)), Ok(mut out)) => {
                     grant.extend_from_slice(&back.topped);
                     // The grant it did not write goes back now, not when the task applies: a
                     // pass applies its tasks once every job of it is back, and a grant is sized
@@ -1866,15 +1865,11 @@ impl Trunk {
                     *state = State::Done(out);
                     given_back?;
                 }
-                (task, result) => {
+                (remote, result) => {
                     if let Some(kept) = back.kept {
                         store.unlend_pages(*kept);
                     }
-                    if let Some(NodeTask {
-                        run: Running::Remote { grant, state },
-                        ..
-                    }) = task
-                    {
+                    if let Some((grant, state)) = remote {
                         grant.extend_from_slice(&back.topped);
                         *state = State::Dropped;
                     }
@@ -1884,6 +1879,7 @@ impl Trunk {
                             what: "a maintenance worker's result for no job of its",
                         },
                     };
+                    drop(task);
                     self.abandoning = Some(error);
                     return self.abandon_tasks(store);
                 }
@@ -1900,7 +1896,7 @@ impl Trunk {
         let wait = self.wait != Wait::No;
         // Each loop takes a job back or returns: the jobs out bound it.
         for _ in 0..=self.tasks.len() {
-            if !self.tasks.iter().any(|t| t.run.out()) {
+            if !self.tasks.has_out() {
                 break;
             }
             let pool = self.pool.as_mut().ok_or(no_pool())?;
@@ -1911,21 +1907,22 @@ impl Trunk {
             if let Some(kept) = back.kept {
                 store.unlend_pages(*kept);
             }
-            for t in &mut self.tasks {
-                if let Running::Remote { grant, state } = &mut t.run
-                    && matches!(state, State::Out(k) if *k == back.ticket)
-                {
-                    grant.extend_from_slice(&back.topped);
-                    *state = State::Dropped;
-                }
+            if let Some(mut t) = self
+                .tasks
+                .out(back.ticket)
+                .and_then(|seq| self.tasks.get_mut(seq))
+                && let Running::Remote { grant, state } = &mut t.run
+            {
+                grant.extend_from_slice(&back.topped);
+                *state = State::Dropped;
             }
         }
-        if self.tasks.iter().any(|t| t.run.out()) {
+        if self.tasks.has_out() {
             self.workers_waiting = true;
             return Ok(());
         }
         let mut kept = Vec::with_capacity(self.tasks.len());
-        for t in std::mem::take(&mut self.tasks) {
+        for t in self.tasks.take_all() {
             match t.run {
                 Running::Remote { grant, state } => {
                     if let State::Done(out) = state
@@ -1946,7 +1943,11 @@ impl Trunk {
                 _ => kept.push(t),
             }
         }
-        self.tasks = kept;
+        // Filed again in plan order, under the same root.
+        let root = self.root;
+        for t in kept {
+            self.tasks.push(t, root)?;
+        }
         match self.abandoning.take() {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1956,22 +1957,12 @@ impl Trunk {
     /// Node `n`'s in-flight list lost its first `dead` bundles: its tasks' planned ranges move
     /// down with the list.
     pub(super) fn shift_tasks(&mut self, n: usize, dead: usize) {
-        for t in &mut self.tasks {
-            if t.node == n
-                && let What::Compact { start, covered, .. } | What::Settle { start, covered, .. } =
-                    &mut t.what
-            {
-                *start = start.saturating_sub(dead);
-                *covered = covered.saturating_sub(dead);
-            }
-        }
+        self.tasks.shift(n, dead);
     }
 
     /// An inline compaction before the runtime's workers are prepared.
     pub(super) fn inline_out(&self) -> bool {
-        self.tasks
-            .iter()
-            .any(|t| matches!(t.run, Running::Inline(_)))
+        self.tasks.has_inline()
     }
 }
 

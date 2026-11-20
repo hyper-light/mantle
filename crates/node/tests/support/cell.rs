@@ -109,10 +109,10 @@ pub const PROFILES: [(&str, u64, u64); 3] = [
     ("geographic", 500_000_000, 100_000_000),
 ];
 
-/// The range of a cell of `nodes`, each a founding voter, under `settings`.
-fn range(nodes: u64, settings: Settings) -> Range {
+/// The range of `layer` of a cell of `nodes`, each a founding voter, under `settings`.
+fn range(layer: Layer, nodes: u64, settings: Settings) -> Range {
     Range {
-        layer: Layer::Name,
+        layer,
         rules: RULES,
         boot: ConfState {
             voters: (1..=nodes).collect(),
@@ -122,6 +122,16 @@ fn range(nodes: u64, settings: Settings) -> Range {
         members: 0,
     }
 }
+
+/// The cell's five ranges, one of each layer as a cell's are (`process::ranges`), the Name range
+/// the one the clients ask of ([`GROUP`]).
+pub const LAYERS: [(u128, Layer); 5] = [
+    (GROUP - 2, Layer::Root),
+    (GROUP - 1, Layer::Bucket),
+    (GROUP, Layer::Name),
+    (GROUP + 1, Layer::File),
+    (GROUP + 2, Layer::Block),
+];
 
 /// The engine of a cell's first Name range, before any entry.
 fn first_range(mut engine: Model) -> Model {
@@ -455,7 +465,7 @@ impl Pki {
             messages: message_bounds(
                 &[Hosted {
                     group: GROUP,
-                    range: range(count, settings),
+                    range: range(Layer::Name, count, settings),
                     engine: (),
                 }],
                 CHUNK_BYTES,
@@ -519,6 +529,9 @@ enum Report {
     /// Where a node listens, once open.
     Bound(u64, SocketAddr, SocketAddr),
     Status(u64, Status),
+    /// Each range's leader and term as a node's member knows them, and the hand-overs it began to
+    /// spread the leads and of them those that failed, as they move.
+    Leads(u64, Leads),
     /// A node's power cut: its log and its range's engine, as they stood.
     Crashed(u64, SimLog, Vec<(u128, Model)>),
     /// A node stopped on an error, as its process would, giving back what it held.
@@ -544,6 +557,15 @@ enum Report {
     Suspected(u64, u64, u64),
 }
 
+/// What a node knows of the leads of its ranges ([`Report::Leads`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Leads {
+    /// Each range's group, the leader its member names (0: none) and its term.
+    pub led: Vec<(u128, u64, u64)>,
+    /// The hand-overs the node began to spread the leads, and those that failed.
+    pub moves: (u64, u64),
+}
+
 /// A node's task: opens the node on its log, reports where it listens, then turns it, each turn
 /// raced against the test's next order, reporting its status as it changes.
 async fn run_node(
@@ -556,6 +578,7 @@ async fn run_node(
     draw: u64,
 ) {
     let id = settings.id;
+    let groups: Vec<u128> = settings.ranges.iter().map(|hosted| hosted.group).collect();
     let opened = Node::open_on(settings, log)
         .await
         .map_err(|e| e.to_string())
@@ -577,6 +600,7 @@ async fn run_node(
         }
     };
     let mut told: Option<Status> = None;
+    let mut told_leads = Leads::default();
     // The suspicions of each peer last reported.
     let mut suspicions: Vec<(u64, u64)> = Vec::new();
     let mut drawn = (id ^ draw).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -747,6 +771,39 @@ async fn run_node(
             }
             told = status;
         }
+        // Each range's leader and term, compared with what was told before anything is made: a
+        // turn that moved none allocates nothing (`tests/turn_allocs.rs` counts the cell's turns).
+        // A node of one range says its leader in its status alone, so a cell of one range sends
+        // its reports as it did before the leads were reported: the counts `tests/turn_allocs.rs`
+        // pins include the reports' channel's blocks, which a report more moves.
+        if groups.len() < 2 {
+            continue;
+        }
+        let led = |group: u128| {
+            let status = node.status(group);
+            (
+                group,
+                status.map_or(0, |s| s.leader),
+                status.map_or(0, |s| s.term),
+            )
+        };
+        let moves = node.lead_moves();
+        let moved = moves != told_leads.moves
+            || told_leads.led.len() != groups.len()
+            || groups
+                .iter()
+                .zip(&told_leads.led)
+                .any(|(group, told)| led(*group) != *told);
+        if moved {
+            let leads = Leads {
+                led: groups.iter().map(|group| led(*group)).collect(),
+                moves,
+            };
+            if reports.send(Report::Leads(id, leads.clone())).is_err() {
+                return;
+            }
+            told_leads = leads;
+        }
     }
 }
 
@@ -759,6 +816,8 @@ pub struct Member {
     /// While it is down: its device and its engines, as its power cut left them.
     down: Option<(SimFile, Vec<(u128, Model)>)>,
     pub status: Option<Status>,
+    /// What it last said of its ranges' leads ([`Report::Leads`]).
+    pub leads: Leads,
     /// The device faults the test arms, while it runs.
     faults: Option<mpsc::Sender<DeviceFault>>,
     /// The stream writes the test wants refused for room, while it runs.
@@ -837,6 +896,8 @@ pub struct Sim {
     pub suspected: BTreeMap<(u64, u64), u64>,
     /// What a loaded node's stalls are drawn from beside its id ([`Sim::with_spare_drawn`]).
     draw: u64,
+    /// The ranges every node hosts, each by its group and layer.
+    layers: Vec<(u128, Layer)>,
 }
 
 /// A node's transport budget from its statement: its floor (`bounds::least_transport`) or with
@@ -875,7 +936,14 @@ impl Sim {
 
     /// The cell of `seed` of `nodes`, its range under `settings` and its nodes' logs under `log`.
     fn of(seed: u64, nodes: u64, settings: Settings, log: LogConfig, budget: Budget) -> Self {
-        Self::spared(seed, (nodes, nodes), (settings, log), budget, 0, 0)
+        Self::spared(
+            seed,
+            (nodes, nodes),
+            (settings, log),
+            budget,
+            (0, 0),
+            &[(GROUP, Layer::Name)],
+        )
     }
 
     /// The cell of `seed`, its range under `settings`, each node holding `command_asks` commands
@@ -887,8 +955,8 @@ impl Sim {
             (nodes, nodes),
             (settings, log_config()),
             bounds::least_transport,
-            command_asks,
-            0,
+            (command_asks, 0),
+            &[(GROUP, Layer::Name)],
         )
     }
 
@@ -906,8 +974,8 @@ impl Sim {
             (voters, voters + 1),
             (SETTINGS, log_config()),
             bounds::least_transport,
-            0,
-            draw,
+            (0, draw),
+            &[(GROUP, Layer::Name)],
         )
     }
 
@@ -917,8 +985,8 @@ impl Sim {
         (voters, nodes): (u64, u64),
         (settings, log): (Settings, LogConfig),
         budget: Budget,
-        command_asks: usize,
-        draw: u64,
+        (command_asks, draw): (usize, u64),
+        layers: &[(u128, Layer)],
     ) -> Self {
         let shards = usize::try_from(nodes + CLIENTS + 1).unwrap();
         let mut rt = SimRuntime::new(
@@ -967,6 +1035,7 @@ impl Sim {
                     bound: None,
                     down: None,
                     status: None,
+                    leads: Leads::default(),
                     faults: None,
                     refusals: None,
                     armed: false,
@@ -1011,6 +1080,7 @@ impl Sim {
             budget,
             suspected: BTreeMap::new(),
             draw,
+            layers: layers.to_vec(),
         };
         for id in 1..=nodes {
             let file = SimFile::new(
@@ -1020,21 +1090,62 @@ impl Sim {
             )
             .unwrap();
             let log = Log::create(file, cell.log, log_id(id)).unwrap();
-            cell.spawn(id, log, vec![(GROUP, first_range(Model::default()))]);
+            let engines = layers
+                .iter()
+                .map(|(group, layer)| {
+                    let engine = if *layer == Layer::Name {
+                        first_range(Model::default())
+                    } else {
+                        Model::default()
+                    };
+                    (*group, engine)
+                })
+                .collect();
+            cell.spawn(id, log, engines);
         }
-        cell.until("every node listens", |c| {
+        cell.listening()
+    }
+
+    /// The cell of `seed` of three nodes hosting the cell's five ranges ([`LAYERS`]), every node a
+    /// voter of each, its logs holding a group for each and the stream's.
+    pub fn ranged(seed: u64) -> Self {
+        let log = LogConfig {
+            max_groups: LAYERS.len() + 1,
+            ..log_config()
+        };
+        Self::spared(
+            seed,
+            (NODES, NODES),
+            (SETTINGS, log),
+            bounds::least_transport,
+            (0, 0),
+            &LAYERS,
+        )
+    }
+
+    /// Runs until every node listens, then tells each where the others do.
+    fn listening(mut self) -> Self {
+        self.until("every node listens", |c| {
             if c.members.values().all(|m| m.bound.is_some()) {
                 Some(())
             } else {
                 None
             }
         });
-        cell.introduce();
-        cell
+        self.introduce();
+        self
     }
 
     /// Starts node `id`'s task on its shard, on `log` with `engines`.
     fn spawn(&mut self, id: u64, log: Log<SimFile>, engines: Vec<(u128, Model)>) {
+        let hosted: Vec<Hosted<Model>> = engines
+            .into_iter()
+            .map(|(group, engine)| Hosted {
+                group,
+                range: range(self.layer_of(group), self.voters, self.settings),
+                engine,
+            })
+            .collect();
         let (orders, taken) = channel::<Order>(usize::try_from(self.nodes).unwrap() + 2).unwrap();
         let (faults, armed) = mpsc::channel();
         let (refusals, refused) = mpsc::channel();
@@ -1062,14 +1173,7 @@ impl Sim {
             credentials: self.pki.credentials(&self.pki.nodes[&id]),
             peers: self.pki.peers(id),
             addresses,
-            ranges: engines
-                .into_iter()
-                .map(|(group, engine)| Hosted {
-                    group,
-                    range: range(self.voters, self.settings),
-                    engine,
-                })
-                .collect(),
+            ranges: hosted,
             shards: std::num::NonZeroUsize::MIN,
             log: self.log,
             // The budget a node derives, from these settings' statement (below).
@@ -1111,6 +1215,14 @@ impl Sim {
                 run_node(settings, log, taken, tell, load, answer, self.draw),
             )
             .unwrap();
+    }
+
+    /// The layer of the range of `group`.
+    fn layer_of(&self, group: u128) -> Layer {
+        self.layers
+            .iter()
+            .find(|(g, _)| *g == group)
+            .map_or(Layer::Name, |(_, layer)| *layer)
     }
 
     /// Tells each running node where every other listens, and every client where each node does.
@@ -1240,6 +1352,7 @@ impl Sim {
         let member = self.members.get_mut(&id).unwrap();
         member.bound = None;
         member.status = None;
+        member.leads = Leads::default();
         member.down = Some((file, engines));
     }
 
@@ -1379,6 +1492,9 @@ impl Sim {
                 Report::Status(id, status) => {
                     self.members.get_mut(&id).unwrap().status = Some(status);
                 }
+                Report::Leads(id, leads) => {
+                    self.members.get_mut(&id).unwrap().leads = leads;
+                }
                 Report::Crashed(id, log, engines) => {
                     let file = only(log.log).close().unwrap();
                     self.members.get_mut(&id).unwrap().down = Some((file, engines));
@@ -1392,6 +1508,7 @@ impl Sim {
                     member.refusals = None;
                     member.bound = None;
                     member.status = None;
+                    member.leads = Leads::default();
                     member.down = Some((only(log.log).close().unwrap(), engines));
                 }
                 Report::Failed(id, why) => panic!("seed {}: {id} failed: {why}", self.seed),
@@ -1507,6 +1624,60 @@ impl Sim {
                 && named.iter().all(|n| *n == first);
             if agreed { Some(first.1) } else { None }
         })
+    }
+
+    /// Each range's leader, in the order of the ranges the cell hosts, once every running node names
+    /// it in one term and it runs; none until then.
+    pub fn leads(&self) -> Option<Vec<u64>> {
+        self.leads_by(|_| true)
+    }
+
+    /// Each range's leader, in the order of the ranges the cell hosts, once every running node `by`
+    /// passes names it in one term and it is one of them; none until then.
+    pub fn leads_by(&self, by: impl Fn(u64) -> bool) -> Option<Vec<u64>> {
+        let naming: Vec<&Member> = self
+            .members
+            .iter()
+            .filter(|(id, m)| m.orders.is_some() && by(**id))
+            .map(|(_, m)| m)
+            .collect();
+        let mut leads = Vec::with_capacity(self.layers.len());
+        for (group, _) in &self.layers {
+            let mut named = naming.iter().map(|m| {
+                m.leads
+                    .led
+                    .iter()
+                    .find(|(g, ..)| g == group)
+                    .map(|(_, leader, term)| (*leader, *term))
+            });
+            let first = named.next()??;
+            let among = self
+                .members
+                .get(&first.0)
+                .is_some_and(|m| m.orders.is_some() && by(first.0));
+            if first.0 == 0 || !among || !named.all(|n| n == Some(first)) {
+                return None;
+            }
+            leads.push(first.0);
+        }
+        Some(leads)
+    }
+
+    /// The hand-overs the running nodes began to spread the leads, and of them those that failed,
+    /// as each last said.
+    pub fn lead_moves(&self) -> (u64, u64) {
+        self.lead_moves_by(|_| true)
+    }
+
+    /// The hand-overs the running nodes `by` passes began to spread the leads, and of them those
+    /// that failed, as each last said.
+    pub fn lead_moves_by(&self, by: impl Fn(u64) -> bool) -> (u64, u64) {
+        self.members
+            .iter()
+            .filter(|(id, m)| m.orders.is_some() && by(**id))
+            .fold((0, 0), |(begun, failed), (_, m)| {
+                (begun + m.leads.moves.0, failed + m.leads.moves.1)
+            })
     }
 
     /// Runs until every running node judges every peer its stream keeps by a margin.

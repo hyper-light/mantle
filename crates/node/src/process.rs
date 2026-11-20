@@ -48,9 +48,10 @@
 //!
 //! **Its talk** is lines. On standard output: `bound QUIC PLANE` once the node listens, and
 //! `volume ID` for each volume it holds, its 128-bit id in hex; then, for each range it hosts,
-//! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS ASKING_NS HEARD`,
-//! the group in hex, each time one of the term, leader, commit or applied index
-//! moves, its redials to a peer back off further or start over, or the heartbeats it takes from
+//! `status GROUP TERM LEADER COMMIT APPLIED PATIENCE_NS RECONNECT_NS MEASURING_NS ASKING_NS HEARD
+//! MOVES FAILED`, the group in hex, each time one of the term, leader, commit or applied index
+//! moves, the node begins a hand-over that spreads the ranges' leads or one fails, its redials to
+//! a peer back off further or start over, or the heartbeats it takes from
 //! peers not yet judged move (`Status::measuring`): how long the node states it may go
 //! without moving
 //! while its peers live (`Status::patience`, 0 until measured), how long a link to a peer it dials
@@ -61,7 +62,9 @@
 //! waits paused, the longest the pause may last, its backoff (`Status::asking`, else 0), said each
 //! time it changes; and the heartbeats taken from the peers not yet judged (`Status::measuring`,
 //! 0 once every peer is), so a watcher comparing a range's lines sees them move as the node
-//! measures its links. On a line of its own, `held 1` while the node waits on its own device and
+//! measures its links; then the hand-overs the node began to spread the ranges' leads over the
+//! cell, and of them those that failed (`Status::lead_moves`, node.md §6.7). On a line of its
+//! own, `held 1` while the node waits on its own device and
 //! `held 0` once it no longer does, said each time that changes. After each status,
 //! `log FLUSHING_NS LONGEST_NS`: how
 //! long the log's flush has been out (0 when none is) and the longest an update has waited for
@@ -3526,6 +3529,8 @@ async fn serve(
                     != (now.term, now.leader, now.commit, now.applied, now.reconnect)
                     || was.measuring != now.measuring
                     || was.asking != now.asking
+                    || (was.lead_moves, was.lead_moves_failed)
+                        != (now.lead_moves, now.lead_moves_failed)
             });
             if !moved {
                 continue;
@@ -4205,8 +4210,14 @@ fn status_line(lines: &mut String, group: u128, now: &Status) -> std::fmt::Resul
     let asking = now.asking.map_or(0, |a| a.as_nanos());
     writeln!(
         lines,
-        "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking} {}",
-        now.term, now.leader, now.commit, now.applied, now.measuring
+        "status {group:x} {} {} {} {} {patience} {reconnect} {measuring} {asking} {} {} {}",
+        now.term,
+        now.leader,
+        now.commit,
+        now.applied,
+        now.measuring,
+        now.lead_moves,
+        now.lead_moves_failed
     )
 }
 
@@ -4685,6 +4696,8 @@ mod tests {
             commanded: 0,
             room: crate::node::RoomWaits::default(),
             replay: mantle_range::Replay::None,
+            lead_moves: 0,
+            lead_moves_failed: 0,
         };
         let turn = |lines: &mut String| {
             lines.clear();
@@ -4698,7 +4711,7 @@ mod tests {
             lines,
             "link 3 keyed 4 1 2 trusted Closed\n\
              link 3 unkeyed 4 1 2 suspect none\n\
-             status 2a 7 2 40 39 1500000000 0 250000000 9 0\n"
+             status 2a 7 2 40 39 1500000000 0 250000000 9 0 0 0\n"
         );
         hyper_measure::alloc::begin();
         turn(&mut lines);
@@ -4748,6 +4761,8 @@ mod tests {
             commanded: 0,
             room: crate::node::RoomWaits::default(),
             replay: mantle_range::Replay::None,
+            lead_moves: 0,
+            lead_moves_failed: 0,
         };
         let (mut before, mut after) = (String::new(), String::new());
         status_line(&mut before, 0x2a, &status(54)).unwrap();

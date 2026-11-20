@@ -80,6 +80,7 @@ mod enrollments;
 mod hold;
 mod host;
 mod keyed;
+mod lead;
 mod members;
 pub mod refusals;
 mod repair;
@@ -640,6 +641,10 @@ pub struct Status {
     /// Where the member's replay at open stands: the entries past its engine's durable index it
     /// re-applied, their bytes and the span it took (`mantle_range::Replayed`; node.md §2.6).
     pub replay: mantle_range::Replay,
+    /// The hand-overs of a range's lead this node began to spread the leads over the cell, of
+    /// every range it leads here, and of them those that failed (node.md §6.7).
+    pub lead_moves: u64,
+    pub lead_moves_failed: u64,
 }
 
 /// What the node's own commands and reads refused for room waited ([`Status::room`]).
@@ -722,6 +727,8 @@ struct Kept {
     /// The bytes its engine's page cache holds, lent of the operations' idle bytes
     /// (`host::lend`): none while its replica runs on another shard.
     lent: u64,
+    /// Its heir while it leads here, for the spread of the leads (`lead`).
+    lead: lead::Watch,
 }
 
 /// A peer as the node keeps it.
@@ -1580,6 +1587,8 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// ([`Node::take_handing`], [`Node::take_handed`]).
     handing: Vec<(u128, u64)>,
     handed: Vec<(u128, u64)>,
+    /// The hand-overs that spread the ranges' leads over the cell's nodes (`lead`).
+    leads: lead::Leads,
     /// The node's TLS without its server side, which the stop runs on to take no connection: made
     /// as the node opens, from the credentials it opened with.
     dial_only: Option<Tls>,
@@ -1825,6 +1834,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 wake: None,
                 replacing: None,
                 lent: 0,
+                lead: lead::Watch::default(),
             });
         }
         // On a simulated shard the node's times are the simulation's, whole virtual nanoseconds
@@ -2050,6 +2060,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             stopping: None,
             handing: Vec::new(),
             handed: Vec::new(),
+            leads: lead::Leads::default(),
             dial_only: Some(dial_only),
             table: None,
             moved: 0,
@@ -2770,6 +2781,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 longest: Duration::from_nanos(self.room_longest_ns),
             },
             replay: seen.replay,
+            lead_moves: self.leads.begun,
+            lead_moves_failed: self.leads.failed,
         })
     }
 
@@ -3099,6 +3112,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.step_replacements();
         self.step_members()?;
         self.step_enrollments(now)?;
+        self.balance_leads(now);
         self.step_stop()?;
         self.send_plane();
         self.driver.flush()?;

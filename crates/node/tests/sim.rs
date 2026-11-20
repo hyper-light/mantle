@@ -1656,3 +1656,176 @@ fn loaded_founder(seed: u64, after_join: bool, draw: u64) -> u64 {
     drop(stops);
     live
 }
+
+/// Whether `leads`, each of the cell's five ranges' leader, are spread over its three nodes as the
+/// rule settles them (node.md §6.7): two, two and one.
+fn spread_evenly(leads: &[u64]) -> bool {
+    let mut counts: Vec<usize> = (1..=3u64)
+        .map(|node| leads.iter().filter(|l| **l == node).count())
+        .collect();
+    counts.sort_unstable();
+    counts == [1, 2, 2]
+}
+
+/// The least time between two hand-overs a node begins to spread the leads, and an heir's time
+/// trusted before one goes to it: a range's patience (node.md §6.7), the longest any node states.
+fn patience_ns(cell: &Sim) -> u64 {
+    cell.members
+        .values()
+        .filter_map(|m| m.status.and_then(|s| s.patience))
+        .map(|p| u64::try_from(p.as_nanos()).unwrap())
+        .max()
+        .unwrap()
+}
+
+/// The heartbeats the nodes take from one another, the most any has said.
+fn heartbeats(cell: &Sim) -> u64 {
+    cell.members
+        .values()
+        .filter_map(|m| m.status.map(|s| s.heartbeats))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Runs until the five ranges' leads are spread two, two and one, every node naming them.
+fn spread(cell: &mut Sim) -> Vec<u64> {
+    cell.until("the leads spread two, two and one", |c| {
+        c.leads().filter(|leads| spread_evenly(leads))
+    })
+}
+
+/// Runs `patiences` patiences of the cell, asserting after each that no node `by` passes names
+/// `shunned` leading a range and that no hand-over of theirs failed.
+fn never_led_by(cell: &mut Sim, shunned: u64, patiences: u64, by: impl Fn(u64) -> bool + Copy) {
+    let (_, failed) = cell.lead_moves_by(by);
+    for _ in 0..patiences {
+        let patience = patience_ns(cell);
+        cell.run_for(patience);
+        for (id, member) in &cell.members {
+            if !by(*id) {
+                continue;
+            }
+            for (group, leader, _) in &member.leads.led {
+                assert_ne!(
+                    *leader, shunned,
+                    "node {id} names {shunned} leading {group:x}: {:?}",
+                    member.leads
+                );
+            }
+        }
+        assert_eq!(cell.lead_moves_by(by).1, failed, "a hand-over failed");
+    }
+}
+
+/// Every client's part of the history, checked linearizable, once each ended.
+fn histories_checked(cell: &mut Sim, stops: Vec<std::sync::mpsc::Sender<()>>) {
+    drop(stops);
+    cell.until("every client's part", |c| {
+        if c.parts.len() == usize::try_from(CLIENTS).unwrap() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    let parts: Vec<(u64, Part)> = std::mem::take(&mut cell.parts).into_iter().collect();
+    check_histories(parts.iter().flat_map(|(_, part)| part.iter().cloned()));
+    cell.converged();
+}
+
+/// A cell of three nodes boots its five ranges, one of each layer. Every range's member on a node
+/// draws its campaign delays from one seed, so one node wins every range's election (seed 1: node
+/// 3, all five); the leads then end spread two, two and one, every node leading at least one, by
+/// hand-overs that each raise a range's leader in its ranking: at most two a range, none failed,
+/// each begun within a patience and a quiet period of the last. Then, every node healthy,
+/// for three patiences, past an heir's wait and a node's spacing, no hand-over begins and no lead
+/// moves.
+#[test]
+fn a_cells_ranges_leads_spread_over_its_nodes_after_boot_and_stay_while_all_are_healthy() {
+    for seed in seeds(&[1]) {
+        let mut cell = Sim::ranged(seed);
+        let booted = cell.until("every range led", |c| c.leads());
+        let (at_boot, booted_at) = (heartbeats(&cell), cell.now_ns());
+        let leads = spread(&mut cell);
+        let (begun, failed) = cell.lead_moves();
+        let (taken, took) = (heartbeats(&cell) - at_boot, cell.now_ns() - booted_at);
+        eprintln!(
+            "seed {seed}: led {booted:?} at boot, spread by {begun} hand-overs ({failed} failed) \
+             in {took} ns, {taken} heartbeats"
+        );
+        for node in 1..=cell.nodes {
+            assert!(leads.contains(&node), "node {node} leads none: {leads:?}");
+        }
+        assert_eq!(failed, 0, "a hand-over failed in a healthy cell");
+        assert!(
+            begun <= 2 * 5,
+            "{begun} hand-overs for five ranges of three voters"
+        );
+        let bound = (begun + 1) * (patience_ns(&cell) + cell.quiet());
+        assert!(took <= bound, "spread in {took} ns, past {bound} ns");
+        cell.run_for(3 * patience_ns(&cell));
+        assert_eq!(cell.leads(), Some(leads), "a lead moved");
+        assert_eq!(cell.lead_moves(), (begun, failed), "a hand-over began");
+    }
+}
+
+/// Node 3, the Name range's first choice, loses power under the clients' load: the ranges it led
+/// fail over to the two others, and once it is started again and has caught up the leads spread
+/// again, two, two and one. Every history is linearizable and every node applies as far as the others.
+#[test]
+fn a_killed_nodes_ranges_fail_over_and_return_once_it_is_back_with_linearizable_histories() {
+    for seed in seeds(&[1]) {
+        let mut cell = Sim::ranged(seed);
+        spread(&mut cell);
+        cell.open_bucket();
+        let ops = 48;
+        let stops = cell.start_workload(ops);
+        cell.done_by(ops, 1);
+        cell.crash(3);
+        let failed_over = cell.until("its ranges fail over", |c| {
+            c.leads().filter(|leads| !leads.contains(&3))
+        });
+        eprintln!("seed {seed}: led {failed_over:?} with node 3 down");
+        cell.done_by(ops, 2);
+        cell.restart(3);
+        spread(&mut cell);
+        cell.done_by(ops, 4);
+        histories_checked(&mut cell, stops);
+    }
+}
+
+/// A voter suspected or behind is never handed a lead. Node 3, the Name range's first choice, is
+/// cut off from the others under the clients' load: once they suspect it and lead its ranges, for
+/// three patiences none is handed to it. Then it is joined again with its range writes held
+/// unanswered, its detectors' evidence still flowing: trusted, but its log behind what the ranges
+/// commit, and for three patiences none is handed to it either, and no hand-over fails. Once its
+/// writes are answered it catches up and the leads spread again, two, two and one; every history is
+/// linearizable.
+#[test]
+fn a_suspected_or_lagging_voter_is_never_handed_a_lead() {
+    for seed in seeds(&[1]) {
+        let mut cell = Sim::ranged(seed);
+        spread(&mut cell);
+        cell.open_bucket();
+        let ops = 48;
+        let stops = cell.start_workload(ops);
+        cell.done_by(ops, 1);
+        let others = |id: u64| id != 3;
+        cell.isolate(3, true);
+        cell.until("the others suspect it and lead its ranges", |c| {
+            let suspected = [1, 2]
+                .iter()
+                .all(|id| c.suspected.get(&(*id, 3)).is_some_and(|n| *n > 0));
+            c.leads_by(others)
+                .filter(|leads| suspected && !leads.contains(&3))
+        });
+        never_led_by(&mut cell, 3, 3, others);
+        cell.done_by(ops, 2);
+        cell.hold_writes(3, true);
+        cell.isolate(3, false);
+        never_led_by(&mut cell, 3, 3, others);
+        cell.hold_writes(3, false);
+        spread(&mut cell);
+        cell.done_by(ops, 4);
+        histories_checked(&mut cell, stops);
+    }
+}

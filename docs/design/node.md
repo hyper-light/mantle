@@ -197,6 +197,13 @@ growths go back to its own engine's owner (each range's task, on its own shard),
 there; a worker keeps one warm store whose file a job swaps; and each engine's share of the seats
 is bounded so that one hot engine cannot hold every seat another's checkpoint waits on.
 
+*As built (2026-11-20), the workers named by range.* A worker's thread is named after its range
+as the range's store file is, `mantle-maint-{group:x}-{seat}` (`shard_db::worker_thread_name`,
+`process::engine`), so a `sample` of a node says which range a busy maintenance thread serves:
+the 82% above was `mantle-maint-0`, a name every range's first worker carried. macOS keeps 63
+bytes of a name (`MAXTHREADNAMESIZE`), a whole group's; Linux keeps 15 (`prctl(2)`,
+`PR_SET_NAME`), `mantle-maint-` and two characters more.
+
 *As built (2026-11-19), the workers' extents.* A job takes its extents from the store's before it
 goes out, a grant sized to what it reads, more than it writes. Given workers, the node suite's
 followers fenced installing a snapshot, the engine's own error `LimitExceeded { what: "extents of

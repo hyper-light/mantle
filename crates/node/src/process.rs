@@ -2683,6 +2683,9 @@ pub(crate) fn engine(
 ) -> Result<Stored<DeviceFile>, ProcessError> {
     let path = store_path(&config.dir, group);
     let fresh = !path.exists();
+    // Its workers' threads are named after the range as its store's file is, so a profile of
+    // the node says which range a busy worker serves.
+    let name = format!("{group:x}");
     // The file transfers at its device's alignment, which the engine's pages are a multiple of
     // (`Store::check`): a page derived to hold a row is a multiple of the device's unit, not a
     // power of two (`mantle_engine::branch::least_page`).
@@ -2704,7 +2707,7 @@ pub(crate) fn engine(
             .map_err(engine)?;
         if config.engine_workers > 0 {
             stored
-                .set_workers(reopen, config.engine_workers)
+                .set_workers(reopen, config.engine_workers, &name)
                 .map_err(engine)?;
         }
         return Ok(stored);
@@ -2713,7 +2716,7 @@ pub(crate) fn engine(
         Stored::create(file, config.store, config.memtable_bytes, config.trunk).map_err(engine)?;
     if config.engine_workers > 0 {
         stored
-            .set_workers(reopen, config.engine_workers)
+            .set_workers(reopen, config.engine_workers, &name)
             .map_err(engine)?;
     }
     let founded = |e: mantle_meta::engine::EngineError| ProcessError::Engine(e.to_string());

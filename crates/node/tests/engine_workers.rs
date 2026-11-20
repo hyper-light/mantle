@@ -147,8 +147,12 @@ fn run(workers: usize) -> (u64, u64, u64, u64, u64) {
                         .unwrap();
                 if workers > 0 {
                     let (again, worker_counts) = (at.clone(), Arc::clone(&counts));
-                    e.set_workers(move || Ok(counted(&again, false, &worker_counts)), workers)
-                        .unwrap();
+                    e.set_workers(
+                        move || Ok(counted(&again, false, &worker_counts)),
+                        workers,
+                        "",
+                    )
+                    .unwrap();
                 }
                 let mut applying = 0;
                 for i in 0..ROWS {
@@ -259,8 +263,12 @@ fn install_on_a_shard(
                         .unwrap();
                 if workers > 0 {
                     let (again, worker_counts) = (at.clone(), Arc::clone(&counts));
-                    e.set_workers(move || Ok(counted(&again, false, &worker_counts)), workers)
-                        .unwrap();
+                    e.set_workers(
+                        move || Ok(counted(&again, false, &worker_counts)),
+                        workers,
+                        "",
+                    )
+                    .unwrap();
                 }
                 for i in 0..APPLIED {
                     let (k, v) = row(i);
@@ -525,6 +533,7 @@ fn burst_costs(workers: usize) -> Vec<ReadCost> {
                             })
                         },
                         workers,
+                        "",
                     )
                     .unwrap();
                 }

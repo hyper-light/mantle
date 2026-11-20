@@ -134,6 +134,7 @@ fn shard(dir: &Path, short: Short, workers: usize, room: u64) -> ShardDb<DeviceF
             })
         },
         workers,
+        "",
     )
     .unwrap();
     match short {

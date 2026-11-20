@@ -112,16 +112,18 @@ impl<F: BlockFile + 'static> Stored<F> {
     /// a worker and takes its result back, where it wrote every page of it on its own thread.
     /// [`Engine::persist`] still returns only once the checkpoint is durable, waiting for the
     /// workers' jobs out first. The owner counts the workers' threads and memory
-    /// (docs/design/node.md §1.4).
+    /// (docs/design/node.md §1.4). Their threads carry `name`, the range's
+    /// (`ShardDb::set_workers_within`).
     pub fn set_workers(
         &mut self,
         open: impl FnMut() -> Result<F, mantle_engine::Error> + Send + 'static,
         most: usize,
+        name: &str,
     ) -> Result<(), mantle_engine::Error>
     where
         F: Send,
     {
-        self.db.set_workers_within(open, most)
+        self.db.set_workers_within(open, most, name)
     }
 
     /// Gives gets and lookups a cache of `pages` of the store's pages, each verified as it was
@@ -658,7 +660,8 @@ mod tests {
         // A new store's first checkpoint, of nothing, is its creation's.
         assert_eq!(e.checkpoints(), (0, 2));
         let reopen = path.clone();
-        e.set_workers(move || Ok(file(&reopen, false)), 1).unwrap();
+        e.set_workers(move || Ok(file(&reopen, false)), 1, "")
+            .unwrap();
         for i in 0..ROWS {
             let (k, v) = row(i, 1);
             e.apply(i + 1, vec![Write::Put(k, v)]).unwrap();

@@ -443,6 +443,7 @@ mod tests {
                                 })
                             },
                             workers,
+                            "",
                         )
                         .unwrap();
                     }
@@ -803,6 +804,7 @@ mod tests {
                             })
                         },
                         1,
+                        "",
                     )
                     .unwrap();
                     // Each memtable takes 16 entries; the worker's first packing never ends
@@ -928,6 +930,7 @@ mod tests {
                             })
                         },
                         1,
+                        "",
                     )
                     .unwrap();
                     test(e, held, here, path).await;
@@ -1257,6 +1260,7 @@ mod tests {
                     })
                 },
                 1,
+                "",
             )
             .unwrap();
             let reads = |n: &std::sync::Arc<std::sync::atomic::AtomicU64>| {
@@ -1453,6 +1457,7 @@ mod tests {
                     })
                 },
                 1,
+                "",
             )
             .unwrap();
             let reads = |n: &std::sync::Arc<std::sync::atomic::AtomicU64>| {

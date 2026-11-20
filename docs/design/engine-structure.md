@@ -840,9 +840,12 @@ jobs a seat once the most is past the need. A node gives each range's engine a m
 (`derive::ENGINE_WORKERS`: a hot range's one worker measured 82% busy at 6,184 small PUTs a second
 needs 1.33 at 10,000), within the node's cores less one shared among its ranges and the memory
 its allowance holds (`derive::engine_workers`, `derive::derive`). A pool serves its own engine's
-file alone (`trunk::pool::serve`), so no engine's work takes another's seats; one pool for every
-engine on a node, which node.md §1.2 states and which would charge the node's need once rather
-than each range's most, is open there.
+file alone (`trunk::pool::serve`), so no engine's work takes another's seats; its threads carry
+their range's name (`shard_db::worker_thread_name`). One pool for every engine on a node, which
+would charge the node's summed need once rather than each range's most, is designed in node.md
+§1.2 (a job carrying its engine's file handle, top-up channel and channel back; the work clients
+wait on before compactions, with a reserve and a cap an engine, as SILK schedules) and not yet
+built.
 
 ## 7. Crash and recovery
 

@@ -140,7 +140,7 @@ fn a_shard_that_may_wait_runs_its_maintenance_on_workers() {
             .block_on(async move {
                 let mut db = ShardDb::create(file(&at), CONFIG, CONFIG.page_size, TRUNK).unwrap();
                 let again = at.clone();
-                db.set_workers_within(move || opened(&again, false), 2)
+                db.set_workers_within(move || opened(&again, false), 2, "")
                     .unwrap();
                 for i in 0..ROWS {
                     let (k, v) = row(i, 1);

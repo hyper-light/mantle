@@ -92,6 +92,7 @@ fn burst(dir: &Path, upkeep: Upkeep) -> ShardDb<DeviceFile> {
                 })
             },
             1,
+            "",
         )
         .unwrap();
         db.trunk.hold_dispatch = true;

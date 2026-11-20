@@ -748,6 +748,19 @@ fn tune4(
     ]
 }
 
+/// A maintenance worker's thread name: `mantle-maint-`, its engine's `name` when it has one,
+/// and its seat, so a profile of the process (macOS `sample`, Linux `top -H`) says which engine a
+/// busy worker serves. The OS keeps a prefix of a long name: 63 bytes on macOS
+/// (`MAXTHREADNAMESIZE`, `pthread_setname_np(3)`), 15 on Linux (`TASK_COMM_LEN`, `prctl(2)`
+/// `PR_SET_NAME`), Rust's `std::thread::Builder::name` cutting it there.
+pub fn worker_thread_name(name: &str, seat: usize) -> String {
+    if name.is_empty() {
+        format!("mantle-maint-{seat}")
+    } else {
+        format!("mantle-maint-{name}-{seat}")
+    }
+}
+
 /// Nanoseconds since `t`, none when timing is off (`ShardDb::set_timed`).
 fn ns_since(t: Option<std::time::Instant>) -> u64 {
     t.map_or(0, |t| {
@@ -1622,16 +1635,18 @@ impl<F: BlockFile> ShardDb<F> {
     where
         F: Send + 'static,
     {
-        self.set_workers_within(open, Pool::cores())
+        self.set_workers_within(open, Pool::cores(), "")
     }
 
     /// [`Self::set_workers`] with at most `most` workers, at least one: the bound an owner that
     /// counts its workers' threads and memory states (a node, docs/design/node.md §1.4), within
-    /// the cores the OS reports less this thread.
+    /// the cores the OS reports less this thread. Their threads carry `name`, the engine's among
+    /// its owner's ([`worker_thread_name`]).
     pub fn set_workers_within(
         &mut self,
         mut open: impl FnMut() -> Result<F, Error> + Send + 'static,
         most: usize,
+        name: &str,
     ) -> Result<(), Error>
     where
         F: Send + 'static,
@@ -1668,10 +1683,11 @@ impl<F: BlockFile> ShardDb<F> {
             .ok_or_else(|| Self::write_limit(usize::MAX))?;
         self.check_write_reservation(reserved)?;
         let config = self.store.config();
+        let name = name.to_owned();
         let spawn: Spawn = Box::new(move |seat| {
             let file = open()?;
             std::thread::Builder::new()
-                .name(format!("mantle-maint-{}", seat.id))
+                .name(worker_thread_name(&name, seat.id))
                 .spawn(move || pool::serve(file, config, seat))
                 .map_err(|e| Error::Io {
                     op: "start a maintenance worker",
@@ -6084,6 +6100,20 @@ impl<F: BlockFile> ShardDb<F> {
 }
 
 #[cfg(test)]
+mod worker_name_tests {
+    use super::worker_thread_name;
+
+    #[test]
+    fn a_worker_is_named_after_its_engine_and_seat() {
+        assert_eq!(worker_thread_name("", 1), "mantle-maint-1");
+        assert_eq!(worker_thread_name("3", 0), "mantle-maint-3-0");
+        // A range's whole group, as its store's file names it, fits macOS's 63 bytes.
+        let group = format!("{:x}", u128::MAX);
+        assert!(worker_thread_name(&group, 1).len() <= 63);
+    }
+}
+
+#[cfg(test)]
 mod tune_tests {
     use super::{Gain, tune};
 
@@ -7194,7 +7224,7 @@ mod frozen_tests {
         let path = dir.path().join("store");
         let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
         let p = path.clone();
-        db.set_workers_within(move || Ok(plain(&p, false)), 1)
+        db.set_workers_within(move || Ok(plain(&p, false)), 1, "")
             .unwrap();
         let mut oracle = BTreeMap::new();
         let mut i = 0u64;
@@ -7257,7 +7287,8 @@ mod frozen_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store");
         let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
-        db.set_workers_within(gated(&path, &GATES_R), 1).unwrap();
+        db.set_workers_within(gated(&path, &GATES_R), 1, "")
+            .unwrap();
         let _open = Open(&GATES_R);
         let mut oracle = BTreeMap::new();
         let mut i = 0u64;

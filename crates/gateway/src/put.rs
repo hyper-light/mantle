@@ -234,15 +234,53 @@ pub trait Ids {
     fn block(&mut self) -> Result<u128, PutError>;
 }
 
-/// Block IDs from the operating system's random source.
+/// Block IDs drawn from the thread's generator ([`id`]).
 pub struct Random;
 
 impl Ids for Random {
     fn block(&mut self) -> Result<u128, PutError> {
-        let mut bytes = [0u8; 16];
-        getrandom::fill(&mut bytes).map_err(|_| PutError::Random)?;
-        Ok(u128::from_be_bytes(bytes))
+        id()
     }
+}
+
+std::thread_local! {
+    /// The thread's generator of IDs, seeded from the operating system as the thread first draws
+    /// one, and only then: one ChaCha12 state and its block of output, a few hundred bytes a
+    /// thread that draws, and none on one that never does.
+    static IDS: std::cell::RefCell<Option<rand::rngs::StdRng>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A block's or a file's ID: 128 bits from the thread's generator, unique as 128 bits drawn from
+/// the operating system are. An ID names its block or file in the cell's ranges and chunk keys
+/// and no client chooses, reads or guesses one to any end, so what it needs is that no two
+/// collide, anywhere in the cell and ever: by the birthday bound a collision among n draws
+/// independent and uniform has probability at most n^2 / 2^129, one in 2^49 at 2^40 IDs. A
+/// cryptographic generator's output is indistinguishable from such draws, so ChaCha12 (rand's
+/// `StdRng`, which its authors call a CSPRNG), seeded once a thread with 256 bits from the
+/// operating system, keeps that bound across threads, nodes and restarts as a draw from the
+/// operating system for each ID did, at one system call a thread where each ID made one
+/// (`getentropy` was 2.3% of a node's first shard under the 1-byte PUT bench, macOS `sample`,
+/// 2026-11-19, two of a put's three calls its IDs). A data key, which must be secret, is still
+/// read from the operating system (`mantle_s3::seal::DataKey::generate`, encryption.md §2).
+pub fn id() -> Result<u128, PutError> {
+    IDS.try_with(|ids| {
+        let mut ids = ids.try_borrow_mut().map_err(|_| PutError::Random)?;
+        let ids = match &mut *ids {
+            Some(ids) => ids,
+            empty => {
+                let mut seed = [0u8; 32];
+                getrandom::fill(&mut seed).map_err(|_| PutError::Random)?;
+                #[cfg(test)]
+                tests::SEEDS.with(|seeds| seeds.set(seeds.get() + 1));
+                empty.insert(rand::SeedableRng::from_seed(seed))
+            }
+        };
+        let mut bytes = [0u8; 16];
+        rand::Rng::fill_bytes(ids, &mut bytes);
+        Ok(u128::from_be_bytes(bytes))
+    })
+    .map_err(|_| PutError::Random)?
 }
 
 /// What a PUT committed.
@@ -1408,6 +1446,37 @@ mod tests {
     use super::*;
 
     const HANDOVER: u64 = 1_000;
+
+    std::thread_local! {
+        /// The seeds this thread's generator of IDs read from the operating system ([`id`]).
+        pub(super) static SEEDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// IDs stay unique: 2^16 drawn on each of four threads, and the four threads' together, are
+    /// all distinct, each thread's generator seeded from the operating system once for all its
+    /// draws, where each ID was a system call of its own.
+    #[test]
+    fn ids_drawn_on_threads_are_unique_and_each_thread_seeds_once() {
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let ids: Vec<u128> = (0..1 << 16).map(|_| id().unwrap()).collect();
+                    (ids, SEEDS.with(std::cell::Cell::get))
+                })
+            })
+            .collect();
+        let mut all = std::collections::HashSet::new();
+        for thread in threads {
+            let (ids, seeds) = thread.join().unwrap();
+            assert_eq!(seeds, 1, "one seed a thread");
+            let mine: std::collections::HashSet<u128> = ids.iter().copied().collect();
+            assert_eq!(mine.len(), 1 << 16, "a thread's IDs are distinct");
+            all.extend(mine);
+        }
+        assert_eq!(all.len(), 4 << 16, "the threads' IDs are distinct");
+        let mut random = Random;
+        assert_ne!(random.block().unwrap(), random.block().unwrap());
+    }
 
     struct Counter(u128);
 

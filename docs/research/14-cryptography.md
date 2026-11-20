@@ -277,6 +277,29 @@ A128CBC-HS256 and gives every intermediate value and the compact serialization. 
 AES Key Wrap and AES GCM computations are deterministic, the resulting JWE value will be the
 same for all encryptions performed using these inputs" [RFC7516 §A.3.8].
 
+## 11. rand's generators, for IDs drawn without a system call each
+
+**`StdRng`.** rand 0.10.3 documents its standard generator as "[CSPRNG]: statistically good
+quality of randomness and [unpredictable]", "Fast (amortized): the RNG is fast for bulk
+generation, but the cost of method calls is not consistent due to usage of an output buffer";
+"The current algorithm used is the ChaCha block cipher with 12 rounds", and it is
+"Non-portable: any future library version may replace the algorithm". It is `SeedableRng`:
+"Using a fresh seed **direct from the OS** is the most secure option" [RAND-STD].
+
+**`ThreadRng`, and why it is not used.** rand's thread-local generator is "Automatic seeding via
+[`SysRng`] and after every 64 kB of output", with "no automatic reseeding on process fork", and
+"No further protections exist to in-memory state"; its reseed threshold was chosen by benchmark:
+"reseeding has a noticeable impact with thresholds of 32 kB and less. We choose 64 kiB output to
+avoid significant overhead". Its draws panic where the operating system's generator fails:
+"Implementations of [`TryRng`] and [`Rng`] panic in case of [`SysRng`] failure during
+reseeding", the reseed calling `panic!("could not reseed ThreadRng: {e}")` [RAND-THREAD]. A
+generator held per thread and seeded through `getrandom`, whose failure is a typed error, keeps
+the draw's failure an error (CLAUDE.md §1).
+
+**The birthday bound.** Among n values drawn independently and uniformly from 2^128, the chance
+that any two are equal is at most n(n-1)/2 / 2^128 < n^2 / 2^129: a union bound over the
+n(n-1)/2 pairs, each equal with probability 2^-128.
+
 ## Sources
 
 - [ENT] AWS-LC `crypto/fipsmodule/rand/entropy/entropy_sources.c`, commit 02561621ffa4cf17c0c4f70bc11a82df36b42ae9, as vendored in `vendor/aws-lc-sys/aws-lc/`.
@@ -320,4 +343,6 @@ same for all encryptions performed using these inputs" [RFC7516 §A.3.8].
 - [LCRS1241] aws/aws-lc-rs#1241, "Support TLS 1.3 AES-GCM sealing from multiple borrowed input slices", https://github.com/aws/aws-lc-rs/issues/1241.
 - [RFC8446] E. Rescorla, "The Transport Layer Security (TLS) Protocol Version 1.3", RFC 8446, August 2018, §5.2, §5.3, §5.5.
 - [RFC8448] M. Thomson, "Example Handshake Traces for TLS 1.3", RFC 8448, January 2019, §3.
+- [RAND-STD] rand 0.10.3 `src/rngs/std.rs`, the `StdRng` documentation, as published on crates.io and read from the cargo registry, 2026-11-19.
+- [RAND-THREAD] rand 0.10.3 `src/rngs/thread.rs`, `RESEED_BLOCK_THRESHOLD`, `ReseedingCore::try_to_reseed` and the `ThreadRng` documentation, as published on crates.io and read from the cargo registry, 2026-11-19.
 - [SIGV4] "Create a signed AWS API request", AWS IAM User Guide, https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html, "Derive a signing key".

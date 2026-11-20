@@ -62,10 +62,20 @@ drew, which no file takes, as its own ID (§2).
 A PUT writes bottom up, as metadata.md §2 lays out, and its Name commit is its linearization
 point:
 
-1. **Identities.** The gateway draws a file ID and a data key from the operating system, and a
-   block ID for each block as it begins it. Each is random and 128 or 256 bits, never reused:
-   a retry writes a new file (metadata.md §2). The request's operation identity, which the
-   client drew (§2.1), is carried through to the Name commit.
+1. **Identities.** The gateway draws a data key from the operating system, and a file ID and a
+   block ID for each block as it begins it from its thread's generator (`put::id`). Each is
+   random and 128 or 256 bits, never reused: a retry writes a new file (metadata.md §2). The
+   request's operation identity, which the client drew (§2.1), is carried through to the Name
+   commit. An ID must be unique, never secret: it names a file or a block in the ranges and the
+   chunk keys, and no client chooses or addresses one. Drawn uniform and independent, n IDs
+   collide with probability at most n^2 / 2^129 (the birthday bound, research/14 §11), one in
+   2^49 at 2^40 IDs; a cryptographic generator's output is indistinguishable from such draws, so
+   the thread's generator is one: ChaCha12, rand's `StdRng`, which rand states is a CSPRNG
+   (research/14 §11), seeded once a thread with 256 bits from the operating system
+   (`getrandom`), a few hundred bytes of state a thread that draws. Each ID was a system call of
+   its own, `getentropy` 2.3% of a node's first shard under the 1-byte PUT bench (macOS
+   `sample`, 2026-11-19), two of a put's three calls; the data key, which must be secret, is
+   still read from the operating system as encryption.md §2 decides.
 2. **The body streams.** Each 64 KiB of plaintext is sealed as it arrives, the last segment
    marked at the end, and any checksum the request asks for runs over the plaintext
    (`mantle-s3` checksum.rs). A CRC-32C of each plaintext segment is taken as it arrives and

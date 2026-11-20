@@ -2511,6 +2511,45 @@ in a process), `read_fields` refused (a request is handed with its fields read, 
 each a lane message, as is a chunk's piece moving a job's work (`Host::chunk_moved`), which the
 node's task sees on its transport.
 
+*As built (2026-11-19): a turn steps the jobs that have work, at one read of the wall clock*
+(`crates/node/src/node/host.rs`). A turn of the host stepped every job it held (`Host::step`,
+`turn_job`, `step_job`), and a put's step read the wall clock for its renewals
+(`Serve::wall_ns`, `SystemTime::now`): profiled with macOS `sample` at about 5,500 1-byte PUTs a
+second on a three-node cell on one Mac Studio (2026-11-19), the clock was 14% of each node's first
+shard, 98% of it under `step_job`, about 6% of a core a node, which at 25-50 ns a read is on the
+order of a million steps a second where each node answered under 2,000 PUTs: a put waits most of
+its life on its chunks and its commits, and every turn of the node's task stepped it, found its
+asks out and read the clock. Now:
+
+- **A job rests while it waits on its asks alone** (`Job::rests`, `Job::resting`): a put whose
+  bucket row is out, or one not over whose driver takes none of its body now (`Put::wants_body`)
+  and holds no request for want of the node's room (`Putting::waiting`) and no chunk for want of a
+  volume's (`Put::waits_for_room`). Its turn would feed it nothing, ask nothing and answer
+  nothing, so a turn passes it by, keeping its keys (`Host::rekey`) for what its bound moves.
+- **What can give it work wakes it as it comes** (`Host::wake`): an answer to one of its asks
+  (`answer_job`), a reply given it, a refusal, `SlowDown` at its bound or a failure
+  (`reply_job`), room offered to a chunk of its (`offer_room`), and its put's renewal coming due
+  (`Host::step`, read from the earliest renewal kept, `renewals`). These are the events a driving
+  shard's task already waits on (`Host::due`): an answer, a renewal, a beat or bound. Nothing else
+  moves a resting put: its body is not read while its driver takes none (`take_body`), and its
+  requests are drained by the step that made them (`step_put`). A job its door could move, a
+  body's bytes or a reply's room, and every job but a put, is stepped at every turn as before.
+- **The wall clock is read once a turn** (`Host::step`) and passed to each step (`turn_job`,
+  `step_job`, `step_put`, `step_copy`, `ask_put`), as the shard's clock already was: a turn lasts
+  microseconds, so a renewal is ticked and a placement weighed at most a turn late, as each bound
+  read by the shard's clock is. `write_replies` reads it once for its turns of jobs, and only
+  where one steps. A put's
+  own time as it is made (`start_put`), a completion's and a copy's are still read once each, at
+  one read an operation.
+
+Tested (`node::host`): 64 puts of an empty body, each committed by one Name command a stub of
+the node answers 32 turns after it is asked, are stepped twice each, 128 steps over 33 turns,
+where every turn stepped every put, 2,112 steps (33 a put); the wall clock is read 33 times, once
+a turn, where each put's step read it, 2,112 reads; and each put is answered `Done` with its
+version, no wake lost. A put waiting on its body is still stepped at every turn, as are gets,
+copies and the other operations: their doors' events (a body's bytes, a reply's room) reach the
+host by no ask of its own, and waking each by its exchange is the next step.
+
 *As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
 The node's task reads every native body, so it reads them as upload-stall's job did, never into a
 piece of the endpoint's budget: a job's fields straight into their buffer, made at their length as

@@ -640,6 +640,18 @@ held at a gate, the shard's own flushes counted: none), and hyper-durable's
 `a_second_compaction_while_a_checkpoint_is_out_begins_no_other` and
 `a_member_stopped_with_its_checkpoint_out_opens_at_the_durable_point_before_and_loses_nothing`
 hold this.
+A compaction the replica cannot write now waits the same way: a start out, a write past the
+core's depth out, or a store with no room, hyper-log's store holding a refusal its replica has
+yet to take among them (raft-log.md §3). Its checkpoint is not asked of the machine until a drive
+can write its start, so a checkpoint found durable is never let go: asked first, one found
+durable at a drive with no room went with the compaction, and nothing asked it again, as the
+node asks a stalled range again only once its ranges moved, and a stalled follower, refusing
+every message, moves nothing. A stalled replica makes its refused writes again only once no
+compaction waits (§2): made before the one its room waits on, they are only refused again.
+hyper-durable's
+`a_compaction_whose_checkpoint_is_durable_while_the_store_has_no_room_moves_the_start_once_it_has`
+and `a_stalled_replicas_refused_write_is_made_again_after_the_compaction_its_checkpoint_waits_on`
+hold this.
 For now the rows travel inside the snapshot message. The production engine will move its files
 out of band instead (12 §6.3).
 

@@ -579,6 +579,18 @@ without workers or with the issuer attached (whose own reads `get_async` makes),
 as before. A page the OS holds is read in place as the inline path reads it (research/41): the
 worker is for the read that would wait on the device (research/03 HL23-F3, F7).
 
+A client's read its range confirmed (replica.md §3, "Reads") reads its rows the same way, through
+the same held pages and loads, under the same bound (`Query::answer_confirmed` over
+`Engine::get_now`, `next_now`). Two engine calls serve it: `ShardDb::loads_sent`, a wrapping count
+of the loads sent, a counter's read on each pass, by which the read knows whether a refused pass
+sent one or found its page loading already, and `release_loaded`, which an answered read calls as
+an applied entry does, unless an entry of the range waits on the held pages (`Engine::reads_done`).
+A read whose passes have sent `loads_most` loads is made waiting on the device, as an entry's read
+past that bound is; only a refused pass asks the bound.
+`node::upkeep::tests::a_confirmed_reads_pages_load_on_the_worker_and_the_shard_reads_none`: a
+GET's read and then a LIST's page over a cold engine, made waiting, read 2 pages and 1 more on
+the shard's handle; made as confirmed reads, none, their pages loaded on the worker.
+
 ## 6. Scheduling flush and compaction
 
 Each shard schedules its replicas' flushes and compactions against foreground I/O, as SILK does

@@ -1386,6 +1386,11 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     /// in no order a reply depends on: each reply is its own exchange's (`Node::reply_commands`).
     commanded: Waiting<Commanded>,
     reading: KeyedOn<Reading>,
+    /// The reads of `reading` the shell gave back, confirmed and applied through, whose rows'
+    /// pages load on their engine's workers (`Query::answer_confirmed`), by number, with the
+    /// loads their passes sent: each made again at every turn until answered. Bound: the reads
+    /// held, each once, as the shell gives a read back once.
+    waiting_reads: Vec<(u64, usize)>,
     /// The groups whose leadership may have moved since the last turn's replies, each to be read
     /// once there: a range the node's drive drove (only a drive steps a replica here, a message
     /// stepped in schedules its range for the turn's drive) and a far range whose shard showed it
@@ -1948,6 +1953,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             receiving: Keyed::default(),
             commanded: Waiting::default(),
             reading: KeyedOn::default(),
+            waiting_reads: Vec::new(),
             checks: Marked::default(),
             replying: Vec::new(),
             next_read: 0,
@@ -3207,6 +3213,11 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 return Ok(());
             }
         }
+        // A confirmed read waiting for its rows' pages is made again, for the same reason: one
+        // answered is replied by the turn.
+        if self.serve_waiting()? {
+            return Ok(());
+        }
         let now = hyper_rt::futures::now_ns();
         let wake = self.liveness.wake();
         // A closing node dials no peer (`Node::dial`): the redial a connection it closed asks is
@@ -4055,6 +4066,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if let Some((handle, e)) = fenced {
             return Err(shard::refused(&self.owner, handle, e));
         }
+        self.serve_waiting()?;
         if !served.is_empty() {
             self.serve_reads(served)?;
         }
@@ -4552,8 +4564,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// Serves the reads the shell gave back, each confirmed and applied through: the query read
-    /// from the range's engine now, and replied.
+    /// Serves the reads the shell gave back, each confirmed and applied through
+    /// ([`Self::serve_read`]); one whose rows' pages load on its engine's workers waits in
+    /// `waiting_reads`.
     fn serve_reads(&mut self, served: Vec<(u128, Vec<u8>)>) -> Result<(), NodeError> {
         for (group, context) in served {
             let Ok(id) = <[u8; 8]>::try_from(context.as_slice()).map(u64::from_le_bytes) else {
@@ -4562,23 +4575,78 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if !self.reading.get(id).is_some_and(|r| r.group == group) {
                 continue;
             }
-            let Some(reading) = self.reading.remove(id) else {
-                continue;
-            };
-            let Some(handle) = self.kept(group).map(|k| k.handle) else {
-                continue;
-            };
-            // An answer fills at most what a reply's body carries, past its head.
-            let room = crate::read::reply_room(NodeClasses::frame_bound(classes::Class::Request));
-            let read = self.owner.get_mut(handle).and_then(|shell| {
-                reading
-                    .query
-                    .answer(shell.machine_mut().engine_mut(), room)
-                    .ok()
-            });
-            self.answer_read(reading.origin, read)?;
+            let mut loads = 0;
+            if !self.serve_read(id, &mut loads)? {
+                self.waiting_reads.push((id, loads));
+            }
         }
         Ok(())
+    }
+
+    /// Makes each read waiting for its rows' pages again ([`Self::serve_read`]): whether any was
+    /// answered. At every turn, and before the node's wait sleeps, with no await between: a
+    /// worker's message that woke an await of the turn would otherwise leave the read waiting
+    /// with its page in hand. Refused again, it leaves the task waiting on the workers' next
+    /// message.
+    fn serve_waiting(&mut self) -> Result<bool, NodeError> {
+        if self.waiting_reads.is_empty() {
+            return Ok(false);
+        }
+        let mut waiting = std::mem::take(&mut self.waiting_reads);
+        let held = waiting.len();
+        let mut at = 0;
+        let mut served = Ok(());
+        while let Some((id, loads)) = waiting.get_mut(at) {
+            match self.serve_read(*id, loads) {
+                Ok(false) => at = at.saturating_add(1),
+                Ok(true) => {
+                    waiting.swap_remove(at);
+                }
+                Err(e) => {
+                    served = Err(e);
+                    break;
+                }
+            }
+        }
+        let answered = waiting.len() < held;
+        self.waiting_reads = waiting;
+        served.map(|()| answered)
+    }
+
+    /// Serves read `id`, confirmed and applied through: the query answered from its range's
+    /// engine in memory, in at most what a reply's body carries past its head
+    /// (`Query::answer_confirmed`), and replied: true. False while a row's page loads on the
+    /// engine's workers, whose message wakes the task; `loads` counts the loads its passes sent.
+    /// A read answered meanwhile (redirected once this node no longer led its range) is done.
+    fn serve_read(&mut self, id: u64, loads: &mut usize) -> Result<bool, NodeError> {
+        let Some(group) = self.reading.get(id).map(|r| r.group) else {
+            return Ok(true);
+        };
+        let Some(handle) = self.kept(group).map(|k| k.handle) else {
+            self.reading.remove(id);
+            return Ok(true);
+        };
+        let room = crate::read::reply_room(NodeClasses::frame_bound(classes::Class::Request));
+        let pass = match (self.reading.get(id), self.owner.get_mut(handle)) {
+            (Some(reading), Some(shell)) => {
+                let entry_waits = shell.waits_for_room();
+                reading.query.answer_confirmed(
+                    shell.machine_mut().engine_mut(),
+                    room,
+                    loads,
+                    entry_waits,
+                )
+            }
+            _ => Some(Err(crate::read::ReadError::Query)),
+        };
+        let Some(read) = pass else {
+            return Ok(false);
+        };
+        let Some(reading) = self.reading.remove(id) else {
+            return Ok(true);
+        };
+        self.answer_read(reading.origin, read.ok())?;
+        Ok(true)
     }
 
     /// Answers a read to `origin` with what its range's engine gave, `None` when the engine

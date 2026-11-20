@@ -410,6 +410,48 @@ the core's `Limits::pending_reads`, past which a read is refused. Leases are not
 shell kept one round out at a time and gave a lost round's reads back after an election timeout;
 reads then waited up to a round trip more each (research/07 §10).
 
+**A confirmed read waits for its pages; the shard does not** (measured 2026-11-20). A read given
+back is answered from the range's engine on the shard that drives the range, which serves its
+consensus, log and transport too: a GET's or HEAD's name, file and block rows, a LIST's scan. A
+profile of a 1-byte PUT run on one Mac Studio cell, after entries' reads moved off the shard
+(§2), still showed the node's shard blocked in the device read under `ShardDb::get`
+(`get_passed`, `read_page_uncached`, `read_resident`, `read_now`), and a cell's GETs are all such
+reads. So the read is made as an entry's reads are (§2): through `Engine::get_now` and
+`next_now` (`Query::answer_confirmed`), from memory, or refused with the page loading on the
+engine's workers, the same held pages, loads and bound, a page held or loading never loaded again.
+Refused, the read stays held (the far shard's `Reading`, the node's `waiting_reads`) and is made
+again at every turn of its shard, and once more before the shard's wait sleeps, with no await
+between: the workers' message wakes the task, and a wake that ended another await of the turn
+finds the read made again before the wait, which leaves the task waiting on the workers' next
+message. No timer is involved. The read stays linearizable: it was confirmed at its read index
+and the replica applied through it, and rows applied later are a longer committed prefix, so a
+read served from them is linearized at its serving, between its asking and its answer, as one
+served at once is at its own: ReadIndex has the leader wait "for its state machine to advance at
+least as far as the readIndex" and then query it (Diss §6.4 step 4, research/06 §A1.4), and
+nothing in it bounds how far past. A read whose range stops leading meanwhile is refused or
+redirected as before, which is never wrong, only a read its caller asks again.
+
+Every part has a bound. The reads waiting are those the shard holds already: a far shard's at
+most a lane's capacity (`reads_most`), the node's at most the reads it holds, each once, as the
+shell gives a read back once. The pages held and loading for a range are `ShardDb::loads_most`
+(§2). A read counts the loads its passes sent (`Engine::loads_sent`, a pass that found its page
+loading sends none), and the pass that brings the count to `loads_most` is made waiting on the
+device, as an entry's read past that bound is: without it, the pages another reader's answer let
+go to a cache that then dropped them could be loaded again without end. An answered read lets
+the range's held pages go to the cache (`Engine::reads_done`), as an applied entry does, unless
+an entry of the range waits on them: the entry is never made to load a page twice by a read, and
+a read that finds a page it held gone to the cache reads it there or loads it again, within its
+count. A LIST is covered the same way, each one-row scan of its page from memory or a load: a
+page of keys spans few leaves of each branch on its path, and a list whose pages pass the bound
+reads the rest on the shard. Measured by
+`node::upkeep::tests::a_confirmed_reads_pages_load_on_the_worker_and_the_shard_reads_none` (a
+Name range's engine opened again over rows only its file holds, the worker's reads held at a
+gate: a GET's read of a key's current version and a LIST's page are each refused at once, the
+shard's own handle reading nothing; with the gate open each worker's message wakes the task and
+both answer what the same reads made waiting answer, with 0 reads on the shard's handle, where
+made waiting from a cold cache the get read 2 pages there and the list after it 1 more) and
+`read::tests::a_confirmed_read_waits_for_its_pages_within_the_engines_bound_on_loads`.
+
 The transport tells the sending replica whether each snapshot arrived. A leader stops
 replicating to a member while that member's snapshot is out, so a lost snapshot left
 unreported would stall the member for good; the simulation found this. A snapshot's own

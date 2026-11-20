@@ -42,7 +42,7 @@
 
 use mantle_codec::{Reader, Writer};
 use mantle_meta::apply::Layer;
-use mantle_meta::engine::Rows;
+use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
 use mantle_meta::error::MetaError;
 use mantle_meta::name::{self, Named, Probe, Routed, Scan};
 use mantle_meta::record::{
@@ -268,6 +268,29 @@ pub enum ReadError {
     Meta(String),
     #[error("a reply of {0} bytes holds no page of volumes, or not the extents asked")]
     Page(usize),
+    /// A row the read needs is on a page not in memory now, read without waiting
+    /// ([`Engine::get_now`]): its load is out on the engine's workers.
+    #[error("a row's page is not in memory now")]
+    Unloaded,
+}
+
+/// A range's engine read without waiting on its device ([`Engine::get_now`],
+/// [`Engine::next_now`]), as a confirmed read reads it on the node's shard.
+struct Now<'a, E>(&'a mut E);
+
+impl<E: Engine> Rows for Now<'_, E> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        self.0.get_now(key)
+    }
+
+    fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+        self.0.next_now(from, to)
+    }
+
+    /// A query writes nothing; the engine's own, were one to.
+    fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
+        self.0.apply(index, writes)
+    }
 }
 
 fn put_text(w: &mut Writer, text: &str) {
@@ -626,9 +649,55 @@ impl Query {
         }
     }
 
+    /// The answer to a read its range confirmed and applied through, from the rows `engine` holds
+    /// in memory ([`Engine::get_now`], [`Engine::next_now`]), so the node's shard, which serves
+    /// its consensus, log and transport too, never waits on the device for it
+    /// (docs/design/replica.md §3): the answer, or why the engine failed it; `None` when a row is
+    /// on a page not in memory, that page loading on the engine's workers and their message
+    /// waking the task, to make the read again then. `loads` counts the loads the read's passes
+    /// sent; a pass that brings it to the most the engine holds and loads at once is made waiting
+    /// on the device instead, as an entry's read past that bound is, so every read is answered
+    /// within that many loads whatever the cache drops meanwhile. Answered, the pages loaded go
+    /// to the engine's cache ([`Engine::reads_done`]) unless `entry_waits`: an entry of the range
+    /// waits on them, and its application lets them go.
+    pub fn answer_confirmed<E: Engine>(
+        &self,
+        engine: &mut E,
+        max_bytes: usize,
+        loads: &mut usize,
+        entry_waits: bool,
+    ) -> Option<Result<Read, ReadError>> {
+        let before = engine.loads_sent();
+        let answered = match self.answer(&mut Now(engine), max_bytes) {
+            Err(ReadError::Unloaded) => {
+                // A pass that found its page loading already sent none: it waits for that load.
+                if engine.loads_sent() != before {
+                    // Saturating: the count is checked against the bound below, and stops there.
+                    *loads = loads.saturating_add(1);
+                }
+                let most = match engine.loads_most() {
+                    Ok(most) => most,
+                    Err(e) => return Some(Err(ReadError::Meta(e.to_string()))),
+                };
+                if *loads < most {
+                    return None;
+                }
+                self.answer(engine, max_bytes)
+            }
+            answered => answered,
+        };
+        if !entry_waits {
+            engine.reads_done();
+        }
+        Some(answered)
+    }
+
     /// The answer `engine` gives the query now, in at most `max_bytes` once encoded.
     pub fn answer<E: Rows>(&self, engine: &mut E, max_bytes: usize) -> Result<Read, ReadError> {
-        let meta = |e: mantle_meta::error::MetaError| ReadError::Meta(e.to_string());
+        let meta = |e: MetaError| match e {
+            MetaError::Engine(EngineError::Unloaded) => ReadError::Unloaded,
+            e => ReadError::Meta(e.to_string()),
+        };
         match self {
             Self::Current { bucket, key } => {
                 if !gated(engine, bucket).map_err(meta)? {
@@ -1637,6 +1706,127 @@ mod tests {
         assert!(bytes.len() <= room, "{} > {room}", bytes.len());
         assert_eq!(Read::decode(query, &bytes), Ok(read.clone()));
         read
+    }
+
+    /// A model engine whose reads without waiting are refused while `cold`, each refusal sending
+    /// a load (`sends`) or finding its page loading already; `released` counts the readers done.
+    struct Cold {
+        rows: Model,
+        cold: bool,
+        sends: bool,
+        sent: u64,
+        most: usize,
+        released: u64,
+    }
+
+    impl Rows for Cold {
+        fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+            self.rows.get(key)
+        }
+        fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+            self.rows.next(from, to)
+        }
+        fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
+            self.rows.apply(index, writes)
+        }
+    }
+
+    impl Engine for Cold {
+        fn applied(&self) -> u64 {
+            self.rows.applied()
+        }
+        fn durable(&self) -> u64 {
+            self.rows.durable()
+        }
+        fn persist(&mut self) -> Result<(), EngineError> {
+            self.rows.persist()
+        }
+        fn image(&mut self) -> Result<Vec<Row>, EngineError> {
+            self.rows.image()
+        }
+        fn image_size(&self) -> Option<(u64, u64)> {
+            self.rows.image_size()
+        }
+        fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
+            self.rows.install(index, rows)
+        }
+        fn get_now(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+            if self.cold {
+                self.sent += u64::from(self.sends);
+                return Err(EngineError::Unloaded);
+            }
+            self.get(key)
+        }
+        fn next_now(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+            if self.cold {
+                self.sent += u64::from(self.sends);
+                return Err(EngineError::Unloaded);
+            }
+            self.next(from, to)
+        }
+        fn loads_sent(&self) -> u64 {
+            self.sent
+        }
+        fn loads_most(&mut self) -> Result<usize, EngineError> {
+            Ok(self.most)
+        }
+        fn reads_done(&mut self) {
+            self.released += 1;
+        }
+    }
+
+    /// A confirmed read whose pages are not in memory waits, each pass that sends a load counted
+    /// and none that finds its page loading already; the pass that brings the count to the most
+    /// the engine loads at once is made waiting on the device and answers, so the passes that
+    /// load are bounded whatever the cache drops between them. Answered, the read lets the pages
+    /// go, unless an entry of the range waits on them.
+    #[test]
+    fn a_confirmed_read_waits_for_its_pages_within_the_engines_bound_on_loads() {
+        let (rows, index) = name_range();
+        let mut e = Cold {
+            rows,
+            cold: true,
+            sends: false,
+            sent: 0,
+            most: 3,
+            released: 0,
+        };
+        put(&mut e.rows, index + 1, "k");
+        let query = Query::Current {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let mut loads = 0;
+        // Its page loading for another reader: no load sent, none counted, however many passes.
+        for _ in 0..10 {
+            assert_eq!(
+                query.answer_confirmed(&mut e, 1 << 10, &mut loads, false),
+                None
+            );
+        }
+        assert_eq!((loads, e.released), (0, 0));
+        e.sends = true;
+        for sent in 1..3 {
+            assert_eq!(
+                query.answer_confirmed(&mut e, 1 << 10, &mut loads, false),
+                None
+            );
+            assert_eq!(loads, sent);
+        }
+        let Some(Ok(Read::Current(Some(_)))) =
+            query.answer_confirmed(&mut e, 1 << 10, &mut loads, false)
+        else {
+            panic!("not answered at the bound");
+        };
+        assert_eq!((loads, e.released), (3, 1));
+        // Warm, it answers at its first pass, and with an entry waiting keeps the pages held.
+        e.cold = false;
+        let mut loads = 0;
+        assert!(matches!(
+            query.answer_confirmed(&mut e, 1 << 10, &mut loads, true),
+            Some(Ok(Read::Current(Some(_))))
+        ));
+        assert_eq!((loads, e.released), (0, 1));
     }
 
     #[test]

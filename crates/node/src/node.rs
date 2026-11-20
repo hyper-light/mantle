@@ -3073,6 +3073,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             if let Some((octets, ns)) = doorway.drained() {
                 self.windows.get.paced(octets, ns);
             }
+            // The jobs whose connections named them since the last turn, woken for the host's
+            // step: what a connection sends or takes moves its job alone (`door::Mark`).
+            self.host.take_marks(doorway);
         }
         loop {
             let (gateway, learned) = (self.gateway.as_deref(), &self.windows);

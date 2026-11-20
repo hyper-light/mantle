@@ -21,7 +21,7 @@
 //! signature against what the cell holds as the request arrives (docs/design/principals.md).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::Waker;
 use std::time::Instant;
 
@@ -84,6 +84,78 @@ pub struct Request {
     pub body: ChannelReceiver<Piece>,
     /// The reply, as the host writes it.
     pub reply: Sender<Answer>,
+    /// Its name on the node's marks ([`Mark`]), given as it is submitted
+    /// ([`Submitter::submit`]): none before.
+    pub mark: Option<Arc<Mark>>,
+}
+
+/// A request's name on its node's marks (node.md §2.9 step 6d): its connection names it as it gives
+/// its job something to take, a piece of its body or room in its reply, and as it lets go of it
+/// ([`Named`]), so the node's task steps that job alone where a walk stepped every job it held at
+/// every turn. Named once until the node's task takes the name ([`Mark::taken`]), so the marks hold
+/// each request at most once.
+pub struct Mark {
+    /// Unique among its door's requests: one a request, from a `u64` count no door's requests
+    /// wrap.
+    id: u64,
+    marked: AtomicBool,
+    /// Whether its connection let go of it ([`Named`]): set before the name that says so, so a job
+    /// stepped before the connection's channels close, as they do just after, does not wait on
+    /// them for a name that will not come.
+    gone: AtomicBool,
+}
+
+impl Mark {
+    /// Its name, which the node's host finds its job by.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Whether its connection let go of it: its job waits on its connection no more.
+    pub fn gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
+    /// The node's task took its name: what its connection gives its job from here names it again.
+    pub fn taken(&self) {
+        self.marked.store(false, Ordering::Release);
+    }
+
+    /// Named on `marks` unless it is already, and the node's task turned: a name with no room sets
+    /// `missed`, and the node's task steps every request's job.
+    fn name(&self, marks: &Sender<u64>, missed: &AtomicBool, node: &Waker) {
+        if !self.marked.swap(true, Ordering::AcqRel) && marks.try_send(self.id).is_err() {
+            missed.store(true, Ordering::Release);
+        }
+        node.wake_by_ref();
+    }
+}
+
+/// A connection's hold on the request it submitted ([`Submitter::submit`]): dropped as the
+/// connection lets go of the request, its exchange answered or broken, it names the request once
+/// more, so its job, waiting on a connection that went for the room or the body it would give, is
+/// stepped and finds its door gone.
+pub struct Named {
+    mark: Arc<Mark>,
+    marks: Sender<u64>,
+    marking: Arc<Marking>,
+    node: Waker,
+}
+
+impl Drop for Named {
+    fn drop(&mut self) {
+        self.mark.gone.store(true, Ordering::Release);
+        self.mark
+            .name(&self.marks, &self.marking.missed, &self.node);
+    }
+}
+
+/// What a door's marks share beside their channel: the next request's name, and whether a name
+/// found no room since the node's task last looked.
+#[derive(Default)]
+struct Marking {
+    next: AtomicU64,
+    missed: AtomicBool,
 }
 
 /// A piece of a request's body.
@@ -255,6 +327,11 @@ pub enum Answer {
 /// node to take them.
 pub struct Doorway {
     requests: ChannelReceiver<Asked>,
+    /// The requests named since the node's task last took them ([`Mark`]), and the most it takes
+    /// a turn: the channel's room.
+    marks: ChannelReceiver<u64>,
+    room: usize,
+    marking: Arc<Marking>,
     /// One request taken from the channel to learn that one waits, ahead of the rest.
     held: Option<Asked>,
     slowed: Arc<Slowings>,
@@ -269,6 +346,12 @@ pub struct Doorway {
 #[derive(Clone)]
 pub struct Submitter {
     requests: Sender<Asked>,
+    /// Where its requests are named, and the name of the one it submitted last, which its
+    /// connection's turns of the node name ([`Submitter::wake`]): a connection holds one request
+    /// at a time.
+    marks: Sender<u64>,
+    marking: Arc<Marking>,
+    mark: Option<Arc<Mark>>,
     node: Waker,
     slowed: Arc<Slowings>,
     learned: Arc<Learned>,
@@ -284,8 +367,16 @@ struct Slowings([AtomicU64; Slowed::ALL.len()]);
 
 /// A door for `capacity` requests waiting at once, past which a submission is refused at once
 /// (`503 SlowDown`, node.md §4.5), for the node whose task `node` wakes.
+///
+/// Its marks have room for twice `capacity` names, the connections the listener holds and so the
+/// requests in flight: a request is named once until the node's task takes the name, and once more
+/// where its connection submitted the next before its job ended. A name with no room turns every
+/// request's job ([`Doorway::missed`]).
 pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtError> {
     let (requests, taken) = channel(capacity)?;
+    let room = capacity.saturating_mul(2).max(1);
+    let (marks, marked) = channel(room)?;
+    let marking = Arc::new(Marking::default());
     let slowed = Arc::new(Slowings::default());
     let learned = Arc::new(Learned {
         body: AtomicUsize::new(Depth::FIRST),
@@ -295,6 +386,9 @@ pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtE
     Ok((
         Doorway {
             requests: taken,
+            marks: marked,
+            room,
+            marking: Arc::clone(&marking),
             held: None,
             slowed: Arc::clone(&slowed),
             depth: Depth::default(),
@@ -303,6 +397,9 @@ pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtE
         },
         Submitter {
             requests,
+            marks,
+            marking,
+            mark: None,
             node,
             slowed,
             learned,
@@ -325,6 +422,23 @@ impl Doorway {
             self.held = self.requests.try_recv().ok().flatten();
         }
         self.held.as_ref()
+    }
+
+    /// The next request named since the node's task last took one ([`Mark`]), in the order named;
+    /// at most [`Doorway::marks_room`] a turn, as a connection naming its request again as fast as
+    /// it is taken waits for the next turn, which its wake makes due.
+    pub fn marked(&mut self) -> Option<u64> {
+        self.marks.try_recv().ok().flatten()
+    }
+
+    /// The names its marks hold at once.
+    pub fn marks_room(&self) -> usize {
+        self.room
+    }
+
+    /// Whether a name found no room since the last call: every request's job is stepped.
+    pub fn missed(&self) -> bool {
+        self.marking.missed.swap(false, Ordering::AcqRel)
     }
 
     /// The host took a piece of body the connection delivered as `paced` says: a sample of the
@@ -395,10 +509,24 @@ pub enum Refusal {
 }
 
 impl Submitter {
-    /// Submits `request` and turns the node to take it; refused when the door holds as many as
-    /// it takes or the node is gone, the request dropped.
-    pub fn submit(&self, request: Request) -> Result<(), Refusal> {
-        self.send(Asked::Op(Box::new(request)))
+    /// Submits `request`, named ([`Mark`]), and turns the node to take it: the connection's hold
+    /// on it, which names it once more as it is let go ([`Named`]). Refused when the door holds as
+    /// many as it takes or the node is gone, the request dropped.
+    pub fn submit(&mut self, mut request: Request) -> Result<Named, Refusal> {
+        let mark = Arc::new(Mark {
+            id: self.marking.next.fetch_add(1, Ordering::Relaxed),
+            marked: AtomicBool::new(false),
+            gone: AtomicBool::new(false),
+        });
+        request.mark = Some(Arc::clone(&mark));
+        self.send(Asked::Op(Box::new(request)))?;
+        self.mark = Some(Arc::clone(&mark));
+        Ok(Named {
+            mark,
+            marks: self.marks.clone(),
+            marking: Arc::clone(&self.marking),
+            node: self.node.clone(),
+        })
     }
 
     /// Asks the node for a key, as [`Submitter::submit`] hands it an operation.
@@ -417,9 +545,13 @@ impl Submitter {
         }
     }
 
-    /// Turns the node, after the connection sent a piece of a body it took.
+    /// Turns the node, after the connection sent a piece of its request's body or took an answer
+    /// of its reply, naming the request it submitted last, so the node's task steps its job alone.
     pub fn wake(&self) {
-        self.node.wake_by_ref();
+        match &self.mark {
+            Some(mark) => mark.name(&self.marks, &self.marking.missed, &self.node),
+            None => self.node.wake_by_ref(),
+        }
     }
 
     /// The pieces the node last learned a body needs in flight to its host ([`Depth`]), which a
@@ -579,6 +711,73 @@ mod tests {
         }
         doorway.replies();
         assert_eq!(submitter.reply_depth(), 4);
+    }
+
+    /// A connection's request, submitted with its channels' ends dropped: what is named of it.
+    fn submitted(submitter: &mut Submitter, doorway: &mut Doorway) -> (Named, u64) {
+        let (_, body) = channel(1).unwrap();
+        let (reply, _) = channel(1).unwrap();
+        let request = Request {
+            op: Op::Create {
+                bucket: "b".into(),
+                id: 1,
+            },
+            principal: "o".into(),
+            denied: Vec::new(),
+            body,
+            reply,
+            mark: None,
+        };
+        let named = submitter.submit(request).unwrap();
+        let Some(Asked::Op(request)) = doorway.take() else {
+            panic!("the request submitted");
+        };
+        let id = request.mark.as_ref().unwrap().id();
+        (named, id)
+    }
+
+    /// A connection names the request it submitted as it sends a piece or takes an answer, once
+    /// until the node's task takes the name and lets it go, and once more as it lets go of the
+    /// request; each request its own name. Names past the marks' room, twice the door's
+    /// connections, are missed, which the node's task reads once.
+    #[test]
+    fn a_connection_names_its_request_once_until_the_name_is_let_go() {
+        let (mut doorway, submitter) = doorway(1, Waker::noop().clone()).unwrap();
+        assert_eq!(doorway.marks_room(), 2);
+        let (mut first, mut second) = (submitter.clone(), submitter.clone());
+        let (named, one) = submitted(&mut first, &mut doorway);
+        let (_held, two) = submitted(&mut second, &mut doorway);
+        assert_ne!(one, two, "each request its own name");
+        // Named no more than once until taken, however often its connection wakes the node.
+        first.wake();
+        first.wake();
+        second.wake();
+        assert_eq!(doorway.marked(), Some(one));
+        assert_eq!(doorway.marked(), Some(two));
+        assert_eq!(doorway.marked(), None);
+        assert!(!doorway.missed());
+        // Taken but not let go: still named, so named no more.
+        first.wake();
+        assert_eq!(doorway.marked(), None);
+        // Let go of: named again as its connection wakes the node, and as it lets go.
+        first.mark.as_ref().unwrap().taken();
+        first.wake();
+        assert_eq!(doorway.marked(), Some(one));
+        first.mark.as_ref().unwrap().taken();
+        assert!(!first.mark.as_ref().unwrap().gone());
+        drop(named);
+        assert_eq!(doorway.marked(), Some(one));
+        assert!(first.mark.as_ref().unwrap().gone(), "its connection let go");
+        // A third request's name past the marks' room of two is missed, read once.
+        let (_third, _) = submitted(&mut first, &mut doorway);
+        first.wake();
+        second.mark.as_ref().unwrap().taken();
+        second.wake();
+        let mut extra = submitter.clone();
+        let (_fourth, _) = submitted(&mut extra, &mut doorway);
+        extra.wake();
+        assert!(doorway.missed());
+        assert!(!doorway.missed());
     }
 
     /// The listener's connections read the depth the node learned: one before any phase, a body's

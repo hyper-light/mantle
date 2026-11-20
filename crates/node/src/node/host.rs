@@ -324,26 +324,56 @@ impl Job {
     }
 
     /// Its next bound or working beat, while its own work is held. A get whose reply began
-    /// and whose patience passed is vouched for no more and needs no beat; a get still reading
-    /// its version must wake at the bound even through the local S3 door. A put or a get whose
-    /// chunk waits for room is due at the beat on either door: no answer of its own comes to turn
-    /// the node when a peer's volume frees room, so the host offers it room again then
-    /// (`Host::step`). A native one is due a beat after it was last vouched for (`Job::vouch`),
-    /// or a beat from `now` before it first was.
+    /// and whose patience passed is vouched for no more and needs no beat, but one whose chunk
+    /// read still waits for room is due at once, its driver ended then (`Host::bound_jobs`); a get
+    /// still reading its version must wake at the bound even through the local S3 door. A put or
+    /// a get whose chunk waits for room is due at the beat on either door: no answer of its own
+    /// comes to turn the node when a peer's volume frees room, so the host offers it room again
+    /// then (`Host::step`). A native one is due at its next vouch (`Job::vouch`): at once where it
+    /// was never vouched for or its work moved since it last was, else half a beat after it last
+    /// was.
     fn due_ns(&self, now: u64, beat: u64) -> Option<u64> {
         if self.bounded(now) == Bounded::Unvouched {
-            return None;
+            return if self.waits_for_room() {
+                Some(now)
+            } else {
+                None
+            };
         }
-        let bound = self.bound_ns();
-        Some(match self.door {
-            _ if self.waits_for_room() => bound.min(now.saturating_add(beat)),
-            Door::Local(_) => bound,
-            Door::Native(..) => bound.min(
-                self.vouched_ns
-                    .unwrap_or(now)
-                    .saturating_add(vouch_every(beat)),
-            ),
-        })
+        let vouch = match (&self.door, self.vouched_ns) {
+            (Door::Local(_), _) => None,
+            (Door::Native(..), Some(vouched)) if self.moved_ns <= vouched => {
+                Some(vouched.saturating_add(vouch_every(beat)))
+            }
+            (Door::Native(..), _) => Some(now),
+        };
+        let room = self.waits_for_room().then(|| now.saturating_add(beat));
+        [Some(self.bound_ns()), vouch, room]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// When, on the shard's clock, the host's bound pass next has work for it
+    /// (`Host::bound_jobs`), none where it has none before its state moves, which keys it again
+    /// (`Host::rekey`): the pass reads the jobs due alone, so this is every time it acts on one.
+    /// A held one's is its bound or its beat (`Job::due_ns`); one at work holding nothing out, on
+    /// its native door, is due half a beat after it was last told, or admitted, where its own
+    /// bytes moved since (`Job::moving`). Each is the first time the pass, which read every job
+    /// at every turn, would act: no word to an asker comes later than it did. A key set at a turn
+    /// is never later than one set at a later turn on the job's state as it was, which a resting
+    /// job keeps.
+    fn beat_ns(&self, now: u64, beat: u64) -> Option<u64> {
+        if !self.working() {
+            None
+        } else if self.held() {
+            self.due_ns(now, beat)
+        } else if let Door::Native(..) = self.door {
+            let since = self.vouched_ns.or(self.admitted_ns)?;
+            (self.moved_ns > since).then(|| since.saturating_add(vouch_every(beat)))
+        } else {
+            None
+        }
     }
 
     /// When, on the wall clock, its put next renews what it holds (`Put::due_ns`): a put's or a
@@ -442,6 +472,24 @@ pub(crate) struct Host {
     /// for it: a put or a get whose chunk waits for room is offered it again a beat after
     /// (`Host::step`).
     room_offered_ns: u64,
+    /// Its jobs whose chunk waits for room (`Job::waits_for_room`), each keyed by when, on the
+    /// shard's clock, it began to wait: room freed is offered to these alone, the first come
+    /// first (`Host::offer_room`), where a walk of every job looked for them. Kept as each job is
+    /// keyed (`Host::rekey`). Bound: one a job.
+    rooms: Earliest,
+    /// Its jobs awake, each keyed by when it was woken, counted (`woken`): a turn steps these
+    /// alone, the first woken first, each once (`Host::step`), where a walk of every job passed
+    /// each resting one by. A job is here exactly where it does not rest (`Job::resting`), put
+    /// here as it is woken (`Host::wake`) and taken out as its turn leaves it resting
+    /// (`Host::rest`). Bound: one a job.
+    ready: Earliest,
+    /// Wakes counted, the key of the next job woken (`Host::wake`): from a `u64` count no node's
+    /// wakes wrap.
+    woken: u64,
+    /// The slots a turn takes due from its heaps, its beats' and its renewals', and the waiters it
+    /// offers room in their order, kept from turn to turn so a turn makes none: at most one a job.
+    due: Vec<usize>,
+    offered: Vec<(u64, usize)>,
     /// Its jobs' slots by the native exchange each came in on (`Door::exchange`), one exchange a
     /// job, each request's: a reply's job found by its exchange (`Node::write_replies`), not by a
     /// search of every job. Kept as each job is pushed and swap-removed (`Host::push`,
@@ -540,9 +588,59 @@ impl Earliest {
         self.heap.first().map(|(key, _)| *key)
     }
 
+    /// The least key with its slot.
+    fn least(&self) -> Option<(u64, usize)> {
+        self.heap.first().copied()
+    }
+
+    /// Slot `at`'s key.
+    fn key(&self, at: usize) -> Option<u64> {
+        let place = self.place.get(at).copied().flatten()?;
+        self.heap.get(place).map(|(key, _)| *key)
+    }
+
+    /// Whether no slot is keyed.
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
     /// Each key with its slot, in the heap's order: the slots keyed, and only those.
     fn entries(&self) -> &[(u64, usize)] {
         &self.heap
+    }
+
+    /// The slots keyed `until` or before, into `due`, cleared first: the heap read from its root,
+    /// level by level, each entry due naming its children, and no entry past `until` naming any,
+    /// as none of its children's keys is less than its own. A pass reads the entries due and at
+    /// most their children, twice and once more as many as are due, not every entry: a host's
+    /// turn takes the few jobs due among thousands kept. `due` holds the heap's places as they
+    /// are read, then their slots.
+    fn due(&self, until: u64, due: &mut Vec<usize>) {
+        due.clear();
+        if self.first().is_none_or(|first| first > until) {
+            return;
+        }
+        due.push(0);
+        let mut read = 0;
+        // Each place is named once, by its parent: at most every entry's.
+        for _ in 0..self.heap.len() {
+            let Some(&place) = due.get(read) else {
+                break;
+            };
+            read = read.saturating_add(1);
+            let left = place.checked_mul(2).and_then(|p| p.checked_add(1));
+            let right = left.and_then(|left| left.checked_add(1));
+            for child in [left, right].into_iter().flatten() {
+                if self.heap.get(child).is_some_and(|(key, _)| *key <= until) {
+                    due.push(child);
+                }
+            }
+        }
+        for place in due.iter_mut() {
+            if let Some((_, slot)) = self.heap.get(*place) {
+                *place = *slot;
+            }
+        }
     }
 
     /// A job pushed, holding no key yet.
@@ -761,6 +859,11 @@ impl Host {
             doors: Doors::new(doors),
             gateway,
             room_offered_ns: 0,
+            rooms: Earliest::default(),
+            ready: Earliest::default(),
+            woken: 0,
+            due: Vec::new(),
+            offered: Vec::new(),
             exchanges: Slots::default(),
             asks: Slots::default(),
             named: Slots::default(),
@@ -782,9 +885,15 @@ impl Host {
         self.called.hold(job.door.called(), at);
         self.asks
             .hold(job.pending.iter().map(|(pending, _)| *pending), at);
+        let resting = job.resting;
         self.jobs.push(job);
         self.beats.grow();
         self.renewals.grow();
+        self.rooms.grow();
+        self.ready.grow();
+        if !resting {
+            self.wake(at);
+        }
         self.rekey(at, now);
         #[cfg(test)]
         self.audit();
@@ -804,6 +913,8 @@ impl Host {
             .release(job.pending.iter().map(|(pending, _)| *pending));
         self.beats.swap_remove(at);
         self.renewals.swap_remove(at);
+        self.rooms.swap_remove(at);
+        self.ready.swap_remove(at);
         if let Some(moved) = self.jobs.get(at) {
             self.exchanges.hold(moved.door.exchange(), at);
             self.named.hold(moved.door.named(), at);
@@ -833,9 +944,33 @@ impl Host {
     /// work wakes it as it comes, an answer to one of its asks (`answer_job`), a reply given it
     /// (`reply_job`), room offered it (`offer_room`) and its put's renewal coming due
     /// (`Host::step`); nothing else moves a job that rests (`Job::rests`).
+    ///
+    /// A job woken is kept with the jobs awake (`ready`), keyed by its wake, and keeps its key
+    /// where it was awake already: the first woken is stepped first.
     fn wake(&mut self, at: usize) {
-        if let Some(job) = self.jobs.get_mut(at) {
-            job.resting = false;
+        let Some(job) = self.jobs.get_mut(at) else {
+            return;
+        };
+        job.resting = false;
+        if self.ready.key(at).is_none() {
+            self.ready.set(at, Some(self.woken));
+            self.woken = self.woken.wrapping_add(1);
+        }
+    }
+
+    /// Job `at`'s turn ended: it rests where it waits on its own asks and its door alone
+    /// (`Job::rests`), taken out of the jobs awake, else it is stepped again at the next turn,
+    /// last of those awake, as every job that does not rest is.
+    fn rest(&mut self, at: usize) {
+        let Some(job) = self.jobs.get_mut(at) else {
+            return;
+        };
+        job.resting = job.rests();
+        if job.resting {
+            self.ready.set(at, None);
+        } else {
+            self.ready.set(at, Some(self.woken));
+            self.woken = self.woken.wrapping_add(1);
         }
     }
 
@@ -845,12 +980,16 @@ impl Host {
     /// room, every S3 job is woken, its name let go. A name whose job ended finds none.
     pub(super) fn take_marks(&mut self, doorway: &mut door::Doorway) {
         if doorway.missed() {
-            for job in &mut self.jobs {
-                if let Door::Local(local) = &job.door {
+            for at in 0..self.jobs.len() {
+                if let Some(Job {
+                    door: Door::Local(local),
+                    ..
+                }) = self.jobs.get(at)
+                {
                     if let Some(mark) = &local.mark {
                         mark.taken();
                     }
-                    job.resting = false;
+                    self.wake(at);
                 }
             }
         }
@@ -858,15 +997,18 @@ impl Host {
             let Some(id) = doorway.marked() else {
                 break;
             };
-            let Some(job) = self.named.get(&id).and_then(|at| self.jobs.get_mut(at)) else {
+            let Some(at) = self.named.get(&id) else {
                 continue;
             };
-            if let Door::Local(local) = &job.door
+            if let Some(Job {
+                door: Door::Local(local),
+                ..
+            }) = self.jobs.get(at)
                 && let Some(mark) = &local.mark
             {
                 mark.taken();
             }
-            job.resting = false;
+            self.wake(at);
         }
     }
 
@@ -902,31 +1044,44 @@ impl Host {
             .caller
             .missed
             .swap(false, std::sync::atomic::Ordering::AcqRel);
+        let room = calls.room;
         if missed {
-            for job in &mut self.jobs {
-                if let Door::Native(_, native) = &job.door {
+            for at in 0..self.jobs.len() {
+                if let Some(Job {
+                    door: Door::Native(_, native),
+                    ..
+                }) = self.jobs.get(at)
+                {
                     native
                         .handed
                         .called
                         .store(false, std::sync::atomic::Ordering::Release);
-                    job.resting = false;
+                    self.wake(at);
                 }
             }
         }
-        for _ in 0..calls.room {
-            let Some(name) = calls.taken.try_recv().ok().flatten() else {
+        for _ in 0..room {
+            let Some(name) = self
+                .calls
+                .as_mut()
+                .and_then(|calls| calls.taken.try_recv().ok().flatten())
+            else {
                 break;
             };
-            let Some(job) = self.called.get(&name).and_then(|at| self.jobs.get_mut(at)) else {
+            let Some(at) = self.called.get(&name) else {
                 continue;
             };
-            if let Door::Native(_, native) = &job.door {
+            if let Some(Job {
+                door: Door::Native(_, native),
+                ..
+            }) = self.jobs.get(at)
+            {
                 native
                     .handed
                     .called
                     .store(false, std::sync::atomic::Ordering::Release);
             }
-            job.resting = false;
+            self.wake(at);
         }
     }
 
@@ -938,19 +1093,22 @@ impl Host {
     /// after: a beat or vouch counted from its turn rather than from a later `now`, or a bound
     /// that passed with its reply begun, after which it needs no turn. Such a key costs one turn,
     /// which keys it again.
+    ///
+    /// A job whose chunk waits for room is kept with the waiters (`rooms`), keyed by when it began
+    /// to wait, which it keeps while it waits.
     fn rekey(&mut self, at: usize, now: u64) {
         let Some(job) = self.jobs.get(at) else {
             return;
         };
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
-        let due = if job.working() && job.held() {
-            job.due_ns(now, beat)
-        } else {
-            None
-        };
+        let due = job.beat_ns(now, beat);
         let renewal = job.renewal_ns();
+        let waiting = job
+            .waits_for_room()
+            .then(|| self.rooms.key(at).unwrap_or(now));
         self.beats.set(at, due);
         self.renewals.set(at, renewal);
+        self.rooms.set(at, waiting);
     }
 
     /// The slot of the job of the native request on `exchange`.
@@ -5311,6 +5469,9 @@ impl Host {
         answered.dedup();
         for &at in &answered {
             self.take_answers(node, at, now)?;
+            // Keyed from what its answers made of it, a chunk refused for room among the waiters
+            // before room is offered.
+            self.rekey(at, now);
         }
         self.answered = answered;
         // A chunk refused for room at a peer's volume hears nothing when that volume frees room
@@ -5321,7 +5482,7 @@ impl Host {
         // room for on its exchange and reads it as room frees (`node::hold`): the beat serves the
         // puts refused past what it holds, and a volume's `Busy`.
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
-        let waiting = self.jobs.iter().any(Job::waits_for_room);
+        let waiting = !self.rooms.is_empty();
         let due = waiting && now >= self.room_offered_ns.saturating_add(beat);
         if freed || due {
             self.offer_room(node, now)?;
@@ -5337,29 +5498,29 @@ impl Host {
         // `step_job`).
         let wall = node.wall_ns();
         // A renewal is the one event of a resting put's that no answer or bound brings: each
-        // one due wakes its job, read from the earliest kept (`renewals`) where one is.
-        if self.renewals.first().is_some_and(|first| first <= wall) {
-            for &(due, at) in self.renewals.entries() {
-                if due <= wall
-                    && let Some(job) = self.jobs.get_mut(at)
-                {
-                    job.resting = false;
-                }
-            }
+        // one due wakes its job, the renewals due alone read from those kept (`renewals`).
+        let mut due = std::mem::take(&mut self.due);
+        self.renewals.due(wall, &mut due);
+        for &at in &due {
+            self.wake(at);
         }
+        self.due = due;
+        // The jobs awake as the steps begin, each stepped once, the first woken first: one that
+        // does not rest after its step is woken again after them, for the next turn, and one
+        // that ends leaves its slot to the job moved into it, whose entry names that slot. A job
+        // that rests is not read: a turn's steps cost by the jobs woken, not the jobs held.
         let mut timing = Timing::from(now);
-        let mut at = 0;
-        while at < self.jobs.len() {
-            // A job that rests has nothing to do this turn: passed by, its keys kept for what its
-            // bound moved (`bound_jobs`, `Host::rekey`).
-            if self.jobs.get(at).is_some_and(|job| job.resting) {
-                self.rekey(at, now);
-                at = at.saturating_add(1);
-                continue;
+        let woken = self.woken;
+        for _ in 0..self.jobs.len() {
+            let Some((key, at)) = self.ready.least() else {
+                break;
+            };
+            if key >= woken {
+                break;
             }
-            if !self.turn_job(node, at, now, wall, &mut timing)? {
-                at = at.saturating_add(1);
-            }
+            #[cfg(test)]
+            tests::READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+            self.turn_job(node, at, now, wall, &mut timing)?;
         }
         labels::set(timing.slowest.map(|(_, label)| label));
         #[cfg(test)]
@@ -5614,9 +5775,7 @@ impl Host {
         // Its keys from its state as its turn ends; one over is let go, and the job moved into its
         // slot keyed as its own turn ended, or at its turn next in the step.
         if !over {
-            if let Some(job) = self.jobs.get_mut(at) {
-                job.resting = job.rests();
-            }
+            self.rest(at);
             self.rekey(at, now);
         }
         Ok(over)
@@ -5625,18 +5784,29 @@ impl Host {
     /// Asks again each chunk a put's or a get's driver holds for want of room, its volume's or the
     /// transport's, of the same volume; a driver that fails doing so ends its job as its failed
     /// answers do. A job past its client's patience is offered none: `bound_jobs` ends it.
+    ///
+    /// Only the jobs waiting are offered it (`rooms`), the first to wait first: a turn costs by
+    /// the waiters, not the jobs held, and the room freed goes to those that waited longest, as
+    /// a first-come queue serves.
     fn offer_room<N: Serve>(&mut self, node: &mut N, now: u64) -> Result<(), NodeError> {
-        for at in 0..self.jobs.len() {
-            let Some(job) = self.jobs.get_mut(at) else {
+        let mut offered = std::mem::take(&mut self.offered);
+        offered.clear();
+        offered.extend_from_slice(self.rooms.entries());
+        offered.sort_unstable();
+        for &(_, at) in &offered {
+            #[cfg(test)]
+            tests::READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+            let Some(job) = self.jobs.get(at) else {
                 continue;
             };
-            if job.bounded(now) != Bounded::Held {
+            if job.bounded(now) != Bounded::Held || !job.waits_for_room() {
                 continue;
             }
             // Room offered to a chunk that waits for it is its job's work, as an answer is.
-            if job.waits_for_room() {
-                job.resting = false;
-            }
+            self.wake(at);
+            let Some(job) = self.jobs.get_mut(at) else {
+                continue;
+            };
             let (put, get) = match &mut job.work {
                 Work::Put(putting) => (putting.put.as_mut(), None),
                 Work::Get(getting) => (None, getting.get.as_mut()),
@@ -5656,6 +5826,7 @@ impl Host {
                 self.fail_job(node, at, Status::Failed)?;
             }
         }
+        self.offered = offered;
         Ok(())
     }
 
@@ -5669,33 +5840,55 @@ impl Host {
     /// operation waiting on its client, for its body or room to write its reply, is the
     /// transport's to judge, and a native one whose own bytes move tells its asker so as they
     /// move (`Job::moving`).
+    ///
+    /// Only the jobs due are read (`beats`, `Job::beat_ns`), each keyed again as it is bounded:
+    /// a turn costs by the bounds and vouches due, not the jobs held. Nothing here ends a job, so
+    /// each slot due names its job throughout.
     fn bound_jobs<N: Serve>(&mut self, node: &mut N, now: u64, beat: u64) -> Result<(), NodeError> {
-        for at in 0..self.jobs.len() {
-            let Some(job) = self.jobs.get_mut(at) else {
-                continue;
-            };
-            if !job.working() {
-                continue;
-            }
-            if !job.held() {
-                job.moving(now, beat);
-                continue;
-            }
-            match job.bounded(now) {
-                Bounded::SlowDown => self.slow_job(node, at, door::Slowed::Patience)?,
-                // The job says so on its door, twice a beat or as its work moves, and the node's
-                // task tells its exchange's asker (`Replies::write`).
-                Bounded::Held => job.vouch(now, beat),
-                // A chunk read waiting for room is the node's own wait, which no transport ends:
-                // its get ends there, unfinished, as one whose driver fails past its reply's head
-                // does (`write_get`).
-                Bounded::Unvouched if job.waits_for_room() => {
-                    if let Some(get) = self.get_of(at) {
-                        get.out_of_patience();
-                    }
+        let mut due = std::mem::take(&mut self.due);
+        self.beats.due(now, &mut due);
+        for &at in &due {
+            self.bound_job(node, at, now, beat)?;
+            self.rekey(at, now);
+        }
+        self.due = due;
+        Ok(())
+    }
+
+    /// Job `at` bounded at `now` ([`Host::bound_jobs`]).
+    fn bound_job<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        now: u64,
+        beat: u64,
+    ) -> Result<(), NodeError> {
+        #[cfg(test)]
+        tests::READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+        let Some(job) = self.jobs.get_mut(at) else {
+            return Ok(());
+        };
+        if !job.working() {
+            return Ok(());
+        }
+        if !job.held() {
+            job.moving(now, beat);
+            return Ok(());
+        }
+        match job.bounded(now) {
+            Bounded::SlowDown => self.slow_job(node, at, door::Slowed::Patience)?,
+            // The job says so on its door, twice a beat or as its work moves, and the node's
+            // task tells its exchange's asker (`Replies::write`).
+            Bounded::Held => job.vouch(now, beat),
+            // A chunk read waiting for room is the node's own wait, which no transport ends:
+            // its get ends there, unfinished, as one whose driver fails past its reply's head
+            // does (`write_get`).
+            Bounded::Unvouched if job.waits_for_room() => {
+                if let Some(get) = self.get_of(at) {
+                    get.out_of_patience();
                 }
-                Bounded::Unvouched => {}
             }
+            Bounded::Unvouched => {}
         }
         Ok(())
     }
@@ -8365,8 +8558,8 @@ impl Host {
         at: usize,
         reply: Reply,
     ) -> Result<(), NodeError> {
+        self.wake(at);
         if let Some(job) = self.jobs.get_mut(at) {
-            job.resting = false;
             job.work = Work::Draining(Box::new(reply));
             self.asks
                 .release(job.pending.iter().map(|(pending, _)| *pending));
@@ -9452,6 +9645,14 @@ pub(super) mod tests {
         pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The keys this thread's hosts compared in their heaps ([`Earliest::less`]).
         pub(super) static COMPARED_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The jobs this thread's hosts' turns read: each bounded ([`Host::bound_job`]), offered
+        /// room ([`Host::offer_room`]) or taken to be stepped ([`Host::step`]).
+        pub(super) static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The jobs this thread's hosts' turns read since this was last asked.
+    fn reads() -> u64 {
+        READS.with(|reads| reads.replace(0))
     }
 
     impl Host {
@@ -9479,28 +9680,54 @@ pub(super) mod tests {
             assert_eq!(self.asks.len(), asks, "an ask's slot no job waits on");
             self.beats.audit(self.jobs.len(), "beat");
             self.renewals.audit(self.jobs.len(), "renewal");
+            self.rooms.audit(self.jobs.len(), "room");
+            self.ready.audit(self.jobs.len(), "wake");
+            for (at, job) in self.jobs.iter().enumerate() {
+                assert_eq!(
+                    self.ready.key(at).is_some(),
+                    !job.resting,
+                    "job {at} awake exactly where it does not rest"
+                );
+            }
+        }
+
+        /// Job `at` rests, as its turn found nothing to do: a test's job made so at once.
+        pub(super) fn lull(&mut self, at: usize) {
+            self.jobs[at].resting = true;
+            self.ready.set(at, None);
         }
 
         /// The oracle as a step ends at `now`, every job turned in it: [`Host::audit`], and each
         /// job's keys what its state makes them at `now` (`Host::rekey`), the earliest of each
         /// what a full recount finds.
+        ///
+        /// A job a step did not read, resting with nothing due, keeps the keys its last turn set:
+        /// each is never later than its state makes it at `now`, and set exactly where its state
+        /// sets one. A job waits among the waiters for room exactly where its chunk waits for it.
         pub(super) fn audit_keys(&self, now: u64) {
             self.audit();
             let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
             let mut beats = Vec::new();
             for (at, job) in self.jobs.iter().enumerate() {
-                let due = if job.working() && job.held() {
-                    job.due_ns(now, beat)
-                } else {
-                    None
-                };
-                assert_eq!(self.beats.key(at), due, "job {at}'s beat");
+                let due = job.beat_ns(now, beat);
+                let key = self.beats.key(at);
+                assert_eq!(
+                    key.is_some(),
+                    due.is_some(),
+                    "job {at}'s beat {key:?}, {due:?}"
+                );
+                assert!(key <= due, "job {at}'s beat {key:?} past {due:?}");
                 assert_eq!(
                     self.renewals.key(at),
                     job.renewal_ns(),
                     "job {at}'s renewal"
                 );
-                beats.extend(due);
+                assert_eq!(
+                    self.rooms.key(at).is_some(),
+                    job.waits_for_room(),
+                    "job {at} among the waiters for room"
+                );
+                beats.extend(key);
             }
             assert_eq!(self.beats.first(), beats.into_iter().min());
             let renewal = self.jobs.iter().filter_map(Job::renewal_ns).min();
@@ -9509,12 +9736,6 @@ pub(super) mod tests {
     }
 
     impl Earliest {
-        /// Slot `at`'s key.
-        fn key(&self, at: usize) -> Option<u64> {
-            let place = self.place.get(at).copied().flatten()?;
-            self.heap.get(place).map(|(key, _)| *key)
-        }
-
         /// The oracle's recount of the keys of `slots` slots, each an `of`: each slot's place
         /// naming its entry, no key less than its parent's, and an entry a slot keyed.
         fn audit(&self, slots: usize, of: &str) {
@@ -9723,6 +9944,127 @@ pub(super) mod tests {
                 "{answers:?}"
             );
         }
+    }
+
+    /// A turn reads the jobs its events name, not the jobs held: 1,024 puts of an empty body, each
+    /// committed by one Name command answered 32 turns after it is asked. Each put is read as its
+    /// turn first comes and as its answer comes, 2,048 reads in all, and the 31 turns between read
+    /// none, where the walk before read every put three times a turn: whether any waited for room,
+    /// its bound and vouch, and its resting flag, 3 × 1,024 × 33 = 101,376 reads. Each answered
+    /// `Done` with its version.
+    #[test]
+    fn a_turn_reads_the_jobs_its_events_name_not_every_job_held() {
+        const PUTS: usize = 1_024;
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(PUTS, Some(std::sync::Arc::new(scheming_gateway())));
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        let mut bodies = Vec::new();
+        let mut replies = Vec::new();
+        for _ in 0..PUTS {
+            let mut putting = native_put(0);
+            putting.trailing = None;
+            let (job, body, answers) = local_job(Work::Put(putting), now, 7);
+            assert!(body.try_send(Piece::End(Some(crc.clone()))).is_ok());
+            host.push(job, now);
+            bodies.push(body);
+            replies.push(answers);
+        }
+        let mut stub = put_and_get_stub();
+        let mut held = Vec::new();
+        let _ = reads();
+        let mut read = Vec::new();
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 64, "the puts never ended");
+            if turns == 33 {
+                stub.answers.append(&mut held);
+            }
+            host.step(&mut stub).unwrap();
+            read.push(reads());
+            held.append(&mut stub.answers);
+        }
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(stub.asked, PUTS as u64, "each put's one commit");
+        assert_eq!(
+            read[0], PUTS as u64,
+            "each put read as its turn first comes"
+        );
+        assert!(
+            read[1..32].iter().all(|&read| read == 0),
+            "the turns between read none: {read:?}"
+        );
+        assert_eq!(read[32], PUTS as u64, "each put read as its answer comes");
+        for answers in &mut replies {
+            let answers = answered(answers);
+            assert!(
+                matches!(answers.as_slice(), [door::Answer::Ready, door::Answer::Head(reply), door::Answer::End]
+                    if reply.status == Status::Done && reply.version == "v"),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// The bound pass reads the jobs due alone, and tells each asker its work is held or moves at
+    /// the turn the walk of every job at every turn did: 64 native puts, half held on an ask of
+    /// their own and half at work holding nothing, each one's work moving every second to eighth
+    /// turn, turned 64 times a quarter of a vouch's interval apart. Run beside the walk on a twin
+    /// host, each job's last vouch is the walk's at every turn, 1,110 vouches each; the pass read
+    /// the 1,110 jobs it told, and no other, where the walk read 4,096.
+    #[test]
+    fn the_bound_pass_reads_the_jobs_due_and_vouches_when_the_walk_did() {
+        const JOBS: usize = 64;
+        let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap();
+        let quarter = vouch_every(beat) / 4;
+        let start = 1_000;
+        let mut stub = put_and_get_stub();
+        let mut hosts = [Host::new(JOBS, None), Host::new(JOBS, None)];
+        let mut doors = Vec::new();
+        for host in &mut hosts {
+            for at in 0..JOBS {
+                let (job, replies) = handed_job(Work::Put(native_put(1)), start, 0);
+                host.push(job, start);
+                doors.push(replies);
+                if at % 2 == 0 {
+                    host.wait_on(at, Pending::Chunk(at as u64), None);
+                    host.rekey(at, start);
+                }
+            }
+        }
+        let (mut read, mut walked, mut vouches) = (0, 0, 0);
+        for turn in 1..=64u64 {
+            let now = start + turn * quarter;
+            for host in &mut hosts {
+                for at in 0..JOBS {
+                    // Its work moves between turns, as a piece of its chunk does (`chunk_moved`).
+                    if turn % (at as u64 % 7 + 2) == 0 {
+                        host.jobs[at].moved_ns = now - 1;
+                        host.rekey(at, now - 1);
+                    }
+                }
+            }
+            let before: Vec<_> = hosts[0].jobs.iter().map(|job| job.vouched_ns).collect();
+            let _ = reads();
+            hosts[0].bound_jobs(&mut stub, now, beat).unwrap();
+            read += reads();
+            hosts[0].audit_keys(now);
+            // The rule before: every job bounded at every turn, and keyed again.
+            for at in 0..JOBS {
+                hosts[1].bound_job(&mut stub, at, now, beat).unwrap();
+                hosts[1].rekey(at, now);
+            }
+            walked += reads();
+            let pass: Vec<_> = hosts[0].jobs.iter().map(|job| job.vouched_ns).collect();
+            let walk: Vec<_> = hosts[1].jobs.iter().map(|job| job.vouched_ns).collect();
+            assert_eq!(pass, walk, "turn {turn}: each job's last vouch");
+            vouches += pass
+                .iter()
+                .zip(&before)
+                .filter(|(pass, before)| pass != before)
+                .count();
+        }
+        assert_eq!(walked, 64 * JOBS as u64);
+        assert_eq!((read, vouches), (1_110, 1_110), "jobs read, vouches told");
     }
 
     /// The S3 connection of a job made through a door, as the listener holds it: its submitter,
@@ -10178,7 +10520,7 @@ pub(super) mod tests {
             .called
             .store(false, std::sync::atomic::Ordering::Release);
         host.push(job, now);
-        host.jobs[0].resting = true;
+        host.lull(0);
         call.name(&handed);
         host.take_calls();
         assert!(!host.jobs[0].resting, "woken by its name");
@@ -10191,8 +10533,8 @@ pub(super) mod tests {
         host.push(other, now);
         let (third, third_replies) = called_job(&host, done(), now, 0, 9);
         host.push(third, now);
-        for job in &mut host.jobs {
-            job.resting = true;
+        for at in 0..host.jobs.len() {
+            host.lull(at);
         }
         for replies in [&replies, &other_replies, &third_replies] {
             replies.call.as_ref().unwrap().name(&replies.handed);
@@ -14738,7 +15080,9 @@ pub(super) mod tests {
         let mut seen: Vec<Seen> = (0..HELD).map(|_| Seen::default()).collect();
         host.bound_jobs(&mut stub, 1, beat).unwrap();
         assert_eq!(vouches(&mut replies, &mut seen), vec![1; HELD]);
+        // Moved as a piece of its chunk moves, which keys it again (`Host::chunk_moved`).
         host.jobs[3].moved_ns = 2;
+        host.rekey(3, 2);
         for now in [3, 4] {
             host.bound_jobs(&mut stub, now, beat).unwrap();
             let mut expected = vec![0; HELD];
@@ -14766,7 +15110,7 @@ pub(super) mod tests {
         let mut stub = silent_stub();
         let (job, half) = handed_job(Work::Put(native_put(20 << 20)), 1, 0);
         assert!(job.working() && !job.held());
-        host.jobs.push(job);
+        host.push(job, 1);
         let (mut replies, mut seen) = (vec![half], vec![Seen::default()]);
         let mut told = Vec::new();
         let mut now = 1;
@@ -14775,7 +15119,9 @@ pub(super) mod tests {
             if vouches(&mut replies, &mut seen) == [1] {
                 told.push(now);
             }
+            // Its body taken in its turn, which keys it again as it ends (`Host::turn_job`).
             host.jobs[0].moved_ns = now;
+            host.rekey(0, now);
             now += piece;
         }
         assert!(told.len() >= 5, "told at {told:?}");
@@ -15112,9 +15458,7 @@ pub(super) mod tests {
         }
         for job in &host.jobs {
             visited += 1;
-            if job.working() && job.held() {
-                due = [due, job.due_ns(now, beat)].into_iter().flatten().min();
-            }
+            due = [due, job.beat_ns(now, beat)].into_iter().flatten().min();
         }
         (visited, due)
     }

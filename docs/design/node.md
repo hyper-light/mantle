@@ -195,7 +195,8 @@ rather than each range's most: a worker then serves any engine's job, so a job c
 engine's file handle, store configuration and issuer attachment, its asks for extents and its
 growths go back to its own engine's owner (each range's task, on its own shard), every wake routed
 there; a worker keeps one warm store whose file a job swaps; and each engine's share of the seats
-is bounded so that one hot engine cannot hold every seat another's checkpoint waits on.
+is bounded so that one hot engine cannot hold every seat another's checkpoint waits on. The design
+below states it.
 
 *As built (2026-11-20), the workers named by range.* A worker's thread is named after its range
 as the range's store file is, `mantle-maint-{group:x}-{seat}` (`shard_db::worker_thread_name`,
@@ -203,6 +204,99 @@ as the range's store file is, `mantle-maint-{group:x}-{seat}` (`shard_db::worker
 the 82% above was `mantle-maint-0`, a name every range's first worker carried. macOS keeps 63
 bytes of a name (`MAXTHREADNAMESIZE`), a whole group's; Linux keeps 15 (`prctl(2)`,
 `PR_SET_NAME`), `mantle-maint-` and two characters more.
+
+*Design (2026-11-20), one pool for the node's engines.* What the shared pool takes, in the order
+it is built:
+
+1. **A seat, and what stays the engine's.** A seat is a thread and one warm store's pools: a
+   cursor over each of a compaction's inputs and two builders at a compaction's most
+   (`derive::workers_bytes`' pooled part), and a stack. What a job reads and writes stays its
+   engine's and travels with the job, as it does now: its inputs' descriptors, the copy of its
+   memtable's arena and the sorter's buffers (`SortPack`, `derive::workers_bytes`' packing part),
+   its grant (`Job::grant`, `file_end`, `generation`) and the cache's loan for its pages
+   (`Job::keep`), each back with its result. Every
+   engine of a node has one store configuration (`process::engine` opens each with
+   `config.store`), so one seat's pools fit every engine's jobs.
+2. **A job carries its engine.** Beside its work a job carries three things of its engine's: a
+   handle on the engine's file, a clone of the engine's own (`BlockFile::try_clone`, which takes
+   no descriptor for a file kept as segments, hyper-block `segmented`), which the seat's store
+   takes for the job and drops before the job's result is sent, so an engine whose jobs are all
+   back has no handle held by any seat and its close waits on no seat's retirement; a one-slot
+   channel for its grant's top-ups, made with the job, so an engine's answer to `Message::Need`
+   reaches the seat running that job and no other; and its engine's channel back with that
+   channel's count (`BackChannel`, `Signal`), on which the seat sends the job's `Need`, `Grown` and
+   `Done`. The issuer is the device's, one a physical device (the table above), so a seat attaches
+   once to each device it serves; that an attached store's transfers name their file per
+   transfer, as a native AIO control block names its descriptor (`struct iocb`'s `aio_fildes`,
+   `io_submit(2)`), is the first thing the slice that moves packings checks
+   (`Store::attach_through`).
+3. **Routing, wakes and order.** A seat routes nothing: each message goes on the channel its job
+   brought, so it reaches its own engine's owner (the range's task, on its shard) and wakes that
+   task alone, as `Pool::wake_on_message` and the count's `Condvar` wake it now. A job's messages
+   are sent by one thread on one FIFO channel, so they arrive in the order sent; an engine's
+   messages from several jobs interleave as its two workers' do now, each job named by its ticket.
+   None is lost: a message is counted once it is in the channel (`BackChannel::blocking_send`), and
+   no send waits on an owner that waits on the seat, since an engine's channel holds
+   `MESSAGES_A_WORKER` (two) for every job it may have out (its cap, below), as it holds two a
+   worker now.
+4. **Bounds.** The pool holds at most `N` seats, each started only when a job handed finds the
+   jobs queued outnumbering the seats waiting for one, so threads never pass `N` nor the jobs out
+   at once; where no thread may start on the owner's task (a runtime's ranges,
+   `ShardDb::prepare_async_backend`), all `N` start at cold setup and the runtime adopts their
+   retirement, as an engine's own pool's seats do now (`Pool::prepare`,
+   `Pool::adopt_retirement`). An engine has at most `cap` jobs queued or running; a job past
+   it stays with its engine, which keeps it as it keeps a job its own pool refuses now
+   (`Pool::send`'s `Ok(Err(job))`), so the pool queues at most `E × cap` jobs for `E` engines,
+   each engine's channel back holds `2 × cap` messages and each job's top-up channel one. A
+   hand-off past a bound is refused, typed, and never waits.
+5. **Size.** Each engine measures its need as `trunk::pool` does now: its jobs' busy nanoseconds
+   over its shard's period less its waits on them, `busy_e / period_e` workers (Little's law, L =
+   λW). The node's need is the sum of the ratios, not of their ceilings, so idle ranges cost a
+   fraction each rather than a worker each: `N = ⌈Σ_e busy_e / period_e⌉ + R`, `R` the reserve
+   below. `N` is bounded by the node's cores less one, not divided among its ranges, so one engine
+   may use every seat its cap allows; and by memory, the most of those the allowance holds the
+   node's need with, one fewer at a time, none below `R + 1` (as `derive::derive` bounds
+   `ENGINE_WORKERS` now). The floor charges a seat's builders and pools per seat (e490322a) and a
+   packing's buffers per engine: its active memtable's copy and one for each packing it may have
+   out. At run time the pool admits class 1 within the measured sum, as `Pool::can_take` admits
+   an engine's compactions within its measured want now.
+6. **Fairness.** Two classes, as SILK schedules flush and compaction (Balmau et al., USENIX ATC
+   2019; research/34 §5) and as the trunk's tasks already do within an engine (the work clients
+   wait on is never queued behind compactions, research/58; engine-structure.md §6). Class 0 is
+   what a client or the shard waits on: a packing, a compaction made urgent (the root without
+   room), a checkpoint's flush (`Work::Sync`), a page a read waits for (`Work::Load`) and a
+   growth. Class 1 is a compaction not yet urgent, SILK's deeper compactions, which take what is
+   left. `R` seats take class 0 alone, as SILK gives flushes a pool of their own, so class 1 holds
+   at most `N − R` seats node-wide; and each engine's cap is `N − R` seats of either class, so a hot
+   engine never holds the reserve. A free seat takes class 0 before class 1, and among engines
+   with work in a class, the next after the engine it last served. A cold engine's checkpoint
+   flush therefore waits behind no compaction, only behind class-0 jobs ahead of it in the round,
+   at most one an engine, each a flush, a page's read, a growth or one memtable's packing. Within
+   an engine its own order holds: its pool keeps what it holds as now.
+7. **What a profile says.** A shared seat serves every range, so its thread's name cannot say
+   which, as the per-range names above do. The pool counts each engine's busy nanoseconds, the
+   measure it sizes by, and reports them by range beside the seats' names
+   (`mantle-maint-shared-{seat}`).
+8. **The order of building.** (a) The seats and their scheduling, class and cap, each job carrying
+   its engine's channel back, with no store: two engines on one pool. (b) Packings and compactions
+   on the seats, each job carrying its engine's handle and top-up channel, after the attachment
+   check in item 2; each engine's pool keeps its page loads, checkpoint flushes, growths and index
+   jobs. (c) Those moved, the engine's own pool removed, and `derive` charging `N` seats and each
+   engine's packings in place of `ENGINE_WORKERS` a range.
+
+On the Mac Studio's figures (perf-10k `8b64f8d3`, above): the hot range's need at 10,000 PUTs a
+second is 1.33 workers, and its four other ranges' workers were nearly idle (the sample gave no
+figure), so while their sum stays under 0.67 the node needs `⌈Σ⌉ = 2` and holds `N = 3` with
+`R = 1`, well within its 31 cores. The floor charged five ranges' two workers each, 5 ×
+63,588,641 = 317,943,205 bytes past the least (`derive::tests`), each worker past a range's first
+28,602,155: its builders and pools, which a seat holds, and a packing's buffers, which stay its
+engine's. Three seats for ten workers hold seven fewer workers' builders and pools, at most 7 ×
+28,602,155 = 200,215,085 bytes less, the packing buffers each engine keeps for the packings it
+may have out not among them, and three threads for ten; `derive` states the exact charge, and the
+founder's operations it buys, when (c) lands.
+Class 1 holds at most two seats node-wide, the hot range's cap: what it holds now, while its need
+is 1.33; as the sum grows, `N` and the cap grow with it, to the cores. A cold range's checkpoint
+flush waits behind no compaction, at most behind four other ranges' class-0 jobs.
 
 *As built (2026-11-19), the workers' extents.* A job takes its extents from the store's before it
 goes out, a grant sized to what it reads, more than it writes. Given workers, the node suite's

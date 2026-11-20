@@ -2697,6 +2697,68 @@ are still stepped at every turn, and a job on either door still is while it read
 drains its body; and each turn still walks every job for whether any waits for room
 (`offer_room`), its bound and vouch (`bound_jobs`), and its resting flag and keys.
 
+*As built (2026-11-20): a turn reads the jobs due, waiting or woken, and no other*
+(`crates/node/src/node/host.rs`). The last open part of the notes above. Each turn still read
+every job three times for its cheap checks: whether any waited for room (`Host::step`), its bound
+and vouch (`bound_jobs`), and its resting flag and keys (the step loop's pass-by, `rekey`), so a
+turn cost by the jobs in flight however few moved, the naive poll research/99 [2] §1 names. Each
+check now reads only what an event or a deadline puts before it, as epoll returns its ready list
+alone (research/99 [1]):
+
+| Check | Before | Now |
+| --- | --- | --- |
+| bound, vouch, moving | every job, every turn | the jobs due in the earliest-deadline heap (`beats`) |
+| room freed | every job, at each freeing or beat | the waiters for room (`rooms`), first come first |
+| resting flag | every job, every turn | the jobs awake (`ready`), first woken first |
+| renewal due | every put's renewal, once one was due | the renewals due (`renewals`) |
+
+- **Every word to an asker is a deadline in `beats`** (`Job::beat_ns`): a held job's bound, its
+  beat while its chunk waits for room, and on its native door its next vouch, at once where it was
+  never vouched for or its work moved since it last was, else half a beat after (`Job::due_ns`,
+  `Job::vouch`); one at work holding nothing out, on its native door, half a beat after it was last
+  told or admitted, where its bytes moved since (`Job::moving`); and a get past its bound whose
+  chunk read waits for room, at once, its driver ended then. Before, the held job's vouch as its
+  work moved and the moving job's word were read at every turn and in no deadline, and a held job's
+  first vouch keyed half a beat late: each is now keyed at the first turn the walk would have said
+  it, so none comes later. Each key is set as the job's state moves (its turn's end, an answer
+  taken, a piece of its chunk moved, its bound pass) and is never later than one set at a later
+  turn on the same state, so a resting job keeps its own (the oracle, `Host::audit_keys`).
+- **A pass takes the due alone** (`Earliest::due`): the heap read from its root level by level,
+  each entry due naming its children and none past the turn's time naming any, as no child's key
+  is less than its parent's; at most twice and once more as many entries as are due, not every
+  entry (Cormen et al., 3rd ed., §6.5). Nothing in the bound pass ends a job, so each slot it took
+  names its job through the pass, and each is keyed again as it is bounded.
+- **Room goes to its waiters** (`rooms`, `Host::offer_room`): each job whose chunk waits for room
+  is kept keyed by when it began to wait, which it keeps while it waits, and room freed, or the
+  beat, is offered to those alone, the first to wait first, as a first-come queue serves. A job
+  answered is keyed before room is offered, so a chunk refused for room in the turn's answers is
+  offered room that turn, as the walk did.
+- **The jobs awake are a set, not a flag to scan for** (`ready`, `Host::wake`, `Host::rest`): a
+  job is there exactly where it does not rest, keyed by its wake, counted (`woken`); waking it
+  keeps the key it has. A turn steps the jobs awake as its steps begin, the first woken first, each
+  once: a job that does not rest after its step is woken again after them, for the next turn, as
+  every job that does not rest is stepped at every turn; one that ends leaves its slot to the job
+  moved into it, whose entry names that slot (`Earliest::swap_remove`).
+
+Bound: each set holds one entry a job, bounded by the job table; a pass's scratch vectors are kept
+from turn to turn (`due`, `offered`), at most one entry a job.
+
+Tested (`node::host`): 1,024 S3 puts each committed by one command answered 32 turns after it is
+asked are read 1,024 times as their turn first comes, not at all in the 31 turns between, and
+1,024 times as their answers come: 2,048 reads, where the walk read every put three times a turn,
+3 × 1,024 × 33 = 101,376 (counted from the three walks, which read every job whatever its state);
+each answered `Done` with its version. 64 native puts, half held on an ask of their own and half
+at work holding nothing, their work moving every second to eighth turn, turned 64 times a quarter
+of a vouch's interval apart beside a twin host running the walk: each job's last vouch is the
+walk's at every turn, 1,110 vouches each, and the pass read the 1,110 jobs it told and no other,
+where the walk read 4,096.
+
+Open: commands, bucket and admin operations, single reads, batch deletes, completions and copies
+still do not rest, nor a job on either door while it reads its fields or drains its body: each is
+stepped at every turn, now kept awake rather than found by a walk. A driving shard's hand-off still
+looks for jobs handed from the slot it reached (`Host::handing`), each job once a turn where the
+node drives shards.
+
 *As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
 The node's task reads every native body, so it reads them as upload-stall's job did, never into a
 piece of the endpoint's budget: a job's fields straight into their buffer, made at their length as

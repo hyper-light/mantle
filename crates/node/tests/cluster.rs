@@ -2821,10 +2821,12 @@ fn chunks_a_peer_stored_read_back_after_it_stops_and_starts_again() {
         );
     }
     cell.stop(2);
-    // Its volume is closed: what node 1 asks of it is lost, not answered.
+    // Its volume is closed: what node 1 asks of it is not answered. It is lost where the exchange
+    // ends unanswered, or ended `Suspected` where node 1 has heard node 2 announce its stop
+    // (`Node::end_chunk_gets`), which a slower host hears before the get goes out.
     assert!(matches!(
         cell.get_chunk(1, 2, volume, chunks[0].0, 0, 1),
-        ChunkOutcome::Lost(_)
+        ChunkOutcome::Lost(_) | ChunkOutcome::Suspected
     ));
     let dials = cell.watch.links.get(&(1, 2)).map_or(0, |link| link.dials);
     cell.restart(2);

@@ -240,7 +240,84 @@ under load, at moderate load and saturated.
   ask decided with none left just after another job's result was taken for an owner that has not
   yet given back the grant that job did not write. A test's grants of one extent against
   a store holding one extent free for each ask failed every fill before the change and fail none
-  after, each store reopened with every row (`shard_db/worker_need.rs`).
+  after, each store reopened with every row (`shard_db/worker_need.rs`). *Open:* such an ask is
+  answered from the next checkpoint's room (below) too; answered only beyond it, a refused ask's
+  job must be abandoned without failing the shard and its task held until the store has the room
+  its job held, or it is handed out and refused again (tried 2026-11-20: `shard_db/worker_need.rs`
+  then waited without end).
+- **The next checkpoint's room is kept.** An extent freed while the durable checkpoint names it is
+  free only once the next checkpoint is durable (§8, E1 as built), and that checkpoint writes
+  extents of its own: a packing of each memtable it finds, the allocator's map and the trunk's
+  image. Maintenance that took the store's last extents left that checkpoint no room, and the
+  store stayed full of extents only the checkpoint could free: the node suite's sustained-writes
+  cell fenced so, "extents of a store would exceed its bound of 256", 214 held and 42 pending
+  (CI run 44721951954; mantle-node `tests/engine_workers.rs`). So maintenance leaves that room
+  free (`Trunk::room_kept`, counted once a pass): a packing for the memtable taking puts and one
+  for each frozen or packing memtable (`ShardDb::packing_extents`, the memtable's runs and one
+  more), the allocator's map at its most (`Store::map_room`), and the trunk's image as it stands
+  (`Trunk::image_extents_now`). An inline task opens, and a worker's job takes its grant, only
+  where the store holds its ask beside that room and the room the inline tasks writing now may
+  still take; an inline task asks as a grant is sized, the extents the pages it reads fill or its
+  inputs' extents when fewer, and a part a page at most: a settle's entries count every version,
+  and a leaf's parts sized by them asked 101 extents with 83 free after a checkpoint, a wait
+  never met. A packing's grant (`ShardDb::sort_off`) still asks one extent more a cut at the
+  root's pivots than that room counts it, and goes out beside what is held without the rest of
+  the room; a rotation keeps the room for it (below). *Open:* the grant to leave the rest of the
+  room, which held the packing behind a growth in `shard_db/room_seats.rs` when tried. The
+  fallback that ran a compaction inline with no
+  job out, taking extents as it wrote, is gone: it was the fence. A task without its room waits;
+  the wait records the extents it needs (`Trunk::note_room_short`) and lasts until the store has
+  them, not merely more than before: ended by the checkpoint's own image and map coming back, it
+  let one memtable in a checkpoint and drained the kept room by an extent a cycle (measured,
+  2026-11-20).
+- **Rotations and entries wait with maintenance.** A rotation needs, in extents the store may
+  hand out once grown (`Store::room_most`), the checkpoint's room and image, a packing more and
+  the room the owed maintenance asks (`ShardDb::rotation_room`, `Trunk::owed_room`): the
+  compactions owed are what give extents back, and packings taking their room would fill the
+  store with branches none could compact. While maintenance waits for room every entry waits too
+  (`ShardDb::room_now` answers no room), even into a memtable with room, which that checkpoint
+  would pack into extents its room keeps for the memtable already there, filling the store a
+  memtable a checkpoint. A replicated range's entry so waits committed and unapplied, as for any
+  rotation (§6), a paced wait the node answers `SlowDown`. A blocking rotation whose maintenance
+  waits for room answers no room rather than fail the put (`ShardDb::rotate_with`).
+- **A checkpoint saves the trunk as it stands.** A checkpoint ran the trunk's maintenance to its
+  end before saving, and at the store's bound that maintenance waited for the extents only the
+  checkpoint frees. Now a drain and a paced flush stop once what is left waits for room with no
+  task begun (`Trunk::stalled_for_room`: an inline task still opening, no output built, or a
+  worker's job not handed out); those tasks are dropped and their nodes queued to plan them anew
+  (`Trunk::drop_unstarted`), an opening's partial cursors first giving their read buffers and
+  unclaimed reads back to the store (`Compaction::cancel_opening`; `trunk/room.rs` drops one
+  that opened an input and finds every buffer and extent back), as a node changed under a task
+  replans it (§6, Flat maintenance), and the trunk is saved as it stands: a save needs only that
+  no task holds inputs or output and none is being abandoned (`Trunk::saveable`). SplinterDB's
+  trunk nodes likewise name their
+  branches as they stand, a flush moving references only (research/34 §1). The image names what
+  maintenance owes, in format 8: each pivot the first of its node's in-flight bundles live for it
+  (`start`), each node its in-flight list after its pivots (each bundle's cut keys, each part's
+  index into them, its branches, oldest first), and the root its pending branches after its own
+  list, newest last, as they would enter it. Opened, the nodes holding in-flight bundles are
+  queued, so their compactions are planned anew (`trunk/room.rs`: a trunk saved owing
+  maintenance opens with every row and every extent named once, then drains). A format 7 image
+  is refused, as every earlier format was once the format moved.
+- **A range checkpoints for room.** While the engine waits for room and the durable checkpoint
+  names extents freed since (`ShardDb::wants_checkpoint`), a range checkpoints with nothing
+  applied since its last, at the index it has applied (`Stored::persist`, `Stored::persist_now`).
+  That index is durable already, so invariant I8 holds: the range never records durable past
+  what its engine holds, and the engine never begins a checkpoint of its own. The checkpoint
+  frees the extents the one before named.
+- **At the bound.** Where the tree and its maintenance's working room hold the store's extents,
+  nothing is pending a checkpoint and every task left waits for room, no task begun and no
+  memtable frozen or packing (`ShardDb::at_extent_bound`), the engine stays in that wait: an
+  entry is answered no room now, never a fence, and every acknowledged row reads back, before and
+  after the store is opened again (mantle-node `tests/engine_workers.rs`, both fills; on
+  2026-11-20 the shard alone met the bound at entry 8,925 of 24,000 and the paced fill with its
+  worker at entry 17,625). A
+  small store reaches it before its bytes are full, since each small branch takes a whole
+  extent: the node suite's cell (256 extents of four 4 KiB pages, 4 KiB memtables) held about
+  175–190 branches in 238–240 extents at the stall of a sustained fill over 3,000 keys, where
+  the same 4 MiB as 512 extents of two pages took the whole fill (2026-11-20, mantle-node
+  `tests/engine_workers.rs`). *Open:* small branches sharing extents, so a store's extents bound
+  the bytes it holds rather than its branches.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 
@@ -782,8 +859,10 @@ counted budget; no task waits on another node's:
   as its lists keep the most they grew to (`tests/builder_memory.rs`, a memtable's worst mixes).
 
 Reads are unchanged: every apply runs on the shard's thread between steps, so a read sees each
-node either before or after a task, never half of one. A checkpoint saves the nodes as they are;
-an output not yet applied is named by no saved node and is freed at recovery, as a job out is now.
+node either before or after a task, never half of one. A checkpoint saves the nodes as they are,
+their in-flight lists and the root's pending branches with them (§3, image format 8), so it waits
+for no task to finish; an output not yet applied is named by no saved node and is freed at
+recovery, as a job out is now.
 
 ### Writes handed to the device's issuer (E7's second part)
 
@@ -855,7 +934,8 @@ than each range's most, is open there.
 - **Begun without waiting, as built.** A range's checkpoint on a node's shard, whose thread runs
   the node's consensus and transport too, is made by `ShardDb::checkpoint_now` in the same order
   and waits on nothing (docs/design/replica.md §4). Its memtables are packed and the trunk's
-  maintenance run to its end as `flush` does, in slices of an extent's pages, the retained
+  maintenance run as `flush` runs it, to its end or until what is left waits for extents only
+  this checkpoint frees (§3), in slices of an extent's pages, the retained
   checkpoint's slice (§2, `Store::checkpoint_async`); the trunk's image and the allocator's map
   are written (`Store::checkpoint_map`); and each full flush is a job on a maintenance worker
   (`Work::Sync`), which flushes the store's file through its own handle: a flush covers every

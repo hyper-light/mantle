@@ -163,6 +163,11 @@ impl Allocator {
             .saturating_add(u64::try_from(self.free.len()).unwrap_or(u64::MAX))
     }
 
+    /// Extents freed while the durable checkpoint names them: free once the next is durable.
+    pub fn pending(&self) -> u64 {
+        u64::try_from(self.pending.len()).unwrap_or(u64::MAX)
+    }
+
     /// The extents the shard's allocator has handed out at least once: its high-water.
     pub fn high_water(&self) -> u64 {
         u64::try_from(self.refs.len()).unwrap_or(u64::MAX)

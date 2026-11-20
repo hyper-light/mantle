@@ -208,14 +208,31 @@ root's pivots went into a bundle whose flush waited, 194 branches of an extent e
 result gives back what it did not write as it is taken; a packing's branches go in flight where
 their pivot's flush waits (engine-structure.md, Incorporation); and a packing or a compaction
 goes out only where the store holds its grant beside what is held: else it waits while another
-job may give extents back, and with none the shard runs it, taking extents as it writes them,
-as without workers (`Trunk::dispatch_tasks`, `ShardDb::sort_off`, `ShardDb::hand_off_sorted`). The same install with its
+job may give extents back, and with none a packing is packed by the shard, taking extents as it
+writes them, as without workers (`Trunk::dispatch_tasks`, `ShardDb::sort_off`,
+`ShardDb::hand_off_sorted`). The same install with its
 worker then took 180 extents (`tests/engine_workers.rs`). So the store's size reserves nothing
 for jobs in flight (`derive::engine`'s `engine.max_extents`, unchanged): a job never takes room
-the store lacks. Reaching the limit is still the engine's refusal only where what the store
-holds fills it, as without workers. *Open:* `STORE_BYTES_AN_OBJECT` was measured before the
+the store lacks. *Open:* `STORE_BYTES_AN_OBJECT` was measured before the
 workers (2026-10-31); the workers' layout is not the shard's, within a few extents of 256 either
 way near the limit, and the transfer harness measures it again with them.
+
+*As built (2026-11-20), a store at its extent bound.* The node suite's sustained-writes cell then
+fenced a range's engine, "extents of a store would exceed its bound of 256" (CI run 44721951954):
+maintenance took the store's last extents while 42 the durable checkpoint named waited for the
+next checkpoint, which then had no room to write. The engine now keeps the next checkpoint's
+room free of its maintenance's openings and grants and of its rotations, saves its trunk with
+maintenance still owed, and no longer runs a compaction inline without its room: the task waits
+(engine-structure.md §3; a worker's top-up and a packing's grant do not keep that room yet, open
+there).
+While the engine waits for extents only a checkpoint frees, its range checkpoints at the index
+it has applied, durable already, so invariant I8 holds (`Stored::persist_now`,
+`ShardDb::wants_checkpoint`). At its store's extent bound a range's engine answers an entry no
+room now, a paced wait the node answers `SlowDown`, never a fence, and every acknowledged row
+reads back. The cell's store reaches that bound before its bytes are full, each small branch
+taking a whole extent of four pages: about 175–190 branches in 238–240 of its 256 extents
+(`tests/engine_workers.rs`). *Open:* small branches sharing extents, which the sustained-writes
+cell's whole fill waits on.
 
 *As built (2026-11-17).* The node runs on hyper-rt's multi-shard `Runtime`, a shard for each CPU
 the process runs at once (hyper-rt `Facts::cpus_at_once`; `process::runtime`), its task launched

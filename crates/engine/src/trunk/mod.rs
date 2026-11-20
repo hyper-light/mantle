@@ -646,6 +646,15 @@ pub struct Trunk {
     /// A ready job's grant the shard's file had no admitted extents for: the most asked since the
     /// shard last looked ([`Trunk::take_capacity_wanted`]), so its file grows enough.
     capacity_wanted: u64,
+    /// The extents the next checkpoint takes besides the trunk's image, which maintenance leaves
+    /// free: the memtables it packs and the allocator's map ([`Trunk::set_checkpoint_room`]).
+    checkpoint_room: u64,
+    /// The checkpoint's room with the image's extents, counted once a pass that asks it
+    /// ([`Trunk::room_kept`]).
+    room_kept: Option<u64>,
+    /// A task of the last pass waited for extents the store did not have free beside the
+    /// checkpoint's room: the store's free extents then ([`Trunk::stalled_for_room`]).
+    room_short: Option<u64>,
     /// A test's estimates that fall short of what a job writes: a compaction's grant and a
     /// packing's at most this many extents each, so the job asks its pool for more as it writes
     /// ([`pool::Message::Need`]).
@@ -781,6 +790,62 @@ fn save32(out: &mut Vec<u8>, n: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// A branch descriptor's bytes in an image at most: [`Branch::encode`]'s fixed fields, within
+/// seven u64s, two u32s and the u8 height, and a u64 an extent.
+fn descriptor_bytes(b: &Branch) -> Result<usize, Error> {
+    size_of::<[u64; 7]>()
+        .checked_add(size_of::<[u32; 2]>())
+        .and_then(|n| n.checked_add(size_of::<u8>()))
+        .and_then(|n| n.checked_add(b.extents.len().checked_mul(size_of::<u64>())?))
+        .ok_or(corrupt())
+}
+
+/// An in-flight bundle's bytes in an image ([`encode_bundle`]).
+fn bundle_bytes<'a>(
+    cuts: &[Vec<u8>],
+    at: usize,
+    branches: impl Iterator<Item = &'a Branch>,
+) -> Result<usize, Error> {
+    let mut bytes = size_of::<[u32; 3]>()
+        .checked_add(at.checked_mul(size_of::<u32>()).ok_or(corrupt())?)
+        .ok_or(corrupt())?;
+    for cut in cuts {
+        bytes = bytes
+            .checked_add(size_of::<u32>())
+            .and_then(|n| n.checked_add(cut.len()))
+            .ok_or(corrupt())?;
+    }
+    for b in branches {
+        bytes = bytes.checked_add(descriptor_bytes(b)?).ok_or(corrupt())?;
+    }
+    Ok(bytes)
+}
+
+/// An in-flight bundle as an image names it: its cut keys, each part's index into them (none
+/// for a flush's branch or a packing of one part), then its branches, oldest first as the list
+/// holds them ([`InFlight`]).
+fn encode_bundle<'a>(
+    out: &mut Vec<u8>,
+    cuts: &[Vec<u8>],
+    at: impl ExactSizeIterator<Item = usize>,
+    branches: impl ExactSizeIterator<Item = &'a Branch>,
+) -> Result<(), Error> {
+    save32(out, cuts.len())?;
+    for cut in cuts {
+        save32(out, cut.len())?;
+        out.extend_from_slice(cut);
+    }
+    save32(out, at.len())?;
+    for j in at {
+        save32(out, j)?;
+    }
+    save32(out, branches.len())?;
+    for b in branches {
+        b.encode(out)?;
+    }
+    Ok(())
+}
+
 impl Saving {
     fn address<F: BlockFile>(&self, store: &Store<F>, page: usize) -> Result<u64, Error> {
         let per = usize::try_from(store.extent_pages()).map_err(|_| corrupt())?;
@@ -850,8 +915,11 @@ enum State {
 /// maplet hashes. Format 7: a branch's range filter states the keys it filters and its reach, an
 /// entry cut short there, its suffix bits all set, holding every key starting with it; its leaf
 /// index's entries are pages doubled, a group of leaves' last with its low bit set; a trie's
-/// sparse levels are one sequence.
-const IMAGE_FORMAT: u8 = 7;
+/// sparse levels are one sequence. Format 8: each pivot names the first of its node's in-flight
+/// bundles live for it, and each node its in-flight list after its pivots, the root's pending
+/// branches after its own, so a checkpoint saves the trunk without first running its maintenance
+/// to the end (docs/design/engine-structure.md §3).
+const IMAGE_FORMAT: u8 = 8;
 /// The saved image header's magic: "mantleTK" in ASCII, little-endian.
 const IMAGE_MAGIC: u64 = u64::from_le_bytes(*b"mantleTK");
 /// None, in a child or an end key's place.
@@ -931,6 +999,9 @@ impl Trunk {
             inflight_nodes: 0,
             wanting_nodes: 0,
             capacity_wanted: 0,
+            checkpoint_room: 0,
+            room_kept: None,
+            room_short: None,
             #[cfg(test)]
             compact_most: None,
             #[cfg(test)]
@@ -2009,6 +2080,119 @@ impl Trunk {
         self.root = self.nodes.len().saturating_sub(1);
     }
 
+    /// Whether the trunk can be saved as it stands: no task holds inputs or output and none is
+    /// being abandoned. Pending branches, in-flight lists and the changes nodes want are named
+    /// by the image or planned anew, so a checkpoint need not run maintenance to its end first
+    /// (SplinterDB's flush moves references only and its trunk nodes name their branches as they
+    /// stand; research/34 §1).
+    pub(crate) fn saveable(&self) -> bool {
+        self.tasks.is_empty() && self.abandoning.is_none()
+    }
+
+    /// The bytes node `n`'s descriptor takes in an image ([`Self::encode_node`]).
+    fn node_bytes(&self, n: usize) -> Result<usize, Error> {
+        let node = self.node(n)?;
+        let mut bytes = size_of::<u8>()
+            .checked_add(size_of::<[u32; 3]>())
+            .and_then(|b| b.checked_add(node.end.as_ref().map_or(0, Vec::len)))
+            .ok_or(corrupt())?;
+        for pivot in &node.pivots {
+            bytes = bytes
+                .checked_add(size_of::<[u32; 4]>())
+                .and_then(|b| b.checked_add(pivot.key.len()))
+                .ok_or(corrupt())?;
+            for b in pivot.bundle.branches() {
+                bytes = bytes.checked_add(descriptor_bytes(b)?).ok_or(corrupt())?;
+            }
+        }
+        for bundle in &node.inflight {
+            let more = bundle_bytes(&bundle.cuts, bundle.at.len(), bundle.iter())?;
+            bytes = bytes.checked_add(more).ok_or(corrupt())?;
+        }
+        if n == self.root {
+            for p in &self.pending {
+                let more = bundle_bytes(&p.cuts, p.parts.len(), p.branches())?;
+                bytes = bytes.checked_add(more).ok_or(corrupt())?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Node `n`'s descriptor appended to an image: leaf, end key, its pivots (key, child, the
+    /// first in-flight bundle live for it, its bundle), then its in-flight list, oldest first,
+    /// and at the root the pending branches after it, newest last, as they would enter it.
+    fn encode_node(&self, n: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+        let node = self.node(n)?;
+        out.push(u8::from(node.leaf));
+        match &node.end {
+            Some(end) => {
+                save32(out, end.len())?;
+                out.extend_from_slice(end);
+            }
+            None => out.extend_from_slice(&ABSENT.to_le_bytes()),
+        }
+        save32(out, node.pivots.len())?;
+        for p in &node.pivots {
+            save32(out, p.key.len())?;
+            out.extend_from_slice(&p.key);
+            match p.child {
+                Some(c) => save32(out, c)?,
+                None => out.extend_from_slice(&ABSENT.to_le_bytes()),
+            }
+            save32(out, p.start)?;
+            save32(out, p.bundle.branches().len())?;
+            for b in p.bundle.branches() {
+                b.encode(out)?;
+            }
+        }
+        let pending = if n == self.root {
+            self.pending.len()
+        } else {
+            0
+        };
+        save32(
+            out,
+            node.inflight.len().checked_add(pending).ok_or(corrupt())?,
+        )?;
+        for bundle in &node.inflight {
+            encode_bundle(
+                out,
+                &bundle.cuts,
+                bundle.at.iter().copied(),
+                bundle.branches.iter(),
+            )?;
+        }
+        if n == self.root {
+            for p in &self.pending {
+                encode_bundle(
+                    out,
+                    &p.cuts,
+                    p.parts.iter().map(|(j, _)| *j),
+                    p.parts.iter().map(|(_, b)| b),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The extents the trunk's image takes saved now: its header page and its bytes' pages, in
+    /// extents of `store`'s pages.
+    pub(crate) fn image_extents_now<F: BlockFile>(&self, store: &Store<F>) -> Result<u64, Error> {
+        let mut bytes = size_of::<u8>()
+            .checked_add(size_of::<[u32; 3]>())
+            .and_then(|b| b.checked_add(size_of::<u64>()))
+            .ok_or(corrupt())?;
+        for n in 0..self.nodes.len() {
+            bytes = bytes.checked_add(self.node_bytes(n)?).ok_or(corrupt())?;
+        }
+        let capacity = store.page_capacity().max(1);
+        let per = usize::try_from(store.extent_pages())
+            .map_err(|_| corrupt())?
+            .max(1);
+        let pages = bytes.div_ceil(capacity).checked_add(1).ok_or(corrupt())?;
+        u64::try_from(pages.div_ceil(per)).map_err(|_| corrupt())
+    }
+
     /// Writes the trunk's image for a checkpoint and returns its header page, which the
     /// superblock names as the root: the nodes, each pivot's key, child and branches, serialized
     /// into pages of fresh extents. The previous image's extents are released now and freed once
@@ -2020,9 +2204,9 @@ impl Trunk {
                 what: "a synchronous save during a paced checkpoint",
             });
         }
-        if !self.is_idle() {
+        if !self.saveable() {
             return Err(Error::InvalidArgument {
-                what: "a trunk saved with maintenance pending",
+                what: "a trunk saved with maintenance running",
             });
         }
         let mut blob = Vec::new();
@@ -2035,31 +2219,8 @@ impl Trunk {
         put32(&mut blob, self.config.fanout)?;
         blob.extend_from_slice(&self.config.leaf_entries.to_le_bytes());
         put32(&mut blob, self.nodes.len())?;
-        for node in &self.nodes {
-            if !node.inflight.is_empty() {
-                return Err(corrupt());
-            }
-            blob.push(u8::from(node.leaf));
-            match &node.end {
-                Some(end) => {
-                    put32(&mut blob, end.len())?;
-                    blob.extend_from_slice(end);
-                }
-                None => blob.extend_from_slice(&ABSENT.to_le_bytes()),
-            }
-            put32(&mut blob, node.pivots.len())?;
-            for p in &node.pivots {
-                put32(&mut blob, p.key.len())?;
-                blob.extend_from_slice(&p.key);
-                match p.child {
-                    Some(c) => put32(&mut blob, c)?,
-                    None => blob.extend_from_slice(&ABSENT.to_le_bytes()),
-                }
-                put32(&mut blob, p.bundle.branches().len())?;
-                for b in p.bundle.branches() {
-                    b.encode(&mut blob)?;
-                }
-            }
+        for n in 0..self.nodes.len() {
+            self.encode_node(n, &mut blob)?;
         }
         // The header page, then the blob's pages, in fresh extents.
         let capacity = store.page_capacity();
@@ -2125,9 +2286,9 @@ impl Trunk {
         budget: u64,
     ) -> Result<Option<u64>, Error> {
         if !self.saving() {
-            if !self.is_idle() {
+            if !self.saveable() {
                 return Err(Error::InvalidArgument {
-                    what: "a trunk saved with maintenance pending",
+                    what: "a trunk saved with maintenance running",
                 });
             }
             let capacity = store.page_capacity();
@@ -2326,67 +2487,25 @@ impl Trunk {
     }
 
     fn encode_saved_node(&mut self) -> Result<(), Error> {
-        let save = &mut self.saving;
-        let node = self.nodes.get(save.node).ok_or(corrupt())?;
-        if !node.inflight.is_empty() {
-            return Err(corrupt());
-        }
-        // Reserve this node's exact descriptor shape before encoders append to the scratch.
-        let mut bytes = size_of::<u8>()
-            .checked_add(size_of::<[u32; 2]>())
+        let n = self.saving.node;
+        let bytes = self.node_bytes(n)?;
+        let total = self
+            .saving
+            .bytes
+            .len()
+            .checked_add(bytes)
             .ok_or(corrupt())?;
-        bytes = bytes
-            .checked_add(node.end.as_ref().map_or(0, Vec::len))
-            .ok_or(corrupt())?;
-        for pivot in &node.pivots {
-            bytes = bytes
-                .checked_add(size_of::<[u32; 3]>())
-                .and_then(|n| n.checked_add(pivot.key.len()))
-                .ok_or(corrupt())?;
-            for branch in pivot.bundle.branches() {
-                // Branch::encode has seven u64 fields, two u32 fields and its u8 height.
-                let fixed = size_of::<[u64; 7]>()
-                    .checked_add(size_of::<[u32; 2]>())
-                    .and_then(|n| n.checked_add(size_of::<u8>()))
-                    .ok_or(corrupt())?;
-                bytes = bytes
-                    .checked_add(fixed)
-                    .and_then(|n| {
-                        n.checked_add(branch.extents.len().checked_mul(size_of::<u64>())?)
-                    })
-                    .ok_or(corrupt())?;
-            }
-        }
-        let total = save.bytes.len().checked_add(bytes).ok_or(corrupt())?;
-        if total > save.image_limit {
+        if total > self.saving.image_limit {
             return Err(Error::LimitExceeded {
                 what: "a trunk image's serialized bytes",
-                limit: u64::try_from(save.image_limit).unwrap_or(u64::MAX),
+                limit: u64::try_from(self.saving.image_limit).unwrap_or(u64::MAX),
             });
         }
-        save_reserve(&mut save.bytes, bytes)?;
-        save.bytes.push(u8::from(node.leaf));
-        match &node.end {
-            Some(end) => {
-                save32(&mut save.bytes, end.len())?;
-                save.bytes.extend_from_slice(end);
-            }
-            None => save.bytes.extend_from_slice(&ABSENT.to_le_bytes()),
-        }
-        save32(&mut save.bytes, node.pivots.len())?;
-        for pivot in &node.pivots {
-            save32(&mut save.bytes, pivot.key.len())?;
-            save.bytes.extend_from_slice(&pivot.key);
-            match pivot.child {
-                Some(child) => save32(&mut save.bytes, child)?,
-                None => save.bytes.extend_from_slice(&ABSENT.to_le_bytes()),
-            }
-            save32(&mut save.bytes, pivot.bundle.branches().len())?;
-            for branch in pivot.bundle.branches() {
-                branch.encode(&mut save.bytes)?;
-            }
-        }
-        Ok(())
+        // Reserve this node's exact descriptor shape before the encoder appends to the scratch.
+        let mut out = std::mem::take(&mut self.saving.bytes);
+        let encoded = save_reserve(&mut out, bytes).and_then(|()| self.encode_node(n, &mut out));
+        self.saving.bytes = out;
+        encoded
     }
 
     fn reset_save(&mut self) {
@@ -2534,6 +2653,7 @@ impl Trunk {
                 } else {
                     Some(usize::try_from(child).map_err(|_| corrupt())?)
                 };
+                let start = usize_of(r.take(4)?)?;
                 let bundle_len = usize_of(r.take(4)?)?;
                 let mut bundle = Vec::with_capacity(bundle_len.min(len));
                 for _ in 0..bundle_len {
@@ -2547,14 +2667,50 @@ impl Trunk {
                     key,
                     child,
                     bundle,
-                    start: 0,
+                    start,
                     seek: SeekRent::default(),
                 });
+            }
+            let bundles = usize_of(r.take(4)?)?;
+            let mut inflight = Vec::with_capacity(bundles.min(len));
+            for _ in 0..bundles {
+                let cut_count = usize_of(r.take(4)?)?;
+                let mut cuts = Vec::with_capacity(cut_count.min(len));
+                for _ in 0..cut_count {
+                    let cut_len = usize_of(r.take(4)?)?;
+                    cuts.push(r.take(cut_len)?.to_vec());
+                }
+                let at_count = usize_of(r.take(4)?)?;
+                let mut at = Vec::with_capacity(at_count.min(len));
+                for _ in 0..at_count {
+                    // A part's index into the cuts; 0 alone for a packing of one part over
+                    // every key, which has none ([`InFlight`]).
+                    let j = usize_of(r.take(4)?)?;
+                    if j != 0 && j >= cuts.len() {
+                        return Err(corrupt());
+                    }
+                    at.push(j);
+                }
+                let branch_count = usize_of(r.take(4)?)?;
+                if at_count != 0 && at_count != branch_count {
+                    return Err(corrupt());
+                }
+                let mut branches = Vec::with_capacity(branch_count.min(len));
+                for _ in 0..branch_count {
+                    let rest = r.bytes.get(r.at..).ok_or(corrupt())?;
+                    let (branch, used) = Branch::decode(store, rest)?;
+                    r.at = r.at.checked_add(used).ok_or(corrupt())?;
+                    branches.push(branch);
+                }
+                inflight.push(InFlight { branches, cuts, at });
+            }
+            if pivots.iter().any(|p| p.start > inflight.len()) {
+                return Err(corrupt());
             }
             nodes.push(Node {
                 leaf,
                 pivots,
-                inflight: Vec::new(),
+                inflight,
                 end,
                 wants: None,
                 queued: false,
@@ -2569,7 +2725,10 @@ impl Trunk {
             .iter()
             .flat_map(|n| n.pivots.iter().map(|p| entries_of(p.bundle.branches())))
             .fold(0u64, u64::saturating_add);
-        Ok(Self {
+        // Nodes saved with in-flight bundles are looked at again, so their compactions are
+        // planned anew.
+        let inflight_nodes = nodes.iter().filter(|n| !n.inflight.is_empty()).count();
+        let mut trunk = Self {
             nodes,
             root,
             config: TrunkConfig {
@@ -2586,9 +2745,12 @@ impl Trunk {
             timed: false,
             yield_io: false,
             io_waiting: false,
-            inflight_nodes: 0,
+            inflight_nodes,
             wanting_nodes: 0,
             capacity_wanted: 0,
+            checkpoint_room: 0,
+            room_kept: None,
+            room_short: None,
             #[cfg(test)]
             compact_most: None,
             #[cfg(test)]
@@ -2616,7 +2778,17 @@ impl Trunk {
             taken: 0,
             reuse_window: (0, 0),
             reuse: Reuse::default(),
-        })
+        };
+        for n in 0..trunk.nodes.len() {
+            if trunk
+                .nodes
+                .get(n)
+                .is_some_and(|node| !node.inflight.is_empty())
+            {
+                trunk.queue(n);
+            }
+        }
+        Ok(trunk)
     }
 
     /// Pivot `i`'s compaction is done: its branch goes to the front of the pivot's bundle, and

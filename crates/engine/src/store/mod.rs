@@ -1614,6 +1614,37 @@ impl<F: BlockFile> Store<F> {
         self.alloc.capacity()
     }
 
+    /// The extents a checkpoint's allocator map takes at most: a count for every extent the
+    /// allocator may hand out, as [`Self::checkpoint_map`] lays them, a page's capacity in u32
+    /// counts and an extent's pages of them.
+    pub(crate) fn map_room(&self) -> u64 {
+        let per_page = u64::try_from(self.page_capacity() / 4).unwrap_or(u64::MAX);
+        let per_extent = per_page
+            .saturating_mul(u64::from(self.config.extent_pages))
+            .max(1);
+        self.alloc
+            .limit()
+            .max(self.config.max_extents)
+            .div_ceil(per_extent)
+    }
+
+    /// Extents freed while the durable checkpoint names them, free again once the next
+    /// checkpoint is durable (`Allocator::release`).
+    pub(crate) fn pending_extents(&self) -> u64 {
+        self.alloc.pending()
+    }
+
+    /// Extents the allocator may hand out once the file has grown to its bound: those free now,
+    /// and those a file kept as segments may still admit.
+    pub(crate) fn room_most(&self) -> u64 {
+        let more = if self.segments.is_some() {
+            self.config.max_extents.saturating_sub(self.alloc.limit())
+        } else {
+            0
+        };
+        self.capacity().saturating_add(more)
+    }
+
     /// Books a segment of `extents` past those admitted, to be added and written whole
     /// ([`Self::grow_segment`]) and then admitted ([`Self::admit`]); a segment booked already
     /// and not out (recovered past the admitted extents, or whose growth no worker took) is booked
@@ -1991,6 +2022,12 @@ impl<F: BlockFile> Store<F> {
             }
             None => Vec::with_capacity(self.config.page_size),
         }
+    }
+
+    /// A test's count of the page buffers and read spans lent to readers and not given back.
+    #[cfg(test)]
+    pub(crate) fn lent(&self) -> (usize, usize) {
+        (self.pages_lent, self.spans_lent)
     }
 
     /// Takes back a page buffer a reader is done with.

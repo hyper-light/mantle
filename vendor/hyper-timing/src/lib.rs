@@ -49,8 +49,8 @@ mod round;
 pub use round::{DeadlineExtender, ProgressWitness, RoundAnchors, RoundBudget, RoundWait, Verdict};
 mod qos;
 pub use qos::{
-    Arrivals, Costs, Detector, LinkBehaviour, Span, arrival_detector_at, configure_arrivals,
-    election_span, lateness_bound, mistake_bound,
+    Arrivals, Costs, Detector, LinkBehaviour, Span, arrival_detector_at, arrival_detector_with,
+    configure_arrivals, election_span, lateness_bound, mistake_bound,
 };
 mod folds;
 pub use folds::{Exposure, FlushTail, Flushes, FoldFull, Lateness, Wakes};
@@ -73,8 +73,10 @@ use std::time::Duration;
 const SMOOTHED_SHIFT: u32 = 3;
 /// RFC 9002 §5.3: `rttvar = 3/4 · rttvar + 1/4 · |smoothed_rtt − sample|`, the 1/4 as a shift of 2.
 const VARIATION_SHIFT: u32 = 2;
-/// RFC 9002 §6.2.1: the probe timeout's variation term, `4 · rttvar`.
-const TAIL_VARIATION_MULTIPLIER: u64 = 4;
+/// RFC 9002 §6.2.1: the probe timeout's variation term, `4 · rttvar`; RFC 6298 §2.3's `K = 4` in
+/// `RTO = SRTT + max(G, K · RTTVAR)`. mantle: hyper-liveness's premature suspicion of a configured
+/// link reads it (vendor/UPSTREAM.md).
+pub const TAIL_VARIATION_MULTIPLIER: u64 = 4;
 
 /// Why a path's window could not be derived or built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

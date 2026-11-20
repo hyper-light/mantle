@@ -374,6 +374,26 @@ pub fn arrival_detector_at(
     arrival_detector(arrivals, eta, alpha, value)
 }
 
+/// The detector at a given `interval` and `margin` on `arrivals`, with the bounds and the
+/// unavailability the configurator states for the margin it finds: what a margin chosen by a rule
+/// of its own promises. `None` where [`arrival_detector_at`] would give none, or for a zero
+/// interval. mantle: vendor/UPSTREAM.md.
+pub fn arrival_detector_with(
+    arrivals: &Arrivals,
+    costs: &Costs,
+    granularity: Duration,
+    interval: Duration,
+    margin: Duration,
+) -> Option<Detector> {
+    arrival_resolution(arrivals, costs, granularity)?;
+    let (eta, alpha) = (interval.as_secs_f64(), margin.as_secs_f64());
+    if eta <= 0.0 {
+        return None;
+    }
+    let value = arrival_unavailability(arrivals, costs, eta, alpha);
+    arrival_detector(arrivals, eta, alpha, value)
+}
+
 /// `Pr(Binomial(trials, p) ≥ at_least)`.
 fn binomial_tail(trials: u32, p: f64, at_least: u32) -> f64 {
     let mut tail = 0.0;

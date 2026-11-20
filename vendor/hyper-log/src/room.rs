@@ -12,7 +12,9 @@
 //! bytes ([`Limits::group_bytes`]), waits for its group's room and is passed over by room it could
 //! not use, so a hot group never takes the others' room.
 //! A waiter that waits for the queue's room is never passed: room goes to it before any later
-//! arrival, so none starves.
+//! arrival, so none starves. A group waits with as many as its handle keeps out
+//! ([`GROUP_WAITERS`]), so a handle within its bound is never refused for room, whatever holds the
+//! queue.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -40,6 +42,18 @@ pub(crate) const GROUP_SUBMISSIONS: usize = crate::PIPELINE_FRAMES;
 /// a handle for want of its own group's room.
 pub(crate) const GROUP_ADMITS: usize = crate::PIPELINE_FRAMES.saturating_sub(1);
 
+/// Submissions one group may wait with for room: every write its handle keeps out (`group.rs`
+/// `OUT`), the [`GROUP_ADMITS`] its group's own room admits whatever their bytes and the
+/// [`GROUP_SUBMISSIONS`] beyond them, so the log refuses a handle within its bound for room
+/// neither when its own group holds the queue nor when other groups do. With
+/// [`GROUP_SUBMISSIONS`], a group whose frame-sized parts found other groups' bytes holding the
+/// queue had none admitted and three waiting, and its fourth was refused `Busy`: a refusal for room,
+/// on which a replica stalls and, resumed, makes the same write again in the same parts, refused
+/// again while the others keep the queue full (mantle docs/design/raft-log.md §3.1). Waiting, the
+/// parts are admitted in arrival order with every other group's waiters, so none starves; the
+/// waiting list stays bounded, a group waiting with this many and the log holding `max_groups`.
+pub(crate) const GROUP_WAITERS: usize = GROUP_ADMITS.saturating_add(GROUP_SUBMISSIONS);
+
 /// What the queue admits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
@@ -49,8 +63,8 @@ pub(crate) struct Limits {
     /// [`GROUP_ADMITS`] frames of the largest charge, so one group never holds the last frame's
     /// worth the others need (mantle docs/design/raft-log.md §3.1).
     pub(crate) group_bytes: u64,
-    /// Waiters the list holds: a group waits with at most its own [`GROUP_SUBMISSIONS`], and
-    /// the log holds at most `max_groups` (mantle docs/design/raft-log.md §3). Past it, `Busy`.
+    /// Waiters the list holds: a group waits with at most its own [`GROUP_WAITERS`], and the log
+    /// holds at most `max_groups` (mantle docs/design/raft-log.md §3). Past it, `Busy`.
     pub(crate) waiters: usize,
 }
 
@@ -74,7 +88,7 @@ struct Group {
     admitted: usize,
     /// Their charged bytes.
     bytes: u64,
-    /// The group's waiters, oldest first; at most [`GROUP_SUBMISSIONS`].
+    /// The group's waiters, oldest first; at most [`GROUP_WAITERS`].
     waiting: VecDeque<u64>,
 }
 
@@ -167,7 +181,7 @@ impl Room {
         if waiting == 0 && self.eligible.is_empty() && takes && self.fits(bytes) {
             return self.hold(group, bytes).map(|()| Take::Admitted);
         }
-        if !wait || self.waiters.len() >= self.limits.waiters || waiting >= GROUP_SUBMISSIONS {
+        if !wait || self.waiters.len() >= self.limits.waiters || waiting >= GROUP_WAITERS {
             return Err(LogError::Busy);
         }
         let seq = self.next;
@@ -401,7 +415,7 @@ mod tests {
     /// A group's own room admits [`GROUP_ADMITS`] submissions of the largest charge whatever
     /// else it holds, its share being that many frames' worth as the log derives it, and
     /// [`GROUP_SUBMISSIONS`] more wait beyond them: a handle's bound of both (`group.rs` `OUT`)
-    /// is never refused while its own group alone holds the queue, and one past it is.
+    /// is never refused while its own group alone holds the queue.
     #[test]
     fn a_handles_bound_of_frame_sized_submissions_waits_never_refused() {
         let frame = 10;
@@ -410,16 +424,58 @@ mod tests {
             submissions: 2 * GROUP_SUBMISSIONS,
             bytes: frames(crate::PIPELINE_FRAMES),
             group_bytes: frames(GROUP_ADMITS),
-            waiters: GROUP_SUBMISSIONS,
+            waiters: GROUP_WAITERS,
         });
         for sent in 1..=GROUP_ADMITS + GROUP_SUBMISSIONS {
             let take = room.take(1, frame, true, &mut Vec::new());
             assert!(take.is_ok(), "submission {sent} refused: {take:?}");
         }
+    }
+
+    /// Other groups hold the queue's bytes: a group's handle's bound of frame-sized submissions
+    /// all wait, none refused, and one past it is; as the others' room is given back, the waiters
+    /// are admitted in arrival order, the group's within its share. With [`GROUP_SUBMISSIONS`]
+    /// waiters a group, the fourth was refused `Busy`, a refusal for room that a replica made again
+    /// whole and was refused again while the others kept the queue full (hyper-durable
+    /// `tests/hyperlog.rs`, `a_write_in_frame_sized_parts_waits_behind_groups_that_fill_the_queue`).
+    #[test]
+    fn a_handles_bound_waits_never_refused_while_other_groups_hold_the_queue() {
+        let frame = 10;
+        let frames = |n: usize| frame * u64::try_from(n).unwrap();
+        let mut room = Room::new(Limits {
+            submissions: 4 * GROUP_SUBMISSIONS,
+            bytes: frames(crate::PIPELINE_FRAMES),
+            group_bytes: frames(GROUP_ADMITS),
+            waiters: 4 * GROUP_WAITERS,
+        });
+        for holder in 2..=4 {
+            assert_eq!(
+                room.take(holder, frame, false, &mut Vec::new()).unwrap(),
+                Take::Admitted
+            );
+        }
+        let mut slots = Vec::new();
+        for sent in 1..=GROUP_WAITERS {
+            match room.take(1, frame, true, &mut Vec::new()) {
+                Ok(Take::Waiting(seq)) => slots.push(seq),
+                other => panic!("submission {sent} of the handle's bound: {other:?}"),
+            }
+        }
         assert!(matches!(
             room.take(1, frame, true, &mut Vec::new()),
             Err(LogError::Busy)
         ));
+        let mut admitted = Vec::new();
+        for holder in 2..=4 {
+            room.release(holder, frame, &mut admitted);
+        }
+        assert_eq!(admitted, slots[..GROUP_ADMITS].to_vec());
+        for answered in 0..GROUP_SUBMISSIONS {
+            admitted.clear();
+            room.release(1, frame, &mut admitted);
+            assert_eq!(admitted, vec![slots[GROUP_ADMITS + answered]]);
+        }
+        assert_eq!(room.waiting(), 0);
     }
 
     /// Past its bound the waiting list refuses, and nothing that does not wait jumps it.

@@ -1344,6 +1344,221 @@ mod tests {
         });
     }
 
+    /// Puts an empty object at `key` in bucket "b" of a Name range, as entry `index`, as a
+    /// range's state machine applies a PUT.
+    fn put_object(e: &mut mantle_range::Stored<Gated>, index: u64, key: &str) {
+        use mantle_meta::name;
+        let put = name::Command::Put(name::Put {
+            bucket: "b".into(),
+            incarnation: 1,
+            key: key.into(),
+            versioning: mantle_meta::record::Versioning::Unversioned,
+            preconditions: name::Preconditions::default(),
+            at_ns: index * 1_000_000_000,
+            ordered_ns: None,
+            version: mantle_meta::record::Version {
+                marker: false,
+                null: false,
+                modified_ns: 0,
+                etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+                size: 0,
+                checksum: None,
+                file: None,
+                owner: "o".into(),
+                headers: Vec::new(),
+                retention: None,
+                legal_hold: None,
+                listing: None,
+            },
+            default: None,
+            id: u128::from(index),
+            deadline_ns: u64::MAX,
+        });
+        assert!(matches!(
+            name::apply(e, index, &put).unwrap(),
+            name::Outcome::Put { .. }
+        ));
+    }
+
+    /// A Name range's engine opened again over rows only its store's file holds, its cache empty,
+    /// the worker's reads held at a gate: a read its range confirmed and applied through, served
+    /// as the node serves one (`Query::answer_confirmed`), whether a GET's read of a key's current
+    /// version or a LIST's page, is answered waiting at once, the shard's own handle reading
+    /// nothing, and its pages load on the worker. With the gate open, each worker's message wakes
+    /// the task (no timer: a wait that reaches the node's idle timeout fails the test as a lost
+    /// wake), and the reads made again answer what the same reads made waiting on the device
+    /// answer, the shard's handle at no reads throughout. Answered, they let the loaded pages go.
+    #[test]
+    fn a_confirmed_reads_pages_load_on_the_worker_and_the_shard_reads_none() {
+        use crate::read::{Query, Read};
+        use mantle_meta::engine::Engine;
+        use mantle_meta::name;
+        on_a_shard_with_a_held_flush(|mut e, _held, _here, path| async move {
+            e.install(0, name::first(1).unwrap()).unwrap();
+            let open = name::Command::Gate(name::GateChange {
+                bucket: "b".into(),
+                incarnation: 1,
+                attempt: 1,
+                from: None,
+                to: Some(mantle_meta::record::GateState::Open),
+                generation: 1,
+            });
+            assert_eq!(
+                name::apply(&mut e, 1, &open).unwrap(),
+                name::Outcome::GateMoved
+            );
+            // Three checkpoints' objects, each packed: the get reads the branch its key's filter
+            // passes, and the listing merges every branch on its path.
+            let keys: Vec<String> = (0..3 * 64).map(|n| format!("k{n:04}")).collect();
+            for (n, key) in (2u64..).zip(&keys) {
+                put_object(&mut e, n, key);
+                if n % 64 == 1 {
+                    e.persist().unwrap();
+                }
+            }
+            e.persist().unwrap();
+            drop(e);
+            let (_, rules) = crate::derive::cell(3).unwrap();
+            let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
+            let row = mantle_engine::memtable::hashed::entry_bytes(16, 100).unwrap();
+            let shard_reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let file = Gated {
+                file: open_store(&path, false).unwrap(),
+                gate: None,
+                held: None,
+                flushes: std::sync::Arc::default(),
+                reads: shard_reads.clone(),
+                read_gate: None,
+            };
+            let mut e =
+                mantle_range::Stored::open(file, engine.store, row * (8 * 64 + 3), engine.trunk)
+                    .unwrap();
+            let gate = std::sync::Arc::new(Gate::default());
+            let opens = Opens(gate.clone());
+            let worker_reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (again, worker_gate, counted) = (path.clone(), gate.clone(), worker_reads.clone());
+            e.set_workers(
+                move || {
+                    let file = open_store(&again, false).map_err(|e| mantle_engine::Error::Io {
+                        op: "open",
+                        detail: e.to_string(),
+                    })?;
+                    Ok(Gated {
+                        file,
+                        gate: None,
+                        held: None,
+                        flushes: std::sync::Arc::default(),
+                        reads: counted.clone(),
+                        read_gate: Some(worker_gate.clone()),
+                    })
+                },
+                1,
+            )
+            .unwrap();
+            let reads = |n: &std::sync::Arc<std::sync::atomic::AtomicU64>| {
+                n.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            let opened = reads(&shard_reads);
+            let bound = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap();
+            let room = 1 << 16;
+            let queries = [
+                Query::Current {
+                    bucket: "b".into(),
+                    key: keys[100].clone(),
+                },
+                Query::List(mantle_protocol::object::List {
+                    bucket: "b".into(),
+                    prefix: String::new(),
+                    delimiter: "/".into(),
+                    start: None,
+                    max_keys: 1000,
+                    fetch_owner: true,
+                }),
+            ];
+            // Each read's first pass, the worker held: answered waiting, its page out.
+            gate.tell_task();
+            let mut loads = [0usize; 2];
+            for (query, loads) in queries.iter().zip(&mut loads) {
+                assert_eq!(query.answer_confirmed(&mut e, room, loads, false), None);
+            }
+            assert_eq!(reads(&shard_reads), opened, "the shard read the device");
+            assert_eq!(
+                e.loads().1,
+                1,
+                "a second load went out for the page loading"
+            );
+            drop(opens);
+            let mut answers: [Option<Read>; 2] = [None, None];
+            let mut wakes = 0u64;
+            while answers.iter().any(Option::is_none) {
+                assert!(wait_for_wake(bound).await, "a wake was lost: {wakes} wakes");
+                wakes += 1;
+                for ((query, loads), answer) in queries.iter().zip(&mut loads).zip(&mut answers) {
+                    if answer.is_some() {
+                        continue;
+                    }
+                    if let Some(read) = query.answer_confirmed(&mut e, room, loads, false) {
+                        *answer = Some(read.unwrap());
+                    }
+                }
+                assert!(wakes < 256, "the reads waited past 256 of the task's wakes");
+            }
+            assert_eq!(reads(&shard_reads), opened, "the shard read the device");
+            let worker = reads(&worker_reads);
+            assert!(worker > 0, "the worker read nothing");
+            // Answered, the pages they loaded went to the cache.
+            assert_eq!(e.loads().0, 0);
+            let [Some(get), Some(list)] = answers else {
+                panic!("a read not answered");
+            };
+            let Read::Current(Some((_, version))) = &get else {
+                panic!("{get:?}");
+            };
+            assert_eq!(version.size, 0);
+            let Read::Keys(page) = &list else {
+                panic!("{list:?}");
+            };
+            assert!(!page.truncated);
+            assert_eq!(
+                page.contents
+                    .iter()
+                    .map(|l| l.key.clone())
+                    .collect::<Vec<_>>(),
+                keys
+            );
+            // The same reads as the node made them before, waiting on the device, in the engine
+            // opened cold again: they answer the same, read on the shard's own handle.
+            drop(e);
+            let cold_reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let file = Gated {
+                file: open_store(&path, false).unwrap(),
+                gate: None,
+                held: None,
+                flushes: std::sync::Arc::default(),
+                reads: cold_reads.clone(),
+                read_gate: None,
+            };
+            let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
+            let mut cold =
+                mantle_range::Stored::open(file, engine.store, row * (8 * 64 + 3), engine.trunk)
+                    .unwrap();
+            // A cache that holds every page, as a node lends its engines one: each page is read
+            // once.
+            cold.lend_cache(1 << 20);
+            let mut before = [0u64; 2];
+            for ((query, answer), before) in queries.iter().zip([get, list]).zip(&mut before) {
+                let opened = reads(&cold_reads);
+                assert_eq!(query.answer(&mut cold, room).unwrap(), answer);
+                *before = reads(&cold_reads) - opened;
+            }
+            println!(
+                "shard reads: {before:?} by the get and the list made waiting, none by them \
+                 confirmed; worker reads: {worker} over {wakes} wakes, loads counted {loads:?}"
+            );
+            assert!(before[0] > 0, "the cold get read nothing on the shard");
+        });
+    }
+
     /// A failed engine stops the turn with the node's error, fenced.
     #[test]
     fn a_failed_maintenance_is_the_nodes_error() {

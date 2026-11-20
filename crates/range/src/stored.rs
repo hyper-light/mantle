@@ -404,6 +404,21 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
         Ok(self.rows.get(0).map(|(k, v)| (k.to_vec(), v.to_vec())))
     }
 
+    /// `ShardDb::loads_sent`.
+    fn loads_sent(&self) -> u64 {
+        self.db.loads_sent()
+    }
+
+    /// `ShardDb::loads_most`.
+    fn loads_most(&mut self) -> Result<usize, EngineError> {
+        self.db.loads_most().map_err(|e| fenced(&mut self.fault, e))
+    }
+
+    /// The pages loaded for the reader go to the cache (`ShardDb::release_loaded`).
+    fn reads_done(&mut self) {
+        self.db.release_loaded();
+    }
+
     /// The engine's idle step that waits for nothing (`ShardDb::idle_step_now`), in SILK's order:
     /// the packing first, then the trunk's work and its workers' results, then the consolidations
     /// seeks paid for, then the cache's. A puts-only or reads-only range otherwise paid it only at

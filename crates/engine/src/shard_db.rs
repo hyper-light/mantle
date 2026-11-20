@@ -407,6 +407,9 @@ pub struct ShardDb<F: BlockFile> {
     /// Whether the last operation made inline was a calm get ([`Self::get_calm`]): it changed
     /// nothing whether maintenance is owed reads, so the look after it is the one before it.
     calm: bool,
+    /// The loads [`Self::get_ready`] and [`Self::scan_rows_ready`] sent the workers since the
+    /// engine opened, a count that wraps ([`Self::loads_sent`]).
+    loads_sent: u64,
     /// Entries of the key lists of every memtable given back: an index swept when this much has
     /// gone stale since its last sweep is more than half of what it holds.
     kept_gone: u64,
@@ -926,6 +929,7 @@ impl<F: BlockFile> ShardDb<F> {
             kept_next: 0,
             kept_whole: false,
             calm: false,
+            loads_sent: 0,
             kept_gone: 0,
             kept_free: Vec::new(),
             sort_spares: Vec::new(),
@@ -2989,7 +2993,11 @@ impl<F: BlockFile> ShardDb<F> {
                 what: "a page's load with no workers",
             })?;
             match pool.send(job, Owner::Load, true) {
-                Ok(Ok(ticket)) => self.store.load_out(ticket.job, address)?,
+                Ok(Ok(ticket)) => {
+                    self.store.load_out(ticket.job, address)?;
+                    // A count its readers compare by difference: wrapping is its meaning.
+                    self.loads_sent = self.loads_sent.wrapping_add(1);
+                }
                 // Every worker is out: the next one back sends its message, which wakes the
                 // task, and the read made again then hands the load out.
                 Ok(Err(_)) => pool.want_message(),
@@ -3033,10 +3041,17 @@ impl<F: BlockFile> ShardDb<F> {
     }
 
     /// Lets go of the pages loaded for reads that waited ([`Self::get_ready`]), now done: a
-    /// replicated range's entry that applied. They go to the page cache, which keeps them by its
-    /// own rule.
+    /// replicated range's entry that applied, or a confirmed read answered with no entry waiting.
+    /// They go to the page cache, which keeps them by its own rule.
     pub fn release_loaded(&mut self) {
         self.store.release_loaded();
+    }
+
+    /// The loads sent the workers for reads that may not wait since the engine opened, a count
+    /// that wraps: a reader that compares it before and after a read refused knows whether that
+    /// read sent one, or found its page loaded or loading already.
+    pub fn loads_sent(&self) -> u64 {
+        self.loads_sent
     }
 
     /// The pages loaded and loading for reads that may not wait, and the loads out.

@@ -145,6 +145,27 @@ pub trait Engine: Rows {
         self.next(from, to)
     }
 
+    /// The loads [`Engine::get_now`] and [`Engine::next_now`] have sent the engine's workers
+    /// since it opened, a count that wraps: a range counts by it the loads a confirmed read's
+    /// passes sent (docs/design/replica.md §3). An engine that never loads: none.
+    fn loads_sent(&self) -> u64 {
+        0
+    }
+
+    /// The most pages the engine holds and loads at once for [`Engine::get_now`] and
+    /// [`Engine::next_now`], past which such a read is made waiting on its device: a confirmed
+    /// read that has sent as many loads is read so, as an entry's read past it is
+    /// (docs/design/replica.md §3). An engine that never loads: none.
+    fn loads_most(&mut self) -> Result<usize, EngineError> {
+        Ok(0)
+    }
+
+    /// A reader of [`Engine::get_now`] and [`Engine::next_now`] is done: the pages loaded for
+    /// such reads go to the engine's cache, which keeps them by its own rule. A range's confirmed
+    /// read lets them go once answered, as an entry's application does
+    /// (docs/design/replica.md §3). An engine that loads nothing holds none.
+    fn reads_done(&mut self) {}
+
     /// Pays up to about `budget` units of the maintenance the engine owes (its packings,
     /// compactions and consolidations, its cache's upkeep), in time its owner has no request
     /// for, waiting for nothing: what its workers finished is taken back and what is due handed

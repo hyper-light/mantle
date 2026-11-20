@@ -1173,11 +1173,15 @@ pub(super) struct Kept {
     rows_at: Option<u64>,
 }
 
-/// A read a range's replica took and has yet to serve: its range, its context and its query.
+/// A read a range's replica took and has yet to serve: its range, its context and its query;
+/// whether the replica gave it back, confirmed and applied through, its rows' pages then loading
+/// on the engine's workers (`Query::answer_confirmed`); and the loads its passes sent.
 struct Reading {
     group: u128,
     id: u64,
     query: Query,
+    confirmed: bool,
+    loads: usize,
 }
 
 /// A shard's ranges in the owner of its task.
@@ -1196,7 +1200,8 @@ struct Shard<E: Engine, S: LogStore> {
     /// The reads the replicas took and have yet to serve, at most `reads_most`: a lane's capacity,
     /// the exchanges the transport admits at once, each of which asks at most one. The node's own
     /// reads ask here too; one past the bound is refused ([`Served::Refused`]) and asked again
-    /// after its asker's pause.
+    /// after its asker's pause. A read given back whose rows' pages load on its engine's workers
+    /// stays here until answered, within the same bound.
     reading: Vec<Reading>,
     reads_most: usize,
     /// The reads' contexts the replicas gave back this turn, each with its range; kept for its
@@ -1337,7 +1342,13 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
                 match handle {
                     Some(handle) if asked => {
                         self.owner.schedule(handle);
-                        self.reading.push(Reading { group, id, query });
+                        self.reading.push(Reading {
+                            group,
+                            id,
+                            query,
+                            confirmed: false,
+                            loads: 0,
+                        });
                     }
                     _ => self.gave.push(Out::Served(group, id, Served::Refused)),
                 }
@@ -1463,39 +1474,24 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
         }
     }
 
-    /// Serves the reads the replicas gave back this turn, each confirmed and applied through: its
-    /// query answered from its range's engine now, in at most what a reply's body carries past its
-    /// head. Then refuses each read whose range no longer leads, which its core will not give back
-    /// (node.md §5.1, as `Node::reply_commands` redirects the node's own).
+    /// Serves the reads the replicas gave back this turn, each confirmed and applied through, and
+    /// those given back before whose rows' pages were loading ([`Self::serve_confirmed`]). Then
+    /// refuses each read whose range no longer leads, which its core will not give back (node.md
+    /// §5.1, as `Node::reply_commands` redirects the node's own).
     fn serve(&mut self) {
-        let room = crate::read::reply_room(NodeClasses::frame_bound(classes::Class::Request));
         for (group, context) in self.served.drain(..) {
             let Ok(id) = <[u8; 8]>::try_from(context.as_slice()).map(u64::from_le_bytes) else {
                 continue;
             };
-            let Some(at) = self
+            if let Some(reading) = self
                 .reading
-                .iter()
-                .position(|reading| reading.id == id && reading.group == group)
-            else {
-                continue;
-            };
-            let reading = self.reading.swap_remove(at);
-            let replica = self
-                .ranges
-                .iter()
-                .find(|kept| kept.group == group)
-                .and_then(|kept| self.owner.get_mut(kept.handle));
-            let served = match replica.map(|replica| {
-                reading
-                    .query
-                    .answer(replica.machine_mut().engine_mut(), room)
-            }) {
-                Some(Ok(read)) => Served::Read(Box::new(read)),
-                _ => Served::Failed,
-            };
-            self.gave.push(Out::Served(group, id, served));
+                .iter_mut()
+                .find(|reading| reading.id == id && reading.group == group)
+            {
+                reading.confirmed = true;
+            }
         }
+        self.serve_confirmed();
         let mut at = 0;
         while let Some(reading) = self.reading.get(at) {
             let leads = self
@@ -1512,6 +1508,49 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             self.gave
                 .push(Out::Served(reading.group, reading.id, Served::Refused));
         }
+    }
+
+    /// Answers each read given back, confirmed and applied through, from its range's engine in
+    /// memory, in at most what a reply's body carries past its head (`Query::answer_confirmed`):
+    /// one whose rows' pages load on the engine's workers stays, made again at each turn, the
+    /// workers' message waking the task. Whether any was answered.
+    fn serve_confirmed(&mut self) -> bool {
+        let room = crate::read::reply_room(NodeClasses::frame_bound(classes::Class::Request));
+        let mut answered = false;
+        let mut at = 0;
+        while let Some(reading) = self.reading.get_mut(at) {
+            if !reading.confirmed {
+                at = at.saturating_add(1);
+                continue;
+            }
+            let replica = self
+                .ranges
+                .iter()
+                .find(|kept| kept.group == reading.group)
+                .and_then(|kept| self.owner.get_mut(kept.handle));
+            let pass = replica.map(|replica| {
+                let entry_waits = replica.waits_for_room();
+                reading.query.answer_confirmed(
+                    replica.machine_mut().engine_mut(),
+                    room,
+                    &mut reading.loads,
+                    entry_waits,
+                )
+            });
+            let served = match pass {
+                Some(None) => {
+                    at = at.saturating_add(1);
+                    continue;
+                }
+                Some(Some(Ok(read))) => Served::Read(Box::new(read)),
+                Some(Some(Err(_))) | None => Served::Failed,
+            };
+            let reading = self.reading.swap_remove(at);
+            self.gave
+                .push(Out::Served(reading.group, reading.id, served));
+            answered = true;
+        }
+        answered
     }
 
     /// Queues the replicas whose deadline came, and those with a write out or a page of a member's
@@ -1777,7 +1816,16 @@ async fn run<E: Engine + 'static, S: LogStore>(
         // finds) ended that wait, not the one below, which slept to the range's next deadline with
         // the page in hand. Every source the owner and compaction answer through wakes through the
         // flag ([`Woken`]), so the wake is kept, and taken at the turn it brings.
-        if shard.woken.take() || shard.owner.has_work() || shard.answered() || shard.upkeep.owed() {
+        // A read waiting for its rows' pages is made again before the wait, with no await between
+        // them: a worker's message that woke an await above (the lane's room) would otherwise
+        // leave it waiting with its page in hand. Refused again, it leaves the task waiting on the
+        // workers' next message; answered, the turn hands it on.
+        if shard.woken.take()
+            || shard.owner.has_work()
+            || shard.answered()
+            || shard.upkeep.owed()
+            || shard.serve_confirmed()
+        {
             hyper_rt::futures::yield_now().await;
             continue;
         }

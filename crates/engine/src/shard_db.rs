@@ -5969,7 +5969,16 @@ impl<F: BlockFile> ShardDb<F> {
         // drives while the flush steps the trunk.
         self.grow(false)?;
         if self.rotation.is_some() && !self.rotate_step(keys)? {
-            return Ok(false);
+            // A rotation that waits for the root's room, which maintenance makes only once the
+            // checkpoint this flush is for frees the extents it waits for, would hold that
+            // checkpoint for good and the checkpoint the rotation: the node suite's paced fill
+            // spun so for its million turns, its worker idle (mantle-node
+            // tests/engine_workers.rs). It is dropped, as `room_now` drops a paced rotation it
+            // cannot finish, and the flush packs the memtable itself.
+            if !self.trunk.stalled_for_room(&self.store) {
+                return Ok(false);
+            }
+            self.rotation = None;
         }
         if self.packing.is_some() || !self.frozen.is_empty() {
             self.pack_some(keys.max(1), false)?;
@@ -7451,6 +7460,77 @@ mod frozen_tests {
             assert!(steps < 1 << 12, "the checkpoint at {i} never completed");
         }
         assert!(db.rotation.is_none(), "the rotation overtaken ended");
+        for _ in 0..1000 {
+            put_or_delete(&mut db, &mut oracle, i);
+            i += 1;
+        }
+        db.flush().unwrap();
+        check(&mut db, &oracle);
+    }
+
+    /// A paced rotation left begun, as [`ShardDb::room_now`] leaves one waiting on a worker's
+    /// message, while the root has no room and the maintenance that would make it waits for
+    /// extents only the next checkpoint frees ([`Trunk::stalled_for_room`]; here the whole store
+    /// kept for the checkpoint). The checkpoint begun without waiting steps the rotation first,
+    /// the rotation steps that maintenance, and the maintenance waits for the checkpoint: the
+    /// node suite's paced fill spun so for its million turns at an entry, its worker idle
+    /// (mantle-node tests/engine_workers.rs). The checkpoint goes on past such a rotation, packs
+    /// the memtable itself, and completes; after it, every row reads back.
+    #[test]
+    fn a_rotation_waiting_on_maintenance_that_waits_for_the_checkpoint_does_not_hold_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = ShardDb::create(plain(&path, true), STORE, MEM, TRUNK).unwrap();
+        let p = path.clone();
+        db.set_workers_within(move || Ok(plain(&p, false)), 1, "")
+            .unwrap();
+        let mut oracle = BTreeMap::new();
+        let mut i = 0u64;
+        for _ in 0..40 {
+            put_or_delete(&mut db, &mut oracle, i);
+            i += 1;
+        }
+        db.flush().unwrap();
+        // The root without room: a packed memtable's branch pending for each source it holds.
+        for b in 0..TRUNK.fanout as u64 {
+            let mut builder =
+                crate::branch::Builder::new(&mut db.store, crate::branch::filter::Keys::Exactly(8))
+                    .unwrap();
+            for j in 0..8 {
+                let (k, v) = (key(1_000_000 + b * 8 + j), format!("p{b}-{j}").into_bytes());
+                builder
+                    .add(&mut db.store, &k, crate::branch::Op::Put, &v)
+                    .unwrap();
+                oracle.insert(k, v);
+            }
+            db.trunk.add(builder.finish(&mut db.store).unwrap());
+        }
+        assert!(!db.trunk.has_room());
+        // Puts in the memtable, and its paced rotation begun and left.
+        for _ in 0..8 {
+            put_or_delete(&mut db, &mut oracle, i);
+            i += 1;
+        }
+        assert!(!db.mem.is_empty());
+        db.rotation = Some(Rotation {
+            started: std::time::Instant::now(),
+            finish_packing: false,
+            most: None,
+            stalled: false,
+        });
+        // Every extent free kept for the checkpoint: no compaction opens before it.
+        db.trunk.set_checkpoint_room(db.store.capacity());
+        let mut steps = 0;
+        while !db.checkpoint_now(i).unwrap() {
+            steps += 1;
+            assert!(
+                steps < 1 << 12,
+                "the checkpoint at {i} never completed: rotation {} root room {} stalled {}",
+                db.rotation.is_some(),
+                db.trunk.has_room(),
+                db.trunk.stalled_for_room(&db.store)
+            );
+        }
         for _ in 0..1000 {
             put_or_delete(&mut db, &mut oracle, i);
             i += 1;

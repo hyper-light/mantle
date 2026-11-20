@@ -75,6 +75,8 @@
 //! plane holds keys for its connection, the dials made to it, the connections and dials to it that
 //! ended, the times the node's detectors came to suspect it and whether they suspect it now
 //! (`suspect` or `trusted`), and the last refusal one ended with (`Node::links`); and
+//! `refused CAUSE COUNT` as a cause's count of the puts it answered `SlowDown` moves, said as
+//! `slowed` is ([`refused_lines`], `node::refusals`); and
 //! `moved BYTES SERVE_NS` as its transfers move:
 //! the bytes of exchanges' bodies it has read and written (`Node::moved`), said at most every half
 //! of the transport's serve period `SERVE_NS`, the longest an exchange it carries may go without
@@ -96,7 +98,8 @@
 //! by kind, the proposals and reads far ranges refused, and the stream's words held; then the
 //! table of what held its shard (`slow_poll_counts`): each spawn site and
 //! label whose polls held the shard past twice its quantum, with those polls since the shard
-//! began, how long they held it in all and at most, and whose time it was. A line it cannot read
+//! began, how long they held it in all and at most, and whose time it was; and last what answered
+//! its puts `SlowDown`, each cause's count since it opened (`refused_counts`). A line it cannot read
 //! ends the process with the line named. Standard input closing ends `mantle node`, its
 //! harness's child, at once, without the orderly stop's steps; `mantle serve` runs on, as under a
 //! service manager, whose input is empty.
@@ -1382,6 +1385,7 @@ fn gateway_settings(
         scan_rows: config.scan_rows,
         rates,
         target: config.target,
+        refusals: crate::node::refusals::Refusals::default(),
     })
 }
 
@@ -2993,6 +2997,8 @@ async fn serve(
     // The requests the node answered `SlowDown`, each cause's count as last said and when, none
     // before the first saying: said as `moved` is, at most once each half serve period.
     let mut said_slowed: Option<(Slowings, u64)> = None;
+    // The puts it answered `SlowDown`, each cause's count as last said and when, said as `slowed`.
+    let mut said_refused: Option<(Refusings, u64)> = None;
     // Whether the node waits on its own device, as last said, none before the first saying.
     let mut said_held: Option<bool> = None;
     // The log's refusals for room as last said: the node's rounds of compaction and the liveness
@@ -3126,6 +3132,7 @@ async fn serve(
                             })
                             .collect();
                         stall_counts(&mut line, &episodes).map_err(wrote)?;
+                        refused_counts(&mut line, &node.put_refusals()).map_err(wrote)?;
                         line.push('\n');
                         stats = Some(log);
                         say(&mut output, &line).await?;
@@ -3388,6 +3395,14 @@ async fn serve(
         // lines.
         said_slowed = slowed_lines(&mut lines, said_slowed, (node.slowed(), now), serve_ns / 2)
             .map_err(wrote)?;
+        // And which cause of a put's `SlowDown` answered it, said as `slowed` is.
+        said_refused = refused_lines(
+            &mut lines,
+            said_refused,
+            (node.put_refusals(), now),
+            serve_ns / 2,
+        )
+        .map_err(wrote)?;
         // Whether the node waits on its own device, said as it changes, so a watcher knows it holds
         // still for its device and not by choice: a fact of the node, said once, where a status
         // for each range repeated it, and a log line after, at each of the liveness stream's
@@ -4134,6 +4149,48 @@ fn slowed_lines(
     Ok(Some((counts, now)))
 }
 
+/// The puts a node answered `SlowDown`, a count for each cause in `node::refusals::names`' order.
+type Refusings = [u64; crate::node::refusals::CAUSES];
+
+/// `refused CAUSE COUNT`, written onto `lines` for each cause of a put's `SlowDown`
+/// (`Node::put_refusals`) whose count is not the one last `said`, as [`slowed_lines`] says each
+/// request's: the first at once, the next no sooner than `gap_ns` after the last saying, so a
+/// refusal storm says at most a line a cause each gap, its counts all it refused. The counts said
+/// now and when, or `said` where nothing was due.
+fn refused_lines(
+    lines: &mut String,
+    said: Option<(Refusings, u64)>,
+    (counts, now): (Refusings, u64),
+    gap_ns: u64,
+) -> Result<Option<(Refusings, u64)>, std::fmt::Error> {
+    let (was, due) = match said {
+        None => ([0; crate::node::refusals::CAUSES], true),
+        Some((was, at)) => (was, now.saturating_sub(at) >= gap_ns),
+    };
+    if !due || counts == was {
+        return Ok(said);
+    }
+    for (((prefix, name), count), before) in crate::node::refusals::names().zip(counts).zip(was) {
+        if count != before {
+            writeln!(lines, "refused {prefix}{name} {count}")?;
+        }
+    }
+    Ok(Some((counts, now)))
+}
+
+/// What answered the node's puts `SlowDown`, written after the stalls in a `counts` answer: each
+/// cause's count since the node opened, `refused_CAUSE COUNT`, every cause named
+/// (`node::refusals::names`), so an answer is as long however many it refused.
+pub fn refused_counts(
+    said: &mut String,
+    counts: &[u64; crate::node::refusals::CAUSES],
+) -> std::fmt::Result {
+    for ((prefix, name), count) in crate::node::refusals::names().zip(counts) {
+        write!(said, " refused_{prefix}{name} {count}")?;
+    }
+    Ok(())
+}
+
 /// `longest-poll NS`, written onto `lines` where `longest_ns`, the longest poll the node's shard
 /// has run (hyper-rt's `Counters::longest_step_ns`: one task's poll by the wall clock, since the
 /// process began), is past the one last `said`: the longest said now.
@@ -4659,6 +4716,41 @@ mod tests {
         // Every cause has its own name in the lines.
         let names: std::collections::BTreeSet<_> = Slowed::ALL.iter().map(|c| c.name()).collect();
         assert_eq!(names.len(), Slowed::ALL.len());
+    }
+
+    /// Each cause of a put's `SlowDown` is said as its count changes, `refused CAUSE COUNT`, as
+    /// `slowed` is: the first at once, a storm within a gap not at all, and past it a line for each
+    /// cause that moved; and a `counts` answer says every cause's count, each named once.
+    #[test]
+    fn each_cause_of_a_puts_slowdown_is_said_as_it_changes_and_counted() {
+        use crate::node::refusals::{CAUSES, Cause, names};
+        let gap = 1_000;
+        let mut counts = [0u64; CAUSES];
+        let mut lines = String::new();
+        let said = refused_lines(&mut lines, None, (counts, 5), gap).unwrap();
+        assert_eq!((said, lines.as_str()), (None, ""));
+        counts[Cause::ShortAway.slot()] = 1;
+        let said = refused_lines(&mut lines, said, (counts, 10), gap).unwrap();
+        assert_eq!(lines, "refused unplaced_short_away 1\n");
+        counts[Cause::Lost(Refusal::Closed).slot()] = 2;
+        let said = refused_lines(&mut lines, said, (counts, 10 + gap - 1), gap).unwrap();
+        assert_eq!(lines, "refused unplaced_short_away 1\n");
+        refused_lines(&mut lines, said, (counts, 10 + gap), gap).unwrap();
+        assert_eq!(
+            lines,
+            "refused unplaced_short_away 1\nrefused unplaced_lost_closed 2\n"
+        );
+        let mut answer = String::new();
+        refused_counts(&mut answer, &counts).unwrap();
+        let words: Vec<&str> = answer.split_whitespace().collect();
+        assert_eq!(words.len(), 2 * CAUSES);
+        let named: std::collections::BTreeSet<_> = words.iter().step_by(2).collect();
+        assert_eq!(named.len(), CAUSES, "every cause named once");
+        assert!(
+            answer.contains(" refused_unplaced_lost_closed 2"),
+            "{answer}"
+        );
+        assert_eq!(names().count(), CAUSES);
     }
 
     /// A report of the watchdog's, numbered `number`, on a task spawned at `site` and labelled

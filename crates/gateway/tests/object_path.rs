@@ -325,6 +325,7 @@ fn holding(window: usize) -> Holding {
     Holding {
         handover_ns: HANDOVER,
         window,
+        beat_ns: HANDOVER,
     }
 }
 

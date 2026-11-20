@@ -126,7 +126,16 @@ the PUT fails `507 Insufficient Storage` (node.md §4.4, research/75). The place
 volumes of nodes the cell holds away after every other, so a block too wide for the volumes seen
 asks them rather than failing before any chunk goes (repair.md §5, as built 2026-11-20); a volume
 with no room now, `Busy` or the transport's backpressure, is asked again within the client's
-patience and is never sent on (research/77 D2). Either way what it wrote is
+patience and is never sent on (research/77 D2). A chunk whose put was lost with its connection,
+closed under it (a stall past the idle timeout closes one to a node alive) or none up, is sent on as
+a refused one is; where no volume is left it is asked again of the same volume once, a beat later,
+the probe timeout at the initial estimates, by which the node has dialed a closed connection again
+(node.md §3), and fails the block only if lost or refused again (as built 2026-11-20). The resend is
+safe because a put lost may have landed and a chunk's key and bytes are its identity: the volume
+answers the same key and bytes put again as done, and refuses other bytes under the key (node.md
+§5.2, §5.4; chunk-store.md §4, audit B05). It is one, counted per chunk, and costs a node truly
+gone one beat of the client's patience, 60 s for the stock clients (research/77 D2), before its
+`NotConnected` fails the block `Unplaced` as before. Either way what it wrote is
 left to the sweeps: blocks and files never handed over are found and released (metadata.md §2),
 and chunks no block names are reconciled per volume (STATUS).
 

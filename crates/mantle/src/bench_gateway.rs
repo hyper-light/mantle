@@ -365,6 +365,8 @@ fn begin(
         Holding {
             handover_ns: HANDOVER,
             window,
+            // Its volumes answer every chunk at once: none is lost, so none waits a beat.
+            beat_ns: HANDOVER,
         },
         Box::new(Counter(first)),
         0,

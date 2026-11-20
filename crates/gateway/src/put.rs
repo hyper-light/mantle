@@ -88,6 +88,14 @@ pub enum Answer {
     /// No room for the chunk now, at the volume's writer queue or in the transport toward it: it
     /// is asked again of the same volume once room frees ([`Put::room`], research/77 D2).
     Busy,
+    /// The chunk's put was lost with its connection to the volume's node, closed under it or none
+    /// up: the put may have landed (node.md §5.2), and the node may take it once its connection is
+    /// made again. It is sent on to the next volume offered, as a refused chunk is; where none is
+    /// left, it is asked again of the same volume once, a beat later ([`Holding::beat_ns`]), with
+    /// the same key and bytes, which the volume answers as done where the first put landed and
+    /// refuses where other bytes are under the key (chunk-store.md §4, audit B05). Lost or refused
+    /// again, the block fails as a refused chunk's does.
+    Lost,
     /// No volume takes the chunk as it was sent: the node may not send it, or sent it so that
     /// every volume refuses it alike. The PUT cannot go on.
     Failed,
@@ -219,6 +227,10 @@ pub struct Holding {
     /// filling: one is the fewest, and overlaps the body's arrival with the writes; more
     /// overlap the writes of several blocks, whose round trips otherwise add up (audit §16.3).
     pub window: usize,
+    /// How long, in the caller's time, a chunk lost with its connection waits before it is asked
+    /// again of the same volume ([`Answer::Lost`]): the caller's beat, within which its transport
+    /// makes a closed connection again.
+    pub beat_ns: u64,
 }
 
 /// A file's identity and key: a file ID never used before, and its data key, wrapped as the
@@ -322,6 +334,9 @@ struct Going {
     full: bool,
     /// Each chunk's volume, and whether the chunk is durable there.
     at: Vec<Option<(u128, bool)>>,
+    /// Each chunk lost with its connection that was asked again of the same volume, once at most
+    /// ([`Answer::Lost`]).
+    resent: Vec<bool>,
     /// Every chunk is durable and the block's write is asked of the Block range.
     recording: bool,
     /// When, in the caller's time, it went down.
@@ -526,6 +541,13 @@ pub struct Put {
     /// The chunks answered `Busy`, by their block's place in the file and their index, waiting
     /// for room at the volume they went to: at most every chunk of the blocks going down.
     roomless: Vec<(u64, usize)>,
+    /// The chunks lost with their connection where no other volume was left, by their block's
+    /// place in the file and their index, and when, in the caller's time, each is asked again of
+    /// the same volume: a beat past the first tick that saw it lost ([`Put::tick`]), none before
+    /// that tick. Each chunk is asked again once (`Going::resent`), so these are at most every
+    /// chunk of the blocks going down.
+    lost: Vec<(u64, usize, Option<u64>)>,
+    beat_ns: u64,
     next_id: Id,
     phase: Phase,
     /// The file's deadline, once the File range has written it: the Name write waits for the
@@ -559,6 +581,7 @@ impl Put {
         let Holding {
             handover_ns,
             window,
+            beat_ns,
         } = holding;
         if window == 0 {
             return Err(PutError::Window);
@@ -655,6 +678,8 @@ impl Put {
             checked: None,
             ready: VecDeque::new(),
             roomless: Vec::new(),
+            lost: Vec::new(),
+            beat_ns,
             asked: BTreeMap::new(),
             next_id: 0,
             phase: Phase::Body,
@@ -684,10 +709,13 @@ impl Put {
         self.guard(|put| put.finish(expected))
     }
 
-    /// The caller's time now: renewals that have come due are asked for.
+    /// The caller's time now: renewals that have come due are asked for, each chunk lost with its
+    /// connection since the last tick is due to be asked again a beat from now, and each whose
+    /// beat has come is asked again of its volume.
     pub fn tick(&mut self, now_ns: u64) -> Result<(), PutError> {
         self.guard(|put| {
             put.now_ns = put.now_ns.max(now_ns);
+            put.resend_lost()?;
             if matches!(put.phase, Phase::Body | Phase::Ended) {
                 put.renew_due()?;
             }
@@ -695,13 +723,20 @@ impl Put {
         })
     }
 
-    /// When, in the caller's time, the next renewal comes due, for the caller to tick then;
-    /// `None` while none waits.
+    /// When, in the caller's time, the next renewal or the next chunk lost with its connection
+    /// comes due, for the caller to tick then; `None` while none waits.
     pub fn due_ns(&self) -> Option<u64> {
-        if self.outcome.is_some() || !matches!(self.phase, Phase::Body | Phase::Ended) {
+        if self.outcome.is_some() {
             return None;
         }
-        self.due.first().map(|&(at, _)| at)
+        let renewal = matches!(self.phase, Phase::Body | Phase::Ended)
+            .then(|| self.due.first().map(|&(at, _)| at))
+            .flatten();
+        self.lost
+            .iter()
+            .filter_map(|&(_, _, due)| due)
+            .chain(renewal)
+            .min()
     }
 
     /// The next request to send, each once; `None` while every request is in flight or the
@@ -990,6 +1025,7 @@ impl Put {
                 next: 0,
                 full: true,
                 at: vec![None; width],
+                resent: vec![false; width],
                 recording: false,
                 down_ns: self.now_ns,
             },
@@ -1022,6 +1058,7 @@ impl Put {
                 self.roomless.push((index, i));
                 Ok(())
             }
+            (Asked::Chunk(index, i), Answer::Lost) => self.lost(index, i),
             (Asked::Chunk(index, _), Answer::Failed) => {
                 let going = self.going.get(&index).ok_or(PutError::Mismatch)?;
                 Err(PutError::Unsendable(going.id))
@@ -1140,6 +1177,53 @@ impl Put {
         let request = chunk(going.id, i, volume, bytes, *crc)?;
         *going.at.get_mut(i).ok_or(PutError::Mismatch)? = Some((volume, false));
         self.ask(Asked::Chunk(index, i), request);
+        Ok(())
+    }
+
+    /// A chunk lost with its connection ([`Answer::Lost`]): sent on to the next volume offered,
+    /// as a refused one is, where one is left or it was asked again already; else held to be asked
+    /// again of the same volume a beat later, once (node.md §5.2: a put lost may have landed, and
+    /// the same key and bytes put again are the same chunk).
+    fn lost(&mut self, index: u64, i: usize) -> Result<(), PutError> {
+        let going = self.going.get_mut(&index).ok_or(PutError::Mismatch)?;
+        let left = going.next < going.volumes.len();
+        let resent = going.resent.get_mut(i).ok_or(PutError::Mismatch)?;
+        if left || *resent {
+            return self.refused(index, i, false);
+        }
+        *resent = true;
+        self.lost.push((index, i, None));
+        Ok(())
+    }
+
+    /// Each chunk lost since the last tick due a beat from now, and each whose beat has come asked
+    /// again of the volume it went to, with its key and bytes. Saturating: a beat past the end of
+    /// the clock never comes, and the client's patience ends the put.
+    fn resend_lost(&mut self) -> Result<(), PutError> {
+        if self.lost.is_empty() {
+            return Ok(());
+        }
+        let (now, next) = (self.now_ns, self.now_ns.saturating_add(self.beat_ns));
+        let mut due = Vec::new();
+        self.lost.retain_mut(|(index, i, at)| {
+            if *at.get_or_insert(next) > now {
+                return true;
+            }
+            due.push((*index, *i));
+            false
+        });
+        for (index, i) in due {
+            let going = self.going.get(&index).ok_or(PutError::Mismatch)?;
+            let (volume, _) = going
+                .at
+                .get(i)
+                .copied()
+                .flatten()
+                .ok_or(PutError::Mismatch)?;
+            let (bytes, crc) = going.chunks.get(i).ok_or(PutError::Mismatch)?;
+            let request = chunk(going.id, i, volume, bytes, *crc)?;
+            self.ask(Asked::Chunk(index, i), request);
+        }
         Ok(())
     }
 
@@ -1534,6 +1618,7 @@ mod tests {
         let holding = Holding {
             handover_ns: HANDOVER,
             window: 1,
+            beat_ns: 1,
         };
         let layout = Layout::new(Scheme::Copies(3)).unwrap();
         let mut put =

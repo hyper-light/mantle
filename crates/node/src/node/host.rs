@@ -198,6 +198,9 @@ pub(crate) struct Job {
     /// When, on the shard's clock, its asker was last told its work is held (`Job::vouch`); none
     /// before it first was.
     vouched_ns: Option<u64>,
+    /// Whether the host's turns pass it by: its last turn left it waiting on its own asks alone
+    /// (`Job::rests`), and only what wakes it gives it work again (`Host::wake`).
+    resting: bool,
     /// When the host admitted it, on the shard's clock; none for one answered at once, refused or
     /// malformed, which the admission limit does not count (`crate::admit`).
     admitted_ns: Option<u64>,
@@ -227,6 +230,27 @@ impl Job {
         let quiet = self.moved_ns.saturating_add(patience);
         self.deadline_ns
             .map_or(quiet, |deadline| deadline.min(quiet))
+    }
+
+    /// Whether its turn has nothing to do until one of its own asks is answered, room is offered
+    /// it, its bound comes or its put's renewal comes due, each of which wakes it (`Host::wake`,
+    /// node.md §2.9 step 6d): a put whose bucket row is out, or one not over whose driver takes
+    /// none of its body now, holds no request for want of the node's room and no chunk for want
+    /// of a volume's, so its turn would feed it nothing, ask nothing and answer nothing. A job its
+    /// door could move, a body's bytes or a reply's room, is turned at every step.
+    fn rests(&self) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        match &self.work {
+            Work::Put(putting) => putting.put.as_ref().is_none_or(|put| {
+                put.outcome().is_none()
+                    && !put.wants_body()
+                    && !put.waits_for_room()
+                    && putting.waiting.is_empty()
+            }),
+            _ => false,
+        }
     }
 
     /// Whether its work is held, by a peer or a device: an ask of its own out, or a chunk waiting
@@ -742,6 +766,16 @@ impl Host {
         self.audit();
     }
 
+    /// Job `at` woken, so the host's next turn steps it: each event that can give a resting job
+    /// work wakes it as it comes, an answer to one of its asks (`answer_job`), a reply given it
+    /// (`reply_job`), room offered it (`offer_room`) and its put's renewal coming due
+    /// (`Host::step`); nothing else moves a job that rests (`Job::rests`).
+    fn wake(&mut self, at: usize) {
+        if let Some(job) = self.jobs.get_mut(at) {
+            job.resting = false;
+        }
+    }
+
     /// Job `at`'s keys from its state at `now`, the shard's clock: its beat or bound where its work
     /// is held (`Job::due_ns`), and its put's next renewal (`Job::renewal_ns`). Set as it is
     /// pushed, as its turn ends and as a piece of a chunk it asked moves: between its turns nothing
@@ -806,6 +840,7 @@ impl Host {
                 deadline_ns,
                 moved_ns: now,
                 vouched_ns: None,
+                resting: false,
                 admitted_ns,
                 charge,
                 window,
@@ -3786,6 +3821,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 deadline_ns,
                 moved_ns: now,
                 vouched_ns: None,
+                resting: false,
                 admitted_ns,
                 charge,
                 window,
@@ -3850,6 +3886,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 deadline_ns: None,
                 moved_ns: now,
                 vouched_ns: None,
+                resting: false,
                 admitted_ns,
                 charge,
                 window,
@@ -4287,8 +4324,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if self.replies.begin_visits() == 0 {
             return Ok(());
         }
-        // The shard's clock, read once for the turn's replies, as the host's step reads it.
+        // The shard's clock, read once for the turn's replies, as the host's step reads it; the
+        // wall clock as well, once a job's step wants it.
         let now = read.unwrap_or_else(clock);
+        let mut wall = None;
         let rounds = self
             .gateway
             .as_ref()
@@ -4314,8 +4353,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                         // A job that ended gave all it will: the next write finds its channel
                         // ended.
                         if let Some(job) = self.host.job_of(exchange) {
+                            let wall = *wall.get_or_insert_with(|| self.wall.now_ns());
                             self.lend(|host, node| {
-                                host.turn_job(node, job, now, &mut Timing::from(now))
+                                host.turn_job(node, job, now, wall, &mut Timing::from(now))
                             })?;
                         }
                     }
@@ -4965,10 +5005,34 @@ impl Host {
             self.room_offered_ns = now;
         }
         self.bound_jobs(node, now, beat)?;
+        // The wall clock, read once for the turn as the shard's is: a put's renewals and the
+        // times its records carry are the turn's, read once where each step read it, every job
+        // stepped every turn, each read through `SystemTime::now` (macOS `sample` of the 1-byte
+        // PUT bench's three-node cell, 2026-11-19: 14% of the first shard, 98% of it under
+        // `step_job`).
+        let wall = node.wall_ns();
+        // A renewal is the one event of a resting put's that no answer or bound brings: each
+        // one due wakes its job, read from the earliest kept (`renewals`) where one is.
+        if self.renewals.first().is_some_and(|first| first <= wall) {
+            for &(due, at) in self.renewals.entries() {
+                if due <= wall
+                    && let Some(job) = self.jobs.get_mut(at)
+                {
+                    job.resting = false;
+                }
+            }
+        }
         let mut timing = Timing::from(now);
         let mut at = 0;
         while at < self.jobs.len() {
-            if !self.turn_job(node, at, now, &mut timing)? {
+            // A job that rests has nothing to do this turn: passed by, its keys kept for what its
+            // bound moved (`bound_jobs`, `Host::rekey`).
+            if self.jobs.get(at).is_some_and(|job| job.resting) {
+                self.rekey(at, now);
+                at = at.saturating_add(1);
+                continue;
+            }
+            if !self.turn_job(node, at, now, wall, &mut timing)? {
                 at = at.saturating_add(1);
             }
         }
@@ -5156,15 +5220,17 @@ impl Host {
         self.reply_job(node, at, reply)
     }
 
-    /// Job `at`'s step at the turn of `now`, timed in `timing` where it did work; whether it is
-    /// over, and so let go. Bytes of its own body taken or of its reply given are its work
-    /// moving, as its asks answered are: a native job counts them in its door, taken here as a
-    /// value into the node's count (node.md §2.9 step 6c).
+    /// Job `at`'s step at the turn of `now`, the wall clock read `wall` for it, timed in `timing`
+    /// where it did work; whether it is over, and so let go. Bytes of its own body taken or of its
+    /// reply given are its work moving, as its asks answered are: a native job counts them in its
+    /// door, taken here as a value into the node's count (node.md §2.9 step 6c). One not over
+    /// rests where it waits on its own asks alone (`Job::rests`).
     fn turn_job<N: Serve>(
         &mut self,
         node: &mut N,
         at: usize,
         now: u64,
+        wall: u64,
         timing: &mut Timing,
     ) -> Result<bool, NodeError> {
         let before = (node.moved(), self.moved);
@@ -5172,7 +5238,7 @@ impl Host {
             .jobs
             .get(at)
             .map_or((None, 0), |job| (job.label, job.pending.len()));
-        let over = self.step_job(node, at)?;
+        let over = self.step_job(node, at, wall)?;
         if let Some(Job {
             door: Door::Native(_, native),
             ..
@@ -5223,6 +5289,9 @@ impl Host {
         // Its keys from its state as its turn ends; one over is let go, and the job moved into its
         // slot keyed as its own turn ended, or at its turn next in the step.
         if !over {
+            if let Some(job) = self.jobs.get_mut(at) {
+                job.resting = job.rests();
+            }
             self.rekey(at, now);
         }
         Ok(over)
@@ -5238,6 +5307,10 @@ impl Host {
             };
             if job.bounded(now) != Bounded::Held {
                 continue;
+            }
+            // Room offered to a chunk that waits for it is its job's work, as an answer is.
+            if job.waits_for_room() {
+                job.resting = false;
             }
             let (put, get) = match &mut job.work {
                 Work::Put(putting) => (putting.put.as_mut(), None),
@@ -5302,8 +5375,13 @@ impl Host {
         Ok(())
     }
 
-    /// One operation's turn; whether it is over.
-    fn step_job<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
+    /// One operation's turn, at the wall clock's `wall`; whether it is over.
+    fn step_job<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        wall: u64,
+    ) -> Result<bool, NodeError> {
         #[cfg(test)]
         tests::STEPS.with(|steps| steps.set(steps.get().saturating_add(1)));
         let Some(job) = self.jobs.get(at) else {
@@ -5316,13 +5394,13 @@ impl Host {
             Work::Draining(_) => self.drain_job(at),
             Work::Answering(_) => self.answer_door(at),
             Work::Bucket(_) => self.step_bucket(node, at),
-            Work::Put(_) => self.step_put(node, at),
+            Work::Put(_) => self.step_put(node, at, wall),
             Work::Get(_) => self.step_get(node, at),
             Work::Command(_) => self.step_command(node, at),
             Work::Complete(_) => self.step_complete(node, at),
             Work::Read(_) => self.step_single(node, at),
             Work::Deletes(_) => self.step_deletes(node, at),
-            Work::Copy(_) => self.step_copy(node, at),
+            Work::Copy(_) => self.step_copy(node, at, wall),
             Work::Admin(_) => self.step_admin(node, at),
         }
     }
@@ -5374,6 +5452,8 @@ impl Host {
         outcome: Outcome,
         now: u64,
     ) -> Result<(), NodeError> {
+        // An answer is a resting job's work: its next turn takes it on.
+        self.wake(at);
         // A range step that waited its range's budget without a leader that can serve it (node.md
         // §5.4), the only end a job's steps have: the request is answered `SlowDown`, a cause that
         // passes, which clients retry.
@@ -5969,10 +6049,9 @@ impl Host {
                 by: Wrapper::Root(*generation),
                 bytes: data.wrap(root).ok()?,
             };
-            let mut file = [0u8; 16];
-            getrandom::fill(&mut file).ok()?;
+            // The file's ID from the thread's generator, as its blocks' are (`put::id`).
             let keys = Keys {
-                file: u128::from_be_bytes(file),
+                file: put::id().ok()?,
                 data,
                 wrapped,
             };
@@ -6009,8 +6088,12 @@ impl Host {
 
     /// A put's turn: its bucket's row read first; then its body read as far as the driver takes
     /// it, its driver's time moved and its requests asked; once its outcome is known, its answer.
-    fn step_put<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
-        let wall = node.wall_ns();
+    fn step_put<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        wall: u64,
+    ) -> Result<bool, NodeError> {
         let state = {
             let Some(Job {
                 work: Work::Put(putting),
@@ -6101,7 +6184,7 @@ impl Host {
                 break;
             };
             // Not asked: the node holds as many asks as it keeps. It waits, in its place.
-            if let Some(request) = self.ask_put(node, at, id, request)? {
+            if let Some(request) = self.ask_put(node, at, id, request, wall)? {
                 if let Some(Job {
                     work: Work::Put(putting),
                     ..
@@ -6181,14 +6264,15 @@ impl Host {
         }
     }
 
-    /// Asks a put's driver's request of what serves it; the request back when the node holds as
-    /// many asks as it keeps.
+    /// Asks a put's driver's request of what serves it at the turn's wall clock, `wall`; the
+    /// request back when the node holds as many asks as it keeps.
     fn ask_put<N: Serve>(
         &mut self,
         node: &mut N,
         at: usize,
         id: u64,
         request: put::Request,
+        wall: u64,
     ) -> Result<Option<put::Request>, NodeError> {
         let Some(kept) = self.kept_id(at, Driver::Put, id) else {
             self.fail_job(node, at, Status::Failed)?;
@@ -6211,11 +6295,10 @@ impl Host {
         let asked = match &request {
             put::Request::Place { block, .. } => {
                 // Only volumes that take chunks now, their nodes seen, weighted by measured
-                // availability (docs/design/repair.md §5).
-                let now = node.wall_ns();
+                // availability (docs/design/repair.md §5), at the turn's wall clock.
                 let Ok(volumes) = node
                     .table()
-                    .map(|t| place::offer(*block, &t.facts, &[], false, now))
+                    .map(|t| place::offer(*block, &t.facts, &[], false, wall))
                 else {
                     self.fail_job(node, at, Status::Failed)?;
                     return Ok(None);
@@ -6969,10 +7052,10 @@ impl Host {
             return self.fail_job(node, at, Status::Failed);
         };
         let now = node.wall_ns();
-        let mut file = [0u8; 16];
-        if getrandom::fill(&mut file).is_err() {
+        // The file's ID from the thread's generator, as a put's is (`put::id`).
+        let Ok(file) = put::id() else {
             return self.fail_job(node, at, Status::Failed);
-        }
+        };
         let Some(Job {
             work: Work::Complete(completing),
             ..
@@ -7004,16 +7087,8 @@ impl Host {
         let listed = std::mem::take(&mut completing.listed);
         let made = match completing.native.take() {
             // A native upload's Finish: every run, held to what its client sent.
-            Some(sent) => {
-                Completion::native(complete, sent, u128::from_be_bytes(file), handover_ns, now)
-            }
-            None => Completion::new(
-                complete,
-                listed,
-                u128::from_be_bytes(file),
-                handover_ns,
-                now,
-            ),
+            Some(sent) => Completion::native(complete, sent, file, handover_ns, now),
+            None => Completion::new(complete, listed, file, handover_ns, now),
         };
         match made {
             Ok(completion) => {
@@ -7272,8 +7347,12 @@ impl Host {
     /// UploadPartCopy's upload's row next, then the source's version; then its drivers, the
     /// get's plaintext fed to the put as the put takes it, each one's requests asked; once the
     /// put commits, its reply, a null version's time read from its mark first.
-    fn step_copy<N: Serve>(&mut self, node: &mut N, at: usize) -> Result<bool, NodeError> {
-        let wall = node.wall_ns();
+    fn step_copy<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        wall: u64,
+    ) -> Result<bool, NodeError> {
         let Some(Job {
             work: Work::Copy(copying),
             pending,
@@ -7430,7 +7509,7 @@ impl Host {
                         let Some((id, request)) = next else {
                             break;
                         };
-                        if let Some(request) = self.ask_put(node, at, id, request)? {
+                        if let Some(request) = self.ask_put(node, at, id, request, wall)? {
                             if let Some(Job {
                                 work: Work::Copy(copying),
                                 ..
@@ -7597,10 +7676,9 @@ impl Host {
                 by: Wrapper::Root(*generation),
                 bytes: data.wrap(root).ok()?,
             };
-            let mut file = [0u8; 16];
-            getrandom::fill(&mut file).ok()?;
+            // The file's ID from the thread's generator, as its blocks' are (`put::id`).
             let keys = Keys {
-                file: u128::from_be_bytes(file),
+                file: put::id().ok()?,
                 data,
                 wrapped,
             };
@@ -7963,6 +8041,7 @@ impl Host {
         reply: Reply,
     ) -> Result<(), NodeError> {
         if let Some(job) = self.jobs.get_mut(at) {
+            job.resting = false;
             job.work = Work::Draining(Box::new(reply));
             self.asks
                 .release(job.pending.iter().map(|(pending, _)| *pending));
@@ -9038,6 +9117,8 @@ pub(super) mod tests {
         pub(super) static CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         /// The jobs this thread's hosts stepped ([`Host::step_job`]).
         pub(super) static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// The wall clock's reads this thread's stubs of the node gave ([`Stub`]'s `wall_ns`).
+        pub(super) static WALL_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         /// The probes this thread made of a host's slots ([`Slots::get`]).
         pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The keys this thread's hosts compared in their heaps ([`Earliest::less`]).
@@ -9256,6 +9337,63 @@ pub(super) mod tests {
         let (reads, steps) = clock_reads();
         assert_eq!(steps, 64, "every job is still visited");
         assert_eq!(reads, 2, "the turn's read and the one working step's");
+    }
+
+    /// Steps a put: 64 puts of an empty body, each committed by one Name command answered 32 turns
+    /// after it is asked, as a range's log answers a commit many turns of a loaded node's task
+    /// later. Each put is stepped as its turn first comes, its body's end taken and its commit
+    /// asked, and again as its answer comes, its reply given and its job let go: the 31 turns
+    /// between, where it waits on its commit alone, pass it by (`Job::rests`), so each put is
+    /// stepped twice, 128 steps, where it was stepped at every turn, 2,112 steps, 33 a put; and
+    /// each turn reads the wall clock once where each step of a put read it, 2,112 reads.
+    #[test]
+    fn a_put_waiting_on_its_asks_alone_is_stepped_only_as_they_are_answered() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        let mut bodies = Vec::new();
+        let mut replies = Vec::new();
+        for _ in 0..64 {
+            let mut putting = native_put(0);
+            putting.trailing = None;
+            let (job, body, answers) = local_job(Work::Put(putting), now, 7);
+            assert!(body.try_send(Piece::End(Some(crc.clone()))).is_ok());
+            host.push(job, now);
+            bodies.push(body);
+            replies.push(answers);
+        }
+        let mut stub = put_and_get_stub();
+        let mut held = Vec::new();
+        let _ = clock_reads();
+        WALL_READS.with(|reads| reads.set(0));
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 64, "the puts never ended");
+            if turns == 33 {
+                stub.answers.append(&mut held);
+            }
+            host.step(&mut stub).unwrap();
+            held.append(&mut stub.answers);
+        }
+        let (_, steps) = clock_reads();
+        let walls = WALL_READS.with(|reads| reads.replace(0));
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(stub.asked, 64, "each put's one commit");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each put stepped as it begins and as it is answered"
+        );
+        assert_eq!(walls, 33, "the wall clock read once a turn");
+        for answers in &mut replies {
+            let answers = answered(answers);
+            assert!(
+                matches!(answers.as_slice(), [door::Answer::Ready, door::Answer::Head(reply), door::Answer::End]
+                    if reply.status == Status::Done && reply.version == "v"),
+                "{answers:?}"
+            );
+        }
     }
 
     /// A gateway of the rates and target `mantle init`'s cells state (crates/mantle/tests/support).
@@ -9891,6 +10029,7 @@ pub(super) mod tests {
             deadline_ns: Some(10),
             moved_ns: 1,
             vouched_ns: None,
+            resting: false,
             admitted_ns: Some(1),
             charge: 0,
             window: 1,
@@ -11295,6 +11434,7 @@ pub(super) mod tests {
         }
 
         fn wall_ns(&self) -> u64 {
+            WALL_READS.with(|reads| reads.set(reads.get() + 1));
             0
         }
 
@@ -11424,6 +11564,7 @@ pub(super) mod tests {
             deadline_ns: None,
             moved_ns: now,
             vouched_ns: None,
+            resting: false,
             admitted_ns: Some(now),
             charge,
             window: 1,
@@ -12516,6 +12657,7 @@ pub(super) mod tests {
             deadline_ns: None,
             moved_ns: now,
             vouched_ns: None,
+            resting: false,
             admitted_ns: Some(now),
             charge,
             window: 1,

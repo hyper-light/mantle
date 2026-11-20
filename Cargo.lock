@@ -888,6 +888,7 @@ dependencies = [
  "mantle-meta",
  "mantle-s3",
  "proptest",
+ "rand 0.10.3",
  "thiserror",
 ]
 

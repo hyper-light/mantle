@@ -3321,9 +3321,16 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let sleep = pin!(hyper_rt::futures::sleep(sleep_ns));
         let ended = race3(event, receive, race2(sleep, any_wake)).await;
         let woke = hyper_rt::futures::now_ns();
+        // A wait begun before the stream's wake and ended at or past it measures how late the
+        // stream's wakes are polled (`Liveness::on_wait`). A node whose every turn runs past its
+        // wake, a loaded host's, begins no such wait, and with no granularity measured its stream
+        // refuses every peer's heartbeat as unmeasured: it never judges a peer it meets loaded, and
+        // a joiner's promotion waits on that judgment for good (`tests/sim.rs`, the founder loaded
+        // before the join). Until one is measured, the lateness its poll came at past a wake is the
+        // sample.
         if let Some(at) = wake
-            && now < at
             && woke >= at
+            && (now < at || self.liveness.granularity().is_none())
         {
             self.liveness.on_wait(at, woke);
             self.liveness_moved = true;

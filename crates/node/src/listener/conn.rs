@@ -548,13 +548,16 @@ impl Connection {
             denied,
             body: taken,
             reply: answers,
+            mark: None,
         };
-        // A door at its bound refuses before any of the body is read (node.md §4.5).
-        if self.door.submit(request).is_err() {
+        // A door at its bound refuses before any of the body is read (node.md §4.5). Held until
+        // the exchange ends, answered or broken, which names its job once more
+        // (`door::Named`).
+        let Ok(_named) = self.door.submit(request) else {
             return self
                 .refuse(&slow(&self.door), resource, ids, (version, head), unread)
                 .await;
-        }
+        };
         let mut body = body;
         let mut refused: Option<Refused> = None;
         loop {

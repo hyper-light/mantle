@@ -232,23 +232,56 @@ impl Job {
             .map_or(quiet, |deadline| deadline.min(quiet))
     }
 
-    /// Whether its turn has nothing to do until one of its own asks is answered, room is offered
-    /// it, its bound comes or its put's renewal comes due, each of which wakes it (`Host::wake`,
-    /// node.md §2.9 step 6d): a put whose bucket row is out, or one not over whose driver takes
-    /// none of its body now, holds no request for want of the node's room and no chunk for want
-    /// of a volume's, so its turn would feed it nothing, ask nothing and answer nothing. A job its
-    /// door could move, a body's bytes or a reply's room, is turned at every step.
+    /// Whether its turn has nothing to do until an event that wakes it comes (`Host::wake`,
+    /// node.md §2.9 step 6d): one of its own asks answered, room offered it, its bound, its put's
+    /// renewal due, or its S3 connection naming it (`door::Mark`) as it sends a piece of its body,
+    /// takes an answer of its reply or lets go. Its turn would feed it nothing, ask nothing and
+    /// answer nothing where it holds no request for want of the node's room and no chunk for want
+    /// of a volume's, and:
+    ///
+    /// - a put or a get reads its bucket's row or its version, or its get has no bytes to give
+    ///   while its reads are out;
+    /// - a put not over whose driver takes none of its body now waits on its asks;
+    /// - a put whose driver wants its body found its S3 door's channel empty, or a get or its last
+    ///   answers found no room in its S3 door's reply: the connection names it as it sends or
+    ///   takes more.
+    ///
+    /// A native job its door could move, a body's bytes or a reply's room, is turned at every
+    /// step: the node's task names no job to its host (`Native::mark` names its exchange to the
+    /// node's task alone).
     fn rests(&self) -> bool {
-        if self.pending.is_empty() {
-            return false;
-        }
+        let asking = !self.pending.is_empty();
+        // One whose connection let go waits on it no more: its channels close as it goes.
+        let named = match &self.door {
+            Door::Local(local) => local
+                .mark
+                .as_ref()
+                .filter(|mark| !mark.gone())
+                .map(|_| local.as_ref()),
+            Door::Native(..) => None,
+        };
+        let roomless = named.is_some_and(|local| !local.pending.is_empty());
         match &self.work {
-            Work::Put(putting) => putting.put.as_ref().is_none_or(|put| {
-                put.outcome().is_none()
-                    && !put.wants_body()
-                    && !put.waits_for_room()
-                    && putting.waiting.is_empty()
-            }),
+            Work::Put(putting) => match putting.put.as_ref() {
+                None => asking,
+                Some(put) if put.outcome().is_some() || put.waits_for_room() => false,
+                Some(_) if !putting.waiting.is_empty() => false,
+                Some(put) if !put.wants_body() => asking,
+                // What it carried over of its last piece is fed before any more is read.
+                Some(_) if !putting.carry.is_empty() => false,
+                Some(_) => named.is_some_and(|local| {
+                    local
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| body.dry && body.ended.is_none())
+                }),
+            },
+            Work::Get(getting) => match getting.get.as_ref() {
+                None => asking,
+                Some(get) if get.waits_for_room() || !getting.waiting.is_empty() => false,
+                Some(get) => roomless || (asking && !get.ready() && get.outcome().is_none()),
+            },
+            Work::Answering(_) => roomless,
             _ => false,
         }
     }
@@ -416,6 +449,12 @@ pub(crate) struct Host {
     /// asks. Kept as each ask is waited on (`Host::wait_on`), answered (`take_answers`) or let go
     /// (`reply_job`), and as each job is pushed and swap-removed.
     asks: Slots<Pending>,
+    /// Its S3 jobs' slots by their requests' names (`door::Mark`), one a job: the job its
+    /// connection named found in one probe (`Host::take_marks`), kept as `exchanges` is.
+    named: Slots<u64>,
+    /// The slots of the jobs a turn's answers are for (`Host::step`), kept from turn to turn so a
+    /// turn makes none: at most the asks answered at once, each a job's, which `asks` bounds.
+    answered: Vec<usize>,
     /// Its held jobs' next beats or bounds on the shard's clock (`Job::due_ns`), and its puts'
     /// next renewals on the wall clock (`Job::renewal_ns`), each job's keyed from its state as
     /// its turn ends (`Host::rekey`), the earliest of each read in one step by `Host::due`.
@@ -711,6 +750,8 @@ impl Host {
             room_offered_ns: 0,
             exchanges: Slots::default(),
             asks: Slots::default(),
+            named: Slots::default(),
+            answered: Vec::new(),
             beats: Earliest::default(),
             renewals: Earliest::default(),
         }
@@ -721,6 +762,7 @@ impl Host {
     fn push(&mut self, job: Job, now: u64) {
         let at = self.jobs.len();
         self.exchanges.hold(job.door.exchange(), at);
+        self.named.hold(job.door.named(), at);
         self.asks
             .hold(job.pending.iter().map(|(pending, _)| *pending), at);
         self.jobs.push(job);
@@ -739,12 +781,14 @@ impl Host {
         }
         let job = self.jobs.swap_remove(at);
         self.exchanges.release(job.door.exchange());
+        self.named.release(job.door.named());
         self.asks
             .release(job.pending.iter().map(|(pending, _)| *pending));
         self.beats.swap_remove(at);
         self.renewals.swap_remove(at);
         if let Some(moved) = self.jobs.get(at) {
             self.exchanges.hold(moved.door.exchange(), at);
+            self.named.hold(moved.door.named(), at);
             self.asks
                 .hold(moved.pending.iter().map(|(pending, _)| *pending), at);
         }
@@ -772,6 +816,37 @@ impl Host {
     /// (`Host::step`); nothing else moves a job that rests (`Job::rests`).
     fn wake(&mut self, at: usize) {
         if let Some(job) = self.jobs.get_mut(at) {
+            job.resting = false;
+        }
+    }
+
+    /// The S3 requests their connections named since the last turn (`door::Mark`), each one's job
+    /// woken and its name let go, so what its connection does next names it again: at most the
+    /// marks' room a turn, as `Node::take_marks` takes the native ones. Where a name found no
+    /// room, every S3 job is woken, its name let go. A name whose job ended finds none.
+    pub(super) fn take_marks(&mut self, doorway: &mut door::Doorway) {
+        if doorway.missed() {
+            for job in &mut self.jobs {
+                if let Door::Local(local) = &job.door {
+                    if let Some(mark) = &local.mark {
+                        mark.taken();
+                    }
+                    job.resting = false;
+                }
+            }
+        }
+        for _ in 0..doorway.marks_room() {
+            let Some(id) = doorway.marked() else {
+                break;
+            };
+            let Some(job) = self.named.get(&id).and_then(|at| self.jobs.get_mut(at)) else {
+                continue;
+            };
+            if let Door::Local(local) = &job.door
+                && let Some(mark) = &local.mark
+            {
+                mark.taken();
+            }
             job.resting = false;
         }
     }
@@ -1019,6 +1094,15 @@ impl Door {
         match self {
             Self::Native(exchange, _) => *exchange,
             Self::Local(_) => None,
+        }
+    }
+
+    /// The S3 request's name its connection names it by (`door::Mark`); none for a native door's,
+    /// or a local one made with none.
+    fn named(&self) -> Option<u64> {
+        match self {
+            Self::Local(local) => local.mark.as_ref().map(|mark| mark.id()),
+            Self::Native(..) => None,
         }
     }
 }
@@ -1316,6 +1400,7 @@ fn native_door() -> Option<(Native, Replies)> {
             body: Pieces {
                 pieces,
                 ended: None,
+                dry: false,
             },
             reply,
             pending: VecDeque::new(),
@@ -2258,6 +2343,9 @@ fn room_beat() -> u64 {
 struct Pieces {
     pieces: ChannelReceiver<Piece>,
     ended: Option<Option<checksum::Checksum>>,
+    /// Whether its channel held no piece as its put last looked (`take_body`): the put waits on
+    /// its door for more.
+    dry: bool,
 }
 
 /// A local door's ends: the request's body as the listener sends it, and the reply as the host
@@ -2273,6 +2361,10 @@ struct Local {
     pending: VecDeque<door::Answer>,
     /// Whether the listener was told the put wants its body.
     ready: bool,
+    /// The request's name, which its connection names as it gives the job a piece of its body or
+    /// room in its reply, or lets go of it (`door::Mark`): the job's turns pass it by while it
+    /// waits on its connection alone (`Job::rests`). None for a job made with none.
+    mark: Option<std::sync::Arc<door::Mark>>,
 }
 
 /// A native put's body as the node's task reads it from its exchange for the put's job (node.md
@@ -3841,7 +3933,13 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             denied,
             body,
             reply,
+            mark,
         } = request;
+        // Its first turn comes as it is pushed: a name before it is let go, so its connection's
+        // next names it again.
+        if let Some(mark) = &mark {
+            mark.taken();
+        }
         let now = hyper_rt::futures::now_ns();
         let mut admitted_ns = None;
         let (charge, window) = charged(self.gateway.as_deref(), &self.windows, &op);
@@ -3874,10 +3972,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                     body: Some(Pieces {
                         pieces: body,
                         ended: None,
+                        dry: false,
                     }),
                     reply,
                     pending: VecDeque::new(),
                     ready: false,
+                    mark,
                 })),
                 principal,
                 work,
@@ -4983,11 +5083,18 @@ impl Host {
         // beat or a client's patience.
         let now = clock();
         // Every operation's answers taken before any asks again, so each asks with the room
-        // that every answer taken this turn gave back.
+        // that every answer taken this turn gave back: the jobs answered found by their asks'
+        // slots (`asks`), each once, where a walk of every job looked up each one's asks.
         let freed = node.freed();
-        for at in 0..self.jobs.len() {
+        let mut answered = std::mem::take(&mut self.answered);
+        answered.clear();
+        answered.extend(node.answers().filter_map(|pending| self.asks.get(&pending)));
+        answered.sort_unstable();
+        answered.dedup();
+        for &at in &answered {
             self.take_answers(node, at, now)?;
         }
+        self.answered = answered;
         // A chunk refused for room at a peer's volume hears nothing when that volume frees room
         // (its queue held by others' writes or by its cleaner, as a filling volume's is), and with
         // no other chunk of this node answered nothing offered it room again before its client's
@@ -8226,6 +8333,7 @@ fn take_body(
             return Ok(());
         }
         let cut = cut.is_some_and(|cut| cut.load(std::sync::atomic::Ordering::Acquire));
+        body.dry = false;
         match body.pieces.try_recv() {
             Ok(Some(Piece::Bytes(bytes, paced))) => {
                 // The piece's time from its send to this turn: a sample of the body's depth.
@@ -8244,7 +8352,10 @@ fn take_body(
             Ok(Some(Piece::Refused(status))) => return Err(status),
             // The door is gone with the body unfinished.
             Ok(None) if cut => return Err(Status::IncompleteBody),
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                body.dry = true;
+                return Ok(());
+            }
             Err(_) => return Err(Status::IncompleteBody),
         }
     }
@@ -9396,6 +9507,262 @@ pub(super) mod tests {
         }
     }
 
+    /// The S3 connection of a job made through a door, as the listener holds it: its submitter,
+    /// which names the request it submitted last, the body's sender, the reply's receiver, and its
+    /// hold on the request (`door::Named`).
+    struct Connection {
+        submitter: door::Submitter,
+        body: Sender<Piece>,
+        answers: ChannelReceiver<door::Answer>,
+        _named: door::Named,
+    }
+
+    /// A job of `work` admitted at `now` and charged `charge`, its request `op` submitted at
+    /// `doorway` by a connection of its own with a reply's channel of `room` answers, as the
+    /// listener submits one (`listener::conn`): its door names it by the request's mark.
+    fn named_job(
+        (work, op): (Work, Op),
+        now: u64,
+        charge: u64,
+        (submitter, doorway): (&door::Submitter, &mut door::Doorway),
+        room: usize,
+    ) -> (Job, Connection) {
+        let (body, pieces) = hyper_rt::sync::channel(2).unwrap();
+        let (reply, answers) = hyper_rt::sync::channel(room).unwrap();
+        let mut submitter = submitter.clone();
+        let named = submitter
+            .submit(door::Request {
+                op,
+                principal: "o".into(),
+                denied: Vec::new(),
+                body: pieces,
+                reply,
+                mark: None,
+            })
+            .unwrap();
+        let Some(door::Asked::Op(request)) = doorway.take() else {
+            panic!("the request submitted");
+        };
+        let door::Request {
+            body: pieces,
+            reply,
+            mark,
+            ..
+        } = *request;
+        assert!(mark.is_some(), "named as it was submitted");
+        let (mut job, _, _) = local_job(work, now, charge);
+        job.door = Door::Local(Box::new(Local {
+            body: Some(Pieces {
+                pieces,
+                ended: None,
+                dry: false,
+            }),
+            reply,
+            pending: VecDeque::new(),
+            ready: false,
+            mark,
+        }));
+        let connection = Connection {
+            submitter,
+            body,
+            answers,
+            _named: named,
+        };
+        (job, connection)
+    }
+
+    /// A get of `b/k`'s current version.
+    fn get_op() -> Op {
+        Op::Get {
+            bucket: "b".into(),
+            key: "k".into(),
+            headers: Headers::default(),
+            version: None,
+        }
+    }
+
+    /// The steps each of `turns` turns of `host` took, the door's names taken before each.
+    fn stepped(
+        host: &mut Host,
+        stub: &mut Stub,
+        doorway: &mut door::Doorway,
+        turns: usize,
+    ) -> Vec<u64> {
+        (0..turns)
+            .map(|_| {
+                host.take_marks(doorway);
+                let _ = clock_reads();
+                host.step(stub).unwrap();
+                clock_reads().1
+            })
+            .collect()
+    }
+
+    /// Steps GETs of an empty object through the S3 door whose connections have no room for their
+    /// replies: 64 gets, each reply's channel holding one answer and its connection reading none.
+    /// Each get is stepped as it asks its version and as the version comes, its head given and its
+    /// end held for want of room; then, its connection reading nothing, 32 turns pass every get by
+    /// (`Job::rests`), where every turn stepped every get; and as each connection takes the head
+    /// and names its request (`door::Submitter::wake`), its get alone is stepped, giving its end
+    /// and ending. 192 steps over 36 turns, three a get, where every turn stepped every get, 2,272,
+    /// 35 or 36 a get; and each get answered its head and end, no wake lost.
+    #[test]
+    fn an_s3_get_with_no_room_for_its_reply_is_stepped_only_as_its_connection_names_it() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        let (mut doorway, submitter) = door::doorway(64, std::task::Waker::noop().clone()).unwrap();
+        let read = scheming_gateway().charges.read(1);
+        let mut connections = Vec::new();
+        for _ in 0..64 {
+            let get = (work(get_op(), None), get_op());
+            let (job, connection) = named_job(get, now, read, (&submitter, &mut doorway), 1);
+            host.push(job, now);
+            connections.push(connection);
+        }
+        let mut stub = put_and_get_stub();
+        // Its version asked, then read: its head given, its end held for want of room.
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 2), [64, 64]);
+        // Its connection reads nothing: no get is stepped.
+        let idle = stepped(&mut host, &mut stub, &mut doorway, 32);
+        assert_eq!(idle.iter().sum::<u64>(), 0, "{idle:?}");
+        // Half the connections take the head and name their gets: those alone are stepped.
+        let mut heads = Vec::new();
+        for connection in connections.iter_mut().take(32) {
+            heads.push(connection.answers.try_recv().unwrap());
+            connection.submitter.wake();
+        }
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 1), [32]);
+        for connection in connections.iter_mut().skip(32) {
+            heads.push(connection.answers.try_recv().unwrap());
+            connection.submitter.wake();
+        }
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 1), [32]);
+        assert!(host.idle(), "every get ended");
+        assert_eq!(stub.asked, 64, "each get's one read");
+        for (head, connection) in heads.iter().zip(&mut connections) {
+            assert!(
+                matches!(head, Some(door::Answer::Head(reply)) if reply.status == Status::Done && reply.size == 0),
+                "{head:?}"
+            );
+            let rest = answered(&mut connection.answers);
+            assert_eq!(rest, [door::Answer::End]);
+        }
+    }
+
+    /// Steps puts of an empty body through the S3 door whose connections send their bodies late:
+    /// 64 puts, each told its driver wants its body (`door::Answer::Ready`) at its first turn and
+    /// finding its body's channel empty; 32 turns then pass every put by (`Job::rests`), where
+    /// every turn stepped every put waiting on its body; and as each connection sends its body's
+    /// end and names its request, each put alone is stepped, taking its end and asking its commit,
+    /// and again as its commit is answered. 192 steps over 35 turns, three a put, where every turn
+    /// stepped every put waiting on its body, 2,240, 35 a put; and each put answered `Done` with
+    /// its version, no wake lost.
+    #[test]
+    fn an_s3_put_waiting_on_its_body_is_stepped_only_as_its_connection_names_it() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        let (mut doorway, submitter) = door::doorway(64, std::task::Waker::noop().clone()).unwrap();
+        let mut connections = Vec::new();
+        for _ in 0..64 {
+            let mut putting = native_put(0);
+            putting.trailing = None;
+            let op = Op::Put {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 1,
+                length: 0,
+                headers: Headers::default(),
+                checksum: None,
+                md5: None,
+                trailing: None,
+                metadata: Vec::new(),
+            };
+            let put = (Work::Put(putting), op);
+            let (job, connection) = named_job(put, now, 7, (&submitter, &mut doorway), 4);
+            host.push(job, now);
+            connections.push(connection);
+        }
+        let mut stub = put_and_get_stub();
+        // Told its driver wants its body, which has not come.
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 1), [64]);
+        let idle = stepped(&mut host, &mut stub, &mut doorway, 32);
+        assert_eq!(idle.iter().sum::<u64>(), 0, "{idle:?}");
+        // Each connection reads `Ready`, sends the body's end and names its put.
+        let crc = checksum::checksum(Algorithm::Crc32c, &[]).unwrap();
+        for connection in &mut connections {
+            assert_eq!(
+                connection.answers.try_recv().unwrap(),
+                Some(door::Answer::Ready)
+            );
+            assert!(
+                connection
+                    .body
+                    .try_send(Piece::End(Some(crc.clone())))
+                    .is_ok()
+            );
+            connection.submitter.wake();
+        }
+        // Its end taken and its commit asked; then its commit answered, its reply given.
+        assert_eq!(stepped(&mut host, &mut stub, &mut doorway, 2), [64, 64]);
+        assert!(host.idle(), "every put ended");
+        assert_eq!(stub.asked, 64, "each put's one commit");
+        for connection in &mut connections {
+            let answers = answered(&mut connection.answers);
+            assert!(
+                matches!(answers.as_slice(), [door::Answer::Head(reply), door::Answer::End]
+                    if reply.status == Status::Done && reply.version == "v"),
+                "{answers:?}"
+            );
+        }
+    }
+
+    /// Steps GETs waiting on their own reads alone: 64 gets of an empty object, each one's version
+    /// read answered 32 turns after it is asked. Each get is stepped as it asks and as its answer
+    /// comes, its head and end given and its job let go: the 31 turns between pass it by
+    /// (`Job::rests`), whatever its door, so each get is stepped twice, 128 steps, where every turn
+    /// stepped every get, 2,112 steps, 33 a get; and each answered its head and end.
+    #[test]
+    fn a_get_waiting_on_its_reads_alone_is_stepped_only_as_they_are_answered() {
+        let now = hyper_rt::futures::now_ns();
+        let mut host = Host::new(64, Some(std::sync::Arc::new(scheming_gateway())));
+        let read = scheming_gateway().charges.read(1);
+        let mut replies = Vec::new();
+        for _ in 0..64 {
+            let (job, _, answers) = local_job(work(get_op(), None), now, read);
+            host.push(job, now);
+            replies.push(answers);
+        }
+        let mut stub = put_and_get_stub();
+        let mut held = Vec::new();
+        let _ = clock_reads();
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 64, "the gets never ended");
+            if turns == 33 {
+                stub.answers.append(&mut held);
+            }
+            host.step(&mut stub).unwrap();
+            held.append(&mut stub.answers);
+        }
+        let (_, steps) = clock_reads();
+        assert_eq!(turns, 33, "asked at the first turn, answered at the 33rd");
+        assert_eq!(stub.asked, 64, "each get's one read");
+        assert_eq!(
+            steps,
+            2 * 64,
+            "each get stepped as it asks and as it is answered"
+        );
+        for answers in &mut replies {
+            let answers = answered(answers);
+            assert!(
+                matches!(answers.as_slice(), [door::Answer::Head(reply), door::Answer::End]
+                    if reply.status == Status::Done && reply.size == 0),
+                "{answers:?}"
+            );
+        }
+    }
+
     /// A gateway of the rates and target `mantle init`'s cells state (crates/mantle/tests/support).
     fn scheming_gateway() -> GatewaySettings {
         GatewaySettings {
@@ -10018,10 +10385,12 @@ pub(super) mod tests {
                 body: Some(Pieces {
                     pieces: body,
                     ended: None,
+                    dry: false,
                 }),
                 reply,
                 pending: VecDeque::new(),
                 ready: false,
+                mark: None,
             })),
             principal: "client".into(),
             work: getting("b".into(), "k".into(), Headers::default(), None, false),
@@ -10157,6 +10526,7 @@ pub(super) mod tests {
             Pieces {
                 pieces,
                 ended: None,
+                dry: false,
             },
         )
     }
@@ -11553,10 +11923,12 @@ pub(super) mod tests {
                 body: Some(Pieces {
                     pieces,
                     ended: None,
+                    dry: false,
                 }),
                 reply,
                 pending: VecDeque::new(),
                 ready: false,
+                mark: None,
             })),
             principal: "o".into(),
             work,
@@ -11741,10 +12113,12 @@ pub(super) mod tests {
             body: Some(Pieces {
                 pieces,
                 ended: None,
+                dry: false,
             }),
             reply,
             pending: VecDeque::new(),
             ready: false,
+            mark: None,
         }));
         host.push(job, 0);
         // Three volumes, each refusing its copy of the block for want of room until the ask at

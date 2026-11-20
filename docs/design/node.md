@@ -2550,6 +2550,82 @@ version, no wake lost. A put waiting on its body is still stepped at every turn,
 copies and the other operations: their doors' events (a body's bytes, a reply's room) reach the
 host by no ask of its own, and waking each by its exchange is the next step.
 
+*As built (2026-11-20): an S3 job waiting on its connection rests, its connection naming it*
+(`crates/node/src/door.rs`, `crates/node/src/node/host.rs`). A get and a put waiting on its S3
+connection, for the body's next piece or for room in its reply, was stepped at every turn of the
+node's task, every job a turn: the listener's connection turned the node's task as it sent or took
+(`Submitter::wake`) but named no job, so the host could only look at every one. At 10,000 GETs and
+10,000 PUTs a second from up to 2,048 clients a cell, most of a job's life is spent so. A job's
+step makes progress only from these sources, so each now names the job it concerns, as epoll's
+ready list holds only the descriptors whose I/O moved (research/99 [1]) and explicit event
+delivery costs a server by its events, not by the connections it holds (research/99 [2]):
+
+| Job | What moves it | How it is woken |
+| --- | --- | --- |
+| any | an answer to one of its asks, a reply or refusal given it, `SlowDown` at its bound | `answer_job`, `reply_job` (§ above) |
+| put or get whose chunk waits for room | room offered | `offer_room` |
+| put | its renewal due | the earliest renewal kept (`renewals`) |
+| S3 put taking its body | its connection sends a piece or the end | the request's name (`door::Mark`) |
+| S3 get, or S3 last answers | its connection takes an answer, freeing room | the request's name |
+| any S3 job | its connection lets go of it, answered or broken | `door::Named`'s drop names it |
+| native job | its exchange's body or room | not named: stepped every turn, as before |
+
+- **A request is named, once until the node's task takes the name** (`door::Mark`). The listener's
+  `Submitter::submit` names each request (a `u64` count, unique for the door's life), and its
+  connection names it on each turn of the node it makes: after sending a piece of the body, after
+  taking an answer. A name already given is not given again until the node's task lets it go, so
+  the marks hold each request at most once: a bounded channel of twice the door's connections
+  (`door::doorway`), one request in flight a connection and one more whose job outlived its
+  exchange. A name with no room sets `missed`, and the node's task wakes every S3 job, as a native
+  mark with no room visits every reply (`Marks`). The connection's hold on the request
+  (`door::Named`) names it once more as the exchange ends, answered or broken, so a job waiting on
+  a connection that went is stepped and finds its door gone, not left to rest unbounded; it says
+  the connection went first (`Mark::gone`), so a job stepped before the connection's channels
+  close, as they do just after, rests on them no more and finds them closed at its next turn.
+- **The node's task takes the names before the host's step** (`Node::take_door`,
+  `Host::take_marks`): each name's job found in one probe (`Host::named`, slots by name kept with
+  the job table, one a job, as `exchanges` is), its name let go, then woken. A job's name is let go
+  before the step that serves it, so what its connection does after names it again: no event is
+  lost between the name's taking and the job's step, only stepped twice. A name given before its
+  job is pushed is let go as the job is (`take_local`), whose first turn steps it.
+- **A job rests only once its step found nothing more** (`Job::rests`): a put whose driver wants
+  its body found its door's channel empty (`Pieces::dry`, set by `take_body`) with nothing carried
+  over; a get, or a job's last answers (`Work::Answering`), found its reply's channel full
+  (`Local::pending` held); and, on either door, a get reads its version, or has no bytes to give
+  while its reads are out. This is edge-triggered epoll's discipline, waiting for an event only
+  after a read or write returned `EAGAIN` (research/99 [1]): an event that came before the step is
+  seen by it, one after names the job. A job holding a request for want of the node's room, or a
+  chunk for want of a volume's, is stepped at every turn, as nothing names it when room frees.
+
+- **A turn's answers are taken for the jobs they are for** (`Host::step`): each answered ask's job
+  found by its slot (`asks`), each once, where every job's asks were looked up in the node's
+  answers at every turn, a probe for each ask in flight.
+
+Bound: the names a turn takes are at most the marks' room; the host's slots by name, one a job,
+are bounded by its job table, and a name whose job ended finds none and is dropped. The answered
+jobs a turn takes are at most the asks answered, in a vector kept from turn to turn.
+
+Tested (`node::host`, `door`): 64 S3 gets of an empty object, each reply's channel one answer and
+its connection reading none, are stepped as they ask their version and as it comes (64 and 64),
+then not at all for 32 turns, where every turn stepped every get (2,048 steps in those 32 turns,
+measured with the old rule), then 32 and 32 as half the connections and then the rest take the
+head and name their gets: 192 steps over 36 turns where every turn stepped every get, 2,272; each
+answered its head and end. 64 S3 puts whose bodies come 32 turns late are stepped as they are told
+`Ready` (64), not at all for 32 turns (2,048 steps with the old rule), then as each connection
+sends the end and names its put (64) and as each commit is answered (64): 192 steps over 35 turns,
+where every turn stepped every put waiting on its body, 2,240; each answered `Done`. 64 gets whose
+version read is answered 32 turns after it is asked are stepped twice each, 128 steps, where every
+turn stepped every get, 2,112. A connection names its request once until the name is let go, again
+as it lets go of the request, and a name past the marks' room is missed and read once.
+
+Open: a native job's door events name its exchange to the node's task (`Native::mark`), not its
+job to the host, so native jobs waiting on their exchange, and every job on a driving shard
+(woken by its shard's `Notify`, which names nothing), are stepped at every turn; so are commands,
+bucket and admin operations, single reads, batch deletes, completions and copies. And each turn
+still walks every job for its cheap checks: whether any waits for room (`offer_room`), its bound
+and vouch (`bound_jobs`), and its resting flag and keys (`Host::step`'s pass-by, `rekey`), where
+the earliest-deadline heap (`beats`) could find the few due and a ready set the few woken.
+
 *As built (2026-11-18), the stall fixes in step 6's shape* (upload-stall merged, `crates/node/src/node/host.rs`).
 The node's task reads every native body, so it reads them as upload-stall's job did, never into a
 piece of the endpoint's budget: a job's fields straight into their buffer, made at their length as

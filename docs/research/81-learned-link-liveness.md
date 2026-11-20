@@ -217,8 +217,14 @@ heartbeats' schedule, so that "the detection time is bounded and the bound does 
 behavior of message delays and losses", `T_D ≤ δ + η` [11 Thm. 5]; configure `η` and `δ` from the
 loss and the delay's mean and variance alone through the one-sided inequality [11 §5.1, Thm. 9];
 estimate the expected arrival from the `n` most recent heartbeats where clocks are not synchronized
-(NFD-E) [11 §6.3]; and adapt by "periodically reexecuting the configuration" [11 §8.1.1]. They note
-where the model ends: bursts longer than the sending period break the heartbeats' independence, and
+(NFD-E) [11 §6.3]; give the margin all that a bound on detection leaves past the interval, in
+the procedure that configures NFD-E too ("the configuration procedure for NFD-U can also be used
+to configure NFD-E" [11 §6.3]), whose last step is "Set α = T_D^u − η and output η and α", where
+without synchronized clocks the bound is relative to the mean delay, `T_D ≤ T_D^u + E(D)` (6.1),
+since "an absolute bound T_D^U on detection time cannot be enforced by any nontrivial failure
+detector" [11 §6.2, pp. 571–572; read 2026-11-20, its Greek letters lost to the text extraction
+and restored from the procedure's own names]; and adapt by "periodically reexecuting the
+configuration" [11 §8.1.1]. They note where the model ends: bursts longer than the sending period break the heartbeats' independence, and
 then one needs "a short-term component" and "a long-term component", taking "the most conservative
 one" [11 §8.1.2]. Bertier, Marin and Sens combine Chen's estimate "with a dynamic estimation based
 on Jacobson's estimation of the round-trip time", a detector with "no tuning parameter" that
@@ -652,7 +658,8 @@ https://cs.nyu.edu/~apanda/classes/sp25/papers/chandra-toueg.pdf, §1, §9.1, Fi
 [11] W. Chen, S. Toueg and M. K. Aguilera, "On the Quality of Service of Failure Detectors", IEEE
 Transactions on Computers 51(5), May 2002, pp. 561–580, read from
 https://www.microsoft.com/en-us/research/wp-content/uploads/2002/05/ieeetc02_fdqos.pdf, §1.2.1,
-§1.2.2, §3.1, Theorem 5, §5.1, Theorem 9, §6.3, §8.1.1, §8.1.2.
+§1.2.2, §3.1, Theorem 5, §5.1, Theorem 9, §6.2 (pp. 571–572, read 2026-11-20), §6.3, §8.1.1,
+§8.1.2.
 
 [12] M. Bertier, O. Marin and P. Sens, "Implementation and Performance Evaluation of an Adaptable
 Failure Detector", Proc. DSN 2002, pp. 354–363. Not read: HAL's copy (hal-01544787) refused

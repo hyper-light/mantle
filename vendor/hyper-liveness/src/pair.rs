@@ -148,6 +148,9 @@ pub(crate) struct Context<'a> {
     /// The node judges each peer's process apart from its disk (`Liveness::set_disk_apart`): a
     /// heartbeat is taken whether or not a flush proves it.
     pub(crate) apart: bool,
+    /// The longest a live peer may go silent, past which the owner takes it for failed
+    /// (`Liveness::set_silence`): the most a premature suspicion's renewal lengthens a margin to.
+    pub(crate) silence: Option<Duration>,
 }
 
 /// What a heartbeat taken did, for the node.
@@ -1235,7 +1238,13 @@ impl Pair {
                 self.pool_margin(evidence, true, granularity, context.exposure.mtbf());
             }
         } else if let Some(suspected) = suspected_by {
-            self.premature_configured(suspected, lateness, granularity, context.exposure.mtbf());
+            self.premature_configured(
+                suspected,
+                lateness,
+                granularity,
+                context.exposure.mtbf(),
+                context.silence,
+            );
         }
         // Its lateness feeds the node's pool as any heartbeat's does: a node alone in its mode has
         // no other evidence, and the node's evidence is never narrower than its widest configured
@@ -1507,16 +1516,27 @@ impl Pair {
     /// T_E)/MTBF`, so no margin past `MTBF − (E(D) + η + T_E)` is imposed, and a lengthening past
     /// what promises anything leaves the margin in force. Chandra and Toueg's time-out grows
     /// unbounded where the premature time-outs never stop; this margin stops at the ceiling, and a
-    /// peer whose stalls pass it for good is suspected at each. The configuration's `current`
-    /// states the margin renewed, the detector judging the peer. Two configurator evaluations for
-    /// each premature suspicion, at most one a heartbeat taken; nothing allocated. mantle:
-    /// vendor/UPSTREAM.md.
+    /// peer whose stalls pass it for good is suspected at each.
+    ///
+    /// Where the owner states the longest a live peer may go silent (`Liveness::set_silence`),
+    /// the renewal is capped below the ceiling at that `silence` less the interval, Chen et al.'s
+    /// `α = T_D^u − η` (IEEE TC 2002, §6.2 Step 3, p. 572; research/81 [11]), so a crash is
+    /// suspected within the silence the owner already lets a peer keep: a partition of 30 s that
+    /// heals lengthened the margin past 30 s, the MTBF's ceiling hours away, and every crash of
+    /// the peer went unsuspected that long until the latenesses doubled. A renewal past the cap
+    /// renews to it where the lateness was within it, the longest margin the bound leaves; a
+    /// lateness past the cap renews nothing, the margin staying, since the owner takes a peer that
+    /// silent for failed whatever the stream says, and no margin within the cap would have spared
+    /// that suspicion. The configuration's `current` states the margin renewed, the detector
+    /// judging the peer. Two configurator evaluations for each premature suspicion, three where
+    /// the cap binds, at most one a heartbeat taken; nothing allocated. mantle: vendor/UPSTREAM.md.
     fn premature_configured(
         &mut self,
         suspected: Duration,
         lateness: Option<i64>,
         granularity: Duration,
         mtbf: Option<Duration>,
+        silence: Option<Duration>,
     ) {
         let (Some(election), Some(mtbf), Some(configured)) =
             (self.election, mtbf, self.received.configuration)
@@ -1526,12 +1546,24 @@ impl Pair {
         let Some(link) = self.received.link.as_mut() else {
             return;
         };
+        let interval = link.estimator.next_interval();
+        // The longest margin the owner's bound on a live peer's silence leaves: a crashed peer is
+        // suspected an interval and the margin past its last heartbeat, within the bound.
+        let cap = silence.map(|silence| silence.saturating_sub(interval));
+        let late = lateness
+            .and_then(|late| u64::try_from(late).ok())
+            .map(Duration::from_nanos);
+        // Late past it, the peer was suspected where its owner takes it for failed anyway: no
+        // margin within the bound would have spared the suspicion, and one past it would slow a
+        // crash's detection past what the owner lets a silent peer be. The margin stays.
+        if late.zip(cap).is_some_and(|(late, cap)| late > cap) {
+            return;
+        }
         let costs = Costs { election, mtbf };
         let as_configured = link.estimator.arrivals().ok().or(Some(configured.link));
         let Some(behaviour) = wider(as_configured, link.estimator.arrivals_seen()) else {
             return;
         };
-        let interval = link.estimator.next_interval();
         let promises = |detector: &Detector| detector.unavailability < 1.0;
         let found = arrival_detector_at(&behaviour, &costs, granularity, interval).filter(promises);
         // RFC 6298's bound past the lateness, `max(G, K·σ)`, where that is longer than the
@@ -1539,13 +1571,22 @@ impl Pair {
         let slack = u32::try_from(TAIL_VARIATION_MULTIPLIER)
             .map_or(Duration::MAX, |k| behaviour.deviation.saturating_mul(k))
             .max(granularity);
-        let renewed = lateness
-            .and_then(|late| u64::try_from(late).ok())
-            .map(|late| Duration::from_nanos(late).saturating_add(slack))
+        let renewed = late
+            .map(|late| late.saturating_add(slack))
             .filter(|past| found.is_none_or(|found| *past > found.margin))
             .and_then(|past| arrival_detector_with(&behaviour, &costs, granularity, interval, past))
             .filter(promises)
             .or(found);
+        // A stall within the bound whose renewal would pass it renews to the bound: the longest
+        // margin it leaves, as Chen et al.'s configuration of NFD-E sets `α = T_D^u − η`, all that
+        // its bound on detection leaves past the interval (IEEE TC 2002, §6.2 Step 3, p. 572).
+        let renewed = match (renewed, cap) {
+            (Some(past), Some(cap)) if past.margin > cap => {
+                arrival_detector_with(&behaviour, &costs, granularity, interval, cap)
+                    .filter(promises)
+            }
+            (renewed, _) => renewed,
+        };
         if let Some(renewed) = renewed.filter(|renewed| renewed.margin > suspected) {
             link.estimator.impose(renewed.margin);
             self.received.configuration = Some(Configuration {
@@ -1841,6 +1882,7 @@ mod tests {
             evidence: None,
             local: steady(),
             apart: false,
+            silence: None,
         };
         let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
         let arrival = until + MS;
@@ -1878,6 +1920,7 @@ mod tests {
             evidence: None,
             local: steady(),
             apart: false,
+            silence: None,
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -1927,6 +1970,7 @@ mod tests {
             evidence: None,
             local: steady(),
             apart: false,
+            silence: None,
         };
         let us = 1_000;
         let now = 10 * MS;
@@ -2068,6 +2112,7 @@ mod tests {
             evidence: None,
             local: steady(),
             apart: false,
+            silence: None,
         };
         let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
         let heard = last_due + 10_000;
@@ -2178,6 +2223,7 @@ mod tests {
             evidence: None,
             local: steady(),
             apart: false,
+            silence: None,
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -2235,6 +2281,7 @@ mod tests {
             evidence: None,
             local: steady(),
             apart: false,
+            silence: None,
         };
         let mut pair = pair();
         pair.election = Some(Duration::from_secs(1));
@@ -2290,6 +2337,7 @@ mod tests {
             evidence: Some(&evidence),
             local: steady(),
             apart: false,
+            silence: None,
         };
         let mut pair = pair();
         let take = |pair: &mut Pair, seq: u64, arrival: u64| {
@@ -2386,6 +2434,7 @@ mod tests {
             evidence: None,
             local: steady(),
             apart: false,
+            silence: None,
         };
         let mut pair = pair();
         let take = |pair: &mut Pair, seq: u64, arrival: u64| {
@@ -2480,5 +2529,122 @@ mod tests {
         let current = pair.configuration().unwrap().current;
         assert_eq!(current.margin, before);
         assert!(current.unavailability < 1.0, "{current:?}");
+    }
+
+    /// A link calibrated at a small margin, its peer cut off for 30 s and heard again: the
+    /// heartbeat that ends the suspicion is late past the longest a live peer may go silent
+    /// (`Liveness::set_silence`; mantle's transport's idle timeout, 3.072 s), where its owner
+    /// takes a silent peer for failed anyway, so the margin stays and a crash afterwards is
+    /// suspected within that bound and an interval. A stall within the bound whose renewal would
+    /// pass it renews to the bound less the interval, past the stall. Without the bound the
+    /// partition lengthened the margin past 30 s, an MTBF of 20 h leaving its ceiling far past it,
+    /// and a crash went unsuspected for as long.
+    #[test]
+    fn a_premature_suspicion_never_lengthens_a_configured_margin_past_its_owners_silence() {
+        // Ten hours of node time watched and no failure: an MTBF of 20 h.
+        let mut exposure = Exposure::new();
+        exposure.on_exposure(Duration::from_secs(36_000));
+        let granularity = Duration::from_micros(50);
+        let silence = Duration::from_millis(3_072);
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+            local: steady(),
+            apart: false,
+            silence: Some(silence),
+        };
+        let take = |pair: &mut Pair, seq: u64, arrival: u64| {
+            let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
+            pair.take(
+                2,
+                &beat(7, seq),
+                arrival,
+                &context,
+                &mut changes,
+                &mut taken,
+            )
+            .unwrap();
+            changes
+        };
+        let link = |pair: &Pair| pair.received.link.as_ref().unwrap().estimator.clone();
+        let margin = |pair: &Pair| link(pair).margin().unwrap();
+        let late = |pair: &Pair| {
+            Duration::from_nanos(u64::try_from(link(pair).latest_lateness().unwrap()).unwrap())
+        };
+        // Heartbeats at 10 ms, each up to a millisecond late (a xorshift stream, Marsaglia 2003);
+        // the slot of the last taken returned.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % MS
+        };
+        let mut on_schedule = |pair: &mut Pair, seq: &mut u64, count: u64| {
+            for _ in 0..count {
+                let arrival = *seq * 10 * MS + noise();
+                assert_eq!(take(pair, *seq, arrival), [None, None, None, None]);
+                *seq += 1;
+            }
+            (*seq - 1) * 10 * MS
+        };
+        // Two links, each calibrated by its own configuration over 300 heartbeats at least, at a
+        // margin a tenth of the bound or less (107.5 ms here).
+        let (mut cut, mut cut_seq, mut held, mut held_seq) = (pair(), 0, pair(), 0);
+        for (pair, seq) in [(&mut cut, &mut cut_seq), (&mut held, &mut held_seq)] {
+            while *seq < 300 || pair.configuration().is_none() {
+                on_schedule(pair, seq, 1);
+            }
+            assert!(margin(pair) <= silence / 10, "{:?}", margin(pair));
+        }
+        // The peer stalls `slots` heartbeats and sends at its slot.
+        let stall = |pair: &mut Pair, seq: &mut u64, slots: u64| {
+            *seq += slots;
+            let changes = take(pair, *seq, *seq * 10 * MS);
+            *seq += 1;
+            changes
+        };
+        // Cut off for 30 s: suspected, and trusted again at the heartbeat that ends the cut, late
+        // past the bound. The margin stays as calibrated.
+        let (calibrated, configurations) = (margin(&cut), cut.counts.configurations);
+        let changes = stall(&mut cut, &mut cut_seq, 2_999);
+        assert!(
+            matches!(changes[0], Some(Change::Suspected(_))),
+            "{changes:?}"
+        );
+        assert!(matches!(changes[2], Some(Change::Trusted { .. })));
+        assert!(late(&cut) > silence, "{:?}", late(&cut));
+        assert_eq!(margin(&cut), calibrated);
+        assert_eq!(cut.configuration().unwrap().current.margin, calibrated);
+        assert_eq!(cut.counts.configurations, configurations);
+        // Five heartbeats on schedule, then the peer crashes: suspected within the bound and an
+        // interval of its last heartbeat.
+        let last = on_schedule(&mut cut, &mut cut_seq, 5);
+        let within = last + nanos(silence) + 10 * MS;
+        let point = cut.deadline(&steady(), last).unwrap();
+        assert!(point <= within, "{point} past {within}");
+        assert!(matches!(
+            cut.judge(2, within, &steady()).0,
+            Some(Change::Suspected(_))
+        ));
+        // Held 3 s, within the bound: its renewal past the lateness by `max(G, 4σ)` passes the
+        // bound, so the margin is renewed to the bound less the interval, past the stall.
+        let configurations = held.counts.configurations;
+        let changes = stall(&mut held, &mut held_seq, 299);
+        assert!(
+            matches!(changes[0], Some(Change::Suspected(_))),
+            "{changes:?}"
+        );
+        assert!(matches!(changes[2], Some(Change::Trusted { .. })));
+        let (stalled, interval) = (late(&held), link(&held).next_interval());
+        assert!(stalled < silence - interval, "{stalled:?}");
+        let renewed = margin(&held);
+        assert!(
+            renewed > stalled && renewed <= silence - interval,
+            "{stalled:?} renewed to {renewed:?}"
+        );
+        assert_eq!(held.configuration().unwrap().current.margin, renewed);
+        assert_eq!(held.counts.configurations, configurations);
     }
 }

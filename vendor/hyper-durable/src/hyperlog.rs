@@ -456,6 +456,15 @@ impl<F: BlockFile + 'static> GroupStore<F> {
         Ok(self.group.term(index).is_ok_and(|held| held == term))
     }
 
+    /// Whether a refusal waits for the caller: a write not yet taken by [`LogStore::poll`] was
+    /// refused, the log's refusal of one of its parts or the store's own. The handle took it, and
+    /// writes it sends from then on are of its next epoch, which the log lays (`GroupLog`), while
+    /// the caller, which hears of the refusal only once every part of the write is answered,
+    /// still counts what it submits as sent behind it (mantle docs/design/raft-log.md §3).
+    fn refusing(&self) -> bool {
+        self.writes.iter().any(|w| w.outcome.is_err())
+    }
+
     /// Sends the parts waiting while the handle has room.
     fn send_queued(&mut self) {
         while self.group.has_room() {
@@ -829,11 +838,32 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         Ok(view.map_or(0, |view| view.released))
     }
 
+    /// None while a refusal waits for the caller (`GroupStore::refusing`): a write submitted
+    /// then is refused with it, so a `Ready` taken then would only be made again.
     fn room(&self) -> bool {
-        self.queued.is_empty() && self.group.has_room()
+        self.queued.is_empty() && self.group.has_room() && !self.refusing()
     }
 
     fn submit(&mut self, write: &Write<'_>, waker: &Waker) -> Result<(), Fault> {
+        match &self.waker {
+            Some(held) if held.will_wake(waker) => {}
+            _ => self.waker = Some(waker.clone()),
+        }
+        if self.refusing() {
+            // Sent now, its parts would go in the handle's epoch after the refusal, which the log
+            // takes, behind the refused write's parts still out, which it refuses `Behind`: laid
+            // past what the refused write held, its entries would leave a gap (`Invalid`, which
+            // fences a replica). Refused here instead, unsent, as the log refuses what a handle
+            // sent before it took a refusal, and answered after the refused write. Refused before
+            // it is split, it holds no part.
+            self.writes.push_back(Parts {
+                total: 0,
+                sent: 0,
+                answered: 0,
+                outcome: Err(Fault::Behind),
+            });
+            return Ok(());
+        }
         let update = update_of(write)?;
         let parts = self.group.parts(update).map_err(|e| fault(&e))?;
         self.writes.push_back(Parts {
@@ -843,10 +873,6 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
             outcome: Ok(()),
         });
         self.queued.extend(parts);
-        match &self.waker {
-            Some(held) if held.will_wake(waker) => {}
-            _ => self.waker = Some(waker.clone()),
-        }
         self.send_queued();
         Ok(())
     }

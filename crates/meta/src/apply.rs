@@ -4,7 +4,7 @@
 
 use crate::engine::{EngineError, Rows};
 use crate::error::{MetaError, reserved};
-use crate::overlay::Overlay;
+use crate::overlay::{Overlay, Writes};
 use crate::session::{self, Check, Rules, Touched, Watermark};
 use crate::wire::{Answer, Command, Entry};
 use crate::{block, bucket, file, name, root};
@@ -20,6 +20,16 @@ pub enum Layer {
     Root,
 }
 
+/// The storage a range's entries are applied in, kept from one entry to the next: the entry's
+/// writes and a command's, each emptied as it is taken, keeping its capacity within its bound
+/// ([`Writes`]), so applying an entry allocates nothing for the overlays once one as large has
+/// been applied.
+#[derive(Debug, Default)]
+pub struct Kept {
+    entry: Writes,
+    command: Writes,
+}
+
 /// Applies entry `index` to rows for which the caller keeps no [`Watermark`], as a benchmark or
 /// a test does: its expiry reads the order of last use. A replica keeps one
 /// ([`apply_entry_with`]).
@@ -30,13 +40,16 @@ pub fn apply_entry<R: Rows>(
     layer: Layer,
     rules: &Rules,
 ) -> Result<Vec<Answer>, MetaError> {
-    apply_entry_with(rows, index, entry, layer, rules, &mut Watermark::default())
+    let mut kept = Kept::default();
+    let mut known = Watermark::default();
+    apply_entry_with(rows, index, entry, layer, rules, &mut known, &mut kept)
 }
 
 /// Applies entry `index` to the range's rows and answers its commands in order, `watermark`
-/// being what the range knows of its sessions' last use, which the entry moves on. An error
-/// means the entry breaks the state machine, and the replica stops; it leaves `watermark`
-/// knowing nothing, since the rows stay as they were whatever the entry's scan read.
+/// being what the range knows of its sessions' last use, which the entry moves on, and `kept`
+/// the storage its writes are buffered in. An error means the entry breaks the state machine,
+/// and the replica stops; it leaves `watermark` knowing nothing, since the rows stay as they
+/// were whatever the entry's scan read.
 pub fn apply_entry_with<R: Rows>(
     rows: &mut R,
     index: u64,
@@ -44,10 +57,16 @@ pub fn apply_entry_with<R: Rows>(
     layer: Layer,
     rules: &Rules,
     watermark: &mut Watermark,
+    kept: &mut Kept,
 ) -> Result<Vec<Answer>, MetaError> {
     let mut known = std::mem::take(watermark);
+    let Kept {
+        entry: entry_writes,
+        command: command_writes,
+    } = kept;
     let (answers, writes) = {
-        let mut overlay = Overlay::new(&mut *rows, (rules.max_key_bytes, rules.max_value_bytes));
+        let bound = (rules.max_key_bytes, rules.max_value_bytes);
+        let mut overlay = Overlay::new(&mut *rows, bound, entry_writes);
         session::expire(&mut overlay, index, entry.at_ns, rules, &mut known)?;
         let mut touched = Touched::default();
         let mut answers = reserved(entry.commands.len())?;
@@ -88,8 +107,7 @@ pub fn apply_entry_with<R: Rows>(
                         // The command runs over the entry's writes so far, and its own take effect
                         // only if its session keeps its answer: refused for room, it applied
                         // nothing, and a copy of it later is its first application.
-                        let bound = (rules.max_key_bytes, rules.max_value_bytes);
-                        let mut own = Overlay::new(&mut overlay, bound);
+                        let mut own = Overlay::new(&mut overlay, bound, &mut *command_writes);
                         let answer = match run(&mut own, index, command, layer) {
                             // A row past what every member's engine holds whole: the command is
                             // refused whole, each layer writing its command's batch at once,
@@ -99,10 +117,9 @@ pub fn apply_entry_with<R: Rows>(
                             }
                             ran => ran?,
                         };
-                        let writes = own.take();
                         let encoded = answer.encode()?;
                         if touched.fits(c, encoded.len(), rules) {
-                            overlay.absorb(writes);
+                            overlay.absorb(command_writes)?;
                             touched.keep(c, encoded);
                             answer
                         } else {
@@ -115,7 +132,7 @@ pub fn apply_entry_with<R: Rows>(
             answers.push(answer);
         }
         touched.write(&mut overlay, index)?;
-        (answers, overlay.into_writes())
+        (answers, overlay.into_writes()?)
     };
     known.wrote(&writes);
     rows.apply(index, writes)?;
@@ -620,9 +637,10 @@ mod tests {
                 .unwrap()
                 .map(|b| Session::decode(&b).unwrap())
         };
+        let (mut entry_writes, mut command_writes) = (Writes::default(), Writes::default());
         let (answers, writes) = {
             let bound = (rules.max_key_bytes, rules.max_value_bytes);
-            let mut overlay = Overlay::new(&mut *rows, bound);
+            let mut overlay = Overlay::new(&mut *rows, bound, &mut entry_writes);
             session::expire(
                 &mut overlay,
                 index,
@@ -679,14 +697,15 @@ mod tests {
                                 (Answer::AnswersFull, None)
                             }
                             Check::New => {
-                                let mut own = Overlay::new(&mut overlay, bound);
+                                let mut own =
+                                    Overlay::new(&mut overlay, bound, &mut command_writes);
                                 let answer = match run(&mut own, index, command, layer) {
                                     Err(MetaError::Engine(EngineError::RowTooLarge { .. })) => {
                                         Answer::RowTooLarge
                                     }
                                     ran => ran.unwrap(),
                                 };
-                                let writes = own.into_writes();
+                                let writes = own.into_writes().unwrap();
                                 let mut s = read(&mut overlay, c.session).unwrap();
                                 s.low = s.low.max(c.unanswered);
                                 s.answers.retain(|(kept, _)| *kept >= s.low);
@@ -717,7 +736,7 @@ mod tests {
                 };
                 answers.push(answer);
             }
-            (answers, overlay.into_writes())
+            (answers, overlay.into_writes().unwrap())
         };
         rows.apply(index, writes).unwrap();
         answers
@@ -752,6 +771,7 @@ mod tests {
             rng % n
         };
         let (mut held, mut each) = (name_range(), name_range());
+        let mut storage = Kept::default();
         // Each session registered, with the highest serial its gateway has sent.
         let mut sessions: Vec<(u64, u64)> = Vec::new();
         // Answers seen: repeated, refused for an unknown session, run, refused for a row, and
@@ -811,7 +831,17 @@ mod tests {
                 })
                 .collect();
             let e = entry(at_ns, commands);
-            let a = apply_entry(&mut held, index, &e, Layer::Name, &rules).unwrap();
+            // The storage kept from entry to entry, as a range keeps it.
+            let a = apply_entry_with(
+                &mut held,
+                index,
+                &e,
+                Layer::Name,
+                &rules,
+                &mut Watermark::default(),
+                &mut storage,
+            )
+            .unwrap();
             let b = apply_per_command(&mut each, index, &e, Layer::Name, &rules);
             assert_eq!(a, b, "entry {index}");
             assert_eq!(all(&mut held), all(&mut each), "entry {index}");
@@ -914,7 +944,17 @@ mod tests {
     /// range's sessions, so scans the order of last use, as every entry did before the watermark.
     fn scanning(rows: &mut Counted, index: u64, entry: &Entry, rules: &Rules) -> Vec<Answer> {
         let mut nothing_known = Watermark::default();
-        apply_entry_with(rows, index, entry, Layer::Name, rules, &mut nothing_known).unwrap()
+        let mut fresh = Kept::default();
+        apply_entry_with(
+            rows,
+            index,
+            entry,
+            Layer::Name,
+            rules,
+            &mut nothing_known,
+            &mut fresh,
+        )
+        .unwrap()
     }
 
     /// An entry at a time the watermark shows no session's lifetime has passed scans nothing to
@@ -929,10 +969,18 @@ mod tests {
         };
         let (mut kept, mut before) = (Counted::of(name_range()), Counted::of(name_range()));
         let mut watermark = Watermark::default();
+        let mut storage = Kept::default();
         let mut run = |index, e: Entry| {
             (kept.scans, before.scans) = (0, 0);
-            let answers =
-                apply_entry_with(&mut kept, index, &e, Layer::Name, &rules, &mut watermark);
+            let answers = apply_entry_with(
+                &mut kept,
+                index,
+                &e,
+                Layer::Name,
+                &rules,
+                &mut watermark,
+                &mut storage,
+            );
             assert_eq!(
                 answers.as_ref().ok(),
                 Some(&scanning(&mut before, index, &e, &rules))
@@ -1008,6 +1056,8 @@ mod tests {
             };
             let (mut kept, mut each) = (Counted::of(name_range()), Counted::of(name_range()));
             let mut watermark = Watermark::default();
+            // Kept from entry to entry, as a range keeps it; the reference's is fresh at each.
+            let mut storage = Kept::default();
             // Each session registered, with the highest serial its gateway has sent.
             let mut sessions: Vec<(u64, u64)> = Vec::new();
             // Each owner's last registration's place in its run.
@@ -1059,9 +1109,16 @@ mod tests {
                     .collect();
                 let e = entry(at_ns, commands);
                 (kept.scans, each.scans) = (0, 0);
-                let answers =
-                    apply_entry_with(&mut kept, index, &e, Layer::Name, &rules, &mut watermark)
-                        .unwrap();
+                let answers = apply_entry_with(
+                    &mut kept,
+                    index,
+                    &e,
+                    Layer::Name,
+                    &rules,
+                    &mut watermark,
+                    &mut storage,
+                )
+                .unwrap();
                 let reference = scanning(&mut each, index, &e, &rules);
                 let at = (lifetime_ns, index);
                 assert_eq!(answers, reference, "{at:?}");

@@ -112,14 +112,40 @@ repeated snapshots.
   that stalls the group's writes once full, and a stalled replica takes no message, so neither the
   install nor its answer can arrive while it stands: a hold kept through a stall would hold the
   compaction the stall waits for, for good. The bound is the group's room: the stall lets the hold
-  go, and the compaction ends the stall as it would with no image; the log is shared by a node's
-  ranges, so the node's compaction pass for room, run when any range on it is stalled, lets every
-  range's hold go. Up to it the hold costs nothing beyond the entries a group may hold anyway.
+  go, and the compaction ends the stall as it would with no image. The log is shared by a node's
+  ranges, and the node's compaction pass for room, run when any range on it is stalled, keeps
+  another range's hold while the pass frees room otherwise, and lets each hold that keeps back a
+  compaction go, compacting again, only when no other compaction started (2026-11-20, below). Up
+  to it the hold costs nothing beyond the entries a group may hold anyway.
 - **A snapshot its start passed** is not sent ([TIKV]'s cancel): one queued while stalled is dropped
   as it leaves and reported failed, and the core asks again.
-- **Open.** A group whose writes fill its room within one image's making and transfer still stalls
-  before the member installs, and the stall lets the hold go: such a member is still sent image
-  after image. mantle's node compacts only in its pass for room, which lets every hold go, so there
-  the hold changes nothing yet. Closing it needs the stalled leader to send the snapshot and take
-  the member's answer while it waits for room, and the node to pass again for room when a hold is
-  let go (docs/design/replica.md §7).
+- **Open.** A group whose own writes fill its room within one image's making and transfer still
+  stalls before the member installs, and the stall lets the hold go: such a member is still sent
+  image after image (§7).
+
+## 7. A stalled leader's sends and answers (Analysis, 2026-11-20)
+
+Whether a leader stalled for room could send the snapshot and take its member's answer, so that a
+hold could be kept through the stall:
+
+- **Sending is sound.** The core lets a leader's queued messages leave while the term and vote it
+  leads in are durable, whatever its writes out (hyper-raft `src/node.rs`, I1 and I2,
+  `RawNode::releases_now`): what a leader sends, its members persist for themselves ([DISS]
+  §10.2.1, "Writing to the leader's disk in parallel"; raft-rs gives a leader's messages in
+  `Ready::messages`, sent before the `Ready`'s write, and a follower's in
+  `Ready::persisted_messages`). A snapshot is of applied, so committed, state and depends on no
+  refused write.
+- **Hearing is sound.** An answer moves the member's progress, which is volatile, and may move the
+  commit, which counts the leader only through its durable writes (I3; [DISS] §10.2.1: "The
+  leader may even commit an entry before it has been written to its own disk, if a majority of
+  followers have written it to their disks; this is still safe", research/06 A1.2).
+- **It saves no image alone.** A group stalled on its own room is full of the entries after the
+  image's point; its stall ends only once a compaction frees them, and those are what the member
+  that installed the image needs next. Kept through the stall, the hold must also let the member
+  be sent those entries and acknowledge them while the leader stays stalled: the stalled leader
+  takes part in replication, which hyper-durable's stall rule refuses (docs/durable.md §2.4) and
+  whose interplay with the refused writes made again (R-4, I7) needs its own proof. Not built.
+- **The node's pass** (built): one log holds every range's entries, so a range stalled on the
+  log's room is served by any range's compaction. The pass keeps a hold while other compactions
+  free room, as [TIKV] keeps its log behind the least match until a size bound, the bound here the
+  pass that finds no other room.

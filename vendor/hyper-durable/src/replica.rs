@@ -407,9 +407,9 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// is behind. A member that installs it is sent what follows from the log, not a second image
     /// (CockroachDB's raft log queue, its pending snapshot index; mantle
     /// docs/research/100-holding-the-log-for-an-image.md). Let go when every other member holds
-    /// it, at a transfer reported failed, at the lead's loss, and at a stall, on this group or,
-    /// at its owner's word, another on the same log: its bound is the log's room
-    /// ([`Replica::hold_for_image`], [`Replica::let_go_of_image`]).
+    /// it, at a transfer reported failed, at the lead's loss, at a stall of this group, and at its
+    /// owner's word, when its pass for room can free the log's room no other way: its bound is the
+    /// log's room ([`Replica::hold_for_image`], [`Replica::let_go_of_image`]).
     held_for_image: Option<u64>,
     /// The entries to keep of a compaction that waits on the state machine's checkpoint out
     /// ([`StateMachine::persist`] answered false): each drive asks the machine again, and the
@@ -3048,10 +3048,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// Lets go of the log's hold for an image ([`Replica::held_for_image`]) at its owner's word:
-    /// another group on the same log is stalled for room, which this group's compaction may free.
-    /// The hold's bound is the log's room, the group's own and what every group on the log
-    /// shares, so a stall anywhere on it lets every hold go and no stalled group waits on
-    /// another's hold.
+    /// another group on the same log is stalled for room that only this group's compaction past
+    /// the hold can free. The hold's bound is the log's room, the group's own and what every group
+    /// on the log shares, so an owner whose pass for room frees nothing else lets every hold that
+    /// keeps back a compaction go and compacts again (mantle-node's `compact`), and no stalled
+    /// group waits on another's hold past that pass.
     pub fn let_go_of_image(&mut self) {
         self.held_for_image = None;
     }

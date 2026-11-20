@@ -1,7 +1,8 @@
 //! The store's runs handed to the device's issuer (`Store::attach`), on a real file whose writes
 //! are held at a gate until the test opens it: a run submitted returns before its write lands,
 //! and a read of its pages waits for it and reads exactly what was written; a checkpoint
-//! answers every run before its flush, so a page written before it reads back after.
+//! answers every run before its flush, so a page written before it reads back after. A read held
+//! on its worker past its span's or cursor's give-back lands late in its own buffer alone.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,6 +18,7 @@ mod file_outcome;
 use file_outcome::finished_file;
 
 use std::future::{Future, poll_fn};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 
@@ -49,6 +51,45 @@ struct Gate {
     reject_reads: AtomicBool,
     reject_writes: AtomicBool,
     reject_sync: AtomicBool,
+    /// The next read to enter is held, alone, until `release`; it then lands late, `SCRIBBLE`
+    /// in every byte of the buffer it was handed, and says so in `landed_late`. Where that buffer
+    /// lies, as `held` says it entered.
+    hold_one: AtomicBool,
+    held: AtomicBool,
+    release: AtomicBool,
+    landed_late: AtomicBool,
+    held_at: AtomicUsize,
+    held_len: AtomicUsize,
+    /// While `watch` is set, every buffer a read or write is handed: its address and length.
+    watch: AtomicBool,
+    seen: Mutex<Vec<(usize, usize)>>,
+}
+
+/// What the held read lands late, a byte no page the tests write holds whole.
+const SCRIBBLE: u8 = 0xA5;
+
+impl Gate {
+    fn note(&self, buf: &[u8]) {
+        if self.watch.load(Ordering::SeqCst) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((buf.as_ptr().addr(), buf.len()));
+        }
+    }
+
+    /// The buffers watched that share a byte with the held read's.
+    fn overlapping_held(&self) -> Vec<(usize, usize)> {
+        let start = self.held_at.load(Ordering::SeqCst);
+        let end = start + self.held_len.load(Ordering::SeqCst);
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&(at, len)| len > 0 && at < end && start < at + len)
+            .collect()
+    }
 }
 
 /// A file whose writes wait at the gate while it is shut.
@@ -67,6 +108,20 @@ impl BlockFile for Gated {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+        self.gate.note(buf);
+        if self.gate.hold_one.swap(false, Ordering::SeqCst) {
+            self.gate
+                .held_at
+                .store(buf.as_ptr().addr(), Ordering::SeqCst);
+            self.gate.held_len.store(buf.len(), Ordering::SeqCst);
+            self.gate.held.store(true, Ordering::SeqCst);
+            while !self.gate.release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            buf.fill(SCRIBBLE);
+            self.gate.landed_late.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
         if self.gate.hold_reads.load(Ordering::SeqCst) {
             self.gate.reads_entered.fetch_add(1, Ordering::SeqCst);
             while self.gate.hold_reads.load(Ordering::SeqCst) {
@@ -80,6 +135,7 @@ impl BlockFile for Gated {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        self.gate.note(buf);
         self.gate.entered.fetch_add(1, Ordering::SeqCst);
         while !self.gate.open.load(Ordering::SeqCst) {
             std::thread::yield_now();
@@ -147,6 +203,7 @@ impl Drop for OpenOnDrop {
     fn drop(&mut self) {
         self.0.open.store(true, Ordering::SeqCst);
         self.0.hold_reads.store(false, Ordering::SeqCst);
+        self.0.release.store(true, Ordering::SeqCst);
     }
 }
 
@@ -598,6 +655,188 @@ fn polling_one_delayed_read_does_not_expand_its_lookahead() {
 #[test]
 fn alternating_polls_of_delayed_reads_do_not_expand_their_lookahead() {
     delayed_read_lookahead(true);
+}
+
+/// A span given back while its read is out on the issuer, as a cursor or a compaction's opening
+/// given up gives its spans back: the read keeps the buffer it was handed until its answer is
+/// taken. No read or write the store makes meanwhile is handed that buffer, the bytes the read
+/// lands late reach that buffer alone, and the store counts it out until the answer brings it
+/// back to the pool.
+#[test]
+fn a_read_landing_after_its_span_is_given_back_writes_only_its_own_buffer() {
+    let (dir, gate, mut store, _) = native_written();
+    store.set_cache(0);
+    let pages = |store: &Store<Gated>, extent: u64| -> Vec<u64> {
+        (0..CONFIG.extent_pages)
+            .map(|page| store.address(extent, page).unwrap())
+            .collect()
+    };
+    let mut run = store.run().unwrap();
+    let mut extents = Vec::new();
+    for _ in 0..2 {
+        let extent = store.allocate_extent().unwrap();
+        for address in pages(&store, extent) {
+            store
+                .queue_page(&mut run, address, &payload(address))
+                .unwrap();
+        }
+        extents.push(extent);
+    }
+    store.write_run(&mut run).unwrap();
+    store.drain().unwrap();
+    let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
+    store.attach(&issuer, 2).unwrap();
+    let _open = OpenOnDrop(gate);
+    let out_before = store.io_stats().buffers_out;
+    gate.hold_one.store(true, Ordering::SeqCst);
+    let mut span = store.span_sequential().unwrap();
+    store
+        .prefetch(&mut span, pages(&store, extents[0])[0])
+        .unwrap();
+    while !gate.held.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    gate.watch.store(true, Ordering::SeqCst);
+    store.give_span(span);
+    // The span's own buffer is back in the pool; the read's is the issuer's until its answer.
+    assert_eq!(store.io_stats().buffers_out, out_before + 1);
+
+    // Meanwhile the other worker reads the second extent for another span, and writes a third.
+    let mut other = store.span_sequential().unwrap();
+    let mut out = Vec::new();
+    for address in pages(&store, extents[1]) {
+        out.clear();
+        store
+            .read_page_ahead(&mut other, address, &mut out)
+            .unwrap();
+        assert_eq!(out, payload(address));
+    }
+    store.give_span(other);
+    let fresh = store.allocate_extent().unwrap();
+    for address in pages(&store, fresh) {
+        store
+            .queue_page(&mut run, address, &payload(address))
+            .unwrap();
+    }
+    let completed = gate.completed.load(Ordering::SeqCst);
+    store.write_run(&mut run).unwrap();
+    while gate.completed.load(Ordering::SeqCst) == completed {
+        std::thread::yield_now();
+    }
+    assert_eq!(gate.overlapping_held(), Vec::new());
+    assert!(!gate.landed_late.load(Ordering::SeqCst));
+
+    // The read lands now, late, in its own buffer, and its answer brings that buffer back.
+    gate.watch.store(false, Ordering::SeqCst);
+    gate.release.store(true, Ordering::SeqCst);
+    store.drain().unwrap();
+    assert!(gate.landed_late.load(Ordering::SeqCst));
+    assert_eq!(store.io_stats().buffers_out, out_before);
+    // Every page reads back as written, through the store's own buffer and through a span whose
+    // reads take the pool's buffers, the late read's now among them.
+    gate.seen.lock().unwrap().clear();
+    gate.watch.store(true, Ordering::SeqCst);
+    let mut again = store.span_sequential().unwrap();
+    for extent in [extents[0], extents[1], fresh] {
+        for address in pages(&store, extent) {
+            out.clear();
+            store.read_page(address, &mut out).unwrap();
+            assert_eq!(out, payload(address));
+            out.clear();
+            store
+                .read_page_ahead(&mut again, address, &mut out)
+                .unwrap();
+            assert_eq!(out, payload(address));
+        }
+    }
+    store.give_span(again);
+    // The pool hands the buffer out again once its answer is in, and not before.
+    assert!(!gate.overlapping_held().is_empty());
+    store.give_run(run);
+    store.drain().unwrap();
+    assert_eq!(store.io_stats().buffers_out, 0);
+}
+
+/// A compaction's cursor given back with the read of its next leaf out, as an opening given up
+/// gives back its partial cursors (`Merge::cancel_opening`): the read keeps its buffer until its
+/// answer comes, nothing read meanwhile is handed that buffer, and once the read has landed late
+/// the branch reads back whole, sequentially through the pool's buffers.
+#[test]
+fn a_cursor_given_back_with_its_read_out_leaves_the_read_its_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate: &'static Gate = Box::leak(Box::default());
+    gate.open.store(true, Ordering::SeqCst);
+    let file = Gated {
+        file: DeviceFile::open(
+            &dir.path().join("store"),
+            true,
+            CachingRequest::Buffered,
+            Alignment::new(CONFIG.page_size).unwrap(),
+        )
+        .unwrap(),
+        gate,
+    };
+    let config = Config {
+        extent_pages: 2,
+        ..CONFIG
+    };
+    let mut store = Store::create(file, config).unwrap();
+    // Two values cannot fit in a page, so the leaves lie across several extents.
+    let entries: Vec<([u8; 1], Vec<u8>)> = (0..8u8)
+        .map(|k| ([b'a' + k], vec![k + 1; CONFIG.page_size / 2]))
+        .collect();
+    let mut builder = Builder::new(&mut store, Keys::Exactly(entries.len() as u64)).unwrap();
+    for (key, value) in &entries {
+        builder.add(&mut store, key, Op::Put, value).unwrap();
+    }
+    let branch = builder.finish(&mut store).unwrap();
+    let issuer = Issuer::start_for(dir.path(), 2, 2).unwrap();
+    store.attach(&issuer, 2).unwrap();
+    let _open = OpenOnDrop(gate);
+    // Every read the placing handed out has landed, so the first read handed out next, as the
+    // cursor moves on, is the one held.
+    let mut cursor = branch.seek_sequential(&mut store, b"a").unwrap();
+    store.drain().unwrap();
+    gate.hold_one.store(true, Ordering::SeqCst);
+    let mut moved = 0;
+    while cursor.next_ready(&branch, &mut store).unwrap() {
+        assert!(moved < entries.len(), "no leaf was read through the issuer");
+        cursor.next(&branch, &mut store).unwrap();
+        moved += 1;
+    }
+    while !gate.held.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    gate.watch.store(true, Ordering::SeqCst);
+    cursor.give_back(&mut store);
+    assert!(store.io_stats().buffers_out >= 1);
+
+    // Meanwhile a scan reads the whole branch.
+    let mut scan = branch.seek(&mut store, b"a").unwrap();
+    for (key, value) in &entries {
+        assert!(scan.valid());
+        assert_eq!((scan.key(), scan.value()), (&key[..], &value[..]));
+        scan.next(&branch, &mut store).unwrap();
+    }
+    assert!(!scan.valid());
+    scan.give_back(&mut store);
+    assert_eq!(gate.overlapping_held(), Vec::new());
+    assert!(!gate.landed_late.load(Ordering::SeqCst));
+
+    gate.watch.store(false, Ordering::SeqCst);
+    gate.release.store(true, Ordering::SeqCst);
+    store.drain().unwrap();
+    assert!(gate.landed_late.load(Ordering::SeqCst));
+    assert_eq!(store.io_stats().buffers_out, 0);
+    let mut again = branch.seek_sequential(&mut store, b"a").unwrap();
+    for (key, value) in &entries {
+        assert!(again.valid());
+        assert_eq!((again.key(), again.value()), (&key[..], &value[..]));
+        again.next(&branch, &mut store).unwrap();
+    }
+    assert!(!again.valid());
+    again.give_back(&mut store);
+    store.drain().unwrap();
 }
 
 #[test]

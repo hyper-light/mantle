@@ -29,6 +29,7 @@ use crate::error::Error;
 use crate::memtable::hashed::{HashMem, Walk};
 use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
+use crate::store::superblock::Superblock;
 use crate::store::{Config, IntoFile, Store};
 use crate::trunk::pool::{self, Back, Growth, Job, Owner, Pool, SortPack, Spawn, Ticket, Work};
 use crate::trunk::{Source, Trunk, TrunkConfig};
@@ -309,6 +310,28 @@ enum CheckpointPhase {
     Metadata(u64),
 }
 
+/// A checkpoint begun without waiting on a maintenance worker or the device
+/// ([`ShardDb::checkpoint_now`]): the index it makes durable, and where it stands.
+#[derive(Debug)]
+struct Flushing {
+    applied: u64,
+    stage: Flush,
+}
+
+/// Where a checkpoint begun without waiting stands.
+#[derive(Debug)]
+enum Flush {
+    /// The memtables holding what was applied through its index are packing into the trunk and
+    /// the trunk's maintenance runs to its end, as [`ShardDb::flush`] runs it; `swapped` once the
+    /// memtable that took the puts when it began is packing.
+    Pack { swapped: bool },
+    /// The trunk's image and the allocator's map are written; the map's flush is out on a
+    /// worker, or waits for a free one (none).
+    Map(Superblock, Option<Ticket>),
+    /// The superblock naming them is written; its flush is out on a worker, or waits for one.
+    Seal(Superblock, Option<Ticket>),
+}
+
 /// A shard's engine over a store.
 #[derive(Debug)]
 pub struct ShardDb<F: BlockFile> {
@@ -317,6 +340,8 @@ pub struct ShardDb<F: BlockFile> {
     packing: Option<Packing>,
     rotation: Option<Rotation>,
     checkpoint: Option<Checkpoint>,
+    /// The checkpoint begun without waiting and not yet durable ([`Self::checkpoint_now`]).
+    flushing: Option<Flushing>,
     /// Terminal worker cleanup leaves active entries unflushed, as the synchronous Stop did.
     stopping: bool,
     terminal_error: Option<Error>,
@@ -872,6 +897,7 @@ impl<F: BlockFile> ShardDb<F> {
             packing: None,
             rotation: None,
             checkpoint: None,
+            flushing: None,
             stopping: false,
             terminal_error: None,
             terminal_done: false,
@@ -1014,6 +1040,241 @@ impl<F: BlockFile> ShardDb<F> {
         self.flush()?;
         let head = self.trunk.save(&mut self.store)?;
         self.store.checkpoint(Some(head), applied)
+    }
+
+    /// [`Self::checkpoint`] made without waiting on a maintenance worker or the device: true once
+    /// the engine's state through `applied` is durable; false while it is under way, the runtime
+    /// task polling now woken by the workers' next message
+    /// ([`Pool::wake_on_message`](crate::trunk::pool::Pool)), or at once where the shard has work
+    /// of its own left in it. A replicated range's compaction makes its checkpoint so on a node's
+    /// shard, which serves its consensus and transport too: there, each of the checkpoint's two
+    /// flushes of the device stopped the whole node, 4.3 ms at the median on an idle SSD and
+    /// 13-19 ms with others out, measured on a Mac Studio (docs/design/replica.md §4).
+    ///
+    /// The memtables are packed and the trunk's maintenance run to its end as [`Self::flush`]
+    /// does, in slices of an extent's pages, the store's own paced checkpoint's slice
+    /// (`Store::checkpoint_async`); the trunk's image and the allocator's map are written; and
+    /// each flush runs on a maintenance worker's own handle on the file ([`Work::Sync`]), which
+    /// makes durable every write the shard completed before handing it out, the superblock
+    /// written between them as [`Store::checkpoint`] orders it. Puts go on into the memtable
+    /// meanwhile, past `applied` and not covered by it. From the image's writing to the second
+    /// flush nothing may change the trunk or the allocator the checkpoint names: no maintenance
+    /// runs ([`Self::checkpoint_frozen`]), a put the memtable has no room for waits for the
+    /// checkpoint ([`Self::room_now`]), and a change that cannot wait finishes it first, waiting
+    /// on its worker ([`Self::finish_checkpoint`]). Asked again while one is out, whatever its
+    /// `applied`, it goes on with that one ([`Self::checkpointing`]) and begins no other. A crash
+    /// before the second flush reopens at the checkpoint before, whose superblock is the newest.
+    /// Without workers there is no thread to flush on, and with the device's issuer attached the
+    /// store's own paced checkpoint runs ([`Self::checkpoint_paced`]).
+    pub fn checkpoint_now(&mut self, applied: u64) -> Result<bool, Error> {
+        let keys = u64::from(self.store.config().extent_pages).max(1);
+        if self.store.has_issuer() {
+            return self.checkpoint_paced(applied, keys);
+        }
+        if self.flushing.is_none() {
+            if self.trunk.pool_mut().is_none() {
+                self.checkpoint(applied)?;
+                return Ok(true);
+            }
+            self.no_checkpoint_mutation()?;
+            self.no_worker_failure()?;
+            self.flushing = Some(Flushing {
+                applied,
+                stage: Flush::Pack { swapped: false },
+            });
+        }
+        // A pass takes a step, or one of the workers' messages, which no more than the pool's
+        // seats can be out, and a step moves a stage on or pays a slice of the shard's own.
+        let seats = self.trunk.pool_mut().map_or(0, |pool| pool.seats());
+        for _ in 0..=seats {
+            if self.step_checkpoint(keys)? {
+                return Ok(true);
+            }
+            let Some(pool) = self.trunk.pool_mut().filter(|pool| pool.busy()) else {
+                continue;
+            };
+            match pool.wake_on_message(&mut self.store)? {
+                Some(false) => return Ok(false),
+                Some(true) => {}
+                // No runtime task to wake: off a shard, the engine's owner may wait.
+                None => {
+                    pool.wait_any(&mut self.store)?;
+                }
+            }
+        }
+        // Work of the shard's own is left: its task turns again at once, as after a yield.
+        if let Some(task) = hyper_rt::futures::current_task() {
+            hyper_rt::waker::waker_for(task.0).wake_by_ref();
+        }
+        Ok(false)
+    }
+
+    /// The index of the checkpoint begun without waiting and not yet durable
+    /// ([`Self::checkpoint_now`]), or of the retained one an issuer's store makes.
+    pub fn checkpointing(&self) -> Option<u64> {
+        self.flushing
+            .as_ref()
+            .map(|f| f.applied)
+            .or(self.checkpoint.as_ref().map(|c| c.applied))
+    }
+
+    /// One step of the checkpoint out ([`Self::checkpoint_now`]): true once it is durable. A
+    /// failure fences the store, the checkpoint dropped: the engine reopens at the one before.
+    fn step_checkpoint(&mut self, keys: u64) -> Result<bool, Error> {
+        let Some(Flushing { applied, stage }) = self.flushing.take() else {
+            return Ok(true);
+        };
+        match self.checkpoint_stage(applied, stage, keys) {
+            Ok(None) => Ok(true),
+            Ok(Some(stage)) => {
+                self.flushing = Some(Flushing { applied, stage });
+                Ok(false)
+            }
+            Err(error) => Err(self.store.fail(error)),
+        }
+    }
+
+    /// The checkpoint at `applied` taken on from `stage`: the stage it stands at after, none
+    /// once it is durable.
+    fn checkpoint_stage(
+        &mut self,
+        applied: u64,
+        stage: Flush,
+        keys: u64,
+    ) -> Result<Option<Flush>, Error> {
+        match stage {
+            Flush::Pack { swapped } => {
+                let packed = self.flush_step(keys, !swapped)?;
+                // Puts write the memtable alone, so one found empty holds nothing applied
+                // before the checkpoint began: that is packing or packed.
+                let swapped = swapped || self.mem.is_empty();
+                if !(packed && swapped) {
+                    return Ok(Some(Flush::Pack { swapped }));
+                }
+                let head = self.trunk.save(&mut self.store)?;
+                let sb = self.store.checkpoint_map(Some(head), applied)?;
+                let ticket = self.send_sync()?;
+                Ok(Some(Flush::Map(sb, ticket)))
+            }
+            Flush::Map(sb, mut ticket) => {
+                if !self.synced(&mut ticket)? {
+                    return Ok(Some(Flush::Map(sb, ticket)));
+                }
+                self.store.checkpoint_seal(&sb)?;
+                let ticket = self.send_sync()?;
+                Ok(Some(Flush::Seal(sb, ticket)))
+            }
+            Flush::Seal(sb, mut ticket) => {
+                if !self.synced(&mut ticket)? {
+                    return Ok(Some(Flush::Seal(sb, ticket)));
+                }
+                self.store.checkpoint_commit(sb);
+                Ok(None)
+            }
+        }
+    }
+
+    /// A checkpoint's flush handed to a free maintenance worker ([`Work::Sync`]): its ticket, or
+    /// none with no worker free, the workers' next message asked for.
+    fn send_sync(&mut self) -> Result<Option<Ticket>, Error> {
+        let job = Box::new(Job {
+            work: Work::Sync,
+            grant: Vec::new(),
+            file_end: self.store.end(),
+            generation: self.store.generation(),
+            keep: None,
+        });
+        let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
+            what: "a checkpoint's flush with no workers",
+        })?;
+        match pool.send(job, Owner::Sync, true) {
+            Ok(Ok(ticket)) => Ok(Some(ticket)),
+            Ok(Err(_)) => {
+                pool.want_message();
+                Ok(None)
+            }
+            Err((error, _)) => Err(error),
+        }
+    }
+
+    /// Whether the checkpoint's flush `ticket` names is back and done; one that waited for a
+    /// free worker is handed out now if one is.
+    fn synced(&mut self, ticket: &mut Option<Ticket>) -> Result<bool, Error> {
+        let Some(out) = *ticket else {
+            *ticket = self.send_sync()?;
+            return Ok(false);
+        };
+        let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
+            what: "a checkpoint's flush out with no workers",
+        })?;
+        let Some(back) = pool.take(&mut self.store, Owner::Sync, false)? else {
+            return Ok(false);
+        };
+        Self::flush_back(out, back)
+    }
+
+    /// A checkpoint's flush back: done, or its failure.
+    fn flush_back(out: Ticket, back: Back) -> Result<bool, Error> {
+        if back.ticket != out {
+            return Err(Error::InvalidArgument {
+                what: "a checkpoint's flush result for another flush",
+            });
+        }
+        if let Some(error) = back
+            .physical_error
+            .or_else(|| back.result.as_ref().err().cloned())
+        {
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// The checkpoint out ([`Self::checkpoint_now`]) made durable here, waiting on its worker
+    /// and its device: what a change that cannot wait for it does first, as an install, a
+    /// change of configuration and an entry larger than a memtable apply whatever they wait on
+    /// (a rotation, a flush, a blocking checkpoint). A flush that waited for a free worker is
+    /// made on the shard's own handle.
+    fn finish_checkpoint(&mut self) -> Result<(), Error> {
+        let Some(Flushing { applied, stage }) = self.flushing.take() else {
+            return Ok(());
+        };
+        let finished = self.finish_stage(applied, stage);
+        finished.map_err(|error| self.store.fail(error))
+    }
+
+    fn finish_stage(&mut self, applied: u64, stage: Flush) -> Result<(), Error> {
+        let (sb, ticket, sealed) = match stage {
+            Flush::Pack { .. } => {
+                self.flush_whole()?;
+                let head = self.trunk.save(&mut self.store)?;
+                (self.store.checkpoint_map(Some(head), applied)?, None, false)
+            }
+            Flush::Map(sb, ticket) => (sb, ticket, false),
+            Flush::Seal(sb, ticket) => (sb, ticket, true),
+        };
+        self.synced_here(ticket)?;
+        if !sealed {
+            self.store.checkpoint_seal(&sb)?;
+            self.synced_here(None)?;
+        }
+        self.store.checkpoint_commit(sb);
+        Ok(())
+    }
+
+    /// The flush `ticket` names waited for, or with none out, made on the shard's own handle.
+    fn synced_here(&mut self, ticket: Option<Ticket>) -> Result<(), Error> {
+        let Some(out) = ticket else {
+            return self.store.flush_device();
+        };
+        let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
+            what: "a checkpoint's flush out with no workers",
+        })?;
+        let back =
+            pool.take(&mut self.store, Owner::Sync, true)?
+                .ok_or(Error::InvalidArgument {
+                    what: "a checkpoint's flush out and never back",
+                })?;
+        Self::flush_back(out, back).map(|_| ())
     }
 
     /// Cold validation precedes every range spawn and any preparation mutation.
@@ -3420,6 +3681,15 @@ impl<F: BlockFile> ShardDb<F> {
         if self.store.segments().is_none() {
             return Ok(false);
         }
+        // A checkpoint begun without waiting has written the allocator's map it names: a growth
+        // admitted, or a worker's ask answered, before its commit would change the allocator.
+        if self
+            .flushing
+            .as_ref()
+            .is_some_and(|f| !matches!(f.stage, Flush::Pack { .. }))
+        {
+            return Ok(false);
+        }
         if let Some(error) = &self.growth_failed {
             return Err(error.clone());
         }
@@ -4541,6 +4811,10 @@ impl<F: BlockFile> ShardDb<F> {
         self.checkpoint
             .as_ref()
             .is_some_and(|c| !matches!(c.phase, CheckpointPhase::Flush))
+            || self
+                .flushing
+                .as_ref()
+                .is_some_and(|f| !matches!(f.stage, Flush::Pack { .. }))
     }
 
     pub(crate) fn checkpoint_failed(&self) -> bool {
@@ -5207,6 +5481,13 @@ impl<F: BlockFile> ShardDb<F> {
         if self.rotation.is_none() && self.mem.room() >= bytes {
             return Ok(true);
         }
+        // A rotation would change the trunk and allocator a checkpoint out writes, or chase it
+        // with packings: the entry waits for the checkpoint, stepped here.
+        if let Some(applied) = self.flushing.as_ref().map(|f| f.applied)
+            && !self.checkpoint_now(applied)?
+        {
+            return Ok(false);
+        }
         // A put the trunk's metadata has no room for is refused at its rotation, typed, as
         // [`Self::put`] refuses it: that path decides.
         if self.rotation.is_none() && self.metadata_full() {
@@ -5333,12 +5614,18 @@ impl<F: BlockFile> ShardDb<F> {
     /// Packs every memtable and finishes its maintenance before a range starts durability.
     /// A false result owns all unfinished work.
     pub(crate) fn flush_paced(&mut self, keys: u64) -> Result<bool, Error> {
-        self.trunk.clear_io_wait();
         self.require_async_backend()?;
+        self.flush_step(keys, true)
+    }
+
+    /// [`Self::flush_paced`]'s steps, on a store of either backend; the memtable taking puts is
+    /// packed only when `swap`: a checkpoint packs the one it found, not those filled after.
+    fn flush_step(&mut self, keys: u64, swap: bool) -> Result<bool, Error> {
+        self.trunk.clear_io_wait();
         // A job the file's admitted extents cannot hold waits for growth, which only this
         // drives while the flush steps the trunk.
         self.grow(false)?;
-        if self.rotation.is_some() && !self.rotate_paced(keys)? {
+        if self.rotation.is_some() && !self.rotate_step(keys)? {
             return Ok(false);
         }
         if self.packing.is_some() || !self.frozen.is_empty() {
@@ -5346,7 +5633,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.take_packs(false)?;
             return Ok(false);
         }
-        if !self.mem.is_empty() {
+        if swap && !self.mem.is_empty() {
             let fresh = self.fresh_mem()?;
             let full = std::mem::replace(&mut self.mem, fresh);
             self.pack_full(full)?;
@@ -5364,6 +5651,8 @@ impl<F: BlockFile> ShardDb<F> {
     /// still owed is paid first, whole, and counted a stall: the packing memtable's, and the
     /// trunk's maintenance when its root has no room for more branches.
     fn rotate(&mut self) -> Result<(), Error> {
+        // A checkpoint out names the trunk and allocator this rotation's packing changes.
+        self.finish_checkpoint()?;
         // A paced rotation begun ([`Self::room_now`]) is this one, done whole here: resumed after,
         // it would swap the memtable this one gives the puts.
         self.rotation = None;
@@ -5479,6 +5768,12 @@ impl<F: BlockFile> ShardDb<F> {
     /// Packs every memtable into the trunk and runs its maintenance to the end.
     pub fn flush(&mut self) -> Result<(), Error> {
         self.no_checkpoint_mutation()?;
+        self.finish_checkpoint()?;
+        self.flush_whole()
+    }
+
+    /// [`Self::flush`]'s work, with no checkpoint out.
+    fn flush_whole(&mut self) -> Result<(), Error> {
         self.finish_packing()?;
         if !self.mem.is_empty() {
             let fresh = self.fresh_mem()?;

@@ -391,6 +391,10 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// The images made for members behind the log's start since the member opened
     /// ([`Replica::images_made`]).
     images_made: u64,
+    /// The entries to keep of a compaction that waits on the state machine's checkpoint out
+    /// ([`StateMachine::persist`] answered false): each drive asks the machine again, and the
+    /// start moves at the one that finds it durable ([`Replica::persisting`]).
+    persisting: Option<u64>,
     /// What the core was last told was applied.
     told_applied: u64,
     /// The index of the entry that made the configuration.
@@ -581,6 +585,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             sizes_from: durable.index.saturating_add(1),
             imaged: None,
             images_made: 0,
+            persisting: None,
             told_applied: durable.index,
             conf_index: durable.index,
             fence: None,
@@ -846,6 +851,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.stall = None;
         self.fence = None;
         self.wait = Wait::Commit;
+        self.persisting = None;
         self.reads.clear();
         self.reports.clear();
         self.fenced = Some(cause.clone());
@@ -1652,6 +1658,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             r.drive_applied = 0;
             r.driven_at = now;
             r.take_answers(now, out)?;
+            // A compaction waiting on the machine's checkpoint asks it again before the writes a
+            // stall refused are made again, as an owner compacts a stalled group before it drives
+            // it: the start moves once the checkpoint is durable, its write out with this drive's
+            // waker and answered at the next drive, as a compaction's between drives is, and the
+            // refused writes are made again only once it is answered (`make_again`).
+            if let Some(keep) = r.persisting {
+                r.compact_through(keep, now, waker)?;
+            }
             if r.stall.is_some() {
                 r.make_again(now, waker)?;
             }
@@ -2783,57 +2797,82 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// keeping `keep` entries for members that lag; true when a compaction's start went out.
     /// The start never passes the state machine's durable index (I8) nor what the log holds
     /// durably (`docs/durable.md` §4.2). Allowed while stalled: a compaction is what frees room.
+    /// A machine whose checkpoint is not durable yet says so ([`StateMachine::persist`]): no
+    /// start moves now, and the compaction waits on the checkpoint, each drive asking the machine
+    /// again and moving the start at the one that finds it durable ([`Replica::persisting`]), so
+    /// the thread that drives the group waits on no flush. Asked meanwhile, the machine goes on
+    /// with the checkpoint out and begins no other.
     pub fn compact(&mut self, keep: u64, now: u64, waker: &Waker) -> Result<bool, ReplicaError> {
-        self.guarded(|r| {
-            let persisted = r.machine.persist();
-            r.machine_did(persisted)?;
-            let durable = r.machine.durable().index;
-            let bounds = r.node.store().log.bounds();
-            let (start, last) =
-                bounds.map_err(|e| r.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
-            let index = durable.saturating_sub(keep).min(last);
-            // A start a write out moves is not yet in the store's bounds: a compaction behind it
-            // would move the start back. A snapshot's start refused for room is made again past
-            // any compaction now: the state machine stands at it, so none passes it.
-            let moving = r.writes.iter().any(|w| w.start);
-            if index <= start.index || moving || !r.has_slot() {
-                return Ok(false);
-            }
-            let term = r.node.store().log.term(index);
-            let term = term.map_err(|e| r.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
-            // No image: a member behind the new start is sent one made when the core asks for it
-            // ([`Replica::make_wanted`]). Imaged here, every compaction read and encoded every
-            // row on the thread that drives the group, whether or not any member was behind.
-            let imaged = r.machine.image_bytes();
-            // The log is compacted only through what it states committed, stated with it.
-            let hard = (index > r.issued.commit).then_some(HardState {
-                commit: index,
-                ..r.issued
-            });
-            let write = Write {
-                start: Some(Point { index, term }),
-                hard_state: hard,
-                at_flush: r.at_flush(),
-                ..Write::default()
-            };
-            let submitted = r.node.store_mut().log.submit(&write, waker);
-            let state = r.submitted_state(submitted)?;
-            if let Some(hard) = hard {
-                r.issued = hard;
-            }
-            r.writes_made.starts = r.writes_made.starts.saturating_add(1);
-            r.writes.push_back(Out {
-                kind: Kind::Start(imaged),
-                state,
-                messages: Vec::new(),
-                tip: (0, 0),
-                commit: hard.map(|h| h.commit),
-                vote: false,
-                start: true,
-                submitted: now,
-            });
-            Ok(true)
-        })
+        self.guarded(|r| r.compact_through(keep, now, waker))
+    }
+
+    /// Whether a compaction waits on the state machine's checkpoint ([`Replica::compact`]): its
+    /// owner drives the replica again when the machine's work wakes it, and that drive moves the
+    /// start once the checkpoint is durable.
+    pub fn persisting(&self) -> bool {
+        self.persisting.is_some()
+    }
+
+    /// [`Replica::compact`]'s work, and a drive's for a compaction that waits on the machine's
+    /// checkpoint.
+    fn compact_through(
+        &mut self,
+        keep: u64,
+        now: u64,
+        waker: &Waker,
+    ) -> Result<bool, ReplicaError> {
+        let persisted = self.machine.persist();
+        if !self.machine_did(persisted)? {
+            self.persisting = Some(keep);
+            return Ok(false);
+        }
+        self.persisting = None;
+        let durable = self.machine.durable().index;
+        let bounds = self.node.store().log.bounds();
+        let (start, last) =
+            bounds.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+        let index = durable.saturating_sub(keep).min(last);
+        // A start a write out moves is not yet in the store's bounds: a compaction behind it
+        // would move the start back. A snapshot's start refused for room is made again past
+        // any compaction now: the state machine stands at it, so none passes it.
+        let moving = self.writes.iter().any(|w| w.start);
+        if index <= start.index || moving || !self.has_slot() {
+            return Ok(false);
+        }
+        let term = self.node.store().log.term(index);
+        let term = term.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+        // No image: a member behind the new start is sent one made when the core asks for it
+        // ([`Replica::make_wanted`]). Imaged here, every compaction read and encoded every
+        // row on the thread that drives the group, whether or not any member was behind.
+        let imaged = self.machine.image_bytes();
+        // The log is compacted only through what it states committed, stated with it.
+        let hard = (index > self.issued.commit).then_some(HardState {
+            commit: index,
+            ..self.issued
+        });
+        let write = Write {
+            start: Some(Point { index, term }),
+            hard_state: hard,
+            at_flush: self.at_flush(),
+            ..Write::default()
+        };
+        let submitted = self.node.store_mut().log.submit(&write, waker);
+        let state = self.submitted_state(submitted)?;
+        if let Some(hard) = hard {
+            self.issued = hard;
+        }
+        self.writes_made.starts = self.writes_made.starts.saturating_add(1);
+        self.writes.push_back(Out {
+            kind: Kind::Start(imaged),
+            state,
+            messages: Vec::new(),
+            tip: (0, 0),
+            commit: hard.map(|h| h.commit),
+            vote: false,
+            start: true,
+            submitted: now,
+        });
+        Ok(true)
     }
 
     /// Whether the log is due to be compacted by `rule` ([`Compaction`], Ongaro's thesis §5.1.2),
@@ -2846,8 +2885,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             return false;
         };
         // A start out is a compaction or an install under way, and [`Replica::compact`] waits
-        // for it.
-        if self.writes.iter().any(|w| w.start) {
+        // for it; so is a compaction waiting on the machine's checkpoint.
+        if self.persisting.is_some() || self.writes.iter().any(|w| w.start) {
             return false;
         }
         let raft = &self.node.raft;

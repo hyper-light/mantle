@@ -450,6 +450,42 @@ about 5,500 a second, and a cost that grew with every object stored.
 `a_member_behind_the_start_is_sent_its_snapshot_by_the_drive_that_makes_it`
 (`crates/range/tests/group.rs`) hold this. A member installs one before its log records the new
 start, its engine's rows durable first, so the log never starts past what the engine holds.
+
+A compaction's checkpoint waits on no flush and no worker on the node's shard. Made inline, it
+packed the engine's memtables, waited on its maintenance workers for them, and flushed the
+device twice (`Store::checkpoint`; macOS's `F_FULLFSYNC`) on the thread that runs the node's
+consensus, log and transport: in a three-node cell on one Mac Studio taking one-byte PUTs up to a
+million objects, 1–3% of that thread's time, and at about 640,000 objects a third of the time it
+spent blocked; one flush on that SSD takes 4.3 ms at the median idle and 13–19 ms with 3–16
+others out. Now the state machine's `persist` answers whether its checkpoint is durable
+(hyper-durable's `StateMachine::persist`), and a range's begins one without waiting
+(`Engine::persist_now`, `ShardDb::checkpoint_now`, engine-structure.md §7): its memtables are
+packed by the maintenance workers and the shard in slices, the trunk's image and the allocator's
+map written, and each of its two flushes runs on a worker's own handle on the store's file, which
+flushes the file's writes whatever handle made them (research/02 §2.9: `fsync` flushes "all
+modified in-core data of … the file", and `F_FULLFSYNC` does the same, then drains the drive's
+queue). Answered not yet, the compaction moves no start and waits on the checkpoint
+(`Replica::persisting`): the worker's message that ends a flush wakes the node's task, as an
+entry waiting for room is woken (§2), the node drives every range whose compaction waits
+(`shard::answer_due`), and the drive asks the machine again and moves the start at the one that
+finds the checkpoint durable, through its index and never past it (I8). The checkpoint's index
+is the entry applied when it began; asked again while it is out, the machine goes on with it
+and begins no other, and `compaction_due` is false meanwhile. Entries apply while it is out,
+into the memtable, past its index and not covered by it; from the image's writing to the second
+flush nothing may change the trunk or allocator it names, so the engine's maintenance waits and
+an entry the memtable has no room for waits committed and unapplied for the checkpoint (§2),
+while a change of configuration, an install and an entry larger than a memtable, which apply
+whatever they wait on, finish the checkpoint first. A crash before the second flush reopens the
+engine at the checkpoint before, whose superblock is still the newest, and the log, whose start
+never passed it, replays every entry since. An engine without workers has no thread to flush
+on and checkpoints inline as before. `a_checkpoint_flushes_on_its_worker_and_entries_apply_while_it_is_out`,
+`an_entry_with_no_room_while_a_checkpoint_is_out_waits_for_it` and
+`a_checkpoint_that_never_completed_opens_at_the_one_before` (node `upkeep`, the worker's flush
+held at a gate, the shard's own flushes counted: none), and hyper-durable's
+`a_compaction_waits_on_the_machines_checkpoint_and_moves_the_start_once_it_is_durable`,
+`a_second_compaction_while_a_checkpoint_is_out_begins_no_other` and
+`a_member_stopped_with_its_checkpoint_out_opens_at_the_durable_point_before_and_loses_nothing`
+hold this.
 For now the rows travel inside the snapshot message. The production engine will move its files
 out of band instead (12 §6.3).
 

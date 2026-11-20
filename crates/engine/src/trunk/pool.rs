@@ -57,14 +57,20 @@ pub struct Task {
     pub pages: usize,
 }
 
-/// A worker's work: a compaction, a full memtable to sort and pack into one branch, or a growth
-/// of the shard's file.
+/// A worker's work: a compaction, a full memtable to sort and pack into one branch, a growth
+/// of the shard's file, or a flush of it to the device.
 #[derive(Debug)]
 pub enum Work {
     Compact(Task),
     Sort(SortPack),
     Grow(Growth),
     Index(Box<IndexJob>),
+    /// The shard's file flushed to the device through the worker's own handle on it
+    /// (`Store::flush_device`), for a checkpoint begun without waiting
+    /// (`ShardDb::checkpoint_now`): the flush makes durable every write the shard completed
+    /// before handing it out, the handle being the same file's, and the shard's thread, which a
+    /// node's consensus and transport share, never waits on the device for it.
+    Sync,
 }
 
 /// The index over the memtables a shard keeps for gets (`crate::kept`, research/51 §7), out on a
@@ -152,14 +158,16 @@ pub struct Output {
     pub kept: Option<Box<Kept>>,
 }
 
-/// Who a job's result goes back to: the trunk's maintenance, the shard's packing, or the shard's
-/// file's growth.
+/// Who a job's result goes back to: the trunk's maintenance, the shard's packing, the shard's
+/// file's growth, its kept memtables' index, or its checkpoint's flush.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
     Trunk,
     Pack,
     Grow,
     Index,
+    /// A checkpoint's flush ([`Work::Sync`]).
+    Sync,
 }
 
 /// A job handed to a worker: the worker, and the job's number among every job the pool has
@@ -580,6 +588,10 @@ fn run<F: BlockFile>(store: &mut Store<F>, job: &mut Job) -> Result<(Parts, u64)
         }
         Work::Grow(g) => {
             store.grow_segment(g.start, g.extents, g.add)?;
+            Vec::new()
+        }
+        Work::Sync => {
+            store.flush_device()?;
             Vec::new()
         }
         Work::Index(job) => {

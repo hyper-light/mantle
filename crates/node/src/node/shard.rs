@@ -622,9 +622,15 @@ pub(crate) enum Served {
 /// next tick, and the page waited for it. So is a range whose committed entries wait for room in
 /// its engine (hyper-durable's `Replica::waits_for_room`): the engine's worker message wakes the
 /// task (`ShardDb::room_now`), and the drive asks the engine again, the shard having waited on
-/// nothing meanwhile (replica.md §2).
+/// nothing meanwhile (replica.md §2). So is a range whose compaction waits for its engine's
+/// checkpoint (hyper-durable's `Replica::persisting`): the worker's message that ends a flush
+/// wakes the task (`ShardDb::checkpoint_now`), and the drive takes the checkpoint on, moving the
+/// log's start once it is durable (replica.md §4).
 pub(crate) fn answer_due<E: Engine + 'static, S: LogStore>(replica: &Replica<E, S>) -> bool {
-    replica.in_flight() > 0 || replica.catching_up() || replica.waits_for_room()
+    replica.in_flight() > 0
+        || replica.catching_up()
+        || replica.waits_for_room()
+        || replica.persisting()
 }
 
 /// Compacts each of `handles`' ranges in `owner` through what its engine made durable, freeing the

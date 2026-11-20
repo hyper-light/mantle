@@ -82,6 +82,15 @@ pub trait StateMachine {
     /// makes it durable before returning: the log's start moves to `at` only after (I8).
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal>;
 
-    /// Makes everything applied durable, so that the log may be compacted behind it.
-    fn persist(&mut self) -> Result<(), Fatal>;
+    /// Makes everything applied durable, so that the log may be compacted behind it: true once it
+    /// is, [`StateMachine::durable`] reaching what was applied when the checkpoint began. False
+    /// when the machine has begun a checkpoint it makes without waiting (an engine's writes and
+    /// flushes on its own workers) and it is not durable yet: [`StateMachine::durable`] stays at
+    /// the last one, the machine has arranged for its owner to be woken once it may have
+    /// completed, by the work it waits on and not by a timer, and the replica asks again at its
+    /// next drive ([`crate::Replica::persisting`]). Asked again while one is out, the machine
+    /// goes on with that one and begins no other; entries applied meanwhile go on and are not
+    /// covered by it. A crash before it completes reopens at the durable point before it, which
+    /// the log still covers: its start never passes [`StateMachine::durable`] (I8).
+    fn persist(&mut self) -> Result<bool, Fatal>;
 }

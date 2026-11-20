@@ -208,6 +208,131 @@ fn an_entry_the_machine_has_no_room_for_waits_committed_for_the_drive_that_finds
     assert!(!r.waits_for_room());
 }
 
+/// A compaction whose machine's checkpoint is not durable yet moves no start: the replica holds
+/// the compaction, rests (the machine's work wakes its owner), and goes on applying entries
+/// meanwhile; the drive that finds the checkpoint durable moves the start to the index applied
+/// when it began, and not past it (I8).
+#[test]
+fn a_compaction_waits_on_the_machines_checkpoint_and_moves_the_start_once_it_is_durable() {
+    let mut r = sole(3, Unbounded, |_| {});
+    for i in 0..4u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    let begun_at = r.applied().index;
+    let start = r.log_mut().disk.start.index;
+    r.machine_mut().held = true;
+    assert!(
+        !r.compact(0, now(), waker()).unwrap(),
+        "no start moves while the checkpoint is out"
+    );
+    assert!(r.persisting());
+    assert!(!r.log_mut().start_out(), "no start write was made");
+    for i in 4..8u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    // `pump` returns only once the replica rests: it asked for no drive while it waits.
+    let out = pump(&mut r);
+    assert_eq!(
+        out.answers.len(),
+        4,
+        "entries apply while the checkpoint is out"
+    );
+    assert_eq!(r.applied().index, begun_at + 4);
+    assert_eq!(r.log_mut().disk.start.index, start, "the start waits on it");
+    assert!(r.persisting());
+    r.machine_mut().held = false;
+    pump(&mut r);
+    assert!(!r.persisting());
+    assert_eq!(r.machine().durable.applied.index, begun_at);
+    assert_eq!(
+        r.log_mut().disk.start.index,
+        begun_at,
+        "the start moves to the checkpoint's index and not past it"
+    );
+    assert_eq!(r.applied().index, begun_at + 4);
+}
+
+/// A compaction asked again while the machine's checkpoint is out begins no other checkpoint: the
+/// machine goes on with the one out, of what was applied when it began, and the start moves to
+/// that once it is durable.
+#[test]
+fn a_second_compaction_while_a_checkpoint_is_out_begins_no_other() {
+    let mut r = sole(3, Unbounded, |_| {});
+    for i in 0..4u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    let begun_at = r.applied().index;
+    let begun = r.machine().begun;
+    r.machine_mut().held = true;
+    assert!(!r.compact(0, now(), waker()).unwrap());
+    for i in 4..8u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    assert!(!r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    assert_eq!(r.machine().begun, begun + 1, "one checkpoint out");
+    let out = r.machine().out.as_ref().map(|state| state.applied.index);
+    assert_eq!(out, Some(begun_at), "of what was applied when it began");
+    r.machine_mut().held = false;
+    pump(&mut r);
+    assert_eq!(r.machine().begun, begun + 1);
+    assert_eq!(r.machine().durable.applied.index, begun_at);
+    assert_eq!(r.log_mut().disk.start.index, begun_at);
+}
+
+/// A member stopped before its machine's checkpoint is durable opens again at the durable point
+/// before it, which the log still covers: the compaction that waited on it moved no start, so every
+/// entry applied since is in the log and applied again, in order, nothing lost.
+#[test]
+fn a_member_stopped_with_its_checkpoint_out_opens_at_the_durable_point_before_and_loses_nothing() {
+    let mut r = sole(3, Unbounded, |_| {});
+    for i in 0..4u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    assert!(r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    let first = r.machine().durable.applied.index;
+    assert_eq!(r.log_mut().disk.start.index, first);
+    for i in 4..8u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    pump(&mut r);
+    let last = r.applied().index;
+    r.machine_mut().held = true;
+    assert!(!r.compact(0, now(), waker()).unwrap());
+    pump(&mut r);
+    assert_eq!(r.log_mut().disk.start.index, first);
+    let before = r.machine().now.entries.clone();
+    // The process stops: the device keeps what was durable, the machine its last checkpoint.
+    let disk = r.log_mut().disk.clone();
+    let kv = r.machine().crashed();
+    drop(r);
+    assert_eq!(kv.durable.applied.index, first);
+    let mut r: Sim =
+        Replica::open(&settings(1, 7), SimStore::from_disk(disk, 3), kv, Unbounded).unwrap();
+    assert_eq!(
+        r.applied().index,
+        first,
+        "opened at the durable point before"
+    );
+    r.campaign().unwrap();
+    pump(&mut r);
+    assert!(r.is_leader());
+    let entries = r.machine().now.entries.iter();
+    let after: Vec<_> = entries
+        .filter(|(index, _, _)| *index <= last)
+        .cloned()
+        .collect();
+    assert_eq!(
+        after, before,
+        "every entry applied before the stop, applied again"
+    );
+}
+
 /// A change waits behind the fence until a write states its commit; entries committed after it
 /// wait with it, at most a page from each write out and the page of the `Ready` that gave it
 /// (`docs/durable.md` §6); the replica takes no `Ready` meanwhile.
@@ -809,7 +934,7 @@ impl StateMachine for Boom {
     fn install(&mut self, image: &[u8], at: Point, c: &ConfState) -> Result<(), Fatal> {
         self.0.install(image, at, c)
     }
-    fn persist(&mut self) -> Result<(), Fatal> {
+    fn persist(&mut self) -> Result<bool, Fatal> {
         self.0.persist()
     }
 }

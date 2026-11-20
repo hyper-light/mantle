@@ -798,6 +798,22 @@ Mac under load, 2026-10-07; benches/shard_db.rs `attribute`):
   3. Write the superblock copy naming the new root, the allocator map and the applied index.
   4. Full flush.
   5. Release the old root's extents.
+- **Begun without waiting, as built.** A range's checkpoint on a node's shard, whose thread runs
+  the node's consensus and transport too, is made by `ShardDb::checkpoint_now` in the same order
+  and waits on nothing (docs/design/replica.md §4). Its memtables are packed and the trunk's
+  maintenance run to its end as `flush` does, in slices of an extent's pages, the retained
+  checkpoint's slice (§2, `Store::checkpoint_async`); the trunk's image and the allocator's map
+  are written (`Store::checkpoint_map`); and each full flush is a job on a maintenance worker
+  (`Work::Sync`), which flushes the store's file through its own handle: a flush covers every
+  modified page of the file, whatever descriptor wrote it, so the writes the shard completed
+  before handing the job out are durable when it ends (research/02 §2.9, `fsync(2)` and
+  `F_FULLFSYNC`). The superblock is written between the two (`Store::checkpoint_seal`) and the
+  checkpoint commits at the second's end (`Store::checkpoint_commit`), the worker's message
+  waking the shard's task each time. As in the retained checkpoint (§2), once the image is
+  written nothing changes the trunk or the allocator until the commit: idle maintenance waits,
+  `room_now` makes no rotation and answers no room, and a put that cannot wait finishes the
+  checkpoint first, inline. Puts into the memtable go on throughout, past the checkpoint's index.
+  A crash before the second flush opens at the superblock before.
 - **Recovery.** Open the newest valid superblock, check its root and map, and replay the Raft log
   from the applied index.
 - **Log holes.** A Raft log with several batches in flight must not acknowledge a batch while a

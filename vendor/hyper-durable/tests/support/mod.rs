@@ -460,6 +460,13 @@ pub struct Kv {
     /// Has no room for an entry: each is answered unapplied, as an engine whose maintenance it
     /// would wait on answers it.
     pub roomless: bool,
+    /// Its checkpoint's flush is held: `persist` begins one of what it applied and answers it
+    /// not yet durable until this is cleared, as an engine whose flush is out on its workers.
+    pub held: bool,
+    /// The checkpoint out: the state as applied when it began, durable once it completes.
+    pub out: Option<KvState>,
+    /// The checkpoints `persist` began since the member opened.
+    pub begun: u64,
 }
 
 /// What a fenced entry's data begins with: a member acts on it at its next start.
@@ -482,9 +489,12 @@ impl Kv {
             acted: Vec::new(),
             changes: Vec::new(),
             roomless: false,
+            held: false,
+            out: None,
+            begun: 0,
         }
     }
-    /// What a crash leaves.
+    /// What a crash leaves: a checkpoint out is lost with it.
     pub fn crashed(&self) -> Self {
         Self {
             now: self.durable.clone(),
@@ -497,6 +507,9 @@ impl Kv {
             acted: Vec::new(),
             changes: Vec::new(),
             roomless: false,
+            held: false,
+            out: None,
+            begun: 0,
         }
     }
 }
@@ -619,11 +632,22 @@ impl StateMachine for Kv {
         self.durable = self.now.clone();
         Ok(())
     }
-    fn persist(&mut self) -> Result<(), Fatal> {
-        if !self.volatile {
-            self.durable = self.now.clone();
+    fn persist(&mut self) -> Result<bool, Fatal> {
+        if self.volatile {
+            return Ok(true);
         }
-        Ok(())
+        // A checkpoint out goes on; none other begins while it is.
+        if self.out.is_none() {
+            self.begun += 1;
+            self.out = Some(self.now.clone());
+        }
+        if self.held {
+            return Ok(false);
+        }
+        if let Some(state) = self.out.take() {
+            self.durable = state;
+        }
+        Ok(true)
     }
 }
 

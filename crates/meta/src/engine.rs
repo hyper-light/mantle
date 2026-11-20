@@ -67,6 +67,18 @@ pub trait Engine: Rows {
     /// Makes everything applied durable.
     fn persist(&mut self) -> Result<(), EngineError>;
 
+    /// [`Engine::persist`] made without waiting on the engine's own workers or its device: true
+    /// once everything applied when its checkpoint began is durable ([`Engine::durable`] reaches
+    /// it); false while that checkpoint is under way, the runtime task polling now woken once it
+    /// may have completed, by the work it waits on and not by a timer. Asked again while one is
+    /// out, it goes on with that one and begins no other; what is applied meanwhile is not
+    /// covered by it. A range compacts its log so, on a node's shard that serves its consensus
+    /// and transport as well (docs/design/replica.md §4). An engine with nothing to wait on
+    /// persists here.
+    fn persist_now(&mut self) -> Result<bool, EngineError> {
+        self.persist().map(|()| true)
+    }
+
     /// Every row as of `applied()`: what a snapshot carries to a member that lags
     /// (docs/design/replica.md §4).
     fn image(&mut self) -> Result<Vec<Row>, EngineError>;

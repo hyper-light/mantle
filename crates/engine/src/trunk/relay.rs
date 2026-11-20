@@ -35,6 +35,7 @@ pub(crate) enum Kind {
     Sort,
     Grow,
     Index,
+    Sync,
 }
 
 fn kind(work: &Work) -> Kind {
@@ -43,6 +44,7 @@ fn kind(work: &Work) -> Kind {
         Work::Sort(_) => Kind::Sort,
         Work::Grow(_) => Kind::Grow,
         Work::Index(_) => Kind::Index,
+        Work::Sync => Kind::Sync,
     }
 }
 

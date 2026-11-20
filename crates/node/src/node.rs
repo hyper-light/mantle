@@ -590,8 +590,11 @@ pub struct Status {
     /// made by what they were for.
     pub stalled: bool,
     /// The liveness stream's writes the log refused for room since the node started, each owed
-    /// and asked again once the log made a range's write durable (node.md §6.2).
+    /// and asked again once the log made a range's write durable, or a sending interval of the
+    /// stream's after the refusal (node.md §2.4, item 5; §6.2).
     pub liveness_waits: u64,
+    /// The liveness stream's writes the log took since the node started.
+    pub liveness_writes: u64,
     /// The node's rounds of compaction since it started, each compacting every range that had
     /// applied entries to free (`Node::compact_if_stalled`): the node compacts only when its log
     /// refuses a write for room, so each is the log full and the node making room (node.md §6.2).
@@ -1340,12 +1343,13 @@ pub struct Node<E: Engine, L: NodeLog = Log<DeviceFile>> {
     liveness_write: Option<(L::Written, u64)>,
     liveness_moved: bool,
     /// The stream's write the log refused for room (`LogError::Full`, or its queue `Busy`), with
-    /// the log's durable range writes and the ranges' applied entries counted when it did: owed
-    /// to the stream, which waits on its answer and asks no other meanwhile, and asked of the log
-    /// again once a range's write became durable since, or once every range applied all its log
-    /// holds committed past what it had then (a start's replay done): what may have freed room, or
-    /// what a compaction can now free.
-    liveness_owed: Option<(u64, u64)>,
+    /// the log's durable range writes and the ranges' applied entries counted when it did, and
+    /// when: owed to the stream, which waits on its answer and asks no other meanwhile, and asked
+    /// of the log again once a range's write became durable since, or once every range applied all
+    /// its log holds committed past what it had then (a start's replay done): what may have freed
+    /// room, or what a compaction can now free. Whatever moved, it is asked again one of the
+    /// stream's shortest sending intervals after the refusal ([`Node::liveness_retry_at`]).
+    liveness_owed: Option<(u64, u64, u64)>,
     /// A compaction of every range wanted for the owed write: one at each refusal
     /// ([`Node::compact_if_stalled`]).
     liveness_compact: bool,
@@ -2700,6 +2704,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             snapshots_taken: self.snapshots_taken,
             stalled: seen.stalled,
             liveness_waits: self.liveness_waits,
+            liveness_writes: self.liveness_writes,
             compactions: self.compactions,
             in_flight: seen.in_flight,
             writes: seen.writes,
@@ -3157,9 +3162,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// Waits for the first of: the transport's next event, a datagram on the plane, the earliest
-    /// deadline (a replica's, the stream's, a redial), or any other wake of the task (a log's or a
-    /// volume's answer). Returns at once when replicas are queued, or when an answer has come
-    /// already ([`Node::answered`]).
+    /// deadline (a replica's, the stream's, an owed liveness write's retry, a redial), or any
+    /// other wake of the task (a log's or a volume's answer). Returns at once when replicas are
+    /// queued, or when an answer has come already ([`Node::answered`]).
     ///
     /// A wait begun before the stream's wake and ended at or past it, whatever ended it, is
     /// reported to the stream as it ends: its lateness is the stream's granularity
@@ -3211,6 +3216,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let due = [
             self.deadlines.first().map(|(at, _)| *at),
             wake,
+            self.liveness_retry_at(),
             redial,
             self.asks_due(now),
             self.reads_due(now),
@@ -3371,9 +3377,29 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// The log refused the stream's write for room: owed until the log takes it, and a
     /// compaction of every range wanted, through what each engine applied.
     fn owe_liveness(&mut self) {
-        self.liveness_owed = Some((self.log_durables, self.applied_total()));
+        let refused = hyper_rt::futures::now_ns();
+        self.liveness_owed = Some((self.log_durables, self.applied_total(), refused));
         self.liveness_compact = true;
         self.liveness_waits = self.liveness_waits.saturating_add(1);
+    }
+
+    /// When the owed write is asked again whatever else moved: one of the stream's shortest
+    /// sending intervals after the log refused it, the cadence at which the stream of a node that
+    /// writes nothing else asks its proofs (node.md §2.4, item 5). A refusal for room is answered
+    /// by no waiter the node could hold: hyper-log holds one only for room in its queue, and frees
+    /// a full file's segments at a sweep it tells no submitter of (raft-log.md §3, §5), so an idle
+    /// node, whose ranges neither write nor apply, saw nothing move and never asked again: its
+    /// stream waited on the answer, and its peers heard no heartbeat from it while it idled.
+    /// `None` while none is owed, or while no pair has a schedule and no heartbeat waits on it.
+    fn liveness_retry_at(&self) -> Option<u64> {
+        let (_, _, refused) = self.liveness_owed?;
+        let interval = self
+            .remotes
+            .iter()
+            .filter_map(|r| self.liveness.report(r.id))
+            .filter_map(|report| report.sending)
+            .min()?;
+        Some(refused.saturating_add(u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX)))
     }
 
     /// Every range's applied entries, summed: what a replay moves.
@@ -3402,12 +3428,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             .all(|(applied, commit)| applied >= commit)
     }
 
-    /// Whether the owed write is asked again now: a range's write became durable since it was
-    /// refused, the log's progress that may have freed room; or every range applied all its log
-    /// holds committed, past what it had then, which a compaction then frees.
-    fn liveness_due(&self) -> bool {
-        self.liveness_owed.is_some_and(|(durables, applied)| {
-            self.log_durables > durables || (self.caught_up() && self.applied_total() > applied)
+    /// Whether the owed write is asked again at `now`: a range's write became durable since it
+    /// was refused, the log's progress that may have freed room; or every range applied all its
+    /// log holds committed, past what it had then, which a compaction then frees; or its retry
+    /// came ([`Self::liveness_retry_at`]).
+    fn liveness_due(&self, now: u64) -> bool {
+        self.liveness_owed.is_some_and(|(durables, applied, _)| {
+            self.log_durables > durables
+                || (self.caught_up() && self.applied_total() > applied)
+                || self.liveness_retry_at().is_some_and(|at| now >= at)
         })
     }
 
@@ -3527,11 +3556,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// and its changes to the replicas.
     fn act_on_liveness(&mut self) -> Result<(), NodeError> {
         let asked = std::mem::take(&mut self.asked.flush);
-        // An owed write is asked again only on what may have freed room (`liveness_due`): asked
-        // again before, a log still full refuses it again at once.
-        let owed = self.liveness_due();
+        // An owed write is asked again only on what may have freed room, or at its retry a
+        // sending interval on (`liveness_due`): asked again at every turn, a log still full
+        // refuses it again at once.
+        let started = hyper_rt::futures::now_ns();
+        let owed = self.liveness_due(started);
         if (asked || owed) && self.liveness_write.is_none() {
-            let started = hyper_rt::futures::now_ns();
             match self.log.write_liveness(LIVENESS_GROUP, self.waker.clone()) {
                 Ok(pending) => {
                     self.liveness_owed = None;

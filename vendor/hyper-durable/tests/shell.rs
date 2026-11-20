@@ -1729,31 +1729,18 @@ fn refused(r: &mut Sim, append: &Message) -> Message {
         ..Message::default()
     })
     .unwrap();
-    next_snapshot(r, append.term)
+    next_snapshot(r)
 }
 
-/// The snapshot `r` sends learner 2, behind its log's start, in leader's `term`. The core asks
-/// storage for one and is told it is temporarily unavailable; the drive after makes the image,
-/// and the core sends it at its next send to the learner: one the drives that made it brought,
-/// or the learner's next answer to a heartbeat (mantle: vendor/UPSTREAM.md, an image made when
-/// the core asks, not at a compaction).
-fn next_snapshot(r: &mut Sim, term: u64) -> Message {
-    let snapshot = |m: &Message| m.to == 2 && m.msg_type == MessageType::MsgSnapshot;
-    if let Some(sent) = pump(r).messages.into_iter().find(snapshot) {
-        return sent;
-    }
-    r.step(Message {
-        msg_type: MessageType::MsgHeartbeatResponse,
-        from: 2,
-        to: 1,
-        term,
-        ..Message::default()
-    })
-    .unwrap();
+/// The snapshot `r` sends learner 2, behind its log's start. The core asks storage for one and is
+/// told it is temporarily unavailable; the drive after makes the image and has the core send it,
+/// with no answer of the learner's between (mantle: vendor/UPSTREAM.md, an image made when the
+/// core asks, not at a compaction, and sent once made, not at the core's next try).
+fn next_snapshot(r: &mut Sim) -> Message {
     pump(r)
         .messages
         .into_iter()
-        .find(snapshot)
+        .find(|m| m.to == 2 && m.msg_type == MessageType::MsgSnapshot)
         .expect("a snapshot for the learner")
 }
 
@@ -1799,7 +1786,7 @@ fn a_snapshot_carries_the_configuration_held_at_its_images_point() {
     r.report_snapshot(2, false).unwrap();
     r.report_unreachable(2).unwrap();
     r.propose(Vec::new(), b"again".to_vec()).unwrap();
-    let sent = next_snapshot(&mut r, probe.term);
+    let sent = next_snapshot(&mut r);
     let metadata = sent.snapshot.as_ref().unwrap().metadata.clone().unwrap();
     assert_eq!(metadata.index, checkpointed.index);
     assert_eq!(metadata.conf_state.unwrap().learners, vec![2]);

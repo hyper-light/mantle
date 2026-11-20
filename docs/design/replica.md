@@ -426,19 +426,30 @@ dissertation's §5.2). A member that needs entries from before the start is sent
 instead: every row of the range as of the last entry the leader applied when the core asked for
 it, with the configuration the group held there (hyper-raft `docs/durable.md` §2.3). The core asks
 storage for one (`Storage::snapshot`); none held reaches what it needs, so storage notes the
-index needed and answers that a snapshot is temporarily unavailable, the replica's next drive
-makes the image, and the core sends it at its next try, the member's next answer to a heartbeat:
-raft-rs's and etcd's storage contract, and TiKV's shape (research/91 §2–§3). A snapshot's index
-is at or past the log's start, so the member continues from the entries after it; one a later
-compaction passed serves no member and is let go of. Until this, every compaction imaged the
+index needed and answers that a snapshot is temporarily unavailable, and the replica's next drive
+makes the image: raft-rs's and etcd's storage contract, and TiKV's shape (research/91 §2–§3). The
+same drive has the core send it (`RawNode::send_append`) to each member behind the start that it
+may send to now, as log catch-up sends a page once the store has read it, and as raft-rs's owner
+has the core send entries its storage fetched after answering them temporarily unavailable
+(`on_entries_fetched`, research/91 §2a): the answer leaves the member's progress as it was, so
+the snapshot goes out by the core's own path. Left to the core's next try, it went at the
+member's next answer to a heartbeat, a round later, and never where nothing beat: the node's
+`a_far_ranges_snapshot_is_sent_and_installed_through_the_lanes`, whose network is the test's
+thread, waited out its deadline. A stalled member takes no part in the group (§3), so it makes
+the image once the stall ends, in the drive that sends it. An image short of what was asked, a
+machine's last checkpoint behind what it applied, waits for the core's next try: sent at once,
+the core would ask again at once and every drive image again. A snapshot's index is at or past
+the log's start, so the member continues from the entries after it; one a later compaction
+passed serves no member and is let go of. Until this, every compaction imaged the
 range, read and encoded every row on the node's shard whether or not any member was behind: 2%
 of that thread's time in a profile of a three-node cell on one Mac Studio taking one-byte PUTs at
 about 5,500 a second, and a cost that grew with every object stored.
 `a_compaction_with_no_member_behind_makes_no_image`,
-`a_member_behind_the_start_catches_up_by_an_image_made_when_asked` and
-`an_image_made_for_a_member_is_of_the_point_applied_when_asked` (`crates/range/tests/group.rs`)
-hold this. A member installs one before its log records the new start, its engine's rows
-durable first, so the log never starts past what the engine holds.
+`a_member_behind_the_start_catches_up_by_an_image_made_when_asked`,
+`an_image_made_for_a_member_is_of_the_point_applied_when_asked` and
+`a_member_behind_the_start_is_sent_its_snapshot_by_the_drive_that_makes_it`
+(`crates/range/tests/group.rs`) hold this. A member installs one before its log records the new
+start, its engine's rows durable first, so the log never starts past what the engine holds.
 For now the rows travel inside the snapshot message. The production engine will move its files
 out of band instead (12 §6.3).
 

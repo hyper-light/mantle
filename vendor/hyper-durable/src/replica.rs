@@ -436,7 +436,8 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// (`hyper_liveness::Change::DiskSlow`): at most the group's voters.
     slow_disks: Vec<u64>,
     /// The catch-up's lists, kept between drives (`Replica::stream_catch_up`): the members' next
-    /// indexes, the pages the store holds read, and the members waiting at one.
+    /// indexes, the pages the store holds read, and the members waiting at one, or at a snapshot
+    /// just made (`Replica::send_made`).
     lows: Vec<u64>,
     pages: Vec<u64>,
     waiting: Vec<u64>,
@@ -1663,8 +1664,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.take_light(out)?;
                 r.quiet_commit(now, waker)?;
                 r.stream_catch_up(waker, out)?;
+                r.make_wanted(out)?;
             }
-            r.make_wanted()?;
             r.release_reads(out);
             r.keep();
             r.settle();
@@ -2696,13 +2697,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// ([`Held::wanted`]): the state machine's image, with the configuration the group held at
     /// its point. Not the configuration applied since: a member installing it applies the
     /// changes after the image's point from the log, each once. The core, told the snapshot was
-    /// temporarily unavailable, sends it at its next try, the member's next answer to a
-    /// heartbeat. An image is made only here, so only for a member behind the log's start,
-    /// never for a compaction (raft-rs's `Storage::snapshot`, TiKV's `PeerStorage::snapshot`;
-    /// Ongaro's thesis §5.2; mantle docs/research/91-snapshots-on-demand.md). None is made before
-    /// the machine applied through what is needed: the core asks again, and one made now would
-    /// not reach it.
-    fn make_wanted(&mut self) -> Result<(), ReplicaError> {
+    /// temporarily unavailable, is then asked to send it ([`Replica::send_made`]). An image is
+    /// made only here, so only for a member behind the log's start, never for a compaction
+    /// (raft-rs's `Storage::snapshot`, TiKV's `PeerStorage::snapshot`; Ongaro's thesis §5.2;
+    /// mantle docs/research/91-snapshots-on-demand.md). None is made before the machine applied
+    /// through what is needed: the core asks again, and one made now would not reach it. Not
+    /// while stalled: a stalled member takes no part in the group, and the image waits to be
+    /// made, of what the machine applied by then, at the drive that sends it.
+    fn make_wanted(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
         let Some(wanted) = self.node.store().wanted.take() else {
             return Ok(());
         };
@@ -2721,6 +2723,53 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 term: point.term,
             }),
         });
+        // An image short of what was asked, a machine's last checkpoint behind what it applied,
+        // waits for the core's next try: sent at once, the core would ask again at once, and
+        // every drive would image again until the machine checkpoints past it.
+        if point.index < wanted {
+            return Ok(());
+        }
+        self.send_made(out)
+    }
+
+    /// Has the core send the snapshot just made (`RawNode::send_append`) to each member behind the
+    /// log's start that it may send to now: one whose next entry the log no longer holds, or that
+    /// asked for a snapshot, with no probe or snapshot of its own out. Sent in the drive that made
+    /// it, as [`Replica::stream_catch_up`] sends a page once the store has read it and raft-rs's
+    /// `on_entries_fetched` sends a member what storage had said was temporarily unavailable
+    /// (mantle docs/research/91-snapshots-on-demand.md §2a). Left to the core's next try, it went
+    /// at the member's next answer to a heartbeat: a round later, and never in a group no beat
+    /// reached. The members are the core's, so as many as its configuration names.
+    fn send_made(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
+        if !self.is_leader() {
+            return Ok(());
+        }
+        let start = self.node.store().log.bounds().map(|(start, _)| start.index);
+        let start = start.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+        let id = self.id();
+        let mut waiting = std::mem::take(&mut self.waiting);
+        waiting.clear();
+        let behind = self
+            .node
+            .raft
+            .tracker()
+            .iter()
+            .filter(|&(member, progress)| {
+                member != id
+                    && !progress.is_paused()
+                    && (progress.next_index <= start || progress.pending_request_snapshot != 0)
+            });
+        waiting.extend(behind.map(|(member, _)| member));
+        let sent = waiting
+            .iter()
+            .try_for_each(|&member| self.node.send_append(member));
+        let any = !waiting.is_empty();
+        self.waiting = waiting;
+        self.must(sent)?;
+        if any {
+            let messages = self.node.messages_now();
+            self.emit(messages, out);
+        }
         Ok(())
     }
 

@@ -2509,3 +2509,68 @@ fn an_image_made_for_a_member_is_of_the_point_applied_when_asked() {
     let leader = rows_applied(nodes[0].replica.engine_mut());
     assert_eq!(rows_applied(nodes[2].replica.engine_mut()), leader);
 }
+
+/// Steps each of `messages` into the member it is for.
+fn deliver(nodes: &mut [Node], messages: Vec<Message>) {
+    for m in messages {
+        let to = usize::try_from(m.to).unwrap() - 1;
+        // A message the core refuses changes nothing.
+        let _ = nodes[to].replica.step(m);
+    }
+}
+
+/// A member behind the log's start is sent its snapshot by the leader's drive that makes the
+/// image, with no tick or heartbeat between the core's request and the send: the member refuses
+/// an append it cannot take, the core asks for a snapshot as it takes the refusal and is told
+/// none is ready, and the leader's next drive makes the image and has the core send it, as
+/// raft-rs's `on_entries_fetched` sends what storage had said was temporarily unavailable
+/// (docs/design/replica.md §4). Left to the core's next try, it went at the member's next answer
+/// to a heartbeat, and a member no heartbeat reached was never sent it.
+#[test]
+fn a_member_behind_the_start_is_sent_its_snapshot_by_the_drive_that_makes_it() {
+    let mut nodes = led(1);
+    let mut sent = Vec::new();
+    for serial in 1..4 {
+        nodes[0].replica.propose(&registration(serial)).unwrap();
+        exchange(&mut nodes, Some(3), &mut sent);
+    }
+    assert!(nodes[0].replica.compact(0, 0, Waker::noop()).unwrap());
+    exchange(&mut nodes, Some(3), &mut sent);
+
+    // The leader's next append reaches member 3, which lacks the entries before it.
+    nodes[0].replica.propose(&registration(4)).unwrap();
+    let (out, _) = drive(&mut nodes[0].replica, true);
+    let (to_3, others): (Vec<Message>, Vec<Message>) =
+        out.messages.into_iter().partition(|m| m.to == 3);
+    deliver(&mut nodes, others);
+    assert!(
+        !of(&to_3, MessageType::MsgAppend).is_empty(),
+        "no append for member 3: {to_3:?}"
+    );
+    deliver(&mut nodes, to_3);
+    let (out, _) = drive(&mut nodes[2].replica, true);
+    let refusal = out
+        .messages
+        .into_iter()
+        .find(|m| m.to == 1 && m.msg_type == MessageType::MsgAppendResponse && m.reject)
+        .expect("member 3 refuses the append");
+    // Taking the refusal, the core asks for a snapshot, and none is held.
+    nodes[0].replica.step(refusal).unwrap();
+    assert_eq!(nodes[0].replica.images_made(), 0);
+
+    // The leader's next drive, with no tick before it, makes the image and sends it.
+    let (out, _) = drive(&mut nodes[0].replica, false);
+    assert_eq!(nodes[0].replica.images_made(), 1);
+    let snapshots = of(&out.messages, MessageType::MsgSnapshot);
+    assert_eq!(snapshots.len(), 1, "{:?}", out.messages);
+    assert_eq!(snapshots[0].to, 3);
+
+    // Member 3 installs it, and once caught up holds the leader's rows: the image sent was the
+    // only one made and sent.
+    deliver(&mut nodes, out.messages);
+    beat_until_caught_up(&mut nodes, 3, 20, &mut sent);
+    assert!(sent.is_empty(), "another snapshot went out: {sent:?}");
+    assert_eq!(nodes[0].replica.images_made(), 1);
+    let leader = rows_applied(nodes[0].replica.engine_mut());
+    assert_eq!(rows_applied(nodes[2].replica.engine_mut()), leader);
+}

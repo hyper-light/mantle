@@ -178,6 +178,8 @@ fn a_sole_voter_logs_its_commit_in_the_write_of_its_entries() {
 fn an_entry_the_machine_has_no_room_for_waits_committed_for_the_drive_that_finds_room() {
     let mut r = sole(3, Unbounded, |_| {});
     let before = r.applied().index;
+    // The machine already holds the empty entry of the leader's election, applied in `sole`.
+    let held = r.machine().now.clone();
     r.machine_mut().roomless = true;
     for i in 0..4u64 {
         r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
@@ -195,7 +197,11 @@ fn an_entry_the_machine_has_no_room_for_waits_committed_for_the_drive_that_finds
         r.durable_commit() >= before + 4,
         "the entries were not committed"
     );
-    assert!(r.machine().now.entries.is_empty());
+    assert_eq!(
+        r.machine().now,
+        held,
+        "the machine took an entry it had no room for"
+    );
     // Still waiting: a drive with no room applies nothing and rests again.
     let out = pump(&mut r);
     assert!(out.answers.is_empty());

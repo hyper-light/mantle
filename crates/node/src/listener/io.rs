@@ -28,11 +28,12 @@ pub enum IoError {
 }
 
 /// What a client took of a write once the socket had no room for the rest of it: when it first had
-/// none, and the octets the socket took after, which the client made room for, so its pace with
-/// no buffer of the socket's or the client's holding it back (`crate::window`, `host::Drain`). A
-/// write the socket took whole says only that its room was there. Under TLS the octets are the
-/// plaintext the connection took into records after, the record being sent as the socket filled
-/// left out.
+/// none, which the socket says by taking less than it was offered or refusing the offer whole
+/// (`EAGAIN`, `WSAEWOULDBLOCK`), and the octets the socket took after, which the client made room
+/// for, so its pace with no buffer of the socket's or the client's holding it back
+/// (`crate::window`, `host::Drain`). A write the socket took whole says only that its room was
+/// there. Under TLS the octets are the plaintext the connection took into records after, the
+/// record being sent as the socket filled left out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Drained {
     pub full: Option<Instant>,
@@ -48,6 +49,30 @@ impl Drained {
                 .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
         }
     }
+}
+
+/// What a plain connection offers its socket of a body at a time. A Linux or macOS socket takes
+/// no more of an offer than its send buffer has room for and says how much it took (`write(2)`:
+/// a socket subject to flow control may write fewer bytes than requested), so the whole of the
+/// rest is offered. A Windows socket takes all of an offer while it is under its quota, however far
+/// past the quota that leaves it, and all of one more past it while it holds a single send; then
+/// it refuses (`WSAEWOULDBLOCK`) until enough is sent (Microsoft KB214397, "Winsock can buffer more
+/// than the SO_SNDBUF buffer size"); and the quota follows TCP's ideal send backlog, up to 16 MB,
+/// unless the socket sets `SO_SNDBUF` (Microsoft, `SIO_IDEAL_SEND_BACKLOG_QUERY`, dynamic send
+/// buffering). Offered whole blocks, it took a get's first two at once, never a part, so no piece
+/// said its socket was full and no client of a plain connection on Windows was paced; and once
+/// full, it would take a whole block for the little room its client made. Offered a record's
+/// plaintext at a time ([`super::RECORD_PLAINTEXT`]), as the TLS arm offers its socket on every
+/// platform, it takes at most two records past its client's room.
+#[cfg(windows)]
+fn offer(body: &[u8]) -> &[u8] {
+    body.get(..super::RECORD_PLAINTEXT).unwrap_or(body)
+}
+
+/// See the Windows arm.
+#[cfg(not(windows))]
+fn offer(body: &[u8]) -> &[u8] {
+    body
 }
 
 /// A connection's transport: plain HTTP on loopback, TLS elsewhere.
@@ -198,25 +223,34 @@ impl Io {
     /// writes as the socket takes: one vectored write each time it is writable, so a head and the
     /// body after it go out together, neither copied into the other. Under TLS both go into the
     /// connection's records before they are flushed. What its client took of them once the
-    /// socket was full ([`Drained`]).
+    /// socket was full ([`Drained`]). Each write the socket is tried for is a charge of the
+    /// connection's turn on its shard (`hyper_rt::coop`), as a record's is under TLS.
     pub async fn write_pair(&mut self, first: &[u8], second: &[u8]) -> Result<Drained, IoError> {
         let mut drained = Drained::default();
         match self {
             Self::Plain(stream) => {
                 let (mut a, mut b) = (first, second);
                 while !a.is_empty() || !b.is_empty() {
-                    let slices = [IoSlice::new(a), IoSlice::new(b)];
-                    let n = stream
-                        .write_vectored(&slices)
-                        .await
-                        .map_err(IoError::Socket)?;
+                    let body = offer(b);
+                    let slices = [IoSlice::new(a), IoSlice::new(body)];
+                    hyper_rt::coop::consume_budget().await;
+                    // The socket refused the offer whole: it is full, and what it takes from
+                    // here its client makes room for. A Windows socket says so only this way: it
+                    // takes all of an offer while it is under its quota (`offer`).
+                    let Some(n) = stream
+                        .try_write_vectored(&slices)
+                        .map_err(IoError::Socket)?
+                    else {
+                        drained.full.get_or_insert_with(Instant::now);
+                        stream.writable().await.map_err(IoError::Socket)?;
+                        continue;
+                    };
                     if n == 0 {
                         return Err(IoError::Stalled);
                     }
-                    let offered = a.len().saturating_add(b.len());
+                    let offered = a.len().saturating_add(body.len());
                     drained.took(n);
-                    // The socket took less than it was offered: it is full, and what it takes
-                    // from here its client makes room for.
+                    // The socket took less than it was offered: it is full, as one that refused.
                     if n < offered {
                         drained.full.get_or_insert_with(Instant::now);
                     }

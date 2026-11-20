@@ -441,16 +441,23 @@ impl TcpStream {
         }
     }
 
+    /// Writes from `bufs` in order, in one call, without waiting: the bytes the kernel took, or `None`
+    /// when the send buffer is full, so a caller can tell a write the socket refused from one it took.
+    pub fn try_write_vectored(&self, bufs: &[IoSlice<'_>]) -> Result<Option<usize>, RtError> {
+        Ok(match tcpsys::write_vectored(&self.stream, bufs)? {
+            Io::Ready(n) => Some(n),
+            Io::WouldBlock | Io::Interrupted | Io::Astray => None,
+        })
+    }
+
     /// Writes from `bufs` in order, in one call, awaiting writability while the send buffer is full.
     pub async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> Result<usize, RtError> {
         crate::coop::consume_budget().await;
         loop {
-            match tcpsys::write_vectored(&self.stream, bufs)? {
-                Io::Ready(n) => return Ok(n),
-                Io::WouldBlock | Io::Interrupted | Io::Astray => {
-                    writable(self.stream.raw_id()).await?;
-                }
+            if let Some(n) = self.try_write_vectored(bufs)? {
+                return Ok(n);
             }
+            writable(self.stream.raw_id()).await?;
         }
     }
 

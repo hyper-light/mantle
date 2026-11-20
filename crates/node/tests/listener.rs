@@ -497,7 +497,11 @@ fn ask(
 
 /// A get's blocks as the test's host gives them: larger than a loopback socket's buffers on both
 /// sides together (4 MiB each by default on Linux and macOS), so each fills its socket however fast
-/// its client reads.
+/// its client reads. A Windows socket's send quota follows TCP's ideal send backlog, up to 16 MB,
+/// and its client's receive window that client's retrieve rate, up to 16 MB (research/72 [9, 11]);
+/// it takes all of a send under its quota, so the connection offers it a record at a time and
+/// reads a refused send as full there (`listener::io`). Offered a block whole, it took each whole,
+/// so no piece said it was full, however slow its client.
 const BLOCK: usize = 32 << 20;
 
 /// What a get's connection told the node its client's pace was (`door::Doorway::drained`): the

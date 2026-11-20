@@ -25,7 +25,7 @@ pub mod device;
 use std::task::Waker;
 
 use hyper_durable::{
-    EntryRef, Fatal, Fault, Health, LogStore, Point, StateMachine, StoreView, Write,
+    EntryRef, Fatal, Fault, Health, Imaged, LogStore, Point, StateMachine, StoreView, Write,
 };
 use hyper_raft::StorageError;
 use hyper_raft::proto::{ConfChangeV2, ConfState, Entry, HardState};
@@ -467,6 +467,11 @@ pub struct Kv {
     pub out: Option<KvState>,
     /// The checkpoints `persist` began since the member opened.
     pub begun: u64,
+    /// Makes its image a slice a call ([`Imaged::Slice`]), as a machine too large to image in
+    /// one drive: the count first, then an entry a slice, made at the call after the last.
+    pub sliced: bool,
+    /// The image under way, made in slices: the point it began at and the entries written.
+    pub imaging: Option<(Point, usize)>,
 }
 
 /// What a fenced entry's data begins with: a member acts on it at its next start.
@@ -492,6 +497,8 @@ impl Kv {
             held: false,
             out: None,
             begun: 0,
+            sliced: false,
+            imaging: None,
         }
     }
     /// What a crash leaves: a checkpoint out is lost with it.
@@ -510,6 +517,8 @@ impl Kv {
             held: false,
             out: None,
             begun: 0,
+            sliced: self.sliced,
+            imaging: None,
         }
     }
 }
@@ -587,20 +596,46 @@ impl StateMachine for Kv {
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
         self.control || entry.data.starts_with(ACTS)
     }
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
+    fn image(&mut self, into: &mut Vec<u8>, _: u64) -> Result<Imaged, Fatal> {
         let state = if self.checkpoints {
             &self.durable
         } else {
             &self.now
         };
-        put(into, state.entries.len() as u64);
-        for (index, term, data) in &state.entries {
-            put(into, *index);
-            put(into, *term);
-            put(into, data.len() as u64);
-            into.extend_from_slice(data);
+        if !self.sliced {
+            put(into, state.entries.len() as u64);
+            for (index, term, data) in &state.entries {
+                put(into, *index);
+                put(into, *term);
+                put(into, data.len() as u64);
+                into.extend_from_slice(data);
+            }
+            return Ok(Imaged::Made(state.applied, state.configuration.clone()));
         }
-        Ok((state.applied, state.configuration.clone()))
+        // The replica begins an image with nothing written: on no bytes, any image under way was
+        // dropped, and a new one begins.
+        let (at, written) = match self.imaging {
+            Some(under_way) if !into.is_empty() => under_way,
+            _ => {
+                put(into, state.entries.len() as u64);
+                self.imaging = Some((state.applied, 0));
+                return Ok(Imaged::Slice);
+            }
+        };
+        // Every slice reads the state of the point the image began at, as the range machine's.
+        if state.applied != at {
+            return Err(Fatal("an entry applied under an image"));
+        }
+        let Some((index, term, data)) = state.entries.get(written) else {
+            self.imaging = None;
+            return Ok(Imaged::Made(state.applied, state.configuration.clone()));
+        };
+        put(into, *index);
+        put(into, *term);
+        put(into, data.len() as u64);
+        into.extend_from_slice(data);
+        self.imaging = Some((at, written + 1));
+        Ok(Imaged::Slice)
     }
     fn image_bytes(&self) -> Option<u64> {
         // As `image` writes it: the count, then each entry's index, term and length, and its data.

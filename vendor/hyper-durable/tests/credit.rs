@@ -25,7 +25,8 @@ use hyper_block::block::{BlockFile, Durable};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_durable::{
-    Disk, EntryRef, Fatal, GroupStore, Output, Point, Replica, Settings, StateMachine, Unbounded,
+    Disk, EntryRef, Fatal, GroupStore, Imaged, Output, Point, Replica, Settings, StateMachine,
+    Unbounded,
 };
 use hyper_log::{Config, Log, Waits};
 use hyper_raft::proto::{
@@ -79,8 +80,8 @@ impl StateMachine for Noted {
         false
     }
 
-    fn image(&mut self, _: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
-        Ok((self.at, self.configuration.clone()))
+    fn image(&mut self, _: &mut Vec<u8>, _: u64) -> Result<Imaged, Fatal> {
+        Ok(Imaged::Made(self.at, self.configuration.clone()))
     }
 
     fn image_bytes(&self) -> Option<u64> {

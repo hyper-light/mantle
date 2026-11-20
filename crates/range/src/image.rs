@@ -2,35 +2,56 @@
 //! rows travel inside the snapshot message for now; the production engine will move its
 //! files out of band instead (docs/design/replica.md §6; 12 §6.3).
 
-use mantle_codec::{Reader, Writer};
+use mantle_codec::Reader;
 use mantle_meta::engine::Row;
 
 const FORMAT: u8 = 1;
 
-/// The rows' bytes, made at their length ([`encoded_len_of`]), so the buffer never grows.
-pub fn encode(rows: &[Row]) -> Option<Vec<u8>> {
-    let bytes = rows.iter().try_fold(0u64, |sum, (k, v)| {
-        sum.checked_add(u64::try_from(k.len()).ok()?)?
-            .checked_add(u64::try_from(v.len()).ok()?)
-    })?;
-    let len = encoded_len_of(u64::try_from(rows.len()).ok()?, bytes)?;
-    let mut w = Writer::with_capacity(usize::try_from(len).ok()?);
-    w.u8(FORMAT);
-    w.u64(u64::try_from(rows.len()).ok()?);
-    for (k, v) in rows {
-        w.u32(u32::try_from(k.len()).ok()?);
-        w.bytes(k);
-        w.u32(u32::try_from(v.len()).ok()?);
-        w.bytes(v);
-    }
-    let crc = mantle_crc::crc32c(w.as_slice());
-    w.u32(crc);
-    Some(w.into_vec())
+/// The bytes before an image's first row: its format and its count of rows.
+const HEAD: usize = 1 + 8;
+
+/// Begins an image in `into`, which is empty: its head, whose count [`finish`] sets. The rows
+/// follow a slice at a time ([`push_row`]), as a range images its rows a page a drive on a node's
+/// shard (docs/design/replica.md §4).
+pub fn begin(into: &mut Vec<u8>) {
+    into.push(FORMAT);
+    into.extend_from_slice(&0u64.to_le_bytes());
 }
 
-/// The bytes [`encode`] writes for `rows` rows whose keys and values take `bytes`, without
-/// writing them: the format byte, the count, each row's two lengths and its key and value, and
-/// the checksum.
+/// Appends a row: its key's length, its key, its value's length and its value. None for a key or
+/// a value past a u32 of bytes, nothing appended.
+pub fn push_row(into: &mut Vec<u8>, key: &[u8], value: &[u8]) -> Option<()> {
+    let (k, v) = (
+        u32::try_from(key.len()).ok()?,
+        u32::try_from(value.len()).ok()?,
+    );
+    into.extend_from_slice(&k.to_le_bytes());
+    into.extend_from_slice(key);
+    into.extend_from_slice(&v.to_le_bytes());
+    into.extend_from_slice(value);
+    Some(())
+}
+
+/// Ends the image of `rows` rows [`begin`] began in `into`, whose bytes past the head have the
+/// CRC-32C `rows_crc`, kept as each slice was written (`mantle_crc::crc32c_extend`): sets the
+/// count and appends the checksum of the whole, combined from the head's and the rows'
+/// (`mantle_crc::crc32c_combine`), so no step reads the image again. None for an `into` no image
+/// was begun in.
+pub fn finish(into: &mut Vec<u8>, rows: u64, rows_crc: u32) -> Option<()> {
+    let count = into.get_mut(1..HEAD)?;
+    for (to, byte) in count.iter_mut().zip(rows.to_le_bytes()) {
+        *to = byte;
+    }
+    let head = mantle_crc::crc32c(into.get(..HEAD)?);
+    let len = u64::try_from(into.len().checked_sub(HEAD)?).ok()?;
+    let crc = mantle_crc::crc32c_combine(head, rows_crc, len);
+    into.extend_from_slice(&crc.to_le_bytes());
+    Some(())
+}
+
+/// The bytes an image of `rows` rows whose keys and values take `bytes` holds, without writing
+/// it: the format byte, the count, each row's two lengths and its key and value, and the
+/// checksum.
 pub fn encoded_len_of(rows: u64, bytes: u64) -> Option<u64> {
     rows.checked_mul(4 + 4)?
         .checked_add(bytes)?
@@ -67,12 +88,32 @@ pub fn decode(bytes: &[u8]) -> Option<Vec<Row>> {
 
 #[cfg(test)]
 mod tests {
+    use mantle_codec::Writer;
+
     use super::*;
+
+    /// An image of `rows`, written as a range writes one, `per` rows a slice, its checksum kept a
+    /// slice at a time.
+    fn encode(rows: &[Row], per: usize) -> Vec<u8> {
+        let mut into = Vec::new();
+        begin(&mut into);
+        let mut crc = 0;
+        for slice in rows.chunks(per.max(1)) {
+            let start = into.len();
+            for (k, v) in slice {
+                push_row(&mut into, k, v).unwrap();
+            }
+            crc = mantle_crc::crc32c_extend(crc, &into[start..]);
+        }
+        assert_eq!(mantle_crc::crc32c(&into[HEAD..]), crc);
+        finish(&mut into, rows.len() as u64, crc).unwrap();
+        into
+    }
 
     #[test]
     fn rows_round_trip_and_damage_is_refused() {
         let rows = vec![(b"a".to_vec(), b"1".to_vec()), (Vec::new(), Vec::new())];
-        let bytes = encode(&rows).unwrap();
+        let bytes = encode(&rows, 1);
         assert_eq!(decode(&bytes), Some(rows));
         let mut bad = bytes.clone();
         bad[9] ^= 1;
@@ -80,7 +121,7 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
     }
 
-    /// `encode` as it was before Lean doors step 7, in a writer that grows.
+    /// The image as the encoder before slices wrote it, in one step.
     fn reference(rows: &[Row]) -> Vec<u8> {
         let mut w = Writer::default();
         w.u8(FORMAT);
@@ -96,12 +137,11 @@ mod tests {
         w.into_vec()
     }
 
-    /// An image is one buffer made at its length, the bytes the encoder before step 7 wrote: no
-    /// rows, one, ten thousand of varied lengths, and one row of 64 MiB. Its bound, a u32 of bytes
-    /// (hyper-raft's wire), is past what a unit test holds twice over; the length is computed the
-    /// same way at every size.
+    /// An image written a slice at a time, its checksum combined from the slices', is the bytes
+    /// the one-step encoder wrote, at every slice: no rows, one, ten thousand of varied lengths a
+    /// row, a hundred and a whole at a time, and one row of 64 MiB.
     #[test]
-    fn an_image_is_written_at_its_length() {
+    fn an_image_in_slices_is_the_image_made_whole() {
         let many: Vec<Row> = (0..10_000usize)
             .map(|i| (format!("key/{i}").into_bytes(), vec![9u8; i % 1000]))
             .collect();
@@ -114,34 +154,23 @@ mod tests {
                 vec![(b"large".to_vec(), vec![5u8; 64 << 20])],
             ),
         ];
-        let mut wrong = Vec::new();
         for (what, rows) in cases {
-            let (expected, before) = crate::counted(|| reference(&rows));
-            let (bytes, made) = crate::counted(|| encode(&rows).unwrap());
-            println!(
-                "image {what}: before {before:?}, now {made:?}, {} bytes",
-                bytes.len()
-            );
-            if made != (1, 0) || bytes.capacity() != bytes.len() {
-                wrong.push(format!(
-                    "{what}: (allocations, reallocations) {made:?}, capacity {} for {} bytes",
-                    bytes.capacity(),
-                    bytes.len()
-                ));
+            let expected = reference(&rows);
+            for per in [1, 100, rows.len()] {
+                let bytes = encode(&rows, per);
+                assert_eq!(bytes, expected, "{what}, {per} a slice");
             }
-            assert_eq!(bytes, expected, "{what}");
-            assert_eq!(decode(&bytes), Some(rows), "{what}");
+            assert_eq!(decode(&expected), Some(rows), "{what}");
         }
-        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// `encoded_len_of` counts what `encode` writes, for no rows, empty rows and rows of every
-    /// length a byte's worth apart.
+    /// `encoded_len_of` counts what an image of the rows holds, for no rows, empty rows and rows
+    /// of every length a byte's worth apart.
     #[test]
-    fn the_encoded_length_is_what_encode_writes() {
+    fn the_encoded_length_is_what_an_image_holds() {
         let mut rows = Vec::new();
         for n in 0..40usize {
-            let len = encode(&rows).unwrap().len() as u64;
+            let len = encode(&rows, 7).len() as u64;
             let bytes: u64 = rows.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
             assert_eq!(
                 encoded_len_of(rows.len() as u64, bytes),

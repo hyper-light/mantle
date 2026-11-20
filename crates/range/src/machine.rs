@@ -12,7 +12,7 @@
 
 use std::collections::TryReserveError;
 
-use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
+use hyper_durable::{EntryRef, Fatal, Imaged, Point, StateMachine};
 use mantle_codec::{Reader, Writer};
 use mantle_meta::apply::{Layer, apply_entry_with};
 use mantle_meta::engine::{Engine, EngineError, Row, Rows, Write};
@@ -224,6 +224,27 @@ pub struct RangeMachine<E> {
     failure: Option<Failure>,
     /// The replay of the entries past the engine's durable index at open ([`Replay`]).
     replay: Replay,
+    /// The image under way for a member behind the log's start, made a slice a drive
+    /// ([`StateMachine::image`]).
+    imaging: Option<Imaging>,
+}
+
+/// An image made a slice a drive on a node's shard (docs/design/replica.md §4): of the point the
+/// machine applied when it began, under the configuration held there. Its replica applies nothing
+/// until the last slice is made, so each slice reads the state of that point.
+struct Imaging {
+    at: Point,
+    configuration: ConfState,
+    /// The key the next slice reads from: the least past the last row written.
+    from: Vec<u8>,
+    /// The last row's key written, kept as each row is.
+    last: Vec<u8>,
+    /// The rows written.
+    rows: u64,
+    /// The bytes the largest row written takes in the image.
+    largest: usize,
+    /// The CRC-32C of the rows' bytes written (`image::finish`).
+    crc: u32,
 }
 
 impl<E: Engine> RangeMachine<E> {
@@ -265,6 +286,7 @@ impl<E: Engine> RangeMachine<E> {
             durable: point,
             failure: None,
             replay: Replay::None,
+            imaging: None,
         })
     }
 
@@ -454,15 +476,99 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
 
     /// Every row as of the last entry applied, under the configuration held there: the image is
     /// made when the core asks for a snapshot for a member behind the log's start, never for a
-    /// compaction, so it is of everything applied then (docs/design/replica.md §4). It is made at
-    /// its length and moved into `into`, not copied.
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
-        let rows = self
-            .engine
-            .image()
-            .map_err(|e| failed(&mut self.failure, "the engine gave no image", e))?;
-        *into = image::encode(&rows).ok_or(Fatal("a row past u32 bytes"))?;
-        Ok((self.applied, self.configuration.clone()))
+    /// compaction, so it is of everything applied then (docs/design/replica.md §4).
+    ///
+    /// It is made a slice a drive, each slice the engine's pages of rows from where the last
+    /// stopped until `bytes` are written ([`Engine::image_page`]), at most `bytes` / 8 rows and,
+    /// once the image met its largest row, `bytes` and a row, read from memory: a page not in
+    /// memory loads on the engine's workers, whose message wakes the shard, and the slice stops
+    /// there ([`Imaged::Waits`]). Made whole on the shard, an image of a million rows held every
+    /// range the node serves for seconds. The replica applies nothing while it is under way, so
+    /// every slice reads the state of the point it began at: one applied meanwhile is a broken
+    /// promise the machine refuses ([`Fatal`]).
+    fn image(&mut self, into: &mut Vec<u8>, bytes: u64) -> Result<Imaged, Fatal> {
+        if into.is_empty() {
+            image::begin(into);
+            self.imaging = Some(Imaging {
+                at: self.applied,
+                configuration: self.configuration.clone(),
+                from: Vec::new(),
+                last: Vec::new(),
+                rows: 0,
+                largest: 0,
+                crc: 0,
+            });
+        }
+        let Some(imaging) = self.imaging.as_mut() else {
+            return Err(Fatal("an image went on that was never begun"));
+        };
+        if imaging.at != self.applied {
+            return Err(Fatal("the machine applied while its image was made"));
+        }
+        let budget = usize::try_from(bytes).unwrap_or(usize::MAX).max(1);
+        let start = into.len();
+        let mut more = true;
+        let mut waits = false;
+        while more {
+            let written = into.len().saturating_sub(start);
+            let Some(left) = budget.checked_sub(written).filter(|&left| left > 0) else {
+                break;
+            };
+            // As many rows as the bytes left hold at the largest row written so far, one to learn
+            // it from at first: a slice passes its bytes by at most a row once the image met its
+            // largest, and holds no more rows than its bytes do at the least a row takes, its
+            // two lengths.
+            let rows = match imaging.largest {
+                0 => 1,
+                largest => left.checked_div(largest.max(8)).unwrap_or(1).max(1),
+            };
+            let Imaging {
+                from,
+                last,
+                largest,
+                ..
+            } = &mut *imaging;
+            let mut given = 0u64;
+            let page = self.engine.image_page(from.as_slice(), rows, &mut |k, v| {
+                let at = into.len();
+                image::push_row(into, k, v).ok_or(EngineError::RowTooLarge {
+                    key: k.len(),
+                    value: v.len(),
+                })?;
+                *largest = (*largest).max(into.len().saturating_sub(at));
+                last.clear();
+                last.extend_from_slice(k);
+                given = given.saturating_add(1);
+                Ok(())
+            });
+            imaging.rows = imaging.rows.saturating_add(given);
+            if given > 0 {
+                // The least key past the last row: that key and a zero byte.
+                std::mem::swap(&mut imaging.from, &mut imaging.last);
+                imaging.from.push(0);
+            }
+            match page {
+                Ok(filled) => more = filled,
+                Err(EngineError::Unloaded) => {
+                    waits = true;
+                    break;
+                }
+                Err(e) => return Err(failed(&mut self.failure, "the engine gave no image", e)),
+            }
+        }
+        imaging.crc = mantle_crc::crc32c_extend(imaging.crc, into.get(start..).unwrap_or_default());
+        if !waits {
+            // The pages a slice read go to the engine's cache, as an entry's do once applied.
+            self.engine.reads_done();
+        }
+        if more {
+            return Ok(if waits { Imaged::Waits } else { Imaged::Slice });
+        }
+        let Some(imaging) = self.imaging.take() else {
+            return Err(Fatal("an image went on that was never begun"));
+        };
+        image::finish(into, imaging.rows, imaging.crc).ok_or(Fatal("an image with no head"))?;
+        Ok(Imaged::Made(imaging.at, imaging.configuration))
     }
 
     /// The bytes `image` would write now. Asked when a member opens and at each compaction
@@ -625,6 +731,16 @@ mod tests {
             self.rows.image()
         }
 
+        fn image_page(
+            &mut self,
+            from: &[u8],
+            rows: usize,
+            each: &mut mantle_meta::engine::EachRow<'_>,
+        ) -> Result<bool, EngineError> {
+            self.now()?;
+            self.rows.image_page(from, rows, each)
+        }
+
         fn image_size(&self) -> Option<(u64, u64)> {
             self.rows.image_size()
         }
@@ -658,6 +774,28 @@ mod tests {
         max_key_bytes: usize::MAX,
         max_value_bytes: usize::MAX,
     };
+
+    /// The image `machine` makes, a slice of about `bytes` a call, asked again while it waits on
+    /// a page; and the bytes and rows each slice wrote.
+    fn image_whole(
+        machine: &mut RangeMachine<Counted>,
+        bytes: u64,
+    ) -> (Vec<u8>, Point, ConfState, Vec<(usize, u64)>) {
+        let mut image = Vec::new();
+        let mut slices = Vec::new();
+        loop {
+            let (before, rows) = (image.len(), machine.imaging.as_ref().map_or(0, |i| i.rows));
+            let made = machine.image(&mut image, bytes).unwrap();
+            let after = machine.imaging.as_ref().map_or(0, |i| i.rows);
+            match made {
+                Imaged::Made(at, configuration) => {
+                    return (image, at, configuration, slices);
+                }
+                Imaged::Slice => slices.push((image.len() - before, after - rows)),
+                Imaged::Waits => {}
+            }
+        }
+    }
 
     /// A cell's first Name range, as a replica opens it.
     fn opened() -> RangeMachine<Counted> {
@@ -862,8 +1000,7 @@ mod tests {
         let mut given = opened();
         assert_eq!(apply_at(&mut given, 1, 400, stranger()).1, 1);
         assert_eq!(apply_at(&mut given, 2, 450, stranger()).1, 0);
-        let mut image = Vec::new();
-        let (at, configuration) = source.image(&mut image).unwrap();
+        let (image, at, configuration, _) = image_whole(&mut source, 64);
         given.install(&image, at, &configuration).unwrap();
         let later = [
             (500, stranger()),
@@ -888,5 +1025,56 @@ mod tests {
             rows
         };
         assert_eq!(rows(&mut given), rows(&mut source));
+    }
+
+    /// An image is made a slice a call, each about the bytes asked: a slice holds no more rows
+    /// than the bytes hold at a row's least, and writes no more than the bytes and a row past
+    /// them. A page not in memory stops a slice, which goes on once it lands. The image decodes
+    /// to the engine's rows, of the point applied when it began, under the configuration held
+    /// there. One the machine applied an entry under, against the promise its replica keeps, it
+    /// refuses.
+    #[test]
+    fn an_image_is_made_a_bounded_slice_at_a_time() {
+        let mut machine = opened();
+        // The first row is the largest: every slice is bounded from the first.
+        let rows: Vec<Row> = (0..2_000u32)
+            .map(|i| {
+                let len = 96 - (i % 97) as usize;
+                (format!("image/{i:05}").into_bytes(), vec![7u8; len])
+            })
+            .collect();
+        let writes = rows.iter().map(|(k, v)| Write::Put(k.clone(), v.clone()));
+        machine.engine.rows = mantle_meta::engine::Model::default();
+        machine.engine.rows.apply(1, writes.collect()).unwrap();
+        machine.applied = Point { index: 1, term: 1 };
+        let expected = machine.engine.rows.image().unwrap();
+        let largest = expected
+            .iter()
+            .map(|(k, v)| 8 + k.len() + v.len())
+            .max()
+            .unwrap();
+        machine.engine.cold = 3;
+        let (image, at, configuration, slices) = image_whole(&mut machine, 1_024);
+        assert_eq!(at, Point { index: 1, term: 1 });
+        assert_eq!(configuration, ConfState::default());
+        assert_eq!(image::decode(&image), Some(expected.clone()));
+        assert_eq!(machine.engine.refused, 3, "each cold page stopped a slice");
+        assert!(slices.len() > 20, "{} slices", slices.len());
+        for &(bytes, rows) in &slices {
+            assert!(bytes <= 1_024 + largest, "a slice of {bytes} bytes");
+            assert!(rows <= 1_024 / 8 + 1, "a slice of {rows} rows");
+        }
+        // An entry applied while an image is under way breaks the promise: refused.
+        let mut image = Vec::new();
+        assert_eq!(machine.image(&mut image, 64).unwrap(), Imaged::Slice);
+        apply_at(&mut machine, 2, 10, Vec::new());
+        assert!(machine.image(&mut image, 64).is_err());
+        // Begun again, of the point applied now.
+        let (image, at, ..) = image_whole(&mut machine, 1 << 20);
+        assert_eq!(at.index, 2);
+        assert_eq!(
+            image::decode(&image),
+            Some(machine.engine.rows.image().unwrap())
+        );
     }
 }

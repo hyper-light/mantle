@@ -58,32 +58,135 @@ pub fn encoded_len_of(rows: u64, bytes: u64) -> Option<u64> {
         .checked_add(1 + 8 + 4)
 }
 
-pub fn decode(bytes: &[u8]) -> Option<Vec<Row>> {
-    let body_len = bytes.len().checked_sub(4)?;
+/// An image that fails a check (docs/design/replica.md §4): the check, and what the image
+/// states of itself, so a rare failure identifies itself. The checksum carried and the one its
+/// bytes give tell an image whose bytes changed after it was made (they differ) from one made
+/// with a head that disagrees with its rows (they agree, and a later check failed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageError {
+    /// The check it failed.
+    pub check: &'static str,
+    /// The point the image is of, its index and term, where its holder knows it.
+    pub at: Option<(u64, u64)>,
+    /// Its bytes.
+    pub len: usize,
+    /// The rows its head states, where it holds a head.
+    pub count: Option<u64>,
+    /// The checksum it carries and the one its bytes give, where it is long enough to carry one.
+    pub crcs: Option<(u32, u32)>,
+}
+
+impl ImageError {
+    /// What `bytes` states of itself, failing `check`.
+    fn of(bytes: &[u8], check: &'static str) -> Self {
+        let count = bytes
+            .get(1..HEAD)
+            .and_then(|count| <[u8; 8]>::try_from(count).ok())
+            .map(u64::from_le_bytes);
+        let crcs = bytes
+            .len()
+            .checked_sub(4)
+            .and_then(|body| bytes.split_at_checked(body))
+            .and_then(|(body, crc)| {
+                let carried = <[u8; 4]>::try_from(crc).ok().map(u32::from_le_bytes)?;
+                Some((carried, mantle_crc::crc32c(body)))
+            });
+        Self {
+            check,
+            at: None,
+            len: bytes.len(),
+            count,
+            crcs,
+        }
+    }
+
+    /// The same, of the image of `index` and `term`.
+    pub fn at(self, index: u64, term: u64) -> Self {
+        Self {
+            at: Some((index, term)),
+            ..self
+        }
+    }
+}
+
+impl std::fmt::Display for ImageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "an image {}: ", self.check)?;
+        if let Some((index, term)) = self.at {
+            write!(f, "of index {index} and term {term}, ")?;
+        }
+        write!(f, "{} bytes, ", self.len)?;
+        match self.count {
+            Some(count) => write!(f, "{count} rows stated, ")?,
+            None => write!(f, "no count of rows, ")?,
+        }
+        match self.crcs {
+            Some((carried, computed)) => write!(
+                f,
+                "checksum {carried:#010x} carried and {computed:#010x} computed"
+            ),
+            None => write!(f, "no checksum"),
+        }
+    }
+}
+
+impl std::error::Error for ImageError {}
+
+/// Checks `bytes` as an image, handing `each` its rows in order: the checksum over everything
+/// before it first, then the format, the count against what the bytes can hold, each row, and
+/// no byte past the last. The rows it holds.
+fn walk(bytes: &[u8], each: &mut dyn FnMut(&[u8], &[u8])) -> Result<u64, ImageError> {
+    let fail = |check| ImageError::of(bytes, check);
+    let body_len = bytes
+        .len()
+        .checked_sub(4)
+        .ok_or_else(|| fail("is shorter than its checksum"))?;
     let (body, crc) = bytes.split_at(body_len);
-    if mantle_crc::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
-        return None;
+    let carried = <[u8; 4]>::try_from(crc)
+        .map(u32::from_le_bytes)
+        .map_err(|_| fail("is shorter than its checksum"))?;
+    if mantle_crc::crc32c(body) != carried {
+        return Err(fail("does not match its checksum"));
     }
     let mut r = Reader::new(body);
-    if r.u8()? != FORMAT {
-        return None;
+    if r.u8() != Some(FORMAT) {
+        return Err(fail("is of an unknown format"));
     }
-    let count = usize::try_from(r.u64()?).ok()?;
-    // A row takes eight bytes at least.
-    if count > r.remaining() / 8 {
-        return None;
+    let count = r.u64().ok_or_else(|| fail("has no count of rows"))?;
+    let most = u64::try_from(r.remaining() / 8).unwrap_or(u64::MAX);
+    if count > most {
+        return Err(fail("states more rows than its bytes hold"));
     }
-    let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
-        let k = usize::try_from(r.u32()?).ok()?;
-        let key = r.take(k)?.to_vec();
-        let v = usize::try_from(r.u32()?).ok()?;
-        rows.push((key, r.take(v)?.to_vec()));
+        let (key, value) = row(&mut r).ok_or_else(|| fail("ends inside a row"))?;
+        each(key, value);
     }
     if r.remaining() != 0 {
-        return None;
+        return Err(fail("holds bytes past its rows"));
     }
-    Some(rows)
+    Ok(count)
+}
+
+/// Checks `bytes` as an image without taking its rows ([`walk`]): the rows it holds.
+pub fn check(bytes: &[u8]) -> Result<u64, ImageError> {
+    walk(bytes, &mut |_, _| {})
+}
+
+/// The rows `bytes` holds, checked as [`walk`] checks them.
+pub fn decode(bytes: &[u8]) -> Result<Vec<Row>, ImageError> {
+    let mut rows = Vec::new();
+    walk(bytes, &mut |key, value| {
+        rows.push((key.to_vec(), value.to_vec()))
+    })?;
+    Ok(rows)
+}
+
+/// The next row `r` holds: its key, then its value, each after its length.
+fn row<'a>(r: &mut Reader<'a>) -> Option<(&'a [u8], &'a [u8])> {
+    let k = usize::try_from(r.u32()?).ok()?;
+    let key = r.take(k)?;
+    let v = usize::try_from(r.u32()?).ok()?;
+    Some((key, r.take(v)?))
 }
 
 #[cfg(test)]
@@ -114,11 +217,55 @@ mod tests {
     fn rows_round_trip_and_damage_is_refused() {
         let rows = vec![(b"a".to_vec(), b"1".to_vec()), (Vec::new(), Vec::new())];
         let bytes = encode(&rows, 1);
-        assert_eq!(decode(&bytes), Some(rows));
+        assert_eq!(decode(&bytes), Ok(rows));
         let mut bad = bytes.clone();
         bad[9] ^= 1;
-        assert_eq!(decode(&bad), None);
-        assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
+        let failed = |bytes: &[u8]| decode(bytes).unwrap_err().check;
+        assert_eq!(failed(&bad), "does not match its checksum");
+        let error = decode(&bad).unwrap_err();
+        assert_eq!(error.len, bytes.len());
+        assert_eq!(error.count, Some(2));
+        let (carried, computed) = error.crcs.unwrap();
+        assert_ne!(carried, computed);
+        assert_eq!(
+            error.at(7, 3).to_string(),
+            format!(
+                "an image does not match its checksum: of index 7 and term 3, {} bytes, 2 rows \
+                 stated, checksum {carried:#010x} carried and {computed:#010x} computed",
+                bytes.len()
+            )
+        );
+        assert_eq!(
+            failed(&bytes[..bytes.len() - 1]),
+            "does not match its checksum"
+        );
+        assert_eq!(failed(&bytes[..3]), "is shorter than its checksum");
+        assert_eq!(check(&bytes), Ok(2));
+        // Bodies whose checksum holds but whose head disagrees with their rows: each names the
+        // check it failed.
+        let sealed = |body: &[u8]| {
+            let mut sealed = body.to_vec();
+            sealed.extend_from_slice(&mantle_crc::crc32c(body).to_le_bytes());
+            sealed
+        };
+        let body = &bytes[..bytes.len() - 4];
+        let mut format = body.to_vec();
+        format[0] = FORMAT + 1;
+        assert_eq!(failed(&sealed(&format)), "is of an unknown format");
+        // The last row's value said to be longer than the bytes left.
+        let mut short = body.to_vec();
+        let at = short.len() - 4;
+        short[at..].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(failed(&sealed(&short)), "ends inside a row");
+        let mut many = body.to_vec();
+        many[1..HEAD].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            failed(&sealed(&many)),
+            "states more rows than its bytes hold"
+        );
+        let mut fewer = body.to_vec();
+        fewer[1..HEAD].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(failed(&sealed(&fewer)), "holds bytes past its rows");
     }
 
     /// The image as the encoder before slices wrote it, in one step.
@@ -160,7 +307,7 @@ mod tests {
                 let bytes = encode(&rows, per);
                 assert_eq!(bytes, expected, "{what}, {per} a slice");
             }
-            assert_eq!(decode(&expected), Some(rows), "{what}");
+            assert_eq!(decode(&expected), Ok(rows), "{what}");
         }
     }
 

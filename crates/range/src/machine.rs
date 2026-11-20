@@ -123,6 +123,8 @@ pub enum Failure {
     Record(#[from] RecordError),
     #[error(transparent)]
     Memory(#[from] TryReserveError),
+    #[error(transparent)]
+    Image(#[from] image::ImageError),
 }
 
 /// The [`Fatal`] of the step `what`, which failed on `e`, kept in `failure` unless one is
@@ -575,6 +577,17 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
             return Err(Fatal("an image went on that was never begun"));
         };
         image::finish(into, imaging.rows, imaging.crc).ok_or(Fatal("an image with no head"))?;
+        // Checked whole before it leaves, one pass over its bytes and no row taken, so an image
+        // made wrong fails here, naming its point, rows, bytes and checksums, rather than on the
+        // member that installs it: a member that installed a malformed image of a range under
+        // sustained writes and stalls fenced with no word of where it was made (2026-11-20).
+        image::check(into).map_err(|e| {
+            failed(
+                &mut self.failure,
+                "an image made does not pass its checks",
+                e.at(imaging.at.index, imaging.at.term),
+            )
+        })?;
         Ok(Imaged::Made(imaging.at, imaging.configuration))
     }
 
@@ -598,7 +611,13 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         if matches!(self.replay, Replay::Due { .. }) {
             self.replay = Replay::None;
         }
-        let mut rows = image::decode(image).ok_or(Fatal("a snapshot's rows do not decode"))?;
+        let mut rows = image::decode(image).map_err(|e| {
+            failed(
+                &mut self.failure,
+                "a snapshot's rows do not decode",
+                e.at(at.index, at.term),
+            )
+        })?;
         let conf = conf::encode(configuration).ok_or(Fatal("a configuration past u32 members"))?;
         rows.retain(|(k, _)| k.as_slice() != conf::ROW && k.as_slice() != TERM);
         rows.push((conf::ROW.to_vec(), conf));
@@ -966,6 +985,32 @@ mod tests {
         assert_ne!(machine.engine_mut().image().unwrap(), rows);
     }
 
+    /// An image whose bytes changed after it was made is refused by the member that installs it,
+    /// and the fence names the check it failed and what the image states of itself: its point,
+    /// its bytes, the rows its head states, the checksum it carries and the one its bytes give.
+    /// The node that died of one on the release ladder (2026-11-20) said only that "a snapshot's
+    /// rows do not decode".
+    #[test]
+    fn an_image_that_fails_its_checks_fences_its_installer_with_its_facts() {
+        let mut source = opened();
+        apply_at(&mut source, 1, 10, Vec::new());
+        let (mut image, at, configuration, _) = image_whole(&mut source, 64);
+        let len = image.len();
+        image[len / 2] ^= 1;
+        let mut given = opened();
+        let refused = given.install(&image, at, &configuration).unwrap_err();
+        assert_eq!(refused, Fatal("a snapshot's rows do not decode"));
+        let failure = given.failure().unwrap().to_string();
+        assert!(
+            failure.starts_with(&format!(
+                "an image does not match its checksum: of index {} and term {}, {len} bytes, ",
+                at.index, at.term
+            )),
+            "{failure}"
+        );
+        assert!(failure.contains("carried and"), "{failure}");
+    }
+
     /// A range reopened, or given a snapshot, knows nothing of its sessions' last use: its first
     /// entry reads the order of last use, and the entries after it read nothing until a session's
     /// lifetime can have passed. A snapshot's sessions were used at its own entries' times, which
@@ -1064,7 +1109,7 @@ mod tests {
         let (image, at, configuration, slices) = image_whole(&mut machine, 1_024);
         assert_eq!(at, Point { index: 1, term: 1 });
         assert_eq!(configuration, ConfState::default());
-        assert_eq!(image::decode(&image), Some(expected.clone()));
+        assert_eq!(image::decode(&image), Ok(expected.clone()));
         assert_eq!(machine.engine.refused, 3, "each cold page stopped a slice");
         assert!(slices.len() > 20, "{} slices", slices.len());
         for &(bytes, rows) in &slices {
@@ -1081,7 +1126,7 @@ mod tests {
         assert_eq!(at.index, 2);
         assert_eq!(
             image::decode(&image),
-            Some(machine.engine.rows.image().unwrap())
+            Ok(machine.engine.rows.image().unwrap())
         );
     }
 }

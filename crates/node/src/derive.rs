@@ -1340,17 +1340,19 @@ pub fn log_bytes(config: &LogConfig) -> Option<u64> {
 pub const LOG_DEPTH: usize = 3;
 
 /// The heap a range's member takes as it opens, beside what it keeps for each member of its
-/// configuration: 1,672 bytes under elections by suspicion, the node's, at one to ten members,
+/// configuration: 1,688 bytes under elections by suspicion, the node's, at one to ten members,
 /// measured by `tests/range_memory.rs` on macOS aarch64. It holds on the other targets, where CI
 /// runs that test: the allocator counts the bytes each allocation asks for, and nothing a member
 /// allocates as it opens differs by `cfg`; Linux aarch64 measured the 1,736 macOS did while
 /// hyper-durable's `Fault::FailedFor` kept its two words inline (ac41e04b), 16 bytes in each of
 /// the four writes a member reserves room for at open, its log's depth and one of its own, until
-/// they were boxed. 1,584 before hyper-raft's d804110 gave the core's watch the grants each
+/// they were boxed. 1,672 before the core's watch kept the reach a sole voter beats on
+/// (`Watch::reach`, an `Option<u64>` of nanoseconds, 16 bytes in the boxed watch; 689d7afb).
+/// 1,584 before hyper-raft's d804110 gave the core's watch the grants each
 /// candidacy stood for (`Watch::grant_wait`); 1,104 before hyper-raft's core step R-8 (5626e0b)
 /// gave a member its held-commit state, which b5ea01b keeps behind pointers, and 1,080 before
 /// d97153c gave the core's watch its hand-over order and the voter it left.
-pub const MEMBER_BYTES: u64 = 1_672;
+pub const MEMBER_BYTES: u64 = 1_688;
 
 /// The bytes of the context a node names a read by: the read's number (`Node`'s reads).
 const READ_CONTEXT_BYTES: u64 = 8;
@@ -5377,11 +5379,12 @@ mod tests {
     /// each replica in its arena's slot with its entries: 104,808 bytes on macOS aarch64, at its
     /// types' sizes on each other target.
     fn need_96_gib() -> u64 {
+        // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
         let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
         if cfg!(target_os = "linux") {
-            13_714_102_845 - 32 * STACK + 1_605_344 + slots
+            13_714_102_925 - 32 * STACK + 1_605_344 + slots
         } else {
-            13_714_102_845 - 32 * (STACK - WORKER) + slots
+            13_714_102_925 - 32 * (STACK - WORKER) + slots
         }
     }
 
@@ -6604,8 +6607,9 @@ mod tests {
         assert!(need <= memory, "{need}");
         if workers > 0 {
             let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
-            assert_eq!(need, 7_259_117_850 + slots);
-            assert_eq!(need + workers * (STACK - WORKER), 7_762_434_330 + slots);
+            // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
+            assert_eq!(need, 7_259_117_930 + slots);
+            assert_eq!(need + workers * (STACK - WORKER), 7_762_434_410 + slots);
         }
         let given = allowance(Some(need), &machine(memory, None));
         assert_eq!(given.ok(), Some(need));
@@ -6803,8 +6807,9 @@ mod tests {
         if cfg!(not(target_os = "linux")) {
             let at = floor_at_one(founder(2), &runner(2, 256));
             let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
-            assert_eq!(at, 7_366_591_259 + slots);
-            assert_eq!(at + 256 * (STACK - WORKER), 7_869_907_739 + slots);
+            // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
+            assert_eq!(at, 7_366_591_339 + slots);
+            assert_eq!(at + 256 * (STACK - WORKER), 7_869_907_819 + slots);
         }
         // Spread over the shards, the same founder's ranges take a lane from each peer for each
         // shard past the first, and two lanes to the node's shard from each.
@@ -7730,7 +7735,8 @@ mod tests {
         assert!(
             runs(
                 7_255_000_000 + slots..7_260_000_000 + slots,
-                7_257_853_211 + slots..7_257_853_212 + slots
+                // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
+                7_257_853_291 + slots..7_257_853_292 + slots
             )
             .contains(&founded),
             "{founded}"
@@ -7849,10 +7855,11 @@ mod tests {
                 "{at_measured}"
             );
         } else {
-            assert_eq!(at_measured, 7_359_402_011 + slots);
-            assert_eq!((7u64 << 30) - at_measured, 156_790_757 - slots);
+            // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
+            assert_eq!(at_measured, 7_359_402_091 + slots);
+            assert_eq!((7u64 << 30) - at_measured, 156_790_677 - slots);
             // Its workers at Rust's 2 MiB: CI's refusal, the frames' 10,200 bytes and the slots.
-            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_261_211 + slots);
+            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_261_291 + slots);
         }
         // Every term that holds the depth holds the one taken: the issuer's workers among the
         // threads, each volume's reads and transfers, and the transport's room for them.

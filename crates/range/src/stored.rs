@@ -409,9 +409,9 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
         self.db.loads_sent()
     }
 
-    /// `ShardDb::loads_most`.
+    /// `ShardDb::loads_most`, from the engine's configuration alone, so never refused.
     fn loads_most(&mut self) -> Result<usize, EngineError> {
-        self.db.loads_most().map_err(|e| fenced(&mut self.fault, e))
+        Ok(self.db.loads_most())
     }
 
     /// The pages loaded for the reader go to the cache (`ShardDb::release_loaded`).

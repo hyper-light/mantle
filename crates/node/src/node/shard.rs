@@ -644,7 +644,10 @@ pub(crate) fn answer_due<E: Engine + 'static, S: LogStore>(replica: &Replica<E, 
 /// try. A stalled range whose compaction had nothing to free makes its writes again at its next
 /// drive (another range's compaction may have freed it). While a range is stalled every range is
 /// driven again, as it always has been; else only those whose compaction started, or a node waiting
-/// with nothing to compact would turn every range again at every turn. Whether any started.
+/// with nothing to compact would turn every range again at every turn. Each range lets go of its
+/// log's hold for an image, if it holds one (hyper-durable's `Replica::let_go_of_image`): the pass
+/// runs only when the log is out of room (`Node::compact_if_stalled`, `In::Compact`). Whether any
+/// started.
 pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
     owner: &mut Owner<Answers<S>, RangeMachine<E>, Unbounded>,
     handles: impl Iterator<Item = Handle>,
@@ -658,6 +661,11 @@ pub(crate) fn compact<E: Engine + 'static, S: LogStore>(
             continue;
         };
         let stalled = shell.is_stalled();
+        // This pass runs only when the log is out of room, a range anywhere on it stalled or the
+        // liveness stream's write refused: every range lets its hold for an image go, as the
+        // hold's bound is the log's room, which every range on it shares, so no stalled range
+        // waits on another's hold (replica.md §4).
+        shell.let_go_of_image();
         if !stalled && shell.in_flight() > 0 {
             continue;
         }

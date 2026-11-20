@@ -603,9 +603,33 @@ committed, state and depends on no refused write, and a stalled replica still se
 Dropping the image at the stall instead lets the entries apply, but an image that outlasts what
 the log's room holds of writes fills it again, is dropped again, and is never made: a livelock,
 where making it on is bounded by its slices. The compaction that ends such a stall passes the
-image's point, so the member installs it and is sent a second image, made unstalled
-(hyper-durable's `an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader`). The
-engine offers no view that outlives a write to read from instead:
+image's point; the snapshot queued while stalled is then dropped as it leaves, reported failed, and
+the member is sent a fresh image, made unstalled (hyper-durable's
+`an_image_under_way_is_made_while_a_refusal_for_room_stalls_its_leader`).
+
+A leader holds its log for the image's members (`Replica::held_for_image`, research/100). Its
+compaction moves the log's start no further than the image's point, from the drive that begins the
+image (at the machine's durable index then, which no image it makes is behind) through its
+transfer, and again at the point of any snapshot that leaves: a member that installs it is sent
+what follows from the log, not a second image, under writes that compact the log meanwhile. It is
+CockroachDB's pending snapshot index, which its raft log queue never truncates past, set before
+the snapshot is made and released once it is delivered or fails, because without it "the behind
+node will be caught up to a point behind the current first index and thus require another
+snapshot, likely entering a never ending loop of snapshots"; etcd pauses its compaction while a
+snapshot is in flight for the same reason, and TiKV compacts no further than its peers' least
+match. The hold is let go when every other member's match reaches the point (its install
+answered), when a transfer is reported failed, when the member is removed (it leaves the core's
+tracker), when the lead is lost, and at its bound, the group's room in the log: CockroachDB
+bounds its hold by an hour's send timeout and TiKV by the log's size, but here a log out of room
+stalls the group's writes, and a stalled replica takes no message, so neither the install nor its
+answer could arrive while a hold kept through the stall held back the compaction the stall waits
+for. The stall lets the hold go, and that compaction frees the room as it would with no image, so
+no stall path (§2, §3) waits on a hold; the writes up to it are the backpressure a full log is
+(SlowDown). The log is shared, so the node's compaction pass for room, run when a range anywhere
+on it is stalled or the liveness stream's write was refused, lets every range's hold go (mantle-node's
+`compact`, `Replica::let_go_of_image`): no stalled range waits on another range's hold. An image whose point the start passed is not sent: one made while stalled is dropped as
+it leaves and reported failed, so the core asks again and a fresh one is made, as TiKV cancels a
+snapshot being generated once its compaction passes it (`Replica::drop_passed`). The engine offers no view that outlives a write to read from instead:
 its scans page as S3's listings do, no scan state living across writes (`ShardDb::scan`), and it
 is one owner's, so another thread reads none of it; a checkpoint is durable, but its extents are
 reused once a later one is, and no reader holds them (research/91 §6). The range's writes so wait
@@ -1026,9 +1050,19 @@ A member takes a snapshot that does not name it all the same (thesis §4.1; hype
   out of band (§6). The range's writes wait while it is made, its committed entries held
   unapplied, bounded by the log's room as entries waiting for room in the engine are (§2); the
   image is made on while its leader is stalled for room (§4), so a log filled by one range's held
-  entries is freed by that range's compaction once it is made; that compaction passes the image's
-  point, so a member behind a range whose writes fill the log within one image's time is sent
-  image after image and catches up from none. A view of the engine that
+  entries is freed by that range's compaction once it is made. The leader's log is held at the
+  image's point until its member holds it (§4, research/100; built 2026-11-20), so a member whose
+  image is made and installed before the group's writes fill its room catches up from one image.
+  Open: the hold's bound is that room, as a stalled replica takes no message, so a member behind a
+  range whose writes fill the room within one image's making and transfer is still sent image
+  after image. The node compacts only in its pass for room (`Node::compact_if_stalled`,
+  `In::Compact`), which lets every hold go, so on a node the hold keeps nothing a compaction would
+  otherwise free: the member catches up from one image only when it installs before the log
+  fills, as it did before. Next: a stalled leader sends the snapshot and takes the member's answer
+  while it waits for room (they depend on no refused write: the snapshot is of committed state,
+  the answer changes only the member's progress), and the node passes again for room when a hold
+  is let go, so a hold may outlast a pass for room with no range waiting on it for good, its bound
+  then a count of the node's passes. A view of the engine that
   outlives writes (a checkpoint whose extents a reader holds) would let the range apply
   meanwhile and the image be read off the shard.
 - Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed

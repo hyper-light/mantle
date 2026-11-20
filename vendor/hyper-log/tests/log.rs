@@ -2191,7 +2191,8 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
     for p in pending.drain(..) {
         p.wait().unwrap();
     }
-    // A group holds two submissions at most: the one a frame takes and one for the next.
+    // A group holds three submissions at most, one in each frame the writer has in hand: the
+    // one on the device and one for each of the next two.
     let mut cfg = config_now(16, 8);
     cfg.queue_submissions = 8;
     let (device, gated) = held(sim(42));
@@ -2201,13 +2202,14 @@ fn the_queue_bounds_every_submission_not_yet_answered() {
     let mut pending = vec![log.submit(1, small(1)).unwrap()];
     gated.held();
     pending.push(log.submit(1, small(2)).unwrap());
-    assert!(matches!(log.submit(1, small(3)), Err(LogError::Busy)));
+    pending.push(log.submit(1, small(3)).unwrap());
+    assert!(matches!(log.submit(1, small(4)), Err(LogError::Busy)));
     pending.push(log.submit(2, small(1)).unwrap());
     drop(shut);
     for p in pending {
         p.wait().unwrap();
     }
-    assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(2, 0)));
+    assert_eq!(log.view(1).unwrap().unwrap().hard_state, Some(hard(3, 0)));
 }
 
 /// An update of one entry whose records take `len` payload bytes.
@@ -2241,8 +2243,8 @@ fn charged(len: usize) -> u64 {
 
 /// The queue's byte bound is three frames of the largest charge, and holds every submission
 /// not yet answered by the bytes its records take: one group's flood of frame-sized updates is
-/// refused at its own two, another group still gets in, and the bound refuses past three
-/// though the count bound has room (audit S03).
+/// refused past its share, two frames' worth, another group still gets in, and the bound refuses
+/// past three though the count bound has room (audit S03).
 #[test]
 fn the_queue_bounds_the_bytes_of_every_submission_not_yet_answered() {
     let (device, stepped) = held(sim(43));
@@ -2255,7 +2257,8 @@ fn the_queue_bounds_the_bytes_of_every_submission_not_yet_answered() {
     let _released = stepped.released();
     let mut pending = vec![log.submit(1, full(1)).unwrap()];
     stepped.held();
-    // One group floods: its second is taken, and its third refused at its own bound.
+    // One group floods: its second is taken, and its third refused past its share of the bytes,
+    // though its count has room.
     pending.push(log.submit(1, full(2)).unwrap());
     assert!(matches!(log.submit(1, full(3)), Err(LogError::Busy)));
     // Another group still gets in, and the three fill the byte bound: a fourth is refused

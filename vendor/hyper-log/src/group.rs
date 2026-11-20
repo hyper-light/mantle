@@ -412,8 +412,10 @@ impl<F: BlockFile + 'static> GroupLog<F> {
     /// (`PIPELINE_FRAMES`): a fourth could not be written before the third flush from now, and
     /// would add only waiting (hyper-raft docs/durable.md §6). A replica takes readies ahead of
     /// their persistence up to this many. The log admits a group's writes
-    /// `GROUP_SUBMISSIONS` at a time; one past them waits in the log for its group's room, never
-    /// refused, within the handle's own bound (`OUT`), which holds this many and a compaction's.
+    /// `GROUP_SUBMISSIONS` at a time, this many, so each is admitted as it is sent and the frame
+    /// on the device is followed (mantle docs/design/raft-log.md §3); a compaction's past them
+    /// waits in the log for its group's room, never refused, within the handle's own bound
+    /// (`OUT`).
     pub fn depth(&self) -> usize {
         crate::PIPELINE_FRAMES
     }

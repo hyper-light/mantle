@@ -651,8 +651,12 @@ fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
                         .unwrap();
                 if workers > 0 {
                     let (again, worker_counts) = (path.clone(), Arc::clone(&writes));
-                    e.set_workers(move || Ok(counted(&again, false, &worker_counts)), workers)
-                        .unwrap();
+                    e.set_workers(
+                        move || Ok(counted(&again, false, &worker_counts)),
+                        workers,
+                        "",
+                    )
+                    .unwrap();
                 }
                 let fault = |e: &Stored<Counted>, error: mantle_meta::engine::EngineError| {
                     format!("{error}: the engine's {:?}", e.fault())

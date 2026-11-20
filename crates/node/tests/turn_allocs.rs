@@ -202,12 +202,15 @@ fn serving(make: fn(u64) -> Sim, seed: u64, ops: u64) -> alloc::Counts {
 /// index's first tables at the first read a peer asks, which the clients' run is, as 9ec351b7's
 /// maps did. Made once: the clients' runs of 40, 80 and 160 operations each count 4 more than the
 /// tree before, at the floor's windows and at a chunk's, reallocations the same. On Linux 34,401.
+/// 981 fewer since a compaction makes no image (dcaf3f68): the clients' run compacts its ranges'
+/// logs, and each compaction imaged its range, every row read and encoded, whether or not a member
+/// was behind; reallocations 2,055 as before. On Linux 33,420, this Mac's and the 51.
 #[test]
 fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
     const SERVING: u64 = if cfg!(target_os = "linux") {
-        34_401
+        33_420
     } else {
-        34_350
+        33_369
     };
     let counts = serving(Sim::new, 1, 40);
     assert_eq!(counts.allocations, SERVING, "{counts:?}");
@@ -229,13 +232,14 @@ fn a_cell_serving_writes_turns_without_remaking_what_a_turn_keeps() {
 /// same sites made once here, reallocations 2,052. On Linux 33,194: CI run 44547229268's
 /// linux-aarch64 crates leg counted 40,729 at 5fbd5059, with the cell's status reports boxed,
 /// where this Mac counted 40,678, the 51 above it. 33,147 since the reads' index by group, the 4
-/// the floor's run names; on Linux 33,198.
+/// the floor's run names; on Linux 33,198. 32,142 since a compaction makes no image (dcaf3f68),
+/// 1,005 fewer, the images the floor's run names; reallocations 2,052 as before. On Linux 32,193.
 #[test]
 fn a_cell_serving_writes_at_chunked_windows_copies_fewer_datagrams() {
     const CHUNKED: u64 = if cfg!(target_os = "linux") {
-        33_198
+        32_193
     } else {
-        33_147
+        32_142
     };
     let floor = serving(Sim::new, 1, 40);
     let chunked = serving(Sim::chunked, 1, 40);

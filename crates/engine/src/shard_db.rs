@@ -31,7 +31,9 @@ use crate::rows::Rows;
 use crate::scan::{BorrowedScanMerge, ScanMerge};
 use crate::store::superblock::Superblock;
 use crate::store::{Config, IntoFile, Store};
-use crate::trunk::pool::{self, Back, Growth, Job, Owner, Pool, SortPack, Spawn, Ticket, Work};
+use crate::trunk::pool::{
+    self, Back, Growth, Job, Load, Owner, Pool, SortPack, Spawn, Ticket, Work,
+};
 use crate::trunk::{Source, Trunk, TrunkConfig};
 use crate::util::reuse;
 use hyper_block::block::BlockFile;
@@ -2875,6 +2877,171 @@ impl<F: BlockFile> ShardDb<F> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// [`Self::get`] made on a runtime shard's thread without waiting on the device: `Some` of
+    /// its answer from memory ([`Self::get_now`]), or `None` when a page it needs is in none of
+    /// it, that page's read handed to a maintenance worker ([`Work::Load`]) and the workers' next
+    /// message asked to wake the task polling now. The read made again after takes the page
+    /// back first and reads it where it is held, whatever the cache dropped meanwhile
+    /// ([`Self::release_loaded`] lets it go), and a page loaded or loading is never asked of a
+    /// worker again. A replicated range's entry reads its rows so on a node's shard, which
+    /// serves its consensus and transport too: there, each page the cache missed stopped the
+    /// whole node on the device (docs/design/replica.md §2). Off a runtime task, with no workers,
+    /// or with the device's issuer attached (whose reads [`Self::get_async`] makes), it is
+    /// [`Self::get`]; and past [`Self::loads_most`] pages loaded and loading, the read is made
+    /// here, waiting, so an entry whose reads span more pages than the bound still applies.
+    pub fn get_ready(&mut self, key: &[u8], value: &mut Vec<u8>) -> Result<Option<bool>, Error> {
+        if !self.loads_off_shard() {
+            return self.get(key, value).map(Some);
+        }
+        self.take_loads()?;
+        if let Some(found) = self.get_now(key, value)? {
+            return Ok(Some(found));
+        }
+        if self.load_refused()? {
+            return Ok(None);
+        }
+        self.get(key, value).map(Some)
+    }
+
+    /// [`Self::scan_rows`] made as [`Self::get_ready`] makes a get: `Some` of whether the page
+    /// filled, its rows appended to `out`, or `None`, `out` as it was, with the page it needs
+    /// loading on a worker and the task woken by the workers' next message.
+    pub fn scan_rows_ready(
+        &mut self,
+        from: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        out: &mut Rows,
+    ) -> Result<Option<bool>, Error> {
+        if !self.loads_off_shard() {
+            return self.scan_rows(from, end, limit, out).map(Some);
+        }
+        self.take_loads()?;
+        self.calm = false;
+        let rows = out.len();
+        let counted = (self.scans, self.scan_segments, self.scan_listed);
+        self.store.begin_no_wait();
+        let filled = self.scan_inner(from, end, limit, out, None);
+        self.after_scan();
+        let refused = self.store.end_no_wait();
+        match filled {
+            Ok(filled) => return Ok(Some(filled)),
+            Err(_) if refused => {
+                out.truncate(rows);
+                (self.scans, self.scan_segments, self.scan_listed) = counted;
+            }
+            Err(error) => return Err(error),
+        }
+        if self.load_refused()? {
+            return Ok(None);
+        }
+        self.scan_rows(from, end, limit, out).map(Some)
+    }
+
+    /// The most pages loaded and loading at once for reads that may not wait
+    /// ([`Self::get_ready`]): twice the sources a read's path opens through the trunk as it
+    /// stands (`TrunkConfig::sources_most`), each source's leaf and the index page a get reads
+    /// above it, or as many pages as a memtable's bytes hold where that is more. A one-row scan
+    /// lands a leaf of every source on its path, so an extent's pages, two in a node's engines,
+    /// were too few for one entry's reads, and its scan read on the shard.
+    pub fn loads_most(&self) -> Result<usize, Error> {
+        let path = self.trunk.sources_most()?.saturating_mul(2);
+        let memtable = self
+            .mem_limit
+            .checked_div(self.store.config().page_size)
+            .unwrap_or(0);
+        Ok(path.max(memtable).max(1))
+    }
+
+    /// Whether a read that may not wait loads its missing page on a worker: on a runtime task,
+    /// to wake when it lands, with workers to load it, and without the device's issuer.
+    fn loads_off_shard(&mut self) -> bool {
+        hyper_rt::futures::current_task().is_some()
+            && !self.store.has_issuer()
+            && self.trunk.pool_mut().is_some()
+    }
+
+    /// The page the read just refused wanted, loaded on a worker unless it is loaded or loading
+    /// already, and the workers' next message asked to wake the task: true; false where the
+    /// read must be made here instead, with no page named (a write out over it) or the loads at
+    /// their bound ([`Self::loads_most`]).
+    fn load_refused(&mut self) -> Result<bool, Error> {
+        let Some(address) = self.store.refused_page() else {
+            return Ok(false);
+        };
+        if !self.store.loads_page(address) {
+            if self.store.loads() >= self.loads_most()? {
+                return Ok(false);
+            }
+            let job = Box::new(Job {
+                work: Work::Load(Box::new(Load {
+                    address,
+                    page: Vec::new(),
+                })),
+                grant: Vec::new(),
+                file_end: self.store.end(),
+                generation: self.store.generation(),
+                keep: None,
+            });
+            let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
+                what: "a page's load with no workers",
+            })?;
+            match pool.send(job, Owner::Load, true) {
+                Ok(Ok(ticket)) => self.store.load_out(ticket.job, address)?,
+                // Every worker is out: the next one back sends its message, which wakes the
+                // task, and the read made again then hands the load out.
+                Ok(Err(_)) => pool.want_message(),
+                Err((error, _)) => return Err(error),
+            }
+        }
+        let pool = self.trunk.pool_mut().ok_or(Error::InvalidArgument {
+            what: "a page's load with no workers",
+        })?;
+        // A message come already is taken: the task turns again at once to read with it.
+        if pool.wake_on_message(&mut self.store)? != Some(false)
+            && let Some(task) = hyper_rt::futures::current_task()
+        {
+            hyper_rt::waker::waker_for(task.0).wake_by_ref();
+        }
+        Ok(true)
+    }
+
+    /// Takes back every page's load that has come, without waiting: each page is held for the
+    /// reads that wait on it ([`Store::hold_loaded`]). One the worker failed to read, or read
+    /// and found damaged, fails here as a read on the shard would.
+    fn take_loads(&mut self) -> Result<(), Error> {
+        // Each pass takes one result back, and no more than the loads out can come.
+        for _ in 0..self.store.loads_out() {
+            let Some(pool) = self.trunk.pool_mut() else {
+                return Ok(());
+            };
+            let Some(back) = pool.take(&mut self.store, Owner::Load, false)? else {
+                return Ok(());
+            };
+            let page = match (back.physical_error, back.result, back.loaded) {
+                (Some(error), ..) | (None, Err(error), _) => Err(error),
+                (None, Ok(_), Some(load)) => Ok(load.page),
+                (None, Ok(_), None) => Err(Error::InvalidArgument {
+                    what: "a page's load back without its page",
+                }),
+            };
+            self.store.hold_loaded(back.ticket.job, page)?;
+        }
+        Ok(())
+    }
+
+    /// Lets go of the pages loaded for reads that waited ([`Self::get_ready`]), now done: a
+    /// replicated range's entry that applied. They go to the page cache, which keeps them by its
+    /// own rule.
+    pub fn release_loaded(&mut self) {
+        self.store.release_loaded();
+    }
+
+    /// The pages loaded and loading for reads that may not wait, and the loads out.
+    pub fn loads(&self) -> (usize, usize) {
+        (self.store.loads(), self.store.loads_out())
     }
 
     /// A get the memtables and the kept memtables answer whole, with nothing of the kept

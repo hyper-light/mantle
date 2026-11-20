@@ -188,6 +188,61 @@ hyper-durable's `an_entry_the_machine_has_no_room_for_waits_committed_for_the_dr
 (the replica rests with the entries committed and unapplied, and applies them in order once the
 machine has room).
 
+**An entry's reads wait for their pages; the shard does not** (measured 2026-11-20). A cell of
+three nodes on one Mac Studio took 1-byte PUTs up to a million objects, profiled with macOS
+`sample`. At about 640,000 objects a tenth of the blocked time of each node's first shard, which
+runs its consensus, log and transport, was synchronous device reads from the range's apply path:
+a one-row scan (`name::current` reading a name's current version through `Rows::next`,
+`ShardDb::scan_rows`) landing a leaf (`land_page`, `read_exact_at`), and a get whose leaf the
+page cache missed (`ShardDb::get`, `get_passed`, `read_page_uncached`). Each miss stopped every
+range, the consensus and the transport on the device, and the misses grow as the store outgrows
+its cache.
+
+An entry's read set is not known before it is applied: each command reads what the reads before
+it named (a session's row its serials, a name's current version the precondition it is checked
+against), so no probe can list the pages first. The range applies the entry with reads that wait
+on nothing instead (`Engine::get_now`, `Engine::next_now`; `ShardDb::get_ready`,
+`scan_rows_ready`): from memory, or refused `EngineError::Unloaded`, with the page the refused
+read named (`Store::refused_page`) handed to a maintenance worker, read through the worker's own
+handle on the store's file and verified as every page read is (`Work::Load`). The layer buffers
+the entry's writes in an overlay and hands the engine its batch only after the entry's last read
+(`apply::apply_entry_with`), so a pass refused part way is discarded whole: it is the dry run, and
+it is the application itself once every page is in memory, with no second pass to pay. Refused,
+the state machine answers the entry unapplied as it does for no room, the replica stops before it
+committed and unapplied, the worker's message wakes the task (`Pool::wake_on_message`), and the
+node drives each range whose entries wait at every turn (`shard::answer_due`); no timer is
+involved. The pass made again reads the loaded page where the store holds it (`Store::hold_loaded`,
+taken before the device), whatever the cache dropped meanwhile, and goes on to the
+next page it lacks: a page loaded or loading is never asked of a worker again, and the held pages
+go to the cache once the entry applies (`ShardDb::release_loaded`). An extent that no node names
+any more drops its held pages and marks its loads out stale before it can be written again
+(`Store::release`), so no held page outlives the page it copied.
+
+A pass stops at its first missing page and sends at most one load, and the pages held and loading
+for a range are at most twice the sources a read's path opens through the trunk as it stands
+(`ShardDb::loads_most`, `TrunkConfig::sources_most`: each source's leaf and the index page a get
+reads above it), or a memtable's bytes' worth of pages where that is more: past it the read is
+made on the shard as before, so an entry whose reads span more pages than the bound still
+applies. An extent's pages, the first bound tried, were two in a node's engines, fewer than a
+one-row scan over three branches lands: the test below caught that scan reading on the shard. A read off a runtime
+task, in an engine with no workers or with the device's issuer attached (whose reads go there,
+engine-structure.md §2) is made as before. The load goes to a worker rather than the issuer because
+a node's range engines have none attached (§4, the checkpoint's flushes). A page the OS holds in
+memory is still read in place (`read_resident_at`, research/41 §1): a load off the thread costs a
+wake the scheduler grants, 7–58 µs at the median and milliseconds at the tail on this host
+(research/41 §1), which the shard no longer waits through, against a flash read of about 100 µs
+(HL23-F3, research/03 §2) that it did; a thread blocked on a synchronous read is the pattern that
+does not scale (HL23-F7, R1.3), and clients' work never waits on the engine's own (SILK,
+research/34 §5). The price: an entry whose pages are cold takes one round trip a missing page, one
+after another, and a pass made again reads again what the passes before it read. A clear's span
+(only a split writes one) is still read inline (`Stored::batch_bytes`, `clear`). Measured by
+`node::upkeep::tests::an_entrys_reads_load_their_pages_on_the_worker_and_the_shard_reads_none`
+(an engine opened again over rows its file alone holds, its cache empty, the worker's reads held
+at a gate: the read is refused at once, asked again it sends no second load, the shard's handle
+reads nothing throughout, each worker's message wakes the task, each page is read once on the
+worker, and the entry then applies whole) and
+`machine::tests::an_entry_whose_rows_are_not_in_memory_applies_nothing_until_they_are`.
+
 **A row past the range's bounds refuses its command** (measured 2026-10-21). The engine holds a
 row whole, in one branch page and in its memtable (`mantle_engine::branch::fits`,
 `memtable::hashed::entry_bytes`), and takes a row past its page into its memtable, to fence at

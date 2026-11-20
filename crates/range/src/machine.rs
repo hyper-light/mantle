@@ -96,8 +96,10 @@ struct Termed<'a, E> {
     engine: &'a mut E,
     row: Option<Write>,
     /// The batch is applied only with room for all of it now ([`Engine::apply_now`]), refused
-    /// [`EngineError::NoRoom`] otherwise: an entry's, which waits committed rather than the shard.
-    /// A change's is applied whatever it waits on: the core has applied it already.
+    /// [`EngineError::NoRoom`] otherwise, and every row is read from memory or refused
+    /// [`EngineError::Unloaded`] ([`Engine::get_now`]): an entry's, which waits committed rather
+    /// than the shard. A change's is applied whatever it waits on: the core has applied it
+    /// already.
     now: bool,
 }
 
@@ -129,10 +131,16 @@ impl<E: Engine> Termed<'_, E> {
 
 impl<E: Engine> Rows for Termed<'_, E> {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        if self.now {
+            return self.engine.get_now(key);
+        }
         self.engine.get(key)
     }
 
     fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+        if self.now {
+            return self.engine.next_now(from, to);
+        }
         self.engine.next(from, to)
     }
 
@@ -244,9 +252,12 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     type Answer = Applied;
 
     /// The entry's batch is applied only with room in the engine for all of it now
-    /// ([`Engine::apply_now`]): with none, nothing of it is applied or answered and the shell
-    /// gives it again at the drive the engine's worker wakes the owner for, the layer's work then
-    /// done again over the same rows, the same batch.
+    /// ([`Engine::apply_now`]), and only once every row its commands read is in memory
+    /// ([`Engine::get_now`]): with no room, or a row's page loading, nothing of it is applied or
+    /// answered and the shell gives it again at the drive the engine's worker wakes the owner
+    /// for, the layer's work then done again over the same rows, the same batch. The layer
+    /// buffers the entry's writes in an overlay and hands the engine its batch only after its
+    /// last read, so a read refused part way leaves nothing of the entry behind.
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Applied>) -> Result<bool, Fatal> {
         let (layer, rules) = (self.layer, self.rules);
         // Lent to the entry, as the engine is, and kept only once the entry applies.
@@ -263,7 +274,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         if entry.data.is_empty() {
             match engine.apply(entry.index, Vec::new()) {
                 Ok(()) => {}
-                Err(EngineError::NoRoom) => return Ok(false),
+                Err(EngineError::NoRoom | EngineError::Unloaded) => return Ok(false),
                 Err(e) => return Err(failed(failure, "the engine refused an entry", e)),
             }
         } else {
@@ -279,7 +290,9 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
             );
             let made = match applied {
                 Ok(made) => made,
-                Err(MetaError::Engine(EngineError::NoRoom)) => return Ok(false),
+                Err(MetaError::Engine(EngineError::NoRoom | EngineError::Unloaded)) => {
+                    return Ok(false);
+                }
                 Err(e) => {
                     return Err(failed(
                         failure,
@@ -451,10 +464,26 @@ mod tests {
 
     /// A model engine that counts the reads of the order of last use it is asked, and, while
     /// `roomless`, has no room for a batch now, as an engine whose rotation waits on its worker.
+    /// Its first `cold` reads without waiting each find their page not in memory, as an engine
+    /// whose cache is cold does, a page landing at each: `refused` counts them.
     struct Counted {
         rows: mantle_meta::engine::Model,
         scans: u64,
         roomless: bool,
+        cold: u64,
+        refused: u64,
+    }
+
+    impl Counted {
+        /// A read without waiting: refused while pages are cold, the next one landing.
+        fn now(&mut self) -> Result<(), EngineError> {
+            if self.cold == 0 {
+                return Ok(());
+            }
+            self.cold -= 1;
+            self.refused += 1;
+            Err(EngineError::Unloaded)
+        }
     }
 
     impl Rows for Counted {
@@ -505,6 +534,16 @@ mod tests {
             }
             self.rows.apply(index, writes).map(|()| true)
         }
+
+        fn get_now(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+            self.now()?;
+            self.get(key)
+        }
+
+        fn next_now(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+            self.now()?;
+            self.next(from, to)
+        }
     }
 
     const RULES: Rules = Rules {
@@ -524,6 +563,8 @@ mod tests {
             rows,
             scans: 0,
             roomless: false,
+            cold: 0,
+            refused: 0,
         };
         RangeMachine::open(engine, Layer::Name, RULES, &ConfState::default()).unwrap()
     }
@@ -611,6 +652,61 @@ mod tests {
         assert!(machine.failure().is_none());
         machine.engine_mut().roomless = false;
         assert!(machine.apply(&entry, &mut answers).unwrap());
+        assert_eq!(machine.applied, Point { index: 1, term: 1 });
+        assert_eq!(answers.len(), 1);
+        assert!(
+            matches!(answers[0].answer, Answer::Registered { .. }),
+            "{answers:?}"
+        );
+        assert_ne!(machine.engine_mut().image().unwrap(), rows);
+    }
+
+    /// An entry whose reads find their pages not in memory is answered unapplied at each read
+    /// refused, as an entry with no room is: no row, no answer, the machine's applied point and
+    /// its knowledge of its sessions' last use as they were. Each drive reads again, past the
+    /// pages landed, and the one that finds every page in memory applies it whole, answered once.
+    #[test]
+    fn an_entry_whose_rows_are_not_in_memory_applies_nothing_until_they_are() {
+        let mut machine = opened();
+        let registration = wire::Sessioned {
+            session: 0,
+            serial: 0,
+            unanswered: 0,
+            command: wire::Command::Register {
+                owner: 1,
+                run: 1,
+                nth: 1,
+            },
+        };
+        let data = wire::Entry {
+            at_ns: 10,
+            commands: vec![registration],
+        }
+        .encode()
+        .unwrap();
+        let entry = EntryRef {
+            index: 1,
+            term: 1,
+            kind: EntryType::EntryNormal,
+            context: &[],
+            data: &data,
+        };
+        let rows = machine.engine_mut().image().unwrap();
+        let watermark = machine.watermark;
+        machine.engine_mut().cold = 3;
+        let mut answers = Vec::new();
+        for refused in 1..=3 {
+            assert!(!machine.apply(&entry, &mut answers).unwrap(), "{refused}");
+            assert_eq!(machine.engine().refused, refused);
+            assert!(answers.is_empty());
+            assert_eq!(machine.applied, Point { index: 0, term: 0 });
+            assert_eq!(machine.engine().applied(), 0);
+            assert_eq!(machine.engine_mut().image().unwrap(), rows);
+            assert_eq!(machine.watermark, watermark);
+            assert!(machine.failure().is_none());
+        }
+        assert!(machine.apply(&entry, &mut answers).unwrap());
+        assert_eq!(machine.engine().refused, 3);
         assert_eq!(machine.applied, Point { index: 1, term: 1 });
         assert_eq!(answers.len(), 1);
         assert!(

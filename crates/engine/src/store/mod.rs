@@ -228,6 +228,18 @@ pub struct Store<F: BlockFile> {
     prices_reads: bool,
     /// A read was refused since the last [`Self::begin_no_wait`].
     would_wait: bool,
+    /// The page the first read refused since the last [`Self::begin_no_wait`] wanted: the one a
+    /// maintenance worker loads for it (`ShardDb::get_ready`).
+    refused: Option<u64>,
+    /// Pages maintenance workers read for reads that may not wait, verified, by address: every
+    /// read takes a page from here before the device, so a read made again finds what it waited
+    /// for whatever the cache dropped meanwhile. At most the loads `ShardDb::get_ready` bounds,
+    /// let go once what waited on them is done ([`Self::release_loaded`]), and a page dropped as
+    /// soon as no node names its extent ([`Self::release`]), before the extent can be reused.
+    loaded: Vec<(u64, Vec<u8>)>,
+    /// Loads out on a worker: the job's number, the page's address, and whether its extent was
+    /// let go since, its page then dropped when it comes back.
+    loading: Vec<(u64, u64, bool)>,
     config: Config,
     alloc: Allocator,
     /// Accepted worker jobs; nonempty borrowed runs cannot cross this boundary.
@@ -784,6 +796,9 @@ impl<F: BlockFile> Store<F> {
             no_wait: false,
             prices_reads: false,
             would_wait: false,
+            refused: None,
+            loaded: Vec::new(),
+            loading: Vec::new(),
             config,
             alloc: Allocator::new(config.max_extents),
             durable: Superblock {
@@ -868,6 +883,9 @@ impl<F: BlockFile> Store<F> {
             no_wait: false,
             prices_reads: true,
             would_wait: false,
+            refused: None,
+            loaded: Vec::new(),
+            loading: Vec::new(),
             config,
             alloc: Allocator::granted(),
             durable: Superblock {
@@ -996,6 +1014,9 @@ impl<F: BlockFile> Store<F> {
                 file: Some(file),
                 original: None,
                 no_wait: false,
+                refused: None,
+                loaded: Vec::new(),
+                loading: Vec::new(),
                 prices_reads: false,
                 would_wait: false,
                 config,
@@ -1746,6 +1767,16 @@ impl<F: BlockFile> Store<F> {
     pub fn release(&mut self, extent: u64) -> Result<(), Error> {
         self.checkpoint_idle()?;
         self.alloc.release(extent)?;
+        // Free from here, or at the next checkpoint, and then written again: a page loaded or
+        // loading from it would be read for a page no longer there.
+        if !self.alloc.is_held(extent) && self.loads() > 0 {
+            let per = u64::from(self.config.extent_pages);
+            let within = |address: u64| address.checked_div(per) == Some(extent);
+            self.loaded.retain(|&(address, _)| !within(address));
+            for (_, address, stale) in &mut self.loading {
+                *stale |= within(*address);
+            }
+        }
         // An extent no node names any more is read by no one: its pages leave the cache, so
         // the cache holds live pages, not the inputs of compactions done. Forgetting a
         // compaction's inputs at once cost milliseconds of one slice, so the extent waits its
@@ -3167,7 +3198,7 @@ impl<F: BlockFile> Store<F> {
     /// [`Self::read_page`] once the cache has missed: from a queued run, or the device, and
     /// cached.
     fn read_page_uncached(&mut self, address: u64, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.queued_page(address, out)? {
+        if self.queued_page(address, out)? || self.loaded_page(address, out) {
             return Ok(());
         }
         if self.no_wait {
@@ -3407,6 +3438,87 @@ impl<F: BlockFile> Store<F> {
     pub(crate) fn begin_no_wait(&mut self) {
         self.no_wait = true;
         self.would_wait = false;
+        self.refused = None;
+    }
+
+    /// The page the first read refused since the last [`Self::begin_no_wait`] wanted, where one
+    /// wanted a page rather than a write out over it to land.
+    pub(crate) fn refused_page(&self) -> Option<u64> {
+        self.refused
+    }
+
+    /// Whether the page at `address` is loaded or loading for a read that may not wait.
+    pub(crate) fn loads_page(&self, address: u64) -> bool {
+        self.loaded.iter().any(|&(a, _)| a == address)
+            || self.loading.iter().any(|&(_, a, _)| a == address)
+    }
+
+    /// The pages loaded and loading for reads that may not wait.
+    pub(crate) fn loads(&self) -> usize {
+        self.loaded.len().saturating_add(self.loading.len())
+    }
+
+    /// The loads out on a worker.
+    pub(crate) fn loads_out(&self) -> usize {
+        self.loading.len()
+    }
+
+    /// The load of the page at `address` is out on a worker as job `job`.
+    pub(crate) fn load_out(&mut self, job: u64, address: u64) -> Result<(), Error> {
+        self.loading
+            .try_reserve(1)
+            .map_err(|e| io("hold a page's load", e))?;
+        self.loading.push((job, address, false));
+        Ok(())
+    }
+
+    /// Job `job`'s load back with `page`, the payload of the page its address names, read and
+    /// verified on the worker: held for the reads that wait on it, unless the page's extent was
+    /// let go meanwhile, when its bytes may be another page's and are dropped. A load of no job
+    /// out is refused.
+    pub(crate) fn hold_loaded(
+        &mut self,
+        job: u64,
+        page: Result<Vec<u8>, Error>,
+    ) -> Result<(), Error> {
+        let at =
+            self.loading
+                .iter()
+                .position(|&(j, _, _)| j == job)
+                .ok_or(Error::InvalidArgument {
+                    what: "a page's load back for no load out",
+                })?;
+        let (_, address, stale) = self.loading.swap_remove(at);
+        if stale {
+            return Ok(());
+        }
+        let page = page?;
+        self.loaded
+            .try_reserve(1)
+            .map_err(|e| io("hold a loaded page", e))?;
+        self.loaded.push((address, page));
+        Ok(())
+    }
+
+    /// Lets go of the pages loaded for reads that waited, now done: each goes to the cache, which
+    /// keeps it by its own rule as it keeps a page read here.
+    pub(crate) fn release_loaded(&mut self) {
+        for (address, page) in self.loaded.drain(..) {
+            if let Some(c) = self.cache.as_mut() {
+                c.insert(address, &page);
+            }
+        }
+    }
+
+    /// The loaded page held for `address`, appended to `out`: whether one is.
+    fn loaded_page(&self, address: u64, out: &mut Vec<u8>) -> bool {
+        match self.loaded.iter().find(|&&(a, _)| a == address) {
+            Some((_, page)) => {
+                out.extend_from_slice(page);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Ends [`Self::begin_no_wait`]: whether a read was refused meanwhile, so the error it was
@@ -3428,7 +3540,7 @@ impl<F: BlockFile> Store<F> {
                     .iter()
                     .any(|q| q.first <= address && address < q.end)
         }) {
-            return Err(self.refuse_wait());
+            return Err(self.refuse_wait(None));
         }
         let offset = Self::offset_in(self.config, address)?;
         if Self::past(offset, self.config.page_size)? > self.end {
@@ -3451,15 +3563,18 @@ impl<F: BlockFile> Store<F> {
                 }
                 landed
             }
-            Ok(false) => Err(self.refuse_wait()),
+            Ok(false) => Err(self.refuse_wait(Some(address))),
             Err(error) => Err(error),
         };
         self.give_buf(buf);
         read
     }
 
-    fn refuse_wait(&mut self) -> Error {
+    fn refuse_wait(&mut self, page: Option<u64>) -> Error {
         self.would_wait = true;
+        if self.refused.is_none() {
+            self.refused = page;
+        }
         Error::Gone {
             what: "a page only the device can supply now",
         }
@@ -4078,9 +4193,13 @@ impl<F: BlockFile> Store<F> {
                 .first_queued(address, address.saturating_add(1))
                 .is_some();
         if pending.is_none() && !memory {
+            // A page a worker loaded for a read that waited is read where it is held.
+            if self.loaded_page(address, out) {
+                return Ok(None);
+            }
             // A page only the device has: refused while reads may not wait, nothing moved.
             if self.no_wait {
-                return Err(self.refuse_wait());
+                return Err(self.refuse_wait(Some(address)));
             }
             blocking_allowed("a cold span read synchronously in a runtime task")?;
         }
@@ -4094,7 +4213,7 @@ impl<F: BlockFile> Store<F> {
         {
             // Refuse before removing the pending read or replacing its current page.
             if self.no_wait {
-                return Err(self.refuse_wait());
+                return Err(self.refuse_wait(None));
             }
             blocking_allowed("an unanswered span read synchronously in a runtime task")?;
         }

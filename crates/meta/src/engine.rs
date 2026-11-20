@@ -41,6 +41,11 @@ pub enum EngineError {
     /// the room may have come.
     #[error("no room for a batch without waiting on the engine's maintenance")]
     NoRoom,
+    /// A row read without waiting ([`Engine::get_now`], [`Engine::next_now`]) is on a page not
+    /// in memory now: its load is begun on the engine's own workers, and the engine's owner is
+    /// woken when it lands. Nothing was read.
+    #[error("a row's page is not in memory now")]
+    Unloaded,
 }
 
 /// Rows as a state machine reads and writes them.
@@ -123,6 +128,21 @@ pub trait Engine: Rows {
     /// wait on applies the batch.
     fn apply_now(&mut self, index: u64, writes: Vec<Write>) -> Result<bool, EngineError> {
         self.apply(index, writes).map(|()| true)
+    }
+
+    /// [`Rows::get`] made without waiting on the engine's device: the value from memory, or
+    /// [`EngineError::Unloaded`] with the page it needs loading on the engine's own workers and
+    /// the runtime task polling now woken once it lands, by that work and not by a timer
+    /// (docs/design/replica.md §2). A range reads an entry's rows so, on a node's shard that
+    /// serves its consensus and transport as well: the entry waits, committed and unapplied,
+    /// rather than the shard. An engine that never waits on a device reads.
+    fn get_now(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        self.get(key)
+    }
+
+    /// [`Rows::next`] made without waiting on the engine's device, as [`Engine::get_now`].
+    fn next_now(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+        self.next(from, to)
     }
 
     /// Pays up to about `budget` units of the maintenance the engine owes (its packings,

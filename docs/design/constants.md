@@ -915,6 +915,8 @@ than a hundred characters is stated as the SHA-256 of its tokens (`sha256:`).
 | `crates/range/src/conf.rs` `FORMAT` | format | `1` | Version byte of the encoded configuration row. |
 | `crates/range/src/conf.rs` `ROW` | format | `&[LOCAL, marker::CONFIGURATION]` | The row that holds the configuration. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/range/src/image.rs` `FORMAT` | format | `1` | Version byte of the encoded snapshot image. |
+| `crates/range/src/image.rs` `HEAD` | format | `1 + 8` | An image's head before its first row: the format byte and the count of rows, a u64, which `finish` sets once the last slice is in. |
+| `crates/range/src/machine.rs` `RangeMachine::image:max(8)` | format | `8` | The least bytes a row takes in an image, its key's and its value's lengths, a u32 each: a slice reads no more rows than its bytes hold at it. |
 | `crates/range/src/machine.rs` `TERM_BYTES` | format | `8 + 4` | A term's row: the term, a u64, and its CRC-32C, a u32, the length `encode_term` makes its buffer at. |
 | `crates/range/src/machine.rs` `TERM` | format | `&[LOCAL, marker::TERM]` | The row that holds the term of the last entry applied. (a table of a format or algorithm (unlisted in constants.md: not a scalar)) |
 | `crates/range/src/replica.rs` `QUIET` | derived | `Duration::MAX` | `Duration::MAX`, no quiet write: the durable shell writes a commit no write stated after its owner's period so that a member acting on applied state at its next start reopens with it (hyper-raft docs/durable.md §4.1); no entry of a range is acted on at start (`RangeMachine::acts_at_start`), and the engine's durable index is part of the durable commit, so the write is never due. |

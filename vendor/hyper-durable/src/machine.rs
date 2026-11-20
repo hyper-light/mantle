@@ -9,6 +9,19 @@ use crate::store::{EntryRef, Point};
 #[error("the state machine failed: {0}")]
 pub struct Fatal(pub &'static str);
 
+/// What a call of [`StateMachine::image`] made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Imaged {
+    /// The image is whole in `into`: of this point, under this configuration.
+    Made(Point, ConfState),
+    /// A slice was written: the next is made at the replica's next drive, which its owner takes
+    /// at its next turn.
+    Slice,
+    /// The next slice waits on work of the machine's own (a page of its engine loading), which
+    /// wakes its owner, as an entry the machine has no room for does ([`StateMachine::apply`]).
+    Waits,
+}
+
 /// A group's state machine, owned by its replica.
 ///
 /// Its durable state is what a restart opens at: [`StateMachine::durable`] says how far it
@@ -67,7 +80,15 @@ pub trait StateMachine {
     /// checkpoints, as focal's does, gives the latest, which may be behind what it applied and
     /// is never behind the log's start, for a compaction never passes [`StateMachine::durable`]
     /// (I8).
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal>;
+    ///
+    /// Made a slice at a time, each about `bytes` of the image, so the thread that drives the
+    /// group holds no image's whole cost in one drive (mantle docs/design/replica.md §4): asked
+    /// with `into` empty, the machine begins an image of the point it applied; asked again with
+    /// what it wrote, it goes on from where it stopped. The replica applies no entry while an
+    /// image is under way, so every slice reads the state of that one point, and asks for the
+    /// next slice at its next drive ([`Imaged`]). A machine that images in one step gives it
+    /// whole at the first ask.
+    fn image(&mut self, into: &mut Vec<u8>, bytes: u64) -> Result<Imaged, Fatal>;
 
     /// The bytes [`StateMachine::image`] would write now, or none for a machine that cannot say
     /// without reading its state. Asked when a member opens and at each compaction, on the

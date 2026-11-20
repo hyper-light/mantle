@@ -158,3 +158,26 @@ machine that does not need it.
   `RawNode::send_append`; Finding 4), not at the core's next try.
 - Open: the image is still made in one step on the node's shard when it is asked for. The next
   step is TiKV's shape: build it off the shard, or in bounded slices (docs/design/replica.md §7).
+
+## 6. Making the image without holding the shard (Analysis, 2026-11-20)
+
+Ground truth read in mantle's engine at the time of this note:
+
+- `ShardDb::scan` (crates/engine/src/shard_db.rs): "As S3's listings page, so no scan state lives
+  across writes." A page's continuation is a key; nothing pins the rows a scan read.
+- Every read of a `ShardDb` takes `&mut self` (its caches, its memtables' seals, its loads), so the
+  engine is one owner's, its shard's; no other thread reads it.
+- A checkpoint is the durable image of the trunk at an index (`ShardDb::checkpoint_now`), but the
+  engine keeps no reader's hold on its extents, which later work reuses once a later checkpoint is
+  durable.
+
+So neither option the task named as "off the shard" has a view to read from without new engine
+work. In slices, a cursor over the live engine reads one point only while nothing writes it: the
+replica already holds committed entries unapplied while its machine has no room
+(`StateMachine::apply` answering false, `RawNode::pause_apply`), bounded by the core's committed
+page and the log's room, and the same hold keeps the range's state at the image's point while
+the slices are read. The slice's bytes are the drive's committed page
+(`max_committed_size_per_ready`), the quantum a drive's applies take, so the owner's round robin
+stays fair within one unit of work (Shreedhar and Varghese, SIGCOMM 1995, Theorem 4.5, as
+hyper-durable's `owner.rs` cites it).
+

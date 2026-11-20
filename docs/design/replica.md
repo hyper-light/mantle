@@ -540,7 +540,30 @@ member's next answer to a heartbeat, a round later, and never where nothing beat
 thread, waited out its deadline. A stalled member takes no part in the group (§3), so it makes
 the image once the stall ends, in the drive that sends it. An image short of what was asked, a
 machine's last checkpoint behind what it applied, waits for the core's next try: sent at once,
-the core would ask again at once and every drive image again. A snapshot's index is at or past
+the core would ask again at once and every drive image again.
+
+The image is made a slice a drive, not whole in one (`Replica::make_wanted`,
+`StateMachine::image`). Made whole, it read and encoded every row on the node's shard, which runs
+consensus, the log and transport for every range on the node: one image took 20% of that thread's
+sampled time at about 640,000 objects, and at a million and more one catch-up held the node for
+seconds, long enough for its peers to suspect it. Each slice reads the engine's rows from where
+the last stopped (`Engine::image_page`, from memory as an entry's reads are, §2: a page not in
+memory loads on the maintenance workers, whose message wakes the shard, and the slice goes on at
+that drive) until it wrote a drive's committed page of bytes (`max_committed_size_per_ready`), the
+quantum a drive's applies take and the owner's round robin is fair within (hyper-durable's
+`owner.rs`, Shreedhar and Varghese 1995): at most that many bytes over 8 rows, and the page and a
+row once the image met its largest row. The drive asks for another turn (`Driven::more`), so the
+owner drives the range again behind every other range queued, and the shard's own work runs
+between. The slices read one point because nothing is applied while the image is under way:
+committed entries wait unapplied, as they wait for room (§2), the core giving no more
+(`pause_apply`), and apply once the last slice is made, or once the image is dropped with the lead,
+as only a leader sends one. The engine offers no view that outlives a write to read from instead:
+its scans page as S3's listings do, no scan state living across writes (`ShardDb::scan`), and it
+is one owner's, so another thread reads none of it; a checkpoint is durable, but its extents are
+reused once a later one is, and no reader holds them (research/91 §6). The range's writes so wait
+on the image, about the time the whole image took on the shard, where before every range on the
+node waited on it. The checksum is kept a slice at a time and combined with the head's at the end
+(`mantle_crc::crc32c_combine`), so no step reads the image again. A snapshot's index is at or past
 the log's start, so the member continues from the entries after it; one a later compaction
 passed serves no member and is let go of. Until this, every compaction imaged the
 range, read and encoded every row on the node's shard whether or not any member was behind: 2%
@@ -566,9 +589,11 @@ is to voters. hyper-raft's
 `by_suspicion_a_sole_voter_beats_on_its_reach_and_a_learners_lost_answer_is_recovered`.
 `a_compaction_with_no_member_behind_makes_no_image`,
 `a_member_behind_the_start_catches_up_by_an_image_made_when_asked`,
-`an_image_made_for_a_member_is_of_the_point_applied_when_asked` and
-`a_member_behind_the_start_is_sent_its_snapshot_by_the_drive_that_makes_it`
-(`crates/range/tests/group.rs`) hold this. A member installs one before its log records the new
+`an_image_made_for_a_member_is_of_the_point_applied_when_asked`,
+`a_member_behind_the_start_is_sent_its_snapshot_by_the_drive_that_makes_it` and
+`a_member_behind_the_start_catches_up_by_an_image_made_a_slice_a_drive`
+(`crates/range/tests/group.rs`), and the range machine's
+`an_image_is_made_a_bounded_slice_at_a_time`, hold this. A member installs one before its log records the new
 start, its engine's rows durable first, so the log never starts past what the engine holds.
 
 A compaction's checkpoint waits on no flush and no worker on the node's shard. Made inline, it
@@ -932,10 +957,18 @@ A member takes a snapshot that does not name it all the same (thesis §4.1; hype
   quarter of a frame until it does.
 - The window of entries kept for lagging followers before one is sent a snapshot, and
   moving snapshots out of band with the production engine.
-- The image a member behind the log's start is sent is made in one step on the node's shard
-  when the core asks for it (§4): rare, as only a member that far behind asks, but O(rows) when
-  it comes. The next step is TiKV's (research/91 §3): build it off the shard, or in bounded
-  slices, storage answering "temporarily unavailable" until the last slice is made.
+- The image a member behind the log's start is sent is made a slice a drive on the node's shard
+  (§4), and its range applies nothing until it is made. Built (2026-11-20). Open: the image is
+  still held whole in memory, one a range, its range's rows' keys and values and 8 bytes a row
+  (`image::encoded_len_of`), and the snapshot message carries it whole, so a range's memory and
+  its largest message grow with its rows; derive's floor does not count it. Next: stream it to
+  the member in chunks, each bounded and checksummed, with the production engine's files moved
+  out of band (§6). The range's writes wait while it is made, its committed entries held
+  unapplied, bounded by the log's room as entries waiting for room in the engine are (§2); the
+  image pauses while its member is stalled for room (§3), as an entry's apply does, so a log
+  filled by one range's held entries waits on another's compaction. A view of the engine that
+  outlives writes (a checkpoint whose extents a reader holds) would let the range apply
+  meanwhile and the image be read off the shard.
 - Read leases, if a deployment states its clock-drift bound (06 §A1.5); reads are confirmed
   by ReadIndex rounds (§3) until then.
 - The session lifetime and the sessions a range holds, from how long gateways go between

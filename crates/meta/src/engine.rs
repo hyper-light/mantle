@@ -61,6 +61,9 @@ pub trait Rows {
     fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError>;
 }
 
+/// What [`Engine::image_page`] gives each row to, its key and its value: an error stops the page.
+pub type EachRow<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), EngineError> + 'a;
+
 /// A range's rows, and what of them a crash keeps.
 pub trait Engine: Rows {
     /// The last log entry applied.
@@ -84,9 +87,34 @@ pub trait Engine: Rows {
         self.persist().map(|()| true)
     }
 
-    /// Every row as of `applied()`: what a snapshot carries to a member that lags
-    /// (docs/design/replica.md §4).
+    /// Every row as of `applied()`, read in one step: what a snapshot carries to a member that
+    /// lags (docs/design/replica.md §4), which a range makes by pages ([`Engine::image_page`]).
     fn image(&mut self) -> Result<Vec<Row>, EngineError>;
+
+    /// A page of [`Engine::image`]: up to `rows` rows from `from` on, in key order, as of
+    /// `applied()`, each given to `each`; true when the page filled, rows past its last may
+    /// remain. Read without waiting on the engine's device, as [`Engine::next_now`]:
+    /// [`EngineError::Unloaded`], nothing given, while a page it needs loads, the runtime task
+    /// polling now woken once it lands. A range images its rows so, a page a drive, on a node's
+    /// shard that serves its consensus and transport as well (docs/design/replica.md §4). An
+    /// engine that holds its rows in memory gives them from its image.
+    fn image_page(
+        &mut self,
+        from: &[u8],
+        rows: usize,
+        each: &mut EachRow<'_>,
+    ) -> Result<bool, EngineError> {
+        let image = self.image()?;
+        let mut given = 0usize;
+        for (k, v) in image.iter().filter(|(k, _)| k.as_slice() >= from) {
+            if given == rows {
+                return Ok(true);
+            }
+            each(k, v)?;
+            given = given.saturating_add(1);
+        }
+        Ok(false)
+    }
     /// The rows `image` would give and their keys' and values' bytes, when the engine knows them
     /// without reading its rows; `None` when it does not.
     fn image_size(&self) -> Option<(u64, u64)>;
@@ -261,6 +289,21 @@ impl Engine for Model {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
+    }
+
+    fn image_page(
+        &mut self,
+        from: &[u8],
+        rows: usize,
+        each: &mut EachRow<'_>,
+    ) -> Result<bool, EngineError> {
+        let mut page = self
+            .rows
+            .range::<[u8], _>((Bound::Included(from), Bound::Unbounded));
+        for (k, v) in page.by_ref().take(rows) {
+            each(k, v)?;
+        }
+        Ok(page.next().is_some())
     }
 
     fn image_size(&self) -> Option<(u64, u64)> {

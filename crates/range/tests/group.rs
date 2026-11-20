@@ -2575,6 +2575,137 @@ fn a_member_behind_the_start_is_sent_its_snapshot_by_the_drive_that_makes_it() {
     assert_eq!(rows_applied(nodes[2].replica.engine_mut()), leader);
 }
 
+/// The image for a member behind the log's start is made a slice a drive, each about a drive's
+/// committed page of bytes, not whole in one drive (docs/design/replica.md §4): the leader's
+/// drives while it is under way each ask for another turn, none applies an entry, and an entry
+/// committed meanwhile is applied only once the image is made, which is of the point applied
+/// when it began. The drive that makes the last slice sends it, and the member installs it and
+/// holds the leader's rows. Made whole, an image of a million rows held the node's shard, which
+/// drives every range on it, for seconds.
+#[test]
+fn a_member_behind_the_start_catches_up_by_an_image_made_a_slice_a_drive() {
+    const PAGE: u64 = 512;
+    let page = usize::try_from(PAGE).unwrap();
+    let sliced = Range {
+        settings: Settings {
+            max_committed_size_per_ready: PAGE,
+            ..SETTINGS
+        },
+        ..range()
+    };
+    let mut nodes: Vec<Node> = (1..=3)
+        .map(|id| {
+            let log = Log::create(sim(id), log_config(), 0x6c6f67 + u128::from(id)).unwrap();
+            let replica = open(id, &log, first_range(), &sliced, id).unwrap();
+            Node { replica, log }
+        })
+        .collect();
+    nodes[0].replica.campaign().unwrap();
+    let mut sent = Vec::new();
+    exchange(&mut nodes, None, &mut sent);
+    for serial in 1..40 {
+        nodes[0].replica.propose(&registration(serial)).unwrap();
+        let away = if serial >= 37 { Some(3) } else { None };
+        exchange(&mut nodes, away, &mut sent);
+    }
+    assert!(nodes[0].replica.compact(0, 0, Waker::noop()).unwrap());
+    exchange(&mut nodes, Some(3), &mut sent);
+    let image_bytes = {
+        let rows = rows(nodes[0].replica.engine_mut());
+        rows.iter()
+            .map(|(k, v)| 8 + k.len() + v.len())
+            .sum::<usize>()
+    };
+    assert!(image_bytes > 4 * page, "{image_bytes} bytes of rows");
+
+    // Member 3 refuses the leader's next append, and the core asks for a snapshot.
+    nodes[0].replica.propose(&registration(40)).unwrap();
+    let (out, _) = drive(&mut nodes[0].replica, true);
+    let (to_3, others): (Vec<Message>, Vec<Message>) =
+        out.messages.into_iter().partition(|m| m.to == 3);
+    deliver(&mut nodes, others);
+    deliver(&mut nodes, to_3);
+    let (out, _) = drive(&mut nodes[2].replica, true);
+    let refusal = out
+        .messages
+        .into_iter()
+        .find(|m| m.to == 1 && m.msg_type == MessageType::MsgAppendResponse && m.reject)
+        .expect("member 3 refuses the append");
+    exchange(&mut nodes, Some(3), &mut sent);
+    nodes[0].replica.step(refusal).unwrap();
+    let began_at = nodes[0].replica.applied();
+
+    // The leader's drives make the image a slice each, applying nothing meanwhile, and the one
+    // that makes the last sends it.
+    let mut drives = 0;
+    let mut snapshot = None;
+    let mut proposed = false;
+    while snapshot.is_none() {
+        drives += 1;
+        assert!(drives < 1_000, "the image was never made");
+        let (out, driven) = drive(&mut nodes[0].replica, false);
+        let made = nodes[0].replica.images_made() == 1;
+        let snapshots = of(&out.messages, MessageType::MsgSnapshot);
+        if made {
+            assert!(!nodes[0].replica.imaging());
+            assert_eq!(snapshots.len(), 1, "{:?}", out.messages);
+            snapshot = Some(snapshots[0].clone());
+        } else {
+            assert!(
+                nodes[0].replica.imaging(),
+                "drive {drives}: no image under way"
+            );
+            assert!(driven.more, "drive {drives} asked for no turn to go on");
+            assert!(snapshots.is_empty());
+            assert_eq!(
+                nodes[0].replica.applied(),
+                began_at,
+                "applied while imaging"
+            );
+            // An entry committed while the image is under way waits for it.
+            if !proposed {
+                proposed = true;
+                nodes[0].replica.propose(&registration(41)).unwrap();
+            }
+        }
+        let others = out.messages.into_iter().filter(|m| m.to == 2).collect();
+        deliver(&mut nodes, others);
+        let (back, _) = drive(&mut nodes[1].replica, true);
+        deliver(
+            &mut nodes,
+            back.messages.into_iter().filter(|m| m.to == 1).collect(),
+        );
+    }
+    let slices = drives;
+    assert!(
+        slices >= image_bytes / (2 * page),
+        "{slices} drives made an image of {image_bytes} bytes of rows"
+    );
+    let snapshot = snapshot.unwrap();
+    let meta = snapshot
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .metadata
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        meta.index, began_at,
+        "the image is of the point applied when it began"
+    );
+    assert!(proposed, "the image was made in one drive");
+
+    // The entry committed meanwhile applies once the image is made, and member 3 installs the
+    // image and catches up to the leader's rows.
+    exchange(&mut nodes, Some(3), &mut sent);
+    assert!(nodes[0].replica.applied() > began_at);
+    deliver(&mut nodes, vec![snapshot]);
+    beat_until_caught_up(&mut nodes, 3, 20, &mut sent);
+    assert_eq!(nodes[0].replica.images_made(), 1);
+    let leader = rows_applied(nodes[0].replica.engine_mut());
+    assert_eq!(rows_applied(nodes[2].replica.engine_mut()), leader);
+}
+
 /// When a write's answer is given, as hyper-log's writer gives it (docs/design/raft-log.md §3), on
 /// the test's clock: a frame takes what was admitted while the device was busy, its flush takes
 /// `flush_ns`, and its persist record confirms the frame before it, whose writes are answered once

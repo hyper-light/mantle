@@ -1011,6 +1011,19 @@ impl<S: Storage> RawNode<S> {
         }
         Ok(light)
     }
+    /// What there is to apply now and nothing to send: what [`RawNode::light_now`] gives to
+    /// apply, its messages and its commit left for the next `Ready` or light ready. An owner whose
+    /// writes wait for room in its log applies what it committed meanwhile, which takes no write
+    /// and is what its log frees, and sends nothing until its writes are made again. Refused while
+    /// a `Ready` is taken and not issued.
+    pub fn committed_now(&mut self, in_place: bool) -> Result<LightReady> {
+        if self.taken.is_some() {
+            return Err(Error::Invariant(
+                "committed entries asked for while a ready is taken and not issued",
+            ));
+        }
+        self.light(in_place, false)
+    }
     /// Whether [`RawNode::ready`] has anything to give.
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;

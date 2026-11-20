@@ -188,6 +188,39 @@ hyper-durable's `an_entry_the_machine_has_no_room_for_waits_committed_for_the_dr
 (the replica rests with the entries committed and unapplied, and applies them in order once the
 machine has room).
 
+**A wait is ended by its own event, never by another wait's** (found 2026-11-20). CI gates run
+44721951954, at perf-10k's 0603268e, failed three end-to-end tests through a leader's failure
+(cut off on linux-x86_64 and macos-aarch64, its plane deaf on linux-x86_64, five voters' leader
+killed and started again on linux-aarch64-1cpu), each waiting 600 s for a member that stood at
+`leader: 5, commit: 833, applied: 808` while its cell moved on. A follower caught up from a new
+leader takes entries faster than its engine's one-page memtable takes them
+(`crates/mantle/tests/support/cell.rs`), so they wait for room, and the cells' group retains at
+most 4,257 bytes (`log.group_bytes`), about 25 such entries: the waiting entries, and those
+committed behind them that the core gave no one while they waited (`pause_apply`), filled the
+group, and the next write was refused for room, which stalls the replica (§3). A stalled replica
+took no `Ready` and released no fence, so when the engine's worker made room and its message
+drove the range, nothing was applied; the compaction that frees the group frees only what is
+applied (I8), so the refused write waited for the entries and the entries for the write, and
+neither came again. A replica now applies at every drive, stalled or not (`Replica::drive`):
+what its fence lets go, and what the core committed meanwhile, which it takes with nothing to
+send (hyper-raft's `RawNode::committed_now`), so a stalled member still takes no part in the
+group. Applying takes no write, and Raft applies while `commitIndex > lastApplied` whatever the log
+takes next (Ongaro and Ousterhout 2014, Figure 2; research/06). What waits for room or for a
+page's load is applied at the drive its worker's message begins, the node's compaction of a
+stalled range is tried again once a range's applied index moved (`Node::compact_if_stalled`),
+its start made durable frees the group, and the refused write is made again (§3). A page held
+asks for the next drive, stalled or not (`Driven::more`). The commit fence alone still waits on
+the log, for the durable commit its first entry needs. Measured by
+`group::a_followers_entries_waiting_for_room_that_fill_its_group_apply_while_it_stalls`
+(`crates/range/tests/group.rs`: two voters on hyper-log, the follower's engine with no room, its
+group of 102 entries filled with entries committed and unapplied and its next write refused for
+room; once its engine has room its next drives apply every entry it knows committed, stalled,
+its compaction frees the group and it follows again; before, it stood at applied 1, commit 103)
+and hyper-durable's `entries_waiting_for_room_apply_while_a_refusal_for_room_stalls_the_replica`
+(a sole voter, four entries waiting for room and two committed behind them, the next write
+refused for room: once the machine has room the next drive applies all six, sending nothing,
+and the compaction passes them; before, that drive applied none).
+
 **An entry's reads wait for their pages; the shard does not** (measured 2026-11-20). A cell of
 three nodes on one Mac Studio took 1-byte PUTs up to a million objects, profiled with macOS
 `sample`. At about 640,000 objects a tenth of the blocked time of each node's first shard, which
@@ -358,7 +391,8 @@ group's retained bound, the log's segments, its groups or its queue) waits, whol
 write after it, which the log refuses too (`LogError::Behind`), so no later write is durable
 before it (durable.md §2.4). The replica then takes no part in the group: it refuses messages,
 proposals, reads and campaigns with `Stalled`, as the network may drop them, and is not ticked,
-the ticks it missed never replayed. The refused writes are made again, as one write of everything
+the ticks it missed never replayed; it still applies what its fence lets go and what its core
+committed, sending nothing, which takes no write and is what its compaction frees (§2). The refused writes are made again, as one write of everything
 the core holds not yet durable, once room may have been freed: once its own compaction is durable
 (`compact`), or on its owner's word (`resume`) after another group of the log compacted or left. A
 snapshot's report that comes meanwhile is kept, the latest for each member, since replication to

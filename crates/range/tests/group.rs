@@ -22,7 +22,7 @@ use hyper_block::sim::SimFile;
 use hyper_durable::Fault;
 use hyper_log::{Config as LogConfig, Log, Waits};
 use mantle_meta::apply::Layer;
-use mantle_meta::engine::{Engine, Model, Rows};
+use mantle_meta::engine::{Engine, EngineError, Model, Row, Rows, Write};
 use mantle_meta::name::{self, GateChange, Preconditions, Put};
 use mantle_meta::record::{GateState, Version, Versioning};
 use mantle_meta::session::Rules;
@@ -964,6 +964,175 @@ fn a_write_refused_for_room_waits_until_the_group_compacts() {
     replica.propose(&registration(1_000)).unwrap();
     drive(&mut replica, true);
     assert_eq!(replica.applied(), applied + 2);
+}
+
+/// The model engine with no room for an entry while `roomless`, as an engine whose memtable is
+/// full while its worker packs the one before (`Engine::apply_now`): the entry waits committed
+/// and unapplied for the room (docs/design/replica.md §2).
+#[derive(Debug)]
+struct Roomless {
+    model: Model,
+    roomless: bool,
+}
+
+impl Rows for Roomless {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        self.model.get(key)
+    }
+
+    fn next(&mut self, from: &[u8], to: &[u8]) -> Result<Option<Row>, EngineError> {
+        self.model.next(from, to)
+    }
+
+    fn apply(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
+        self.model.apply(index, writes)
+    }
+}
+
+impl Engine for Roomless {
+    fn applied(&self) -> u64 {
+        self.model.applied()
+    }
+
+    fn durable(&self) -> u64 {
+        self.model.durable()
+    }
+
+    fn persist(&mut self) -> Result<(), EngineError> {
+        self.model.persist()
+    }
+
+    fn image(&mut self) -> Result<Vec<Row>, EngineError> {
+        self.model.image()
+    }
+
+    fn image_size(&self) -> Option<(u64, u64)> {
+        self.model.image_size()
+    }
+
+    fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
+        self.model.install(index, rows)
+    }
+
+    fn apply_now(&mut self, index: u64, writes: Vec<Write>) -> Result<bool, EngineError> {
+        if self.roomless {
+            return Ok(false);
+        }
+        self.model.apply(index, writes).map(|()| true)
+    }
+}
+
+/// A follower's entries that wait for room in its engine fill its group's retained bound, and its
+/// write after them is refused for room: it stalls. Once its engine has room, the drive its work
+/// wakes the owner for applies them, stalled; its compaction then frees the group, the refused
+/// write is made again, and it follows its leader again. Applied only once the stall cleared,
+/// they held back the compaction the refused write waited for, and it them, for good: a follower
+/// of mantle's end-to-end runs through a leader's failure stood 25 entries behind its commit, its
+/// group's bound, for 600 s (docs/design/replica.md §2).
+#[test]
+fn a_followers_entries_waiting_for_room_that_fill_its_group_apply_while_it_stalls() {
+    // As `a_write_refused_for_room_waits_until_the_group_compacts`: the log holds a group to 102
+    // entries.
+    let small = Settings {
+        max_size_per_msg: 256,
+        max_inflight_msgs: 1,
+        max_uncommitted_size: 256,
+        max_entry_bytes: 256,
+        ..SETTINGS
+    };
+    let config = LogConfig {
+        group_entries: 102,
+        group_bytes: 1 << 20,
+        ..log_config()
+    };
+    let two = Range {
+        boot: ConfState {
+            voters: vec![1, 2],
+            ..ConfState::default()
+        },
+        settings: small,
+        ..range()
+    };
+    let leads = Log::create(sim(8), config, 0x6c6f67).unwrap();
+    let mut leader = open(1, &leads, first_range(), &two, 8).unwrap();
+    let follows = Log::create(sim(9), config, 0x6c6f68).unwrap();
+    let store = Synchronous::new(mantle_range::claim(&follows, GROUP, &two).unwrap(), None);
+    let engine = Roomless {
+        model: first_range(),
+        roomless: false,
+    };
+    let mut follower = Replica::open(2, store, engine, &two, 9).unwrap();
+    // Each drives in turn, the other taking what it sent; a message a stalled follower refuses
+    // is lost, as the network may lose it.
+    let round = |leader: &mut Member, follower: &mut Replica<Synchronous<SimFile>, Roomless>| {
+        for _ in 0..8 {
+            let (out, _) = drive(leader, true);
+            for m in out.messages {
+                let _ = follower.step(m);
+            }
+            let mut out = Out::default();
+            follower.drive(0, Waker::noop(), &mut out).unwrap();
+            for m in out.messages {
+                let _ = leader.step(m);
+            }
+        }
+    };
+    leader.campaign().unwrap();
+    round(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+    let before = follower.applied();
+    // The log starts at what is applied: a compaction frees only what is applied past it.
+    assert!(follower.compact(0, 0, Waker::noop()).unwrap());
+    round(&mut leader, &mut follower);
+    follower.engine_mut().roomless = true;
+    let mut serial = 0;
+    while !follower.is_stalled() {
+        assert!(
+            serial < 400,
+            "the follower never stalled: {}",
+            follower.describe()
+        );
+        // The leader proposes what its budget takes, and compacts what it applied: its own
+        // group never fills.
+        let _ = leader.propose(&registration(serial));
+        let _ = leader.compact(0, 0, Waker::noop());
+        serial += 1;
+        round(&mut leader, &mut follower);
+    }
+    assert_eq!(follower.applied(), before, "an entry applied with no room");
+    let committed = follower.committed();
+    assert!(committed > before + 1, "{committed}");
+    assert!(
+        !follower.compact(0, 0, Waker::noop()).unwrap(),
+        "nothing applied to free"
+    );
+    // The engine has room: the drives its work wakes the owner for apply every entry the
+    // follower knows committed, stalled.
+    follower.engine_mut().roomless = false;
+    let mut out = Out::default();
+    let mut answered = 0;
+    for _ in 0..8 {
+        follower.drive(0, Waker::noop(), &mut out).unwrap();
+        answered += out.answers.len();
+        out.clear();
+    }
+    assert_eq!(follower.applied(), committed);
+    assert_eq!(u64::try_from(answered).unwrap(), committed - before);
+    assert!(follower.is_stalled());
+    // Its compaction frees the group, the refused write is made again, and it follows again.
+    assert!(follower.compact(0, 0, Waker::noop()).unwrap());
+    for _ in 0..8 {
+        let _ = leader.compact(0, 0, Waker::noop());
+        round(&mut leader, &mut follower);
+    }
+    assert!(!follower.is_stalled(), "{}", follower.describe());
+    let _ = leader.propose(&registration(1_000));
+    for _ in 0..8 {
+        let _ = leader.compact(0, 0, Waker::noop());
+        round(&mut leader, &mut follower);
+    }
+    assert_eq!(follower.applied(), leader.applied());
+    assert!(follower.applied() > committed);
 }
 
 /// Each member's log as it stands: its frames, the flushes they and their confirmations made, and

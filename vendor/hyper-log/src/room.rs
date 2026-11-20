@@ -32,14 +32,22 @@ use crate::LogError;
 /// another group's.
 pub(crate) const GROUP_SUBMISSIONS: usize = crate::PIPELINE_FRAMES;
 
+/// Submissions a group's own room admits whatever their bytes: its share of the queue's bytes
+/// ([`Limits::group_bytes`]) is this many frames of the largest charge, and a submission holds at
+/// most one frame's (mantle docs/design/raft-log.md §3.1). The rest of its [`GROUP_SUBMISSIONS`]
+/// it admits while their bytes fit the share. A group's handle keeps out at most these and the
+/// [`GROUP_SUBMISSIONS`] that may wait beyond them (`group.rs` `OUT`), so the room never refuses
+/// a handle for want of its own group's room.
+pub(crate) const GROUP_ADMITS: usize = crate::PIPELINE_FRAMES.saturating_sub(1);
+
 /// What the queue admits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) submissions: usize,
     pub(crate) bytes: u64,
-    /// Charged bytes one group's submissions hold at most: the queue's less one frame's worth, so
-    /// one group never holds the last frame's worth the others need (mantle
-    /// docs/design/raft-log.md §3.1).
+    /// Charged bytes one group's submissions hold at most: the queue's less one frame's worth,
+    /// [`GROUP_ADMITS`] frames of the largest charge, so one group never holds the last frame's
+    /// worth the others need (mantle docs/design/raft-log.md §3.1).
     pub(crate) group_bytes: u64,
     /// Waiters the list holds: a group waits with at most its own [`GROUP_SUBMISSIONS`], and
     /// the log holds at most `max_groups` (mantle docs/design/raft-log.md §3). Past it, `Busy`.
@@ -388,6 +396,30 @@ mod tests {
         assert!(admitted.is_empty(), "the hot group passed its share");
         room.release(1, 10, &mut admitted);
         assert_eq!(admitted, vec![hot]);
+    }
+
+    /// A group's own room admits [`GROUP_ADMITS`] submissions of the largest charge whatever
+    /// else it holds, its share being that many frames' worth as the log derives it, and
+    /// [`GROUP_SUBMISSIONS`] more wait beyond them: a handle's bound of both (`group.rs` `OUT`)
+    /// is never refused while its own group alone holds the queue, and one past it is.
+    #[test]
+    fn a_handles_bound_of_frame_sized_submissions_waits_never_refused() {
+        let frame = 10;
+        let frames = |n: usize| frame * u64::try_from(n).unwrap();
+        let mut room = Room::new(Limits {
+            submissions: 2 * GROUP_SUBMISSIONS,
+            bytes: frames(crate::PIPELINE_FRAMES),
+            group_bytes: frames(GROUP_ADMITS),
+            waiters: GROUP_SUBMISSIONS,
+        });
+        for sent in 1..=GROUP_ADMITS + GROUP_SUBMISSIONS {
+            let take = room.take(1, frame, true, &mut Vec::new());
+            assert!(take.is_ok(), "submission {sent} refused: {take:?}");
+        }
+        assert!(matches!(
+            room.take(1, frame, true, &mut Vec::new()),
+            Err(LogError::Busy)
+        ));
     }
 
     /// Past its bound the waiting list refuses, and nothing that does not wait jumps it.

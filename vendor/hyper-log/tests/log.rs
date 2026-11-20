@@ -2280,6 +2280,39 @@ fn the_queue_bounds_the_bytes_of_every_submission_not_yet_answered() {
     log.write(3, full(1)).unwrap();
 }
 
+/// A handle keeps out only what the log takes of its group whatever the parts' bytes: two
+/// frame-sized parts fill the group's share of the queue's bytes, the next three wait for the
+/// group's own room, and the handle sends no sixth until one is answered. With six out, the
+/// sixth was refused `Busy` while nothing but its own group held the queue: a refusal for room
+/// that stalls a replica until its owner frees room, which no other group would (mantle-node
+/// `tests/range_log_memory.rs`: a leader's write of the 179,803 entries it took while cut off).
+#[test]
+fn a_handles_frame_sized_parts_wait_for_their_groups_room_never_refused() {
+    let (device, stepped) = held(sim(45));
+    let log = Log::create(device, config_now(16, 64), ID).unwrap();
+    let room = log.frame_room().unwrap();
+    let mut group = log.group(1).unwrap();
+    stepped.hold();
+    let _released = stepped.released();
+    group.submit(sized(1, room)).unwrap();
+    // Held in the first part's flush, the log answers nothing while the handle sends.
+    stepped.held();
+    let mut sent = 1;
+    while group.has_room() {
+        sent += 1;
+        group.submit(sized(sent, room)).unwrap();
+    }
+    stepped.release();
+    for part in 1..=sent {
+        let answer = group.wait();
+        assert!(
+            matches!(answer, Some(Ok(()))),
+            "part {part} of {sent} sent within the handle's room: {answer:?}"
+        );
+    }
+    assert_eq!(log.view(1).unwrap().unwrap().last, sent);
+}
+
 /// Tiny and empty updates are charged the bytes their records and persist rows take, so a
 /// flood of them from many groups fills the byte bound as large ones do (audit S03).
 #[test]

@@ -619,9 +619,12 @@ pub(crate) enum Served {
 /// (node.md §2.2). The drive sends the members the pages read and opens the read of the next, so
 /// each read starts as the one before it is answered. Queued for its writes alone, a leader whose
 /// read was answered with none out was driven only by the next message into its range or its
-/// next tick, and the page waited for it.
+/// next tick, and the page waited for it. So is a range whose committed entries wait for room in
+/// its engine (hyper-durable's `Replica::waits_for_room`): the engine's worker message wakes the
+/// task (`ShardDb::room_now`), and the drive asks the engine again, the shard having waited on
+/// nothing meanwhile (replica.md §2).
 pub(crate) fn answer_due<E: Engine + 'static, S: LogStore>(replica: &Replica<E, S>) -> bool {
-    replica.in_flight() > 0 || replica.catching_up()
+    replica.in_flight() > 0 || replica.catching_up() || replica.waits_for_room()
 }
 
 /// Compacts each of `handles`' ranges in `owner` through what its engine made durable, freeing the
@@ -1647,12 +1650,7 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
             let Some(kept) = ranges.get(at) else {
                 return Ok((0, false));
             };
-            match owner.get_mut(kept.handle) {
-                Some(replica) => {
-                    super::upkeep::step(kept.group, replica.machine_mut().engine_mut(), units)
-                }
-                None => Ok((0, false)),
-            }
+            super::upkeep::step_range(owner, kept.handle, kept.group, units)
         })?;
         Ok(())
     }

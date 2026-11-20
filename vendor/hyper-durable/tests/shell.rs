@@ -170,6 +170,44 @@ fn a_sole_voter_logs_its_commit_in_the_write_of_its_entries() {
     assert_eq!((after.fenced, after.quiet), (before.fenced, before.quiet));
 }
 
+/// A state machine with no room for an entry stops the walk before it: the entry stays committed
+/// and unapplied, nothing of it is answered, the core gives no more to apply, and the replica rests
+/// (no drive of its own is asked: the machine's work wakes its owner). Once the machine has room,
+/// the next drive applies it and every entry committed behind it, in order, answered once each.
+#[test]
+fn an_entry_the_machine_has_no_room_for_waits_committed_for_the_drive_that_finds_room() {
+    let mut r = sole(3, Unbounded, |_| {});
+    let before = r.applied().index;
+    r.machine_mut().roomless = true;
+    for i in 0..4u64 {
+        r.propose(Vec::new(), i.to_le_bytes().to_vec()).unwrap();
+    }
+    // `pump` returns only once the replica rests: it asked for no drive while it waits.
+    let out = pump(&mut r);
+    assert!(
+        out.answers.is_empty(),
+        "answered unapplied: {:?}",
+        out.answers
+    );
+    assert_eq!(r.applied().index, before);
+    assert!(r.waits_for_room());
+    assert!(
+        r.durable_commit() >= before + 4,
+        "the entries were not committed"
+    );
+    assert!(r.machine().now.entries.is_empty());
+    // Still waiting: a drive with no room applies nothing and rests again.
+    let out = pump(&mut r);
+    assert!(out.answers.is_empty());
+    assert_eq!(r.applied().index, before);
+    r.machine_mut().roomless = false;
+    let out = pump(&mut r);
+    let applied: Vec<u64> = out.answers.iter().map(|(index, _)| *index).collect();
+    assert_eq!(applied, (before + 1..=before + 4).collect::<Vec<_>>());
+    assert_eq!(r.applied().index, before + 4);
+    assert!(!r.waits_for_room());
+}
+
 /// A change waits behind the fence until a write states its commit; entries committed after it
 /// wait with it, at most a page from each write out and the page of the `Ready` that gave it
 /// (`docs/durable.md` §6); the replica takes no `Ready` meanwhile.
@@ -736,7 +774,7 @@ impl StateMachine for Boom {
         &mut self,
         entry: &EntryRef<'_>,
         answers: &mut Vec<Self::Answer>,
-    ) -> Result<(), Fatal> {
+    ) -> Result<bool, Fatal> {
         if entry.data == b"boom" {
             panic!("the application unwound");
         }

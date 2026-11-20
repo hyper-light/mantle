@@ -318,6 +318,18 @@ struct Stall {
     messages: Vec<((u64, u64), Vec<Message>)>,
 }
 
+/// What committed entries given to apply wait for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    /// The commit fence: the durable commit to cover the first.
+    Commit,
+    /// The next drive: they are past a drive's page.
+    Page,
+    /// Room in the state machine, which wakes the owner for the drive that applies them
+    /// ([`StateMachine::apply`]).
+    Room,
+}
+
 /// Where a walk of committed entries stopped.
 enum Stop {
     /// Everything given was applied.
@@ -326,6 +338,9 @@ enum Stop {
     Fence(u64),
     /// This entry is past the drive's page: it waits for the next drive.
     Page(u64),
+    /// The state machine has no room for this entry now: it waits for the drive its owner is
+    /// woken for ([`StateMachine::apply`]).
+    Room(u64),
     /// A change of configuration, applied by the core before the walk goes on.
     Change(Point, ConfChangeV2),
     /// The state machine or the entry failed.
@@ -380,11 +395,10 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     told_applied: u64,
     /// The index of the entry that made the configuration.
     conf_index: u64,
-    /// Committed entries given to apply that wait: the first and last. They wait for the commit
-    /// fence, or, when `paged`, for the next drive.
+    /// Committed entries given to apply that wait: the first and last, for what `wait` says.
     fence: Option<(u64, u64)>,
-    /// The entries that wait are past a drive's page, not behind the commit fence.
-    paged: bool,
+    /// What the entries that wait wait for.
+    wait: Wait,
     /// The bytes of entries a drive applies at most, as the core counts them
     /// (`EntryRef::encoded_bytes`): its committed page (`max_committed_size_per_ready`), or one
     /// entry larger than it.
@@ -569,7 +583,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             told_applied: durable.index,
             conf_index: durable.index,
             fence: None,
-            paged: false,
+            wait: Wait::Commit,
             page,
             drive_applied: 0,
             reads: VecDeque::new(),
@@ -666,7 +680,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     /// Committed entries that wait for the commit fence: the first and the last.
     pub fn behind_fence(&self) -> Option<(u64, u64)> {
-        self.fence.filter(|_| !self.paged)
+        self.fence.filter(|_| self.wait == Wait::Commit)
+    }
+
+    /// Whether committed entries wait for room in the state machine: its owner drives the
+    /// replica again when the machine's work wakes it ([`StateMachine::apply`]).
+    pub fn waits_for_room(&self) -> bool {
+        self.fence.is_some() && self.wait == Wait::Room
     }
 
     /// Writes out.
@@ -824,7 +844,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.writes.clear();
         self.stall = None;
         self.fence = None;
-        self.paged = false;
+        self.wait = Wait::Commit;
         self.reads.clear();
         self.reports.clear();
         self.fenced = Some(cause.clone());
@@ -1658,7 +1678,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     fn driven(&mut self) -> Driven {
         let slot = self.has_slot();
-        let paged = self.paged && self.fence.is_some();
+        let paged = self.wait == Wait::Page && self.fence.is_some();
         let more = self.stall.is_none()
             && (paged
                 || (slot
@@ -2343,7 +2363,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             .as_ref()
             .map(|s| bytes(s.data.len()));
         if self.fence.take().is_some() {
-            self.paged = false;
+            self.wait = Wait::Commit;
             self.node.resume_apply();
         }
     }
@@ -2424,16 +2444,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// What waits behind the fence is applied once the durable commit covers its first entry;
-    /// what waits past a drive's page, at the next drive, a page of it.
+    /// what waits past a drive's page, at the next drive, a page of it; what waits for room in
+    /// the state machine, at the next drive, which asks the machine again.
     fn release_fence(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
         let Some((first, last)) = self.fence else {
             return Ok(());
         };
-        if !self.paged && first > self.durable_commit() {
+        if self.wait == Wait::Commit && first > self.durable_commit() {
             return Ok(());
         }
         self.fence = None;
-        self.paged = false;
+        self.wait = Wait::Commit;
         self.node.resume_apply();
         self.apply_from(first, last, out)?;
         self.tell_applied()
@@ -2452,15 +2473,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             match self.walk(next, last, out) {
                 Stop::Done => break,
                 Stop::Fence(index) => {
-                    self.fence = Some((index, last));
-                    self.paged = false;
-                    self.node.pause_apply();
+                    self.hold(index, last, Wait::Commit);
                     return Ok(());
                 }
                 Stop::Page(index) => {
-                    self.fence = Some((index, last));
-                    self.paged = true;
-                    self.node.pause_apply();
+                    self.hold(index, last, Wait::Page);
+                    return Ok(());
+                }
+                // The entry stays committed and unapplied, and the core gives no more while it
+                // waits (`pause_apply`): what waits is bounded as a page's wait is, by the core's
+                // committed page and its log's room, and nothing past `last` is taken meanwhile.
+                Stop::Room(index) => {
+                    self.hold(index, last, Wait::Room);
                     return Ok(());
                 }
                 Stop::Change(point, change) => {
@@ -2474,6 +2498,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             return Err(self.fence(Cause::Invariant("the log held less than was committed")));
         }
         Ok(())
+    }
+
+    /// Holds `[first, last]` committed and unapplied for what `wait` says; the core gives no more
+    /// to apply until it is released ([`Self::release_fence`]).
+    fn hold(&mut self, first: u64, last: u64, wait: Wait) {
+        self.fence = Some((first, last));
+        self.wait = wait;
+        self.node.pause_apply();
     }
 
     /// One walk of committed entries from `next` through `last`, applying each that needs
@@ -2510,8 +2542,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 stop = Stop::Page(entry.index);
                 return true;
             }
-            *drive_applied = drive_applied.saturating_add(bytes);
-            // Applied from here, or failed, which fences the replica: it counts afresh at open.
             let Ok(size) = u32::try_from(bytes) else {
                 stop = Stop::Failed(Cause::Invariant("an entry past four gibibytes"));
                 return true;
@@ -2520,12 +2550,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 stop = Stop::Failed(Cause::Core(hyper_raft::Error::Memory));
                 return true;
             }
-            if sizes.is_empty() {
-                *sizes_from = entry.index;
-            }
-            sizes.push_back(size);
-            *compactable = compactable.saturating_add(bytes);
+            // Counted once the entry is applied, or failed, which fences the replica: it counts
+            // afresh at open. An entry the machine has no room for is counted when it applies.
+            let mut count = || {
+                *drive_applied = drive_applied.saturating_add(bytes);
+                if sizes.is_empty() {
+                    *sizes_from = entry.index;
+                }
+                sizes.push_back(size);
+                *compactable = compactable.saturating_add(bytes);
+            };
             if entry.changes_configuration() {
+                count();
                 stop = match change_of(&entry) {
                     Ok(change) => Stop::Change(point_of(&entry), change),
                     Err(cause) => Stop::Failed(cause),
@@ -2533,9 +2569,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 return true;
             }
             match machine.apply(&entry, &mut out.answers) {
-                Ok(()) => {
+                Ok(true) => {
+                    count();
                     *applied = point_of(&entry);
                     false
+                }
+                Ok(false) => {
+                    stop = Stop::Room(entry.index);
+                    true
                 }
                 Err(fatal) => {
                     stop = Stop::Failed(Cause::Machine(fatal));

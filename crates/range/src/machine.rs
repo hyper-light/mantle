@@ -95,6 +95,10 @@ fn failed(failure: &mut Option<Failure>, what: &'static str, e: impl Into<Failur
 struct Termed<'a, E> {
     engine: &'a mut E,
     row: Option<Write>,
+    /// The batch is applied only with room for all of it now ([`Engine::apply_now`]), refused
+    /// [`EngineError::NoRoom`] otherwise: an entry's, which waits committed rather than the shard.
+    /// A change's is applied whatever it waits on: the core has applied it already.
+    now: bool,
 }
 
 impl<'a, E> Termed<'a, E> {
@@ -102,11 +106,28 @@ impl<'a, E> Termed<'a, E> {
     /// from `last`, the last entry's.
     fn new(engine: &'a mut E, last: u64, term: u64) -> Self {
         let row = (term != last).then(|| Write::Put(TERM.to_vec(), encode_term(term)));
-        Self { engine, row }
+        Self {
+            engine,
+            row,
+            now: false,
+        }
     }
 }
 
-impl<E: Rows> Rows for Termed<'_, E> {
+impl<E: Engine> Termed<'_, E> {
+    fn apply_batch(&mut self, index: u64, writes: Vec<Write>) -> Result<(), EngineError> {
+        if !self.now {
+            return self.engine.apply(index, writes);
+        }
+        if self.engine.apply_now(index, writes)? {
+            Ok(())
+        } else {
+            Err(EngineError::NoRoom)
+        }
+    }
+}
+
+impl<E: Engine> Rows for Termed<'_, E> {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         self.engine.get(key)
     }
@@ -117,13 +138,13 @@ impl<E: Rows> Rows for Termed<'_, E> {
 
     fn apply(&mut self, index: u64, mut writes: Vec<Write>) -> Result<(), EngineError> {
         let Some(row) = self.row.take() else {
-            return self.engine.apply(index, writes);
+            return self.apply_batch(index, writes);
         };
         writes
             .try_reserve_exact(1)
             .map_err(|_| EngineError::Memory)?;
         writes.push(row);
-        self.engine.apply(index, writes)
+        self.apply_batch(index, writes)
     }
 }
 
@@ -218,12 +239,17 @@ impl<E: Engine> RangeMachine<E> {
 impl<E: Engine> StateMachine for RangeMachine<E> {
     type Answer = Applied;
 
-    fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Applied>) -> Result<(), Fatal> {
+    /// The entry's batch is applied only with room in the engine for all of it now
+    /// ([`Engine::apply_now`]): with none, nothing of it is applied or answered and the shell
+    /// gives it again at the drive the engine's worker wakes the owner for, the layer's work then
+    /// done again over the same rows, the same batch.
+    fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Applied>) -> Result<bool, Fatal> {
         let (layer, rules) = (self.layer, self.rules);
         // Lent to the entry, as the engine is, and kept only once the entry applies.
-        let mut watermark = std::mem::take(&mut self.watermark);
+        let mut watermark = self.watermark;
         let failure = &mut self.failure;
         let mut engine = Termed::new(&mut self.engine, self.applied.term, entry.term);
+        engine.now = true;
         if entry.kind != EntryType::EntryNormal {
             return Err(Fatal(
                 "a change of configuration given to apply as an entry",
@@ -231,27 +257,33 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         }
         // A new leader's empty entry changes no row of the range.
         if entry.data.is_empty() {
-            engine
-                .apply(entry.index, Vec::new())
-                .map_err(|e| failed(failure, "the engine refused an entry", e))?;
+            match engine.apply(entry.index, Vec::new()) {
+                Ok(()) => {}
+                Err(EngineError::NoRoom) => return Ok(false),
+                Err(e) => return Err(failed(failure, "the engine refused an entry", e)),
+            }
         } else {
             let batch = wire::Entry::decode(entry.data)
                 .map_err(|e| failed(failure, "a committed entry does not decode", e))?;
-            let made = apply_entry_with(
+            let applied = apply_entry_with(
                 &mut engine,
                 entry.index,
                 &batch,
                 layer,
                 &rules,
                 &mut watermark,
-            )
-            .map_err(|e| {
-                failed(
-                    failure,
-                    "a committed entry breaks the range's state machine",
-                    e,
-                )
-            })?;
+            );
+            let made = match applied {
+                Ok(made) => made,
+                Err(MetaError::Engine(EngineError::NoRoom)) => return Ok(false),
+                Err(e) => {
+                    return Err(failed(
+                        failure,
+                        "a committed entry breaks the range's state machine",
+                        e,
+                    ));
+                }
+            };
             answers
                 .try_reserve(made.len())
                 .map_err(|e| failed(failure, "no memory for an entry's answers", e))?;
@@ -267,7 +299,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
             index: entry.index,
             term: entry.term,
         };
-        Ok(())
+        Ok(true)
     }
 
     /// The configuration is kept in the engine, in the batch of the entry that made it, so a
@@ -402,10 +434,12 @@ mod tests {
         }
     }
 
-    /// A model engine that counts the reads of the order of last use it is asked.
+    /// A model engine that counts the reads of the order of last use it is asked, and, while
+    /// `roomless`, has no room for a batch now, as an engine whose rotation waits on its worker.
     struct Counted {
         rows: mantle_meta::engine::Model,
         scans: u64,
+        roomless: bool,
     }
 
     impl Rows for Counted {
@@ -449,6 +483,13 @@ mod tests {
         fn install(&mut self, index: u64, rows: Vec<Row>) -> Result<(), EngineError> {
             self.rows.install(index, rows)
         }
+
+        fn apply_now(&mut self, index: u64, writes: Vec<Write>) -> Result<bool, EngineError> {
+            if self.roomless {
+                return Ok(false);
+            }
+            self.rows.apply(index, writes).map(|()| true)
+        }
     }
 
     const RULES: Rules = Rules {
@@ -464,7 +505,11 @@ mod tests {
         let mut rows = mantle_meta::engine::Model::default();
         rows.install(0, mantle_meta::name::first(1).unwrap())
             .unwrap();
-        let engine = Counted { rows, scans: 0 };
+        let engine = Counted {
+            rows,
+            scans: 0,
+            roomless: false,
+        };
         RangeMachine::open(engine, Layer::Name, RULES, &ConfState::default()).unwrap()
     }
 
@@ -507,6 +552,57 @@ mod tests {
         machine.apply(&entry, &mut answers).unwrap();
         let answers = answers.into_iter().map(|a| a.answer).collect();
         (answers, machine.engine().scans - scans)
+    }
+
+    /// An entry the engine has no room for now is answered unapplied: no row, no answer, the
+    /// machine's applied point and its knowledge of its sessions' last use as they were. Given
+    /// again once the engine has room, it applies as it would have, answered once.
+    #[test]
+    fn an_entry_with_no_room_in_the_engine_applies_nothing_until_there_is_room() {
+        let mut machine = opened();
+        let registration = |nth| wire::Sessioned {
+            session: 0,
+            serial: 0,
+            unanswered: 0,
+            command: wire::Command::Register {
+                owner: 1,
+                run: 1,
+                nth,
+            },
+        };
+        let data = wire::Entry {
+            at_ns: 10,
+            commands: vec![registration(1)],
+        }
+        .encode()
+        .unwrap();
+        let entry = EntryRef {
+            index: 1,
+            term: 1,
+            kind: EntryType::EntryNormal,
+            context: &[],
+            data: &data,
+        };
+        let rows = machine.engine_mut().image().unwrap();
+        let watermark = machine.watermark;
+        machine.engine_mut().roomless = true;
+        let mut answers = Vec::new();
+        assert!(!machine.apply(&entry, &mut answers).unwrap());
+        assert!(answers.is_empty());
+        assert_eq!(machine.applied, Point { index: 0, term: 0 });
+        assert_eq!(machine.engine().applied(), 0);
+        assert_eq!(machine.engine_mut().image().unwrap(), rows);
+        assert_eq!(machine.watermark, watermark);
+        assert!(machine.failure().is_none());
+        machine.engine_mut().roomless = false;
+        assert!(machine.apply(&entry, &mut answers).unwrap());
+        assert_eq!(machine.applied, Point { index: 1, term: 1 });
+        assert_eq!(answers.len(), 1);
+        assert!(
+            matches!(answers[0].answer, Answer::Registered { .. }),
+            "{answers:?}"
+        );
+        assert_ne!(machine.engine_mut().image().unwrap(), rows);
     }
 
     /// A range reopened, or given a snapshot, knows nothing of its sessions' last use: its first

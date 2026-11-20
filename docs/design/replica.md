@@ -140,6 +140,54 @@ range carries on without it.
 Applying never reads the clock, the network or anything else a replica does not share.
 Time comes from the entry, which is what lets every replica reach the same rows.
 
+**An entry waits for room in its engine; the shard does not** (measured 2026-11-20). A cell of
+three nodes on one Mac Studio took 1-byte PUTs at about 5,500 a second, and each node's first
+shard, which runs its consensus, log and transport (node.md §1.2), spent 12–15% of its wall time
+blocked in a condition variable, single polls of the node's task lasting 0.2–0.5 s: an entry's
+rows went into the range's engine (`Stored::apply`, `ShardDb::put`), and a put that found the
+memtable full rotated it, waiting for the maintenance worker still packing the one before
+(`ShardDb::rotate`, `Pool::wait_message`). While it waited nothing on the node moved. A range now
+applies an entry only once its engine has room for all of the entry's writes without waiting on a
+worker (`Engine::apply_now`, `ShardDb::room_now`): the room is the entry's rows at their largest in
+the memtable (`memtable::hashed::entry_bytes`; a clear's as the rows its span holds), and a full
+memtable's rotation is begun and paid in slices as the engine's paced rotation is (`rotate_paced`,
+engine-structure.md §6), never waited on. With no room, nothing of the entry is applied or
+answered: the state machine says so (`StateMachine::apply` answers false), and the replica stops
+before the entry, which stays committed and unapplied, holding what follows it as it holds a page's
+wait (`Replica::waits_for_room`, the core's `pause_apply`). What waits is therefore bounded by the
+same bounds as before: the core's committed page (`max_committed_size_per_ready`, `derive::cell`)
+and the log's room. Raft lets the applied index trail the commit index, a server applying
+committed entries in order while `commitIndex > lastApplied` (Ongaro and Ousterhout 2014,
+Figure 2; research/06), and a client is answered only once its entry is applied, so the wait
+changes when an answer comes, never what it says. The engine asks its workers' next message to
+wake the task that asked (`Pool::wake_on_message`), as its idle step does (node.md §2.9), and the
+node drives each range whose entries wait for room at every turn (`shard::answer_due`): the message
+that frees the room begins the turn that applies the entry, and no timer is involved. A turn's
+maintenance that takes that message first, doing work for the range's engine, queues the range, so
+the next turn comes at once and drives it (`upkeep::step_range`); maintenance that can do nothing
+but wait on a worker leaves the wake asked, and the node asks again before its wait sleeps
+(node.md §2.9). The shard
+meanwhile serves its other ranges, its consensus and its transport; this is the engine's pacing
+(SILK, research/34 §5: flushes and the first compaction are never paused, and the clients' work is
+not made to wait on them) carried one step further, from the engine's own task to the shard that
+owns it.
+
+Room is made for the whole entry before any of its writes, rather than the range's reads held
+while an entry is part applied. A range's engine is read outside the replica's walk (a confirmed
+read is served from it once the range has applied far enough, and the next entry's commands read
+it), and with room made first none of those reads needs to know of an entry in progress: a read
+sees an entry's writes all or none. The price is the entry's rows counted before they are applied,
+and a clear's span read twice, which only a split writes. An entry larger than a whole memtable
+still rotates inline as it fills, nothing reading between its writes. Measured by
+`node::upkeep::tests::an_entry_waits_unapplied_for_the_workers_message_and_applies_whole_after_it`
+(a worker held at a gate: the entry is refused at once with none of its eight rows visible and
+every earlier entry whole, and the worker's message wakes the task, after which the entry applies
+whole),
+`machine::tests::an_entry_with_no_room_in_the_engine_applies_nothing_until_there_is_room`, and
+hyper-durable's `an_entry_the_machine_has_no_room_for_waits_committed_for_the_drive_that_finds_room`
+(the replica rests with the entries committed and unapplied, and applies them in order once the
+machine has room).
+
 **A row past the range's bounds refuses its command** (measured 2026-10-21). The engine holds a
 row whole, in one branch page and in its memtable (`mantle_engine::branch::fits`,
 `memtable::hashed::entry_bytes`), and takes a row past its page into its memtable, to fence at

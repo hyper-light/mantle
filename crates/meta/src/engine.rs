@@ -36,6 +36,11 @@ pub enum EngineError {
     /// applied.
     #[error("a row of a {key}-byte key and a {value}-byte value past the range's bounds")]
     RowTooLarge { key: usize, value: usize },
+    /// No room for a batch without waiting on the engine's own maintenance
+    /// ([`Engine::apply_now`]): nothing of it was applied, and the engine's owner is woken when
+    /// the room may have come.
+    #[error("no room for a batch without waiting on the engine's maintenance")]
+    NoRoom,
 }
 
 /// Rows as a state machine reads and writes them.
@@ -95,6 +100,17 @@ pub trait Engine: Rows {
     /// fence. Asked only once a call failed; an engine that keeps none answers none.
     fn fault(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
+    }
+
+    /// [`Rows::apply`] made only if the engine has room for the whole batch with no wait on its
+    /// own maintenance (a full memtable's rotation waiting on a job out on a worker): true,
+    /// applied; false, nothing of it applied, with the runtime task polling now woken once the
+    /// room may have come, by the work it waits on (docs/design/replica.md §2). A range applies
+    /// its entries so, on a node's shard that serves its consensus and transport as well: an
+    /// entry waits, committed and unapplied, rather than the shard. An engine with nothing to
+    /// wait on applies the batch.
+    fn apply_now(&mut self, index: u64, writes: Vec<Write>) -> Result<bool, EngineError> {
+        self.apply(index, writes).map(|()| true)
     }
 
     /// Pays up to about `budget` units of the maintenance the engine owes (its packings,

@@ -12,8 +12,16 @@
 //! the batch whole on its own thread), and a crash part way returns to the last checkpoint, from
 //! which the entry is applied again whole: a put and a delete applied twice leave what applying
 //! them once leaves, so the batch is atomic as the trait asks.
+//!
+//! A replicated range applies its entries with [`Engine::apply_now`], on a node's shard that
+//! serves its consensus and transport too: the room the whole batch takes in the memtable is made
+//! first, waiting on no maintenance worker, and the batch applied only once it is
+//! (`ShardDb::room_now`). With none, nothing of the batch is applied, so no read sees part of an
+//! entry, and the entry waits committed and unapplied, its range driven again when the worker's
+//! message wakes the shard's task (docs/design/replica.md §2).
 
 use hyper_block::block::BlockFile;
+use mantle_engine::memtable::hashed::entry_bytes;
 use mantle_engine::rows::Rows as EngineRows;
 use mantle_engine::shard_db::{FlushStats, ShardDb};
 use mantle_engine::store::{Config, IoStats};
@@ -145,6 +153,33 @@ impl<F: BlockFile + 'static> Stored<F> {
         Ok(())
     }
 
+    /// The bytes `writes` take in the engine's memtable at most, each entry's head at its largest
+    /// (`mantle_engine::memtable::hashed::entry_bytes`): a clear's deletes as the rows its span
+    /// holds now, which reads the span, and the batch's own puts into it. Saturated: a sum past the
+    /// address space is more than any memtable holds, which rotates as it fills.
+    fn batch_bytes(&mut self, writes: &[Write]) -> Result<usize, EngineError> {
+        let entry = |key: usize, value: usize| entry_bytes(key, value).unwrap_or(usize::MAX);
+        let mut bytes = 0usize;
+        for write in writes {
+            let more = match write {
+                Write::Put(k, v) => entry(k.len(), v.len()),
+                Write::Delete(k) => entry(k.len(), 0),
+                Write::Clear(from, to) if from < to => {
+                    self.scan_all(from, Some(to))?;
+                    let held = self.rows.iter().map(|(k, _)| entry(k.len(), 0));
+                    let own = writes.iter().filter_map(|w| match w {
+                        Write::Put(k, _) if k >= from && k < to => Some(entry(k.len(), 0)),
+                        _ => None,
+                    });
+                    held.chain(own).fold(0usize, usize::saturating_add)
+                }
+                Write::Clear(..) => 0,
+            };
+            bytes = bytes.saturating_add(more);
+        }
+        Ok(bytes)
+    }
+
     /// Deletes every row of `[from, to)` (to the end with no `to`).
     fn clear(&mut self, from: &[u8], to: Option<&[u8]>) -> Result<(), EngineError> {
         self.scan_all(from, to)?;
@@ -256,6 +291,31 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
         self.fault
             .as_ref()
             .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+
+    /// The batch applied once the memtable has room for all of it with no wait on a maintenance
+    /// worker (`ShardDb::room_now`), the room `batch_bytes` counts: so a read between the drives
+    /// that apply the range's entries sees each entry's writes all or none, and the shard waits on
+    /// no worker. Room is made before any write rather than reads held while an entry is part
+    /// applied: a range's reads go to its engine from several paths of the node, and none then
+    /// needs to know of an entry in progress. A batch larger than a whole memtable rotates inline
+    /// as [`Rows::apply`] does, nothing reading between its writes. The shard's own share of the
+    /// rotation's work is a unit a write, as its puts pay theirs as they go.
+    fn apply_now(&mut self, index: u64, writes: Vec<Write>) -> Result<bool, EngineError> {
+        if index <= self.applied {
+            return Err(EngineError::OutOfOrder {
+                index,
+                applied: self.applied,
+            });
+        }
+        let bytes = self.batch_bytes(&writes)?;
+        let keys = u64::try_from(writes.len()).unwrap_or(u64::MAX).max(1);
+        let room = self.db.room_now(bytes, keys);
+        if !room.map_err(|e| fenced(&mut self.fault, e))? {
+            return Ok(false);
+        }
+        self.apply(index, writes)?;
+        Ok(true)
     }
 
     /// The engine's idle step that waits for nothing (`ShardDb::idle_step_now`), in SILK's order:

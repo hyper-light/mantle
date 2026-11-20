@@ -56,6 +56,8 @@ pub struct Stored<F: BlockFile> {
     /// The checkpoints taken since the engine opened: each `persist` that found something to make
     /// durable, two flushes of the store's device apiece (`Store::checkpoint`).
     checkpoints: u64,
+    /// The index of the checkpoint [`Engine::persist_now`] began and has not yet seen durable.
+    out: Option<u64>,
     /// A get's value and a scan's rows: the engine's buffers, kept across calls.
     value: Vec<u8>,
     rows: EngineRows,
@@ -94,6 +96,7 @@ impl<F: BlockFile + 'static> Stored<F> {
             durable: applied,
             unpersisted: false,
             checkpoints: 0,
+            out: None,
             value: Vec::new(),
             rows: EngineRows::new(),
             fault: None,
@@ -151,6 +154,13 @@ impl<F: BlockFile + 'static> Stored<F> {
             .scan_rows(from, to, usize::MAX, &mut self.rows)
             .map_err(|e| fenced(&mut self.fault, e))?;
         Ok(())
+    }
+
+    /// The checkpoint begun at `at` ([`Engine::persist_now`]) is durable.
+    fn durable_at(&mut self, at: u64) {
+        self.out = None;
+        self.durable = at;
+        self.checkpoints = self.checkpoints.saturating_add(1);
     }
 
     /// The bytes `writes` take in the engine's memtable at most, each entry's head at its largest
@@ -257,16 +267,55 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
         self.durable
     }
 
+    /// A checkpoint begun without waiting and still out is finished first, waiting on its worker
+    /// (`ShardDb::checkpoint`): nothing applied since it began leaves it unpersisted.
     fn persist(&mut self) -> Result<(), EngineError> {
-        if self.unpersisted {
+        if self.unpersisted || self.out.is_some() {
             self.db
                 .checkpoint(self.applied)
                 .map_err(|e| fenced(&mut self.fault, e))?;
             self.durable = self.applied;
             self.unpersisted = false;
+            self.out = None;
             self.checkpoints = self.checkpoints.saturating_add(1);
         }
         Ok(())
+    }
+
+    /// The checkpoint begun at the index applied now and made without waiting
+    /// (`ShardDb::checkpoint_now`): its memtables packed and its pages written by the engine's
+    /// maintenance workers and the shard in slices, its two flushes of the device on a worker's
+    /// own handle, the worker's message waking the task. That index is durable once it
+    /// completes; entries applied meanwhile are past it, not covered by it, and leave the engine
+    /// unpersisted.
+    fn persist_now(&mut self) -> Result<bool, EngineError> {
+        if self.fault.is_some() {
+            return Err(EngineError::Fenced);
+        }
+        let at = match self.out {
+            // Completed meanwhile by a put that wanted the memtable's room, which steps it
+            // (`ShardDb::room_now`); one that failed there fenced the engine.
+            Some(at) if self.db.checkpointing().is_none() => {
+                self.durable_at(at);
+                return Ok(true);
+            }
+            Some(at) => at,
+            None if !self.unpersisted => return Ok(true),
+            None => {
+                // Begun here: what is applied from now on is the next checkpoint's.
+                self.unpersisted = false;
+                self.out = Some(self.applied);
+                self.applied
+            }
+        };
+        let done = self
+            .db
+            .checkpoint_now(at)
+            .map_err(|e| fenced(&mut self.fault, e))?;
+        if done {
+            self.durable_at(at);
+        }
+        Ok(done)
     }
 
     fn image(&mut self) -> Result<Vec<Row>, EngineError> {

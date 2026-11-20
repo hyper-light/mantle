@@ -1806,6 +1806,16 @@ impl<F: BlockFile> Store<F> {
         self.writer.is_some()
     }
 
+    /// `error`, a checkpoint's that failed part way, fences the store as a failed write does:
+    /// what it wrote and allocated is not the durable checkpoint's, and reads go to the file
+    /// until the owner reopens it at that checkpoint.
+    pub(crate) fn fail(&mut self, error: Error) -> Error {
+        match self.fence::<()>(Err(error)) {
+            Err(error) => error,
+            Ok(()) => io("checkpoint a store", "checkpoint failed"),
+        }
+    }
+
     fn fence<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = &result {
             self.fence_error.get_or_insert_with(|| error.clone());
@@ -4711,6 +4721,25 @@ impl<F: BlockFile> Store<F> {
     /// Makes a checkpoint naming `root` with state through Raft index `applied`, durable when
     /// this returns, in the order the module describes.
     pub fn checkpoint(&mut self, root: Option<u64>, applied: u64) -> Result<(), Error> {
+        let sb = self.checkpoint_map(root, applied)?;
+        self.sync()?;
+        self.checkpoint_seal(&sb)?;
+        self.sync()?;
+        self.checkpoint_commit(sb);
+        Ok(())
+    }
+
+    /// A checkpoint's first part: the allocator's map as the checkpoint names it written page by
+    /// page into extents of its own, and the superblock that will name it, which is written only
+    /// once the map is flushed ([`Self::checkpoint_seal`]). Nothing is durable yet: the caller
+    /// flushes the file, here ([`Self::checkpoint`]) or on a maintenance worker's handle
+    /// (`ShardDb::checkpoint_now`), and no extent may be taken or freed until
+    /// [`Self::checkpoint_commit`], the counts written being the ones the superblock names.
+    pub(crate) fn checkpoint_map(
+        &mut self,
+        root: Option<u64>,
+        applied: u64,
+    ) -> Result<Superblock, Error> {
         blocking_allowed("a synchronous store checkpoint in a runtime task")?;
         self.allocator_available()?;
         let generation = self
@@ -4752,25 +4781,38 @@ impl<F: BlockFile> Store<F> {
                 self.put(address, Kind::Map, generation, &bytes)?;
             }
         }
-        self.sync()?;
-        let page_size = self.durable.page_size;
-        let sb = Superblock {
-            page_size,
+        Ok(Superblock {
+            page_size: self.durable.page_size,
             extent_pages: self.config.extent_pages,
             generation,
             applied,
             root,
             extents: u64::try_from(refs.len()).map_err(|_| corrupt(Malformed::TooLarge))?,
             map,
-        };
+        })
+    }
+
+    /// A checkpoint's second part, once its map is flushed: the superblock naming it written,
+    /// which a flush then makes the checkpoint of record.
+    pub(crate) fn checkpoint_seal(&mut self, sb: &Superblock) -> Result<(), Error> {
         let mut payload = vec![0u8; sb.encoded_len()?];
         sb.encode(&mut payload)?;
-        self.put(sb.slot(), Kind::Superblock, generation, &payload)?;
-        self.sync()?;
-        // Durable: every extent this checkpoint no longer names, the old map's included, is free.
+        self.put(sb.slot(), Kind::Superblock, sb.generation, &payload)
+    }
+
+    /// A checkpoint's end, once its superblock is flushed: durable, every extent it no longer
+    /// names, the old map's included, is free.
+    pub(crate) fn checkpoint_commit(&mut self, sb: Superblock) {
         self.durable = sb;
         self.alloc.durable();
-        Ok(())
+    }
+
+    /// The file flushed to its device (`fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`): on a
+    /// maintenance worker's store, a checkpoint's flush of the shard's file through the worker's
+    /// own handle on it ([`crate::trunk::pool::Work::Sync`]), counted in the worker's store, not
+    /// the shard's.
+    pub(crate) fn flush_device(&mut self) -> Result<(), Error> {
+        self.sync()
     }
 
     /// Finishes accepted work without consuming the store. Cancellation retains its phase,

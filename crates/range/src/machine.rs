@@ -162,6 +162,9 @@ pub struct RangeMachine<E> {
     configuration: ConfState,
     /// The last entry applied.
     applied: Point,
+    /// The last entry applied when the engine's checkpoint out began ([`Engine::persist_now`]):
+    /// durable once it completes.
+    persisting: Option<Point>,
     /// The last entry the engine holds durably, as far as this machine knows: where it opened,
     /// installed or last persisted. An engine that persists more on its own schedule is behind
     /// this only until the next `persist`; the shell is then told less than the engine holds,
@@ -206,6 +209,7 @@ impl<E: Engine> RangeMachine<E> {
             watermark: Watermark::default(),
             configuration,
             applied: point,
+            persisting: None,
             durable: point,
             failure: None,
         })
@@ -382,15 +386,26 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         self.configuration = configuration.clone();
         self.applied = at;
         self.durable = at;
+        // The engine's persist finished any checkpoint out, which the install passed.
+        self.persisting = None;
         Ok(())
     }
 
-    fn persist(&mut self) -> Result<(), Fatal> {
-        self.engine
-            .persist()
+    /// The engine's checkpoint made without waiting ([`Engine::persist_now`]) on a node's shard,
+    /// which serves its consensus and transport too: begun at the entry applied now, and asked
+    /// again at each of the replica's drives until it completes; that entry is durable then, and
+    /// the log's start may move to it, never past (docs/design/replica.md §4, I8).
+    fn persist(&mut self) -> Result<bool, Fatal> {
+        let at = *self.persisting.get_or_insert(self.applied);
+        let done = self
+            .engine
+            .persist_now()
             .map_err(|e| failed(&mut self.failure, "the engine failed to persist", e))?;
-        self.durable = self.applied;
-        Ok(())
+        if done {
+            self.persisting = None;
+            self.durable = at;
+        }
+        Ok(done)
     }
 }
 

@@ -93,8 +93,8 @@ impl StateMachine for Noted {
         Ok(())
     }
 
-    fn persist(&mut self) -> Result<(), Fatal> {
-        Ok(())
+    fn persist(&mut self) -> Result<bool, Fatal> {
+        Ok(true)
     }
 }
 

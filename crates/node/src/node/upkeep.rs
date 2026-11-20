@@ -42,10 +42,12 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 }
 
 /// Steps the engine of the range at `handle` in `owner` ([`step`]). Maintenance that did work
-/// for a range whose entries wait for room in its engine may have taken the worker's message
-/// that was to wake the shard for it, and made the room (`ShardDb::room_now`): the range is
-/// queued, so the next turn drives it and comes at once (`Owner::has_work`), and a drive that
-/// finds no room yet leaves the wake asked again.
+/// for a range whose entries wait for room in its engine, or whose compaction waits for its
+/// engine's checkpoint, may have taken the worker's message that was to wake the shard for it,
+/// and made the room (`ShardDb::room_now`) or moved the checkpoint on
+/// (`ShardDb::checkpoint_now`): the range is queued, so the next turn drives it and comes at
+/// once (`Owner::has_work`), and a drive that finds no room yet, or the checkpoint still out,
+/// leaves the wake asked again.
 pub(super) fn step_range<E: Engine + 'static, S: mantle_range::LogStore>(
     owner: &mut hyper_durable::Owner<
         super::answers::Answers<S>,
@@ -59,7 +61,7 @@ pub(super) fn step_range<E: Engine + 'static, S: mantle_range::LogStore>(
     let Some(replica) = owner.get_mut(handle) else {
         return Ok((0, false));
     };
-    let waits = replica.waits_for_room();
+    let waits = replica.waits_for_room() || replica.persisting();
     let stepped = step(group, replica.machine_mut().engine_mut(), units)?;
     if waits && stepped.0 > 0 {
         owner.schedule(handle);
@@ -581,10 +583,19 @@ mod tests {
     struct Gate {
         open: std::sync::Mutex<bool>,
         opened: std::sync::Condvar,
+        /// The calls that came to the gate, and the task to wake at the next: what tells a test
+        /// that a job is out and held there, rather than a guess at how long it takes to get
+        /// there.
+        came: std::sync::atomic::AtomicUsize,
+        tell: std::sync::Mutex<Option<std::task::Waker>>,
     }
 
     impl Gate {
         fn pass(&self) {
+            self.came.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(waker) = self.tell.lock().unwrap().take() {
+                waker.wake();
+            }
             let mut open = self.open.lock().unwrap();
             while !*open {
                 open = self.opened.wait(open).unwrap();
@@ -594,6 +605,16 @@ mod tests {
         fn open(&self) {
             *self.open.lock().unwrap() = true;
             self.opened.notify_all();
+        }
+
+        fn came(&self) -> usize {
+            self.came.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// The runtime task polling now is woken when a call next comes to the gate.
+        fn tell_task(&self) {
+            let task = hyper_rt::futures::current_task().unwrap();
+            *self.tell.lock().unwrap() = Some(hyper_rt::waker::waker_for(task.0));
         }
     }
 
@@ -605,10 +626,13 @@ mod tests {
         }
     }
 
-    /// A store's file whose writes on a worker's handle pass the gate first.
+    /// A store's file whose writes on a worker's handle pass the gate first, and whose flushes
+    /// pass `held` first; `flushes` counts the flushes made through this handle.
     struct Gated {
         file: hyper_block::file::DeviceFile,
         gate: Option<std::sync::Arc<Gate>>,
+        held: Option<std::sync::Arc<Gate>>,
+        flushes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl hyper_block::block::BlockFile for Gated {
@@ -634,6 +658,11 @@ mod tests {
             self.file.write_all_at(buf, offset)
         }
         fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+            if let Some(held) = &self.held {
+                held.pass();
+            }
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.file.sync_data()
         }
         fn fills_new_space(&self) -> bool {
@@ -739,6 +768,8 @@ mod tests {
                     let file = Gated {
                         file: open(&path, true).unwrap(),
                         gate: None,
+                        held: None,
+                        flushes: std::sync::Arc::default(),
                     };
                     let mut e =
                         mantle_range::Stored::create(file, engine.store, memtable, engine.trunk)
@@ -756,6 +787,8 @@ mod tests {
                             Ok(Gated {
                                 file,
                                 gate: Some(gate.clone()),
+                                held: None,
+                                flushes: std::sync::Arc::default(),
                             })
                         },
                         1,
@@ -804,6 +837,295 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// Runs `test` on a runtime shard that may wait, as a node's does, with a range's engine
+    /// under the node's derived configuration in a new store at `path`, its one maintenance
+    /// worker's flushes held at `held` and the shard's own handle's flushes counted in `here`.
+    fn on_a_shard_with_a_held_flush<T>(
+        test: impl FnOnce(
+            mantle_range::Stored<Gated>,
+            std::sync::Arc<Gate>,
+            std::sync::Arc<std::sync::atomic::AtomicU64>,
+            std::path::PathBuf,
+        ) -> T
+        + Send
+        + 'static,
+    ) where
+        T: std::future::Future<Output = ()> + 'static,
+    {
+        use hyper_rt::machine::facts::Facts;
+        use hyper_rt::runtime::{LocalRuntime, RuntimeConfig, interests_for};
+        std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("range.store");
+            mantle_engine::store::permit_blocking();
+            let (_, rules) = crate::derive::cell(3).unwrap();
+            let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
+            // Room for 64 entries of eight rows at their largest: the checkpoint's memtable and
+            // every entry applied while it is out.
+            let row = mantle_engine::memtable::hashed::entry_bytes(16, 100).unwrap();
+            let memtable = row * (8 * 64 + 3);
+            let mut shard = LocalRuntime::new(&RuntimeConfig {
+                shards: 1,
+                tasks_per_shard: 1,
+                timers_per_shard: 2,
+                interests_per_shard: interests_for(1),
+                ring_entries: 1,
+                step_budget_ns: 1_000_000_000,
+                timer_tick_ns: 100_000,
+                batch: 1,
+                pin: false,
+                cores: Vec::new(),
+                page_bytes: usize::try_from(Facts::query().page.base).unwrap(),
+                spin_ns: 0,
+                wake_tracking: None,
+                latency_objective_ns: None,
+            })
+            .unwrap();
+            shard
+                .block_on(async move {
+                    let held = std::sync::Arc::new(Gate::default());
+                    let here = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let file = Gated {
+                        file: open_store(&path, true).unwrap(),
+                        gate: None,
+                        held: None,
+                        flushes: here.clone(),
+                    };
+                    let mut e =
+                        mantle_range::Stored::create(file, engine.store, memtable, engine.trunk)
+                            .unwrap();
+                    let (again, worker_held) = (path.clone(), held.clone());
+                    e.set_workers(
+                        move || {
+                            let file = open_store(&again, false).map_err(|e| {
+                                mantle_engine::Error::Io {
+                                    op: "open",
+                                    detail: e.to_string(),
+                                }
+                            })?;
+                            Ok(Gated {
+                                file,
+                                gate: None,
+                                held: Some(worker_held.clone()),
+                                flushes: std::sync::Arc::default(),
+                            })
+                        },
+                        1,
+                    )
+                    .unwrap();
+                    test(e, held, here, path).await;
+                })
+                .unwrap();
+            drop(dir);
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn open_store(
+        path: &std::path::Path,
+        create: bool,
+    ) -> Result<hyper_block::file::DeviceFile, hyper_block::DiskError> {
+        hyper_block::file::DeviceFile::open(
+            path,
+            create,
+            hyper_block::file::CachingRequest::Buffered,
+            hyper_block::buf::Alignment::new(4096).unwrap(),
+        )
+    }
+
+    /// Takes the checkpoint begun at `e`'s applied index on (`Engine::persist_now`), answered
+    /// not durable at each call, until its flush is out on the worker and held at `held`: each
+    /// wait is for a wake of the task, by the worker's message or by the flush coming to the
+    /// gate, and a wait that reaches the node's idle timeout fails the test as a lost wake.
+    async fn until_the_flush_is_held(e: &mut mantle_range::Stored<Gated>, held: &Gate) {
+        use mantle_meta::engine::Engine;
+        let bound = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap();
+        for _ in 0..64 {
+            held.tell_task();
+            assert!(!e.persist_now().unwrap(), "durable with its flush held");
+            if held.came() > 0 {
+                return;
+            }
+            assert!(
+                wait_for_wake(bound).await,
+                "a wake was lost before the flush went out"
+            );
+        }
+        panic!("the checkpoint's flush never went out in 64 of the task's wakes");
+    }
+
+    /// A range's checkpoint begun without waiting (`Engine::persist_now`, `ShardDb::
+    /// checkpoint_now`), its device flush held at a gate on the maintenance worker's handle: the
+    /// shard's thread waits on neither, and while the flush is out entries apply and read whole,
+    /// a second ask begins no other checkpoint, nothing is durable past the store's first
+    /// checkpoint, and no flush runs on the shard's own handle. With the gate open, the worker's
+    /// message wakes the task (no timer: the wait's bound is the node's idle timeout, and one
+    /// that reaches it fails the test as a lost wake) and the checkpoint completes at the index
+    /// applied when it began, not past it, both its flushes on the worker; the store opened
+    /// again stands there.
+    #[test]
+    fn a_checkpoint_flushes_on_its_worker_and_entries_apply_while_it_is_out() {
+        on_a_shard_with_a_held_flush(|mut e, held, here, path| async move {
+            use mantle_meta::engine::Engine;
+            use std::sync::atomic::Ordering::SeqCst;
+            for i in 1..=8 {
+                assert!(e.apply_now(i, batch(i)).unwrap(), "entry {i}");
+            }
+            // The new store's own first checkpoint flushed on the shard's handle, before any entry.
+            let flushed = here.load(SeqCst);
+            until_the_flush_is_held(&mut e, &held).await;
+            for i in 9..=16 {
+                assert!(
+                    e.apply_now(i, batch(i)).unwrap(),
+                    "entry {i} waited on the checkpoint"
+                );
+            }
+            for i in 1..=16 {
+                assert_eq!(whole(&mut e, i), Some(true), "entry {i}");
+            }
+            assert!(!e.persist_now().unwrap(), "durable with its flush held");
+            assert_eq!(held.came(), 1, "a second checkpoint's flush went out");
+            assert_eq!(e.durable(), 0);
+            assert_eq!(
+                here.load(SeqCst),
+                flushed,
+                "a flush ran on the shard's handle"
+            );
+            held.open();
+            let bound = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap();
+            let mut wakes = 0;
+            while !e.persist_now().unwrap() {
+                assert!(
+                    wait_for_wake(bound).await,
+                    "a wake was lost: the checkpoint's flush"
+                );
+                wakes += 1;
+                assert!(
+                    wakes < 64,
+                    "the checkpoint waited past 64 of the worker's messages"
+                );
+            }
+            assert_eq!((e.applied(), e.durable()), (16, 8));
+            assert_eq!(
+                held.came(),
+                2,
+                "the checkpoint's two flushes, on its worker"
+            );
+            assert_eq!(
+                here.load(SeqCst),
+                flushed,
+                "a flush ran on the shard's handle"
+            );
+            drop(e);
+            let file = Gated {
+                file: open_store(&path, false).unwrap(),
+                gate: None,
+                held: None,
+                flushes: std::sync::Arc::default(),
+            };
+            let (_, rules) = crate::derive::cell(3).unwrap();
+            let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
+            let mut e =
+                mantle_range::Stored::open(file, engine.store, 1 << 20, engine.trunk).unwrap();
+            assert_eq!(
+                e.applied(),
+                8,
+                "opened again past the checkpoint or before it"
+            );
+            for i in 1..=8 {
+                assert_eq!(whole(&mut e, i), Some(true), "entry {i}");
+            }
+            assert_eq!(
+                whole(&mut e, 9),
+                Some(false),
+                "entry 9, past the checkpoint"
+            );
+        });
+    }
+
+    /// A store whose checkpoint begun without waiting never completed, its first flush made by
+    /// the worker and its superblock never written, as at a crash while the flush was out, opens
+    /// again at the checkpoint before it: the store's first, before any entry, which the log
+    /// still covers, the compaction never having passed it (docs/design/replica.md §4).
+    #[test]
+    fn a_checkpoint_that_never_completed_opens_at_the_one_before() {
+        on_a_shard_with_a_held_flush(|mut e, held, _here, path| async move {
+            use mantle_meta::engine::Engine;
+            for i in 1..=8 {
+                assert!(e.apply_now(i, batch(i)).unwrap(), "entry {i}");
+            }
+            until_the_flush_is_held(&mut e, &held).await;
+            // The worker's flush ends, unasked by the shard, and the engine goes.
+            held.open();
+            drop(e);
+            let file = Gated {
+                file: open_store(&path, false).unwrap(),
+                gate: None,
+                held: None,
+                flushes: std::sync::Arc::default(),
+            };
+            let (_, rules) = crate::derive::cell(3).unwrap();
+            let engine = crate::derive::engine(4096, 1 << 30, &rules).unwrap();
+            let mut e =
+                mantle_range::Stored::open(file, engine.store, 1 << 20, engine.trunk).unwrap();
+            assert_eq!((e.applied(), e.durable()), (0, 0));
+            assert_eq!(
+                whole(&mut e, 1),
+                Some(false),
+                "entry 1, past the checkpoint"
+            );
+        });
+    }
+
+    /// An entry the memtable has no room for while a checkpoint's flush is out waits for the
+    /// checkpoint, unapplied and unseen, rather than rotate the memtable under the trunk and
+    /// allocator the checkpoint names (`ShardDb::room_now`). With the gate open, the worker's
+    /// messages wake the task; the entry's own asks take the checkpoint on to durable, then make
+    /// its room, and it applies whole; the compaction's next ask finds the checkpoint durable at
+    /// the index applied when it began.
+    #[test]
+    fn an_entry_with_no_room_while_a_checkpoint_is_out_waits_for_it() {
+        on_a_shard_with_a_held_flush(|mut e, held, _here, _path| async move {
+            use mantle_meta::engine::Engine;
+            for i in 1..=8 {
+                assert!(e.apply_now(i, batch(i)).unwrap(), "entry {i}");
+            }
+            until_the_flush_is_held(&mut e, &held).await;
+            let mut waited = None;
+            for i in 9..=8 * 64 {
+                if !e.apply_now(i, batch(i)).unwrap() {
+                    waited = Some(i);
+                    break;
+                }
+            }
+            let i = waited.expect("the memtable never filled while the checkpoint was out");
+            assert_eq!(e.applied(), i - 1);
+            assert_eq!(whole(&mut e, i), Some(false), "entry {i} applied in part");
+            assert_eq!(held.came(), 1, "a second checkpoint's flush went out");
+            held.open();
+            let bound = u64::try_from(bounds::idle_timeout().as_nanos()).unwrap();
+            let mut wakes = 0;
+            loop {
+                assert!(wait_for_wake(bound).await, "a wake was lost: entry {i}");
+                wakes += 1;
+                if e.apply_now(i, batch(i)).unwrap() {
+                    break;
+                }
+                assert!(
+                    wakes < 64,
+                    "entry {i} waited past 64 of the worker's messages"
+                );
+            }
+            assert_eq!(whole(&mut e, i), Some(true), "entry {i}");
+            assert!(
+                e.persist_now().unwrap(),
+                "the checkpoint its entry waited for"
+            );
+            assert_eq!(e.durable(), 8);
+        });
     }
 
     /// A failed engine stops the turn with the node's error, fenced.

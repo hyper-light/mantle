@@ -1050,6 +1050,11 @@ impl<F: BlockFile + 'static> Log<F> {
         let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(u64::try_from(PIPELINE_FRAMES).ok()?))
             .ok_or(LogError::Config("a queue of three frames past u64"))?;
+        // One group's share: the queue's bytes less one frame's worth (mantle
+        // docs/design/raft-log.md §3.1).
+        let group_bytes = writer::charge(room_bytes)
+            .and_then(|largest| queue_bytes.checked_sub(largest))
+            .ok_or(LogError::Config("a queue of no frame"))?;
         let p = Params {
             id,
             config,
@@ -1068,6 +1073,7 @@ impl<F: BlockFile + 'static> Log<F> {
         let mut room = room::Room::new(room::Limits {
             submissions: config.queue_submissions,
             bytes: queue_bytes,
+            group_bytes,
             waiters,
         });
         // The restore is the owner's first batch, not sent: sent one by one, it could be taken

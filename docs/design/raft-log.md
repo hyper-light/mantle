@@ -104,9 +104,9 @@ machine on its device's issuer (node.md §1.2), which is one thread for everythi
 bounded queue admits submissions by count and by bytes and refuses past either with `Busy`
 [research/11 §4] (§3.1). A submission holds its room until it is answered, so the bound
 covers updates waiting to be taken, those held for a later frame, those being written and
-those flushed and awaiting their confirmation, and each group holds two at most, the two
-batches' worth of a group that has one update in each frame; a hot group waits for its own
-room and never takes the others'. When more waits than a frame holds, the writer chooses
+those flushed and awaiting their confirmation, and each group holds three at most, one in each
+of the three frames the writer has in hand (§3.1), and two frames' worth of bytes at most; a hot
+group waits for its own room and never takes the others'. When more waits than a frame holds, the writer chooses
 what goes by class and by fair share of bytes (§3.2). The loop takes everything that arrived while the
 last batch was being made durable, encodes one frame, writes it, flushes the file once
 with the platform's full flush, and publishes the records to readers. It answers the frame's
@@ -116,6 +116,24 @@ just answered as long as that is expected to lower total latency, the wait the c
 writer derived (`hyper_block::commit`). Without it, a few replicas alternate between batches
 and each update waits for two flushes
 (docs/measurements/2026-09-28-raft-log-benchmark.md, finding 2).
+
+A confirmation written on its own is a flush that commits no update of its own: the log I/O group
+commit exists to share among everything that queued meanwhile (DeWitt et al., SIGMOD 1984 §5.2,
+research/03 §13.1; Helland et al., Tandem TR 88.1 §2, research/11 §2.2). The device writes one when the frame's flush ends with no word from the owner
+that another frame follows, a word the owner gives when it admits a submission while the frame is
+on the device. A replica keeps its `depth` of readies ahead of their persistence, one for each
+frame the writer has in hand (replica.md §3), so under steady load a busy group's next ready is
+already sent as each flush ends; it is admitted, and the word given, only if its group's room
+holds three. With room for two, the frame awaiting confirmation and the frame on the device held
+a busy group's two, and its third waited for the room the frame before gives back only once the
+flush on the device has ended, too late to say another frame follows. Eight groups each keeping
+their depth of one-entry writes out, on a simulated file whose flush takes 3 ms
+(`vendor/hyper-log/tests/follow.rs`): with room for two, all but 0.05 of the eight were at their
+depth, the next write waiting for its group's room, at each frame's flush end, and 75 of 151
+frames were confirmed on their own, 73 under load, 225 flushes; with room for three, one was, as
+the load ended, and the 151 frames took 151 flushes. A Mac Studio cell taking a million 1-byte
+PUTs wrote 8,469 such confirmations in 26,670 log flushes, 32%, at perf-10k `b3d4ac5d`. A frame
+is still answered only once a later durable record confirms it.
 
 A frame is laid out once: its header, whose checksum covers the payload where it lies, and
 then the payload, go straight into the aligned buffer the last frame used, kept while it is
@@ -139,7 +157,7 @@ no other call until the `Ready` is made durable (07 §1.2). So a replica submits
 for room in the queue instead of taking `Busy`. Waiters wait in arrival order, each in a slot of
 its own; room the writer frees is handed to the waiters it fits, in order, and only those are
 woken, one wake each, and a fence completes every waiter's slot with its answer once (node.md
-§1.3). The waiting list is bounded by construction: a group waits with at most its two
+§1.3). The waiting list is bounded by construction: a group waits with at most its three
 submissions, and the log holds at most `max_groups`. The wait lasts no longer than the writer's
 progress. Before, room was a condition variable the writer broadcast to every waiter on every
 answered submission; on macOS that broadcast walks every waiter inside one kernel spinlock, and a
@@ -187,8 +205,10 @@ awaiting the persist record that confirms it (§6), the frame being written, who
 does, and the frame gathering while that flush runs. With two, the next frame could gather
 only once a flush had ended and would go out short; bytes past the third cannot be written
 before the third flush from now, so by Little's law they add only waiting [research/11 §4,
-§5.2]. A group's two submissions hold at most two thirds of `B`, so one group never holds
-the last frame's worth that the others need.
+§5.2]. A group's submissions, three at most (§3), hold at most two thirds of `B`, `2·(F + 97)`:
+past that share the group waits for its own room, so one group never holds the last frame's worth
+that the others need. With two submissions a group the count alone kept the share; three
+full-frame submissions would hold all of `B`.
 
 ### 3.2 Sharing a full frame
 

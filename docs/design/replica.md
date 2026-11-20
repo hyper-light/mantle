@@ -334,6 +334,9 @@ is durable once every part is.
 durable (hyper-raft core step R-4), and the shell takes them to the log's depth, one write in each
 of the log's three pipeline frames (`GroupLog::depth`, raft-log.md §3). Meanwhile the core takes
 messages, proposals, reads and ticks: nothing is held and nothing refused while a write is out.
+The log admits a group's three writes at once (raft-log.md §3), so under load the write gathering
+for the next frame is admitted while the frame before it flushes, and that frame is confirmed by
+the next one's record rather than by a confirmation flushed on its own.
 mantle's shell took one `Ready` at a time, held the messages and ticks that came while it flushed
 within a window of appends a member and one election timeout, and refused proposals, reads and
 campaigns with `Stalled`; under steady load a write waited for two flushes, its frame's and the

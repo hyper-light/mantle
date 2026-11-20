@@ -8,8 +8,9 @@
 //! waiter on every answer; on macOS that broadcast walks every waiter inside one kernel spinlock,
 //! and thousands of waiters held it until the kernel panicked (research/26 §1.3–§1.4).
 //!
-//! A waiter whose own group already holds its [`GROUP_SUBMISSIONS`] waits for its group's room
-//! and is passed over by room it could not use, so a hot group never takes the others' room.
+//! A waiter whose own group already holds its [`GROUP_SUBMISSIONS`], or its share of the queue's
+//! bytes ([`Limits::group_bytes`]), waits for its group's room and is passed over by room it could
+//! not use, so a hot group never takes the others' room.
 //! A waiter that waits for the queue's room is never passed: room goes to it before any later
 //! arrival, so none starves.
 
@@ -17,17 +18,29 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::LogError;
 
-/// Submissions one group may have unanswered: the most its replica sends at once, the part of
-/// its ready in flight and a compaction, each of which waits for its answer before the next
-/// (mantle docs/design/replica.md §3–§4); the writes a replica makes as it opens come before any
-/// ready. A caller that sends more waits for its own room, and never takes another group's.
-pub(crate) const GROUP_SUBMISSIONS: usize = 2;
+/// Submissions one group may have unanswered: one in each of the log's pipeline frames
+/// ([`crate::PIPELINE_FRAMES`]), as many as the readies its replica keeps ahead of their
+/// persistence (`GroupLog::depth`; mantle docs/design/replica.md §3): the frame flushed and
+/// awaiting the record that confirms it, the frame on the device, whose record does, and the
+/// frame gathering while it flushes (mantle docs/design/raft-log.md §3.1). The third is what lets
+/// the frame on the device be followed: admitted while that frame flushes, it tells the device
+/// another frame follows, so the next frame's record confirms it and no confirmation of its own
+/// is written (raft-log.md §3). With two, a busy group's third ready waited for its group's room
+/// until the frame before was answered, which is at the flush's end, too late to say so
+/// (`tests/follow.rs`). A compaction, which waits for its answer before the next, waits behind
+/// them for its group's room. A caller that sends more waits for its own room, and never takes
+/// another group's.
+pub(crate) const GROUP_SUBMISSIONS: usize = crate::PIPELINE_FRAMES;
 
 /// What the queue admits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) submissions: usize,
     pub(crate) bytes: u64,
+    /// Charged bytes one group's submissions hold at most: the queue's less one frame's worth, so
+    /// one group never holds the last frame's worth the others need (mantle
+    /// docs/design/raft-log.md §3.1).
+    pub(crate) group_bytes: u64,
     /// Waiters the list holds: a group waits with at most its own [`GROUP_SUBMISSIONS`], and
     /// the log holds at most `max_groups` (mantle docs/design/raft-log.md §3). Past it, `Busy`.
     pub(crate) waiters: usize,
@@ -51,16 +64,21 @@ struct Waiter {
 struct Group {
     /// Submissions admitted and not yet answered.
     admitted: usize,
+    /// Their charged bytes.
+    bytes: u64,
     /// The group's waiters, oldest first; at most [`GROUP_SUBMISSIONS`].
     waiting: VecDeque<u64>,
 }
 
 impl Group {
-    /// Waiters of the group its own room lets wait for the queue's room: the oldest of them.
-    fn eligible(&self) -> usize {
-        self.waiting
-            .len()
-            .min(GROUP_SUBMISSIONS.saturating_sub(self.admitted))
+    /// Whether the group's own room takes a submission of `bytes` more, its share of the queue's
+    /// bytes being `share`.
+    fn takes(&self, bytes: u64, share: u64) -> bool {
+        self.admitted < GROUP_SUBMISSIONS
+            && self
+                .bytes
+                .checked_add(bytes)
+                .is_some_and(|total| total <= share)
     }
 }
 
@@ -73,7 +91,9 @@ pub(crate) struct Room {
     groups: HashMap<u128, Group>,
     /// Every waiter's slot, by arrival number.
     waiters: HashMap<u64, Waiter>,
-    /// Waiters whose group has room, in arrival order: the next room goes to the first.
+    /// Waiters whose group has room, in arrival order: the next room goes to the first. A
+    /// group's oldest waiter is here exactly while its group's own room takes it, and its later
+    /// waiters are not: each comes once the one before it is admitted.
     eligible: BTreeSet<u64>,
     next: u64,
     fenced: bool,
@@ -107,7 +127,10 @@ impl Room {
         let submissions = self.submissions.checked_add(1).ok_or(LogError::Busy)?;
         let total = self.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
         let g = self.groups.entry(group).or_default();
-        g.admitted = g.admitted.checked_add(1).ok_or(LogError::Busy)?;
+        let own = g.admitted.checked_add(1).ok_or(LogError::Busy)?;
+        let own_bytes = g.bytes.checked_add(bytes).ok_or(LogError::Busy)?;
+        g.admitted = own;
+        g.bytes = own_bytes;
         self.submissions = submissions;
         self.bytes = total;
         Ok(())
@@ -127,12 +150,13 @@ impl Room {
         if self.fenced {
             return Err(LogError::Fenced);
         }
-        let (own, waiting) = self
-            .groups
-            .get(&group)
-            .map_or((0, 0), |g| (g.admitted, g.waiting.len()));
+        let share = self.limits.group_bytes;
+        let (takes, waiting) = self.groups.get(&group).map_or_else(
+            || (Group::default().takes(bytes, share), 0),
+            |g| (g.takes(bytes, share), g.waiting.len()),
+        );
         // Room goes to those who wait before anyone who comes after them.
-        if waiting == 0 && self.eligible.is_empty() && own < GROUP_SUBMISSIONS && self.fits(bytes) {
+        if waiting == 0 && self.eligible.is_empty() && takes && self.fits(bytes) {
             return self.hold(group, bytes).map(|()| Take::Admitted);
         }
         if !wait || self.waiters.len() >= self.limits.waiters || waiting >= GROUP_SUBMISSIONS {
@@ -141,9 +165,9 @@ impl Room {
         let seq = self.next;
         self.next = seq.checked_add(1).ok_or(LogError::Busy)?;
         self.waiters.insert(seq, Waiter { group, bytes });
-        let g = self.groups.entry(group).or_default();
-        g.waiting.push_back(seq);
-        if g.waiting.len() <= g.eligible() {
+        self.groups.entry(group).or_default().waiting.push_back(seq);
+        // The group's oldest waiter, whose group's room takes it, waits for the queue's room.
+        if waiting == 0 && takes {
             self.eligible.insert(seq);
         }
         self.admit(admitted);
@@ -156,7 +180,8 @@ impl Room {
     }
 
     /// Hands the room there is to the eligible waiters in arrival order, adding each admitted to
-    /// `admitted`. Stops at the first that does not fit, which keeps its turn.
+    /// `admitted`. Stops at the first that does not fit, which keeps its turn. Each turn admits a
+    /// waiter or drops a stale entry, so it ends within the waiters there are.
     fn admit(&mut self, admitted: &mut Vec<u64>) {
         while let Some(&seq) = self.eligible.first() {
             let Some((group, bytes)) = self.waiters.get(&seq).map(|w| (w.group, w.bytes)) else {
@@ -168,8 +193,7 @@ impl Room {
             }
             self.eligible.remove(&seq);
             self.waiters.remove(&seq);
-            // The admitted waiter is its group's oldest: eligibility runs in arrival order
-            // within a group, so the rest of the group's eligible set is unchanged.
+            // The admitted waiter is its group's oldest: only the oldest is eligible.
             if let Some(g) = self.groups.get_mut(&group)
                 && g.waiting.front() == Some(&seq)
             {
@@ -178,6 +202,25 @@ impl Room {
             // In range: `fits` checked the queue's bound, far below the counters' range.
             let _ = self.hold(group, bytes);
             admitted.push(seq);
+            // The group's next waiter waits for the queue's room now, if its group's room takes it.
+            self.ready(group);
+        }
+    }
+
+    /// Makes `group`'s oldest waiter eligible if its group's own room takes it.
+    fn ready(&mut self, group: u128) {
+        let Some(g) = self.groups.get(&group) else {
+            return;
+        };
+        let Some(&seq) = g.waiting.front() else {
+            return;
+        };
+        if self
+            .waiters
+            .get(&seq)
+            .is_some_and(|w| g.takes(w.bytes, self.limits.group_bytes))
+        {
+            self.eligible.insert(seq);
         }
     }
 
@@ -186,22 +229,16 @@ impl Room {
     pub(crate) fn release(&mut self, group: u128, bytes: u64, admitted: &mut Vec<u64>) {
         self.submissions = self.submissions.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(bytes);
-        let mut newly = None;
         let mut empty = false;
         if let Some(g) = self.groups.get_mut(&group) {
-            let before = g.eligible();
             g.admitted = g.admitted.saturating_sub(1);
-            if g.eligible() > before {
-                newly = g.waiting.get(before).copied();
-            }
+            g.bytes = g.bytes.saturating_sub(bytes);
             empty = g.admitted == 0 && g.waiting.is_empty();
         }
         if empty {
             self.groups.remove(&group);
         }
-        if let Some(seq) = newly {
-            self.eligible.insert(seq);
-        }
+        self.ready(group);
         self.admit(admitted);
     }
 
@@ -240,6 +277,7 @@ mod tests {
         Room::new(Limits {
             submissions,
             bytes: u64::MAX,
+            group_bytes: u64::MAX,
             waiters,
         })
     }
@@ -291,12 +329,13 @@ mod tests {
     /// the next waiter it fits, not to the hot group's.
     #[test]
     fn a_hot_group_waits_for_its_own_room() {
-        let mut room = room(3, 8);
-        room.take(1, 1, false, &mut Vec::new()).unwrap();
-        room.take(1, 1, false, &mut Vec::new()).unwrap();
+        let mut room = room(GROUP_SUBMISSIONS + 1, 8);
+        for _ in 0..GROUP_SUBMISSIONS {
+            room.take(1, 1, false, &mut Vec::new()).unwrap();
+        }
         room.take(2, 1, false, &mut Vec::new()).unwrap();
         let Take::Waiting(hot) = room.take(1, 1, true, &mut Vec::new()).unwrap() else {
-            panic!("the hot group's third was admitted");
+            panic!("the hot group's one past its room was admitted");
         };
         let Take::Waiting(cold) = room.take(3, 1, true, &mut Vec::new()).unwrap() else {
             panic!("a waiter was passed");
@@ -306,6 +345,48 @@ mod tests {
         assert_eq!(admitted, vec![cold]);
         admitted.clear();
         room.release(1, 1, &mut admitted);
+        assert_eq!(admitted, vec![hot]);
+    }
+
+    /// A group holds at most its share of the queue's bytes, however few its submissions: past
+    /// it the group waits for its own room, and room another group frees goes to the next waiter
+    /// it fits, so one group never holds the last frame's worth the others need.
+    #[test]
+    fn a_group_holds_at_most_its_share_of_the_bytes() {
+        let mut room = Room::new(Limits {
+            submissions: 8,
+            bytes: 30,
+            group_bytes: 20,
+            waiters: 8,
+        });
+        room.take(1, 10, false, &mut Vec::new()).unwrap();
+        room.take(1, 10, false, &mut Vec::new()).unwrap();
+        assert!(matches!(
+            room.take(1, 10, false, &mut Vec::new()),
+            Err(LogError::Busy)
+        ));
+        let Take::Waiting(hot) = room.take(1, 10, true, &mut Vec::new()).unwrap() else {
+            panic!("the group took past its share");
+        };
+        // The last frame's worth is the others'.
+        assert_eq!(
+            room.take(2, 10, false, &mut Vec::new()).unwrap(),
+            Take::Admitted
+        );
+        let Take::Waiting(cold) = room.take(3, 10, true, &mut Vec::new()).unwrap() else {
+            panic!("the queue held more than its bytes");
+        };
+        let mut admitted = Vec::new();
+        room.release(2, 10, &mut admitted);
+        assert_eq!(
+            admitted,
+            vec![cold],
+            "the hot group took room it could not use"
+        );
+        admitted.clear();
+        room.release(3, 10, &mut admitted);
+        assert!(admitted.is_empty(), "the hot group passed its share");
+        room.release(1, 10, &mut admitted);
         assert_eq!(admitted, vec![hot]);
     }
 

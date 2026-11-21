@@ -625,6 +625,35 @@ fn fill_row(index: u64) -> (Vec<u8>, Vec<u8>) {
     (key, index.to_le_bytes().repeat(15))
 }
 
+/// What the trunk's branches hold in the store: their live pages, the extents holding one at
+/// least, and the pages above the leaves (`TrunkStats`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Census {
+    live_pages: u64,
+    live_extents: u64,
+    above_leaves: u64,
+}
+
+impl Census {
+    fn of<F: BlockFile + 'static>(e: &Stored<F>) -> Self {
+        let t = e.trunk_stats();
+        Census {
+            live_pages: t.live_pages,
+            live_extents: t.live_extents,
+            above_leaves: t.shape.iter().filter(|l| !l.leaf).map(|l| l.pages).sum(),
+        }
+    }
+
+    /// Each count's most of the two.
+    fn most(self, other: Self) -> Self {
+        Census {
+            live_pages: self.live_pages.max(other.live_pages),
+            live_extents: self.live_extents.max(other.live_extents),
+            above_leaves: self.above_leaves.max(other.above_leaves),
+        }
+    }
+}
+
 /// A range's engine in the cell's store, opened as `process::engine` opens it with `workers`
 /// workers on a shard that may wait, takes [`FILL`] entries as a node's drive applies them
 /// (`Engine::apply_now`, its turn's `Engine::upkeep` while an entry waits for room), and its
@@ -634,7 +663,7 @@ fn fill_row(index: u64) -> (Vec<u8>, Vec<u8>) {
 /// store's extent bound (`Stored::at_extent_bound`): then nothing it holds gives extents back.
 /// Either way the engine is checkpointed, every row acknowledged reads back, and so does it
 /// from the store opened again. The last entry taken, or the engine's error where it fenced.
-fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
+fn sustained_fill(workers: usize, paced: bool) -> Result<u64, String> {
     std::thread::spawn(move || {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("range.store");
@@ -663,6 +692,7 @@ fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
                 };
                 let mut acknowledged = std::collections::BTreeMap::new();
                 let mut taken = 0;
+                let mut peak = Census::default();
                 // A checkpoint begun without waiting and not yet durable.
                 let mut out = false;
                 'fill: for index in 1..=FILL {
@@ -691,6 +721,7 @@ fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
                     }
                     acknowledged.insert(k, v);
                     taken = index;
+                    peak = peak.most(Census::of(&e));
                     e.upkeep(TURN_UNITS).map_err(|error| fault(&e, error))?;
                     if paced {
                         if out || index % CHECKPOINT == 0 {
@@ -700,7 +731,14 @@ fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
                         e.persist().map_err(|error| fault(&e, error))?;
                     }
                 }
+                let end = Census::of(&e);
                 e.persist().map_err(|error| fault(&e, error))?;
+                eprintln!(
+                    "the fill took {taken}: at its end {end:?}, at its most {peak:?}, {} flushes \
+                     near the bound, {} pages written",
+                    e.trunk_stats().near_bound_flushes,
+                    e.io_stats().pages_written
+                );
                 assert!(e.fault().is_none(), "the engine fenced: {:?}", e.fault());
                 for (k, v) in &acknowledged {
                     assert_eq!(
@@ -726,39 +764,31 @@ fn fill_to_the_bound(workers: usize, paced: bool) -> Result<u64, String> {
 
 /// A range's engine in the node suite's cell's store (256 extents of four 4 KiB pages, 4 KiB
 /// memtables, its one worker, a checkpoint made without waiting as the range's compaction makes
-/// it) under a sustained fill reaches the store's extent bound and waits there; it is never
-/// fenced, and every row it acknowledged reads back. The node suite's sustained-writes cell
-/// stopped on "range 626c6f636b's engine in its maintenance: the engine is fenced after a failed
-/// write: extents of a store would exceed its bound of 256" (CI run 44721951954): an inline
-/// compaction of the engine's idle step took the store's last extent while 42 the durable
-/// checkpoint named waited for the next checkpoint (held 214, pending 42 at the refusal). Small
-/// branches share extents, each beginning where the last branch of its expected life ended, a
-/// worker's job where the shard hands it, but an extent stays held while any branch with a page in
-/// it lives, so the store's extents, not its bytes, still bound the fill: the whole fill waits for
-/// branches grouped by the pivot they wait in, or mostly dead extents' live pages copied out
-/// (docs/design/engine-structure.md §3, at the bound). The cell's key space is taken whole
-/// first.
+/// it) takes the whole sustained fill: it never meets the store's extent bound, is never fenced,
+/// and every row it acknowledged reads back. The node suite's sustained-writes cell stopped on
+/// "range 626c6f636b's engine in its maintenance: the engine is fenced after a failed write:
+/// extents of a store would exceed its bound of 256" (CI run 44721951954), and then waited at the
+/// bound: an extent stays held while any branch with a page in it lives, and the index nodes held
+/// up to `fanout + 1` branches a pivot of versions the leaves' settles would drop. Near its bound
+/// the store's index pivots flush as soon as they hold a branch (docs/design/engine-structure.md
+/// §3, near the bound), so the versions above the leaves fit the room the store has left. The
+/// cell's key space is taken whole first.
 #[test]
-fn a_sustained_fill_of_the_cells_store_waits_at_its_extent_bound_and_never_fences() {
-    match fill_to_the_bound(1, true) {
-        Ok(taken) => {
-            eprintln!("the fill took {taken} of its {FILL} entries");
-            assert!(taken > FILL_KEYS, "the bound met at entry {taken}");
-        }
+fn a_sustained_fill_of_the_cells_store_takes_every_entry_and_never_fences() {
+    match sustained_fill(1, true) {
+        Ok(taken) => assert_eq!(taken, FILL, "the bound met at entry {taken}"),
         Err(error) => panic!("the fill fenced the engine: {error}"),
     }
 }
 
 /// The same fill on the shard alone with whole checkpoints, deterministic: the checkpoint's
-/// drain of the trunk's maintenance (`ShardDb::flush`, `Trunk::drain`) took the store's last
-/// extent while 47 the durable checkpoint named waited for this one (held 209, pending 47).
+/// drain of the trunk's maintenance (`ShardDb::flush`, `Trunk::drain`) once took the store's last
+/// extent while 47 the durable checkpoint named waited for this one (held 209, pending 47), and
+/// the fill then met the bound at entry 21,199.
 #[test]
-fn a_sustained_fill_of_the_cells_store_on_the_shard_alone_waits_at_its_extent_bound() {
-    match fill_to_the_bound(0, false) {
-        Ok(taken) => {
-            eprintln!("the fill took {taken} of its {FILL} entries");
-            assert!(taken > FILL_KEYS, "the bound met at entry {taken}");
-        }
+fn a_sustained_fill_of_the_cells_store_on_the_shard_alone_takes_every_entry() {
+    match sustained_fill(0, false) {
+        Ok(taken) => assert_eq!(taken, FILL, "the bound met at entry {taken}"),
         Err(error) => panic!("the fill fenced the engine: {error}"),
     }
 }

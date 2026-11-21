@@ -166,6 +166,16 @@ reference counts rebuilt from the root, which is not implemented.
 increase[s] space usage". The only number is SplinterDB's 137% on update-heavy work, from the
 maplets abstract.
 
+**What mantle takes for space** (docs/design/engine-structure.md §3, near the bound). The flush
+past `F` branches holds up to `F + 1` branches a pivot above the leaves, versions only a leaf's
+settle drops, with no bound on their space. Mantle keeps it while its store has room, and near its
+bound (fewer free extents than the pages above the leaves fill) flushes an index pivot as soon as
+it holds a branch: leveling's space bound, O(1/T) where tiering's is O(T) (Dostoevsky §3;
+research/12 §2.5), and RocksDB's sizing of the levels above the last from the last's own size
+(DONG17 §3.1; research/12 §2.2), bought with the writes of more frequent settles (the RUM
+conjecture, DONG17 §4) only where space binds. The mark's when follows Sprite LFS's cleaner, which
+starts below a threshold of clean segments rather than when they run out (§6 below).
+
 ## 2. Maplets (SIGMOD '23; abstract and arXiv 2510.05518 only)
 
 - **What changes.** One maplet per pivot, a one-sided-error map from key to the set of branches

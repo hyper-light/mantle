@@ -764,6 +764,7 @@ impl Trunk {
     /// Looks at the nodes queued when it begins, each once: a node looked at may queue those it
     /// changed, and they wait for the next look ([`Self::run`] looks again once tasks apply).
     fn look<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        self.note_near_bound(store);
         self.plan_cleaning(store)?;
         for _ in 0..self.looking.len() {
             let Some(n) = self.looking.pop_front() else {
@@ -801,7 +802,13 @@ impl Trunk {
         }
         for i in 0..pivots {
             match self.flush_due(n, i)? {
-                Flush::Now => self.flush_pivot(n, i)?,
+                Flush::Now => {
+                    if self.near_bound && self.held_within_fanout(n, i)? {
+                        self.stats.near_bound_flushes =
+                            self.stats.near_bound_flushes.saturating_add(1);
+                    }
+                    self.flush_pivot(n, i)?
+                }
                 // Looked at again once the child's live in-flight bundles fall below the fanout
                 // ([`Self::wake_held`]).
                 Flush::Held(child) => self.node_mut(child)?.held_by = Some(n),
@@ -982,7 +989,7 @@ impl Trunk {
                 && !self.compacting(n, &pivot.key)
                 && !self.flush_to_come(n, &pivot.key)?
         } else {
-            held > self.config.fanout
+            held > self.flush_past()
         };
         if !due {
             Ok(Flush::No)
@@ -991,6 +998,78 @@ impl Trunk {
         } else {
             Ok(Flush::Held(child))
         }
+    }
+
+    /// The branches a pivot's bundle holds before it flushes: past the fanout, SplinterDB's
+    /// bound (a flush when the child's branches would pass `F`; research/34 §1), so a read's
+    /// sources stay few; with the store near its bound, any branch ([`Self::note_near_bound`]).
+    fn flush_past(&self) -> usize {
+        if self.near_bound {
+            0
+        } else {
+            self.config.fanout
+        }
+    }
+
+    /// Whether pivot `i` of node `n` holds a bundle of at most `fanout` branches: flushed, it
+    /// went down only because the store is near its bound.
+    fn held_within_fanout(&self, n: usize, i: usize) -> Result<bool, Error> {
+        let pivot = self.node(n)?.pivots.get(i).ok_or(corrupt())?;
+        Ok((1..=self.config.fanout).contains(&pivot.bundle.branches().len()))
+    }
+
+    /// Notes whether the store is near its bound ([`Self::near_bound`]): the extents maintenance
+    /// may write into ([`Self::room_free`]) are fewer than the extents the pages above the leaves
+    /// fill ([`Self::above_leaves_pages`]). A key's versions above a leaf and in it are
+    /// merged only by the leaf's settle, which alone drops the older; a pivot past the fanout
+    /// flushes, so a store's index nodes may hold `fanout + 1` branches a pivot of versions the
+    /// leaves will drop (SplinterDB's size tiering, whose space the paper leaves unbounded;
+    /// research/34 §1). Below the mark the index pivots flush as soon as they hold a branch, so the
+    /// data above the leaves is the data on its way down, as leveling bounds the levels above the
+    /// last to what that level's own size sets (RocksDB's dynamic level sizing, DONG17 §3.1;
+    /// research/12 §2.2) and trades the writes of more frequent settles for the space (the RUM
+    /// conjecture, DONG17 §4; Dostoevsky's space amplification, O(T) tiered and O(1/T) leveled,
+    /// research/12 §2.5). The mark is what pushing that data down takes: each compaction below
+    /// rewrites what it merges and frees its inputs only at the next checkpoint, so a store with
+    /// fewer free extents than those pages fill could not take them one level lower, and the
+    /// versions would stay until the store stalls. Engaged, every index node holding a bundle
+    /// is looked at, so its pivots flush now. The pages above the leaves are counted only where
+    /// the store has fewer free pages than the tree's live ones ([`Self::live_total`]), which
+    /// they are a part of: a store far from its bound is told so without a look at its nodes.
+    fn note_near_bound<F: BlockFile>(&mut self, store: &Store<F>) {
+        let per = u64::from(self.extent_pages).max(1);
+        let free = self.room_free(store);
+        let near = free.saturating_mul(per) < self.live_total
+            && free < self.above_leaves_pages().div_ceil(per);
+        if near && !self.near_bound {
+            for n in 0..self.nodes.len() {
+                let holds = self.nodes.get(n).is_some_and(|node| {
+                    !node.leaf && node.pivots.iter().any(|p| !p.bundle.branches().is_empty())
+                });
+                if holds {
+                    self.queue(n);
+                }
+            }
+        }
+        if near {
+            self.stats.near_bound_looks = self.stats.near_bound_looks.saturating_add(1);
+        }
+        self.near_bound = near;
+    }
+
+    /// The extents maintenance may write into, as the mark reads them each look: those the store
+    /// may still hand out once grown (`Store::room_most`) beside the room the next checkpoint's
+    /// packings and map take ([`Self::set_checkpoint_room`]), the image's extents as last saved,
+    /// which the next image replaces, and the cleaner's reserve. In constant time: the image as
+    /// it stands, which [`Self::room_kept`] counts node by node for a task about to open, differs
+    /// from the last only by the nodes changed since.
+    pub(super) fn room_free<F: BlockFile>(&self, store: &Store<F>) -> u64 {
+        let image = u64::try_from(self.saved.len()).unwrap_or(u64::MAX);
+        store
+            .room_most()
+            .saturating_sub(self.checkpoint_room)
+            .saturating_sub(image)
+            .saturating_sub(self.clean_room)
     }
 
     /// SplinterDB's pass through an index node that received data (`restore_balance_index`,
@@ -2376,6 +2455,10 @@ mod shared_extents;
 #[cfg(test)]
 #[path = "relocation.rs"]
 mod relocation;
+
+#[cfg(test)]
+#[path = "near_bound.rs"]
+mod near_bound;
 
 #[cfg(test)]
 mod reuse_tests {

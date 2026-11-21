@@ -328,7 +328,8 @@ under load, at moderate load and saturated.
   (below), the shard alone at 21,155 and the paced fill at 18,325 and 19,050 in two runs, its
   worker's jobs each still beginning a fresh extent; with a job beginning in the tail the shard
   hands it (below), the paced fill at 20,901 to 24,000 run alone, its worker's timing varying.
-  *Open:* the whole fill. At the bound the
+  With the index pivots flushing as soon as they hold a branch near the bound (below), both fills
+  take every entry, five runs each (2026-11-21). Before, at the bound the
   shard alone held 186 branches of 729 pages in 240 extents, which hold 183 written densely: an
   extent is held while any branch with a page in it lives, and a short-lived branch (a packing,
   two pages) sharing an extent with a long-lived one (a leaf's, five or six) leaves its pages
@@ -498,12 +499,68 @@ under load, at moderate load and saturated.
   older versions the inner nodes held at the shard alone's bound (286 in their pivots' bundles,
   24 in flight), a sixth to a third of them: holding fewer versions above the leaves is the next
   lever (a compaction policy for a store near its bound), with whole-extent cleaning.
-  *Open, next:* whole-extent rounds that survive the checkpoint; holding fewer versions.
+  *Open, next:* whole-extent rounds that survive the checkpoint. Holding fewer versions is the
+  next bullet's.
   *The bound it gives, once extents are cleaned whole:* cleaning every extent whose live pages are
   fewer than a share `s` of its pages, the extents held for branches are at most the live pages
   over `s × extent_pages`, plus a tail for each life; at the bound's 725 live pages, `s` = 3/4
   gives 242 and two tails, within the 246 the fill may hold, so this geometry's fill needs a
   cleaner that keeps every extent at least three-quarters live.
+- **Near the bound, the index pivots flush as soon as they hold a branch.** A pivot flushes its
+  bundle once it holds more than `fanout` branches (SplinterDB's bound, research/34 §1), so an
+  index node holds up to `fanout + 1` branches a pivot, and a key's versions there and in its leaf
+  are merged only by the leaf's settle, which alone drops the older. SplinterDB states no bound on
+  that space; its size tiering "temporarily increase[s] space usage" (research/34 §1). At the
+  shard-alone fill's bound (entry 21,199 of 24,000) 288 of the tree's 727 live pages were above the
+  leaves (336 at the fill's most), and the cleaner alone would have had to keep every extent
+  three-quarters live (above). Leveling bounds that space where tiering does not: space
+  amplification is O(1/T) leveled and O(T) tiered (Dostoevsky §3; research/12 §2.5), and RocksDB's
+  dynamic level sizing holds the levels above the last to what the last one's size sets, about 1 +
+  1/(T − 1) at worst (DONG17 §3.1, as research/12 §2.2 derives it); the price is writes, since of
+  space, reads and writes one is bought with another (the RUM conjecture, DONG17 §4). So the trunk
+  trades writes for space only where space binds. *The mark* (`Trunk::note_near_bound`, once a
+  look): the store is near its bound while the extents it may still hand out once grown
+  (`Store::room_most`), beside the room the next checkpoint's packings and map take, the image's
+  extents as last saved and the cleaner's reserve (`Trunk::room_free`, in constant time: the image
+  as it stands differs from the last only by the nodes changed since), are fewer than the extents
+  the pages above the leaves fill (`Trunk::above_leaves_pages`). That is the room pushing those
+  pages down takes: each compaction below rewrites what it merges and frees its inputs only at the
+  next checkpoint, so a store with less could not move its versions a level lower, and they would
+  stay until it stalled; Sprite LFS likewise starts cleaning when its clean segments fall below a
+  threshold, not when they run out (research/34 §6). The mark is no constant: it is the tree's own
+  data above the leaves. Below it every index pivot flushes as soon as it holds a branch
+  (`Trunk::flush_past`), every index node holding a bundle is looked at as the mark is crossed, and
+  a flush still waits for a child that takes none (`Trunk::takes_flush`): the data above the leaves
+  is the data on its way down, and the leaves' settles drop the versions it supersedes. Far from
+  its bound, the store's free pages at least the tree's live pages (`Trunk::live_total`, kept with
+  the live counts), of which those above the leaves are a part, a look counts nothing more and the
+  trunk keeps SplinterDB's flushes. *The bound:* once maintenance has drained, the pages above the
+  leaves fill at most the extents the store has free beside the checkpoint's room, or none are left
+  above the leaves (`trunk/near_bound.rs`). With `H_leaves` and `H_above` the extents the leaves'
+  and the index nodes' branches fill, `B` the store's bound and `kept` the checkpoint's room,
+  `H_above ≤ B − kept − H_leaves − H_above` gives `H_above ≤ (B − kept − H_leaves) / 2`: the
+  versions above the leaves take at most half the room the leaves and the checkpoint leave, and
+  that room can always take them a level lower. *Measured* (mantle-node `tests/engine_workers.rs`,
+  five runs each, the two fills side by side, debug build, macOS arm64, 2026-11-21; before is the
+  same build with the mark never met):
+
+  | | shard alone | paced, one worker |
+  |---|---|---|
+  | entries taken, before | 21,199 in all five | 16,718, 20,514, 20,628, 20,986, 23,050 |
+  | entries taken, after | 24,000 in all five | 24,000 in all five |
+  | live pages in extents at the end, before | 727 in 235 (0.32 extents a page) | 710 to 754 in 241 to 244 (0.32 to 0.34) |
+  | live pages in extents at the end, after | 471 in 138 (0.29) | 430 to 531 in 128 to 151 (0.28 to 0.31) |
+  | pages above the leaves at the end, before | 288 | 327 to 380 |
+  | pages above the leaves at the end, after | 150 | 68 to 214 |
+  | the most extents with a live page, before | 235 | 239 to 243 |
+  | the most extents with a live page, after | 195 | 170 to 191 |
+
+  Each count's most over the fill, after: 708 live pages and 332 above the leaves on the shard
+  alone, 594 to 675 and 281 to 325 paced; 1,074 index pivots flushed early on the shard alone, 772
+  to 2,663 paced. Ten paced runs more, with the mark counting the image as it stands, took 24,000
+  each too. Extents holding live pages alone would be 0.25 extents a page. The writes it costs, on
+  the shard alone (deterministic): 13,131 pages written to the bound at entry 21,199 before, 0.62
+  an entry; 17,566 for the whole fill after, 0.73 an entry.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

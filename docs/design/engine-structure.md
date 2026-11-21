@@ -336,8 +336,7 @@ under load, at moderate load and saturated.
   by life, it held 177 branches of 725 pages in 244 extents
   that hold 182 densely, 55 of them with one live page, 21 with two and 44 with three: a
   branch's death follows the pivot it waits in, not its kind alone (below). Copying a mostly
-  dead extent's live pages out, or grouping branches by the pivot they wait in, is the next
-  step.
+  dead extent's live pages out is the next step (cleaning, below).
 - **Small branches share extents.** The cell's store met its bound before its bytes were full,
   each branch taking whole extents of its own: on the shard alone at entry 8,925, 108 branches
   of 537 pages held 169 extents of four pages, 66 of them part used, and the branches were two
@@ -414,6 +413,72 @@ under load, at moderate load and saturated.
   found a tail to begin in. Adopted only as the shard applied a job's branches, at a pass's end,
   the tail reached fewer jobs, and the fill met its bound at 18,850. The shard alone, which runs no
   job, still meets its bound at 21,155.
+- **Cleaning.** Measured at the shard alone's bound (entry 21,155; mantle-node
+  `tests/engine_workers.rs`, a census of every branch taken where `ShardDb::at_extent_bound`
+  first holds, not kept; 2026-11-20): 244 extents held for 177 branches of 725 live pages, which
+  fill 182 written densely; 55 extents held one live page, 21 two, 44 three and 124 four. The
+  engine waited for 10 extents with 8 free. The live pages sat in leaves' bundles (415), inner
+  nodes' bundles (286) and inner nodes' in-flight bundles (24), and 65 extents held live pages of
+  more than one node. What cleaning recovers there: settling each leaf whose sources alone hold
+  more extents than their pages fill, 13 extents net over 39 leaves; copying each branch that
+  alone holds more extents than its pages fill, 18 net for 60 pages copied (18 branches); the
+  rest, down to 182, only by copying every branch with a page in a mostly dead extent, as Sprite
+  LFS copies a whole segment's live blocks out (research/34 §6). Grouping branches by the slot
+  they wait in lowers the waste found but bounds nothing: a leaf's next settle begins where its
+  last ended, so its own short-lived predecessor dies beside it, and the paced fill's end follows
+  its worker's timing. The store is also near full of live pages: 725 of its 1,024, and beside
+  the 10 extents the waiting task and the checkpoint asked, 246 extents may hold them, so the fill
+  needs its held extents about 74% live, every one of them where none is cleaned twice. By LFS's
+  write cost, 2/(1-u) for segments cleaned at utilization u [LFS §3.4], cleaning at 3/4 moves
+  eight pages for each new one; so holding fewer versions (fewer live pages) is the other lever,
+  beside the cleaner.
+  *Mechanism, as built.* A relocation (`Trunk::plan_relocation`, `What::Relocate`), a maintenance
+  task beside a compaction and a settle: a copy of one branch, a merge of it alone with its
+  tombstones kept and its life kept (a leaf's bundle's long, any other short;
+  `Compaction::set_life`), written inline a budget at a time and gated by room as a compaction is.
+  As it applies, the copy replaces the branch where it stands, found by its root page, and the
+  original's extents are released once each, free at the next checkpoint (a range checkpoints for
+  room, above). Its node plans no other task and takes no change while it is out (`look_at`
+  leaves it until the relocation applies, which looks at it again), so the branch stays where it
+  is; one whose branch is gone as it applies is discarded, its copy released, and nothing of it
+  stays held (`trunk/relocation.rs`). A relocation not begun is dropped for a checkpoint like any
+  task, and planned anew. A relocation takes at most the extents its pages fill: begun part way
+  into a tail it shares that extent, `⌈(t + p) / e⌉ − 1` fresh extents for `p` pages begun at page
+  `t < e`, at most `⌈p / e⌉` (`Trunk::inline_asked`).
+  *Which, and when, as built.* While maintenance waits for room and no relocation is out, each
+  pass (`Trunk::plan_cleaning`) counts how many branches name each extent, over every branch the
+  trunk names (a reference at most `extent_pages` an extent held), and plans the relocation that
+  frees the most extents net of its copy's for each page it copies, among branches of nodes with
+  no task and no change begun whose copy fits the store's free extents beside the room every other
+  task leaves: LFS's cost-benefit [LFS §3.5], the free space a cleaning generates against the
+  pages it reads and writes, without age, which a branch does not keep. An extent a branch names
+  alone is freed when it goes. *The reserve, as built:* the planned relocation's room becomes the
+  cleaner's reserve (`Trunk::set_clean_room`), counted in the room every other inline task, every
+  worker's grant (`Trunk::room_kept`) and every rotation (`ShardDb::rotation_room`) leaves free,
+  and not in the relocation's own (`Trunk::step_inline`); it returns to none as the relocation
+  applies, is dropped or fails. *Why the cleaner always proceeds:* it is planned only where the
+  store has its room free beside the checkpoint's room and what the inline tasks writing then may
+  still take; from then on every task that opens, every grant and every rotation leaves that
+  reserve free beside the checkpoint's room and the inline tasks' rooms, and a packing goes out
+  only after a rotation that kept it; so once the inline tasks writing when it was planned are
+  done, which each is in a bounded number of steps, the relocation's room is free, and it opens.
+  `trunk/relocation.rs` holds every other task for room while the relocation, its reserve's alone,
+  opens and applies. One exception stands, as for the checkpoint's room: a worker's ask for more
+  extents is answered from that room too (*Open*, under a worker's ask, above), so a job out that
+  outgrows its grant may take the reserve, and the relocation then waits for that job's extents.
+  *Measured with the cleaner as built* (mantle-node `tests/engine_workers.rs`, debug build,
+  2026-11-21): the shard alone met its bound at entry 21,199 (21,155 without), and the paced fill
+  at 20,365 in one run (16,276 to 24,000 without, its worker's timing varying): one branch moved at
+  a time, among those that alone hold more extents than they fill, recovers little of the waste.
+  *Open, next:* cleaning a mostly dead extent whole, every branch with a page in it moved in one
+  round (relocations on several nodes at once, the reserve their rooms together), ranked by the
+  extent's live pages (a count kept for each extent through every branch's life, where the census
+  now counts each pass); and holding fewer versions.
+  *The bound it gives, once extents are cleaned whole:* cleaning every extent whose live pages are
+  fewer than a share `s` of its pages, the extents held for branches are at most the live pages
+  over `s × extent_pages`, plus a tail for each life; at the bound's 725 live pages, `s` = 3/4
+  gives 242 and two tails, within the 246 the fill may hold, so this geometry's fill needs a
+  cleaner that keeps every extent at least three-quarters live.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

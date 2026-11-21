@@ -1137,7 +1137,8 @@ impl<F: BlockFile> ShardDb<F> {
         }
         let kept = self
             .checkpoint_room()
-            .saturating_add(self.trunk.image_extents_now(&self.store)?);
+            .saturating_add(self.trunk.image_extents_now(&self.store)?)
+            .saturating_add(self.trunk.clean_room());
         let packing = self.packing_extents();
         let own = kept
             .saturating_add(packing)

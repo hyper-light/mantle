@@ -323,6 +323,9 @@ pub struct Compaction {
     /// prefix of its input's last key, so every key from the first an output takes up to any
     /// input's last shares with that first at least what it shares with this.
     ceiling: Vec<u8>,
+    /// The life of the branches it writes ([`Self::set_life`]): by default a leaf's settle's,
+    /// where tombstones are dropped, and an inner node's otherwise.
+    life: Life,
 }
 
 /// Folds `branch` into `ceiling`, what the greatest range filter entries of the inputs share,
@@ -373,6 +376,7 @@ impl Compaction {
             yield_io: false,
             waiting: false,
             ceiling,
+            life: Life::of_compaction(drop_tombstones),
         })
     }
 
@@ -414,7 +418,14 @@ impl Compaction {
             yield_io: false,
             waiting: false,
             ceiling,
+            life: Life::of_compaction(drop_tombstones),
         }
+    }
+
+    /// States the life of the branches it writes, before it writes any: a relocation's copy keeps
+    /// the life of the branch it copies (docs/design/engine-structure.md §3, cleaning).
+    pub(crate) fn set_life(&mut self, life: Life) {
+        self.life = life;
     }
 
     /// Whether a step stops, rather than wait, when an initial or next input page has not landed from
@@ -559,6 +570,7 @@ impl Compaction {
                 remaining,
                 drop_tombstones,
                 ceiling,
+                life,
                 ..
             } = self;
             let Some((key, op, value)) = merge.entry() else {
@@ -587,7 +599,7 @@ impl Compaction {
                         // keys, shares with it what it shares with that bound.
                         let bound = merge.end.as_deref().unwrap_or(ceiling.as_slice());
                         b.set_shared(crate::util::keys::common_prefix(key, bound))?;
-                        b.set_life(Life::of_compaction(*drop_tombstones))?;
+                        b.set_life(*life)?;
                         building.insert((key.to_vec(), b, 0))
                     }
                 };

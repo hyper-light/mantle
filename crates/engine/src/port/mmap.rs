@@ -113,7 +113,7 @@ const PAGE_OFFSET: usize = 16;
 /// has it). The cache's buffers of a
 /// huge page each held the engine's memory 51% on huge pages where one buffer a loan held 86%, and
 /// seeks, each copying pages out of them, ran 5-10% slower (docs/research/65 §9). Elsewhere it is
-/// a `Vec<u8>`: no OS mantle runs on gives other memory huge pages by itself.
+/// a `Vec<u8>` allocated zeroed: no OS mantle runs on gives other memory huge pages by itself.
 pub struct PageBuf {
     #[cfg(target_os = "linux")]
     addr: Option<NonNull<u8>>,
@@ -170,8 +170,21 @@ impl PageBuf {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let mut vec = Vec::new();
-            vec.try_reserve_exact(cap).ok()?;
+            if cap == 0 {
+                return Some(Self::new());
+            }
+            // Zeroed by the allocator, so that every byte up to the capacity is initialized and
+            // `grow` may take bytes into use without writing them. A large block fresh from the
+            // OS is zero already and resident only where written, so calloc(3) writes none of it
+            // (macOS's malloc takes such blocks from `mach_vm_allocate`, whose pages the kernel
+            // zero-fills on first touch); one it reuses from memory freed before it zeroes once,
+            // as `resize` zeroed each slot of it before.
+            let layout = std::alloc::Layout::array::<u8>(cap).ok()?;
+            // SAFETY: `layout` is of `cap` bytes, not zero.
+            let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })?;
+            // SAFETY: `ptr` came from the global allocator with `Layout::array::<u8>(cap)`, the
+            // layout a `Vec<u8>` of capacity `cap` frees with, and a length of 0 claims no byte.
+            let vec = unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) };
             Some(Self { vec })
         }
     }
@@ -251,6 +264,42 @@ impl PageBuf {
                 self.vec.resize(len, value);
             }
             fits
+        }
+    }
+
+    /// Sets the bytes in use to `len` within the capacity, any new ones as they lie, unwritten:
+    /// zero as the OS gave them, or what was written there before. For a caller that writes each
+    /// byte it later reads, as the cache writes a page's payload into its slot before reading it
+    /// and reads no more than the payload: [`Self::resize`] would write every new byte first,
+    /// which for memory the OS has not yet touched is a page fault and a second zeroing of a page
+    /// the OS has just zeroed (mmap(2): anonymous mappings are initialized to zero). Past the
+    /// capacity, nothing, and false.
+    pub fn grow(&mut self, len: usize) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if len > self.cap {
+                return false;
+            }
+            // Every byte of the mapping is initialized (`whole`), so none needs writing.
+            self.len = len;
+            true
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if len > self.vec.capacity() {
+                return false;
+            }
+            if len <= self.vec.len() {
+                self.vec.truncate(len);
+            } else {
+                // SAFETY: `len` is within the capacity, and every byte up to the capacity is
+                // initialized: zeroed when allocated (`with_capacity`, the only constructor that
+                // allocates), and never reallocated after, as every append is within the
+                // capacity (`extend_from_slice`, `resize`, `grow`), so each byte holds the zero it
+                // was given or a byte written since.
+                unsafe { self.vec.set_len(len) };
+            }
+            true
         }
     }
 
@@ -559,6 +608,37 @@ mod page_buf_tests {
         let empty = PageBuf::with_capacity(0).unwrap();
         assert_eq!((empty.len(), empty.capacity()), (0, 0));
         assert!(PageBuf::new().is_empty());
+    }
+
+    /// `grow` takes bytes into use without writing them: a buffer made reads zero throughout, as
+    /// the OS gave it, and bytes written, cleared and grown over again still hold what was written.
+    /// Bytes zero-filled taking a cache slot into use (`Cache::make_slot`): before, the page's
+    /// (`resize(end, 0)` wrote each, 24,576 at the node's derived page); after, none.
+    #[test]
+    fn a_page_buffer_grows_without_writing() {
+        let page = 4096;
+        let mut b = PageBuf::with_capacity(4 * page).unwrap();
+        assert!(b.grow(2 * page));
+        assert_eq!(b.len(), 2 * page);
+        assert!(b.iter().all(|&x| x == 0), "zero as allocated");
+        b.fill(7);
+        b.clear();
+        assert!(b.grow(3 * page));
+        let zeroed = b
+            .get(..2 * page)
+            .unwrap()
+            .iter()
+            .filter(|&&x| x != 7)
+            .count();
+        assert_eq!(zeroed, 0, "bytes written over taking them back into use");
+        assert!(b.get(2 * page..).unwrap().iter().all(|&x| x == 0));
+        assert!(b.grow(page), "shrinking within the capacity");
+        assert_eq!(b.len(), page);
+        assert!(!b.grow(4 * page + 1), "past the capacity");
+        assert_eq!(b.len(), page);
+        let mut empty = PageBuf::with_capacity(0).unwrap();
+        assert!(empty.grow(0));
+        assert!(!empty.grow(1));
     }
 
     /// On Linux a buffer's mapping begins on a transparent huge page's boundary, whatever the C

@@ -14,7 +14,7 @@
 //! (a table that doubles, CLRS §17.4), so a cache that grows to `n` pages allocates O(log n)
 //! times; it holds at most one tuning step of the limit (`TUNE_STEP_PERCENT`, Luo and Carey, PVLDB
 //! 2021 §5.4), so a step that lowers the limit gives back whole chunks, and at most what the limit
-//! has left. A chunk's pages become slots in idle time (`reserve`), each written once as it is
+//! has left. A chunk's pages become slots in idle time (`reserve`), each left unwritten as it is
 //! made, as many as the reads since the last such time asked for; a read that finds none makes
 //! its own (`make_now`), and leaves its page out only at the limit or while a chunk retires. The
 //! cache takes the memory its reads use, not its limit (measured: reserving up to a 32 GiB limit
@@ -138,10 +138,7 @@ impl Kept {
                 let Some(end) = l.buf.len().checked_add(self.page) else {
                     break;
                 };
-                if end <= l.buf.capacity()
-                    && l.buf.extend_from_slice(payload)
-                    && l.buf.resize(end, 0)
-                {
+                if end <= l.buf.capacity() && l.buf.extend_from_slice(payload) && l.buf.grow(end) {
                     self.pages.push((address, payload.len()));
                     return;
                 }
@@ -570,7 +567,7 @@ impl Cache {
         self.room_pages
     }
 
-    /// One more slot, its page written once so the OS maps it now: the last chunk's next page,
+    /// One more slot, its page left unwritten (`PageBuf::grow`): the last chunk's next page,
     /// or a new chunk's first. False when the limit or the memory refuses one.
     fn make_slot(&mut self) -> bool {
         let full = match (self.chunks.last(), self.sizes.last(), self.held.last()) {
@@ -592,8 +589,12 @@ impl Cache {
         let Some(end) = at.checked_add(self.page) else {
             return false;
         };
-        // Within the room taken for the chunk: no reallocation, the page written once.
-        if !c.resize(end, 0) {
+        // Within the room taken for the chunk: no reallocation, and no write. A read writes its
+        // payload into the slot before any reads it, and reads no more than the payload, so
+        // zeroing it first was a second zeroing of memory the OS had just zeroed, its page fault
+        // only moved earlier: memset under this was 6.5% of a range leader's shard thread on
+        // 1-byte GETs (Mac Studio, 512 clients, `mantle bench doors`, staging 76cb0cf5).
+        if !c.grow(end) {
             return false;
         }
         let i = self.slots.len();
@@ -1529,9 +1530,9 @@ impl Cache {
         end.saturating_sub(first)
     }
 
-    /// Makes up to `n` of the slots wanted, each its page written once so the OS maps it now: a
-    /// read that misses later takes a made slot, with no allocation and no first-touch page
-    /// fault on its path. Run in idle time; the slots made.
+    /// Makes up to `n` of the slots wanted, each its page left unwritten ([`Self::make_slot`]): a
+    /// read that misses later takes a made slot, with no allocation on its path, and writes its
+    /// payload into memory no one zeroed but the OS. Run in idle time; the slots made.
     pub fn reserve(&mut self, n: usize) -> usize {
         self.settle_retirement();
         let mut made = 0usize;

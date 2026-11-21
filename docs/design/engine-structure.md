@@ -322,7 +322,8 @@ under load, at moderate load and saturated.
   applied since its last, at the index it has applied (`Stored::persist`, `Stored::persist_now`).
   That index is durable already, so invariant I8 holds: the range never records durable past
   what its engine holds, and the engine never begins a checkpoint of its own. The checkpoint
-  frees the extents the one before named.
+  frees the extents the one before named. A node asks it at the turn after an entry waits
+  (`Engine::wants_checkpoint`, node.md §1.2), not at its log's next compaction for room.
 - **At the bound.** Where the tree and its maintenance's working room hold the store's extents,
   nothing is pending a checkpoint and every task left waits for room, no task begun and no
   memtable frozen or packing (`ShardDb::at_extent_bound`), the engine stays in that wait: an

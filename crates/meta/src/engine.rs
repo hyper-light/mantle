@@ -87,6 +87,14 @@ pub trait Engine: Rows {
         self.persist().map(|()| true)
     }
 
+    /// Whether the room an entry [`Engine::apply_now`] refused waits for comes only with the
+    /// engine's next checkpoint ([`Engine::persist_now`]): its maintenance waits for extents that
+    /// checkpoint frees. Nothing else frees them, so the entry's owner asks that checkpoint now
+    /// rather than at its log's next compaction for room. An engine that never waits for one: no.
+    fn wants_checkpoint(&self) -> bool {
+        false
+    }
+
     /// Every row as of `applied()`, read in one step: what a snapshot carries to a member that
     /// lags (docs/design/replica.md §4), which a range makes by pages ([`Engine::image_page`]).
     fn image(&mut self) -> Result<Vec<Row>, EngineError>;

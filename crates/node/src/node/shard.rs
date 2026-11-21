@@ -1735,17 +1735,19 @@ impl<E: Engine + 'static, S: LogStore> Shard<E, S> {
     /// A turn's maintenance of the shard's ranges' engines, once what the turn gave is handed on,
     /// after `own_ns` of the turn's own work (`node::upkeep`).
     fn upkeep(&mut self, own_ns: u64) -> Result<(), NodeError> {
+        let now = hyper_rt::futures::now_ns();
         let Self {
             upkeep,
             ranges,
             owner,
+            waker,
             ..
         } = self;
         upkeep.turn(own_ns, ranges.len(), |at, units| {
             let Some(kept) = ranges.get(at) else {
                 return Ok((0, false));
             };
-            super::upkeep::step_range(owner, kept.handle, kept.group, units)
+            super::upkeep::step_range(owner, kept.handle, kept.group, units, now, waker)
         })?;
         Ok(())
     }
@@ -4445,6 +4447,165 @@ mod tests {
     }
 
     type Roomed = hyper_durable::Replica<Answers<Refusing>, RangeMachine<Model>, Unbounded>;
+
+    /// The model engine with no room for an entry until its next checkpoint, as an engine whose
+    /// maintenance waits for extents only that checkpoint frees (`Engine::wants_checkpoint`,
+    /// `ShardDb::wants_checkpoint`): its checkpoints counted.
+    #[derive(Debug, Default)]
+    struct UntilCheckpoint {
+        model: Model,
+        roomless: bool,
+        checkpoints: u64,
+    }
+
+    use mantle_meta::engine::Rows as _;
+
+    impl mantle_meta::engine::Rows for UntilCheckpoint {
+        fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, mantle_meta::engine::EngineError> {
+            self.model.get(key)
+        }
+
+        fn next(
+            &mut self,
+            from: &[u8],
+            to: &[u8],
+        ) -> Result<Option<mantle_meta::engine::Row>, mantle_meta::engine::EngineError> {
+            self.model.next(from, to)
+        }
+
+        fn apply(
+            &mut self,
+            index: u64,
+            writes: Vec<mantle_meta::engine::Write>,
+        ) -> Result<(), mantle_meta::engine::EngineError> {
+            self.model.apply(index, writes)
+        }
+    }
+
+    impl Engine for UntilCheckpoint {
+        fn applied(&self) -> u64 {
+            self.model.applied()
+        }
+
+        fn durable(&self) -> u64 {
+            self.model.durable()
+        }
+
+        fn persist(&mut self) -> Result<(), mantle_meta::engine::EngineError> {
+            self.model.persist()?;
+            self.roomless = false;
+            self.checkpoints += 1;
+            Ok(())
+        }
+
+        fn image(
+            &mut self,
+        ) -> Result<Vec<mantle_meta::engine::Row>, mantle_meta::engine::EngineError> {
+            self.model.image()
+        }
+
+        fn image_size(&self) -> Option<(u64, u64)> {
+            self.model.image_size()
+        }
+
+        fn install(
+            &mut self,
+            index: u64,
+            rows: Vec<mantle_meta::engine::Row>,
+        ) -> Result<(), mantle_meta::engine::EngineError> {
+            self.model.install(index, rows)
+        }
+
+        fn apply_now(
+            &mut self,
+            index: u64,
+            writes: Vec<mantle_meta::engine::Write>,
+        ) -> Result<bool, mantle_meta::engine::EngineError> {
+            if self.roomless {
+                return Ok(false);
+            }
+            self.model.apply(index, writes).map(|()| true)
+        }
+
+        fn wants_checkpoint(&self) -> bool {
+            self.roomless
+        }
+    }
+
+    type Waiting = hyper_durable::Replica<
+        Answers<hyper_durable::RamStore>,
+        RangeMachine<UntilCheckpoint>,
+        Unbounded,
+    >;
+
+    /// Drives `replica` until it rests, within a counted bound of drives.
+    fn rests(replica: &mut Waiting, now: &mut u64) {
+        let waker = Waker::noop().clone();
+        let mut out = Output::default();
+        for _ in 0..256 {
+            *now += 1;
+            out.clear();
+            let driven = replica.drive(*now, &waker, &mut out).unwrap();
+            if !driven.more && driven.out == 0 {
+                return;
+            }
+        }
+        panic!("the replica never rested");
+    }
+
+    /// An entry whose engine has no room until its next checkpoint, which nothing but that
+    /// checkpoint frees (`Engine::wants_checkpoint`), waits committed and unapplied; the node's
+    /// turn's upkeep then has the range compact its log (`upkeep::step_range`), which makes the
+    /// checkpoint, and the entry applies at the drives after, its log's room never short. Left
+    /// for the log's own compaction, the entry waited until the log ran out of room, and a cell
+    /// waiting on it waited with it (the node suite's sustained-writes cell, every node idle).
+    #[test]
+    fn an_entry_waiting_for_its_engines_checkpoint_has_the_turn_ask_it_and_then_applies() {
+        let waker = Waker::noop().clone();
+        let mut engine = UntilCheckpoint::default();
+        engine.install(0, name::first(1).unwrap()).unwrap();
+        engine.persist().unwrap();
+        let store = Answers::new(hyper_durable::RamStore::new());
+        let mut replica =
+            mantle_range::open_shell(1, store, engine, &one_member(), 1, Elections::Suspicion)
+                .unwrap();
+        replica.campaign().unwrap();
+        let mut now = 0;
+        rests(&mut replica, &mut now);
+        let before = replica.applied().index;
+        let checkpoints = replica.machine().engine().checkpoints;
+        replica.machine_mut().engine_mut().roomless = true;
+        replica
+            .propose(Vec::new(), put().encode().unwrap())
+            .unwrap();
+        rests(&mut replica, &mut now);
+        assert!(
+            replica.waits_for_room(),
+            "the entry waits for its engine's room"
+        );
+        assert_eq!(replica.applied().index, before);
+        let mut owner = Owner::new(vec![waker.clone()]);
+        let Ok(handle) = owner.insert(replica) else {
+            panic!("the owner's slot is free");
+        };
+        // Each turn's upkeep, then the drives the range is queued for, a counted few.
+        for _ in 0..4 {
+            super::super::upkeep::step_range(&mut owner, handle, GROUP, 64, now, &waker).unwrap();
+            let replica = owner.get_mut(handle).unwrap();
+            rests(replica, &mut now);
+            if replica.applied().index > before {
+                break;
+            }
+        }
+        let replica = owner.get_mut(handle).unwrap();
+        assert_eq!(
+            replica.applied().index,
+            before + 1,
+            "the entry applied once its engine's checkpoint was made"
+        );
+        assert_eq!(replica.machine().engine().checkpoints, checkpoints + 1);
+        assert!(!replica.waits_for_room());
+    }
 
     /// Node `id`'s member of `range` on a log in memory whose room `full` says.
     fn roomed(id: u64, range: &Range, full: &Arc<AtomicBool>) -> Roomed {

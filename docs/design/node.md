@@ -328,7 +328,12 @@ maintenance still owed, and no longer runs a compaction inline without its room:
 there).
 While the engine waits for extents only a checkpoint frees, its range checkpoints at the index
 it has applied, durable already, so invariant I8 holds (`Stored::persist_now`,
-`ShardDb::wants_checkpoint`). At its store's extent bound a range's engine answers an entry no
+`ShardDb::wants_checkpoint`). The node asks that checkpoint at its next turn: a range whose
+entries wait for room in an engine that wants one (`Engine::wants_checkpoint`) compacts its log
+then (`upkeep::step_range`, `Replica::compact`), which makes the checkpoint, as the log's own
+compaction for room does. Left for that compaction, which comes only once the log is out of room,
+the sustained-writes cell's range waited with 116 extents pending the next checkpoint and 8
+free, every node idle, until its `converged` wait ended unmet (2026-11-21). At its store's extent bound a range's engine answers an entry no
 room now, a paced wait the node answers `SlowDown`, never a fence, and every acknowledged row
 reads back. The cell's store reaches that bound before its bytes are full, each small branch
 taking a whole extent of four pages: about 175–190 branches in 238–240 of its 256 extents

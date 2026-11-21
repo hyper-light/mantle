@@ -302,6 +302,12 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
         Ok(())
     }
 
+    /// `ShardDb::wants_checkpoint`: maintenance waits for extents the durable checkpoint names,
+    /// freed since, which the next checkpoint frees.
+    fn wants_checkpoint(&self) -> bool {
+        self.fault.is_none() && self.db.wants_checkpoint()
+    }
+
     /// The checkpoint begun at the index applied now and made without waiting
     /// (`ShardDb::checkpoint_now`): its memtables packed and its pages written by the engine's
     /// maintenance workers and the shard in slices, its two flushes of the device on a worker's

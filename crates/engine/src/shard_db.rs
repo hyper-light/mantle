@@ -1174,11 +1174,14 @@ impl<F: BlockFile> ShardDb<F> {
     /// ([`Trunk::waits_for_room`]) the file grown to its bound would not hold, and nothing it
     /// holds can give extents back, no task begun, no memtable frozen or packing and none freed
     /// pending a checkpoint. Every entry waits ([`Self::room_now`]) until extents are freed;
-    /// none is refused part way and the store is not fenced.
+    /// none is refused part way and the store is not fenced. The trunk is idle, or stalled with
+    /// its tasks planned room-sized and tried ([`Trunk::stalled_for_room`]): tasks a checkpoint
+    /// dropped are planned anew sized to the room left, and the state is not yet known.
     pub fn at_extent_bound(&self) -> bool {
         self.trunk.waits_for_room(&self.store)
             && self.store.room_most() < self.trunk.room_waited()
             && self.trunk.none_begun()
+            && (self.trunk.is_idle() || self.trunk.stalled_for_room(&self.store))
             && self.frozen.is_empty()
             && self.packing.is_none()
             && self.store.pending_extents() == 0
@@ -4243,7 +4246,14 @@ impl<F: BlockFile> ShardDb<F> {
                 self.flush_stats.forget_ns = self.flush_stats.forget_ns.saturating_add(ns);
             }
         }
-        let debt = self.trunk.debt();
+        // A trunk stalled for room is stepped by no put: its pass would find the same room short
+        // and change nothing ([`Self::trunk_goes_on`]); an entry of several rows paid one such
+        // pass a row (shard_db/still_passes.rs, the cell's block range's entries).
+        let debt = if self.trunk.stalled_for_room(&self.store) {
+            0
+        } else {
+            self.trunk.debt()
+        };
         if debt > 0 {
             let room = trunk_room;
             let w = share(debt, bytes, room, &mut self.trunk_carry);
@@ -4265,7 +4275,10 @@ impl<F: BlockFile> ShardDb<F> {
                 }
                 self.note_trunk(ns_since(t));
             }
-        } else if self.trunk.maintaining() && self.trunk.has_pool() {
+        } else if self.trunk.maintaining()
+            && self.trunk.has_pool()
+            && !self.trunk.stalled_for_room(&self.store)
+        {
             // Maintenance's compactions are out on the workers: a step takes whatever results
             // have come and hands out what they let go, waiting for none.
             if paced {

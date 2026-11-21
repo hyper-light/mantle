@@ -305,16 +305,18 @@ impl Tasks {
         after(&self.index.inline, from)
     }
 
-    pub(super) fn ready_count(&self) -> usize {
-        self.index.ready.len()
+    /// The tasks not handed out, inline or ready, each with its plan number: those whose room
+    /// a step keeps (`Trunk::note_step`).
+    pub(super) fn unsent(&self) -> impl Iterator<Item = (u64, &NodeTask)> {
+        self.index
+            .inline
+            .iter()
+            .chain(self.index.ready.iter())
+            .filter_map(|&(_, seq)| self.get(seq).map(|t| (seq, t)))
     }
 
-    /// The ready tasks, the root's first, each in plan order.
-    pub(super) fn ready(&self) -> impl Iterator<Item = &NodeTask> {
-        self.index
-            .ready
-            .iter()
-            .filter_map(|&(_, seq)| self.get(seq))
+    pub(super) fn ready_count(&self) -> usize {
+        self.index.ready.len()
     }
 
     /// Whether every task is inline or ready: none out, done or dropped.

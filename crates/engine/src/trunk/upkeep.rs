@@ -50,6 +50,9 @@ pub(super) struct NodeTask {
     run: Running,
     units: u64,
     reuse: Reuse,
+    /// The extents it writes at most inline ([`Trunk::inline_asked`]), counted the first time a
+    /// pass asks: its inputs and range are fixed while it is planned, so the count is too.
+    asked: std::cell::Cell<Option<u64>>,
 }
 
 #[derive(Debug)]
@@ -101,6 +104,15 @@ pub(super) enum Cause {
     Branches,
     Size,
 }
+
+/// What the cleaner's choice reads ([`Trunk::plan_cleaning`]): the room free for a copy, the
+/// changes to the extents' live pages, the tasks planned and standing, and the flushes and
+/// splits that move branches between nodes.
+pub(super) type CleaningMark = [u64; 6];
+
+/// A test's mark of a pass's state ([`Trunk::still_mark`]).
+#[cfg(test)]
+type StillMark = ([u64; 15], [[usize; 4]; 2]);
 
 #[derive(Debug)]
 enum Running {
@@ -221,6 +233,13 @@ impl Trunk {
     /// ([`Self::inline_asked`]). The cleaner's reserve is then that copy's room, which every other
     /// task, grant and rotation leaves free until it applies or is dropped: free when planned, it
     /// stays free for the copy, so the relocation never starts without its room and proceeds.
+    ///
+    /// The choice reads the room free, the extents' live pages, which nodes have a task and where
+    /// each branch stands; a look that found none worth planning is not taken again until one of
+    /// them changes ([`CleaningMark`]). Taken each pass, a store waiting for room scanned every
+    /// branch of the tree each time to find the same none: most of a stalled shard's passes with
+    /// the per-input counts of [`Self::inline_asked`] (macOS `sample`, the node suite's
+    /// sustained-writes cell, 2026-11-21).
     fn plan_cleaning<F: BlockFile>(&mut self, store: &Store<F>) -> Result<(), Error> {
         if self.room_short.is_none() || self.clean_room > 0 {
             return Ok(());
@@ -229,6 +248,17 @@ impl Trunk {
             .capacity()
             .saturating_sub(self.room_kept(store)?)
             .saturating_sub(self.inline_room(store)?);
+        let mark = [
+            free,
+            self.live_changes,
+            self.tasks.planned(),
+            u64::try_from(self.tasks.len()).unwrap_or(u64::MAX),
+            self.stats.flushes,
+            self.stats.splits,
+        ];
+        if self.cleaning_looked == Some(mark) {
+            return Ok(());
+        }
         let per = u64::from(self.extent_pages).max(1);
         // (gain, pages, node, root) of the best so far.
         let mut best: Option<(u64, u64, usize, u64)> = None;
@@ -261,9 +291,13 @@ impl Trunk {
                 }
             }
         }
-        if let Some((_, _, n, root)) = best {
-            let ask = self.plan_relocation(n, root)?;
-            self.set_clean_room(ask);
+        match best {
+            Some((_, _, n, root)) => {
+                let ask = self.plan_relocation(n, root)?;
+                self.set_clean_room(ask);
+                self.cleaning_looked = None;
+            }
+            None => self.cleaning_looked = Some(mark),
         }
         Ok(())
     }
@@ -309,6 +343,7 @@ impl Trunk {
                 run: Running::Inline(Box::new(copy)),
                 units,
                 reuse: Reuse::default(),
+                asked: std::cell::Cell::new(None),
             },
             top,
         )?;
@@ -576,6 +611,8 @@ impl Trunk {
         self.io_waiting = false;
         self.workers_waiting = false;
         self.know_extent_pages(store)?;
+        #[cfg(test)]
+        let before = self.still_mark(store);
         // A wait for room lasts until the store has the room it waits for.
         if self.room_short.is_some_and(|need| store.capacity() >= need) {
             self.room_short = None;
@@ -601,7 +638,95 @@ impl Trunk {
         self.end_consolidation();
         #[cfg(test)]
         self.check_tasks()?;
+        #[cfg(test)]
+        self.note_still(store, before, used);
         Ok(used)
+    }
+
+    /// A test's account of where maintenance stands: each task, what it does and where it runs,
+    /// and the room it waits for.
+    #[cfg(test)]
+    pub(crate) fn still_state<F: BlockFile>(&self, store: &Store<F>) -> String {
+        let tasks: Vec<String> = self
+            .tasks
+            .iter()
+            .map(|t| {
+                let what = match &t.what {
+                    What::Compact { .. } => "compaction",
+                    What::Settle { .. } => "settle",
+                    What::Relocate { .. } => "relocation",
+                };
+                let run = match &t.run {
+                    Running::Inline(c) if c.opening() => "inline, opening",
+                    Running::Inline(_) => "inline",
+                    Running::Finished(_) => "finished",
+                    Running::Remote {
+                        state: State::Ready(_),
+                        ..
+                    } => "ready",
+                    Running::Remote { .. } => "out or done",
+                };
+                format!("node {}'s {what}, {run}", t.node)
+            })
+            .collect();
+        format!(
+            "tasks {tasks:?}, nodes looked at {}, changes wanted {}, room waited {:?}, free {} \
+             of {}, the cleaner's reserve {}",
+            self.looking.len(),
+            self.wanting_nodes,
+            self.room_short,
+            store.capacity(),
+            store.room_most(),
+            self.clean_room,
+        )
+    }
+
+    /// A test's mark of what a pass may change ([`Self::still`]).
+    #[cfg(test)]
+    fn still_mark<F: BlockFile>(&self, store: &Store<F>) -> StillMark {
+        (
+            [
+                self.tasks.planned(),
+                u64::try_from(self.tasks.len()).unwrap_or(u64::MAX),
+                u64::try_from(self.pending.len()).unwrap_or(u64::MAX),
+                self.entered,
+                self.room_short.unwrap_or(u64::MAX),
+                self.clean_room,
+                self.capacity_wanted,
+                store.capacity(),
+                store.room_most(),
+                store.pending_extents(),
+                self.pool_accepted(),
+                self.live_total,
+                self.stats.flushes,
+                self.stats.splits,
+                self.stats.consolidations_started,
+            ],
+            [
+                self.tasks.standing(),
+                [
+                    self.looking.len(),
+                    self.wanting_nodes,
+                    self.inflight_nodes,
+                    self.nodes.len(),
+                ],
+            ],
+        )
+    }
+
+    /// Counts a pass that left work owed yet spent nothing, changed nothing
+    /// [`Self::still_mark`] marks and waited on no job out or read, whose end would be an event;
+    /// any other pass ends the count.
+    #[cfg(test)]
+    fn note_still<F: BlockFile>(&mut self, store: &Store<F>, before: StillMark, used: u64) {
+        let waits =
+            self.io_waiting || self.workers_waiting || self.pool.as_ref().is_some_and(|p| p.busy());
+        let owes = !self.is_idle() || self.debt() > 0;
+        if owes && used == 0 && !waits && self.still_mark(store) == before {
+            self.still = self.still.saturating_add(1);
+        } else {
+            self.still = 0;
+        }
     }
 
     /// Moves the pending branches into the root, oldest first, unless the root is changing: they
@@ -1189,6 +1314,7 @@ impl Trunk {
                 run,
                 units,
                 reuse,
+                asked: std::cell::Cell::new(None),
             },
             root,
         )?;
@@ -1451,6 +1577,7 @@ impl Trunk {
                 run,
                 units: count,
                 reuse,
+                asked: std::cell::Cell::new(None),
             },
             root,
         )?;
@@ -1465,7 +1592,25 @@ impl Trunk {
     /// ([`Self::dispatch_tasks`]): the extents the pages its inputs hold fill, or its inputs'
     /// extents when that is less, and one more a part, and one for the last partial one. A merge
     /// writes no more pages than it reads; a branch of one page in an extent of four counts one.
+    /// Counted once a task: each input's pages in its range are found down its index, and a
+    /// pass asks every inline task writing or waiting to, so counted each pass they were most of
+    /// a stalled shard's passes (macOS `sample`, the node suite's sustained-writes cell,
+    /// 2026-11-21).
     fn inline_asked<F: BlockFile>(&self, store: &Store<F>, task: &NodeTask) -> Result<u64, Error> {
+        if let Some(asked) = task.asked.get() {
+            return Ok(asked);
+        }
+        let asked = self.inline_asked_now(store, task)?;
+        task.asked.set(Some(asked));
+        Ok(asked)
+    }
+
+    /// [`Self::inline_asked`] counted from the task's inputs.
+    fn inline_asked_now<F: BlockFile>(
+        &self,
+        store: &Store<F>,
+        task: &NodeTask,
+    ) -> Result<u64, Error> {
         let node = self.nodes.get(task.node).ok_or(corrupt())?;
         let (from, end) = task_range(node, &task.what)?;
         let (extents, pages, entries) = task_inputs(node, &task.what)?.fold(

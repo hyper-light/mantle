@@ -660,6 +660,15 @@ pub struct Trunk {
     checkpoint_room: u64,
     /// The cleaner's reserve ([`Trunk::set_clean_room`]).
     clean_room: u64,
+    /// The live pages of each extent the tree's branches name, by extent: each branch counted in
+    /// every extent it has a page in, kept as branches enter the tree and leave it
+    /// ([`Trunk::count_live`]), which the cleaner reads (docs/design/engine-structure.md §3,
+    /// cleaning). At most an entry an extent the store holds. A pending branch is counted as it
+    /// enters the root.
+    live: Vec<u32>,
+    /// The store's pages an extent, which the live counts are kept in: set as the trunk is loaded
+    /// and as each step begins.
+    extent_pages: u32,
     /// The checkpoint's room with the image's extents, counted once a pass that asks it
     /// ([`Trunk::room_kept`]).
     room_kept: Option<u64>,
@@ -965,6 +974,18 @@ fn size_of_branches<'b>(
     })
 }
 
+/// The pages branch `b` wrote in each extent it names, in order, `per` pages an extent: from page
+/// `first` of its first extent on, its tree's pages then its filter's and index's.
+fn pages_by_extent(b: &Branch, per: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let first = u64::from(b.first);
+    let end = first.saturating_add(b.filter_start.saturating_add(u64::from(b.filter_pages)));
+    b.extents.iter().enumerate().map(move |(i, &e)| {
+        let lo = u64::try_from(i).unwrap_or(u64::MAX).saturating_mul(per);
+        let hi = lo.saturating_add(per);
+        (e, end.min(hi).saturating_sub(first.max(lo)))
+    })
+}
+
 fn release<F: BlockFile>(store: &mut Store<F>, b: &Branch) -> Result<(), Error> {
     for &e in &b.extents {
         store.release(e)?;
@@ -1059,6 +1080,8 @@ impl Trunk {
             capacity_wanted: 0,
             checkpoint_room: 0,
             clean_room: 0,
+            live: Vec::new(),
+            extent_pages: 0,
             room_kept: None,
             room_short: None,
             #[cfg(test)]
@@ -1896,6 +1919,99 @@ impl Trunk {
             self.pending_entries = self.pending_entries.saturating_add(b.count);
         }
         self.pending.push(Pending { cuts, parts, kept });
+    }
+
+    /// Counts branch `b`'s pages in the extents it names as it enters the tree (`enters`), or
+    /// takes them out as it leaves ([`Self::live`]).
+    fn count_live(&mut self, b: &Branch, enters: bool) -> Result<(), Error> {
+        let per = u64::from(self.extent_pages);
+        self.count_pages(pages_by_extent(b, per), enters)
+    }
+
+    /// [`Self::count_live`] of the pages each extent gains or loses, `(extent, pages)`.
+    fn count_pages(
+        &mut self,
+        pages: impl Iterator<Item = (u64, u64)>,
+        enters: bool,
+    ) -> Result<(), Error> {
+        if self.extent_pages == 0 {
+            return Err(Error::InvalidArgument {
+                what: "a branch counted before the store's extent size is known",
+            });
+        }
+        for (e, pages) in pages {
+            let i = usize::try_from(e).map_err(|_| corrupt())?;
+            if self.live.len() <= i {
+                self.live.resize(i.checked_add(1).ok_or(corrupt())?, 0);
+            }
+            let pages = u32::try_from(pages).map_err(|_| corrupt())?;
+            let count = self.live.get_mut(i).ok_or(corrupt())?;
+            *count = if enters {
+                count.checked_add(pages).ok_or(corrupt())?
+            } else {
+                count.checked_sub(pages).ok_or(corrupt())?
+            };
+        }
+        Ok(())
+    }
+
+    /// The live pages of extent `e` the tree's branches have ([`Self::live`]).
+    pub(crate) fn live_pages(&self, e: u64) -> u32 {
+        usize::try_from(e)
+            .ok()
+            .and_then(|i| self.live.get(i))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The live pages of each extent recounted from every branch the tree names, against those
+    /// kept ([`Self::live`]): a test's check that every branch entering or leaving the tree was
+    /// counted.
+    #[cfg(test)]
+    pub(crate) fn check_live(&self) -> Result<(), Error> {
+        let per = u64::from(self.extent_pages);
+        let mut recount: Vec<u32> = Vec::new();
+        if per > 0 {
+            for node in &self.nodes {
+                let branches = node
+                    .inflight
+                    .iter()
+                    .flat_map(|f| f.branches.iter())
+                    .chain(node.pivots.iter().flat_map(|p| p.bundle.branches().iter()));
+                for b in branches {
+                    for (e, pages) in pages_by_extent(b, per) {
+                        let i = usize::try_from(e).map_err(|_| corrupt())?;
+                        if recount.len() <= i {
+                            recount.resize(i + 1, 0);
+                        }
+                        recount[i] += u32::try_from(pages).map_err(|_| corrupt())?;
+                    }
+                }
+            }
+        }
+        let trim = |v: &[u32]| -> Vec<u32> {
+            let end = v.iter().rposition(|&c| c > 0).map_or(0, |i| i + 1);
+            v[..end].to_vec()
+        };
+        if trim(&recount) != trim(&self.live) {
+            return Err(Error::Corruption {
+                what: "the trunk's live pages an extent",
+                why: Malformed::CountMismatch,
+            });
+        }
+        Ok(())
+    }
+
+    /// The store's extent size, which the live counts are kept in ([`Self::live`]).
+    fn know_extent_pages<F: BlockFile>(&mut self, store: &Store<F>) -> Result<(), Error> {
+        let per = store.extent_pages();
+        if self.extent_pages != 0 && self.extent_pages != per {
+            return Err(Error::InvalidArgument {
+                what: "a trunk stepped over a store of another extent size",
+            });
+        }
+        self.extent_pages = per;
+        Ok(())
     }
 
     /// Stamps `b` with the extents taken in branches once it is taken: what a compaction that
@@ -2812,6 +2928,8 @@ impl Trunk {
             capacity_wanted: 0,
             checkpoint_room: 0,
             clean_room: 0,
+            live: Vec::new(),
+            extent_pages: 0,
             room_kept: None,
             room_short: None,
             #[cfg(test)]
@@ -2851,6 +2969,20 @@ impl Trunk {
                 trunk.queue(n);
             }
         }
+        trunk.know_extent_pages(store)?;
+        let per = u64::from(trunk.extent_pages);
+        let named: Vec<(u64, u64)> = trunk
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                node.inflight
+                    .iter()
+                    .flat_map(|f| f.branches.iter())
+                    .chain(node.pivots.iter().flat_map(|p| p.bundle.branches().iter()))
+            })
+            .flat_map(|b| pages_by_extent(b, per))
+            .collect();
+        trunk.count_pages(named.into_iter(), true)?;
         Ok(trunk)
     }
 
@@ -2869,6 +3001,9 @@ impl Trunk {
             self.stats.entries_written = self.stats.entries_written.saturating_add(b.count);
             self.stats.pivot_entries = self.stats.pivot_entries.saturating_add(b.count);
             self.held = self.held.saturating_add(b.count);
+        }
+        if let Some(b) = merged.as_ref() {
+            self.count_live(b, true)?;
         }
         let pivot = self.node_mut(n)?.pivots.get_mut(i).ok_or(corrupt())?;
         pivot.start = covered;
@@ -2898,6 +3033,7 @@ impl Trunk {
         for bundle in gone {
             self.held = self.held.saturating_sub(entries_of(&bundle));
             for b in &bundle {
+                self.count_live(b, false)?;
                 release(store, b)?;
             }
         }
@@ -2917,14 +3053,24 @@ impl Trunk {
         for (_, b) in &mut parts {
             self.stamp(b);
         }
+        let per = u64::from(self.extent_pages);
         let node = self.node(n)?;
         let pivot = node.pivots.first().ok_or(corrupt())?;
         let (from, end) = (pivot.key.clone(), node.end.clone());
         // The parts replace the leaf's bundle; the in-flight bundles it took go once it reads
         // past them ([`Self::drop_dead`]).
-        self.held = self
-            .held
-            .saturating_sub(entries_of(pivot.bundle.branches()));
+        let gone = entries_of(pivot.bundle.branches());
+        let old: Vec<(u64, u64)> = pivot
+            .bundle
+            .branches()
+            .iter()
+            .flat_map(|b| pages_by_extent(b, per))
+            .collect();
+        self.held = self.held.saturating_sub(gone);
+        self.count_pages(old.into_iter(), false)?;
+        for (_, b) in &parts {
+            self.count_live(b, true)?;
+        }
         self.stats.leaf_compactions = self.stats.leaf_compactions.saturating_add(1);
         self.stats.splits = self
             .stats

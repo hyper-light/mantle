@@ -56,8 +56,9 @@ pub enum Signed {
     /// The cell holds no such key, or held it once and it was revoked: S3's
     /// `InvalidAccessKeyId`.
     Unknown,
-    /// The lookup was not answered: the root range's rows failing (`Failed`).
-    Refused(Status),
+    /// The lookup was not answered: the node failed it (`Failed`), for the cause the listener's
+    /// `500` names and the node counts ([`Submitter::failed`]).
+    Failed(Fault),
     /// The lookup was not answered, for a cause that passes (`503 SlowDown`): which.
     Slowed(Slowed),
 }
@@ -372,6 +373,7 @@ pub struct Doorway {
     /// One request taken from the channel to learn that one waits, ahead of the rest.
     held: Option<Asked>,
     slowed: Arc<Slowings>,
+    failed: Arc<Failings>,
     /// The phases of a body's pieces and of a reply's turns under way, and what the last of each
     /// learned, which the listener's connections read as they make a request's channels.
     depth: Depth,
@@ -392,8 +394,16 @@ pub struct Submitter {
     mark: Option<Mark>,
     node: Waker,
     slowed: Arc<Slowings>,
+    failed: Arc<Failings>,
     learned: Arc<Learned>,
 }
+
+/// The S3 requests the listener answered `500 InternalError` itself, for a key's lookup the node
+/// failed or a request whose answers ended before its head, a count for each cause in
+/// [`Fault::ALL`]'s order, which the node adds to its hosts' (`Node::failed`): shared and counted as
+/// [`Slowings`] are.
+#[derive(Default)]
+struct Failings([AtomicU64; Fault::ALL.len()]);
 
 /// The S3 requests the listener answered `503 SlowDown`, a count for each cause in
 /// [`Slowed::ALL`]'s order, which the node says in its lines: shared by the listener's connections,
@@ -416,6 +426,7 @@ pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtE
     let (marks, marked) = channel(room)?;
     let marking = Arc::new(Marking::default());
     let slowed = Arc::new(Slowings::default());
+    let failed = Arc::new(Failings::default());
     let learned = Arc::new(Learned {
         body: AtomicUsize::new(Depth::FIRST),
         reply: AtomicUsize::new(Replying::FIRST_ANSWERS),
@@ -429,6 +440,7 @@ pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtE
             marking: Arc::clone(&marking),
             held: None,
             slowed: Arc::clone(&slowed),
+            failed: Arc::clone(&failed),
             depth: Depth::default(),
             replying: Replying::default(),
             learned: Arc::clone(&learned),
@@ -440,6 +452,7 @@ pub fn doorway(capacity: usize, node: Waker) -> Result<(Doorway, Submitter), RtE
             mark: None,
             node,
             slowed,
+            failed,
             learned,
         },
     ))
@@ -531,6 +544,16 @@ impl Doorway {
     pub fn slowed(&self) -> [u64; Slowed::ALL.len()] {
         let mut counts = [0; Slowed::ALL.len()];
         for (count, kept) in counts.iter_mut().zip(&self.slowed.0) {
+            *count = kept.load(Ordering::Relaxed);
+        }
+        counts
+    }
+
+    /// The S3 requests the listener answered `500 InternalError` itself, for each cause in
+    /// [`Fault::ALL`]'s order.
+    pub fn failed(&self) -> [u64; Fault::ALL.len()] {
+        let mut counts = [0; Fault::ALL.len()];
+        for (count, kept) in counts.iter_mut().zip(&self.failed.0) {
             *count = kept.load(Ordering::Relaxed);
         }
         counts
@@ -645,6 +668,15 @@ impl Submitter {
     /// in its lines; `cause` back, for the answer that names it.
     pub fn slowed(&self, cause: Slowed) -> Slowed {
         if let Some(count) = self.slowed.0.get(cause.index()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        cause
+    }
+
+    /// Counts an S3 request the listener answers `500 InternalError` itself for `cause`, which the
+    /// node says in its lines; `cause` back, for the answer that names it.
+    pub fn failed(&self, cause: Fault) -> Fault {
+        if let Some(count) = self.failed.0.get(cause.index()) {
             count.fetch_add(1, Ordering::Relaxed);
         }
         cause
@@ -893,5 +925,20 @@ mod tests {
         }
         // Taken 10 ms or more after its send, each delivered in 1 ms.
         assert!(submitter.depth() >= 10, "{}", submitter.depth());
+    }
+
+    /// Each `500` the listener answers itself is counted by its cause, on any connection's clone
+    /// of its end, in its own place, and the node reads them; the cause comes back for its answer.
+    #[test]
+    fn the_listeners_own_failures_are_counted_by_cause() {
+        let (doorway, submitter) = doorway(1, Waker::noop().clone()).unwrap();
+        let other = submitter.clone();
+        assert_eq!(submitter.failed(Fault::Keys), Fault::Keys);
+        assert_eq!(other.failed(Fault::Keys), Fault::Keys);
+        assert_eq!(other.failed(Fault::Unanswered), Fault::Unanswered);
+        let mut counts = [0; Fault::ALL.len()];
+        counts[Fault::Keys.index()] = 2;
+        counts[Fault::Unanswered.index()] = 1;
+        assert_eq!(doorway.failed(), counts);
     }
 }

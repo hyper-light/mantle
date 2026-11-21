@@ -2912,14 +2912,22 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     }
 
     /// The requests this node answered `Failed` since it opened, on either door, a count for each
-    /// cause in `door::Fault::ALL`'s order, as every host of the node counted them
-    /// ([`failures::Failures`]).
+    /// cause in `door::Fault::ALL`'s order: as every host of the node counted them
+    /// ([`failures::Failures`]), and as its S3 listener counted its own (`door::Submitter::failed`).
     pub fn failed(&self) -> [u64; crate::door::Fault::ALL.len()] {
-        self.gateway
+        let mut counts = self
+            .gateway
             .as_ref()
             .map_or([0; crate::door::Fault::ALL.len()], |gateway| {
                 gateway.failures.counts()
-            })
+            });
+        // The S3 listener's own: a key's lookup the node failed, or answers ended before a head.
+        if let Some(doorway) = &self.doorway {
+            for (count, door) in counts.iter_mut().zip(doorway.failed()) {
+                *count = count.saturating_add(door);
+            }
+        }
+        counts
     }
 
     /// The entries this node's members proposed as their ranges' leader since it opened, and the

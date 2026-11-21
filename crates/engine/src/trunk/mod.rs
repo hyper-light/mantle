@@ -478,7 +478,7 @@ impl Node {
 
 /// One depth of the trunk ([`Trunk::levels`]): its nodes and pivots, the branches the pivots'
 /// bundles hold and the most one holds, the branches in its nodes' in-flight lists, and the
-/// entries of both.
+/// entries and pages of both.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LevelShape {
     pub leaf: bool,
@@ -488,6 +488,14 @@ pub struct LevelShape {
     pub most: u64,
     pub inflight: u64,
     pub entries: u64,
+    pub pages: u64,
+}
+
+fn pages_of(branches: &[Branch]) -> u64 {
+    branches
+        .iter()
+        .map(branch_pages)
+        .fold(0u64, u64::saturating_add)
 }
 
 fn entries_of(branches: &[Branch]) -> u64 {
@@ -575,6 +583,14 @@ pub struct TrunkStats {
     pub consolidations_started: u64,
     /// Fullest pivots flushed past a memtable's entries ([`Trunk::flush_fullest`]).
     pub fullest_flushes: u64,
+    /// Pivot bundles of `fanout` branches or fewer flushed because the store was near its bound
+    /// ([`Trunk::note_near_bound`]), and the looks that found it so.
+    pub near_bound_flushes: u64,
+    pub near_bound_looks: u64,
+    /// The pages the tree's branches wrote, and the extents holding one of them at least
+    /// ([`Trunk::live`]): the extents held for branches against what their pages fill.
+    pub live_pages: u64,
+    pub live_extents: u64,
     /// Entries of packed memtables whose branches went straight into the root's pivots' bundles
     /// ([`Trunk::add_parts`]): what the root's compactions of one input would have written again
     /// (research/57 §7).
@@ -666,6 +682,14 @@ pub struct Trunk {
     /// cleaning). At most an entry an extent the store holds. A pending branch is counted as it
     /// enters the root.
     live: Vec<u32>,
+    /// The sum of [`Self::live`]: every page the tree's branches wrote, kept with the counts.
+    live_total: u64,
+    /// Whether the store is near its bound: the extents it may still hand out, beside the next
+    /// checkpoint's room, are fewer than the pages above the leaves fill. Its index pivots then
+    /// flush their bundles as soon as they hold a branch ([`Trunk::flush_due`]), so superseded
+    /// versions reach the leaves' settles sooner (docs/design/engine-structure.md §3, near the
+    /// bound). Set once a look ([`Trunk::note_near_bound`]).
+    near_bound: bool,
     /// The store's pages an extent, which the live counts are kept in: set as the trunk is loaded
     /// and as each step begins.
     extent_pages: u32,
@@ -974,11 +998,17 @@ fn size_of_branches<'b>(
     })
 }
 
+/// The pages branch `b` wrote: its tree's, then its filter's and index's, from page `first` of its
+/// first extent on.
+fn branch_pages(b: &Branch) -> u64 {
+    b.filter_start.saturating_add(u64::from(b.filter_pages))
+}
+
 /// The pages branch `b` wrote in each extent it names, in order, `per` pages an extent: from page
 /// `first` of its first extent on, its tree's pages then its filter's and index's.
 fn pages_by_extent(b: &Branch, per: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
     let first = u64::from(b.first);
-    let end = first.saturating_add(b.filter_start.saturating_add(u64::from(b.filter_pages)));
+    let end = first.saturating_add(branch_pages(b));
     b.extents.iter().enumerate().map(move |(i, &e)| {
         let lo = u64::try_from(i).unwrap_or(u64::MAX).saturating_mul(per);
         let hi = lo.saturating_add(per);
@@ -1081,6 +1111,8 @@ impl Trunk {
             checkpoint_room: 0,
             clean_room: 0,
             live: Vec::new(),
+            live_total: 0,
+            near_bound: false,
             extent_pages: 0,
             room_kept: None,
             room_short: None,
@@ -1944,15 +1976,38 @@ impl Trunk {
             if self.live.len() <= i {
                 self.live.resize(i.checked_add(1).ok_or(corrupt())?, 0);
             }
-            let pages = u32::try_from(pages).map_err(|_| corrupt())?;
+            let wrote = u32::try_from(pages).map_err(|_| corrupt())?;
             let count = self.live.get_mut(i).ok_or(corrupt())?;
-            *count = if enters {
-                count.checked_add(pages).ok_or(corrupt())?
+            (*count, self.live_total) = if enters {
+                (
+                    count.checked_add(wrote).ok_or(corrupt())?,
+                    self.live_total.checked_add(pages).ok_or(corrupt())?,
+                )
             } else {
-                count.checked_sub(pages).ok_or(corrupt())?
+                (
+                    count.checked_sub(wrote).ok_or(corrupt())?,
+                    self.live_total.checked_sub(pages).ok_or(corrupt())?,
+                )
             };
         }
         Ok(())
+    }
+
+    /// The pages the branches above the leaves wrote: every index node's pivots' bundles and
+    /// in-flight lists, the versions not yet merged into a leaf. Each node once, each branch's
+    /// pages as [`pages_by_extent`] counts them.
+    pub(crate) fn above_leaves_pages(&self) -> u64 {
+        self.nodes
+            .iter()
+            .filter(|node| !node.leaf)
+            .flat_map(|node| {
+                node.inflight
+                    .iter()
+                    .flat_map(|f| f.branches.iter())
+                    .chain(node.pivots.iter().flat_map(|p| p.bundle.branches().iter()))
+            })
+            .map(branch_pages)
+            .fold(0u64, u64::saturating_add)
     }
 
     /// The live pages of extent `e` the tree's branches have ([`Self::live`]).
@@ -1993,7 +2048,8 @@ impl Trunk {
             let end = v.iter().rposition(|&c| c > 0).map_or(0, |i| i + 1);
             v[..end].to_vec()
         };
-        if trim(&recount) != trim(&self.live) {
+        let total = recount.iter().map(|&c| u64::from(c)).sum::<u64>();
+        if trim(&recount) != trim(&self.live) || total != self.live_total {
             return Err(Error::Corruption {
                 what: "the trunk's live pages an extent",
                 why: Malformed::CountMismatch,
@@ -2929,6 +2985,8 @@ impl Trunk {
             checkpoint_room: 0,
             clean_room: 0,
             live: Vec::new(),
+            live_total: 0,
+            near_bound: false,
             extent_pages: 0,
             room_kept: None,
             room_short: None,
@@ -3309,11 +3367,15 @@ impl Trunk {
             at.most = at.most.max(level.most);
             at.inflight = at.inflight.saturating_add(level.inflight);
             at.entries = at.entries.saturating_add(level.entries);
+            at.pages = at.pages.saturating_add(level.pages);
         }
         TrunkStats {
             merge_units: self.merge_keys,
             merge_ns: self.merge_ns,
             held_entries: self.held,
+            live_pages: self.live_total,
+            live_extents: u64::try_from(self.live.iter().filter(|&&c| c > 0).count())
+                .unwrap_or(u64::MAX),
             shape,
             ..self.stats
         }
@@ -3351,6 +3413,7 @@ impl Trunk {
                     .most
                     .max(u64::try_from(held.len()).unwrap_or(u64::MAX));
                 level.entries = level.entries.saturating_add(entries_of(held));
+                level.pages = level.pages.saturating_add(pages_of(held));
                 if let Some(c) = p.child {
                     queue.push_back((c, depth.saturating_add(1)));
                 }
@@ -3360,6 +3423,7 @@ impl Trunk {
                     .inflight
                     .saturating_add(u64::try_from(bundle.len()).unwrap_or(u64::MAX));
                 level.entries = level.entries.saturating_add(entries_of(bundle));
+                level.pages = level.pages.saturating_add(pages_of(bundle));
             }
         }
         levels

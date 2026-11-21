@@ -789,6 +789,8 @@ pub(crate) fn parse(line: &str) -> Option<Line> {
             measuring,
             asking,
             heard,
+            _moves,
+            _failed,
         ] => Some(Line::Status {
             group: u128::from_str_radix(group, 16).ok()?,
             term: term.parse().ok()?,

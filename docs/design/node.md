@@ -5553,6 +5553,108 @@ names each volume's node and domain, placement over it offers a volume of each n
 each of a thousand blocks, a node started again enlists again with the table unchanged, and one
 started in another domain is refused and ends saying why.
 
+### 6.7 Where each range's lead lies
+
+**The measurement.** On the Mac Studio, a release build of the cell of three nodes served about
+8,500 small PUTs a second natively, and 3,628 small GETs a second natively and 7,479 through S3 at
+512 clients, short of the release gate's 10,000 each. In every GET profile one node's first shard,
+which runs that node's consensus, log, transport and reads, was 89–93% busy while the other two
+nodes' first shards sat at 14–23%: every one of the cell's five ranges was led by the same node, so
+every proposal, append, ReadIndex round, read and apply of a leader ran on one thread. Spreading the
+ranges over that node's other shards (`--range-shards spread`) did worse, 2,544 GETs a second with
+twice the context switches, so the lever is across nodes.
+
+**The cause.** Elections are by suspicion (§2.4): a member that trusts no leader campaigns after a
+delay drawn from its seed and its count of draws (hyper-timing's `election_delay`), and every
+range's member on a node is opened with one seed, the node's id. At a cell's boot every range of
+every node starts leaderless at once, so the node whose first draw is shortest campaigns first in
+every range and wins them all; at a failover every range the dead node led loses its leader at once,
+and the survivor with the shortest draw takes them all. Drawing each range's delays apart would
+scatter the leads, but not evenly: five ranges elected independently over three nodes leave a node
+leading none in 38% of cells (`3·(2/3)^5 − 3·(1/3)^5`).
+
+**The rule** (research/101 §5). A cell holds one range of each layer (§6.6; `process::ranges`), so a
+range's layer is its place in the cell, `k`: Root 0, Bucket 1, Name 2, File 3, Block 4. Over the
+range's `n` voters in ascending order of id, its ranking puts first the voter at `k mod n`, then the
+rest in turn, upward when `k / n` is even and downward when it is odd. Every member works out the
+same ranking from the range's own configuration: a cell of three's five ranges first choose nodes 1,
+2, 3, 1 and 2, two, two and one, and with any one node down its ranges' second choices fall to the
+other two, three and two; five voters' first choices are one each. The ranking says where a lead
+goes; the counts say whether it goes. A node moves a lead only to a voter that leads two or more
+fewer ranges than it does, by what the node knows (each range it hosts names its leader, and a node
+of a cell of three hosts them all): one move narrows a gap between two counts only when the gap is
+two or more, which is TiKV PD's balance-leader scheduler moving leaders from the store with the most
+to the one with the fewest, and CockroachDB's lease rebalancing toward the mean (research/101
+§2–§3). So a range alone, as the simulated cells of one range have, never moves, and from any leads
+the five ranges settle two, two and one, every node leading at least one: settled, were a node to
+lead none, a range it is first for would be led by a node leading only that one, and the third node
+would lead four ranges that each rank it first, where no node is first for more than two.
+
+**The hand-over** (`node::lead`). At each turn, the leader of a range hands its lead to the
+best-ranked voter above itself that is fit: its node's detectors trust it (not suspected), it has
+not announced its stop, its disk is not judged slow (hyper-durable's `disk_is_slow`), and it leads
+two or more fewer ranges than this node. The heir must stay the heir for the range's patience before
+a hand-over begins, and it must be caught up with everything the range committed at the turn the
+hand-over begins (Raft's own transfer brings the target's log up first, thesis §3.10; TiKV refuses a
+transfer to a peer that lags, research/101 §3). The hand-over is hyper-durable's
+`Replica::transfer`, raft-rs's `transfer_leader`: the leader refuses proposals while it is out,
+brings the target's log up to its own, then sends it `TimeoutNow`, and gives the transfer up after
+an election timeout (research/101 §4).
+
+**Bounds.** No hand-over begins while the node stops (the stop hands every lead over itself, §1.7),
+while the range's configuration changes (a learner, a joint configuration, a change not yet applied,
+one not every voter's durable state states, a replacement under way), while the range's core has a
+transfer out, or while another hand-over of the node's is out: one at a time from a node. Its waits
+are the range's patience, the node's own measure (`Status::patience`, §2.4): the longest a peer's
+evidence may go unmoved before it is suspected, a judge's wait for its own flush, and the range's
+expected election and one more round. An heir trusted for that long has been heard within its
+detector's bound, not merely not yet suspected; and a hand-over ends, done or given up by the core,
+within an election (thesis §3.10), so the node begins its next one a patience after its last:
+CockroachDB spaces a store's lease transfers for balance the same way, by a second it states
+(`kv.allocator.min_lease_transfer_interval`, research/101 §2), where Mantle takes the time its cell
+measures, as it takes no other system's tuning. A hand-over the core gave up, or that ended with
+another voter leading, is counted failed: its range's next waits twice as long, and after `n − 1`
+failures in a row, the most moves the rule asks of a range, none begins until the range's term
+changes, which only a change in the cell's health brings. Each hand-over raises its range's leader
+in the range's ranking, a potential that only falls when a node fails or is judged slow, so while
+the cell's health holds a range moves at most `n − 1` times and then stays: the rule cannot flap.
+The node's `status` line says the hand-overs it began and those that failed (process docs).
+
+**Failover and return.** A dead leader's ranges are elected by suspicion as before; a survivor that
+then leads at least two more ranges than another hands it a range that ranks it higher, so a cell of
+three with a node down leads three and two. When the node returns, leading none, the leaders hand it
+the ranges that rank it above them, once it has been trusted a patience and is caught up, until the
+counts are two, two and one again. Each hand-over costs its range a pause of its proposals for one
+round trip and one election at most (research/101 §4), which the cell pays at most `n − 1` times a
+range for each change in its health.
+
+**Operations over several ranges.** A PUT commits to the Block range and then to the Name range, in
+that order and never atomically across them (§5; research/96); a GET reads the Name range and then,
+as the object needs, the File and Block ranges, each read confirmed by its range's leader
+(ReadIndex). Each step goes to its own range's leader, forwarded from the node that took the request
+when that node does not lead it (§6.6, a node's own commands). With every lead on one node, a
+request taken there forwarded nothing and one taken elsewhere forwarded every step; with the leads
+spread, each step is forwarded unless the node that took it leads that range. With clients spread
+evenly over the three nodes, as S3 clients and the native client are, a step is forwarded two times
+in three wherever its range's leader is, so a PUT's two commits make four forwards in three on
+average, before and after; a client held to one node pays at most one more intra-cell round trip a
+step, tens of microseconds beside the full flush each commit waits for (§2.4, durability.md §7).
+What it buys is that the leaders' work, which saturated one thread while two others idled, runs on
+three, and no step waits on another range's leader, since no operation holds two ranges at once.
+
+*As built (2026-11-20).* `node::lead` places and keeps the leads of the ranges the node's own task
+drives. Its tests: the rule's unit tests (each ranking a permutation, the even first choices, the
+spread with a node down, hand-overs only up the ranking, settling within `n − 1` moves, every one of
+the 243 assignments of five leads over three nodes settling two, two and one, the waits), and three
+of the cell under simulation (`tests/sim.rs`): after boot (seed 1: node 3 won all five ranges) the
+leads end two, two and one, none failed, and no hand-over begins while all are healthy; a killed
+node's ranges fail over and return once it is back, every history linearizable; and a voter
+suspected, then trusted but behind, is never handed a lead. Open: a range on another shard
+(`--range-shards spread`) is not yet placed, its shard holding what the rule reads; and whether each
+range should draw its campaign delays from a seed of its own, which would spread the elections
+themselves and save the hand-overs after boot, is measured before it changes the elections every
+test replays.
+
 ## 7. Placement, repair and cells
 
 | Piece | Exists | To build |

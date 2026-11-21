@@ -138,6 +138,20 @@ pub fn slowed(cause: crate::door::Slowed) -> Refused {
     )
 }
 
+/// The answer of an S3 request the node failed for `cause`: `500 InternalError`, its message S3's
+/// words and then the cause's, joined in one string made at their length.
+pub fn failed(cause: crate::door::Fault) -> Refused {
+    Refused::new(
+        "InternalError",
+        500,
+        [
+            "We encountered an internal error. Please try again. ",
+            cause.words(),
+        ]
+        .concat(),
+    )
+}
+
 /// S3's code, status and message for a host's refusal (node.md §4.4; 05 §11.2).
 pub fn refusal(status: Status) -> Refused {
     let (code, http, message) = match status {
@@ -460,6 +474,11 @@ pub fn reply(
                 405,
                 "Your proposed download exceeds the maximum allowed size",
             );
+            Ok(error(&refused, resource, ids, echo.head, fields))
+        }
+        // A failure names its cause after S3's words (`door::Fault`), as a `SlowDown` does.
+        Status::Failed if reply.fault.is_some() => {
+            let refused = reply.fault.map_or_else(|| refusal(Status::Failed), failed);
             Ok(error(&refused, resource, ids, echo.head, fields))
         }
         status => Ok(error(&refusal(status), resource, ids, echo.head, fields)),

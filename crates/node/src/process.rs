@@ -1397,6 +1397,7 @@ fn gateway_settings(
         rates,
         target: config.target,
         refusals: crate::node::refusals::Refusals::default(),
+        failures: crate::node::failures::Failures::default(),
     })
 }
 
@@ -3080,6 +3081,7 @@ async fn serve(
     let mut said_slowed: Option<(Slowings, u64)> = None;
     // The puts it answered `SlowDown`, each cause's count as last said and when, said as `slowed`.
     let mut said_refused: Option<(Refusings, u64)> = None;
+    let mut said_failed: Option<(Failings, u64)> = None;
     // Whether the node waits on its own device, as last said, none before the first saying.
     let mut said_held: Option<bool> = None;
     // The log's refusals for room as last said: the node's rounds of compaction and the liveness
@@ -3499,6 +3501,9 @@ async fn serve(
             serve_ns / 2,
         )
         .map_err(wrote)?;
+        // Why the node answered requests `Failed`, on either door, said as `slowed` is.
+        said_failed = failed_lines(&mut lines, said_failed, (node.failed(), now), serve_ns / 2)
+            .map_err(wrote)?;
         // Whether the node waits on its own device, said as it changes, so a watcher knows it holds
         // still for its device and not by choice: a fact of the node, said once, where a status
         // for each range repeated it, and a log line after, at each of the liveness stream's
@@ -4271,6 +4276,35 @@ fn slowed_lines(
     Ok(Some((counts, now)))
 }
 
+/// The requests a node answered `Failed`, a count for each cause in `door::Fault::ALL`'s order.
+type Failings = [u64; crate::door::Fault::ALL.len()];
+
+/// `failed CAUSE COUNT`, written onto `lines` for each cause whose count of requests answered
+/// `Failed` (`Node::failed`) is not the one last `said`, as [`slowed_lines`] says each `SlowDown`'s:
+/// the first at once, the next no sooner than `gap_ns` after the last saying, so a storm of
+/// failures says at most a line a cause each gap, its counts all it failed. The counts said now
+/// and when, or `said` where nothing was due.
+fn failed_lines(
+    lines: &mut String,
+    said: Option<(Failings, u64)>,
+    (counts, now): (Failings, u64),
+    gap_ns: u64,
+) -> Result<Option<(Failings, u64)>, std::fmt::Error> {
+    let (was, due) = match said {
+        None => ([0; crate::door::Fault::ALL.len()], true),
+        Some((was, at)) => (was, now.saturating_sub(at) >= gap_ns),
+    };
+    if !due || counts == was {
+        return Ok(said);
+    }
+    for ((cause, count), before) in crate::door::Fault::ALL.iter().zip(counts).zip(was) {
+        if count != before {
+            writeln!(lines, "failed {} {count}", cause.name())?;
+        }
+    }
+    Ok(Some((counts, now)))
+}
+
 /// The puts a node answered `SlowDown`, a count for each cause in `node::refusals::names`' order.
 type Refusings = [u64; crate::node::refusals::CAUSES];
 
@@ -4879,6 +4913,29 @@ mod tests {
             "{answer}"
         );
         assert_eq!(names().count(), CAUSES);
+    }
+
+    /// Each cause of a `Failed` is said as its count changes, `failed CAUSE COUNT`, as `slowed`
+    /// is: the first at once, a storm within a gap not at all, and past it a line for each cause
+    /// that moved; each cause's name its own.
+    #[test]
+    fn each_cause_of_a_failure_is_said_as_it_changes() {
+        use crate::door::Fault;
+        let gap = 1_000;
+        let mut counts = [0u64; Fault::ALL.len()];
+        let mut lines = String::new();
+        let said = failed_lines(&mut lines, None, (counts, 5), gap).unwrap();
+        assert_eq!((said, lines.as_str()), (None, ""));
+        counts[Fault::Table.index()] = 1;
+        let said = failed_lines(&mut lines, said, (counts, 10), gap).unwrap();
+        assert_eq!(lines, "failed table 1\n");
+        counts[Fault::Read.index()] = 2;
+        let said = failed_lines(&mut lines, said, (counts, 10 + gap - 1), gap).unwrap();
+        assert_eq!(lines, "failed table 1\n");
+        failed_lines(&mut lines, said, (counts, 10 + gap), gap).unwrap();
+        assert_eq!(lines, "failed table 1\nfailed read 2\n");
+        let names: std::collections::BTreeSet<_> = Fault::ALL.iter().map(|c| c.name()).collect();
+        assert_eq!(names.len(), Fault::ALL.len());
     }
 
     /// A report of the watchdog's, numbered `number`, on a task spawned at `site` and labelled

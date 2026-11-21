@@ -4753,9 +4753,9 @@ reported as success or as a refusal with no effect:
 | Another principal's bucket headed, deleted or its versioning changed, where no policy grants it | 403 `AccessDenied` |
 | Versioning suspended on a bucket Object Lock holds | 409 `InvalidBucketState` (18 §2.1) |
 | `Unplaced`, admission refused, a range splitting or frozen for a move | 503 `SlowDown` |
-| A put whose node's volume table names no volume that takes chunks, so no scheme (a fresh cell's first puts, the node's member of the root range not yet applied the enlistments its leader committed) | none: the put waits for the table to name a scheme, woken as it does, and past its client's patience 503 `SlowDown` (`Patience`); never 500 `InternalError`, which says the node failed (05 §11.2) |
+| A put, a CopyObject or a native upload's Open whose node's volume table names no volume that takes chunks, so no scheme (a fresh cell's first writes, the node's member of the root range not yet applied the enlistments its leader committed) | none: it waits for the table to name a scheme, woken as it does (a put its commit held, a copy its source's version, an Open its bucket's row, its runs cut once there are blocks to cut them in), and past its client's patience 503 `SlowDown` (`Patience`); never 500 `InternalError`, which says the node failed (05 §11.2) |
 | `PutError::Full`: every volume a block's chunks were offered refused them as full | 507 `InsufficientStorage` (RFC 4918 §11.5), which stock clients do not retry (research/75) |
-| An internal step whose outcome is unknown after the request's retries (§5.4) | 500 `InternalError`, which clients retry |
+| An internal step whose outcome is unknown after the request's retries (§5.4) | 500 `InternalError`, which clients retry; the native reply names the step beside its status (`object::Fault`: a range's read or command refused or answered another kind, no range of a layer, the volume table, the keys, an ask refused, the driver, a chunk, a block released, the body, the reply's encoding, a block that did not verify, rows that disagree), the S3 door's `<Message>` after S3's words, and the node counts each on its lines (`failed CAUSE COUNT`) |
 
 A body with both `Transfer-Encoding` and `Content-Length` is refused 400 and the connection
 closed, as RFC 9112 requires for a framing error in a request (25 §2).

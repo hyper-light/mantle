@@ -41,8 +41,8 @@ use mantle_client::{
     Rewind, Settings, Sink, Source, TRAILER, Watch,
 };
 use mantle_protocol::object::{
-    self as native, Headers, List, ListVersions, Listing, MAX_OBJECTS, Metadata, Op, Progress,
-    Reply, Slowed, Status, Target,
+    self as native, Fault, Headers, List, ListVersions, Listing, MAX_OBJECTS, Metadata, Op,
+    Progress, Reply, Slowed, Status, Target,
 };
 use mantle_s3::copy::{Directive, Source as CopySource};
 
@@ -178,7 +178,7 @@ pub enum Error {
     Usage(String),
     Client(ClientError),
     /// A node answered, and not done: what was asked, its status, and a `SlowDown`'s cause.
-    Answered(String, Status, Option<Slowed>),
+    Answered(String, Status, Option<Slowed>, Option<Fault>),
     File(PathBuf, std::io::Error),
     Runtime(String),
     Output(std::io::Error),
@@ -200,7 +200,7 @@ pub enum Error {
 impl Error {
     /// A node's `reply`, not done, to what was asked: its status, and a `SlowDown`'s cause.
     pub(crate) fn answered(what: &str, reply: &Reply) -> Self {
-        Self::Answered(what.to_owned(), reply.status, reply.slowed)
+        Self::Answered(what.to_owned(), reply.status, reply.slowed, reply.fault)
     }
 }
 
@@ -216,9 +216,13 @@ impl fmt::Display for Error {
             Self::Config(path, why) => write!(f, "{}: {why}", path.display()),
             Self::Usage(why) => f.write_str(why),
             Self::Client(e) => write!(f, "{e}"),
-            Self::Answered(what, status, None) => write!(f, "{what}: {status:?}"),
-            // A `SlowDown` names its cause, the path that answered it (node.md §4.5).
-            Self::Answered(what, status, Some(cause)) => {
+            Self::Answered(what, status, None, None) => write!(f, "{what}: {status:?}"),
+            // A `SlowDown` names its cause, the path that answered it (node.md §4.5), and a
+            // `Failed` the step that failed (node.md §4.4).
+            Self::Answered(what, status, Some(cause), _) => {
+                write!(f, "{what}: {status:?}: {}", cause.words())
+            }
+            Self::Answered(what, status, None, Some(cause)) => {
                 write!(f, "{what}: {status:?}: {}", cause.words())
             }
             Self::File(path, e) => write!(f, "{}: {e}", path.display()),
@@ -830,7 +834,7 @@ async fn remove(
             }
         }
         return match failed {
-            Some(status) => Err(Error::Answered("DeleteObjects".into(), status, None)),
+            Some(status) => Err(Error::Answered("DeleteObjects".into(), status, None, None)),
             None => Ok(()),
         };
     };
@@ -1264,6 +1268,7 @@ where
                 "the upload".into(),
                 Status::BadDigest,
                 None,
+                None,
             ))
         }
         Status::NoSuchUpload => {
@@ -1271,6 +1276,7 @@ where
             Err(Error::Answered(
                 "the upload".into(),
                 Status::NoSuchUpload,
+                None,
                 None,
             ))
         }
@@ -1736,6 +1742,17 @@ mod tests {
         assert_eq!(failed.to_string(), "the upload: Failed");
         let bare = Error::answered("the upload", &Reply::status(Status::SlowDown));
         assert_eq!(bare.to_string(), "the upload: SlowDown");
+    }
+
+    /// A node's `Failed` names the step that failed after the status, each cause its own words.
+    #[test]
+    fn a_failures_failure_names_its_cause() {
+        let mut said = std::collections::BTreeSet::new();
+        for cause in Fault::ALL {
+            let text = Error::answered("the upload", &Reply::failed(cause)).to_string();
+            assert_eq!(text, format!("the upload: Failed: {}", cause.words()));
+            assert!(said.insert(text), "{cause:?} says another's");
+        }
     }
 
     #[test]

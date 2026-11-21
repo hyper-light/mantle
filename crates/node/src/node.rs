@@ -77,6 +77,7 @@ mod answers;
 mod drivers;
 mod driving;
 mod enrollments;
+pub mod failures;
 mod hold;
 mod host;
 mod keyed;
@@ -2908,6 +2909,17 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.gateway
             .as_ref()
             .map_or([0; refusals::CAUSES], |gateway| gateway.refusals.counts())
+    }
+
+    /// The requests this node answered `Failed` since it opened, on either door, a count for each
+    /// cause in `door::Fault::ALL`'s order, as every host of the node counted them
+    /// ([`failures::Failures`]).
+    pub fn failed(&self) -> [u64; crate::door::Fault::ALL.len()] {
+        self.gateway
+            .as_ref()
+            .map_or([0; crate::door::Fault::ALL.len()], |gateway| {
+                gateway.failures.counts()
+            })
     }
 
     /// The entries this node's members proposed as their ranges' leader since it opened, and the

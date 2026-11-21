@@ -819,6 +819,66 @@ fn a_batched_entry_is_answered_only_after_the_flushes_it_needs_and_never_while_t
     }
 }
 
+/// A range command's flushes, the unit a PUT's critical path is counted in (docs/design/gateway.md
+/// §2.3; `mantle_gateway::put`'s replay of a one-byte PUT): on a quiet cell, from its asking to
+/// its answer, its leader and enough followers for a quorum each wrote it in a frame, and every
+/// frame any node wrote was answered only once a second durable write of its own confirmed it,
+/// none at its own flush (durability.md §7.5, decision A): two flushes a member, the leader's
+/// beside its followers' since it sends its appends before its own (raft-log.md §3).
+#[test]
+fn a_command_waits_for_its_frame_and_the_frames_confirmation_on_its_leader_and_a_quorum() {
+    for seed in [1u64, 2] {
+        let mut cell = Sim::new(seed);
+        let leader = cell.leader();
+        cell.open_bucket();
+        let order: Vec<u64> = (1..=cell.nodes).collect();
+        let asking = cell.asking(CLIENT, &order);
+        let (registered, _) = cell.ask(&asking, GROUP, registration(CLIENT, 1, 1));
+        let session = match registered.as_deref() {
+            Ok([Answer::Registered { session }]) => *session,
+            other => panic!("seed {seed}: the registration answered {other:?}"),
+        };
+        let counts = |c: &Sim| -> BTreeMap<u64, [u64; 4]> {
+            (1..=c.nodes)
+                .map(|id| {
+                    let s = c
+                        .log_stats(id)
+                        .unwrap_or_else(|| panic!("seed {seed}: node {id}'s log is gone"));
+                    (id, [s.frames, s.confirmations, s.flushes, s.durable_writes])
+                })
+                .collect()
+        };
+        let before = counts(&cell);
+        let (answered, _) = cell.ask(&asking, GROUP, batch(session, 1, "f"));
+        let answered = answered.unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        assert!(batch_answered(&answered), "seed {seed}: {answered:?}");
+        let after = counts(&cell);
+        let quorum = usize::try_from(cell.nodes / 2 + 1).unwrap();
+        let mut wrote = Vec::new();
+        for id in 1..=cell.nodes {
+            let [frames, confirmations, flushes, durable] =
+                std::array::from_fn(|i| after[&id][i] - before[&id][i]);
+            if frames > 0 {
+                wrote.push(id);
+            }
+            assert_eq!(
+                confirmations, frames,
+                "seed {seed}: node {id} answered a frame before a write of its own confirmed it"
+            );
+            assert_eq!(
+                flushes + durable,
+                frames + confirmations,
+                "seed {seed}: node {id}: a frame or a confirmation without its own flush"
+            );
+        }
+        assert!(
+            wrote.contains(&leader) && wrote.len() >= quorum,
+            "seed {seed}: the command answered with {wrote:?} written, leader {leader}, quorum \
+             {quorum}"
+        );
+    }
+}
+
 /// Where a power cut tears a frame of the range's entry after its persist record landed
 /// (durability.md §7.6), the frame's write lost and its record's kept, its flush cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

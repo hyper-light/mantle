@@ -484,6 +484,86 @@ version names a block taken apart.
 *Not yet measured.* The PUT ladder at 1 B, 64 KiB and 8 MiB through both doors against research/71's
 step 9, and crash tests that stop a gateway between the Block and File writes and the Name.
 
+### 2.3 A PUT's critical path, edge by edge
+
+Status: analysis, 2026-11-21, for the release's gate of 10,000 small PUTs a second on a cell of
+three nodes, on a one-byte object in three copies. Checked by `put.rs`'s
+`a_one_byte_puts_critical_path_is_its_slowest_chunk_then_two_rounds_of_commands`, which replays
+the driver itself, each request answered at its cost below, and pins the schedule; and a
+command's cost by the node simulation's
+`a_command_waits_for_its_frame_and_the_frames_confirmation_on_its_leader_and_a_quorum`, which
+counts each member's frames, confirmations and flushes from a command's asking to its answer.
+The simulation runs ranges alone, no gateway and no volumes, on devices that answer at once, so
+it runs no PUT, and counts a command's flushes without timing them.
+
+| step | waits for | costs the path |
+|---|---|---|
+| the bucket's row, read (`Query::Bucket`) | the request's head | no flush: a ReadIndex, one heartbeat round of the Bucket range's leader, and a follower's ask of the leader first (Diss §6.4, research/06 A1.4) |
+| placement (`Request::Place`) | the bucket's row, which the put is made from | none: the node's volume table (`place::offer_new`) |
+| three chunks, at once | placement | one volume flush, the slowest replica's: a volume answers its batch at the batch's one flush (chunk-store.md §4) |
+| the Block and File writes, at once | every chunk durable | two flushes: each member's frame, then the later durable record that confirms it (raft-log.md §3; durability.md §7.5, decision A); the leader's flush beside its followers' (Diss §10.2.1, research/06 A1.2), and its apply in the drive that learns the commit, with no flush between (replica.md §3) |
+| the Name write | both answered | two flushes, as above |
+
+Five flushes, the slowest chunk's and two for each of two rounds of commands, where research/71
+counted seven, from before the File write went beside the Block's (§2.2). A session is registered
+once a gateway session, not once a PUT (§2, "A Name command whose session expired").
+
+*Each edge, and why it stands.*
+
+- *The Block write after every chunk is durable.* The block's row is the pointer to its chunks and
+  soft updates' first rule orders it after them (research/96 §1, GMSP00 §2). Readers reach a block
+  only through a name, which waits for the chunks anyway; but three processes follow a block's row
+  outside any name: repair walks the reverse rows of each volume gone or away, and every block of
+  the range as its service begins (repair.md §5), and rebuilds from a copy it reads, or moves by
+  compare-and-swap, a chunk whose place lies on a volume gone, away or leaving or shares a domain
+  (repair.md §4); and the block sweep and the collector take a released block's chunks apart there
+  and then (metadata.md §2, "Blocks never named"). The row also states where each chunk is, and a
+  chunk refused goes to another volume (§2, "A chunk refused"): a row written before the chunks land
+  names a place the chunk may never have, which the PUT would write again while repair may be moving
+  it. Overlapping the two needs repair to leave alone a block whose chunks are not yet known durable
+  and the row to be written again where a chunk moved: a change of what a block's row promises, not
+  of the PUT's order. Not built; the owner's ("Open", below).
+- *The File write after every chunk is durable.* The file's row names its blocks by ID and length,
+  never a chunk, and no reader follows it before the name (§2.2), so it could go once the body has
+  ended, beside the chunks: the argument of §2.2 holds unchanged, and a crash before the chunks land
+  leaves what the second row of §2.2's table says. It shortens no path: the File write is already
+  beside the Block write, two flushes each, so the path stays five flushes, and the Name write is
+  spared only the slower of the two, a wait under load for independent devices' phases, at the price
+  of a file row written and swept for every PUT whose chunks are refused. Not built.
+- *The Name write after the Block and File writes answered.* The Name commit is the PUT's
+  linearization point (§2), and S3's model is that "Updates to a single key are atomic ... you will
+  get either the old data or the new data, but never partial or corrupt data" (research/05 §13): a
+  version visible, to a reader concurrent with the PUT as much as after it, must name a file and
+  blocks committed and chunks durable. A GET after the PUT's answer reads the name by ReadIndex,
+  served only once the leader has applied every entry committed when the read began (Diss §6.4,
+  research/06 A1.4), so it finds the version, and what the version names must be committed and
+  durable by then. The Block, File and Name ranges are three Raft groups with three logs, and Raft
+  orders entries only within one log (Log Matching, ATC §5.3, research/06 A1.1): a Name entry
+  proposed behind a Block entry on another group is ordered behind nothing, and a crash between them
+  leaves a committed name naming a block never recorded. What would let it go beside them is
+  Parallel Commits, a name whose commit is conditional and every reader resolving it (research/96
+  §2, TSM+20 §3.1.1, §3.2), which §2.2 did not choose.
+- *Waiting for the Block command's apply, not its commit.* The Name write needs the Block range's
+  answer, the block's deadline, which the entry's apply stamps (`block::apply`); the leader
+  applies a committed entry in the drive that stepping in the commit's acknowledgement prompts
+  (replica.md §3, "A drive"), so the wait holds no flush past the commit.
+- *Inside a command.* The leader sends its appends before its own flush (raft-log.md §3), so its
+  flush and its followers' overlap already; a member's answer waits for the record that confirms
+  its frame, which decision A keeps (durability.md §7.5).
+
+*Open: the owner's.* Answering frames at their flush, decision A, took two of the five flushes off
+the path and measured 18% more native PUTs a second on the Mac Studio (durability.md §7.5): about
+9% a flush. At that rate, from the ~8,500 a second measured with 2,048 clients:
+
+| change | flushes on the path | expected |
+|---|---|---|
+| the Block row written beside its chunks, repair and the sweeps leaving a block whose chunks are not yet durable, the row written again where a chunk moved | 4 | ~9%, ~9,300/s |
+| the name beside the file and blocks, Parallel Commits | 3 | ~18%, ~10,000/s |
+| both | 2 | ~27%, ~10,800/s |
+
+Each applies the one measured slope and is no measurement of its own, and each changes what a
+layer's row promises its readers.
+
 ## 3. Reading an object
 
 A GET reads top down (`get.rs`), from the version the Name range read, whose preconditions,

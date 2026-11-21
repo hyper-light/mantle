@@ -682,8 +682,10 @@ pub struct Trunk {
     /// cleaning). At most an entry an extent the store holds. A pending branch is counted as it
     /// enters the root.
     live: Vec<u32>,
-    /// The sum of [`Self::live`]: every page the tree's branches wrote, kept with the counts.
+    /// The sum of [`Self::live`], every page the tree's branches wrote, and the extents holding
+    /// one at least: kept with the counts.
     live_total: u64,
+    live_extents: u64,
     /// Whether the store is near its bound: the extents it may still hand out, beside the next
     /// checkpoint's room, are fewer than the pages above the leaves fill. Its index pivots then
     /// flush their bundles as soon as they hold a branch ([`Trunk::flush_due`]), so superseded
@@ -1112,6 +1114,7 @@ impl Trunk {
             clean_room: 0,
             live: Vec::new(),
             live_total: 0,
+            live_extents: 0,
             near_bound: false,
             extent_pages: 0,
             room_kept: None,
@@ -1978,6 +1981,7 @@ impl Trunk {
             }
             let wrote = u32::try_from(pages).map_err(|_| corrupt())?;
             let count = self.live.get_mut(i).ok_or(corrupt())?;
+            let was = *count;
             (*count, self.live_total) = if enters {
                 (
                     count.checked_add(wrote).ok_or(corrupt())?,
@@ -1989,6 +1993,14 @@ impl Trunk {
                     self.live_total.checked_sub(pages).ok_or(corrupt())?,
                 )
             };
+            if (was == 0) != (*count == 0) {
+                self.live_extents = if was == 0 {
+                    self.live_extents.checked_add(1)
+                } else {
+                    self.live_extents.checked_sub(1)
+                }
+                .ok_or(corrupt())?;
+            }
         }
         Ok(())
     }
@@ -2049,7 +2061,12 @@ impl Trunk {
             v[..end].to_vec()
         };
         let total = recount.iter().map(|&c| u64::from(c)).sum::<u64>();
-        if trim(&recount) != trim(&self.live) || total != self.live_total {
+        let extents =
+            u64::try_from(recount.iter().filter(|&&c| c > 0).count()).map_err(|_| corrupt())?;
+        if trim(&recount) != trim(&self.live)
+            || total != self.live_total
+            || extents != self.live_extents
+        {
             return Err(Error::Corruption {
                 what: "the trunk's live pages an extent",
                 why: Malformed::CountMismatch,
@@ -2986,6 +3003,7 @@ impl Trunk {
             clean_room: 0,
             live: Vec::new(),
             live_total: 0,
+            live_extents: 0,
             near_bound: false,
             extent_pages: 0,
             room_kept: None,
@@ -3374,8 +3392,7 @@ impl Trunk {
             merge_ns: self.merge_ns,
             held_entries: self.held,
             live_pages: self.live_total,
-            live_extents: u64::try_from(self.live.iter().filter(|&&c| c > 0).count())
-                .unwrap_or(u64::MAX),
+            live_extents: self.live_extents,
             shape,
             ..self.stats
         }

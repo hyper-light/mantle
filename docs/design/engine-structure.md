@@ -336,8 +336,7 @@ under load, at moderate load and saturated.
   by life, it held 177 branches of 725 pages in 244 extents
   that hold 182 densely, 55 of them with one live page, 21 with two and 44 with three: a
   branch's death follows the pivot it waits in, not its kind alone (below). Copying a mostly
-  dead extent's live pages out, or grouping branches by the pivot they wait in, is the next
-  step.
+  dead extent's live pages out is the next step (cleaning, as designed, below).
 - **Small branches share extents.** The cell's store met its bound before its bytes were full,
   each branch taking whole extents of its own: on the shard alone at entry 8,925, 108 branches
   of 537 pages held 169 extents of four pages, 66 of them part used, and the branches were two
@@ -414,6 +413,44 @@ under load, at moderate load and saturated.
   found a tail to begin in. Adopted only as the shard applied a job's branches, at a pass's end,
   the tail reached fewer jobs, and the fill met its bound at 18,850. The shard alone, which runs no
   job, still meets its bound at 21,155.
+- **Cleaning, as designed.** Measured at the shard alone's bound (entry 21,155; mantle-node
+  `tests/engine_workers.rs`, a census of every branch taken where `ShardDb::at_extent_bound`
+  first holds, not kept; 2026-11-20): 244 extents held for 177 branches of 725 live pages, which
+  fill 182 written densely; 55 extents held one live page, 21 two, 44 three and 124 four. The
+  engine waited for 10 extents with 8 free. The live pages sat in leaves' bundles (415), inner
+  nodes' bundles (286) and inner nodes' in-flight bundles (24), and 65 extents held live pages of
+  more than one node. What cleaning recovers there: settling each leaf whose sources alone hold
+  more extents than their pages fill, 13 extents net over 39 leaves; copying each branch that
+  alone holds more extents than its pages fill, 18 net for 60 pages copied (18 branches); the
+  rest, down to 182, only by copying every branch with a page in a mostly dead extent, as Sprite
+  LFS copies a whole segment's live blocks out (research/34 §6). Grouping branches by the slot
+  they wait in lowers the waste found but bounds nothing: a leaf's next settle begins where its
+  last ended, so its own short-lived predecessor dies beside it, and the paced fill's end follows
+  its worker's timing. The store is also near full of live pages: 725 of its 1,024, and beside
+  the 10 extents the waiting task and the checkpoint asked, 246 extents may hold them, so the fill
+  needs its held extents about 74% live, every one of them where none is cleaned twice. By LFS's
+  write cost, 2/(1-u) for segments cleaned at utilization u [LFS §3.4], cleaning at 3/4 moves
+  eight pages for each new one; so holding fewer versions (fewer live pages) is the other lever,
+  beside the cleaner.
+  *Mechanism.* A relocation, a maintenance task beside a compaction and a settle: a copy of one
+  branch, a merge of it alone with its tombstones kept, written inline a budget at a time and
+  gated by room as a compaction is, replaces it where it stands as it applies, and its extents
+  are released, free at the next checkpoint (a range checkpoints for room, above). Its node plans
+  no other task while it is out, and one whose branch has moved since is discarded, its copy
+  released. *Which, and when:* when maintenance waits for room and no task has begun, a census of
+  each extent's live pages and the branches holding it (at most `extent_pages` references an
+  extent, so bounded by the extents held) ranks the branches by LFS's cost-benefit, benefit the
+  extents a copy frees net of those it takes, cost the pages it reads and writes (LFS's 1+u a
+  segment) [LFS §3.5]; a branch has no modified time of its own, so age is left out until one is
+  measured to matter. *The reserve:* maintenance and rotations leave free, beside the
+  checkpoint's room, the room of the largest relocation the cleaner makes (branches of at most a
+  stated number of pages, its asked room as a compaction's), and the relocation alone may take it,
+  as Sprite LFS cleans before its clean segments run out [LFS §3.4]; so the cleaner never waits
+  for room it cannot get. *The bound it gives:* cleaning every extent whose live pages are fewer
+  than a share `s` of its pages, the extents held for branches are at most the live pages over
+  `s × extent_pages`, plus a tail for each life; at the bound's 725 live pages, `s` = 3/4 gives
+  242 and two tails, within the 246 the fill may hold, so this geometry's fill needs a cleaner
+  that keeps every extent at least three-quarters live.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

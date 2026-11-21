@@ -152,7 +152,9 @@ pub(crate) const MEMTABLE: usize = STORE_PAGE;
 /// the range's settings and rules, and the log's and the engine's sizes (the engine's own small test
 /// configuration, crates/engine/tests/pool_startup.rs), its page cache every page its store may
 /// hold, 256 extents of four 4 KiB pages, as a node whose memory holds its engines' wants caches
-/// them (`derive::engine_cache_wants_for`). The calibration's probe budget is the node's own
+/// them (`derive::engine_cache_wants_for`), and that whole cache its own floor, never lent
+/// (`engine.cache_floor`, `derive::cache_floor`; 4f803fe5), so it never shrinks below the store
+/// it caches. The calibration's probe budget is the node's own
 /// (`probe_budget_ms`).
 pub(crate) const STATED: &str = "\
 range.election_tick = 10
@@ -172,6 +174,7 @@ log.waits = measured
 engine.extent_pages = 4
 engine.max_extents = 256
 engine.cache_bytes = 4194304
+engine.cache_floor = 4194304
 engine.fanout = 3
 engine.leaf_entries = 96
 engine.workers = 1

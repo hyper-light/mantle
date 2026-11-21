@@ -8,7 +8,7 @@ use mantle_meta::engine::Row;
 const FORMAT: u8 = 1;
 
 /// The bytes before an image's first row: its format and its count of rows.
-const HEAD: usize = 1 + 8;
+pub(crate) const HEAD: usize = 1 + 8;
 
 /// Begins an image in `into`, which is empty: its head, whose count [`finish`] sets. The rows
 /// follow a slice at a time ([`push_row`]), as a range images its rows a page a drive on a node's
@@ -179,6 +179,25 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Row>, ImageError> {
         rows.push((key.to_vec(), value.to_vec()))
     })?;
     Ok(rows)
+}
+
+/// The row `bytes` begins with, its key and value, and the bytes it takes: none where they do
+/// not hold one whole.
+pub(crate) fn next_row(bytes: &[u8]) -> Option<(&[u8], &[u8], usize)> {
+    let mut r = Reader::new(bytes);
+    let (key, value) = row(&mut r)?;
+    Some((key, value, bytes.len().checked_sub(r.remaining())?))
+}
+
+/// The key of the last row `bytes` holds, which are whole rows and at least one: none
+/// otherwise. A walk of its rows, each at least the 8 bytes of its lengths.
+pub(crate) fn last_key(bytes: &[u8]) -> Option<&[u8]> {
+    let mut r = Reader::new(bytes);
+    let mut last = None;
+    while r.remaining() > 0 {
+        last = Some(row(&mut r)?.0);
+    }
+    last
 }
 
 /// The next row `r` holds: its key, then its value, each after its length.

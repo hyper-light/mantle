@@ -18,6 +18,7 @@ mod image;
 mod machine;
 pub mod membership;
 mod replica;
+mod spans;
 mod stored;
 
 pub use error::ReplicaError;

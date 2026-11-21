@@ -24,6 +24,8 @@ use mantle_meta::wire::{self, Answer};
 
 use hyper_raft::proto::{ConfChangeV2, ConfState, EntryType};
 
+use crate::image::ImageError;
+use crate::spans::{self, Forensics, Keys, Reread, Span, Spans};
 use crate::{conf, image};
 
 /// The row that holds the term of the last entry applied.
@@ -125,6 +127,9 @@ pub enum Failure {
     Memory(#[from] TryReserveError),
     #[error(transparent)]
     Image(#[from] image::ImageError),
+    /// An image made that failed its check, with what its spans and the engine's rows tell.
+    #[error(transparent)]
+    Made(#[from] Box<Forensics>),
 }
 
 /// The [`Fatal`] of the step `what`, which failed on `e`, kept in `failure` unless one is
@@ -233,7 +238,14 @@ pub struct RangeMachine<E> {
     /// The image under way for a member behind the log's start, made a slice a drive
     /// ([`StateMachine::image`]).
     imaging: Option<Imaging>,
+    /// A test's change to the image's buffer before a drive's slice: bytes changed under it.
+    #[cfg(test)]
+    between: Option<Between>,
 }
+
+/// A test's change to an image's buffer between drives ([`RangeMachine`]'s `between`).
+#[cfg(test)]
+type Between = Box<dyn FnMut(&mut Vec<u8>) + Send>;
 
 /// An image made a slice a drive on a node's shard (docs/design/replica.md §4): of the point the
 /// machine applied when it began, under the configuration held there. Its replica applies nothing
@@ -251,6 +263,12 @@ struct Imaging {
     largest: usize,
     /// The CRC-32C of the rows' bytes written (`image::finish`).
     crc: u32,
+    /// The drives that made it so far, this one counted.
+    drives: u64,
+    /// Each slice's span of its bytes and the running CRC through it, so a check that fails
+    /// finds the bytes that changed after their slice's CRC was taken, in no more memory than a
+    /// slice ([`Spans`]).
+    spans: Spans,
 }
 
 impl<E: Engine> RangeMachine<E> {
@@ -294,6 +312,8 @@ impl<E: Engine> RangeMachine<E> {
             failure: None,
             replay: Replay::None,
             imaging: None,
+            #[cfg(test)]
+            between: None,
         })
     }
 
@@ -370,6 +390,135 @@ impl<E: Engine> RangeMachine<E> {
 
     pub fn into_engine(self) -> E {
         self.engine
+    }
+
+    /// What the image in `into`, made as `imaging` states and failing `error`, tells of the bytes
+    /// that changed ([`Forensics`]): its spans checked again, and the first that changed read
+    /// again from the engine, which holds the state of the image's point while applies are held
+    /// for it (hyper-durable's `Wait::Image`). One pass over the image, and the engine's rows of
+    /// that span read into a buffer of its length.
+    fn forensics(&mut self, into: &[u8], imaging: &Imaging, error: ImageError) -> Forensics {
+        let spans = &imaging.spans;
+        let mut found = Forensics::of(error, spans, into, imaging.drives, clock_ns());
+        let (Some(first), Some(span)) = (found.changed.first, found.span) else {
+            found.read(Keys::Unread);
+            return found;
+        };
+        let (keys, reread) = match self.reread(into, spans, first, span, imaging.largest) {
+            Ok(read) => read,
+            Err(why) => (Keys::Unread, Reread::Not(why)),
+        };
+        found.reread = reread;
+        found.read(keys);
+        found
+    }
+
+    /// The span `first` of `spans`, `span`, read again from the engine and set against the image
+    /// in `into`: from the least key past the last row of the span before, which is as written.
+    fn reread(
+        &mut self,
+        into: &[u8],
+        spans: &Spans,
+        first: usize,
+        span: Span,
+        largest: usize,
+    ) -> Result<(Keys, Reread), &'static str> {
+        let mut from = Vec::new();
+        if let Some(before) = first.checked_sub(1) {
+            let key = spans
+                .get(before)
+                .and_then(|before| before.bytes(into))
+                .and_then(image::last_key)
+                .ok_or("the rows before it do not read")?;
+            from.try_reserve_exact(key.len().saturating_add(1))
+                .map_err(|_| "no memory for its first key")?;
+            from.extend_from_slice(key);
+            from.push(0);
+        }
+        let len = usize::try_from(span.len).map_err(|_| "its bytes are past usize")?;
+        let at = usize::try_from(span.at).map_err(|_| "its offset is past usize")?;
+        let got = into
+            .get(at..at.saturating_add(len).min(into.len()))
+            .ok_or("the image no longer holds it")?;
+        let expected = self.rebuild(from, len, largest)?;
+        let Some(diff) = spans::diff(span.at, got, &expected) else {
+            return Ok((Keys::Unread, Reread::Same));
+        };
+        let keys = self.keys(got, &expected, diff.row);
+        Ok((keys, Reread::Differs(diff)))
+    }
+
+    /// The image's bytes of the engine's rows from `from` on, `len` at most, read a page at a time
+    /// from memory ([`Engine::image_page`]), `largest` the bytes the image's largest row took:
+    /// a page gives a row at least, of 8 bytes at least, until the bytes are rebuilt or the rows
+    /// end, so at most `len` / 8 + 1 pages are read.
+    fn rebuild(
+        &mut self,
+        mut from: Vec<u8>,
+        len: usize,
+        largest: usize,
+    ) -> Result<Vec<u8>, &'static str> {
+        let mut expected = Vec::new();
+        expected
+            .try_reserve_exact(len)
+            .map_err(|_| "no memory for its rows")?;
+        let mut last = Vec::new();
+        for _ in 0..=len / 8 {
+            let Some(left) = len.checked_sub(expected.len()).filter(|&left| left > 0) else {
+                break;
+            };
+            let rows = left
+                .checked_div(largest.max(8))
+                .unwrap_or(0)
+                .saturating_add(1);
+            let mut given = false;
+            let page = self.engine.image_page(&from, rows, &mut |k, v| {
+                let (Ok(k_len), Ok(v_len)) = (u32::try_from(k.len()), u32::try_from(v.len()))
+                else {
+                    return Err(EngineError::RowTooLarge {
+                        key: k.len(),
+                        value: v.len(),
+                    });
+                };
+                for part in [&k_len.to_le_bytes()[..], k, &v_len.to_le_bytes()[..], v] {
+                    let room = len.saturating_sub(expected.len()).min(part.len());
+                    expected.extend_from_slice(part.get(..room).unwrap_or_default());
+                }
+                last.clear();
+                last.extend_from_slice(k);
+                given = true;
+                Ok(())
+            });
+            match page {
+                Ok(true) if given => {}
+                Ok(_) => break,
+                Err(EngineError::Unloaded) => return Err("a page it needs is not in memory now"),
+                Err(_) => return Err("the engine failed to read it"),
+            }
+            std::mem::swap(&mut from, &mut last);
+            from.push(0);
+        }
+        self.engine.reads_done();
+        Ok(expected)
+    }
+
+    /// The keys of the row at `row` in a span's bytes, the image's `got` against the engine's
+    /// `expected`: the same; or the image's a row of the engine's (read from memory) of a key
+    /// before the engine's there; or another.
+    fn keys(&mut self, got: &[u8], expected: &[u8], row: usize) -> Keys {
+        let (Some((key, value, _)), Some((engine_key, _, _))) = (
+            got.get(row..).and_then(image::next_row),
+            expected.get(row..).and_then(image::next_row),
+        ) else {
+            return Keys::Unread;
+        };
+        if key == engine_key {
+            return Keys::Same;
+        }
+        if key < engine_key && matches!(self.engine.get_now(key), Ok(Some(held)) if held == value) {
+            return Keys::Order;
+        }
+        Keys::Other
     }
 }
 
@@ -498,6 +647,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
     fn image(&mut self, into: &mut Vec<u8>, bytes: u64) -> Result<Imaged, Fatal> {
         if into.is_empty() {
             image::begin(into);
+            let spans = Spans::new(bytes);
             self.imaging = Some(Imaging {
                 at: self.applied,
                 configuration: self.configuration.clone(),
@@ -506,7 +656,13 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
                 rows: 0,
                 largest: 0,
                 crc: 0,
+                drives: 0,
+                spans,
             });
+        }
+        #[cfg(test)]
+        if let Some(between) = self.between.as_mut() {
+            between(into);
         }
         let Some(imaging) = self.imaging.as_mut() else {
             return Err(Fatal("an image went on that was never begun"));
@@ -514,6 +670,7 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         if imaging.at != self.applied {
             return Err(Fatal("the machine applied while its image was made"));
         }
+        imaging.drives = imaging.drives.saturating_add(1);
         let budget = usize::try_from(bytes).unwrap_or(usize::MAX).max(1);
         let start = into.len();
         let mut more = true;
@@ -566,6 +723,19 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
             }
         }
         imaging.crc = mantle_crc::crc32c_extend(imaging.crc, into.get(start..).unwrap_or_default());
+        let slice = spans::Slice {
+            at: u64::try_from(start).map_err(|_| Fatal("an image past u64 bytes"))?,
+            len: u64::try_from(into.len().saturating_sub(start))
+                .map_err(|_| Fatal("an image past u64 bytes"))?,
+            crc: imaging.crc,
+            drive: imaging.drives,
+            ns: clock_ns(),
+            waited: waits,
+        };
+        imaging
+            .spans
+            .record(slice)
+            .ok_or(Fatal("no room to record an image's slice"))?;
         if !waits {
             // The pages a slice read go to the engine's cache, as an entry's do once applied.
             self.engine.reads_done();
@@ -581,13 +751,17 @@ impl<E: Engine> StateMachine for RangeMachine<E> {
         // made wrong fails here, naming its point, rows, bytes and checksums, rather than on the
         // member that installs it: a member that installed a malformed image of a range under
         // sustained writes and stalls fenced with no word of where it was made (2026-11-20).
-        image::check(into).map_err(|e| {
-            failed(
+        // One that fails says which of its bytes changed after their slice's CRC was taken, and
+        // what the engine's rows hold there ([`RangeMachine::forensics`]).
+        if let Err(e) = image::check(into) {
+            let error = e.at(imaging.at.index, imaging.at.term);
+            let found = self.forensics(into, &imaging, error);
+            return Err(failed(
                 &mut self.failure,
                 "an image made does not pass its checks",
-                e.at(imaging.at.index, imaging.at.term),
-            )
-        })?;
+                Box::new(found),
+            ));
+        }
         Ok(Imaged::Made(imaging.at, imaging.configuration))
     }
 
@@ -1009,6 +1183,139 @@ mod tests {
             "{failure}"
         );
         assert!(failure.contains("carried and"), "{failure}");
+    }
+
+    /// A machine holding 2,000 rows of keys of 11 bytes and values of 1 to 7, applied through
+    /// index 1.
+    fn holding_rows() -> RangeMachine<Counted> {
+        let mut machine = opened();
+        let writes = (0..2_000u32).map(|i| {
+            let key = format!("image/{i:05}").into_bytes();
+            Write::Put(
+                key,
+                vec![u8::try_from(i % 251).unwrap(); 1 + (i % 7) as usize],
+            )
+        });
+        machine.engine.rows = mantle_meta::engine::Model::default();
+        machine.engine.rows.apply(1, writes.collect()).unwrap();
+        machine.applied = Point { index: 1, term: 1 };
+        machine
+    }
+
+    /// Makes `machine`'s image a slice of 4 KiB a drive, a span each, `change` made to its buffer
+    /// before the fifth drive: the image's length after each of the first four, the buffer then, the drives
+    /// made, and the failure it fenced on.
+    fn changed_before_the_fifth_drive(
+        machine: &mut RangeMachine<Counted>,
+        change: impl FnOnce(&mut Vec<u8>, &[usize]) + Send + 'static,
+    ) -> (Vec<usize>, Vec<u8>, usize, String) {
+        let mut image = Vec::new();
+        let mut ends = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(machine.image(&mut image, 4_096).unwrap(), Imaged::Slice);
+            ends.push(image.len());
+        }
+        let before = image.clone();
+        let mut change = Some((change, ends.clone()));
+        machine.between = Some(Box::new(move |into| {
+            if let Some((change, ends)) = change.take() {
+                change(into, &ends);
+            }
+        }));
+        let mut drives = 4;
+        let refused = loop {
+            drives += 1;
+            match machine.image(&mut image, 4_096) {
+                Ok(Imaged::Slice) => {}
+                Ok(made) => panic!("{made:?}"),
+                Err(refused) => break refused,
+            }
+        };
+        assert_eq!(refused, Fatal("an image made does not pass its checks"));
+        let failure = machine.failure().unwrap().to_string();
+        println!("{failure}");
+        (ends, before, drives, failure)
+    }
+
+    /// A byte of a made slice changed between drives fences the image's leader naming the span
+    /// that holds it, of every span, the byte, a run of one, the byte there against the engine's,
+    /// and memory corruption: one span changed, in place.
+    #[test]
+    fn a_byte_changed_between_slices_is_named_as_memory_corruption() {
+        let mut machine = holding_rows();
+        // The third slice's first row's value: past its key's length, its key and its value's.
+        let (ends, before, drives, failure) =
+            changed_before_the_fifth_drive(&mut machine, |into, ends| {
+                into[ends[1] + 4 + 11 + 4] ^= 0x40;
+            });
+        let at = ends[1] + 19;
+        assert!(
+            failure.starts_with("an image does not match its checksum: of index 1 and term 1, "),
+            "{failure}"
+        );
+        let span = format!(
+            "span 2 of {drives} changed first, 1 in all: bytes {} to {}, made by drives 3 to 3, ",
+            ends[1], ends[2]
+        );
+        assert!(failure.contains(&span), "{failure}");
+        let run = format!(
+            "it differs from the engine's rows from byte {at} for a run of 1 bytes, 1 of them \
+             differing: {:02x}",
+            before[at] ^ 0x40
+        );
+        assert!(failure.contains(&run), "{failure}");
+        assert!(
+            failure.contains(&format!(" against {:02x}", before[at])),
+            "{failure}"
+        );
+        assert!(!failure.contains("found the image's end"), "{failure}");
+        assert!(
+            failure.ends_with("; memory corruption, bytes changed in place"),
+            "{failure}"
+        );
+    }
+
+    /// A row's bytes taken from a made slice between drives fences the image's leader naming the
+    /// span that held it, the spans after it written before, the drive that found the image's
+    /// end moved, the first byte that differs from the engine's rows, and a row missing.
+    #[test]
+    fn a_row_dropped_between_slices_is_named_as_a_missing_row() {
+        let mut machine = holding_rows();
+        let row = |bytes: &[u8], at: usize| {
+            let value = u32::from_le_bytes(bytes[at + 15..at + 19].try_into().unwrap());
+            4 + 11 + 4 + value as usize
+        };
+        let (ends, before, drives, failure) =
+            changed_before_the_fifth_drive(&mut machine, move |into, ends| {
+                let len = row(into, ends[1]);
+                into.drain(ends[1]..ends[1] + len);
+            });
+        let len = row(&before, ends[1]);
+        let at = ends[1]
+            + (0..)
+                .find(|&i| before[ends[1] + i] != before[ends[1] + len + i])
+                .unwrap();
+        let span = format!(
+            "span 2 of {drives} changed first, 2 in all: bytes {} to {}, made by drives 3 to 3, ",
+            ends[1], ends[2]
+        );
+        assert!(failure.contains(&span), "{failure}");
+        let moved = format!(
+            "drive 5 found the image's end at byte {} where its last slice left it at {}",
+            ends[3] - len,
+            ends[3]
+        );
+        assert!(failure.contains(&moved), "{failure}");
+        assert!(
+            failure.contains(&format!(
+                "it differs from the engine's rows from byte {at} "
+            )),
+            "{failure}"
+        );
+        assert!(
+            failure.ends_with("; a row missing or extra (logic), the bytes after it moved"),
+            "{failure}"
+        );
     }
 
     /// A range reopened, or given a snapshot, knows nothing of its sessions' last use: its first

@@ -3105,8 +3105,9 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         self.write_replies()?;
         self.observe_presence()?;
         self.step_repair()?;
-        // What the turn's operations and repairs left idle, lent to the caches once a turn.
-        self.lend_caches(0, true);
+        // What the turn's operations and repairs left idle past what was refused room, lent to
+        // the caches past their floors once a turn, the only time a cache moves.
+        self.lend_caches();
         self.step_asks(now)?;
         self.step_reads(now)?;
         self.step_replacements();
@@ -3184,6 +3185,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 Some(crate::door::Asked::Op(request)) => self.take_local(*request),
             }
         }
+    }
+
+    /// When the node's next turn is due for the request waiting first at its native door: at once
+    /// where the host admits it now, as the caches' lend gave back the bytes it was refused
+    /// (`Host::lend_caches`); none where none waits or it waits still, a request's arrival or an
+    /// operation's end waking the turn that takes it.
+    fn door_due(&mut self, now: u64) -> Option<u64> {
+        let (gateway, learned) = (self.gateway.as_deref(), &self.windows);
+        let charge = match self
+            .doorway
+            .as_mut()
+            .and_then(crate::door::Doorway::waiting)?
+        {
+            crate::door::Asked::Key(_) => return None,
+            crate::door::Asked::Op(request) => host::charged(gateway, learned, &request.op).0,
+        };
+        let admits = self
+            .admission
+            .as_ref()
+            .is_some_and(|a| a.would_admit(charge));
+        if admits { Some(now) } else { None }
     }
 
     /// Each range's timing from what the stream measured, and each pair charged its ranges'
@@ -3294,6 +3316,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             self.reads_due(now),
             self.host_due(),
             self.parked_due(now),
+            self.door_due(now),
             self.repair_due(),
             held,
             self.held_puts.until_ns(),

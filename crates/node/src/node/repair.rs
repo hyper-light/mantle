@@ -891,17 +891,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                             repair.status.timing = repair.status.timing.saturating_add(1);
                         }
                         let charge = self.repair_charge(slots);
-                        // The caches give back first what of the rebuild's bytes they hold.
-                        let want = self.gateway.as_ref().map_or(0, |g| g.cache_bytes);
+                        // Bytes neither the operations nor the caches hold (`holds`, above).
                         if let Some(admission) = self.admission.as_mut() {
-                            super::host::lend(
-                                want,
-                                admission,
-                                &mut self.ranges,
-                                &mut self.owner,
-                                charge,
-                                false,
-                            );
                             admission.took(charge);
                         }
                         repair.running.push(Running {

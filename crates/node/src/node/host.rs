@@ -83,10 +83,13 @@ pub struct GatewaySettings {
     /// The bytes the host's operations hold at once, each charged what it holds at its own size
     /// (`charges`): one whose bytes would pass them waits, or is answered `SlowDown`.
     pub objects_bytes: u64,
-    /// The most each range's engine's page cache holds (`engine.cache_bytes`), its want: it
-    /// borrows its part of the operations' bytes no running operation holds, and gives it back
-    /// before one is charged them ([`lend`]).
+    /// The most each range's engine's page cache holds (`engine.cache_bytes`), its want: past its
+    /// floor it borrows its part of the operations' bytes no running operation holds, once a turn
+    /// ([`lend`]).
     pub cache_bytes: u64,
+    /// Each range's engine's page cache's floor (`engine.cache_floor`), its own memory, outside
+    /// `objects_bytes`: never lent, so the pages the reads in flight loaded stay.
+    pub cache_floor: u64,
     pub charges: crate::derive::Charges,
     /// The clients of the native protocol it admits at once, each by the certificate the cell's
     /// authority issued it for the client role (node.md §3.6). One past them is refused as the
@@ -4026,34 +4029,37 @@ fn copy_windows(
     (get, put, charges.copy(get, put, length))
 }
 
-/// The page caches of the ranges on the node's shard lent their parts of the operations' bytes
-/// that no running operation holds once `more` are charged (`admit::cache_part`), each at most
-/// `want`: a cache past its part shrinks at once (`Engine::lend_cache`), before the bytes are
-/// charged and in the same turn, on the shard where both run, so the operations' charges and the
-/// caches' bytes are within the operations' memory at every moment; one below its part grows,
-/// keeping its pages, where `grow`, once a turn (`Node::turn`), so operations that end and begin
-/// within a turn move no cache, and a part that moves by less than a page resizes none. A range
-/// on another shard (`range_shards = spread`) borrows nothing: its cache is not on this shard.
+/// The page caches of the ranges on the node's shard, once a turn (`Node::turn`), each at its
+/// `floor` and its part past it of the operations' bytes no running operation holds past those
+/// refused room since the last lend (`admit::cache_part`), at most `want` in all: a cache past it
+/// shrinks at once, keeping the pages within it, and one below it grows keeping its pages. Never as
+/// an operation is admitted or takes more (node.md §1.4, the owner's decision of 2026-11-20):
+/// admission counts the caches' lent bytes as held (`admit::Admission::admits`, `holds`), so the
+/// operations' charges and the caches' bytes past their floors are within the operations' memory
+/// at every moment, and a page a read loaded stays until its retry takes it within the turn. What
+/// was refused room since the last lend is left idle, so it is let in at the next turn. A range on
+/// another shard (`range_shards = spread`) holds its floor and borrows nothing: its cache is not on
+/// this shard.
 pub(super) fn lend<E: Engine, S: mantle_range::LogStore>(
-    want: u64,
+    (want, floor): (u64, u64),
     admission: &mut crate::admit::Admission,
     ranges: &mut [super::Kept],
     owner: &mut shard::Here<E, S>,
-    more: u64,
-    grow: bool,
 ) {
     let here = ranges
         .iter()
         .filter(|kept| owner.get(kept.handle).is_some())
         .count();
-    let part = crate::admit::cache_part(admission.idle_past(more), want, here);
+    let wanted = admission.take_wanted();
+    let past = want.saturating_sub(floor);
+    let part = crate::admit::cache_part(admission.idle_past(wanted), past, here);
     let mut lent = 0u64;
     for kept in ranges.iter_mut() {
         let Some(shell) = owner.get_mut(kept.handle) else {
             continue;
         };
         let engine = shell.machine_mut().engine_mut();
-        kept.lent = crate::admit::lend_to(engine, kept.lent, part, grow);
+        kept.lent = crate::admit::lend_to(engine, part, floor);
         lent = lent.saturating_add(kept.lent);
     }
     admission.lend(lent);
@@ -4290,7 +4296,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let room = self
             .admission
             .as_ref()
-            .is_some_and(|a| a.admits(first.charge).is_ok());
+            .is_some_and(|a| a.would_admit(first.charge));
         let beat = u64::try_from(bounds::initial_pto().as_nanos()).unwrap_or(u64::MAX);
         Some(if room {
             now
@@ -4636,8 +4642,8 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
                 .admission
                 .as_ref()
                 .is_some_and(|admission| !admission.holds(more));
-        // The bytes past its charge, taken where it runs: the caches give back first what of
-        // them they hold.
+        // The bytes past its charge, taken where it runs, where neither the running operations nor
+        // the caches hold them.
         let taking = more > 0 && !crowded && op.is_ok() && self.admission.is_some();
         if taking {
             self.charge_more(more);
@@ -5308,10 +5314,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         }
     }
 
-    /// The ranges' page caches on the node's shard lent their parts of the operations' idle
-    /// bytes once `more` are charged ([`lend`]), growing where `grow`; none for a node that hosts
-    /// no objects, which has no operations' memory to lend.
-    pub(super) fn lend_caches(&mut self, more: u64, grow: bool) {
+    /// The ranges' page caches on the node's shard at their floors and their parts past them of
+    /// the operations' idle bytes, once a turn ([`lend`]); none for a node that hosts no objects,
+    /// which has no operations' memory to lend: its caches hold their floors.
+    pub(super) fn lend_caches(&mut self) {
         let Self {
             gateway,
             admission,
@@ -5320,23 +5326,27 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
             ..
         } = self;
         if let (Some(gateway), Some(admission)) = (gateway.as_deref(), admission.as_mut()) {
-            lend(gateway.cache_bytes, admission, ranges, owner, more, grow);
+            lend(
+                (gateway.cache_bytes, gateway.cache_floor),
+                admission,
+                ranges,
+                owner,
+            );
         }
     }
 
-    /// An operation admitted, charged `charge` bytes: the caches give back first what of them
-    /// they hold.
+    /// An operation admitted, charged `charge` bytes, which neither the running operations nor the
+    /// caches hold (`admit::Admission::admits`).
     fn charge_admitted(&mut self, charge: u64) {
-        self.lend_caches(charge, false);
         if let Some(admission) = self.admission.as_mut() {
             admission.admitted(charge);
         }
     }
 
     /// A running operation takes `more` bytes past its charge, or the cell's repair takes them
-    /// for a rebuild: the caches give back first what of them they hold.
+    /// for a rebuild, bytes neither the running operations nor the caches hold
+    /// (`admit::Admission::holds`).
     pub(super) fn charge_more(&mut self, more: u64) {
-        self.lend_caches(more, false);
         if let Some(admission) = self.admission.as_mut() {
             admission.took(more);
         }
@@ -11386,6 +11396,7 @@ pub(super) mod tests {
             objects: 1,
             objects_bytes: 1,
             cache_bytes: 0,
+            cache_floor: 0,
             charges: crate::derive::Charges::new(1, &[durability::Scheme::Copies(3)]).unwrap(),
             clients: 1,
             bucket_quota: 1,
@@ -11693,6 +11704,7 @@ pub(super) mod tests {
             objects: 1,
             objects_bytes: crate::derive::most_charged(&charges()),
             cache_bytes: 0,
+            cache_floor: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,
@@ -11736,6 +11748,7 @@ pub(super) mod tests {
             objects: 1,
             objects_bytes: charges().read(64),
             cache_bytes: 0,
+            cache_floor: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,
@@ -11808,6 +11821,7 @@ pub(super) mod tests {
             objects: 1,
             objects_bytes: crate::derive::most_charged(&charges()),
             cache_bytes: 0,
+            cache_floor: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,
@@ -11890,6 +11904,7 @@ pub(super) mod tests {
             objects: 1,
             objects_bytes: charges().copy(64, 64, long),
             cache_bytes: 0,
+            cache_floor: 0,
             charges: charges(),
             clients: 1,
             bucket_quota: 1,

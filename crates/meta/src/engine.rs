@@ -125,9 +125,9 @@ pub trait Engine: Rows {
 
     /// Holds at most `bytes` of its pages in its page cache from now: the pages past them dropped
     /// at once, those within them kept and served, and a cache below them raised keeping its
-    /// pages (docs/design/node.md §1.4: the caches borrow the bytes no running operation holds).
-    /// The bytes its cache may hold then, a whole number of its pages, at most `bytes`; an engine
-    /// with no page cache holds none.
+    /// pages (docs/design/node.md §1.4: each cache holds a floor of its own and borrows past it,
+    /// once a turn, the bytes no running operation holds). The bytes its cache may hold then, a
+    /// whole number of its pages; an engine with no page cache holds none.
     fn lend_cache(&mut self, bytes: u64) -> u64 {
         let _ = bytes;
         0

@@ -1390,12 +1390,12 @@ impl<F: BlockFile> Store<F> {
     }
 
     /// Lowers the page cache's limit to `pages` and brings it down to it at once
-    /// (`Cache::shrink`), keeping and serving the pages within it: the pages dropped. At none
-    /// the cache goes, every page it held dropped.
+    /// (`Cache::shrink`), keeping and serving the pages within it: the pages dropped. At none it
+    /// keeps its structure at its least, one page, its slot table and index kept for the pages
+    /// it takes back (node.md §1.4, the owner's decision of 2026-11-20), where it was dropped
+    /// whole and every page read again once it grew: what it keeps is its slot table, at most
+    /// twice the largest limit it had (`cache::Memory::slots`), and its index of the page it holds.
     pub fn shrink_cache(&mut self, pages: usize) -> usize {
-        if pages == 0 {
-            return self.cache.take().map_or(0, |c| c.live());
-        }
         self.cache.as_mut().map_or(0, |c| c.shrink(pages))
     }
 

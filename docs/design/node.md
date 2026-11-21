@@ -499,7 +499,8 @@ measures the second, and derives the rest by these rules:
   initial window to a receive chunk, whole while what remains holds it; (4) every operation more
   that what remains past those holds, each costing its client's windows at a receive chunk, so
   each operation's windows hold a chunk and its datagrams land without a copy. No page cache
-  takes a share: each engine's borrows the operations' idle bytes (below). The node's need
+  takes a share past its floor, a page for each read the operations ask, counted in the ranges'
+  class: past it each engine's borrows the operations' idle bytes (below). The node's need
   (`memory.need`) counts (1) and (2) alone, so a node given its need starts with every capacity
   want whole, and the transport's growth and more operations take what a larger allowance
   leaves. The capacity wants: a
@@ -519,31 +520,49 @@ measures the second, and derives the rest by these rules:
   the store's page size, since the store's bytes an object are its file's length at its most, its
   pages as filled and compaction's room counted, and the cache keeps live pages alone
   (`derive::engine_cache_wants_for`); its want, at most its store's pages, is `engine.cache_bytes`,
-  the most it holds, and no share of the split: it borrows the operations' bytes no running
-  operation holds (rule B for the caches, research/87 §4; `admit::cache_part`, `host::lend`).
-  Admission holds `gateway.objects_bytes` for the running operations' charges (§2.8); the bytes
-  none is charged are idle, and each range's engine on the node's shard holds its part of them,
-  in proportion to the engines' wants, each the same `engine.cache_bytes`, so the same part, at
-  most its want. Before admission charges an operation bytes the caches hold (an operation
-  admitted, a get's or a copy's window widened once its version is read, a copy's put, a
-  rebuild of the cell's repair), the caches shrink at once to their parts of what stays idle,
-  in the same turn on the node's shard where both run: no operation waits on a cache, and the
-  operations' charges and the caches' bytes are within `gateway.objects_bytes` at every moment.
-  A cache shrinks in one bounded trim (`Cache::shrink`): its limit lowered, its pages past it
-  freed by S3-FIFO's rule, each within its queue steps, and the chunks past the limit given back
-  with the pages they hold, so its memory is within its part too; the pages dropped are counted.
-  Once a turn the caches grow back to their parts of what the turn left idle, keeping their pages
-  (`Cache::grow`), so operations that end and begin within a turn move no cache, and a part that
-  moves by less than a page resizes none (`Engine::lend_cache`). A range on another shard
-  (`range_shards = spread`) borrows nothing, its cache not on the node's shard, and a node that
-  hosts no objects has no operations' memory to lend, so its caches hold nothing. With no cache
+  the most it holds, and no share of the split past its floor. Its floor is its own (the owner's
+  decision of 2026-11-20, research/100): a page for each read the node's operations ask at once,
+  one an operation, spread over its ranges and rounded up (`derive::cache_floor`, said
+  `engine.cache_floor`), as a point read loads its leaf alone, the branch's filter and leaf index
+  being resident metadata, which is RocksDB's pinned index and filter blocks
+  (`cache_index_and_filter_blocks`, `pin_l0_filter_and_index_blocks_in_cache`): the leaf each read
+  in flight loaded stays until its retry takes it. It is counted in the ranges' class, so the node
+  admits fewer operations by its size (60,913 where 61,960 on the Mac Studio's 96 GiB, a page of
+  24,576 bytes each), each engine opens with it (`process::engine`), and it is never lent. Past it
+  a cache borrows the operations' bytes no running operation holds (rule B for the caches,
+  research/87 §4; `admit::cache_part`, `host::lend`), once a turn and only then (`Node::turn`):
+  each range's engine on the node's shard holds its floor and its part of what is idle past what
+  was refused room since the last lend, in proportion to the engines' wants, each the same
+  `engine.cache_bytes` past the same floor, so the same part, at most its want. A cache past its
+  part shrinks at once in that lend (`Cache::shrink`: its limit lowered, its pages past it freed by
+  S3-FIFO's rule, each within its queue steps, and the chunks past the limit given back with the
+  pages they hold); one below it grows keeping its pages (`Cache::grow`); a part that moves by less
+  than a page resizes none (`Engine::lend_cache`). No cache moves as an operation is admitted or
+  takes more: admission counts the caches' lent bytes held (`admit::Admission::admits`, `holds`),
+  so an operation is admitted, a get's or a copy's window widened, a copy's put or a repair's
+  rebuild taken, only into bytes neither the running operations nor the caches hold, and the
+  operations' charges and the caches' bytes past their floors are within `gateway.objects_bytes`
+  at every moment, the floors outside it. What the caches' bytes kept out is wanted at the next
+  lend, which leaves it idle (`Admission::take_wanted`), and the turn is due at once for the
+  request it lets in (`Node::door_due`, `Node::parked_due`). Before, every admission shrank the
+  caches to their parts of what stayed idle, and a cache at none was dropped whole: at 512
+  clients the operations held almost every byte, each admission emptied the caches, and a leaf a
+  get loaded was dropped before its retry, a resident `pread` or a worker's load again (native
+  GET on the Mac Studio 11,502 a second at 64 clients, 5,724 at 256, 6,195 at 512). A cache at
+  none past its floor keeps its structure, its slot table, at most twice the largest limit it had,
+  and its index (`Store::shrink_cache`). A range on another shard (`range_shards = spread`) holds
+  its floor and borrows nothing, its cache not on the node's shard, and a node that hosts no
+  objects has no operations' memory to lend, so its caches hold their floors. With no cache
   every page a get or a one-row lookup needed was a `pread` on the node's busy shard: 100 repeated
   gets of 1,100 Name-sized rows read 100 pages and 100 lookups 100, and none with the derived cache
   (`derive::tests::a_range_opened_as_the_node_opens_it_reads_its_pages_from_its_derived_cache`);
-  over random admissions, ends, reads and turns the charges and the caches' bytes stay within the
-  operations' bytes, and a cache an operation's charge emptied reads 100 pages for 100 gets, grown
-  back once it ended none
-  (`derive::tests::the_caches_borrow_the_operations_idle_bytes_and_give_them_back_before_they_are_charged`).
+  over random admissions, ends, reads and turns the charges and the caches' bytes past their
+  floors stay within the operations' bytes, no admission moves a cache, and with an operation
+  holding every byte the caches at their floors read 100 gets' hot pages from memory
+  (`derive::tests::the_caches_hold_their_floors_and_borrow_past_them_once_a_turn`); 32 reads at
+  once, each tried again past the operations admitted meanwhile, for 20 turns with the operations
+  holding every byte, read 1.00 page a get borrowing alone and none at the floor
+  (`derive::tests::a_read_s_pages_stay_in_its_floor_while_the_operations_hold_the_memory`).
   Its want is the largest, about 11 times an engine's metadata's: at an object a 4 KiB block on
   each node, five engines' caches want 2.2 times their volumes' bytes. Taken as a capacity want
   beside the index and the metadata (24f78978), it pulled them below their wants on a host holding
@@ -879,7 +898,8 @@ are sized by their shares (`derive::engine_within`) and take no limit.
 | `log.*` | derived | `hyper_log::Config::derive` from the log's block, its largest entry with the shell's bytes, its groups (the ranges and the liveness stream's), a checkpoint's cadence and what a group holds uncommitted past it of one `Ready` each (`mantle_range::ready_held`: as many entries as its bytes make of the least entry a range proposes, 13 bytes, and the term's empty first one, and its bytes with each entry's 5-byte shell), a cache of one largest entry a group, and a file holding every group's retention at once beside the least file the log runs in: a `Ready` goes in greedy parts of a frame's room, any two in a row more than a room, each a segment at most (`derive::log`). Before, entries were counted at the shell's 5 bytes, 2.6 times too many, and the file was the least, which one group's retention filled: a write past it is refused `Full`. Its memory: each group's slots, a deque doubled past its retained entries at hyper-log's 56 bytes a slot, its handle's unapplied entries and its cache, one group's slots again while they grow, and ten segments of the log's own buffers (`derive::log_bytes`; `tests/log_memory.rs`: every group at its retention, 112.6 MB at the peak of a 225.9 MB bound) |
 | `log.waits` | cited | `measured`: the log's writer waits for the replicas it just answered while that is expected to lower total latency, ended by the clock or a frame's worth of charged bytes, what a node runs (raft-log.md §3, hyper-log's `Waits::Measured`); `never`, a batch of what is queued when the writer looks, is the replica simulation's, whose members have one update out at a time |
 | `engine.extent_pages`, `engine.max_extents` | derived | the least pages the store takes an extent, two; as many extents as each range's share of the metadata device's space holds (`derive::engine`) |
-| `engine.cache_bytes` | derived | the most each range's engine's page cache holds, its want: every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`), at most its store's pages. No share of the split: each engine opens with no cache (`process::engine`) and borrows its part of the operations' bytes no running operation holds, giving it back at once before one is charged it (`admit::cache_part`, `host::lend`, `Engine::lend_cache`; rule B for the caches, research/87 §4) |
+| `engine.cache_bytes` | derived | the most each range's engine's page cache holds, its want: every page of the extents its rows of `engine.objects` take (`derive::engine_cache_wants_for`), at most its store's pages. No share of the split past its floor: each engine opens at its floor (`process::engine`) and borrows past it its part of the operations' bytes no running operation holds, once a turn and given back only then, admission counting it held (`admit::cache_part`, `host::lend`, `Engine::lend_cache`; rule B for the caches, research/87 §4) |
+| `engine.cache_floor` | derived | each range's engine's page cache's own memory, never lent (the owner's decision of 2026-11-20): a page for each read the node's operations ask at once, one an operation, spread over its ranges and rounded up, at most `engine.cache_bytes` (`derive::cache_floor`), as a point read loads its leaf alone, its branch's filter and leaf index resident, RocksDB's pinned index and filter blocks (research/100); counted in the ranges' class, so the node admits fewer operations by its size |
 | `restart_budget_ms` | stated | how long a restart may take to replay its ranges' logs, an availability target storage cannot derive (research/11 §9.4, §18 item 4); with `replay.rate` it bounds the engines' write buffers (§2.6). Unstated, none, and the space bound binds |
 | `replay.rate`, `replay.bound` | measured, derived, bound | the bytes a second the node re-applied at its last open of the entries its ranges' logs held past their engines' durable indexes, from the first range's first apply to the last one's last, each range's replay timed by its state machine (`mantle_range::Replayed`), kept in the node's directory's `replay` record (§1.6) where it re-applied at least Wilks' 59 entries, the fewest readings hyper-rt's harness accepts, of some bytes, over a span the clock measured (`derive::replay_rate`, `derive::REPLAY_LEAST`), said `bound` and 0 before one; and each range's part of what a restart replays within `restart_budget_ms` at that rate (`derive::replay_bound`), said `bound` and 0 without both |
 | `engine.memtable_bytes`, `engine.fanout`, `engine.leaf_entries` | derived, cited | each range's write buffer, its share of the engines' write buffers (§2.6): the least, one row at the range's bounds whole (`memtable::hashed::entry_bytes`), which the floor counts; raised toward its want, `replay.bound` where a budget is stated and a rate measured, else an entry of the range's largest (`range.max_entry_bytes`), within the bytes its log group retains, by what remains past the capacity wants and the operations served, the largest buffer whose engine holds no more than its part (`derive::write_buffer_want`, `derive::write_buffer`); SplinterDB's fanout of 8, at which the engine's measurements ran (engine-structure.md §5–§6), until the fanout is measured against mantle's key counts as its §4 asks; a leaf holding every row the least memtable gives it, the most a memtable holds being rows of the shortest key and no value (`key::least_bytes`; `benches/ranges.rs` sizes a leaf so), the same on every member and at every open since a trunk keeps its leaf's entries in its image and a snapshot carries them |

@@ -94,10 +94,16 @@ pub(crate) struct Admission {
     /// operations hold now, each charged what it holds at its own size.
     budget: u64,
     held: u64,
-    /// The bytes of it the page caches of the ranges on the node's shard hold now, lent of those
-    /// no running operation holds ([`cache_part`]): `held` and `lent` are within `budget` at
-    /// every moment, as each cache gives back what an operation is charged before it is.
+    /// The bytes of it the page caches of the ranges on the node's shard hold now past their
+    /// floors, lent once a turn of those no running operation holds ([`cache_part`]): `held` and
+    /// `lent` are within `budget` at every moment, as no operation is admitted, and none takes
+    /// more, into bytes a cache holds ([`Self::admits`], [`Self::holds`]). The floors are outside
+    /// `budget` (`derive::cache_floor`).
     lent: u64,
+    /// The bytes refused room since the caches were last lent: the charges of operations turned
+    /// away for bytes, summed, and at least the widest widening refused ([`Self::take_wanted`]).
+    /// The next lend leaves them idle, so what a cache's bytes kept out is let in at the next turn.
+    wanted: std::cell::Cell<u64>,
     /// The limit the cycle is about, and the limit now.
     base: usize,
     limit: usize,
@@ -130,6 +136,7 @@ impl Admission {
             budget,
             held: 0,
             lent: 0,
+            wanted: std::cell::Cell::new(0),
             base: ceiling,
             limit: ceiling,
             descent: Some(Descent::Waiting),
@@ -156,25 +163,53 @@ impl Admission {
     }
 
     /// Whether one more operation, holding `charge` bytes, is admitted beside those running: none
-    /// past the limit, and none whose bytes the operations' memory does not hold beside theirs.
+    /// past the limit, and none whose bytes the operations' memory does not hold beside theirs and
+    /// the caches' lent bytes. One turned away for bytes is wanted at the next lend.
     pub(crate) fn admits(&self, charge: u64) -> Result<(), Held> {
         let limit = u64::try_from(self.limit).unwrap_or(u64::MAX);
         if self.running() >= limit {
             return Err(Held::Limit);
         }
-        match self.held.checked_add(charge) {
-            Some(held) if held <= self.budget => Ok(()),
-            _ => Err(Held::Bytes),
+        if self.fits(charge) {
+            Ok(())
+        } else {
+            let wanted = self.wanted.get().saturating_add(charge).min(self.budget);
+            self.wanted.set(wanted);
+            Err(Held::Bytes)
         }
     }
 
-    /// Whether the operations' memory holds `more` bytes beside what they hold, for one running
-    /// that takes them (a copy's put, `Host::read_fields`; a get's or a copy's windows once its
-    /// version is read, `host::reading`, `host::copy_windows`).
+    /// Whether the operations' memory holds `more` bytes beside what they and the caches hold, for
+    /// one running that takes them (a copy's put, `Host::read_fields`; a get's or a copy's windows
+    /// once its version is read, `host::reading`, `host::copy_windows`; a rebuild). One refused is
+    /// wanted at the next lend, the widest refused at least.
     pub(crate) fn holds(&self, more: u64) -> bool {
+        let fits = self.fits(more);
+        if !fits {
+            self.wanted
+                .set(self.wanted.get().max(more.min(self.budget)));
+        }
+        fits
+    }
+
+    /// Whether one more operation holding `charge` bytes would be admitted now ([`Self::admits`]),
+    /// asked to know when a turn is due: nothing is wanted by the asking.
+    pub(crate) fn would_admit(&self, charge: u64) -> bool {
+        let limit = u64::try_from(self.limit).unwrap_or(u64::MAX);
+        self.running() < limit && self.fits(charge)
+    }
+
+    /// Whether `more` bytes fit beside the running operations' and the caches' lent bytes.
+    fn fits(&self, more: u64) -> bool {
         self.held
-            .checked_add(more)
+            .checked_add(self.lent)
+            .and_then(|held| held.checked_add(more))
             .is_some_and(|held| held <= self.budget)
+    }
+
+    /// The bytes refused room since the last lend, which the next leaves idle; none after.
+    pub(crate) fn take_wanted(&self) -> u64 {
+        self.wanted.replace(0)
     }
 
     /// A running operation took `more` bytes besides its charge, or the cell's repair took them for
@@ -190,13 +225,13 @@ impl Admission {
         self.held = self.held.saturating_sub(bytes);
     }
 
-    /// The bytes no running operation holds once `more` are charged: what the caches may hold
-    /// then.
-    pub(crate) fn idle_past(&self, more: u64) -> u64 {
-        self.budget.saturating_sub(self.held).saturating_sub(more)
+    /// The bytes no running operation holds past `wanted`: what the caches may hold past their
+    /// floors until the next lend.
+    pub(crate) fn idle_past(&self, wanted: u64) -> u64 {
+        self.budget.saturating_sub(self.held).saturating_sub(wanted)
     }
 
-    /// The caches hold `bytes` of the operations' memory now.
+    /// The caches hold `bytes` of the operations' memory past their floors now.
     pub(crate) fn lend(&mut self, bytes: u64) {
         self.lent = bytes;
     }
@@ -357,34 +392,32 @@ impl Admission {
     }
 }
 
-/// Each page cache's part of `idle` bytes, the operations' bytes no running operation holds,
-/// shared among `caches` caches on the node's shard in proportion to their wants: each range's
-/// engine wants the pages of the rows the cell's volumes make (`derive::engine_cache_wants_for`),
-/// the same `want` (`engine.cache_bytes`), so each takes the same part, at most its want. A cache
-/// borrows them while no operation is charged them, and gives them back before one is: an
-/// operation's bytes are its own while it runs, so a cache never makes one wait for room, and
-/// between operations every idle byte serves reads from memory, where without it each read its
-/// pages from the device on the node's busy shard.
+/// Each page cache's part past its floor of `idle` bytes, the operations' bytes no running
+/// operation holds past those refused room since the last lend ([`Admission::idle_past`]), shared
+/// among `caches` caches on the node's shard in proportion to their wants: each range's engine
+/// wants the pages of the rows the cell's volumes make (`derive::engine_cache_wants_for`), the
+/// same `want` past the same floor, so each takes the same part, at most its want. Lent once a
+/// turn and given back only then (node.md §1.4, the owner's decision of 2026-11-20): an
+/// operation is admitted only into bytes neither the running operations nor the caches hold, so a
+/// cache never drops a page a read loaded between its tries in a turn, and between operations
+/// every idle byte serves reads from memory.
 pub(crate) fn cache_part(idle: u64, want: u64, caches: usize) -> u64 {
     let caches = u64::try_from(caches).unwrap_or(u64::MAX).max(1);
     idle.checked_div(caches).unwrap_or(0).min(want)
 }
 
-/// A cache holding `lent` bytes given its `part` ([`cache_part`]): shrunk to it at once where it
-/// holds more, before the bytes it gives back are charged; grown to it, keeping its pages, where it
-/// holds less and `grow`, once a turn. The bytes it holds after, a whole number of its pages
-/// (`Engine::lend_cache`).
+/// A cache given its `part` past its `floor` ([`cache_part`]), once a turn: its limit set to the
+/// floor and the part, shrunk at once to it where it holds more, keeping the pages within it, or
+/// grown keeping its pages; a limit already there is left as it is (`Engine::lend_cache`). The
+/// bytes it may hold past its floor after, a whole number of its pages.
 pub(crate) fn lend_to<E: mantle_meta::engine::Engine>(
     engine: &mut E,
-    lent: u64,
     part: u64,
-    grow: bool,
+    floor: u64,
 ) -> u64 {
-    if lent > part || (grow && lent < part) {
-        engine.lend_cache(part)
-    } else {
-        lent
-    }
+    engine
+        .lend_cache(floor.saturating_add(part))
+        .saturating_sub(floor)
 }
 
 #[cfg(test)]
@@ -480,6 +513,38 @@ mod tests {
     /// its clients ask past the ceiling, and the system runs within a fifth of its most throughput,
     /// at ceilings near the knee and far past it; operations of a hundredfold different lengths side
     /// by side are learned alike.
+    /// Admission counts the caches' lent bytes held (node.md §1.4, the owner's decision of
+    /// 2026-11-20): an operation, or a widening, whose bytes a cache holds is refused and wanted,
+    /// a probe for the turn's due wants nothing, and the next lend leaves what was wanted idle, so
+    /// it is let in; the operations' bytes and the caches' are within the budget throughout.
+    #[test]
+    fn what_the_caches_bytes_keep_out_is_wanted_at_the_next_lend() {
+        let mut a = Admission::new(10, 100, 0);
+        a.lend(60);
+        assert_eq!(a.admits(40), Ok(()));
+        assert!(!a.would_admit(41));
+        assert_eq!(a.take_wanted(), 0, "a probe wants nothing");
+        assert_eq!(a.admits(41), Err(Held::Bytes));
+        assert!(a.holds(40));
+        assert!(!a.holds(50));
+        // The charges refused summed, the widest widening refused at least.
+        assert_eq!(a.take_wanted(), 50);
+        assert_eq!(a.take_wanted(), 0);
+        a.admitted(40);
+        assert_eq!(a.lent(), (60, 40));
+        assert_eq!(a.admits(1), Err(Held::Bytes));
+        assert_eq!(a.admits(9), Err(Held::Bytes));
+        // The lend leaves the 10 wanted idle: the caches past their floors hold what remains.
+        let wanted = a.take_wanted();
+        assert_eq!(wanted, 10);
+        a.lend(cache_part(a.idle_past(wanted), u64::MAX, 1));
+        assert_eq!(a.lent(), (50, 40));
+        assert_eq!(a.admits(9), Ok(()));
+        a.admitted(9);
+        let (lent, held) = a.lent();
+        assert!(lent + held <= 100);
+    }
+
     #[test]
     fn the_limit_learns_the_knee_and_keeps_about_it() {
         for (servers, means) in [

@@ -779,6 +779,8 @@ struct Held {
     /// The runtime's shards, sized for those connections, and the listener's lanes
     /// ([`runtime_bytes`]).
     runtime: u64,
+    /// Each range's engine's page cache's floor ([`cache_floor`]), counted in `ranges_bytes`.
+    cache_floor: u64,
 }
 
 /// Why the settings cannot be derived: a fact that admits no unit of some class of work.
@@ -1552,6 +1554,26 @@ pub fn range_bytes(range: &Range, reads: usize) -> Option<u64> {
         .checked_add(read_bytes)
 }
 
+/// Each range's engine's page cache's floor, its own memory, never lent (node.md §1.4, the owner's
+/// decision of 2026-11-20): a page of `page` bytes for each read the node's operations ask at once,
+/// `reads`, one an operation (`asks`), spread over its `ranges`, rounded up. A point read loads its
+/// leaf alone, the branch's leaf index and filter being in the engine's resident metadata
+/// (`mantle_engine::branch::point`), as RocksDB keeps index and filter blocks pinned so a lookup
+/// reads one data block (`cache_index_and_filter_blocks`,
+/// `pin_l0_filter_and_index_blocks_in_cache`; research/100 §1): with a page for each read in
+/// flight, the page each loaded stays until its
+/// retry takes it, where a cache borrowing alone was emptied by the operations that hold memory at
+/// many clients and each read loaded its page again (research/100 §2). Counted in the ranges'
+/// class, so the node admits fewer operations at once by its size.
+pub fn cache_floor(reads: usize, ranges: usize, page: usize) -> Option<u64> {
+    let each = reads
+        .checked_div(ranges)?
+        .saturating_add(usize::from(reads.checked_rem(ranges)? > 0));
+    u64::try_from(each)
+        .ok()?
+        .checked_mul(u64::try_from(page).ok()?)
+}
+
 /// A peer's state on the plane beside its epochs' replay windows and its datagram's room:
 /// measured, 182 bytes at the most.
 const PLANE_PEER_BYTES: u64 = 182;
@@ -2073,8 +2095,8 @@ pub enum Class {
     /// extents' allocator apart: each extent's is charged with its metadata from what remains
     /// (`mantle_engine::shard_db::measured_per_extent`).
     Engines,
-    /// Each range's member ([`range_bytes`]) and what the node holds inline for it
-    /// (`node::slots_bytes`).
+    /// Each range's member ([`range_bytes`]), what the node holds inline for it
+    /// (`node::slots_bytes`), and its engine's page cache's floor ([`cache_floor`]).
     Ranges,
     /// The node's shared log ([`log_bytes`]).
     Log,
@@ -2899,6 +2921,7 @@ fn derive_with(
     // at once: their asks, the transport's bounds with a native client each beside the pinned
     // peers (node.md §3.6) drawing its exchanges from a pool of as many, each share of its windows
     // at `window` (`bounds::transport_at`), and each range's reads.
+    let page = made.store.page_size;
     let held_at = |objects: usize, transfers: usize, window: u64| -> Result<Held, DeriveError> {
         let gateway = idle.running(objects, 0);
         let asked = if hosts {
@@ -2942,8 +2965,16 @@ fn derive_with(
         // the first.
         let mut ranges_bytes =
             crate::node::slots_bytes(placed, hosted.len()).ok_or(overflow("the ranges' slots"))?;
+        // And each range's engine's page cache's floor, its part of a page for each read the
+        // operations ask ([`cache_floor`]); none for a node of no ranges.
+        let floor = if hosted.is_empty() {
+            0
+        } else {
+            cache_floor(asked.reads, hosted.len(), page).ok_or(overflow("a cache's floor"))?
+        };
         for hosted in &hosted {
             ranges_bytes = range_bytes(&hosted.range, reads)
+                .and_then(|bytes| bytes.checked_add(floor))
                 .and_then(|bytes| ranges_bytes.checked_add(bytes))
                 .ok_or(overflow("the ranges' members"))?;
         }
@@ -3002,6 +3033,7 @@ fn derive_with(
             ranges_bytes,
             listener,
             runtime,
+            cache_floor: floor,
         })
     };
     let held_by = |objects: usize, window: u64| held_at(objects, transfers, window);
@@ -3215,9 +3247,10 @@ fn derive_with(
     // whole while what remains holds them all, else each the same part; (3) the transport's
     // growth past its floor to a receive chunk each share for the connections those operations
     // open, whole while what remains holds it; (4) every operation more that what remains then
-    // holds, each with its client's windows at a receive chunk. No page cache takes a share: each
-    // engine's borrows the operations' idle bytes (`admit::cache_part`, `node::host::lend`), at
-    // most its want, `engine.cache_bytes`.
+    // holds, each with its client's windows at a receive chunk. No page cache takes a share past
+    // its floor, which the ranges' class counts with the operations' reads ([`cache_floor`]): past
+    // it each engine's borrows the operations' idle bytes once a turn (`admit::cache_part`,
+    // `node::host::lend`), at most its want, `engine.cache_bytes`.
     let (each, floor_one, one) = if hosts { one_at(initial)? } else { (0, 0, 0) };
     let base = if hosts {
         floor_one
@@ -3363,6 +3396,7 @@ fn derive_with(
         ranges_bytes,
         listener,
         runtime,
+        cache_floor,
     } = held_by(objects, window)?;
     let transport_floor = mantle_protocol::bounds::least_transport(&bounds)
         .map_err(|e| DeriveError::Bounds(e.to_string()))?;
@@ -3406,6 +3440,7 @@ fn derive_with(
             ranges_bytes,
             listener,
             runtime,
+            cache_floor,
         },
         objects_bytes,
     )?;
@@ -3494,10 +3529,13 @@ fn derive_with(
         .and_then(|extent| extent.checked_mul(engine.store.max_extents))
         .ok_or(overflow("an engine's cache"))?
         .min(cache_want);
+    // The floor, at most the want: a cache holds no more pages than its store's, the memory past
+    // them counted and left idle.
+    let floor = cache_floor.min(cache);
     say_engine(
         &mut said,
         &engine,
-        (metadata, cache),
+        (metadata, cache, floor),
         held_extents,
         shapes.iter().any(Option::is_some),
     );
@@ -3602,6 +3640,7 @@ fn derive_with(
                 store: engine.store,
                 memtable_bytes: engine.memtable_bytes,
                 cache_bytes: cache,
+                cache_floor: floor,
                 trunk: engine.trunk,
                 engine_workers: workers,
                 transport_bytes,
@@ -4498,7 +4537,7 @@ fn say_objects_held(said: &mut Said, fragments: u64, objects: u64) {
 fn say_engine(
     said: &mut Said,
     engine: &Engine,
-    (metadata, cache): (u64, u64),
+    (metadata, cache, floor): (u64, u64, u64),
     held_extents: u64,
     founded: bool,
 ) {
@@ -4549,12 +4588,23 @@ fn say_engine(
         "the most each range's engine's page cache of verified pages holds, its want: every page \
          of the extents its rows of engine.objects take, with which a get or a lookup reads each \
          page from the device once, at most its store's pages (derive::engine_cache_wants_for). \
-         No share of memory: the node opens each engine with no cache (process::engine), and \
-         each cache on the node's shard borrows its part of the operations' bytes no running \
-         operation holds, at most this, giving it back at once before admission charges an \
-         operation it and growing back once a turn (admit::cache_part, node::host::lend; \
-         research/87 §4 rule B for caches); none on another shard, none on a node hosting no \
-         objects",
+         No share of memory past its floor (engine.cache_floor): each cache on the node's shard \
+         borrows past it its part of the operations' bytes no running operation holds, at most \
+         this, once a turn, and gives it back only then, admission counting it held \
+         (admit::cache_part, node::host::lend; research/87 §4 rule B for caches); none on \
+         another shard, none on a node hosting no objects",
+    );
+    said.add(
+        "engine.cache_floor",
+        floor,
+        Kind::Derived,
+        "each range's engine's page cache's own memory, never lent: a page for each read the \
+         range holds at once, the reads the node's operations ask and its exchanges, at most the \
+         range's pending_reads (derive::cache_floor), as a point read loads its leaf alone, its \
+         branch's filter and leaf index resident, as RocksDB pins index and filter blocks \
+         (cache_index_and_filter_blocks, pin_l0_filter_and_index_blocks_in_cache; research/100), \
+         at most engine.cache_bytes; counted in the ranges' class, so the operations are fewer \
+         by its size; the owner's decision of 2026-11-20 (node.md §1.4)",
     );
     said.add(
         "engine.memtable_bytes",
@@ -5621,11 +5671,13 @@ mod tests {
         // Every client's shares at a chunk is its want, and the transport holds it whole.
         assert_eq!(want, (3 + clients) * 3 * (chunk - initial));
         assert_eq!(bytes - floor, want);
-        // 61,960 on macOS, 422 fewer than one worker an engine left (62,382); Linux's range holds
-        // its estimate, 61,812, its one worker's 62,234 less as many, derived and not yet run there.
+        // 60,913 on macOS, 1,047 fewer than the 61,960 before each range's cache held its floor, a
+        // page of 24,576 bytes for each read the operations ask spread over the five ranges
+        // (`cache_floor`, the owner's decision of 2026-11-20); Linux's range holds its estimate,
+        // 60,765, its 61,812 less as many, derived and not yet run there.
         let operations = said_bytes(&derived, "gateway.objects");
         assert!(
-            runs(61_350..63_350, 61_500..63_500).contains(&operations),
+            runs(60_250..61_300, 60_400..61_400).contains(&operations),
             "{operations}"
         );
         assert_eq!(
@@ -5769,13 +5821,16 @@ mod tests {
     /// types' sizes on each other target.
     fn need_96_gib() -> u64 {
         // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`,
-        // 689d7afb), run on macOS; Linux's 80 are derived alike, not yet run there. Its engines'
-        // workers, whose builders and held pages `memory.need_workers` counts, are not in it.
+        // 689d7afb), run on macOS; Linux's 80 are derived alike, not yet run there. 245,760 more
+        // since each of its five ranges' caches holds its floor, two pages of 24,576 bytes for the
+        // reads of the operations it serves at least (`cache_floor`, the owner's decision of
+        // 2026-11-20), run on macOS, Linux's derived alike. Its engines' workers, whose builders
+        // and held pages `memory.need_workers` counts, are not in it.
         let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
         if cfg!(target_os = "linux") {
-            13_714_102_925 - 32 * STACK + 1_605_344 + slots
+            13_714_348_685 - 32 * STACK + 1_605_344 + slots
         } else {
-            13_714_102_925 - 32 * (STACK - WORKER) + slots
+            13_714_348_685 - 32 * (STACK - WORKER) + slots
         }
     }
 
@@ -5853,9 +5908,11 @@ mod tests {
                     // Past those served, every operation's windows at a chunk: the want whole.
                     assert_eq!(bytes - floor, want, "depth {depth}, volume {volume}");
                 }
+                // 232 on macOS, 5 fewer than the 237 before each range's cache held its floor
+                // (`cache_floor`, the owner's decision of 2026-11-20).
                 if depth == 4 && volume {
                     assert!(
-                        runs(215..225, 235..245).contains(&operations),
+                        runs(210..220, 228..238).contains(&operations),
                         "{operations}"
                     );
                 }
@@ -7003,9 +7060,12 @@ mod tests {
         assert!(need <= memory, "{need}");
         if workers > 0 {
             let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
-            // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
-            assert_eq!(need, 7_259_117_930 + slots);
-            assert_eq!(need + workers * (STACK - WORKER), 7_762_434_410 + slots);
+            // 80 more since each of its five ranges' members opens on 16 bytes more
+            // (`MEMBER_BYTES`, 689d7afb); 245,760 more since each range's cache holds its floor, a
+            // page of 24,576 bytes for each read its operations ask (`cache_floor`, the owner's
+            // decision of 2026-11-20).
+            assert_eq!(need, 7_259_363_690 + slots);
+            assert_eq!(need + workers * (STACK - WORKER), 7_762_680_170 + slots);
         }
         let given = allowance(Some(need), &machine(memory, None));
         assert_eq!(given.ok(), Some(need));
@@ -7204,9 +7264,12 @@ mod tests {
         if cfg!(not(target_os = "linux")) {
             let at = floor_at_one(founder(2), &runner(2, 256));
             let slots = crate::node::slots_bytes(NonZeroUsize::MIN, 5).unwrap();
-            // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
-            assert_eq!(at, 7_366_591_339 + slots);
-            assert_eq!(at + 256 * (STACK - WORKER), 7_869_907_819 + slots);
+            // 80 more since each of its five ranges' members opens on 16 bytes more
+            // (`MEMBER_BYTES`, 689d7afb); 122,880 more since each of its five ranges' caches holds
+            // its floor, a page of 24,576 bytes for its operation's read (`cache_floor`,
+            // 2026-11-20).
+            assert_eq!(at, 7_366_714_219 + slots);
+            assert_eq!(at + 256 * (STACK - WORKER), 7_870_030_699 + slots);
         }
         // Spread over the shards, the same founder's ranges take a lane from each peer for each
         // shard past the first, and two lanes to the node's shard from each.
@@ -7713,8 +7776,15 @@ mod tests {
             )
         };
         let group = 0x12;
+        // Opened at its floor (`engine.cache_floor`, the owner's decision of 2026-11-20), where it
+        // opened with none.
+        let floor = config.cache_floor / u64::try_from(page).unwrap();
+        assert!(
+            floor > 0 && floor <= u64::try_from(pages).unwrap(),
+            "{floor}"
+        );
         let mut e = crate::process::engine(&config, group, Layer::Name).unwrap();
-        assert_eq!(e.io_stats().cache_limit_pages, 0);
+        assert_eq!(e.io_stats().cache_limit_pages, floor);
         e.set_cache(pages);
         assert_eq!(
             e.io_stats().cache_limit_pages,
@@ -7757,7 +7827,7 @@ mod tests {
         assert!(gets >= ASKED && lookups >= ASKED, "{gets} {lookups}");
         drop(e);
         let mut e = crate::process::engine(&config, group, Layer::Name).unwrap();
-        assert_eq!(e.io_stats().cache_limit_pages, 0);
+        assert_eq!(e.io_stats().cache_limit_pages, floor);
         e.set_cache(pages);
         assert_eq!(
             e.io_stats().cache_limit_pages,
@@ -7767,17 +7837,19 @@ mod tests {
         assert_eq!(reads(&mut e, &next), 0, "lookups of a range opened again");
     }
 
-    /// The ranges' caches borrow the operations' idle bytes (node.md §1.4; `admit::cache_part`,
-    /// `admit::lend_to`, as `node::host::lend` lends them): over random admissions, ends, reads
-    /// and turns, three engines opened as the node opens them, the operations' charges and the
-    /// caches' bytes are within `gateway.objects_bytes` at every step, each cache shrinking at once
-    /// before an operation is charged what it holds, its memory within its part, and at each turn
-    /// back at its part of what is idle: its want where the idle bytes hold every want, else the
-    /// same part of them. Once every operation ended each holds its want; a cache whose bytes an
-    /// operation took reads its pages from the device, and grown back once the operation ended,
-    /// reads its hot pages from memory.
+    /// The ranges' caches hold their floors and borrow past them the operations' idle bytes once a
+    /// turn (node.md §1.4, the owner's decision of 2026-11-20; `admit::cache_part`,
+    /// `admit::lend_to`, as `node::host::lend` lends them): over random admissions, ends, reads and
+    /// turns, three engines opened as the node opens them, each at its floor, the operations'
+    /// charges and the caches' bytes past their floors are within `gateway.objects_bytes` at every
+    /// step, admission counting the lent bytes held, no cache below its floor, and each at each
+    /// turn at its floor and its part past it of what is idle past what was refused room. An
+    /// operation charged every byte is refused while the caches hold some, let in at the next turn
+    /// once they gave them back, and the caches at their floors read their hot pages from memory:
+    /// before the decision a cache an operation's charge emptied was dropped and read every get
+    /// from the device.
     #[test]
-    fn the_caches_borrow_the_operations_idle_bytes_and_give_them_back_before_they_are_charged() {
+    fn the_caches_hold_their_floors_and_borrow_past_them_once_a_turn() {
         use crate::admit::{Admission, cache_part, lend_to};
         use hyper_block::file::DeviceFile;
         use mantle_meta::engine::{Engine as _, Rows as _, Write};
@@ -7788,10 +7860,12 @@ mod tests {
         let mut config = derive(stated(1), &facts(1), &mut fresh).unwrap().config;
         config.dir = dir.path().to_path_buf();
         let page = u64::try_from(config.store.page_size).unwrap();
-        // Each cache wants 16 pages here, and the operations' memory is 64: three caches' wants
-        // whole only while at most 16 pages are charged.
+        // Each cache wants 16 pages here past a floor of 4, and the operations' memory is 64: three
+        // caches' wants whole past their floors only while at most 28 pages are charged.
+        let floor = 4 * page;
         let want = 16 * page;
         let budget = 64 * page;
+        config.cache_floor = floor;
         let row = |i: u64| {
             (
                 format!("v/b/k{i:06}/{}", "0".repeat(24)).into_bytes(),
@@ -7801,6 +7875,11 @@ mod tests {
         let mut caches: Vec<(u64, Stored<DeviceFile>)> = (0..3u128)
             .map(|n| {
                 let mut e = crate::process::engine(&config, 0x20 + n, Layer::Name).unwrap();
+                assert_eq!(
+                    e.io_stats().cache_limit_pages * page,
+                    floor,
+                    "opened at its floor"
+                );
                 for i in 0..ROWS {
                     let (k, v) = row(i);
                     e.apply(i + 1, vec![Write::Put(k, v)]).unwrap();
@@ -7809,17 +7888,17 @@ mod tests {
                 (0, e)
             })
             .collect();
-        let lend = |admission: &mut Admission,
-                    caches: &mut [(u64, Stored<DeviceFile>)],
-                    more: u64,
-                    grow: bool| {
-            let part = cache_part(admission.idle_past(more), want, caches.len());
+        // A turn's lend, as `node::host::lend`.
+        let lend = |admission: &mut Admission, caches: &mut [(u64, Stored<DeviceFile>)]| {
+            let wanted = admission.take_wanted();
+            let part = cache_part(admission.idle_past(wanted), want - floor, caches.len());
             let mut lent = 0;
             for (held, e) in caches.iter_mut() {
-                *held = lend_to(e, *held, part, grow);
+                *held = lend_to(e, part, floor);
                 lent += *held;
             }
             admission.lend(lent);
+            part
         };
         let mut admission = Admission::new(1_000, budget, 0);
         let mut running: Vec<u64> = Vec::new();
@@ -7830,12 +7909,22 @@ mod tests {
             x ^= x << 17;
             match x % 4 {
                 0 => {
+                    // Admitted only into bytes neither the operations nor the caches hold: no
+                    // cache moves.
                     let charge = (1 + (x >> 8) % 24) * page;
+                    let limits: Vec<u64> = caches
+                        .iter()
+                        .map(|(_, e)| e.io_stats().cache_limit_pages)
+                        .collect();
                     if admission.admits(charge).is_ok() {
-                        lend(&mut admission, &mut caches, charge, false);
                         admission.admitted(charge);
                         running.push(charge);
                     }
+                    let after: Vec<u64> = caches
+                        .iter()
+                        .map(|(_, e)| e.io_stats().cache_limit_pages)
+                        .collect();
+                    assert_eq!(limits, after, "step {step}: an admission moved a cache");
                 }
                 1 if !running.is_empty() => {
                     let at = usize::try_from((x >> 8) % running.len() as u64).unwrap();
@@ -7843,9 +7932,7 @@ mod tests {
                     admission.completed(1, 1, charge);
                 }
                 2 => {
-                    // A turn: each cache back to its part of what is idle, its want at most.
-                    lend(&mut admission, &mut caches, 0, true);
-                    let part = cache_part(budget - admission.lent().1, want, caches.len());
+                    let part = lend(&mut admission, &mut caches);
                     assert!(caches.iter().all(|(held, _)| *held == part / page * page));
                 }
                 _ => {
@@ -7860,19 +7947,17 @@ mod tests {
             assert_eq!(held, running.iter().sum::<u64>(), "step {step}");
             for (part, e) in &caches {
                 let stats = e.io_stats();
-                assert_eq!(stats.cache_limit_pages * page, *part, "step {step}");
-                assert!(stats.cache_bytes <= *part, "step {step}");
+                assert_eq!(stats.cache_limit_pages * page, floor + *part, "step {step}");
+                assert!(stats.cache_bytes <= floor + *part, "step {step}");
             }
         }
         for charge in running.drain(..) {
             admission.completed(1, 1, charge);
         }
-        lend(&mut admission, &mut caches, 0, true);
-        // Every operation ended: 64 pages idle over three caches hold each its want, 16 pages.
-        let idle = cache_part(budget, want, caches.len()) / page * page;
-        assert_eq!(idle, want);
-        assert!(caches.iter().all(|(part, _)| *part == want));
-        assert_eq!(admission.lent(), (3 * want, 0));
+        lend(&mut admission, &mut caches);
+        // Every operation ended: 64 pages idle over three caches hold each its want past its floor.
+        assert!(caches.iter().all(|(part, _)| *part == want - floor));
+        assert_eq!(admission.lent(), (3 * (want - floor), 0));
         // The device reads 100 gets of one row make past the first.
         let (key, value) = row(ROWS / 2);
         let reads = |e: &mut Stored<DeviceFile>| {
@@ -7884,22 +7969,124 @@ mod tests {
             e.io_stats().pages_read - before
         };
         assert_eq!(reads(&mut caches[0].1), 0, "hot pages, cached");
-        // An operation charged every byte: the caches give back theirs before it is.
-        lend(&mut admission, &mut caches, budget, false);
+        // An operation charged every byte: refused while the caches hold some, and wanted.
+        assert_eq!(admission.admits(budget), Err(crate::admit::Held::Bytes));
+        // The turn gives them back, past the floors alone, and it is let in.
+        lend(&mut admission, &mut caches);
+        assert_eq!(admission.lent(), (0, 0));
+        assert_eq!(admission.admits(budget), Ok(()));
         admission.admitted(budget);
+        let floors: Vec<u64> = caches
+            .iter()
+            .map(|(_, e)| e.io_stats().cache_limit_pages * page)
+            .collect();
+        assert_eq!(floors, vec![floor; 3], "the floors are never lent");
+        // At its floor a cache reads its hot pages from memory: before, one emptied was dropped
+        // and each get read its pages from the device.
+        let floored = reads(&mut caches[0].1);
+        assert_eq!(floored, 0, "hot pages, in the floor");
+        lend(&mut admission, &mut caches);
         assert_eq!(admission.lent(), (0, budget));
-        assert!(caches.iter().all(|(part, _)| *part == 0));
-        let cold = reads(&mut caches[0].1);
-        assert!(cold >= ASKED, "{cold}");
-        // It ends, and the turn lends the idle bytes again: the hot pages are read from memory.
         admission.completed(1, 1, budget);
-        lend(&mut admission, &mut caches, 0, true);
-        assert_eq!(admission.lent(), (3 * want, 0));
+        lend(&mut admission, &mut caches);
+        assert_eq!(admission.lent(), (3 * (want - floor), 0));
         assert_eq!(reads(&mut caches[0].1), 0, "hot pages, cached again");
         eprintln!(
-            "100 gets read {cold} pages while an operation held every byte, none once its cache \
-             grew back to {} pages of {page}",
-            idle / page
+            "100 gets read {floored} pages while an operation held every byte, the cache at its \
+             floor of {} pages of {page}",
+            floor / page
+        );
+    }
+
+    /// Pages read again for each get under many reads at once while the operations hold the
+    /// memory, as at 512 clients (node.md §1.4, the owner's decision of 2026-11-20): 32 reads at a
+    /// time over a range opened as the node opens it, each tried, then tried again past the
+    /// operations admitted meanwhile, as a read the device waited on is, turn after turn. Before,
+    /// the cache borrowed alone: each admission shrank it at once to its part of what stayed idle,
+    /// none, and a cache at none was dropped whole, so each try loaded its page again. With the
+    /// floor ([`cache_floor`], a page for each read the range holds at once) and the caches moved
+    /// only once a turn, the pages a read loaded stay: after the first turn no get reads a page.
+    #[test]
+    fn a_read_s_pages_stay_in_its_floor_while_the_operations_hold_the_memory() {
+        use hyper_block::file::DeviceFile;
+        use mantle_meta::engine::{Engine as _, Rows as _, Write};
+        use mantle_range::Stored;
+        const ROWS: u64 = 1_100;
+        const READS: usize = 32;
+        const TURNS: u64 = 20;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = derive(stated(1), &facts(1), &mut fresh).unwrap().config;
+        config.dir = dir.path().to_path_buf();
+        let page = config.store.page_size;
+        // A page for each of the 32 reads at once, on one range.
+        let floor = cache_floor(READS, 1, page).unwrap();
+        assert_eq!(floor, u64::try_from(READS * page).unwrap());
+        assert_eq!(cache_floor(READS + 1, 2, page), Some(17 * page as u64));
+        let row = |i: u64| {
+            (
+                format!("v/b/k{i:06}/{}", "0".repeat(24)).into_bytes(),
+                vec![u8::try_from(i % 251).unwrap(); 120],
+            )
+        };
+        // The rows the reads ask, spread over the range's leaves.
+        let asked: Vec<u64> = (0..READS as u64)
+            .map(|r| r * (ROWS / READS as u64))
+            .collect();
+        // Pages each get read from the device over `TURNS` turns: each read tried, the operations
+        // admitted meanwhile (`admitted`), each tried again, and the turn's lend (`turn`).
+        let run = |config: &crate::process::ProcessConfig,
+                   group: u128,
+                   admitted: &dyn Fn(&mut Stored<DeviceFile>),
+                   turn: &dyn Fn(&mut Stored<DeviceFile>)| {
+            let mut e = crate::process::engine(config, group, Layer::Name).unwrap();
+            for i in 0..ROWS {
+                let (k, v) = row(i);
+                e.apply(i + 1, vec![Write::Put(k, v)]).unwrap();
+            }
+            e.persist().unwrap();
+            let before = e.io_stats().pages_read;
+            let mut gets = 0u64;
+            for _ in 0..TURNS {
+                for &i in &asked {
+                    let (k, v) = row(i);
+                    assert_eq!(e.get(&k).unwrap(), Some(v));
+                }
+                admitted(&mut e);
+                for &i in &asked {
+                    let (k, v) = row(i);
+                    assert_eq!(e.get(&k).unwrap(), Some(v));
+                }
+                turn(&mut e);
+                gets += 2 * READS as u64;
+            }
+            (e.io_stats().pages_read - before, gets)
+        };
+        // Before: no floor; an admission's charge shrank the cache to none, dropping it, and the
+        // turn lent it none, the operations holding every byte.
+        config.cache_floor = 0;
+        let (borrowed, gets) = run(&config, 0x30, &|e| e.set_cache(0), &|e| {
+            e.lend_cache(0);
+        });
+        // Now: opened at its floor; an admission moves no cache, and the turn lends it none past
+        // its floor.
+        config.cache_floor = floor;
+        let (floored, _) = run(&config, 0x31, &|_| {}, &|e| {
+            assert_eq!(e.lend_cache(floor), floor);
+        });
+        eprintln!(
+            "{gets} gets of {READS} reads at once over {TURNS} turns, the operations holding every \
+             byte: {borrowed} pages read borrowing alone ({:.2} a get), {floored} at a floor of \
+             {READS} pages of {page} ({:.2} a get)",
+            borrowed as f64 / gets as f64,
+            floored as f64 / gets as f64
+        );
+        assert!(
+            borrowed >= gets,
+            "borrowing alone, each get reads its page: {borrowed}"
+        );
+        assert!(
+            floored <= READS as u64,
+            "at the floor, only the first turn's tries load pages: {floored}"
         );
     }
 
@@ -8138,8 +8325,11 @@ mod tests {
         assert!(
             runs(
                 7_255_000_000 + slots..7_260_000_000 + slots,
-                // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
-                7_257_853_291 + slots..7_257_853_292 + slots
+                // 80 more since each of its five ranges' members opens on 16 bytes more
+                // (`MEMBER_BYTES`, 689d7afb); 122,880 more since each of its five ranges' caches
+                // holds its floor, a page of 24,576 bytes for its operation's read (`cache_floor`,
+                // 2026-11-20).
+                7_257_976_171 + slots..7_257_976_172 + slots
             )
             .contains(&founded),
             "{founded}"
@@ -8260,11 +8450,14 @@ mod tests {
                 "{at_measured}"
             );
         } else {
-            // 80 more since each of its five ranges' members opens on 16 bytes more (`MEMBER_BYTES`, 689d7afb).
-            assert_eq!(at_measured, 7_359_402_091 + slots);
-            assert_eq!((7u64 << 30) - at_measured, 156_790_677 - slots);
+            // 80 more since each of its five ranges' members opens on 16 bytes more
+            // (`MEMBER_BYTES`, 689d7afb); 122,880 more since each of its five ranges' caches holds
+            // its floor, a page of 24,576 bytes for its operation's read (`cache_floor`, the
+            // owner's decision of 2026-11-20).
+            assert_eq!(at_measured, 7_359_524_971 + slots);
+            assert_eq!((7u64 << 30) - at_measured, 156_667_797 - slots);
             // Its workers at Rust's 2 MiB: CI's refusal, the frames' 10,200 bytes and the slots.
-            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_261_291 + slots);
+            assert_eq!(at_measured + 240 * (STACK - WORKER), 7_831_384_171 + slots);
         }
         // Every term that holds the depth holds the one taken: the issuer's workers among the
         // threads, each volume's reads and transfers, and the transport's room for them.

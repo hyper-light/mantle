@@ -482,20 +482,25 @@ impl<F: BlockFile + 'static> Engine for Stored<F> {
     }
 
     /// Its cache's limit set to the pages `bytes` hold, whole: lowered at once, the pages past it
-    /// dropped and none kept at none (`ShardDb::shrink_cache`), or raised keeping its pages, a
-    /// cache made where it had none (`ShardDb::grow_cache`); a limit of as many pages is left as
-    /// it is, so a part that moves by less than a page costs nothing.
+    /// dropped (`ShardDb::shrink_cache`), a cache keeping its structure at its least, one page,
+    /// where it was dropped whole at none (node.md §1.4, the owner's decision of 2026-11-20), or
+    /// raised keeping its pages, a cache made where it had none (`ShardDb::grow_cache`); a limit of
+    /// as many pages is left as it is, so a part that moves by less than a page costs nothing. Its
+    /// owner sets it once a turn, never as an operation is admitted (`node::host::lend`). The bytes
+    /// its limit holds after.
     fn lend_cache(&mut self, bytes: u64) -> u64 {
         let (now, page) = self.db.cache_limit();
         let page = u64::try_from(page).unwrap_or(u64::MAX).max(1);
         let whole = bytes.checked_div(page).unwrap_or(0);
         let pages = usize::try_from(whole).unwrap_or(usize::MAX);
+        // A cache made keeps one page at its least (`Cache::resize`).
+        let pages = if now > 0 { pages.max(1) } else { pages };
         if pages < now {
             self.db.shrink_cache(pages);
         } else if pages > now {
             self.db.grow_cache(pages);
         }
-        u64::try_from(pages)
+        u64::try_from(self.db.cache_limit().0)
             .ok()
             .and_then(|pages| pages.checked_mul(page))
             .unwrap_or(bytes)

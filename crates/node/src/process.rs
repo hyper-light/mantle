@@ -516,10 +516,13 @@ pub struct ProcessConfig {
     pub rules: Rules,
     pub log: LogConfig,
     pub store: StoreConfig,
-    /// The most each range's engine's page cache holds (`engine.cache_bytes`), its want: as many
-    /// of its store's pages as it borrows of the operations' idle bytes, verified as read
-    /// (`GatewaySettings::cache_bytes`, `Engine::lend_cache`).
+    /// The most each range's engine's page cache holds (`engine.cache_bytes`), its want: its
+    /// floor and as many of its store's pages past it as it borrows of the operations' idle
+    /// bytes, verified as read (`GatewaySettings::cache_bytes`, `Engine::lend_cache`).
     pub cache_bytes: u64,
+    /// Each range's engine's page cache's floor (`engine.cache_floor`), its own memory, never lent:
+    /// each engine opens with it ([`engine`]).
+    pub cache_floor: u64,
     pub memtable_bytes: usize,
     pub trunk: TrunkConfig,
     /// The most maintenance workers each range's engine runs its packings and compactions on
@@ -726,6 +729,7 @@ pub const KEYS: &[&str] = &[
     "engine.extent_pages",
     "engine.max_extents",
     "engine.cache_bytes",
+    "engine.cache_floor",
     "engine.memtable_bytes",
     "engine.fanout",
     "engine.leaf_entries",
@@ -1235,6 +1239,7 @@ impl ProcessConfig {
                 max_extents: lines.get("engine.max_extents")?,
             },
             cache_bytes: lines.get("engine.cache_bytes")?,
+            cache_floor: lines.get("engine.cache_floor")?,
             memtable_bytes: lines.get("engine.memtable_bytes")?,
             trunk: TrunkConfig {
                 fanout: lines.get("engine.fanout")?,
@@ -1367,7 +1372,7 @@ fn gateway_settings(
     config: GatewayConfig,
     keys: Vec<(u32, WrappingKey)>,
     enlist: Option<&Enlisting>,
-    cache_bytes: u64,
+    (cache_bytes, cache_floor): (u64, u64),
 ) -> Result<GatewaySettings, ProcessError> {
     let rates = Rates {
         chunk: config.chunk_rate,
@@ -1384,6 +1389,7 @@ fn gateway_settings(
         objects: config.objects,
         objects_bytes: config.objects_bytes,
         cache_bytes,
+        cache_floor,
         charges,
         clients: config.clients,
         bucket_quota: config.bucket_quota,
@@ -2122,7 +2128,14 @@ fn run_node(
     let gateway = config
         .gateway
         .take()
-        .map(|g| gateway_settings(g, keys, config.enlist.as_ref(), config.cache_bytes))
+        .map(|g| {
+            gateway_settings(
+                g,
+                keys,
+                config.enlist.as_ref(),
+                (config.cache_bytes, config.cache_floor),
+            )
+        })
         .transpose()?;
     let resolved = resolve(&config).map_err(step(Step::Network))?;
     // A named peer is looked up again as the node runs, on hyper-rt's blocking pool, off its shards:
@@ -2728,8 +2741,9 @@ fn read_file(path: &Path) -> Result<Vec<u8>, ProcessError> {
 
 /// Range `group`'s engine in the node's directory, holding `layer`'s rows: opened at its last
 /// checkpoint when its store is there, created when not, a Name range founded with its first rows
-/// (its descriptor, spanning every key), with no page cache: `engine.cache_bytes` is no share of
-/// the node's memory, the most a cache holds once it is lent bytes no operation holds. Its
+/// (its descriptor, spanning every key), with its page cache at its floor (`engine.cache_floor`),
+/// its own memory, never lent; past it the cache borrows, once a turn, up to `engine.cache_bytes`
+/// of the operations' bytes no operation holds (node.md §1.4). Its
 /// packings and compactions run on `engine.workers` maintenance workers, each over the store's
 /// file opened again, so an apply on the node's shard writes none of their pages: inline, they
 /// were a quarter of the busiest shard's time under small PUTs, its `pwrite`s (node.md §1.2).
@@ -2760,6 +2774,10 @@ pub(crate) fn engine(
             }
         })
     };
+    let floor = usize::try_from(config.cache_floor)
+        .ok()
+        .and_then(|bytes| bytes.checked_div(config.store.page_size))
+        .unwrap_or(0);
     if !fresh {
         let mut stored = Stored::open(file, config.store, config.memtable_bytes, config.trunk)
             .map_err(engine)?;
@@ -2768,6 +2786,7 @@ pub(crate) fn engine(
                 .set_workers(reopen, config.engine_workers, &name)
                 .map_err(engine)?;
         }
+        stored.set_cache(floor);
         return Ok(stored);
     }
     let mut stored =
@@ -2777,6 +2796,7 @@ pub(crate) fn engine(
             .set_workers(reopen, config.engine_workers, &name)
             .map_err(engine)?;
     }
+    stored.set_cache(floor);
     let founded = |e: mantle_meta::engine::EngineError| ProcessError::Engine(e.to_string());
     if layer == Layer::Name {
         let first = name::first(1).map_err(|e| ProcessError::Engine(e.to_string()))?;

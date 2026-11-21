@@ -248,6 +248,8 @@ impl Job {
     ///
     /// - a put or a get reads its bucket's row or its version, or its get has no bytes to give
     ///   while its reads are out;
+    /// - a put waits for the node's volume table to name a scheme (`Putting::unschemed`), which
+    ///   wakes it as the table does (`Host::step`);
     /// - a put not over whose driver takes none of its body now waits on its asks;
     /// - a put whose driver wants its body found its door's channel empty, or a get or its last
     ///   answers found no room in its door's reply, a native one's until the node's task wrote
@@ -286,7 +288,7 @@ impl Job {
         };
         match &self.work {
             Work::Put(putting) => match putting.put.as_ref() {
-                None => asking,
+                None => asking || putting.unschemed.is_some(),
                 Some(put) if put.outcome().is_some() || put.waits_for_room() => false,
                 Some(_) if !putting.waiting.is_empty() => false,
                 Some(put) if !put.wants_body() => asking,
@@ -352,10 +354,17 @@ impl Job {
         }
     }
 
-    /// Whether its work is held, by a peer or a device: an ask of its own out, or a chunk waiting
-    /// for room at a volume or in the transport toward it.
+    /// Whether its work is held, by a peer, a device or the cell: an ask of its own out, a chunk
+    /// waiting for room at a volume or in the transport toward it, or its put waiting for the
+    /// node's volume table to name a scheme.
     fn held(&self) -> bool {
-        !self.pending.is_empty() || self.waits_for_room()
+        !self.pending.is_empty() || self.waits_for_room() || self.waits_for_table()
+    }
+
+    /// Whether its put waits for the node's volume table to name a scheme for new blocks
+    /// (`Putting::unschemed`).
+    fn waits_for_table(&self) -> bool {
+        matches!(&self.work, Work::Put(putting) if putting.unschemed.is_some())
     }
 
     /// Whether a chunk its put sends or its get reads waits for room at a volume or in the
@@ -589,6 +598,10 @@ pub(crate) struct Host {
     /// its turn ends (`Host::rekey`), the earliest of each read in one step by `Host::due`.
     beats: Earliest,
     renewals: Earliest,
+    /// Whether a put of its jobs was held since its last waking for want of a scheme in the
+    /// node's volume table (`Job::waits_for_table`): each step reads the table while one may
+    /// wait, and wakes every one once it names a scheme.
+    unschemed: bool,
 }
 
 /// Job slots by a key each job holds, kept in step with the jobs' vector as a job is pushed and
@@ -942,6 +955,7 @@ impl Host {
             answered: Vec::new(),
             beats: Earliest::default(),
             renewals: Earliest::default(),
+            unschemed: false,
         }
     }
 
@@ -3321,6 +3335,10 @@ struct Putting {
     trailing: Option<checksum::Algorithm>,
     /// The driver, once the bucket's row was read.
     put: Option<Put>,
+    /// The commit its bucket's row made, held while the node's volume table names no scheme for
+    /// new blocks (`Host::start_put`): a fresh cell's, whose node's member of the root range has
+    /// not yet applied a volume's enlistment. Its driver is made once the table names one.
+    unschemed: Option<Commit>,
     /// Body bytes read and not yet taken by the driver, and the body's bytes taken so far.
     carry: Vec<u8>,
     taken: u64,
@@ -5609,6 +5627,18 @@ impl Host {
             self.wake(at);
         }
         self.due = due;
+        // A put held for want of a scheme hears nothing of its own as the node's member of the
+        // root range applies an enlistment: the table is read at each turn while one may wait,
+        // the node's task turning as its member applies, and each such put woken once the table
+        // names a scheme. Bound: a walk of the jobs, once for every put that waited.
+        if self.unschemed && matches!(node.table().and_then(Table::scheme), Ok(Some(_))) {
+            self.unschemed = false;
+            for at in 0..self.jobs.len() {
+                if self.jobs.get(at).is_some_and(Job::waits_for_table) {
+                    self.wake(at);
+                }
+            }
+        }
         // The jobs awake as the steps begin, each stepped once, the first woken first: one that
         // does not rest after its step is woken again after them, for the next turn, and one
         // that ends leaves its slot to the job moved into it, whose entry names that slot. A job
@@ -6676,8 +6706,26 @@ impl Host {
         at: usize,
         commit: Commit,
     ) -> Result<(), NodeError> {
-        let Ok(Some(scheme)) = node.table().and_then(Table::scheme) else {
-            return self.fail_job(node, at, Status::Failed);
+        let scheme = match node.table().and_then(Table::scheme) {
+            Ok(Some(scheme)) => scheme,
+            // No volume takes chunks in the node's table, so the durability model has no failure
+            // domain to choose over: a fresh cell's first puts, asked of a node whose member of
+            // the root range has not yet applied the enlistments the range committed, which it
+            // applies within a round of its leader's. Not a failure of the node's, which `500
+            // InternalError` would say: the put waits for the table to name a scheme, woken as it
+            // does (`Host::step`), within its client's patience (`Job::bounded`).
+            Ok(None) => {
+                if let Some(Job {
+                    work: Work::Put(putting),
+                    ..
+                }) = self.jobs.get_mut(at)
+                {
+                    putting.unschemed = Some(commit);
+                    self.unschemed = true;
+                }
+                return Ok(());
+            }
+            Err(_) => return self.fail_job(node, at, Status::Failed),
         };
         let now = node.wall_ns();
         let Some(gateway) = self.gateway.as_deref() else {
@@ -6752,6 +6800,7 @@ impl Host {
                 return Ok(true);
             };
             match putting.put.as_mut() {
+                None if putting.unschemed.is_some() => Step::Start,
                 None if pending.is_empty() => Step::Ask(putting.bucket.clone()),
                 None => Step::Wait,
                 Some(put) => {
@@ -6812,6 +6861,20 @@ impl Host {
                 };
                 let asked = node.ask(JobAsk::Read(group, Query::Bucket { bucket }));
                 return self.asked(node, at, asked, None);
+            }
+            // Woken as the node's volume table named a scheme: its driver made, or held again
+            // where the table its turn reads names none still.
+            Step::Start => {
+                let commit = match self.jobs.get_mut(at) {
+                    Some(Job {
+                        work: Work::Put(putting),
+                        ..
+                    }) => putting.unschemed.take(),
+                    _ => None,
+                };
+                if let Some(commit) = commit {
+                    self.start_put(node, at, commit)?;
+                }
             }
             Step::Go => {}
         }
@@ -9031,6 +9094,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
             expected: Expected { md5, checksum },
             trailing,
             put: None,
+            unschemed: None,
             taken: 0,
             carry: Vec::new(),
             waiting: VecDeque::new(),
@@ -9132,6 +9196,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
             expected: Expected { md5, checksum },
             trailing,
             put: None,
+            unschemed: None,
             taken: 0,
             carry: Vec::new(),
             waiting: VecDeque::new(),
@@ -9237,6 +9302,7 @@ fn work(op: Op, block: Option<u64>) -> Work {
             expected: Expected::default(),
             trailing,
             put: None,
+            unschemed: None,
             taken: 0,
             carry: Vec::new(),
             waiting: VecDeque::new(),
@@ -9574,6 +9640,9 @@ enum Next {
 enum Step {
     /// Its bucket's row to ask for.
     Ask(String),
+    /// Its driver to make from the commit its bucket's row made, held while the node's volume
+    /// table named no scheme (`Putting::unschemed`).
+    Start,
     /// Waiting on what it asked.
     Wait,
     /// Going: its body and requests to move.
@@ -14936,6 +15005,91 @@ pub(super) mod tests {
             matches!(get_answers.as_slice(), [door::Answer::Head(reply), door::Answer::End]
                 if reply.status == Status::Done && reply.size == 0),
             "{get_answers:?}"
+        );
+    }
+
+    /// A fresh cell's first put, asked of a node whose member of the root range has not yet
+    /// applied the enlistments the range committed: the node's volume table names no volume, so
+    /// the durability model has no failure domain to choose a scheme over. The put, its bucket's
+    /// row read, waits for the table, resting and stepped no more, and is answered nothing; once
+    /// the member applies an enlistment and the table names a scheme, the put is woken, committed
+    /// and answered `Done`. It was answered `500 InternalError`, which says the node failed the
+    /// request, for a cell not yet ready (the first PUT of a fresh cell, `mantle bench doors`'s
+    /// native control put among them).
+    #[test]
+    fn a_put_before_its_nodes_volume_table_names_a_volume_waits_for_one_and_commits() {
+        let now = hyper_rt::futures::now_ns();
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        let mut host = Host::new(1, Some(std::sync::Arc::new(gateway)));
+        let put = work(
+            Op::Put {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 1,
+                length: 0,
+                headers: Headers::default(),
+                checksum: None,
+                md5: None,
+                trailing: None,
+                metadata: Vec::new(),
+            },
+            None,
+        );
+        let (job, body, mut answers) = local_job(put, now, 1);
+        assert!(body.try_send(Piece::End(None)).is_ok());
+        host.push(job, now);
+        let mut stub = put_and_get_stub();
+        stub.answer = |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Command(_, Command::Name(_)) => {
+                Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                    version: "v".into(),
+                })))
+            }
+            _ => panic!("an ask a put of no bytes does not make"),
+        };
+        // The table a node reads before its member of the root range applied any enlistment.
+        stub.table = Some(Table::of(None, 0, Vec::new()));
+        let _ = clock_reads();
+        for _ in 0..8 {
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(
+            answered(&mut answers),
+            Vec::new(),
+            "no reply while it waits"
+        );
+        assert_eq!(stub.asked, 1, "its bucket's row alone");
+        let (_, steps) = clock_reads();
+        assert_eq!(
+            steps, 2,
+            "stepped as it asks and as it is answered, then resting"
+        );
+        // Held, so bounded by its client's patience: past it, answered `SlowDown` for it, a
+        // cause that passes (`Host::bound_job`).
+        let job = &host.jobs[0];
+        assert!(job.resting && job.held() && job.waits_for_table());
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let bound = job.moved_ns + patience;
+        assert_eq!(job.bounded(bound - 1), Bounded::Held);
+        assert_eq!(job.bounded(bound), Bounded::SlowDown);
+        // The member applied a volume's enlistment: the table names a scheme.
+        stub.table = Some(Table::empty(1));
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 8, "the put never ended");
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(stub.asked, 2, "its bucket's row and its commit");
+        let answers = answered(&mut answers);
+        assert!(
+            matches!(answers.as_slice(), [door::Answer::Ready, door::Answer::Head(reply), door::Answer::End]
+                if reply.status == Status::Done && reply.version == "v"),
+            "{answers:?}"
         );
     }
 

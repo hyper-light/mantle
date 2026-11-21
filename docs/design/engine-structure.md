@@ -470,10 +470,35 @@ under load, at moderate load and saturated.
   2026-11-21): the shard alone met its bound at entry 21,199 (21,155 without), and the paced fill
   at 20,365 in one run (16,276 to 24,000 without, its worker's timing varying): one branch moved at
   a time, among those that alone hold more extents than they fill, recovers little of the waste.
-  *Open, next:* cleaning a mostly dead extent whole, every branch with a page in it moved in one
-  round (relocations on several nodes at once, the reserve their rooms together), ranked by the
-  extent's live pages (a count kept for each extent through every branch's life, where the census
-  now counts each pass); and holding fewer versions.
+  *Live pages, as built.* The trunk keeps each extent's live pages (`Trunk::live`): every branch
+  the tree names counted in each extent it has a page in, from page `first` of its first extent
+  on (`pages_by_extent`), as it enters the tree (a pending branch as it enters the root, a
+  compaction's branch, a settle's parts, a relocation's copy, every branch of an image read back)
+  and taken out as it leaves (an in-flight bundle read past, a leaf's bundle a settle replaced, a
+  relocated original). A test's step ends by counting them again from every branch the tree names
+  (`Trunk::check_live`, beside the tasks' check), and the counts read back from an image equal
+  those kept before it was written (`trunk/relocation.rs`). The trigger reads them: a branch
+  holds an extent alone where the extent's live pages are its own pages there.
+  *Whole extents, tried and set aside* (2026-11-21): rounds relocating every branch with a page in
+  the extent with the best LFS cost-benefit (`(1 - u) * age / (1 + u)`, age from the youngest
+  branch's stamp) were planned, but a round not yet opened when the range checkpointed for room
+  was dropped with the unstarted tasks, and the shard alone met its bound at 21,174 (32 rounds
+  planned, 20 relocations applied); excused from the stall while out, a round that could not open
+  kept the drain from stopping, so a fill spun, and two room tests failed (`trunk/room.rs`, a
+  frozen rotation in `shard_db.rs`). A round must open before the checkpoint that would drop it,
+  or be kept across that checkpoint, before it can land.
+  *Measured with live counts and one relocation at a time* (five runs each, mantle-node
+  `tests/engine_workers.rs`, debug build, 2026-11-21): the shard alone met its bound at 21,199 in
+  all five, ending with 727 live pages in 235 extents (182 if dense; 41 with one live page, 21
+  with two, 48 with three, 125 full; 15 relocations); the paced fill at 17,300, 19,350, 20,525,
+  21,025 and 21,277, ending at 640 and 747 live pages in 215 and 243 extents where its last
+  checkpoint was whole. *What would have to go:* the fill stops where its live pages reach about
+  725 to 750 with the waste left (the held extents 77% live); every run completing needs the
+  peak held below that by the paced fill's spread, about 50 to 100 pages, out of the 310 pages of
+  older versions the inner nodes held at the shard alone's bound (286 in their pivots' bundles,
+  24 in flight), a sixth to a third of them: holding fewer versions above the leaves is the next
+  lever (a compaction policy for a store near its bound), with whole-extent cleaning.
+  *Open, next:* whole-extent rounds that survive the checkpoint; holding fewer versions.
   *The bound it gives, once extents are cleaned whole:* cleaning every extent whose live pages are
   fewer than a share `s` of its pages, the extents held for branches are at most the live pages
   over `s × extent_pages`, plus a tail for each life; at the bound's 725 live pages, `s` = 3/4

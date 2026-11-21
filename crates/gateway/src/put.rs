@@ -1571,9 +1571,9 @@ mod tests {
         }
     }
 
-    /// A PUT of a one-byte object in three copies, its body ended and every chunk of its one
-    /// block durable, and the requests it asks then.
-    fn durable() -> (Put, Vec<(Id, Request)>) {
+    /// A PUT of a one-byte object in three copies, as the 1-byte PUT bench makes one, before any
+    /// of its body is fed.
+    fn one_byte() -> Put {
         let commit = Commit::Object(name::Put {
             bucket: "b".into(),
             incarnation: 1,
@@ -1621,8 +1621,13 @@ mod tests {
             beat_ns: 1,
         };
         let layout = Layout::new(Scheme::Copies(3)).unwrap();
-        let mut put =
-            Put::new(commit, body, keys, layout, holding, Box::new(Counter(0)), 0).unwrap();
+        Put::new(commit, body, keys, layout, holding, Box::new(Counter(0)), 0).unwrap()
+    }
+
+    /// A PUT of a one-byte object in three copies, its body ended and every chunk of its one
+    /// block durable, and the requests it asks then.
+    fn durable() -> (Put, Vec<(Id, Request)>) {
+        let mut put = one_byte();
         assert_eq!(put.feed(b"x").unwrap(), 1);
         put.end(&Expected::default()).unwrap();
         let (id, place) = put.poll().unwrap();
@@ -1769,5 +1774,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A request of a PUT, as the critical path's replay names it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Place,
+        Chunk,
+        Block,
+        File,
+        Name,
+    }
+
+    /// What a request adds to the path it lies on, in flushes of a device: placement none, the
+    /// node answering it from its volume table with no I/O (`mantle_node::place::offer_new`); a
+    /// chunk one, each volume answering its batch's writes at the batch's one flush
+    /// (chunk-store.md §4); a range command two, its frame flushed on its leader and, sent before
+    /// that flush, on a quorum of its members (raft-log.md §3), each member answering it only
+    /// once a later durable record confirms that flush (durability.md §7.5, decision A: frames
+    /// stay answered once confirmed), and the leader applying it in the drive that learning of
+    /// its commit prompts, with no flush between (replica.md §3, "A drive").
+    fn flushes(request: &Request) -> (Kind, u64) {
+        match request {
+            Request::Place { .. } => (Kind::Place, 0),
+            Request::Chunk { .. } => (Kind::Chunk, 1),
+            Request::Block(_) => (Kind::Block, 2),
+            Request::File(_) => (Kind::File, 2),
+            Request::Name(_) => (Kind::Name, 2),
+        }
+    }
+
+    /// Replays a PUT whose every request succeeds, each answered its [`flushes`] after it was
+    /// asked, the earliest answered first and requests answered at once in the order asked: each
+    /// request's kind and the times, in flushes since the PUT's first request, it was asked and
+    /// answered, in the order answered; and the time the PUT ended, its critical path in flushes.
+    fn replay(mut put: Put) -> (Vec<(Kind, u64, u64)>, u64) {
+        let mut now = 0u64;
+        let mut out: Vec<(Id, Kind, u64, u64, Request)> = Vec::new();
+        let mut answered = Vec::new();
+        while put.outcome().is_none() {
+            while let Some((id, request)) = put.poll() {
+                let (kind, cost) = flushes(&request);
+                out.push((id, kind, now, now + cost, request));
+            }
+            let next = (0..out.len()).min_by_key(|&i| (out[i].3, i)).unwrap();
+            let (id, kind, asked, done, request) = out.remove(next);
+            now = done;
+            answered.push((kind, asked, done));
+            let answer = match request {
+                Request::Place { width, .. } => {
+                    Answer::Volumes((0..u128::try_from(width).unwrap()).collect())
+                }
+                Request::Chunk { .. } => Answer::Stored,
+                Request::Block(_) => Answer::Block(written(now)),
+                Request::File(_) => Answer::File(file_written(now)),
+                Request::Name(_) => Answer::Name(name::Outcome::Put {
+                    version: "v".into(),
+                }),
+            };
+            put.answer(id, answer).unwrap();
+        }
+        assert!(matches!(put.outcome(), Some(Ok(_))), "{:?}", put.outcome());
+        assert!(out.is_empty(), "the PUT ended with requests out: {out:?}");
+        (answered, now)
+    }
+
+    /// A one-byte PUT's critical path, the release gate's object: its placement, answered by the
+    /// node with no flush; its three chunks at once, each one volume flush, the Block write waiting
+    /// for the last of them; then the Block and File writes at once, each two flushes; then the
+    /// Name write, two flushes, asked only once both answered. Five flushes in all, the slowest
+    /// chunk's and two for each of two rounds of commands, where research/71 counted seven from
+    /// before the File write went beside the Block's (docs/design/gateway.md §2.2). Every edge is
+    /// one the design orders: a block's row after its chunks (gateway.md §2, step 4), the file's
+    /// after the body's end and its blocks' chunks (step 5), and the name after its file and
+    /// blocks (step 6); gateway.md §2.3 gives each edge's reason.
+    #[test]
+    fn a_one_byte_puts_critical_path_is_its_slowest_chunk_then_two_rounds_of_commands() {
+        let mut put = one_byte();
+        assert_eq!(put.feed(b"x").unwrap(), 1);
+        put.end(&Expected::default()).unwrap();
+        let (answered, path) = replay(put);
+        assert_eq!(
+            answered,
+            [
+                (Kind::Place, 0, 0),
+                (Kind::Chunk, 0, 1),
+                (Kind::Chunk, 0, 1),
+                (Kind::Chunk, 0, 1),
+                (Kind::Block, 1, 3),
+                (Kind::File, 1, 3),
+                (Kind::Name, 3, 5),
+            ]
+        );
+        assert_eq!(path, 5);
     }
 }

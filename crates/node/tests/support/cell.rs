@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Weak, mpsc};
 use std::task::Waker;
 use std::time::Duration;
 
@@ -834,6 +834,9 @@ pub struct Member {
     /// While set, its next write of a range's entries is torn ([`Sim::tear_next_entry`]), leaked
     /// as `hold` is.
     tear: &'static AtomicBool,
+    /// Its log while it runs, for the log's counters ([`Sim::log_stats`]): weak, so a power cut
+    /// still takes the log back whole once the node gives it up (`only`).
+    log: Option<Weak<Log<SimFile>>>,
 }
 
 /// What a node's log held when it was opened again: what the open found past its last frame that
@@ -1043,6 +1046,7 @@ impl Sim {
                     load: Box::leak(Box::new(AtomicU64::new(0))),
                     answer: Box::leak(Box::new(AtomicU64::new(0))),
                     tear: Box::leak(Box::new(AtomicBool::new(false))),
+                    log: None,
                 },
             );
         }
@@ -1159,6 +1163,7 @@ impl Sim {
             answer: self.members[&id].answer,
         };
         let member = self.members.get_mut(&id).unwrap();
+        member.log = Some(Arc::downgrade(&log.log));
         member.orders = Some(orders);
         member.faults = Some(faults);
         member.refusals = Some(refusals);
@@ -1354,6 +1359,13 @@ impl Sim {
         member.status = None;
         member.leads = Leads::default();
         member.down = Some((file, engines));
+    }
+
+    /// Node `id`'s log's counters, while the node runs: its frames, the confirmations it wrote on
+    /// their own and its flushes (`LogStats`).
+    pub fn log_stats(&self, id: u64) -> Option<Box<LogStats>> {
+        let log = self.members.get(&id)?.log.as_ref()?.upgrade()?;
+        log.stats(None).ok()
     }
 
     /// Holds node `id`'s range writes unanswered, or lets them be answered again: held, each write

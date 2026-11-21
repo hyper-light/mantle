@@ -216,12 +216,13 @@ and the writer answers a frame at its flush where the owner's two decisions allo
 hyper-log `AtFlush`). Neither decision is taken, so on every device a frame is still answered
 only once confirmed, as raft-log.md §6 describes.
 
-A PUT's critical path holds seven flushes: the slowest replica's chunk, then the Block, File and
+A PUT's critical path held seven flushes: the slowest replica's chunk, then the Block, File and
 Name commands, each a frame flushed and then confirmed by a second durable write (research/71,
-step 9). The confirmation exists so that recovery can tell a frame torn by a crash from one
-damaged after it was answered (raft-log.md §6, step 5). This section drops it: three of the
-seven flushes leave the path, and recovery does what protocol-aware recovery does with an entry
-it cannot place, asking the group.
+step 9); five since the File command went beside the Block's (gateway.md §2.2, §2.3). The
+confirmation exists so that recovery can tell a frame torn by a crash from one damaged after it
+was answered (raft-log.md §6, step 5). This section drops it: three of the seven flushes leave
+the path, two of the five, and recovery does what protocol-aware recovery does with an entry it
+cannot place, asking the group.
 
 ### 7.1 The rule
 

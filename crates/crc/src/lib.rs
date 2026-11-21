@@ -37,6 +37,10 @@ pub fn crc32c(data: &[u8]) -> u32 {
 /// zlib's CRC combination (crc32.c: `multmodp`, `x2nmodp`, `crc32_combine64`) for one
 /// bit-reflected CRC whose register starts and ends inverted, as CRC-32, CRC-32C and
 /// CRC-64/NVME all do: then `crc(a ‖ b) = crc(a) · x^(8·|b|) ⊕ crc(b)` modulo the polynomial.
+/// The powers x^(2^k) a shift of a u64 of bytes takes: k from 0 through 3 + 63, the byte length's
+/// 64 bits each 3 doublings past a bit (8 = 2^3).
+const X2N_POWERS: usize = u64::BITS as usize + 3;
+
 macro_rules! reflected_crc {
     ($module:ident, $word:ty, $bits:literal, $poly:literal) => {
         mod $module {
@@ -62,9 +66,13 @@ macro_rules! reflected_crc {
                 p
             }
 
-            /// x^(2^k) modulo the polynomial, for k in 0..bits.
-            const X2N: [$word; $bits] = {
-                let mut table = [0; $bits];
+            /// x^(2^k) modulo the polynomial, for every k a byte length's bit count reaches: a
+            /// u64 of bytes is 3 more doublings (8 = 2^3) past its 64 bits. zlib's x2nmodp keeps
+            /// 32 and wraps k at 32, which holds only where x^(2^32) is x modulo the polynomial;
+            /// CRC-32C's is not (combining past 2^29 bytes, 2^32 bits, came out wrong: a range's
+            /// image of 556 MB failed its own check), so every power is kept, none wrapped.
+            const X2N: [$word; super::X2N_POWERS] = {
+                let mut table = [0; super::X2N_POWERS];
                 let mut p: $word = TOP >> 1; // x^1
                 let mut rest: &mut [$word] = &mut table;
                 while let Some((slot, tail)) = rest.split_first_mut() {
@@ -82,7 +90,7 @@ macro_rules! reflected_crc {
                 let mut k: usize = 3; // 8 = 2^3
                 while n != 0 {
                     if n & 1 != 0 {
-                        p = multmodp(X2N.get(k % $bits).copied().unwrap_or(TOP), p);
+                        p = multmodp(X2N.get(k).copied().unwrap_or(TOP), p);
                     }
                     n >>= 1;
                     k = k.wrapping_add(1);
@@ -252,6 +260,55 @@ mod tests {
         assert_eq!(crc32c(&inc), 0x46DD_794E);
         let dec: Vec<u8> = (0u8..32).rev().collect();
         assert_eq!(crc32c(&dec), 0x113F_DB5C);
+    }
+
+    /// Combining past 2^29 bytes (2^32 bits): the shift's powers x^(2^k) run past k = 31 there.
+    /// zlib's table wraps k at 32, which holds only where x^(2^32) is x modulo the polynomial;
+    /// CRC-32C's is not, and a range's image of 556 MB carried a checksum its own bytes did not
+    /// give. Checked against the power reached by squaring, which every polynomial obeys:
+    /// x^(8·2n) = (x^(8·n))², so the shift past 2n bytes is the shift past n bytes squared.
+    #[test]
+    fn a_shift_past_512_mib_is_the_square_of_the_shift_past_half_of_it() {
+        for n in [
+            1u64 << 28,
+            1 << 29,
+            1 << 30,
+            1 << 31,
+            1 << 40,
+            1 << 62,
+            (1 << 62) + 12_345,
+        ] {
+            let half = c32c::shift_operator(n);
+            assert_eq!(
+                c32c::shift_operator(2 * n),
+                c32c::multmodp(half, half),
+                "CRC-32C, {n} bytes doubled"
+            );
+            let half = c32::shift_operator(n);
+            assert_eq!(
+                c32::shift_operator(2 * n),
+                c32::multmodp(half, half),
+                "CRC-32, {n} bytes doubled"
+            );
+            let half = c64nvme::shift_operator(n);
+            assert_eq!(
+                c64nvme::shift_operator(2 * n),
+                c64nvme::multmodp(half, half),
+                "CRC-64, {n} bytes doubled"
+            );
+        }
+        // And combining an image's head with rows of exactly 2^29 bytes, as a range's did.
+        let head = crc32c(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let rows_crc = 0x1234_5678;
+        let n = 1u64 << 29;
+        let stepped = (0..2).fold(head, |acc, _| crc32c_combine(acc, 0, n / 2));
+        // crc(a ‖ b) = crc(a)·x^(8|b|) ⊕ crc(b): two halves of zero-CRC padding compose.
+        let whole_shift = crc32c_combine(head, 0, n);
+        assert_eq!(
+            whole_shift, stepped,
+            "a shift past 2^29 bytes is two shifts past 2^28"
+        );
+        assert_ne!(crc32c_combine(head, rows_crc, n), rows_crc ^ head);
     }
 
     #[test]

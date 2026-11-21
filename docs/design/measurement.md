@@ -376,7 +376,17 @@ stock clients stay the correctness suite.
   best step's before it, and the ladder ends three steps after the last that grew, BBR's count
   before it calls a pipe full (Linux `tcp_bbr.c`, `bbr_full_bw_cnt`): a ladder that stopped at
   the first step not a tenth above the last stopped where one noisy step fell, its best 66 and 156
-  PUTs a second in two runs of one build (measurements/2026-11-14-the-ladder-paced.md). A step in
+  PUTs a second in two runs of one build (measurements/2026-11-14-the-ladder-paced.md). Where either
+  step carries no interval of its median (its rounds ordered in time, too few for one, or a step
+  not judged in rounds), the step grows where its median is at least 5/4 of the best's, BBR's own
+  test of growth after its rate doubles (`bbr_full_bw_thresh`; research/87 [6]). The least and
+  most of rounds ordered in time are no interval: they span every state the rounds passed through,
+  so a step whose median doubled could lie within its best's, and the HTTP door's GET ladder of
+  2026-11-20 (`--sizes 1 --objects 0 --kinds PUT,GET --load closed --clients 2048`, Mac Studio)
+  took 1, 2, 4 and 8 clients and ended, its best 1,375.8 a second at 8, nothing refused or
+  unanswered: three steps without growth, the one end that says no line of its own, as a ladder of
+  steps so bounded ends while its median doubles
+  (`a_ladder_climbs_through_steps_whose_rounds_carry_no_interval`). A step in
   rounds also ends at its first operation refused, or unanswered, throttled or lost on each attempt
   the AWS SDKs give one (research/73), and the ladder ends at any step not every operation of which
   was answered as asked, one refused, unanswered or failing its check, that step not its best: the
@@ -418,7 +428,16 @@ stock clients stay the correctness suite.
 - **Controls**: a door's three controls run on its cell before its phases, while the cell can take
   their objects' puts; where it does not, the run says they could not run and why, not a count
   caught of controls that never ran (the run above said `controls caught 0 of 6` on its full cell),
-  and the run is not exact. `--smoke` requires all six caught.
+  and the run is not exact. `--smoke` requires all six caught. A control's put is asked again with
+  its identity where it was throttled or lost, as every operation is, and where the cell failed it
+  past its start (the native door's `Failed`, S3's `500 InternalError`), which S3 says to ask again
+  (research/05 §11.1) and the node answers from what it made, after a pause drawn as a throttled
+  one's, within mantle-client's three attempts: a cell just made failed `control/native/a` so with
+  no load on it (`--load open:9000 --clients 512`, 2026-11-20), and the run's controls went unrun
+  though every check of its 400,002 operations was exact. A phase's operation failed so is not
+  asked again: it is the cell's refusal of the load offered, counted as one. A put not made on its
+  every attempt says the answer of its last, S3's code beside the native status, and how often it
+  was asked.
 - **Stops**: each phase says how long the harness's process went without running past the 10 ms
   waits a thread of its asks, the sum and the longest. A process stopped whole (a frozen cgroup,
   a pacer duty-cycling the work it runs) stops the cell and its clients together, and every

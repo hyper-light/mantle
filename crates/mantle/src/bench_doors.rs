@@ -59,7 +59,8 @@
 //! each thread's own CPU, allocations and wire summed into the phase's ([`Driven`]); open loop,
 //! their requests arrive as a Poisson process and each waits for a free client; closed, a ladder
 //! of clients doubles while throughput grows, up to `--clients`, each step judged in rounds as a
-//! benchmark point is (measurement.md §5, [`ROUNDS`]) and its growth told by their intervals, the
+//! benchmark point is (measurement.md §5, [`ROUNDS`]) and its growth told by their intervals, or
+//! where a step's rounds carry none by BBR's 5/4 of its median ([`GROWTH`]), the
 //! ladder ending three steps after the last that grew ([`FLAT`]), or at a step not every operation
 //! of which was answered as asked, which asks no more once one is refused or unanswered and whose
 //! first refusal the ladder's end says, its best the best clean step ([`Climb::after`]). Every
@@ -148,6 +149,13 @@ const ROUNDS: Policy = Policy::STANDARD;
 /// `net/ipv4/tcp_bbr.c`, `bbr_full_bw_cnt`; research/87 [6]), so one step a stall slowed does not
 /// end the ladder below its knee, and the steps past it are measured.
 const FLAT: u32 = 3;
+
+/// The growth over the best step before it that counts a closed step as grown where either carries
+/// no interval of its median (rounds ordered in time, too few, or a step not judged in rounds):
+/// BBR's own test of growth after a doubling, a rate at least 5/4 the rate before it (Linux v6.12
+/// `net/ipv4/tcp_bbr.c`, `bbr_full_bw_thresh`; research/87 [6]), which its startup applies to the
+/// same question the ladder asks, whether doubling what is sent grew what is delivered.
+const GROWTH: f64 = 1.25;
 
 /// The wait the harness's watch asks at a time ([`Watch`]): long enough that Linux's default timer
 /// slack, 50 µs a wait (prctl(2), `PR_SET_TIMERSLACK`), adds under a tenth of [`ROUNDS`]'s ±5% to
@@ -562,6 +570,12 @@ enum Came {
     /// The server answered with a refusal (an HTTP status past 2xx), or an operation needed what a
     /// refused one would have made: a failure, which against an endpoint may exclude its phase.
     Refused(String),
+    /// The server answered that the operation failed past its start, the native door's `Failed`
+    /// and S3's `500 InternalError`: a put may not have committed, and asked again with its
+    /// identity it is answered from what it made (`Status::Failed`), as S3 says to ask one again
+    /// (research/05 §11.1). A phase counts it refused, as [`Came::Refused`]; a control's put asks
+    /// it again ([`Work::control_again`]).
+    Internal(String),
     /// Refused `SlowDown` (503): asked again as the AWS SDKs ask a throttled request again. A
     /// native reply's cause beside it, which the S3 door says in its message instead.
     Slowed(Option<Slowed>),
@@ -1419,7 +1433,7 @@ impl Tally {
                 self.differed = self.differed.saturating_add(1);
                 self.keep_first(Failure::Check, why);
             }
-            Came::Refused(why) => {
+            Came::Refused(why) | Came::Internal(why) => {
                 self.failed = self.failed.saturating_add(1);
                 self.refused = self.refused.saturating_add(1);
                 self.keep_first(Failure::Refusal, why);
@@ -1475,8 +1489,24 @@ fn served(came: &Came) -> bool {
 fn refuses(came: &Came) -> bool {
     matches!(
         came,
-        Came::Refused(_) | Came::Unanswered(_) | Came::Lost(_) | Came::Slowed(_)
+        Came::Refused(_)
+            | Came::Internal(_)
+            | Came::Unanswered(_)
+            | Came::Lost(_)
+            | Came::Slowed(_)
     )
+}
+
+/// Whether an operation's outcome is asked again, as the AWS SDKs ask a request again: throttled
+/// (`SlowDown`), or its exchange ended unanswered ([`Work::again_after`]).
+fn asked_again(came: &Came) -> bool {
+    matches!(came, Came::Slowed(_) | Came::Lost(_))
+}
+
+/// Whether a control's put is asked again: where any operation is ([`asked_again`]), and where the
+/// server failed it past its start ([`Came::Internal`], [`Work::control_again`]).
+fn control_asked_again(came: &Came) -> bool {
+    asked_again(came) || matches!(came, Came::Internal(_))
 }
 
 /// When a phase's operations are to start: each one's index, and its intended start on the
@@ -1655,14 +1685,16 @@ fn step_ops(clients: usize) -> Result<u64, Error> {
 }
 
 /// A closed step's throughput as its rounds judged it: the median of its state of most rounds,
-/// and the bounds its growth is told by, its median's 95% interval, or the least and most its
-/// rounds measured where they carry none (rounds ordered in time, or too few).
+/// and the bounds its line says, its median's 95% interval, or the least and most its rounds
+/// measured where they carry none (rounds ordered in time, or too few).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Stepped {
     clients: usize,
     median: f64,
     low: f64,
     high: f64,
+    /// Whether `low` and `high` are its median's 95% interval.
+    interval: bool,
 }
 
 impl Stepped {
@@ -1679,12 +1711,38 @@ impl Stepped {
             median: state.median,
             low,
             high,
+            interval: state.interval.is_some(),
         })
+    }
+
+    /// A step not judged in rounds, or whose rounds kept none: its one throughput, no interval.
+    fn point(clients: usize, rate: f64) -> Self {
+        Self {
+            clients,
+            median: rate,
+            low: rate,
+            high: rate,
+            interval: false,
+        }
+    }
+
+    /// Whether this step grew past `best`: where both carry their median's interval, its interval
+    /// lies wholly above `best`'s; where either carries none, its median is at least [`GROWTH`]
+    /// times `best`'s. The least and most of rounds ordered in time are no interval of the median:
+    /// they span every state the rounds passed through, so a step whose median doubled could lie
+    /// within them, and a ladder whose steps' rounds were ordered ended [`FLAT`] steps in while
+    /// its throughput still doubled with its clients.
+    fn grew_past(&self, best: &Self) -> bool {
+        if self.interval && best.interval {
+            self.low > best.high
+        } else {
+            self.median >= best.median * GROWTH
+        }
     }
 }
 
 /// Where a closed ladder stands after a step: the best clean step so far, of the greatest median;
-/// the steps in a row since one grew, its interval wholly above the best's; and whether it ends.
+/// the steps in a row since one grew past the best ([`Stepped::grew_past`]); and whether it ends.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Climb {
     best: Option<Stepped>,
@@ -1703,7 +1761,7 @@ impl Climb {
         if !clean {
             return false;
         }
-        let grew = self.best.is_none_or(|best| step.low > best.high);
+        let grew = self.best.is_none_or(|best| step.grew_past(&best));
         if self.best.is_none_or(|best| step.median > best.median) {
             self.best = Some(step);
         }
@@ -1972,13 +2030,37 @@ impl Work {
     /// whose exchange ended unanswered at once, each up to mantle-client's attempts in all. Counts
     /// the asking in `again` and in the phase's.
     async fn again_after(&self, came: &Came, j: u64, again: &mut u32) -> Result<bool, Error> {
-        let retry = matches!(came, Came::Slowed(_) | Came::Lost(_));
+        self.ask_again(asked_again(came), came, j, again).await
+    }
+
+    /// Whether a control's put `j` is asked again after `came`: where [`Work::again_after`] asks
+    /// an operation again, and where the server failed it past its start ([`Came::Internal`]),
+    /// after a pause drawn as a throttled one's, as botocore's standard retry mode asks a `500`
+    /// again, within the same attempts. A phase counts that failure as the cell's refusal of its
+    /// load; a control's object is the run's setup, which every check it makes needs put, and a
+    /// cell just made, its controls put before any phase's load, failed one past its start (the
+    /// native door's `control/native/a`, `--load open:9000 --clients 512`, 2026-11-20).
+    async fn control_again(&self, came: &Came, j: u64, again: &mut u32) -> Result<bool, Error> {
+        self.ask_again(control_asked_again(came), came, j, again)
+            .await
+    }
+
+    /// Asks operation `j` again where `retry`, up to mantle-client's attempts in all: at once
+    /// after an exchange that ended unanswered, after a pause otherwise. Counts the asking in
+    /// `again` and in the phase's.
+    async fn ask_again(
+        &self,
+        retry: bool,
+        came: &Came,
+        j: u64,
+        again: &mut u32,
+    ) -> Result<bool, Error> {
         if !retry || again.saturating_add(1) >= mantle_client::ATTEMPTS {
             return Ok(false);
         }
         *again = again.saturating_add(1);
         self.again.fetch_add(1, Ordering::Relaxed);
-        if matches!(came, Came::Slowed(_)) {
+        if matches!(came, Came::Slowed(_) | Came::Internal(_)) {
             let cap = SLOWED_BASE_NS
                 .saturating_mul(
                     1u64.checked_shl(again.saturating_sub(1))
@@ -2009,6 +2091,10 @@ impl Work {
                 Came::Unanswered(format!("SlowDown, asked {asked} times: {}", cause.words()))
             }
             Came::Lost(why) => Came::Unanswered(format!("unanswered ({why}), asked {asked} times")),
+            // A control's put asked again, each attempt failed past its start.
+            Came::Internal(why) if again > 0 => {
+                Came::Internal(format!("{why}, asked {asked} times"))
+            }
             came => came,
         }
     }
@@ -2080,12 +2166,18 @@ impl Work {
         let bucket = BUCKET.to_owned();
         // A read is asked only of an object whose put was acknowledged (`Work::key`), so one with no
         // such key is an acknowledged object missing: a check's failure. Every other status past
-        // done is the server's refusal.
+        // done is the server's refusal, a failure past its start said as S3 says it: the native
+        // reply names no cause beside it.
         let reads = matches!(self.kind, Kind::Get | Kind::Range | Kind::Head);
         let refused = |reply: &Reply| {
             if reads && reply.status == Status::NoSuchKey {
                 Came::Failed(format!(
                     "an acknowledged object missing: {:?}",
+                    reply.status
+                ))
+            } else if reply.status == Status::Failed {
+                Came::Internal(format!(
+                    "{:?}, S3's 500 InternalError: the node failed the operation past its start",
                     reply.status
                 ))
             } else {
@@ -2405,6 +2497,8 @@ impl Work {
             );
             if reads && answer.status == 404 {
                 Came::Failed(format!("an acknowledged object missing: {said}"))
+            } else if answer.status == 500 {
+                Came::Internal(said)
             } else {
                 Came::Refused(said)
             }
@@ -3834,18 +3928,12 @@ impl<'o> Bench<'o> {
         };
         self.line(out, &measured, (&before, &after))?;
         // A step not judged in rounds, or whose rounds kept none, is its one throughput.
-        let point = Stepped {
-            clients,
-            median: rate,
-            low: rate,
-            high: rate,
-        };
         Ok((
             ops,
             judged
                 .as_ref()
                 .and_then(|j| Stepped::of(clients, j))
-                .unwrap_or(point),
+                .unwrap_or_else(|| Stepped::point(clients, rate)),
             measured.tally,
         ))
     }
@@ -4112,13 +4200,13 @@ impl<'o> Bench<'o> {
     /// A phase's steps: open loop, one of `n` operations from `from` on `--clients` clients;
     /// closed, a ladder from one client doubling up to `--clients`, each step judged in rounds
     /// ([`ROUNDS`]) where `n` holds them and asking at most `n` operations further on, and ending
-    /// [`FLAT`] steps after the last whose interval lay wholly above the best's before it, or at a
-    /// step not every operation of which was answered as asked, one refused, unanswered or failing
-    /// its check, which is not its best and whose line says so and why ([`Climb::after`]). A step
-    /// whose `n` holds no judged rounds (a large object's, its bytes capped) is its one throughput.
-    /// Every throughput is the operations answered as asked ([`Tally::goodput`]). Operations end
-    /// at `end` where the phase's keys end; `finish` runs what the ladder left of them at its best
-    /// step's clients. Says how far the steps went.
+    /// [`FLAT`] steps after the last that grew past the best before it ([`Stepped::grew_past`]),
+    /// or at a step not every operation of which was answered as asked, one refused, unanswered or
+    /// failing its check, which is not its best and whose line says so and why
+    /// ([`Climb::after`]). A step whose `n` holds no judged rounds (a large object's, its bytes
+    /// capped) is its one throughput. Every throughput is the operations answered as asked
+    /// ([`Tally::goodput`]). Operations end at `end` where the phase's keys end; `finish` runs
+    /// what the ladder left of them at its best step's clients. Says how far the steps went.
     fn ladder(
         &mut self,
         out: &mut impl Write,
@@ -5095,8 +5183,10 @@ impl Bench<'_> {
             .rt
             .block_on(async move {
                 let mut logical = logical;
-                // Each object put as every operation is, asked again where throttled or lost
-                // (`Work::again_after`); one never put leaves this door's controls unrun.
+                // Each object put as every operation is, asked again with its identity where
+                // throttled, lost or failed past its start, within mantle-client's attempts
+                // (`Work::control_again`); one never put leaves this door's controls unrun, and the
+                // run says the last attempt's answer and how often it was asked.
                 for (j, name) in [(0u64, 'a'), (1, 'b')] {
                     let key = control_key(door, name);
                     let object = generator.object(&key).map_err(failed)?;
@@ -5114,7 +5204,7 @@ impl Bench<'_> {
                                     .await?
                             }
                         };
-                        if !work.again_after(&came, j, &mut again).await? {
+                        if !work.control_again(&came, j, &mut again).await? {
                             break work.settled(came, again);
                         }
                     };
@@ -5122,6 +5212,7 @@ impl Bench<'_> {
                         Came::Done => continue,
                         Came::Failed(why)
                         | Came::Refused(why)
+                        | Came::Internal(why)
                         | Came::Differed(why)
                         | Came::Unanswered(why)
                         | Came::Lost(why) => why,
@@ -5803,6 +5894,7 @@ mod tests {
             median,
             low: median - half,
             high: median + half,
+            interval: true,
         };
         let mut climb = Climb {
             best: None,
@@ -5819,6 +5911,73 @@ mod tests {
         assert_eq!(climb.best.unwrap().clients, 16);
     }
 
+    /// A step whose rounds were ordered in time carries no interval of its median, only the least
+    /// and most its rounds measured, and grows past the best where its median is at least BBR's
+    /// 5/4 of the best's. The HTTP door's GET ladder of 2026-11-20 (`--sizes 1 --objects 0 --kinds
+    /// PUT,GET --load closed --clients 2048`) took 1, 2, 4 and 8 clients and ended, its best
+    /// 1,375.8 a second at 8, nothing refused or unanswered: three steps without growth, the one
+    /// end that says no line of its own. Rounds that rise through each step leave each step's least
+    /// below its best's most, so a ladder told by those bounds ends there while its medians double;
+    /// told by the medians, it climbs while they grow a quarter a step, and still ends three steps
+    /// after the last that did.
+    #[test]
+    fn a_ladder_climbs_through_steps_whose_rounds_carry_no_interval() {
+        // Thirty rounds rising evenly from half the step's median to half again: ordered in time.
+        let ordered = |clients: usize, median: f64| {
+            let rates: Vec<f64> = (0..30u32)
+                .map(|i| median * (0.5 + f64::from(i) / 29.0))
+                .collect();
+            let judged = rounds::judge(&rates);
+            assert_eq!(judged.order, rounds::Order::Persistent);
+            let step = Stepped::of(clients, &judged).unwrap();
+            assert!(!step.interval);
+            assert!((step.median - median).abs() < 1e-6 * median);
+            step
+        };
+        let mut climb = Climb {
+            best: None,
+            flat: 0,
+        };
+        for (clients, median) in [(1, 172.0), (2, 344.0), (4, 688.0), (8, 1_375.8)] {
+            let step = ordered(clients, median);
+            if let Some(best) = climb.best {
+                // The bounds the ladder told growth by before: none of these steps cleared them.
+                assert!(step.low <= best.high, "{clients} clients");
+                assert!(step.grew_past(&best), "{clients} clients");
+            }
+            assert!(
+                climb.after(step, true),
+                "the ladder ended at {clients} clients"
+            );
+            assert_eq!(climb.flat, 0);
+        }
+        assert!(climb.after(ordered(16, 2_751.6), true));
+        // A tenth and then a thirtieth more: the best moves to each, and neither grew.
+        assert!(climb.after(ordered(32, 3_000.0), true));
+        assert!(climb.after(ordered(64, 3_100.0), true));
+        assert!(!climb.after(ordered(128, 3_050.0), true));
+        assert_eq!(climb.best.unwrap().clients, 64);
+
+        // Where either step carries no interval, the medians tell growth, whichever it is.
+        let interval = |clients, median: f64| Stepped {
+            clients,
+            median,
+            low: median * 0.99,
+            high: median * 1.01,
+            interval: true,
+        };
+        assert!(!ordered(8, 1_100.0).grew_past(&interval(4, 1_000.0)));
+        assert!(ordered(8, 1_250.0).grew_past(&interval(4, 1_000.0)));
+        assert!(!interval(8, 1_200.0).grew_past(&ordered(4, 1_000.0)));
+        assert!(interval(8, 1_250.0).grew_past(&ordered(4, 1_000.0)));
+        // A step not judged in rounds is its one throughput, and grows the same way.
+        assert!(!Stepped::point(2, 120.0).grew_past(&Stepped::point(1, 100.0)));
+        assert!(Stepped::point(2, 125.0).grew_past(&Stepped::point(1, 100.0)));
+        // Both with intervals, growth is still told by them: a tenth above, clear of the best's.
+        assert!(interval(8, 1_100.0).grew_past(&interval(4, 1_000.0)));
+        assert!(!interval(8, 1_010.0).grew_past(&interval(4, 1_000.0)));
+    }
+
     /// A step that left an operation unanswered ends the ladder at once, however its throughput
     /// grew, and is not its best: the best stays the last step whose every operation was answered.
     #[test]
@@ -5828,6 +5987,7 @@ mod tests {
             median,
             low: median - 1.0,
             high: median + 1.0,
+            interval: true,
         };
         let mut climb = Climb {
             best: None,
@@ -5898,6 +6058,7 @@ mod tests {
             median,
             low: median - 1.0,
             high: median + 1.0,
+            interval: true,
         };
         let mut climb = Climb {
             best: None,
@@ -5919,6 +6080,88 @@ mod tests {
         };
         assert!(!first.after(step(1, 15_453.0), refused.clean()));
         assert_eq!(first.best, None);
+    }
+
+    /// A control's put is asked again with its identity where the cell failed it past its start
+    /// (the native door's `Failed`, S3's `500 InternalError`), as S3 says to ask one again, and
+    /// where throttled or lost, within mantle-client's attempts; a phase's operation is not asked
+    /// again on such a failure, which it counts refused, its step not clean. A control's put not
+    /// made on its every attempt says the server's answer and how often it was asked, not
+    /// `Failed` alone.
+    #[test]
+    fn a_controls_put_is_asked_again_where_the_cell_failed_it_past_its_start() {
+        let internal = || {
+            Came::Internal(
+                "Failed, S3's 500 InternalError: the node failed the operation past its start"
+                    .to_owned(),
+            )
+        };
+        assert!(control_asked_again(&internal()));
+        assert!(!asked_again(&internal()));
+        for came in [Came::Slowed(None), Came::Lost("reset".to_owned())] {
+            assert!(asked_again(&came) && control_asked_again(&came));
+        }
+        for came in [
+            Came::Done,
+            Came::Skipped,
+            Came::Refused("NoSuchBucket".to_owned()),
+            Came::Failed("ETag".to_owned()),
+            Came::Differed("byte 7".to_owned()),
+            Came::Unanswered("SlowDown, asked 3 times".to_owned()),
+        ] {
+            assert!(!control_asked_again(&came));
+        }
+        let tally = tallied([Came::Done, internal()]);
+        assert_eq!((tally.refused, tally.failed, tally.answered), (1, 1, 1));
+        assert!(!tally.clean());
+        assert!(refuses(&internal()));
+        assert_eq!(
+            tally.why().map(|(tag, _)| tag),
+            Some(Failure::Refusal.tag())
+        );
+
+        let generator = Arc::new(Generator::new(9).unwrap());
+        let work = Work {
+            door: Door::Native,
+            kind: Kind::Put,
+            keys: Keys::Sized {
+                size: CONTROL,
+                kind: 'c',
+                made: None,
+            },
+            generator,
+            etags: Arc::new(Vec::new()),
+            uploads: lock_of(Vec::new()),
+            oracle: lock_of(Oracle::new(0).unwrap()),
+            listing: lock_of(Paging::default()),
+            again: AtomicU64::new(0),
+        };
+        // Asked at most mantle-client's attempts in all: a lost exchange is asked again at once,
+        // so its decision needs no runtime's timers.
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let lost = Came::Lost("its exchange ended unanswered".to_owned());
+        let (mut again, mut asked) = (0u32, 1u32);
+        loop {
+            let polled =
+                std::pin::pin!(work.control_again(&lost, 0, &mut again)).poll(&mut context);
+            match polled {
+                std::task::Poll::Ready(Ok(true)) => asked += 1,
+                std::task::Poll::Ready(Ok(false)) => break,
+                _ => panic!("a lost exchange is asked again at once"),
+            }
+        }
+        assert_eq!(asked, mantle_client::ATTEMPTS);
+        assert_eq!(work.again.load(Ordering::Relaxed), u64::from(again));
+        let said = |came: Came| match came {
+            Came::Internal(why) => why,
+            _ => panic!("still the server's failure past its start"),
+        };
+        let last = said(work.settled(internal(), mantle_client::ATTEMPTS - 1));
+        assert!(last.starts_with("Failed, S3's 500 InternalError"), "{last}");
+        let attempts = format!(", asked {} times", mantle_client::ATTEMPTS);
+        assert!(last.ends_with(&attempts), "{last}");
+        // Asked once, as a phase asks it, it says the answer alone.
+        assert!(!said(work.settled(internal(), 0)).contains("asked"));
     }
 
     /// A phase's throughput counts only the operations answered as asked: the refused, the

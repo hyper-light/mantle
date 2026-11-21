@@ -32,6 +32,14 @@
 //!   never used (replica.md §6), and an original node then stops, so the quorum counts the new
 //!   one: the clients' history through both is linearizable, no acknowledged write lost.
 //!
+//! - A cell whose nodes host objects and serve both doors (`support/doors.rs`): each node hosts a
+//!   range of every layer, keeps a chunk volume, enlists it, and serves the native protocol and
+//!   S3, asked by mantle-client and by a SigV4-signed S3 client. A fresh cell's first put through
+//!   either door, asked the moment its node is enlisted, is never answered `Failed` (S3's `500`);
+//!   an object of one byte or 64 KiB put through either door is read at once through both, on
+//!   another node; and puts through both doors while leader balancing hands the leads over are
+//!   each acknowledged, none `Failed`, and each read back whole.
+//!
 //! The cut and the linearizable histories run on cells of three voters and of five (node.md's
 //! Phase C).
 //!
@@ -108,7 +116,7 @@ use mantle_node::node::{
 use mantle_node::read::{Query, Read};
 use mantle_node::storage::{Storage, VolumeSettings};
 use mantle_protocol::classes::Role;
-use mantle_protocol::node_name;
+use mantle_protocol::{client_name, node_name};
 use mantle_range::{ConfState, Range, Settings, Stored};
 
 #[allow(dead_code)]
@@ -123,6 +131,12 @@ use history::{
 #[path = "support/relay.rs"]
 mod relay;
 use relay::Relay;
+#[path = "support/doors.rs"]
+mod doors;
+#[allow(dead_code)]
+#[path = "../../mantle/tests/support/s3.rs"]
+mod s3;
+use doors::{ACCOUNT, Answered, DoorCell, Enlist, OBJECT_CLIENT, OBJECT_CLIENTS, ObjectOp};
 
 /// The range every node hosts: the cell's first Name range.
 const GROUP: u128 = 0x0072_616e_6765;
@@ -411,6 +425,9 @@ struct Pki {
     nodes: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
     /// By client id: the certificate and the key.
     clients: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
+    /// By native client id: the certificate the authority issued for the client role, acting for
+    /// the account both doors' clients act for (`doors::ACCOUNT`), and the key.
+    objects: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
     /// Every node's log: [`log_config`], unless a test states its own.
     log: LogConfig,
 }
@@ -441,11 +458,26 @@ impl Pki {
         let clients = (CLIENT..CLIENT + CLIENTS)
             .map(|id| (id, issue(&format!("client-{id}"))))
             .collect();
+        let objects = (OBJECT_CLIENT..OBJECT_CLIENT + OBJECT_CLIENTS)
+            .map(|id| {
+                let own = KeyPair::generate().unwrap();
+                let certificate = mantle_cert::client(
+                    &key,
+                    AUTHORITY,
+                    own.public_key(),
+                    (&client_name(id), ACCOUNT),
+                    (validity, drawn()),
+                )
+                .unwrap();
+                (id, (certificate, own.pkcs8().to_vec()))
+            })
+            .collect();
         Self {
             authority,
             voters,
             nodes,
             clients,
+            objects,
             log: log_config(),
         }
     }
@@ -496,6 +528,11 @@ impl Pki {
     /// Node `id`'s settings, its rows in `engine`: its range names the founding voters, whether
     /// it is one or a spare that joins as a replacement adds it.
     fn settings<E>(&self, id: u64, dir: &Path, engine: E) -> NodeSettings<E> {
+        self.settings_hosting(id, dir, vec![hosted(self.voters, engine)])
+    }
+
+    /// Node `id`'s settings, as [`Pki::settings`], hosting `ranges`.
+    fn settings_hosting<E>(&self, id: u64, dir: &Path, ranges: Vec<Hosted<E>>) -> NodeSettings<E> {
         let others: Vec<u64> = self
             .nodes
             .keys()
@@ -516,7 +553,7 @@ impl Pki {
             credentials: self.credentials(&self.nodes[&id]),
             peers,
             addresses: Vec::new(),
-            ranges: vec![hosted(self.voters, engine)],
+            ranges,
             shards: NonZeroUsize::MIN,
             log: self.log,
             // The budget a node derives, once its settings are whole ([`run`]).
@@ -2840,4 +2877,304 @@ fn chunks_a_peer_stored_read_back_after_it_stops_and_starts_again() {
         );
     }
     cell.close();
+}
+
+/// The bytes of a round trip's small object and its large one: one byte, and 64 KiB.
+const SMALL: usize = 1;
+const LARGE: usize = 64 << 10;
+/// The fresh cells whose first puts are asked under each order of enlistment, each cell a schedule
+/// of its own.
+const FRESH_CELLS: usize = 2;
+/// The most puts each door asks while the leads move: the stream's bound, which ends it should the
+/// cell's leads never move.
+const MOVING_PUTS: u64 = 512;
+/// The puts each door has acknowledged after the first hand-over was seen before the stream ends,
+/// so the hand-overs out then end under puts.
+const AFTER_MOVE: usize = 8;
+
+/// `len` bytes of object `n`, each its own of the pattern, so a read of another object's bytes or
+/// of shifted ones differs.
+fn object_bytes(n: u64, len: usize) -> Vec<u8> {
+    (0..len as u64)
+        .map(|i| (i.wrapping_mul(31).wrapping_add(n) % 251) as u8)
+        .collect()
+}
+
+/// `count` answers from `told`, each within a client's whole patience (`doors::patience`).
+fn answers(told: &mpsc::Receiver<Answered>, count: usize) -> Vec<Answered> {
+    (0..count)
+        .map(|_| {
+            told.recv_timeout(doors::patience())
+                .expect("a door's answer")
+        })
+        .collect()
+}
+
+/// Asks `ops` through `door` (`native` or `s3`) of node `at`, each answer waited for.
+fn through(cell: &DoorCell, door: &str, at: u64, ops: Vec<ObjectOp>) -> Vec<Answered> {
+    let (tell, told) = mpsc::channel();
+    let count = ops.len();
+    let thread = if door == "native" {
+        cell.native((at, OBJECT_CLIENT + at - 1), ops.into_iter(), || true, tell)
+    } else {
+        cell.s3(at, ops.into_iter(), || true, tell)
+    };
+    let answered = answers(&told, count);
+    thread.join().unwrap();
+    answered
+}
+
+/// Every answer done, or the test fails naming the first that was not.
+fn all_done(answered: &[Answered], when: &str) {
+    for a in answered {
+        assert!(
+            a.answer.is_ok(),
+            "{when}: {} {:?} answered {:?}",
+            a.door,
+            a.op,
+            a.answer.as_ref().map(Vec::len)
+        );
+    }
+}
+
+/// A fresh cell's first puts (7aafbca8's cell-level repro): through each door of each node, a
+/// bucket made as soon as the doors are bound, and a put asked the moment its node says the root
+/// range took its enlistment; or, the cell's enlistments held, the puts asked before any and the
+/// enlistments then. A node's own member of the root range may not yet have applied an enlistment,
+/// so its volume table names no volume to choose a block's scheme over; a put there waits for one
+/// or is answered `SlowDown` and asked again within its client's patience, and is never answered
+/// `Failed`, S3's `500`. [`FRESH_CELLS`] cells under each order, each its own schedule.
+#[test]
+fn a_fresh_cells_first_put_through_either_door_is_never_answered_failed() {
+    for enlist in [Enlist::AtOnce, Enlist::Held] {
+        for _ in 0..FRESH_CELLS {
+            fresh_cell(enlist);
+        }
+    }
+}
+
+fn fresh_cell(enlist: Enlist) {
+    let pki = Pki::new(NODES, NODES);
+    let mut cell = DoorCell::start(&pki, enlist);
+    let (tell, told) = mpsc::channel();
+    let mut threads = Vec::new();
+    // Each door's put, held until it is released.
+    let mut held: BTreeMap<u64, Vec<mpsc::Sender<()>>> = BTreeMap::new();
+    for id in 1..=NODES {
+        for door in ["native", "s3"] {
+            let (release, wait) = mpsc::channel::<()>();
+            held.entry(id).or_default().push(release);
+            let bucket = format!("fresh-{door}-{id}");
+            let put = ObjectOp::Put(bucket.clone(), "first".into(), object_bytes(id, SMALL));
+            let ops = std::iter::once(ObjectOp::CreateBucket(bucket)).chain(std::iter::once_with(
+                move || {
+                    let _ = wait.recv();
+                    put
+                },
+            ));
+            threads.push(if door == "native" {
+                cell.native((id, OBJECT_CLIENT + id - 1), ops, || true, tell.clone())
+            } else {
+                cell.s3(id, ops, || true, tell.clone())
+            });
+        }
+    }
+    // Only the doors' threads tell now, so one that ends unanswered ends the wait on it.
+    drop(tell);
+    let doors = threads.len();
+    let mut answered = Vec::new();
+    match enlist {
+        Enlist::AtOnce => {
+            // Each node's puts released the moment it says it is enlisted.
+            let mut released: BTreeSet<u64> = BTreeSet::new();
+            while released.len() < held.len() {
+                let id = cell.until("a node enlisted", |c| {
+                    c.enlisted
+                        .iter()
+                        .find(|id| !released.contains(*id))
+                        .copied()
+                });
+                released.insert(id);
+                for release in &held[&id] {
+                    release.send(()).unwrap();
+                }
+            }
+        }
+        Enlist::Held => {
+            // The buckets made, every put released, and only then the enlistments asked.
+            answered.extend(answers(&told, doors));
+            all_done(&answered, "a fresh cell's buckets");
+            for release in held.values().flatten() {
+                release.send(()).unwrap();
+            }
+            for id in 1..=NODES {
+                cell.enlist(id);
+            }
+        }
+    }
+    answered.extend(answers(&told, 2 * doors - answered.len()));
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    all_done(&answered, "a fresh cell's first operations");
+}
+
+/// Objects of one byte and of 64 KiB, each put through one door and read at once through both,
+/// each read on a node other than the writer's: read after write, across the doors and the nodes.
+#[test]
+fn an_object_put_through_either_door_is_read_at_once_through_both() {
+    let pki = Pki::new(NODES, NODES);
+    let mut cell = DoorCell::start(&pki, Enlist::AtOnce);
+    cell.until("every node enlisted", |c| {
+        if c.enlisted.len() == c.s3.len() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    let made = through(
+        &cell,
+        "native",
+        1,
+        vec![ObjectOp::CreateBucket("doors".into())],
+    );
+    all_done(&made, "the bucket");
+    for (n, len) in [SMALL, LARGE].into_iter().enumerate() {
+        for (writer, at) in [("native", 1), ("s3", 2)] {
+            let key = format!("{writer}-{len}");
+            let bytes = object_bytes(n as u64, len);
+            let put = ObjectOp::Put("doors".into(), key.clone(), bytes.clone());
+            all_done(&through(&cell, writer, at, vec![put]), "a put");
+            for reader in ["native", "s3"] {
+                let get = ObjectOp::Get("doors".into(), key.clone());
+                let read = through(&cell, reader, 3, vec![get]);
+                all_done(&read, "a read after its write");
+                assert!(
+                    read[0].answer.as_ref().unwrap() == &bytes,
+                    "{key} put through {writer} and read through {reader}: other bytes"
+                );
+            }
+        }
+    }
+}
+
+/// Puts through each door, one through node 1's native door and one through node 2's S3 listener,
+/// while the cell's leads move: a cell's boot elects one node in every range at once, and leader
+/// balancing hands leads over, one at a time from a node, until each node leads its share (node.md
+/// §6.7). The stream runs until
+/// some node began a hand-over and each door has had [`AFTER_MOVE`] puts acknowledged since, and
+/// no put is answered `Failed`; then each acknowledged object is read through the other door on
+/// node 3, its bytes the ones put: no acknowledged object is lost.
+#[test]
+fn puts_through_either_door_while_the_leads_move_are_each_kept() {
+    let pki = Pki::new(NODES, NODES);
+    let mut cell = DoorCell::start(&pki, Enlist::AtOnce);
+    cell.until("every node enlisted", |c| {
+        if c.enlisted.len() == c.s3.len() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    let made = through(
+        &cell,
+        "native",
+        1,
+        vec![ObjectOp::CreateBucket("moving".into())],
+    );
+    all_done(&made, "the bucket");
+    cell.heard();
+    let moves_before = cell.lead_moves();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let going = |stop: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+        let stop = stop.clone();
+        move || !stop.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let puts = |door: &'static str| {
+        (0..MOVING_PUTS).map(move |n| {
+            let len = if n % 2 == 0 { SMALL } else { LARGE };
+            ObjectOp::Put("moving".into(), format!("{door}-{n}"), object_bytes(n, len))
+        })
+    };
+    let (tell, told) = mpsc::channel();
+    let native = cell.native(
+        (1, OBJECT_CLIENT),
+        puts("native"),
+        going(&stop),
+        tell.clone(),
+    );
+    let s3 = cell.s3(2, puts("s3"), going(&stop), tell);
+    let mut acknowledged: Vec<Answered> = Vec::new();
+    let mut moved_at: Option<BTreeMap<&str, usize>> = None;
+    let mut by_door: BTreeMap<&str, usize> = BTreeMap::new();
+    loop {
+        cell.heard();
+        if moved_at.is_none() && cell.lead_moves() > moves_before {
+            moved_at = Some(by_door.clone());
+        }
+        if let Some(at) = &moved_at
+            && ["native", "s3"]
+                .iter()
+                .all(|d| by_door.get(d).unwrap_or(&0) >= &(at.get(d).unwrap_or(&0) + AFTER_MOVE))
+        {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
+        match told.recv_timeout(doors::patience()) {
+            Ok(answered) => {
+                all_done(
+                    std::slice::from_ref(&answered),
+                    "a put while the leads move",
+                );
+                *by_door.entry(answered.door).or_default() += 1;
+                acknowledged.push(answered);
+            }
+            // Both streams ended, their budget spent.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(e) => panic!("no put answered in {:?}: {e}", doors::patience()),
+        }
+    }
+    native.join().unwrap();
+    s3.join().unwrap();
+    for answered in told.try_iter() {
+        all_done(
+            std::slice::from_ref(&answered),
+            "a put while the leads move",
+        );
+        acknowledged.push(answered);
+    }
+    assert!(
+        moved_at.is_some(),
+        "no node began a hand-over while {} puts ran (leads {:?})",
+        acknowledged.len(),
+        cell.leads
+    );
+    // Each acknowledged object read through the other door, on node 3.
+    let mut reads: BTreeMap<&str, Vec<(ObjectOp, Vec<u8>)>> = BTreeMap::new();
+    for answered in &acknowledged {
+        let ObjectOp::Put(bucket, key, bytes) = &answered.op else {
+            panic!("{:?} is no put", answered.op);
+        };
+        let other = if answered.door == "native" {
+            "s3"
+        } else {
+            "native"
+        };
+        reads
+            .entry(other)
+            .or_default()
+            .push((ObjectOp::Get(bucket.clone(), key.clone()), bytes.clone()));
+    }
+    for (door, gets) in reads {
+        let (ops, put): (Vec<ObjectOp>, Vec<Vec<u8>>) = gets.into_iter().unzip();
+        let read = through(&cell, door, 3, ops);
+        all_done(&read, "an acknowledged object's read");
+        for (answered, bytes) in read.iter().zip(&put) {
+            assert!(
+                answered.answer.as_ref().unwrap() == bytes,
+                "{:?} read through {door}: other bytes than were put",
+                answered.op
+            );
+        }
+    }
 }

@@ -33,6 +33,7 @@ use mantle_meta::wire::{Answer, Command};
 use mantle_node::ask::{CommandOutcome, Wait};
 use mantle_node::derive::{Charges, charges, shard_shape};
 use mantle_node::listener::{Listener, Settings as ListenerSettings};
+use mantle_node::node::failures::Failures;
 use mantle_node::node::refusals::Refusals;
 use mantle_node::node::{GatewaySettings, Hosted, Node, NodeSettings};
 use mantle_node::process::{AccessKey, Enlisting, NativeShards, RangeShards};
@@ -271,6 +272,7 @@ fn gateway(enlist: &Enlisting) -> GatewaySettings {
         rates,
         target: TARGET,
         refusals: Refusals::default(),
+        failures: Failures::default(),
     }
 }
 

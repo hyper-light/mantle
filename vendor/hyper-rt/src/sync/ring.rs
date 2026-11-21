@@ -22,7 +22,9 @@
 //! the push could not order the two: a receiver's drop that freed a full ring's room between a sender's check
 //! and its push let the push in after the close (`tests/sync.rs`, a task waiting for room; 2 of 3 runs with
 //! 200 µs between the check and the push). A push that claimed its place before the close and published
-//! after the closer drained finds the mark after a fence and drops what is left ([`Ring::drain`]).
+//! after the closer drained finds the mark after a fence and drops what is left ([`Ring::drain`]). A drain
+//! reads the mark with Acquire before it takes anything, so the close, and the owned taker's takes before it,
+//! happen before every drain that follows it.
 //!
 //! **No spin.** A slot the consumer has claimed but not yet released reads as full, and a position a
 //! producer has claimed but not yet published reads as empty: the call returns at once and the waiter
@@ -296,8 +298,8 @@ impl<T> Ring<T> {
     /// Takes the value at the head as the ring's one taker: the primitives here take only through their one
     /// receiver until it closes the ring (`close`, in the receiver's drop), and a drain, the only other taker,
     /// begins only after that close, so while this end may take, the head is its alone and moves by a plain
-    /// store where [`Ring::pop`] claims it by a compare-and-swap. A drain that follows reads the head this end
-    /// left, or an older one it walks past as it walks past another taker's ([`Ring::pop`]).
+    /// store where [`Ring::pop`] claims it by a compare-and-swap. A drain that follows synchronizes with the
+    /// close first ([`Ring::drain`]), so its compare-and-swap reads the head this end left or a later one.
     pub(crate) fn pop_owned(&self) -> Option<T> {
         let head = self.head.0.load(Ordering::Relaxed);
         let slot = self.slot(head)?;
@@ -336,7 +338,25 @@ impl<T> Ring<T> {
     /// Drops the values in the ring, at most its capacity of them: what a closed ring holds that no one
     /// will take. Every value published before this thread's last fence is among the first that many; one
     /// published after it was published by a producer that then finds the mark and drains for itself.
+    ///
+    /// The drain reads the mark first, with Acquire, and a ring this thread does not see closed drains
+    /// nothing (mantle: vendor/UPSTREAM.md). The close is a release (SeqCst), so the read synchronizes
+    /// with it, and everything the closer did before closing happens before this drain: the owned
+    /// taker's last takes ([`Ring::pop_owned`]), whose head store is a plain one that no other taker's
+    /// compare-and-swap is otherwise ordered after. Without that edge the memory model lets a producer
+    /// that saw the mark through a Relaxed load (after its fence, which orders only its own earlier
+    /// writes) read the head and stamp from before the owner's last take and win the head's
+    /// compare-and-swap for a position the owner already took, through the cycle claim →mo owner's
+    /// head store →sb close →rf producer's look →sb claim, which no coherence or SeqCst rule forbids
+    /// (C++20 [atomics.order] p3-4; [intro.races], coherence): the value would be read and dropped
+    /// twice. With the edge, write-write coherence ([intro.races]) puts the owner's head store first,
+    /// so the claim reads the head it left. No interleaving shows that cycle, so loom cannot reach it,
+    /// and neither x86's TSO nor ARMv8, which orders the claim's store after the look it depends on,
+    /// produces it; the edge is what the language needs.
     pub(crate) fn drain(&self) {
+        if self.tail.0.load(Ordering::Acquire) & self.mark == 0 {
+            return;
+        }
         for _ in 0..self.capacity() {
             if self.pop().is_none() {
                 break;
@@ -534,6 +554,73 @@ mod tests {
         });
         assert_eq!(ring.pop(), None);
     }
+
+    /// A value that counts its drops in its own place of a test's table.
+    struct Tracked<'a> {
+        drops: &'a std::sync::atomic::AtomicU8,
+    }
+
+    impl Drop for Tracked<'_> {
+        fn drop(&mut self) {
+            self.drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A oneshot's two ends as the primitives run them, on a ring of one place: a producer pushes and, when
+    /// its fence finds the close, drains; the owned taker takes what came within a few looks, then closes
+    /// and drains. Whichever end drops the value, it is dropped once, and the ring is left empty, over many
+    /// rounds on two threads. The language-level double take [`Ring::drain`] rules out needs a cycle through
+    /// the head's modification order that neither this machine nor any interleaving produces, so this holds
+    /// the protocol, not that edge.
+    #[test]
+    fn an_owned_take_and_a_close_against_a_push_drop_each_value_once() {
+        const ROUNDS: usize = 5_000;
+        /// Looks the taker makes before it closes: enough that it takes the value in some rounds and closes
+        /// first in others.
+        const LOOKS: usize = 64;
+        let drops: Vec<std::sync::atomic::AtomicU8> = (0..ROUNDS)
+            .map(|_| std::sync::atomic::AtomicU8::new(0))
+            .collect();
+        let mut taken = 0usize;
+        for round in drops.iter() {
+            let ring = Ring::new(1).unwrap();
+            let took = std::thread::scope(|scope| {
+                let ring = &ring;
+                scope.spawn(move || match ring.push(Tracked { drops: round }) {
+                    Ok(()) => {
+                        fence(Ordering::SeqCst);
+                        if ring.is_closed() {
+                            ring.drain();
+                        }
+                    }
+                    Err(Refused::Full(value) | Refused::Closed(value)) => drop(value),
+                });
+                let mut took = false;
+                for _ in 0..LOOKS {
+                    if let Some(value) = ring.pop_owned() {
+                        drop(value);
+                        took = true;
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                ring.close();
+                ring.drain();
+                took
+            });
+            assert!(ring.pop().is_none(), "a value was left in the closed ring");
+            taken += usize::from(took);
+        }
+        for (round, count) in drops.iter().enumerate() {
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "round {round}"
+            );
+        }
+        assert!(taken > 0, "the taker never took the value");
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +723,52 @@ mod loom_tests {
                 "{pushed:?}"
             );
         });
+    }
+
+    /// Drops of the model's one value, set to none as each execution begins.
+    static DROPPED_ONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The model's value, counting its drops.
+    struct Once;
+
+    impl Drop for Once {
+        fn drop(&mut self) {
+            DROPPED_ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A oneshot's ends on a ring of one place: the producer pushes the one value and, finding the close after
+    /// its fence, drains; the owned taker, a thread of its own, takes it if it has come, then closes and drains.
+    /// Here the owned take may take the producer's own value, which the producer's drain must then never take
+    /// again: in every interleaving the value is dropped once. The language-level cycle [`Ring::drain`]'s
+    /// Acquire breaks is not an interleaving, so loom passes without it too; this holds the rest.
+    #[test]
+    fn an_owned_take_of_the_producers_value_then_a_close_drops_it_once() {
+        loom_bounds::explore(
+            "ring: the owned taker takes the value, then closes, against its producer",
+            || {
+                DROPPED_ONCE.store(0, std::sync::atomic::Ordering::Relaxed);
+                let ring: &'static Ring<Once> = Box::leak(Box::new(Ring::new(1).unwrap()));
+                let producer = loom::thread::spawn(move || match ring.push(Once) {
+                    Ok(()) => {
+                        fence(Ordering::SeqCst);
+                        if ring.is_closed() {
+                            ring.drain();
+                        }
+                    }
+                    Err(Refused::Full(value) | Refused::Closed(value)) => drop(value),
+                });
+                let receiver = loom::thread::spawn(move || {
+                    drop(ring.pop_owned());
+                    ring.close();
+                    ring.drain();
+                });
+                producer.join().unwrap();
+                receiver.join().unwrap();
+                assert!(ring.pop().is_none(), "a value was left in the closed ring");
+                assert_eq!(DROPPED_ONCE.load(std::sync::atomic::Ordering::Relaxed), 1);
+            },
+        );
     }
 
     /// A producer pushes once into a full ring of one place while a closer closes it and drains it, each a

@@ -185,28 +185,117 @@ fn read_name(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
 }
 
 /// The `SCM_TIMESTAMP_MONOTONIC` stamp among the control messages recvmsg left in `message`;
-/// `None` when the kernel attached none or truncated it.
+/// `None` when the kernel attached none or truncated it. A stamp is read only when its eight bytes
+/// end within the control bytes recvmsg wrote (mantle: vendor/UPSTREAM.md) (`msg_controllen` as the call left it): XNU's
+/// `CMSG_NXTHDR` returns a next header once the header itself fits (`<sys/socket.h>`), not its
+/// data, so after a header-only first message the next header's stamp would lie past the buffer,
+/// and a message the kernel cut short keeps the `cmsg_len` it was sent with.
 fn stamp_of(message: &libc::msghdr) -> Option<u64> {
     let whole = usize::try_from(
         // SAFETY: `CMSG_LEN` is arithmetic on its argument and reads no memory.
         unsafe { libc::CMSG_LEN(u32::try_from(size_of::<u64>()).unwrap_or(u32::MAX)) },
     )
     .ok()?;
+    let written = usize::try_from(message.msg_controllen).ok()?;
+    let end = message.msg_control.addr().checked_add(written)?;
     // SAFETY: `message` was filled by recvmsg, whose control buffer and length are its own;
     // CMSG_FIRSTHDR and CMSG_NXTHDR return headers that lie whole within `msg_controllen`, or null
-    // (cmsg(3)), and a stamp message whose `cmsg_len` covers the stamp has it at CMSG_DATA, read
-    // unaligned.
+    // (cmsg(3)), so CMSG_DATA of one is at most one past the buffer's end; the stamp is read,
+    // unaligned, only where its eight bytes end at or before `end`.
     unsafe {
         let mut at = libc::CMSG_FIRSTHDR(message);
         while let Some(header) = at.as_ref() {
+            let data = libc::CMSG_DATA(at);
             if header.cmsg_level == libc::SOL_SOCKET
                 && header.cmsg_type == SCM_TIMESTAMP_MONOTONIC
                 && usize::try_from(header.cmsg_len).is_ok_and(|length| length >= whole)
+                && data
+                    .addr()
+                    .checked_add(size_of::<u64>())
+                    .is_some_and(|stamp_end| stamp_end <= end)
             {
-                return Some(ptr::read_unaligned(libc::CMSG_DATA(at).cast::<u64>()));
+                return Some(ptr::read_unaligned(data.cast::<u64>()));
             }
             at = libc::CMSG_NXTHDR(message, at);
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One control message's header, as the kernel lays it at `at` in `bytes`: its length, level and
+    /// type, then `stamp` after it when one is given.
+    fn lay(bytes: &mut [u8], at: usize, length: u32, kind: libc::c_int, stamp: Option<u64>) {
+        let header = size_of::<libc::cmsghdr>();
+        bytes[at..at + 4].copy_from_slice(&length.to_ne_bytes());
+        bytes[at + 4..at + 8].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
+        bytes[at + 8..at + 12].copy_from_slice(&kind.to_ne_bytes());
+        if let Some(stamp) = stamp {
+            bytes[at + header..at + header + 8].copy_from_slice(&stamp.to_ne_bytes());
+        }
+    }
+
+    /// A message header over `control`, of which the kernel wrote `written` bytes.
+    fn written_into(control: &mut [u64; CONTROL_WORDS], written: usize) -> libc::msghdr {
+        // SAFETY: an all-zero `msghdr` is valid: null pointers with zero lengths.
+        let mut message: libc::msghdr = unsafe { zeroed() };
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = libc::socklen_t::try_from(written).unwrap();
+        message
+    }
+
+    fn as_words(bytes: &[u8; CONTROL_WORDS * 8]) -> [u64; CONTROL_WORDS] {
+        let mut words = [0u64; CONTROL_WORDS];
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
+            *word = u64::from_ne_bytes(chunk.try_into().unwrap());
+        }
+        words
+    }
+
+    #[test]
+    fn a_whole_stamp_is_read() {
+        let mut bytes = [0u8; CONTROL_WORDS * 8];
+        lay(
+            &mut bytes,
+            0,
+            20,
+            SCM_TIMESTAMP_MONOTONIC,
+            Some(0x0123_4567_89ab_cdef),
+        );
+        let mut control = as_words(&bytes);
+        let message = written_into(&mut control, 20);
+        assert_eq!(stamp_of(&message), Some(0x0123_4567_89ab_cdef));
+    }
+
+    /// A stamp message the kernel cut short: its header claims the stamp, but the bytes written end
+    /// before the stamp does. The bytes past them in the buffer are not the stamp.
+    #[test]
+    fn a_stamp_cut_short_is_not_read() {
+        let mut bytes = [0u8; CONTROL_WORDS * 8];
+        lay(
+            &mut bytes,
+            0,
+            20,
+            SCM_TIMESTAMP_MONOTONIC,
+            Some(0x0123_4567_89ab_cdef),
+        );
+        let mut control = as_words(&bytes);
+        let message = written_into(&mut control, 16);
+        assert_eq!(stamp_of(&message), None);
+    }
+
+    /// A header-only first message puts the next header at byte 12, whose stamp would lie at bytes 24
+    /// to 32, past the 24-byte buffer: XNU's `CMSG_NXTHDR` returns that header, and it is not read.
+    #[test]
+    fn a_stamp_past_the_buffer_is_not_read() {
+        let mut bytes = [0u8; CONTROL_WORDS * 8];
+        lay(&mut bytes, 0, 12, SCM_TIMESTAMP_MONOTONIC, None);
+        lay(&mut bytes, 12, 20, SCM_TIMESTAMP_MONOTONIC, None);
+        let mut control = as_words(&bytes);
+        let message = written_into(&mut control, CONTROL_WORDS * 8);
+        assert_eq!(stamp_of(&message), None);
+    }
 }

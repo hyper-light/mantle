@@ -584,7 +584,9 @@ pub struct Status {
     /// stream asks within its sending interval and a flush makes (hyper-liveness, timing.md §2.8:
     /// the longest interval it sends at, `PairReport::sending`, and its mean flush); then the
     /// range's expected election from a suspicion and one more round (hyper-raft's `Timing`).
-    /// `None` until both are measured.
+    /// A peer heard whose link has measured nothing yet is judged at the node's silence less its
+    /// interval (hyper-liveness `Pair::silence_margin`), so its evidence counts that silence.
+    /// `None` until a peer is heard and the election is measured.
     pub patience: Option<Duration>,
     /// Snapshots this node sent that their member took, and snapshots it took, of every range.
     pub snapshots_sent: u64,
@@ -2818,7 +2820,10 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// How long `group`'s member may go without moving while its peers live, by the node's own law
     /// ([`Status::patience`]): the longest any peer's evidence may go unmoved before it is
     /// suspected, the judge's wait for a completion of its own, then the range's expected election
-    /// and one more round. `None` until both are measured. Since hyper-liveness 2b13b15 a judge
+    /// and one more round. `None` until both are known: a peer's evidence from its first heartbeat,
+    /// the node's silence while its link measures (hyper-liveness `Pair::silence_margin`; without
+    /// it a joiner whose founder's link had not measured its first 56 latenesses as the join
+    /// completed stated none, `tests/sim.rs`, `FOUNDER_DRAWS`). Since hyper-liveness 2b13b15 a judge
     /// with nothing durable since a passed point asks no write of its own and judges on its next
     /// completion, its stream's within its sending interval. Left out, the patience a deaf leader
     /// stated was shorter than its step-down: on windows-11-arm leaders that heard no peer stopped

@@ -26,6 +26,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use hyper_block::sim::Fault as DeviceFault;
@@ -1571,8 +1572,13 @@ fn a_node_that_just_joined_meets_its_founder_loaded_after_the_join_and_suspects_
 /// taking none of its 1,777 and 1,881 while the joiner took the founder's, and never judged the
 /// joiner its promotion waits on; on the first, the joiner suspected its cut-off founder 140.0 ms
 /// after the cut, past the 139.6 ms of patience it stated. A poll past a wake now measures the
-/// granularity until a wait has (`Node::wait`). On the fourth the joiner states no patience as the
-/// join completes, no margin yet judging its founder: owed, so it is not among these tests.
+/// granularity until a wait has (`Node::wait`). On the fourth the join completed with the joiner
+/// stating no patience: it had taken 21 of the founder's heartbeats, and its link to the founder,
+/// its one peer and so all its node's evidence, had no margin before 56 latenesses, the first count
+/// at which a `τ_int` can be measured (hyper-timing `LinkEstimator::first_measure`), which came 780
+/// ms after the join, at the 57th. A heard link nothing measured judges is now judged at the node's
+/// silence less its interval (hyper-liveness `Pair::silence_margin`, Chen et al.'s `α = T_D^u −
+/// η`), so the joiner states a patience from its first heartbeat: 3.094 s at the join on seed 1.
 const FOUNDER_DRAWS: [u64; 4] = [1, 2, 3, 4];
 
 macro_rules! loaded_founder_at {
@@ -1602,6 +1608,7 @@ loaded_founder_at! {
     a_joiner_meets_its_founder_loaded_before_the_join_on_the_first_other_draw: false, 0;
     a_joiner_meets_its_founder_loaded_before_the_join_on_the_second_other_draw: false, 1;
     a_joiner_meets_its_founder_loaded_before_the_join_on_the_third_other_draw: false, 2;
+    a_joiner_meets_its_founder_loaded_before_the_join_on_the_fourth_other_draw: false, 3;
     a_joiner_meets_its_founder_loaded_after_the_join_on_the_first_other_draw: true, 0;
     a_joiner_meets_its_founder_loaded_after_the_join_on_the_second_other_draw: true, 1;
     a_joiner_meets_its_founder_loaded_after_the_join_on_the_third_other_draw: true, 2;
@@ -1613,29 +1620,7 @@ loaded_founder_at! {
 /// suspects the cut-off founder within the patience it states, and gives the times it suspected
 /// its live founder while it took [`FOUNDER_HEARTBEATS`] of its heartbeats.
 fn loaded_founder(seed: u64, after_join: bool, draw: u64) -> u64 {
-    let mut cell = Sim::with_spare_drawn(seed, 1, draw);
-    cell.until("the founder leads", |c| {
-        if c.members[&1].status.is_some_and(|s| s.leader == 1) {
-            Some(())
-        } else {
-            None
-        }
-    });
-    cell.open_bucket();
-    let ops = 2 * (log_config().group_entries + 1);
-    let stops = cell.start_workload(ops);
-    cell.done_by(ops, 1);
-    if !after_join {
-        cell.load(1, FOUNDER_LOAD_NS);
-    }
-    cell.replace(cell.nodes + 1, 2);
-    cell.until("the spare joins", |c| {
-        if c.replaced.is_empty() {
-            None
-        } else {
-            Some(())
-        }
-    });
+    let (mut cell, stops) = founder_joined(seed, after_join, draw);
     if after_join {
         cell.load(1, FOUNDER_LOAD_NS);
     }
@@ -1658,7 +1643,14 @@ fn loaded_founder(seed: u64, after_join: bool, draw: u64) -> u64 {
         if after_join {
             return c.quiet();
         }
-        let stated = c.members[&2].status.and_then(|s| s.patience).unwrap();
+        let status = c.members[&2].status.unwrap();
+        let Some(stated) = status.patience else {
+            panic!(
+                "seed {seed}: the joiner states no patience, {} of its founder's heartbeats taken, \
+                 judged {}",
+                status.heartbeats, status.judged
+            );
+        };
         u64::try_from(stated.as_nanos()).unwrap()
     };
     let given_as = if after_join {
@@ -1715,6 +1707,77 @@ fn loaded_founder(seed: u64, after_join: bool, draw: u64) -> u64 {
     );
     drop(stops);
     live
+}
+
+/// The cell of [`loaded_founder`] run until its spare has joined, under the clients' load, the
+/// founder loaded from before the join unless `after_join`; and the clients' stops.
+fn founder_joined(seed: u64, after_join: bool, draw: u64) -> (Sim, Vec<mpsc::Sender<()>>) {
+    let mut cell = Sim::with_spare_drawn(seed, 1, draw);
+    cell.until("the founder leads", |c| {
+        if c.members[&1].status.is_some_and(|s| s.leader == 1) {
+            Some(())
+        } else {
+            None
+        }
+    });
+    cell.open_bucket();
+    let ops = 2 * (log_config().group_entries + 1);
+    let stops = cell.start_workload(ops);
+    cell.done_by(ops, 1);
+    if !after_join {
+        cell.load(1, FOUNDER_LOAD_NS);
+    }
+    cell.replace(cell.nodes + 1, 2);
+    cell.until("the spare joins", |c| {
+        if c.replaced.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    });
+    (cell, stops)
+}
+
+/// The joiner of the fourth of [`FOUNDER_DRAWS`], its founder loaded from before the join, cut off
+/// from the founder as the join completes: its link to the founder has measured nothing yet, so the
+/// node's silence less the link's interval judges it (hyper-liveness `Pair::silence_margin`), and
+/// it suspects the founder within the patience it stated at the cut: by that margin's point, or
+/// sooner once its pool starves (on seed 1 521.4 ms after the cut, within 3.094 s). Before that
+/// margin it stated no patience there, and the founder, trusted by default by a link no margin
+/// judged, was suspected only once the joiner's pool starved, by no bound the joiner stated.
+#[test]
+fn a_joiner_cut_off_from_its_founder_as_the_join_completes_suspects_it_within_its_patience() {
+    let (mut cell, stops) = founder_joined(1, false, FOUNDER_DRAWS[3]);
+    let status = cell.members[&2].status.unwrap();
+    assert!(
+        !status.judged,
+        "the joiner's link to its founder was measured by the join, {} heartbeats taken",
+        status.heartbeats
+    );
+    let Some(stated) = status.patience else {
+        panic!(
+            "the joiner states no patience at the join, {} of its founder's heartbeats taken",
+            status.heartbeats
+        );
+    };
+    let (cut, bound) = (cell.now_ns(), u64::try_from(stated.as_nanos()).unwrap());
+    cell.isolate(1, true);
+    let at = cell.until("the joiner suspects its cut-off founder", |c| {
+        c.suspected.contains_key(&(2, 1)).then(|| c.now_ns())
+    });
+    eprintln!(
+        "the joiner, {} of its founder's heartbeats taken, suspected it {} ns after the cut at the \
+         join; patience {bound} ns",
+        status.heartbeats,
+        at - cut
+    );
+    assert!(
+        at - cut <= bound,
+        "the joiner suspected its founder cut off at the join {} ns after the cut, past the \
+         patience of {bound} ns it stated",
+        at - cut
+    );
+    drop(stops);
 }
 
 /// Whether `leads`, each of the cell's five ranges' leader, are spread over its three nodes as the

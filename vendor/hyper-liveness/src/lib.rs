@@ -346,8 +346,11 @@ pub struct PairReport {
     pub other_mode: u64,
     /// Whether a configured detector of the pair's own judges the peer.
     pub configured: bool,
-    /// Whether a margin judges the peer: its own configuration's, or, while it has none, the one
-    /// what its node measured of its links configures for it (`docs/timing.md` §3, item 10).
+    /// Whether a margin made from what was measured judges the peer: its own configuration's, or,
+    /// while it has none, the one what its node measured of its links configures for it
+    /// (`docs/timing.md` §3, item 10). A heard link with neither is judged at the owner's silence
+    /// less its interval where the owner states one (`Liveness::set_silence`, `Pair::silence_margin`),
+    /// and is not judged by this measure: it is still measuring.
     pub judged: bool,
     /// The interval the peer's heartbeats come at, or a longer one this node asked it to move to,
     /// once one has come, whether or not a margin judges: how long the evidence a pair is judged
@@ -355,8 +358,8 @@ pub struct PairReport {
     pub interval: Option<Duration>,
     /// The interval the peer's heartbeats come at, or a longer one this node asked it to move to,
     /// and the margin in force, `η + α`: how long past a heartbeat's expected arrival less its
-    /// delay the peer is trusted, the election law's base (`docs/timing.md` §2.3); `None` while no
-    /// margin judges.
+    /// delay the peer is trusted, the election law's base (`docs/timing.md` §2.3), the owner's
+    /// silence while that alone judges a heard link; `None` while no margin judges.
     pub freshness: Option<Duration>,
     /// The interval this node's own heartbeats to the peer are due at, once the first is
     /// scheduled: how long the peer's evidence of this node goes without moving while the stream

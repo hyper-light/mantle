@@ -107,6 +107,9 @@ pub struct GatewaySettings {
     /// What answered the node's puts `SlowDown`, counted by every host these settings are shared
     /// with: the node's own and each driving shard's ([`super::refusals`]).
     pub refusals: super::refusals::Refusals,
+    /// The requests its hosts answered `Failed`, by cause, which every host of the node counts
+    /// with: the node's own and each driving shard's ([`super::failures`]).
+    pub failures: super::failures::Failures,
 }
 
 /// A native object request parked until the host has room for it (`Node::take_parked`), its body
@@ -251,8 +254,8 @@ impl Job {
     ///
     /// - a put or a get reads its bucket's row or its version, or its get has no bytes to give
     ///   while its reads are out;
-    /// - a put waits for the node's volume table to name a scheme (`Putting::unschemed`), which
-    ///   wakes it as the table does (`Host::step`);
+    /// - a put, a copy or a native upload's Open waits for the node's volume table to name a
+    ///   scheme (`Job::waits_for_table`), which wakes it as the table does (`Host::step`);
     /// - a put not over whose driver takes none of its body now waits on its asks;
     /// - a put whose driver wants its body found its door's channel empty, or a get or its last
     ///   answers found no room in its door's reply, a native one's until the node's task wrote
@@ -308,8 +311,11 @@ impl Job {
             // One read, one command, a bucket's coordinator's next request, an operator's
             // request, and a copy's row, version or mark: its step asks nothing while an ask of
             // its own is out.
+            Work::Command(_) if self.waits_for_table() => true,
             Work::Read(_) | Work::Command(_) | Work::Bucket(_) | Work::Admin(_) => asking,
-            Work::Copy(copying) if copying.stage != CopyStage::Run => asking,
+            Work::Copy(copying) if copying.stage != CopyStage::Run => {
+                asking || copying.unschemed.is_some()
+            }
             // Its deletes out to its share of the node's commands, or every one asked: only an
             // answer lets it ask the next.
             Work::Deletes(deleting) => asking && !deleting.held,
@@ -358,16 +364,24 @@ impl Job {
     }
 
     /// Whether its work is held, by a peer, a device or the cell: an ask of its own out, a chunk
-    /// waiting for room at a volume or in the transport toward it, or its put waiting for the
-    /// node's volume table to name a scheme.
+    /// waiting for room at a volume or in the transport toward it, or its put, copy or Open
+    /// waiting for the node's volume table to name a scheme.
     fn held(&self) -> bool {
         !self.pending.is_empty() || self.waits_for_room() || self.waits_for_table()
     }
 
-    /// Whether its put waits for the node's volume table to name a scheme for new blocks
-    /// (`Putting::unschemed`).
+    /// Whether its put, copy or native upload's Open waits for the node's volume table to name a
+    /// scheme for new blocks (`Putting::unschemed`, `Copying::unschemed`, `Then::Open`): an
+    /// Open's bucket row is kept while its run is not yet cut.
     fn waits_for_table(&self) -> bool {
-        matches!(&self.work, Work::Put(putting) if putting.unschemed.is_some())
+        match &self.work {
+            Work::Put(putting) => putting.unschemed.is_some(),
+            Work::Copy(copying) => copying.unschemed.is_some(),
+            Work::Command(commanding) => {
+                commanding.row.is_some() && matches!(commanding.then, Then::Open { run: None, .. })
+            }
+            _ => false,
+        }
     }
 
     /// Whether a chunk its put sends or its get reads waits for room at a volume or in the
@@ -601,9 +615,9 @@ pub(crate) struct Host {
     /// its turn ends (`Host::rekey`), the earliest of each read in one step by `Host::due`.
     beats: Earliest,
     renewals: Earliest,
-    /// Whether a put of its jobs was held since its last waking for want of a scheme in the
-    /// node's volume table (`Job::waits_for_table`): each step reads the table while one may
-    /// wait, and wakes every one once it names a scheme.
+    /// Whether a put, copy or Open of its jobs was held since its last waking for want of a
+    /// scheme in the node's volume table (`Job::waits_for_table`): each step reads the table
+    /// while one may wait, and wakes every one once it names a scheme.
     unschemed: bool,
 }
 
@@ -3245,6 +3259,10 @@ pub(crate) struct Copying {
     file: u128,
     /// The put's outcome, while the version's time is read.
     stored: Option<put::Stored>,
+    /// The source's version as its read found it, held while the node's volume table names no
+    /// scheme for new blocks (`Host::copy_source_read`), as a put's commit is
+    /// (`Putting::unschemed`). Its drivers are made once the table names one.
+    unschemed: Option<(u64, Version)>,
 }
 
 /// Which of a copy's drivers a request of its job is for: its ask's request ID carries it in its
@@ -3415,12 +3433,16 @@ enum Then {
     },
     /// A native upload's Open (gateway.md §2.1): its object's length where stated, its
     /// full-object checksum's algorithm, the length of its runs (`name::run_length`) and its
-    /// object's metadata.
+    /// object's metadata. Its runs are cut in whole blocks of the scheme new blocks take, so where
+    /// the node's volume table named none as it came, its run waits (`None`), cut from its
+    /// client's buffer once the table names one (`Host::command_read`), as a put waits
+    /// (`Putting::unschemed`).
     Open {
         key: String,
         length: Option<u64>,
+        buffer: Option<u64>,
         checksum: Algorithm,
-        run: u64,
+        run: Option<u64>,
         metadata: Metadata,
     },
     /// AbortMultipartUpload (05 §4.8).
@@ -3821,7 +3843,7 @@ fn resend_beat_ns() -> u64 {
 }
 
 /// The reply a put's failure is answered with (node.md §4.4): a block no volume offered took,
-/// `SlowDown` for that cause.
+/// `SlowDown` for that cause; and a `Failed` for the cause that failed it.
 fn put_failed(error: &PutError) -> Reply {
     Reply::status(match error {
         PutError::IncompleteBody => Status::IncompleteBody,
@@ -3830,9 +3852,33 @@ fn put_failed(error: &PutError) -> Reply {
         PutError::Unplaced(_) => return Reply::slowed(door::Slowed::Unplaced),
         PutError::Full(_) => Status::InsufficientStorage,
         PutError::InvalidPartNumber(_) => Status::InvalidArgument,
-        PutError::Name(outcome) => name_status(outcome),
-        _ => Status::Failed,
+        PutError::Name(outcome) => match name_status(outcome) {
+            Status::Failed => return Reply::failed(door::Fault::Command),
+            status => status,
+        },
+        error => return Reply::failed(put_fault(error)),
     })
+}
+
+/// The cause of a put's failure that no other status answers: the body past what it declared;
+/// a chunk's answer crossed with another ask's; a block or its file's write released before the
+/// file was written; a range's outcome the driver does not take, or an answer of another kind
+/// than its request; the object's keys or layout; or the driver's own state.
+fn put_fault(error: &PutError) -> door::Fault {
+    match error {
+        PutError::TooLong | PutError::UndeclaredDigest => door::Fault::Body,
+        PutError::Unsendable(_) => door::Fault::Chunk,
+        PutError::Released(_) | PutError::File(mantle_meta::file::Outcome::Expired) => {
+            door::Fault::Released
+        }
+        PutError::Block(_) | PutError::File(_) | PutError::Name(_) | PutError::Mismatch => {
+            door::Fault::Command
+        }
+        PutError::Layout(_) | PutError::Seal(_) | PutError::Crypto(_) | PutError::Random => {
+            door::Fault::Keys
+        }
+        _ => door::Fault::Driver,
+    }
 }
 
 /// A put's checksum as its reply carries it: a full-object value (05 §3.3).
@@ -4364,7 +4410,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         let mut admitted_ns = None;
         let mut driven = None;
         let work = match (head, self.gateway.as_deref(), slowed) {
-            (_, None, _) => Work::Draining(Box::new(Reply::status(Status::Failed))),
+            (_, None, _) => Work::Draining(Box::new(Reply::failed(door::Fault::Keys))),
             (Err(_), Some(_), _) => Work::Draining(Box::new(Reply::status(Status::Malformed))),
             // A node stopping begins no operation (node.md §1.7), and one with no room for it
             // answers it at once: its client asks another, or again.
@@ -4446,7 +4492,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         // the limit is a stopping node's.
         let room = self.gateway.is_some() && !self.stopping() && self.admits(charge);
         let work = match self.gateway.as_deref() {
-            None => Work::Draining(Box::new(Reply::status(Status::Failed))),
+            None => Work::Draining(Box::new(Reply::failed(door::Fault::Keys))),
             // Taken past the limit, the door holds no request while the host has no room: a
             // stopping node's (`take_door`).
             Some(_) if !room => Work::Draining(Box::new(Reply::slowed(door::Slowed::Stopping))),
@@ -4735,9 +4781,7 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
         if !matches!(op, Op::Open { .. }) {
             return None;
         }
-        let scheme = self.table().ok()?.scheme().ok()??;
-        let segments = Layout::new(scheme).ok()?.segments_per_block();
-        segments.checked_mul(u64::try_from(mantle_s3::seal::SEGMENT).ok()?)
+        scheme_block(self.table().ok()?.scheme().ok()??)
     }
 
     /// The group of the range this node hosts of `layer`: the cell's one range of it.
@@ -5637,10 +5681,10 @@ impl Host {
             self.wake(at);
         }
         self.due = due;
-        // A put held for want of a scheme hears nothing of its own as the node's member of the
-        // root range applies an enlistment: the table is read at each turn while one may wait,
-        // the node's task turning as its member applies, and each such put woken once the table
-        // names a scheme. Bound: a walk of the jobs, once for every put that waited.
+        // A put, copy or Open held for want of a scheme hears nothing of its own as the node's
+        // member of the root range applies an enlistment: the table is read at each turn while
+        // one may wait, the node's task turning as its member applies, and each such job woken
+        // once the table names a scheme. Bound: a walk of the jobs, once for every wait.
         if self.unschemed && matches!(node.table().and_then(Table::scheme), Ok(Some(_))) {
             self.unschemed = false;
             for at in 0..self.jobs.len() {
@@ -5967,7 +6011,7 @@ impl Host {
                 && put.room().is_err()
                 && put.outcome().is_none()
             {
-                self.fail_job(node, at, Status::Failed)?;
+                self.fault_job(node, at, door::Fault::Driver)?;
             }
         }
         self.offered = offered;
@@ -6151,11 +6195,17 @@ impl Host {
                 let Then::Open { run, .. } = commanding.then else {
                     return Ok(());
                 };
-                return match outcome {
-                    Outcome::Read(ReadOutcome::Read(read)) => self.command_read(node, at, *read),
-                    Outcome::Command(CommandOutcome::Answered(Answer::Name(
-                        name::Outcome::Created { upload },
-                    ))) => {
+                return match (outcome, run) {
+                    (Outcome::Read(ReadOutcome::Read(read)), _) => {
+                        self.command_read(node, at, *read)
+                    }
+                    // Its command is asked only once its run is cut.
+                    (
+                        Outcome::Command(CommandOutcome::Answered(Answer::Name(
+                            name::Outcome::Created { upload },
+                        ))),
+                        Some(run),
+                    ) => {
                         let reply = Reply {
                             upload,
                             progress: Some(Box::new(Progress {
@@ -6169,10 +6219,10 @@ impl Host {
                         };
                         self.reply_job(node, at, reply)
                     }
-                    Outcome::Command(CommandOutcome::Answered(Answer::Name(refused))) => {
+                    (Outcome::Command(CommandOutcome::Answered(Answer::Name(refused))), _) => {
                         self.fail_job(node, at, name_status(&refused))
                     }
-                    _ => self.fail_job(node, at, Status::Failed),
+                    _ => self.fault_job(node, at, door::Fault::Command),
                 };
             }
             Work::Bucket(coordinating) => {
@@ -6217,7 +6267,7 @@ impl Host {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
                     return self.bucket_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(node, at, Status::Failed),
+                (None, _) => return self.fault_job(node, at, door::Fault::Read),
                 (Some(id), outcome) => {
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn replies: a precondition or a lock the Name range judged, say. A block
@@ -6237,7 +6287,7 @@ impl Host {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
                     return self.current_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(node, at, Status::Failed),
+                (None, _) => return self.fault_job(node, at, door::Fault::Read),
                 (Some(id), outcome) => {
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn ends the exchange on. A block it read is timed for the window the
@@ -6280,19 +6330,19 @@ impl Host {
                         };
                         self.fail_job(node, at, status)
                     }
-                    _ => self.fail_job(node, at, Status::Failed),
+                    _ => self.fault_job(node, at, door::Fault::Command),
                 };
             }
             Work::Complete(completing) => match (request, outcome) {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
                     return self.complete_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(node, at, Status::Failed),
+                (None, _) => return self.fault_job(node, at, door::Fault::Read),
                 (Some(id), outcome) => {
                     // A read or command refused, or answered with another kind: `500`, which
                     // clients retry; never the 404 an upload not found would be.
                     let Some(answer) = complete_answer(outcome) else {
-                        return self.fail_job(node, at, Status::Failed);
+                        return self.fault_job(node, at, door::Fault::Command);
                     };
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn replies.
@@ -6304,21 +6354,21 @@ impl Host {
             Work::Read(_) => {
                 return match outcome {
                     Outcome::Read(ReadOutcome::Read(read)) => self.single_read(node, at, *read),
-                    _ => self.fail_job(node, at, Status::Failed),
+                    _ => self.fault_job(node, at, door::Fault::Read),
                 };
             }
             Work::Deletes(deleting) => match (request, outcome) {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
                     return self.deletes_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(node, at, Status::Failed),
+                (None, _) => return self.fault_job(node, at, door::Fault::Read),
                 (Some(index), outcome) => {
                     let index = usize::try_from(index).unwrap_or(usize::MAX);
                     deleting.out = deleting.out.saturating_sub(1);
                     let (Some(target), Some(slot)) =
                         (deleting.objects.get(index), deleting.results.get_mut(index))
                     else {
-                        return self.fail_job(node, at, Status::Failed);
+                        return self.fault_job(node, at, door::Fault::Driver);
                     };
                     *slot = Some(match outcome {
                         Outcome::Command(CommandOutcome::Answered(Answer::Name(o))) => {
@@ -6339,7 +6389,7 @@ impl Host {
                 (None, Outcome::Read(ReadOutcome::Read(read))) => {
                     return self.copy_read(node, at, *read);
                 }
-                (None, _) => return self.fail_job(node, at, Status::Failed),
+                (None, _) => return self.fault_job(node, at, door::Fault::Read),
                 (Some(tag), outcome) => match untagged(tag) {
                     // An answer the driver refuses ends it with that outcome, which its next
                     // turn replies. A block its get read is timed as a get's is, for the windows
@@ -6526,7 +6576,7 @@ impl Host {
             }
             Err(NodeError::Asks) => Ok(false),
             Err(_) => {
-                self.fail_job(node, at, Status::Failed)?;
+                self.fault_job(node, at, door::Fault::Ask)?;
                 self.drain_job(at)
             }
         }
@@ -6567,7 +6617,7 @@ impl Host {
                     .unwrap_or_default(),
             };
             let Some(group) = node.group_of(Layer::Name) else {
-                return self.fail_job(node, at, Status::Failed);
+                return self.fault_job(node, at, door::Fault::Layer);
             };
             let asked = node.ask(JobAsk::Read(group, query));
             return self.asked(node, at, asked, None).map(|_| ());
@@ -6657,7 +6707,7 @@ impl Host {
         }
         let (offset, last) = (appending.offset, appending.last);
         let Some(incarnation) = appending.incarnation else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Driver);
         };
         // The run's checksum is in the algorithm its object is held to at its end.
         if putting.trailing.map(Algorithm::code) != upload.checksum.map(|(code, _)| code) {
@@ -6735,14 +6785,14 @@ impl Host {
                 }
                 return Ok(());
             }
-            Err(_) => return self.fail_job(node, at, Status::Failed),
+            Err(_) => return self.fault_job(node, at, door::Fault::Table),
         };
         let now = node.wall_ns();
         let Some(gateway) = self.gateway.as_deref() else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Keys);
         };
         let Some((generation, root)) = gateway.keys.last() else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Keys);
         };
         let holding = Holding {
             handover_ns: gateway.handover_ns,
@@ -6764,7 +6814,7 @@ impl Host {
             Some((keys, Layout::new(scheme).ok()?))
         })();
         let Some((keys, layout)) = made else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Keys);
         };
         let Some(Job {
             work: Work::Put(putting),
@@ -6849,7 +6899,7 @@ impl Host {
                     match over {
                         Some(reply) => Step::Over(Box::new(reply)),
                         None if put.tick(wall).is_err() => {
-                            Step::Over(Box::new(Reply::status(Status::Failed)))
+                            Step::Over(Box::new(Reply::failed(door::Fault::Driver)))
                         }
                         None => Step::Go,
                     }
@@ -6866,7 +6916,7 @@ impl Host {
             }
             Step::Ask(bucket) => {
                 let Some(group) = node.group_of(Layer::Bucket) else {
-                    self.fail_job(node, at, Status::Failed)?;
+                    self.fault_job(node, at, door::Fault::Layer)?;
                     return self.drain_job(at);
                 };
                 let asked = node.ask(JobAsk::Read(group, Query::Bucket { bucket }));
@@ -6981,6 +7031,8 @@ impl Host {
         };
         match fed {
             Ok(()) => Ok(()),
+            // The driver refused a piece or the body's end, its outcome not yet known.
+            Err(Status::Failed) => self.fault_job(node, at, door::Fault::Driver),
             Err(status) => self.fail_job(node, at, status),
         }
     }
@@ -6996,7 +7048,7 @@ impl Host {
         wall: u64,
     ) -> Result<Option<put::Request>, NodeError> {
         let Some(kept) = self.kept_id(at, Driver::Put, id) else {
-            self.fail_job(node, at, Status::Failed)?;
+            self.fault_job(node, at, door::Fault::Driver)?;
             return Ok(None);
         };
         // A command goes to its range as the driver made it, moved, once the node has room
@@ -7023,7 +7075,7 @@ impl Host {
                     .table()
                     .map(|t| place::offer_new(*block, &t.facts, wall))
                 else {
-                    self.fail_job(node, at, Status::Failed)?;
+                    self.fault_job(node, at, door::Fault::Table)?;
                     return Ok(None);
                 };
                 // Refused, the driver ends with that outcome, which its next turn replies; one
@@ -7048,7 +7100,7 @@ impl Host {
                 crc,
             } => {
                 let Ok(holder) = node.table().map(|t| t.node_of(*volume)) else {
-                    self.fail_job(node, at, Status::Failed)?;
+                    self.fault_job(node, at, door::Fault::Table)?;
                     return Ok(None);
                 };
                 let Some(holder) = holder else {
@@ -7087,7 +7139,7 @@ impl Host {
             }
             Err(NodeError::Asks) => Ok(Some(request)),
             Err(_) => {
-                self.fail_job(node, at, Status::Failed)?;
+                self.fault_job(node, at, door::Fault::Ask)?;
                 Ok(None)
             }
         }
@@ -7103,15 +7155,13 @@ impl Host {
         layer: Layer,
         command: Command,
     ) -> Result<Option<R>, NodeError> {
-        let asked = node
-            .group_of(layer)
-            .ok_or(NodeError::Bounds(
-                "no range of the command's layer here".into(),
-            ))
-            .and_then(|g| node.ask(JobAsk::Command(g, command)));
-        match asked {
+        let Some(group) = node.group_of(layer) else {
+            self.fault_job(node, at, door::Fault::Layer)?;
+            return Ok(None);
+        };
+        match node.ask(JobAsk::Command(group, command)) {
             Ok(pending) => self.wait_on(at, pending, Some(id)),
-            Err(_) => self.fail_job(node, at, Status::Failed)?,
+            Err(_) => self.fault_job(node, at, door::Fault::Ask)?,
         }
         Ok(None)
     }
@@ -7138,10 +7188,10 @@ impl Host {
                 return self.reply_job(node, at, reply);
             }
             Read::Version(Some(found)) => found,
-            _ => return self.fail_job(node, at, Status::Failed),
+            _ => return self.fault_job(node, at, door::Fault::Read),
         };
         let Some(gateway) = self.gateway.as_deref() else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Keys);
         };
         let keyring = RootKeys {
             keys: gateway
@@ -7216,7 +7266,7 @@ impl Host {
                 get.tick(hyper_rt::futures::now_ns());
                 getting.get = Some(get);
             }
-            Err(_) => return self.fail_job(node, at, Status::Failed),
+            Err(_) => return self.fault_job(node, at, door::Fault::Keys),
         }
         // The reply waits for the range's first bytes (`write_get`).
         getting.total = length;
@@ -7267,7 +7317,7 @@ impl Host {
             // length counts as the node's task writes it.
             Door::Native(_, native) => {
                 let Ok((head, fields)) = reply.encode() else {
-                    self.fail_job(node, at, Status::Failed)?;
+                    self.fault_job(node, at, door::Fault::Encode)?;
                     return Ok(Some(false));
                 };
                 native.give(Told::Head(Box::new(Opening {
@@ -7315,7 +7365,7 @@ impl Host {
                 },
             };
             let Some(group) = name else {
-                self.fail_job(node, at, Status::Failed)?;
+                self.fault_job(node, at, door::Fault::Layer)?;
                 return self.drain_job(at);
             };
             let asked = node.ask(JobAsk::Read(group, query));
@@ -7468,7 +7518,7 @@ impl Host {
                 past_suspicion,
             } => {
                 let Ok(holder) = node.table().map(|t| t.node_of(*volume)) else {
-                    self.fail_job(node, at, Status::Failed)?;
+                    self.fault_job(node, at, door::Fault::Table)?;
                     return Ok(None);
                 };
                 let Some(holder) = holder else {
@@ -7493,7 +7543,7 @@ impl Host {
             }
         };
         let Some(kept) = self.kept_id(at, Driver::Get, id) else {
-            self.fail_job(node, at, Status::Failed)?;
+            self.fault_job(node, at, door::Fault::Driver)?;
             return Ok(None);
         };
         match asked {
@@ -7503,7 +7553,7 @@ impl Host {
             }
             Err(NodeError::Asks) => Ok(Some(request)),
             Err(_) => {
-                self.fail_job(node, at, Status::Failed)?;
+                self.fault_job(node, at, door::Fault::Ask)?;
                 Ok(None)
             }
         }
@@ -7567,7 +7617,7 @@ impl Host {
             return Ok(true);
         };
         let Some(group) = node.group_of(Layer::Bucket) else {
-            self.fail_job(node, at, Status::Failed)?;
+            self.fault_job(node, at, door::Fault::Layer)?;
             return self.drain_job(at);
         };
         let query = Query::Bucket {
@@ -7595,8 +7645,53 @@ impl Host {
         let (Some(bucket_group), Some(name_group)) =
             (node.group_of(Layer::Bucket), node.group_of(Layer::Name))
         else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Layer);
         };
+        // An Open whose run waits on the scheme new blocks take: cut now where the node's volume
+        // table names one; where it names none, the row is kept and the job waits for the table
+        // as a put does (`Host::start_put`), within its client's patience.
+        let unscheduled = match self.jobs.get(at).map(|job| &job.work) {
+            Some(Work::Command(commanding)) => match &commanding.then {
+                Then::Open {
+                    length,
+                    buffer,
+                    run: None,
+                    ..
+                } => Some((*length, *buffer)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((length, buffer)) = unscheduled {
+            let cut = match node.table().and_then(Table::scheme) {
+                Ok(Some(scheme)) => match scheme_block(scheme) {
+                    Some(block) => Some(open_run(length, buffer, block)),
+                    None => return self.fault_job(node, at, door::Fault::Keys),
+                },
+                Ok(None) => None,
+                Err(_) => return self.fault_job(node, at, door::Fault::Table),
+            };
+            let Some(Job {
+                work: Work::Command(commanding),
+                ..
+            }) = self.jobs.get_mut(at)
+            else {
+                return Ok(());
+            };
+            match cut {
+                Some(Ok(cut)) => {
+                    if let Then::Open { run, .. } = &mut commanding.then {
+                        *run = Some(cut);
+                    }
+                }
+                Some(Err(status)) => return self.fail_job(node, at, status),
+                None => {
+                    commanding.row = Some(row);
+                    self.unschemed = true;
+                    return Ok(());
+                }
+            }
+        }
         let Some(Job {
             work: Work::Command(commanding),
             principal,
@@ -7669,8 +7764,9 @@ impl Host {
                 key,
                 length,
                 checksum,
-                run,
+                run: Some(run),
                 metadata,
+                ..
             } => {
                 // The MD5 across the runs is kept while the object may be one PUT's bytes, its
                 // ETag then (gateway.md §2.1), begun from MD5's initial state.
@@ -7681,7 +7777,7 @@ impl Host {
                         .and_then(|state| <[u8; 16]>::try_from(state.chaining()).ok());
                     match begun {
                         Some(chaining) => Some(RunMd5::Running(chaining)),
-                        None => return self.fail_job(node, at, Status::Failed),
+                        None => return self.fault_job(node, at, door::Fault::Driver),
                     }
                 } else {
                     None
@@ -7712,6 +7808,8 @@ impl Host {
                     }))),
                 )
             }
+            // Cut above, before the node's room was judged.
+            Then::Open { run: None, .. } => return self.fault_job(node, at, door::Fault::Driver),
             Then::Abort { key, upload } => (
                 name_group,
                 Command::Name(Box::new(name::Command::Abort(name::Abort {
@@ -8132,6 +8230,12 @@ impl Host {
         else {
             return Ok(true);
         };
+        // Woken as the node's volume table named a scheme: its drivers made from the source's
+        // version it held, or it held again where the table names none still.
+        if let Some(found) = copying.unschemed.take() {
+            self.copy_source_read(node, at, Read::Current(Some(found)))?;
+            return self.moved_on(at);
+        }
         let read = match copying.stage {
             CopyStage::Bucket => Some((
                 Layer::Bucket,
@@ -8176,7 +8280,7 @@ impl Host {
                 return Ok(false);
             }
             let Some(group) = node.group_of(layer) else {
-                self.fail_job(node, at, Status::Failed)?;
+                self.fault_job(node, at, door::Fault::Layer)?;
                 return self.drain_job(at);
             };
             let asked = node.ask(JobAsk::Read(group, query));
@@ -8201,7 +8305,7 @@ impl Host {
             // The digests a copy is held to are its source's own, never a client's: bytes that
             // miss them are the store's failure, not the request's `400 BadDigest`.
             (Some(Err(PutError::BadDigest | PutError::BadChecksum)), _) => {
-                Some(Err(Reply::status(Status::Failed)))
+                Some(Err(Reply::failed(door::Fault::Corrupt)))
             }
             (Some(Err(error)), _) => Some(Err(put_failed(error))),
             (None, Some(Err(error))) => Some(Err(get_failed(error))),
@@ -8229,7 +8333,7 @@ impl Host {
                         return Ok(false);
                     }
                 };
-                let reply = reply.unwrap_or_else(|| Reply::status(Status::Failed));
+                let reply = reply.unwrap_or_else(|| Reply::failed(door::Fault::Driver));
                 self.reply_job(node, at, reply)?;
                 return self.drain_job(at);
             }
@@ -8239,7 +8343,7 @@ impl Host {
             && put.tick(wall).is_err()
             && put.outcome().is_none()
         {
-            self.fail_job(node, at, Status::Failed)?;
+            self.fault_job(node, at, door::Fault::Driver)?;
             return self.drain_job(at);
         }
         self.feed_copy(at);
@@ -8390,11 +8494,11 @@ impl Host {
             ) => {
                 let reply = match &copying.stored {
                     Some(stored) => copied(stored, !order, &copying.source_version),
-                    None => Reply::status(Status::Failed),
+                    None => Reply::failed(door::Fault::Driver),
                 };
                 self.reply_job(node, at, reply)
             }
-            _ => self.fail_job(node, at, Status::Failed),
+            _ => self.fault_job(node, at, door::Fault::Read),
         }
     }
 
@@ -8422,17 +8526,31 @@ impl Host {
                 return self.fail_job(node, at, Status::CopyMarker);
             }
             Read::Version(Some(found)) => found,
-            _ => return self.fail_job(node, at, Status::Failed),
+            _ => return self.fault_job(node, at, door::Fault::Read),
         };
         let now = node.wall_ns();
-        let Ok(Some(scheme)) = node.table().and_then(Table::scheme) else {
-            return self.fail_job(node, at, Status::Failed);
+        let scheme = match node.table().and_then(Table::scheme) {
+            Ok(Some(scheme)) => scheme,
+            // No volume takes chunks in the node's table: the copy waits for one as a put does
+            // (`Host::start_put`), its source's version held, within its client's patience.
+            Ok(None) => {
+                if let Some(Job {
+                    work: Work::Copy(copying),
+                    ..
+                }) = self.jobs.get_mut(at)
+                {
+                    copying.unschemed = Some((order, version));
+                    self.unschemed = true;
+                }
+                return Ok(());
+            }
+            Err(_) => return self.fault_job(node, at, door::Fault::Table),
         };
         let Some(gateway) = self.gateway.as_deref() else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Keys);
         };
         let Some((generation, root)) = gateway.keys.last() else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Keys);
         };
         let keyring = RootKeys {
             keys: gateway
@@ -8456,7 +8574,7 @@ impl Host {
             Some((keys, Layout::new(scheme).ok()?))
         })();
         let Some((keys, layout)) = made else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Keys);
         };
         let Some(Job {
             work: Work::Copy(copying),
@@ -8569,7 +8687,7 @@ impl Host {
             },
         };
         let Some(row) = copying.row.as_ref() else {
-            return self.fail_job(node, at, Status::Failed);
+            return self.fault_job(node, at, door::Fault::Driver);
         };
         let commit = match &copying.part {
             Some((upload, number)) => Commit::Part(name::PutPart {
@@ -8644,7 +8762,7 @@ impl Host {
                 Ok(())
             }
             (_, Err(error)) => self.reply_job(node, at, put_failed(&error)),
-            (Err(_), _) => self.fail_job(node, at, Status::Failed),
+            (Err(_), _) => self.fault_job(node, at, door::Fault::Keys),
         }
     }
 
@@ -8849,6 +8967,17 @@ impl Host {
         self.reply_job(node, at, Reply::status(status))
     }
 
+    /// Ends job `at` `Failed` for `cause`, which its reply names on either door and the node
+    /// counts as the reply goes (`Host::drain_job`).
+    fn fault_job<N: Serve>(
+        &mut self,
+        node: &mut N,
+        at: usize,
+        cause: door::Fault,
+    ) -> Result<(), NodeError> {
+        self.reply_job(node, at, Reply::failed(cause))
+    }
+
     /// Ends job `at` `SlowDown` for `cause`, which its reply names on either door.
     fn slow_job<N: Serve>(
         &mut self,
@@ -8870,6 +8999,10 @@ impl Host {
         else {
             return Ok(false);
         };
+        // A failure is counted by its cause as its reply goes, on either door.
+        if let (Some(cause), Some(gateway)) = (reply.fault, self.gateway.as_deref()) {
+            gateway.failures.count(cause);
+        }
         let (bound_ns, admitted) = (job.bound_ns(), job.admitted_ns.is_some());
         match &mut job.door {
             // A put's body the node's task gives from the exchange is let go of, so the node's
@@ -9037,8 +9170,33 @@ fn directory() -> Vec<Descriptor> {
     }]
 }
 
+/// A native upload's run, cut from an object of `length` and its client's `buffer` in whole blocks
+/// of `block` plaintext bytes (`name::run_length`); or the status that refuses the Open where no
+/// run fits: an object past what 10,000 runs of S3's largest part hold, or a buffer below its
+/// least part or too small for the length's runs.
+fn open_run(length: Option<u64>, buffer: Option<u64>, block: u64) -> Result<u64, Status> {
+    match name::run_length(length, buffer, block) {
+        Some(run) => Ok(run),
+        None if length.is_some_and(|l| {
+            l > name::MAX_PART.saturating_mul(u64::from(name::MAX_PART_NUMBER))
+        }) =>
+        {
+            Err(Status::EntityTooLarge)
+        }
+        None => Err(Status::InvalidArgument),
+    }
+}
+
+/// The plaintext bytes of a whole block of `scheme`'s layout, the unit a native upload's runs are
+/// cut in (`name::run_length`).
+fn scheme_block(scheme: durability::Scheme) -> Option<u64> {
+    let segments = Layout::new(scheme).ok()?.segments_per_block();
+    segments.checked_mul(u64::try_from(mantle_s3::seal::SEGMENT).ok()?)
+}
+
 /// The work an operation's request names; a native upload's Open cuts its runs in `block`'s whole
-/// blocks (`Host::open_block`).
+/// blocks (`Host::open_block`), or once the node's volume table names a scheme where it names
+/// none (`Then::Open`).
 fn work(op: Op, block: Option<u64>) -> Work {
     // Metadata past S3's 2 KB, or that no HTTP field could carry, is refused before anything is
     // written (research/89 §1.4): judged once, its refusal taken in its place below.
@@ -9257,33 +9415,26 @@ fn work(op: Op, block: Option<u64>) -> Work {
             metadata,
             ..
         } => {
-            // No scheme to lay its blocks out by: nothing can be put.
-            let Some(block) = block else {
-                return Work::Draining(Box::new(Reply::status(Status::Failed)));
+            // No scheme to lay its blocks out by yet: its run is cut once the node's volume
+            // table names one.
+            let run = match block.map(|block| open_run(length, buffer, block)) {
+                None => None,
+                Some(Ok(run)) => Some(run),
+                Some(Err(status)) => return Work::Draining(Box::new(Reply::status(status))),
             };
-            match name::run_length(length, buffer, block) {
-                Some(run) => Work::Command(Box::new(Commanding {
-                    bucket,
-                    then: Then::Open {
-                        key,
-                        length,
-                        checksum,
-                        run,
-                        metadata,
-                    },
-                    asked: false,
-                    row: None,
-                })),
-                // No run fits: an object past what 10,000 runs of S3's largest part hold, or a
-                // buffer below its least part or too small for the length's runs.
-                None if length.is_some_and(|l| {
-                    l > name::MAX_PART.saturating_mul(u64::from(name::MAX_PART_NUMBER))
-                }) =>
-                {
-                    Work::Draining(Box::new(Reply::status(Status::EntityTooLarge)))
-                }
-                None => Work::Draining(Box::new(Reply::status(Status::InvalidArgument))),
-            }
+            Work::Command(Box::new(Commanding {
+                bucket,
+                then: Then::Open {
+                    key,
+                    length,
+                    buffer,
+                    checksum,
+                    run,
+                    metadata,
+                },
+                asked: false,
+                row: None,
+            }))
         }
         // A run's checksum is its upload's, in a trailer, which the run is checked by.
         Op::Append { trailing: None, .. } => {
@@ -9584,6 +9735,7 @@ fn copying(
         source_version: String::new(),
         file: 0,
         stored: None,
+        unschemed: None,
     }))
 }
 
@@ -9697,7 +9849,20 @@ fn get_failed(error: &GetError) -> Reply {
     match error {
         GetError::Unreadable(_) => Reply::slowed(door::Slowed::Unreadable),
         GetError::Patience => Reply::slowed(door::Slowed::Patience),
-        _ => Reply::status(Status::Failed),
+        _ => Reply::failed(get_fault(error)),
+    }
+}
+
+/// The cause of a get's failure past those that pass: a block that did not verify, its seal's
+/// or its checksums'; the object's rows disagreeing; a chunk's answer of another ask's kind; the
+/// file's key; or the driver's own state.
+fn get_fault(error: &GetError) -> door::Fault {
+    match error {
+        GetError::Corrupt(_) | GetError::Seal(_) => door::Fault::Corrupt,
+        GetError::Inconsistent(_) => door::Fault::Rows,
+        GetError::Unsendable(_) => door::Fault::Chunk,
+        GetError::Key => door::Fault::Keys,
+        _ => door::Fault::Driver,
     }
 }
 
@@ -11478,6 +11643,7 @@ pub(super) mod tests {
             },
             target: 1e-11,
             refusals: super::super::refusals::Refusals::default(),
+            failures: super::super::failures::Failures::default(),
         }
     }
 
@@ -11786,6 +11952,7 @@ pub(super) mod tests {
             },
             target: 1e-11,
             refusals: super::super::refusals::Refusals::default(),
+            failures: super::super::failures::Failures::default(),
         };
         let charge = |window| charges().write(window, length);
         assert!(charge(learned) > gateway.objects_bytes);
@@ -11830,6 +11997,7 @@ pub(super) mod tests {
             },
             target: 1e-11,
             refusals: super::super::refusals::Refusals::default(),
+            failures: super::super::failures::Failures::default(),
         };
         let mut learned = crate::window::Windows::default();
         let admitted = sized(Some(&gateway), &learned, Moves::Read);
@@ -11903,6 +12071,7 @@ pub(super) mod tests {
             },
             target: 1e-11,
             refusals: super::super::refusals::Refusals::default(),
+            failures: super::super::failures::Failures::default(),
         };
         let source = mantle_s3::copy::Source {
             bucket: "b".into(),
@@ -11986,6 +12155,7 @@ pub(super) mod tests {
             },
             target: 1e-11,
             refusals: super::super::refusals::Refusals::default(),
+            failures: super::super::failures::Failures::default(),
         };
         let admitted = charges().copy(1, 1, mantle_s3::body::MAX_UPLOAD);
         let admission = |budget: u64, others: u64| {
@@ -15104,6 +15274,189 @@ pub(super) mod tests {
         assert!(
             matches!(answers.as_slice(), [door::Answer::Ready, door::Answer::Head(reply), door::Answer::End]
                 if reply.status == Status::Done && reply.version == "v"),
+            "{answers:?}"
+        );
+    }
+
+    /// A put whose node cannot read its volume table is answered `Failed` naming that cause beside
+    /// the status, and counted by it as its reply goes (`Node::failed`, `failed table 1`): a
+    /// failure says which step failed, on the door and on the node's lines.
+    #[test]
+    fn a_put_failed_names_its_cause_and_is_counted_by_it() {
+        let now = hyper_rt::futures::now_ns();
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        let gateway = std::sync::Arc::new(gateway);
+        let mut host = Host::new(1, Some(std::sync::Arc::clone(&gateway)));
+        let put = work(
+            Op::Put {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 1,
+                length: 0,
+                headers: Headers::default(),
+                checksum: None,
+                md5: None,
+                trailing: None,
+                metadata: Vec::new(),
+            },
+            None,
+        );
+        let (job, _body, mut answers) = local_job(put, now, 1);
+        host.push(job, now);
+        let mut stub = put_and_get_stub();
+        stub.answer = |ask| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            _ => panic!("an ask a put that cannot be placed does not make"),
+        };
+        // No table to read: `Serve::table` refuses.
+        stub.table = None;
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 8, "the put never ended");
+            host.step(&mut stub).unwrap();
+        }
+        let answers = answered(&mut answers);
+        assert!(
+            matches!(answers.as_slice(), [door::Answer::Head(reply), door::Answer::End]
+                if reply.status == Status::Failed && reply.fault == Some(door::Fault::Table)),
+            "{answers:?}"
+        );
+        let mut counts = [0; door::Fault::ALL.len()];
+        counts[door::Fault::Table.index()] = 1;
+        assert_eq!(gateway.failures.counts(), counts);
+    }
+
+    /// Runs `work` through the S3 door on a host whose node's volume table names no volume, its
+    /// member of the root range not yet applied any enlistment, each ask answered by `answer` at
+    /// the host's next turn: it makes its first `asked` asks and then rests, held, unanswered,
+    /// and bounded by its client's patience, past which it is answered `SlowDown`
+    /// (`Host::bound_job`); then the member applies an enlistment, the table names a scheme, and
+    /// it runs to its end. Its answers, and the asks it made in all.
+    fn waits_for_a_scheme(
+        work: Work,
+        answer: fn(&JobAsk) -> Outcome,
+        asked: u64,
+    ) -> (Vec<door::Answer>, u64) {
+        let now = hyper_rt::futures::now_ns();
+        let mut gateway = scheming_gateway();
+        gateway.keys = vec![(1, WrappingKey::generate().unwrap())];
+        let mut host = Host::new(1, Some(std::sync::Arc::new(gateway)));
+        let (job, _body, mut answers) = local_job(work, now, 1);
+        host.push(job, now);
+        let mut stub = put_and_get_stub();
+        stub.answer = answer;
+        stub.table = Some(Table::of(None, 0, Vec::new()));
+        for _ in 0..8 {
+            host.step(&mut stub).unwrap();
+        }
+        assert_eq!(
+            answered(&mut answers),
+            Vec::new(),
+            "no reply while it waits"
+        );
+        assert_eq!(stub.asked, asked, "its asks before it needs a scheme");
+        let job = &host.jobs[0];
+        assert!(job.resting && job.held() && job.waits_for_table());
+        let patience = u64::try_from(bounds::STOCK_PATIENCE.as_nanos()).unwrap();
+        let bound = job.moved_ns + patience;
+        assert_eq!(job.bounded(bound - 1), Bounded::Held);
+        assert_eq!(job.bounded(bound), Bounded::SlowDown);
+        stub.table = Some(Table::empty(1));
+        let mut turns = 0;
+        while !host.idle() {
+            turns += 1;
+            assert!(turns <= 8, "it never ended");
+            host.step(&mut stub).unwrap();
+        }
+        (answered(&mut answers), stub.asked)
+    }
+
+    /// A fresh cell's first CopyObject, on a node whose volume table names no volume yet, waits
+    /// for one as a put does, its source's version read and held, and once the table names a
+    /// scheme it makes its drivers, commits and is answered `Done`: never `500 InternalError`
+    /// for a cell not yet ready.
+    #[test]
+    fn a_copy_before_its_nodes_volume_table_names_a_volume_waits_for_one_and_commits() {
+        let copy = work(
+            Op::Copy(Box::new(object::Copy {
+                bucket: "b".into(),
+                key: "k2".into(),
+                id: 1,
+                source: mantle_s3::copy::Source {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    version: None,
+                },
+                conditions: Headers::default(),
+                headers: Headers::default(),
+                directive: Directive::Copy,
+                metadata: Vec::new(),
+                checksum: None,
+            })),
+            None,
+        );
+        let answer = |ask: &JobAsk| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Read(_, Query::Current { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Current(Some((1, empty_version()))),
+            ))),
+            JobAsk::Command(_, Command::Name(_)) => {
+                Outcome::Command(CommandOutcome::Answered(Answer::Name(name::Outcome::Put {
+                    version: mantle_meta::key::version_id(1),
+                })))
+            }
+            _ => panic!("an ask a copy of an empty source does not make"),
+        };
+        let (answers, asked) = waits_for_a_scheme(copy, answer, 2);
+        assert_eq!(asked, 3, "its row, its source and its commit");
+        assert!(
+            replied(&answers, Status::Done, |reply| reply.version
+                == mantle_meta::key::version_id(1)),
+            "{answers:?}"
+        );
+    }
+
+    /// A fresh cell's first native upload's Open, on a node whose volume table names no volume
+    /// yet, has no block to cut its runs in: it waits for one as a put does, its bucket's row
+    /// read and kept, and once the table names a scheme its run is cut from that scheme's blocks,
+    /// its upload created and its progress answered: never `500 InternalError` for a cell not yet
+    /// ready.
+    #[test]
+    fn a_native_open_before_its_nodes_volume_table_names_a_volume_waits_for_one_and_opens() {
+        let open = work(
+            Op::Open {
+                bucket: "b".into(),
+                key: "k".into(),
+                id: 1,
+                length: Some(10),
+                buffer: None,
+                checksum: Algorithm::Crc64Nvme,
+                metadata: Vec::new(),
+            },
+            None,
+        );
+        let answer = |ask: &JobAsk| match ask {
+            JobAsk::Read(_, Query::Bucket { .. }) => Outcome::Read(ReadOutcome::Read(Box::new(
+                Read::Bucket(Some(bucket_row())),
+            ))),
+            JobAsk::Command(_, Command::Name(_)) => Outcome::Command(CommandOutcome::Answered(
+                Answer::Name(name::Outcome::Created { upload: "u".into() }),
+            )),
+            _ => panic!("an ask an Open does not make"),
+        };
+        let (answers, asked) = waits_for_a_scheme(open, answer, 1);
+        assert_eq!(asked, 2, "its row and its upload's creation");
+        let block = scheme_block(durability::Scheme::Copies(3)).unwrap();
+        let run = open_run(Some(10), None, block).unwrap();
+        assert!(
+            replied(&answers, Status::Done, |reply| reply.upload == "u"
+                && reply.progress.as_ref().is_some_and(|p| p.run == run)),
             "{answers:?}"
         );
     }

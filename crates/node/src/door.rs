@@ -32,7 +32,7 @@ use mantle_s3::checksum::Checksum;
 
 /// Why a request was answered `503 SlowDown`, the protocol's causes, which the S3 door's
 /// `<Message>` names after S3's words (`listener::respond::slowed`).
-pub use mantle_protocol::object::Slowed;
+pub use mantle_protocol::object::{Fault, Slowed};
 use mantle_protocol::object::{Op, Reply, Status};
 
 /// What the listener hands the node: an operation, boxed as the larger of the two, or a key to look

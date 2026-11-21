@@ -12,7 +12,7 @@
 //! | Message | Head | Body |
 //! |---|---|---|
 //! | request | the kind (u8); the fields' length (u32); the operation's identity (u128), which every attempt of a mutation carries (gateway.md §2.1), else 0; the time its client will still wait, nanoseconds from its sending (u64), 0 for none (research/77 D2); a put's length, else 0 (u64); the algorithm of the checksum a put's trailer brings after its bytes (u8), 0 for none, else its code (`mantle_s3::checksum::Algorithm::code`) and one | the fields; then a put's bytes; then its trailer, the checksum's value |
-//! | reply | the status (u8); the object's size, a get's or a head's, else 0 (u64); the fields' length (u32) | the fields; then a get's bytes |
+//! | reply | the status (u8); its cause (u8), beside `SlowDown` its [`Slowed`]'s code and beside `Failed` its [`Fault`]'s, else 0; the object's size, a get's or a head's, else 0 (u64); the fields' length (u32) | the fields; then a get's bytes |
 //!
 //! A request's fields, by its kind. A text is UTF-8 behind its length (u32); an optional field is
 //! behind a byte, 0 for none and 1 for one.
@@ -1705,7 +1705,8 @@ pub enum Status {
     /// The head does not decode, or names a bucket or key past S3's bounds.
     Malformed,
     /// S3's `500 InternalError`: the operation failed past its start; a put may not have
-    /// committed, and asking again with the same identity is answered from what it made.
+    /// committed, and asking again with the same identity is answered from what it made. A
+    /// node's reply says which step failed beside it ([`Reply::failed`]).
     Failed,
     /// S3's `304 Not Modified`: a read's `If-None-Match` or `If-Modified-Since` held; the
     /// version's facts follow, its ETag among them (05 §2.4).
@@ -2011,6 +2012,136 @@ impl Slowed {
     }
 }
 
+/// Why a node answered a request `Failed`, S3's `500 InternalError`: the step of the operation
+/// that failed, carried beside the status in a reply's head on the native door, as a `SlowDown`'s
+/// cause is ([`Slowed`]), and in the `<Message>` of the S3 door's `500`, so a failure on either
+/// door names what failed, and the node counts each (`failed NAME COUNT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// A range answered a read of the operation's with a refusal, or with another kind than asked.
+    Read,
+    /// A range answered a command of the operation's with a refusal, or with an outcome its
+    /// driver does not take.
+    Command,
+    /// The node hosts no range of a layer the operation needs.
+    Layer,
+    /// The node's volume table could not be read, or the durability model's choice over it failed.
+    Table,
+    /// The node holds no gateway settings or root key, or could not make the object's keys, its
+    /// layout or its reader.
+    Keys,
+    /// The node refused an ask of the operation's for another cause than its room.
+    Ask,
+    /// The operation's driver failed of itself: an answer for no request it holds, its clock, or
+    /// a state it does not take.
+    Driver,
+    /// A chunk's answer was of another ask's kind: no volume takes the chunk as it was sent.
+    Chunk,
+    /// The sweep released a block, or its file's write, before the file was written: a renewal
+    /// came too late.
+    Released,
+    /// The body ran past its declared length, or carried a `Content-MD5` it did not declare.
+    Body,
+    /// The reply could not be encoded.
+    Encode,
+    /// A block read did not verify: its bytes are not what its checksums or its seal say
+    /// (CLAUDE.md §6).
+    Corrupt,
+    /// The object's rows disagree with each other: its version, its file and its blocks.
+    Rows,
+}
+
+impl Fault {
+    /// Every cause, in the order of their codes.
+    pub const ALL: [Self; 13] = [
+        Self::Read,
+        Self::Command,
+        Self::Layer,
+        Self::Table,
+        Self::Keys,
+        Self::Ask,
+        Self::Driver,
+        Self::Chunk,
+        Self::Released,
+        Self::Body,
+        Self::Encode,
+        Self::Corrupt,
+        Self::Rows,
+    ];
+
+    /// The cause's code beside a reply's status: its place in [`Fault::ALL`] from one, zero
+    /// standing for none.
+    fn code(self) -> u8 {
+        match self {
+            Self::Read => 1,
+            Self::Command => 2,
+            Self::Layer => 3,
+            Self::Table => 4,
+            Self::Keys => 5,
+            Self::Ask => 6,
+            Self::Driver => 7,
+            Self::Chunk => 8,
+            Self::Released => 9,
+            Self::Body => 10,
+            Self::Encode => 11,
+            Self::Corrupt => 12,
+            Self::Rows => 13,
+        }
+    }
+
+    fn of(code: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.code() == code)
+    }
+
+    /// The cause's place in [`Fault::ALL`], where a count of each keeps it.
+    pub fn index(self) -> usize {
+        usize::from(self.code()).saturating_sub(1)
+    }
+
+    /// The cause's name in a node's lines (`failed NAME COUNT`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Command => "command",
+            Self::Layer => "layer",
+            Self::Table => "table",
+            Self::Keys => "keys",
+            Self::Ask => "ask",
+            Self::Driver => "driver",
+            Self::Chunk => "chunk",
+            Self::Released => "released",
+            Self::Body => "body",
+            Self::Encode => "encode",
+            Self::Corrupt => "corrupt",
+            Self::Rows => "rows",
+        }
+    }
+
+    /// What the cause says, a sentence: after `Failed: ` in a native client's failure, and after
+    /// S3's own words in the S3 door's `<Message>`.
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Read => "A range refused a read of the operation's, or answered another kind.",
+            Self::Command => {
+                "A range refused a command of the operation's, or answered what its driver does not take."
+            }
+            Self::Layer => "The node hosts no range of a layer the operation needs.",
+            Self::Table => "The node's volume table could not be read.",
+            Self::Keys => "The node could not make the object's keys, layout or reader.",
+            Self::Ask => "The node refused an ask of the operation's for another cause than room.",
+            Self::Driver => "The operation's driver failed of itself.",
+            Self::Chunk => "A chunk's answer was of another ask's kind.",
+            Self::Released => "A block was released before its file was written.",
+            Self::Body => {
+                "The body ran past its declared length, or carried a Content-MD5 it did not declare."
+            }
+            Self::Encode => "The reply could not be encoded.",
+            Self::Corrupt => "A block read did not verify against its checksums or its seal.",
+            Self::Rows => "The object's rows disagree with each other.",
+        }
+    }
+}
+
 /// A key a page lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
@@ -2197,6 +2328,8 @@ pub struct Reply {
     pub status: Status,
     /// Why it is `SlowDown`, beside that status alone; none beside any other.
     pub slowed: Option<Slowed>,
+    /// Why it is `Failed`, beside that status alone; none beside any other.
+    pub fault: Option<Fault>,
     /// The object's size, a get's or a head's.
     pub size: u64,
     /// The version's id: a put's, a delete's marker's, or the one a get or head read; empty
@@ -2771,6 +2904,7 @@ impl Reply {
         Self {
             status,
             slowed: None,
+            fault: None,
             size: 0,
             version: String::new(),
             etag: String::new(),
@@ -2795,14 +2929,24 @@ impl Reply {
         }
     }
 
+    /// A reply of `Failed` for `cause`.
+    pub fn failed(cause: Fault) -> Self {
+        Self {
+            fault: Some(cause),
+            ..Self::status(Status::Failed)
+        }
+    }
+
     /// The reply's head and the fields that open its body: the fields counted first, then
     /// written into one buffer at their length (`mantle_codec::encode`'s rule), so it never grows.
-    /// A cause beside a status other than `SlowDown` is refused: the head says one decision.
+    /// A cause beside a status other than its own, `SlowDown`'s or `Failed`'s, is refused: the
+    /// head says one decision.
     pub fn encode(&self) -> Result<(Vec<u8>, Vec<u8>), ObjectError> {
-        let cause = match (self.status, self.slowed) {
-            (_, None) => 0,
-            (Status::SlowDown, Some(cause)) => cause.code(),
-            (status, Some(_)) => return Err(ObjectError::Cause(status)),
+        let cause = match (self.status, self.slowed, self.fault) {
+            (_, None, None) => 0,
+            (Status::SlowDown, Some(cause), None) => cause.code(),
+            (Status::Failed, None, Some(cause)) => cause.code(),
+            (status, ..) => return Err(ObjectError::Cause(status)),
         };
         let fields = mantle_codec::encode(0, |f| self.put_fields(f))?.into_vec();
         let mut w = Writer::with_capacity(REPLY_HEAD_BYTES);
@@ -2898,12 +3042,13 @@ impl Reply {
     }
 }
 
-/// A reply's head: its status, a `SlowDown`'s cause and its size, and how long the fields that
-/// open its body are.
+/// A reply's head: its status, a `SlowDown`'s or a `Failed`'s cause and its size, and how long
+/// the fields that open its body are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplyHead {
     pub status: Status,
     pub slowed: Option<Slowed>,
+    pub fault: Option<Fault>,
     pub size: u64,
     fields: u32,
 }
@@ -2918,15 +3063,17 @@ impl ReplyHead {
         let mut r = Reader::new(head);
         let reply = (|| {
             let status = Status::of(r.u8()?)?;
-            // A cause stands beside `SlowDown` alone, and is one the protocol names.
-            let slowed = match (status, r.u8()?) {
-                (_, 0) => None,
-                (Status::SlowDown, code) => Some(Slowed::of(code)?),
+            // A cause stands beside `SlowDown` or `Failed` alone, and is one the protocol names.
+            let (slowed, fault) = match (status, r.u8()?) {
+                (_, 0) => (None, None),
+                (Status::SlowDown, code) => (Some(Slowed::of(code)?), None),
+                (Status::Failed, code) => (None, Some(Fault::of(code)?)),
                 _ => return None,
             };
             Some(Self {
                 status,
                 slowed,
+                fault,
                 size: r.u64()?,
                 fields: r.u32()?,
             })
@@ -3023,6 +3170,7 @@ impl ReplyHead {
             Some(Reply {
                 status: self.status,
                 slowed: self.slowed,
+                fault: self.fault,
                 size: self.size,
                 version,
                 etag,
@@ -3588,6 +3736,7 @@ mod tests {
         replies.push(Reply {
             status: Status::Done,
             slowed: None,
+            fault: None,
             size: 7,
             version: "0123456789ABC".into(),
             etag: "d41d8cd98f00b204e9800998ecf8427e-10000".into(),
@@ -3766,6 +3915,11 @@ mod tests {
             }))),
             ..Reply::status(Status::Done)
         });
+        // Each `Failed`'s cause, written after the replies before it was, so theirs keep their
+        // golden vectors' places.
+        for cause in Fault::ALL {
+            replies.push(Reply::failed(cause));
+        }
         replies
     }
 
@@ -3874,7 +4028,7 @@ mod tests {
         };
         assert_eq!(beside.encode(), Err(ObjectError::Cause(Status::Failed)));
         let mut head = Reply::slowed(Slowed::Door).encode().unwrap().0;
-        head[0] = Status::Failed.code();
+        head[0] = Status::Done.code();
         assert!(ReplyHead::decode(&head).is_err());
         // A code past the last cause names none.
         let mut head = Reply::slowed(Slowed::Door).encode().unwrap().0;
@@ -3883,5 +4037,51 @@ mod tests {
         // A `SlowDown` with no cause beside it reads back as one.
         let (head, _) = Reply::status(Status::SlowDown).encode().unwrap();
         assert_eq!(ReplyHead::decode(&head).unwrap().slowed, None);
+    }
+
+    /// Each cause of a `Failed` reads back beside it, in the byte a `SlowDown`'s cause takes, and
+    /// beside no other status; each has words and a name of its own; a `Failed` with no cause
+    /// reads back as one, as a node that names none writes it.
+    #[test]
+    fn each_failures_cause_reads_back_beside_it_and_beside_nothing_else() {
+        let mut words = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        for (at, cause) in Fault::ALL.into_iter().enumerate() {
+            assert_eq!(cause.index(), at);
+            assert!(
+                words.insert(cause.words()),
+                "{cause:?} says another's words"
+            );
+            assert!(names.insert(cause.name()), "{cause:?} has another's name");
+            let reply = Reply::failed(cause);
+            let (head, fields) = reply.encode().unwrap();
+            assert_eq!(head.len(), REPLY_HEAD_BYTES);
+            let decoded = ReplyHead::decode(&head).unwrap();
+            assert_eq!(
+                (decoded.status, decoded.slowed, decoded.fault),
+                (Status::Failed, None, Some(cause))
+            );
+            assert_eq!(decoded.reply(&fields), Ok(reply));
+        }
+        // Beside another status, or beside a `SlowDown`'s cause, it is not written, nor read.
+        let beside = Reply {
+            fault: Some(Fault::Read),
+            ..Reply::status(Status::Done)
+        };
+        assert_eq!(beside.encode(), Err(ObjectError::Cause(Status::Done)));
+        let both = Reply {
+            fault: Some(Fault::Read),
+            ..Reply::slowed(Slowed::Door)
+        };
+        assert_eq!(both.encode(), Err(ObjectError::Cause(Status::SlowDown)));
+        let mut head = Reply::failed(Fault::Read).encode().unwrap().0;
+        head[0] = Status::NoSuchKey.code();
+        assert!(ReplyHead::decode(&head).is_err());
+        // A code past the last cause names none.
+        let mut head = Reply::failed(Fault::Read).encode().unwrap().0;
+        head[1] = u8::try_from(Fault::ALL.len()).unwrap() + 1;
+        assert!(ReplyHead::decode(&head).is_err());
+        let (head, _) = Reply::status(Status::Failed).encode().unwrap();
+        assert_eq!(ReplyHead::decode(&head).unwrap().fault, None);
     }
 }

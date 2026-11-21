@@ -2166,8 +2166,8 @@ impl Work {
         let bucket = BUCKET.to_owned();
         // A read is asked only of an object whose put was acknowledged (`Work::key`), so one with no
         // such key is an acknowledged object missing: a check's failure. Every other status past
-        // done is the server's refusal, a failure past its start said as S3 says it: the native
-        // reply names no cause beside it.
+        // done is the server's refusal, a failure past its start said as S3 says it, with the
+        // step that failed where the native reply names it beside the status (`Fault`).
         let reads = matches!(self.kind, Kind::Get | Kind::Range | Kind::Head);
         let refused = |reply: &Reply| {
             if reads && reply.status == Status::NoSuchKey {
@@ -2176,10 +2176,17 @@ impl Work {
                     reply.status
                 ))
             } else if reply.status == Status::Failed {
-                Came::Internal(format!(
-                    "{:?}, S3's 500 InternalError: the node failed the operation past its start",
-                    reply.status
-                ))
+                Came::Internal(match reply.fault {
+                    Some(cause) => format!(
+                        "{:?}, S3's 500 InternalError: {}",
+                        reply.status,
+                        cause.words()
+                    ),
+                    None => format!(
+                        "{:?}, S3's 500 InternalError: the node failed the operation past its start",
+                        reply.status
+                    ),
+                })
             } else {
                 Came::Refused(format!("{:?}", reply.status))
             }

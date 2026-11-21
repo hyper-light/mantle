@@ -213,6 +213,8 @@ fn a_relocated_branch_keeps_every_entry_and_its_extents_are_freed_at_the_next_ch
     }
     check(&mut store, &mut trunk, &rows);
     assert_eq!(scan(&mut store, &copy), entries);
+    trunk.check_live().unwrap();
+    let live = trunk.live.clone();
     let (closed, landed) = crate::store::cold_file(store.into_file());
     landed.unwrap();
     drop(closed);
@@ -221,6 +223,10 @@ fn a_relocated_branch_keeps_every_entry_and_its_extents_are_freed_at_the_next_ch
     assert_eq!(recovered.applied, 2);
     let mut trunk = Trunk::load(&mut store, recovered.root.unwrap()).unwrap();
     trunk.check_idle_counts().unwrap();
+    // The live pages counted again as the image is read: the same as kept before it was closed.
+    trunk.check_live().unwrap();
+    let end = |v: &[u32]| v.iter().rposition(|&c| c > 0).map_or(0, |i| i + 1);
+    assert_eq!(trunk.live[..end(&trunk.live)], live[..end(&live)]);
     check(&mut store, &mut trunk, &rows);
     let copy = copy_of(&mut store, &trunk, b.root, &entries);
     assert_eq!(scan(&mut store, &copy), entries);
@@ -253,7 +259,13 @@ fn a_relocation_whose_branch_is_gone_as_it_applies_leaves_no_trace() {
             panic!("the relocation's run changed under it")
         };
         *run = Running::Finished((*c).finish(&mut store).unwrap());
-        *what = What::Relocate { root: u64::MAX };
+        let What::Relocate { ask, .. } = *what else {
+            panic!("a relocation's task changed kind")
+        };
+        *what = What::Relocate {
+            root: u64::MAX,
+            ask,
+        };
     }
     assert_ne!(held(&store), before, "the copy wrote nothing");
     trunk.apply_done(&mut store).unwrap();

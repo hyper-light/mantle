@@ -201,6 +201,22 @@ impl Tasks {
         self.all.is_empty()
     }
 
+    /// The tasks planned so far: a mark that a pass planned one.
+    pub(in crate::trunk) fn planned(&self) -> u64 {
+        self.next
+    }
+
+    /// A test's mark of where the tasks stand: how many are inline, ready, out and done.
+    #[cfg(test)]
+    pub(in crate::trunk) fn standing(&self) -> [usize; 4] {
+        [
+            self.index.inline.len(),
+            self.index.ready.len(),
+            self.index.out.len(),
+            self.index.done.len(),
+        ]
+    }
+
     /// Files `task`, planned now, after every task planned before it; `root` the trunk's root.
     pub(super) fn push(&mut self, task: NodeTask, root: usize) -> Result<(), Error> {
         let seq = self.next;
@@ -462,6 +478,7 @@ mod tests {
             run,
             units,
             reuse: Reuse::default(),
+            asked: std::cell::Cell::new(None),
         }
     }
 

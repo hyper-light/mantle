@@ -298,7 +298,14 @@ under load, at moderate load and saturated.
   unclaimed reads back to the store (`Compaction::cancel_opening`; `trunk/room.rs` drops one
   that opened an input and finds every buffer and extent back), as a node changed under a task
   replans it (§6, Flat maintenance), and the trunk is saved as it stands: a save needs only that
-  no task holds inputs or output and none is being abandoned (`Trunk::saveable`). SplinterDB's
+  no task holds inputs or output and none is being abandoned (`Trunk::saveable`). A paced
+  checkpoint finished whole drops them the same way (`ShardDb::finish_stage`). A trunk so
+  stalled is owed no step, nor is its consolidation (`ShardDb::trunk_goes_on`,
+  `ShardDb::consolidation_goes_on`): its pass would find the same room short and change nothing,
+  so the idle step leaves it for the checkpoint, or the extents freed otherwise, that end the
+  stall. Stepped while stalled, with seeks' consolidation owed beside it, a node's idle steps
+  answered a unit done each pass and were asked again at once, its shard thread spinning while
+  the cell waited for the range to apply (`shard_db/still_passes.rs`, 2026-11-21). SplinterDB's
   trunk nodes likewise name their
   branches as they stand, a flush moving references only (research/34 §1). The image names what
   maintenance owes, in format 8: each pivot the first of its node's in-flight bundles live for it
@@ -315,7 +322,8 @@ under load, at moderate load and saturated.
   applied since its last, at the index it has applied (`Stored::persist`, `Stored::persist_now`).
   That index is durable already, so invariant I8 holds: the range never records durable past
   what its engine holds, and the engine never begins a checkpoint of its own. The checkpoint
-  frees the extents the one before named.
+  frees the extents the one before named. A node asks it at the turn after an entry waits
+  (`Engine::wants_checkpoint`, node.md §1.2), not at its log's next compaction for room.
 - **At the bound.** Where the tree and its maintenance's working room hold the store's extents,
   nothing is pending a checkpoint and every task left waits for room, no task begun and no
   memtable frozen or packing (`ShardDb::at_extent_bound`), the engine stays in that wait: an
@@ -453,7 +461,10 @@ under load, at moderate load and saturated.
   no task and no change begun whose copy fits the store's free extents beside the room every other
   task leaves: LFS's cost-benefit [LFS §3.5], the free space a cleaning generates against the
   pages it reads and writes, without age, which a branch does not keep. An extent a branch names
-  alone is freed when it goes. *The reserve, as built:* the planned relocation's room becomes the
+  alone is freed when it goes. A look that found none worth planning is not taken again until
+  something it reads changes: the room free, the extents' live pages, the tasks planned and
+  standing, or a flush or split (`CleaningMark`); taken each pass, a stalled shard scanned every
+  branch each pass to find the same none. *The reserve, as built:* the planned relocation's room becomes the
   cleaner's reserve (`Trunk::set_clean_room`), counted in the room every other inline task, every
   worker's grant (`Trunk::room_kept`) and every rotation (`ShardDb::rotation_room`) leaves free,
   and not in the relocation's own (`Trunk::step_inline`); it returns to none as the relocation

@@ -199,6 +199,7 @@ fn job(node: usize, ticket: Option<Ticket>, units: u64) -> NodeTask {
         },
         units,
         reuse: Reuse::default(),
+        asked: std::cell::Cell::new(None),
     }
 }
 

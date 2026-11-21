@@ -25,17 +25,19 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
     /// begun at `began`; a range on another shard is that shard's to maintain (`Shard::upkeep`).
     pub(super) fn upkeep_ranges(&mut self, began: Instant) -> Result<(), NodeError> {
         let own_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let now = hyper_rt::futures::now_ns();
         let Self {
             upkeep,
             ranges,
             owner,
+            waker,
             ..
         } = self;
         upkeep.turn(own_ns, ranges.len(), |at, units| {
             let Some(kept) = ranges.get(at) else {
                 return Ok((0, false));
             };
-            step_range(owner, kept.handle, kept.group, units)
+            step_range(owner, kept.handle, kept.group, units, now, waker)
         })?;
         Ok(())
     }
@@ -48,6 +50,15 @@ impl<E: Engine + 'static, L: NodeLog> Node<E, L> {
 /// (`ShardDb::checkpoint_now`): the range is queued, so the next turn drives it and comes at
 /// once (`Owner::has_work`), and a drive that finds no room yet, or the checkpoint still out,
 /// leaves the wake asked again.
+///
+/// A range whose entries wait for the room only its engine's next checkpoint frees
+/// (`Engine::wants_checkpoint`) compacts its log now (`Replica::compact`), which makes that
+/// checkpoint (`StateMachine::persist`): its maintenance can do nothing until then, and the log's
+/// own compaction comes only once the log is out of room, which a range holding its entries
+/// unapplied, and a cell waiting on it, may not bring for many minutes. The node suite's
+/// sustained-writes cell waited so, every node idle, its `converged` wait ending unmet. The
+/// compaction asks the checkpoint as the log's does, its start moved only once it is durable
+/// (I8), and it is asked once: its checkpoint out, the replica's drives go on with it.
 pub(super) fn step_range<E: Engine + 'static, S: mantle_range::LogStore>(
     owner: &mut hyper_durable::Owner<
         super::answers::Answers<S>,
@@ -57,13 +68,24 @@ pub(super) fn step_range<E: Engine + 'static, S: mantle_range::LogStore>(
     handle: hyper_durable::Handle,
     group: u128,
     units: u64,
+    now: u64,
+    waker: &std::task::Waker,
 ) -> Result<(u64, bool), NodeError> {
     let Some(replica) = owner.get_mut(handle) else {
         return Ok((0, false));
     };
     let waits = replica.waits_for_room() || replica.persisting();
     let stepped = step(group, replica.machine_mut().engine_mut(), units)?;
-    if waits && stepped.0 > 0 {
+    let checkpoint = replica.fenced().is_none()
+        && replica.waits_for_room()
+        && !replica.persisting()
+        && replica.machine().engine().wants_checkpoint();
+    if checkpoint {
+        replica
+            .compact(0, now, waker)
+            .map_err(|e| mantle_range::refused(replica.machine(), e))?;
+    }
+    if checkpoint || (waits && stepped.0 > 0) {
         owner.schedule(handle);
     }
     Ok(stepped)

@@ -1144,8 +1144,16 @@ impl<F: BlockFile> ShardDb<F> {
             .saturating_add(packing)
             .saturating_add(self.trunk.owed_room(&self.store)?);
         // A wait of maintenance's, its tasks dropped for a checkpoint and not yet planned anew,
-        // keeps its room from the packing too.
-        let need = own.max(self.trunk.room_waited().saturating_add(packing));
+        // keeps its room from the packing too. A trunk with nothing to plan anew has no task
+        // to keep it for, and takes no pass that would end the wait: kept, the wait held every
+        // entry with the store's room free and nothing to free more (an engine alone filling
+        // its store with live rows, shard_db/still_passes.rs).
+        let waited = if self.trunk.is_idle() {
+            0
+        } else {
+            self.trunk.room_waited()
+        };
+        let need = own.max(waited.saturating_add(packing));
         if self.store.room_most() >= need {
             return Ok(true);
         }
@@ -1381,7 +1389,12 @@ impl<F: BlockFile> ShardDb<F> {
     fn finish_stage(&mut self, applied: u64, stage: Flush) -> Result<(), Error> {
         let (sb, ticket, sealed) = match stage {
             Flush::Pack { .. } => {
+                // As a checkpoint made whole: the flush stops where maintenance waits for the
+                // extents this checkpoint frees, its unstarted tasks dropped before the save.
+                // Saved with them, a paced checkpoint finished so failed "a trunk saved with
+                // maintenance running" (shard_db/still_passes.rs, one worker).
                 self.flush_whole()?;
+                self.trunk_saveable()?;
                 let head = self.trunk.save(&mut self.store)?;
                 (self.store.checkpoint_map(Some(head), applied)?, None, false)
             }
@@ -5155,9 +5168,8 @@ impl<F: BlockFile> ShardDb<F> {
             || self.growth_due()
             || self.packing.is_some()
             || !self.frozen.is_empty()
-            || ((self.trunk.debt() > 0 || !self.trunk.is_idle())
-                && !self.trunk.stalled_for_room(&self.store))
-            || self.trunk.consolidation_owed()
+            || self.trunk_goes_on()
+            || self.consolidation_goes_on()
             || (if paced {
                 self.mem.debt() > 0
             } else {
@@ -5169,6 +5181,28 @@ impl<F: BlockFile> ShardDb<F> {
             || self.kept_out
             || !self.kept_lists.is_empty()
             || self.quiet_unconsolidated()
+    }
+
+    /// Whether the trunk owes maintenance a step can go on with: work owed or in progress, and
+    /// not waiting for extents only the next checkpoint frees ([`Trunk::stalled_for_room`]). A
+    /// stalled trunk's pass finds the same room short and changes nothing, so it is stepped
+    /// again only once an event has changed what it waits on: the checkpoint that frees the
+    /// extents ([`Self::wants_checkpoint`]), or extents freed or admitted otherwise, which end
+    /// the stall as the store's free extents reach the room it waits for. Stepped while stalled,
+    /// a node's idle steps reported a unit done each pass and looked again at once, its shard
+    /// thread spinning while the cell waited for the range to apply (the node suite's
+    /// sustained-writes cell, macOS `sample`, 2026-11-21).
+    fn trunk_goes_on(&self) -> bool {
+        (self.trunk.debt() > 0 || !self.trunk.is_idle())
+            && !self.trunk.stalled_for_room(&self.store)
+    }
+
+    /// Whether a consolidation seeks paid for can go on: owed, and the trunk not stalled for
+    /// room ([`Self::trunk_goes_on`]). A consolidation begins only once maintenance is idle and
+    /// writes as a compaction does, so a stalled trunk's consolidation step is the stalled pass
+    /// again; it waits for the same event.
+    fn consolidation_goes_on(&self) -> bool {
+        self.trunk.consolidation_owed() && !self.trunk.stalled_for_room(&self.store)
     }
 
     /// The shard is quiet with a layout to consolidate that its writes have paid for: its
@@ -5376,7 +5410,7 @@ impl<F: BlockFile> ShardDb<F> {
             self.looked = self.pool_moves() == moves;
             return Ok(1);
         }
-        if self.trunk.debt() > 0 || !self.trunk.is_idle() {
+        if self.trunk_goes_on() {
             let t = self.timed.then(std::time::Instant::now);
             let moves = self.pool_moves();
             let used = if paced {
@@ -5414,7 +5448,7 @@ impl<F: BlockFile> ShardDb<F> {
             // consolidates now rather than pivot by pivot as seeks pay (research/53 §11).
             self.trunk.consolidate_all();
         }
-        if self.trunk.consolidation_owed() {
+        if self.consolidation_goes_on() {
             // Seeks paid for consolidating leaves: one consolidation, in bulk, flushes and settles
             // them.
             let t = self.timed.then(std::time::Instant::now);
@@ -6538,6 +6572,10 @@ mod job_tails;
 #[cfg(test)]
 #[path = "shard_db/read_rent.rs"]
 mod read_rent;
+
+#[cfg(test)]
+#[path = "shard_db/still_passes.rs"]
+mod still_passes;
 
 #[cfg(test)]
 mod grant_tests {

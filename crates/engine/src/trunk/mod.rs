@@ -686,6 +686,11 @@ pub struct Trunk {
     /// one at least: kept with the counts.
     live_total: u64,
     live_extents: u64,
+    /// The changes to [`Self::live`] so far, wrapping: each branch counted in or out.
+    live_changes: u64,
+    /// What the cleaner's last choice read when it found no relocation worth planning
+    /// ([`Trunk::plan_cleaning`]): until one of them changes, it would find none again.
+    cleaning_looked: Option<upkeep::CleaningMark>,
     /// Whether the store is near its bound: the extents it may still hand out, beside the next
     /// checkpoint's room, are fewer than the pages above the leaves fill. Its index pivots then
     /// flush their bundles as soon as they hold a branch ([`Trunk::flush_due`]), so superseded
@@ -714,6 +719,12 @@ pub struct Trunk {
     /// which waits for the jobs it needs.
     #[cfg(test)]
     pub(crate) hold_dispatch: bool,
+    /// A test's count of the passes in a row that changed nothing and waited on nothing: no
+    /// unit spent, no task planned, handed out, taken back or applied, no branch entered, the
+    /// room and its waits as they were, and no job out or read waited on whose end would be the
+    /// next pass's event ([`Self::run`]).
+    #[cfg(test)]
+    pub(crate) still: u64,
     /// Gets, which with its branches' visits set the filters' plan ([`Trunk::filter_plan`]).
     gets: u64,
     /// Nanoseconds maintenance steps took and the keys they merged: the measured price of a
@@ -1114,6 +1125,8 @@ impl Trunk {
             clean_room: 0,
             live: Vec::new(),
             live_total: 0,
+            live_changes: 0,
+            cleaning_looked: None,
             live_extents: 0,
             near_bound: false,
             extent_pages: 0,
@@ -1125,6 +1138,8 @@ impl Trunk {
             pack_most: None,
             #[cfg(test)]
             hold_dispatch: false,
+            #[cfg(test)]
+            still: 0,
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,
@@ -2002,6 +2017,7 @@ impl Trunk {
                 .ok_or(corrupt())?;
             }
         }
+        self.live_changes = self.live_changes.wrapping_add(1);
         Ok(())
     }
 
@@ -3003,6 +3019,8 @@ impl Trunk {
             clean_room: 0,
             live: Vec::new(),
             live_total: 0,
+            live_changes: 0,
+            cleaning_looked: None,
             live_extents: 0,
             near_bound: false,
             extent_pages: 0,
@@ -3014,6 +3032,8 @@ impl Trunk {
             pack_most: None,
             #[cfg(test)]
             hold_dispatch: false,
+            #[cfg(test)]
+            still: 0,
             gets: 0,
             merge_ns: 0,
             merge_keys: 0,

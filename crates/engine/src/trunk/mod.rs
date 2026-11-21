@@ -516,6 +516,11 @@ pub struct TrunkStats {
     pub finish_ns: u64,
     /// Leaves settled to one branch because seeks paid for it ([`Consolidation`]).
     pub consolidations: u64,
+    /// Relocations planned, applied (a copy in place of its branch) and discarded (the branch
+    /// gone as it applied, its copy released) ([`Trunk::plan_relocation`]).
+    pub relocations_planned: u64,
+    pub relocations: u64,
+    pub relocations_discarded: u64,
     /// Work units merged by timed maintenance, inline or on workers, and the nanoseconds they
     /// took: a compacted key's measured cost, which consolidations are priced at
     /// ([`Trunk::note_merge`]).
@@ -653,6 +658,8 @@ pub struct Trunk {
     /// The extents the next checkpoint takes besides the trunk's image, which maintenance leaves
     /// free: the memtables it packs and the allocator's map ([`Trunk::set_checkpoint_room`]).
     checkpoint_room: u64,
+    /// The cleaner's reserve ([`Trunk::set_clean_room`]).
+    clean_room: u64,
     /// The checkpoint's room with the image's extents, counted once a pass that asks it
     /// ([`Trunk::room_kept`]).
     room_kept: Option<u64>,
@@ -1051,6 +1058,7 @@ impl Trunk {
             wanting_nodes: 0,
             capacity_wanted: 0,
             checkpoint_room: 0,
+            clean_room: 0,
             room_kept: None,
             room_short: None,
             #[cfg(test)]
@@ -2803,6 +2811,7 @@ impl Trunk {
             wanting_nodes: 0,
             capacity_wanted: 0,
             checkpoint_room: 0,
+            clean_room: 0,
             room_kept: None,
             room_short: None,
             #[cfg(test)]

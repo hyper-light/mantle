@@ -69,6 +69,10 @@ enum What {
         start: usize,
         covered: usize,
     },
+    /// A copy of the node's branch whose root page is `root`, which replaces it where it stands
+    /// as it applies, its pages moved out of extents mostly dead (cleaning,
+    /// docs/design/engine-structure.md §3).
+    Relocate { root: u64 },
 }
 
 /// What leaf's settle would take now ([`Trunk::leaf_settle`]).
@@ -183,9 +187,148 @@ impl Trunk {
         }
         let kept = self
             .checkpoint_room
-            .saturating_add(self.image_extents_now(store)?);
+            .saturating_add(self.image_extents_now(store)?)
+            .saturating_add(self.clean_room);
         self.room_kept = Some(kept);
         Ok(kept)
+    }
+
+    /// The cleaner's reserve: the extents the largest relocation it makes may take, which every
+    /// other task, grant and rotation leaves free beside the checkpoint's room, and a relocation
+    /// alone may take ([`Self::step_inline`]), as Sprite LFS cleans before its clean segments run
+    /// out (research/34 §6). A relocation's copy takes at most the extents its pages fill
+    /// ([`Self::inline_asked`]), so one of a branch of at most `extents` extents' pages always
+    /// has its room once the inline tasks writing now are done.
+    pub(crate) fn set_clean_room(&mut self, extents: u64) {
+        if self.clean_room != extents {
+            self.clean_room = extents;
+            self.room_kept = None;
+        }
+    }
+
+    /// The cleaner's reserve ([`Self::set_clean_room`]).
+    pub(crate) fn clean_room(&self) -> u64 {
+        self.clean_room
+    }
+
+    /// While maintenance waits for room and no relocation is out, plans the relocation that frees
+    /// the most extents net of its copy's for each page it copies, among the branches of nodes
+    /// with no task and no change begun whose copy fits the store's free extents beside the room
+    /// every other task leaves: Sprite LFS's cost-benefit, the free space a cleaning generates
+    /// against the pages it reads and writes, with no age, which a branch does not keep
+    /// (research/34 §6). An extent a branch names alone is freed when it goes; the copy takes
+    /// the extents its pages fill ([`Self::inline_asked`]). The cleaner's reserve is then that
+    /// copy's room, which every other task, grant and rotation leaves free until it applies or
+    /// is dropped: free when planned, it stays free for the copy once the inline tasks writing
+    /// then are done. Counted over every branch the trunk names, a reference at most
+    /// `extent_pages` an extent held.
+    fn plan_cleaning<F: BlockFile>(&mut self, store: &Store<F>) -> Result<(), Error> {
+        if self.room_short.is_none() || self.clean_room > 0 {
+            return Ok(());
+        }
+        let mut named: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        let mut name = |b: &Branch| {
+            for &e in &b.extents {
+                let n = named.entry(e).or_insert(0);
+                *n = n.saturating_add(1);
+            }
+        };
+        for p in &self.pending {
+            p.branches().for_each(&mut name);
+        }
+        for node in &self.nodes {
+            node.inflight
+                .iter()
+                .flat_map(|f| f.branches.iter())
+                .for_each(&mut name);
+            node.pivots
+                .iter()
+                .flat_map(|p| p.bundle.branches().iter())
+                .for_each(&mut name);
+        }
+        let free = store
+            .capacity()
+            .saturating_sub(self.room_kept(store)?)
+            .saturating_sub(self.inline_room(store)?);
+        let per = u64::from(store.extent_pages()).max(1);
+        // (gain, pages, node, root, ask) of the best so far.
+        let mut best: Option<(u64, u64, usize, u64, u64)> = None;
+        for (n, node) in self.nodes.iter().enumerate() {
+            if self.tasks.busy(n) || node.wants.is_some_and(|c| c.started) {
+                continue;
+            }
+            let branches = node
+                .inflight
+                .iter()
+                .flat_map(|f| f.branches.iter())
+                .chain(node.pivots.iter().flat_map(|p| p.bundle.branches().iter()));
+            for b in branches {
+                let pages = u64::try_from(b.pages_between(b"", None)).unwrap_or(u64::MAX);
+                let ask = pages.div_ceil(per);
+                if ask > free {
+                    continue;
+                }
+                let alone = b
+                    .extents
+                    .iter()
+                    .filter(|e| named.get(e) == Some(&1))
+                    .count();
+                let gain = u64::try_from(alone).unwrap_or(0).saturating_sub(ask);
+                // More extents a page copied: gain / pages, compared crosswise.
+                let better = best.is_none_or(|(g, p, ..)| {
+                    u128::from(gain).saturating_mul(u128::from(p))
+                        > u128::from(g).saturating_mul(u128::from(pages))
+                });
+                if gain > 0 && better {
+                    best = Some((gain, pages, n, b.root, ask));
+                }
+            }
+        }
+        if let Some((_, _, n, root, ask)) = best {
+            self.plan_relocation(n, root)?;
+            self.set_clean_room(ask);
+        }
+        Ok(())
+    }
+
+    /// Plans the relocation of node `n`'s branch whose root page is `root`: a copy of it alone,
+    /// its tombstones kept, written inline a budget at a time and waiting for room as a
+    /// compaction does, which replaces it where it stands as it applies, the original's extents
+    /// then released, free at the next checkpoint. Its node plans nothing else and takes no
+    /// change while it is out ([`Self::look_at`]), so the branch stays where it is; one whose
+    /// branch is no longer there as it applies is discarded, its copy released. The copy keeps
+    /// the branch's life: a leaf's bundle's long, any other short. Refused for a node with a task
+    /// or a change begun, and for a branch the node does not hold.
+    pub(crate) fn plan_relocation(&mut self, n: usize, root: u64) -> Result<(), Error> {
+        if self.tasks.busy(n) || self.node(n)?.wants.is_some_and(|c| c.started) {
+            return Err(Error::InvalidArgument {
+                what: "a relocation beside another task of its node",
+            });
+        }
+        let node = self.node(n)?;
+        let (b, settled) = holding(node, root).ok_or(Error::InvalidArgument {
+            what: "a relocation of a branch its node does not hold",
+        })?;
+        let units = b.count;
+        let mut copy = Compaction::prepare(std::iter::once(b), Vec::new(), None, false, u64::MAX);
+        copy.set_life(if settled {
+            crate::store::Life::Long
+        } else {
+            crate::store::Life::Short
+        });
+        let top = self.root;
+        self.tasks.push(
+            NodeTask {
+                node: n,
+                what: What::Relocate { root },
+                run: Running::Inline(Box::new(copy)),
+                units,
+                reuse: Reuse::default(),
+            },
+            top,
+        )?;
+        self.stats.relocations_planned = self.stats.relocations_planned.saturating_add(1);
+        Ok(())
     }
 
     /// Whether maintenance waits for extents only a checkpoint frees: a task of the last pass
@@ -243,6 +386,9 @@ impl Trunk {
         for mut t in self.tasks.take_all() {
             if let Running::Inline(c) = &mut t.run {
                 c.cancel_opening(store);
+            }
+            if let What::Relocate { .. } = t.what {
+                self.set_clean_room(0);
             }
             if let What::Settle { .. } = t.what
                 && let Some(c) = self.node_mut(t.node)?.wants.as_mut()
@@ -625,6 +771,7 @@ impl Trunk {
     /// Looks at the nodes queued when it begins, each once: a node looked at may queue those it
     /// changed, and they wait for the next look ([`Self::run`] looks again once tasks apply).
     fn look<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        self.plan_cleaning(store)?;
         for _ in 0..self.looking.len() {
             let Some(n) = self.looking.pop_front() else {
                 break;
@@ -640,6 +787,15 @@ impl Trunk {
     /// Node `n`'s triggers: its pivots' compactions, its full pivots' flushes, and the change it
     /// wants, each taken once nothing it would conflict with is in progress.
     fn look_at<F: BlockFile>(&mut self, store: &mut Store<F>, n: usize) -> Result<(), Error> {
+        // A relocation out holds the node's branches where they stand until it applies, which
+        // looks at the node again.
+        if self
+            .tasks
+            .on(n)
+            .any(|t| matches!(t.what, What::Relocate { .. }))
+        {
+            return Ok(());
+        }
         self.drop_dead(store, n)?;
         if self.node(n)?.wants.is_some_and(|c| c.started) {
             return Ok(());
@@ -1258,6 +1414,11 @@ impl Trunk {
         let parts = match &task.what {
             What::Compact { .. } => 1,
             What::Settle { .. } => self.leaf_parts(entries).min(pages.max(1)),
+            // A copy of one branch writes at most the pages a merge of it would, in the extents
+            // they fill: begun part way into a tail it shares that extent, so the copy takes
+            // `ceil((t + p) / e) - 1` fresh extents for `p` pages begun at page `t < e`, at most
+            // `ceil(p / e)`, as begun in a fresh extent.
+            What::Relocate { .. } => return Ok(read),
         };
         Ok(extents.min(read).saturating_add(parts).saturating_add(1))
     }
@@ -1367,7 +1528,13 @@ impl Trunk {
             // (mantle-node tests/engine_workers.rs).
             if opening {
                 let asked = self.inline_asked(store, task)?;
-                let kept = self.room_kept(store)?;
+                // The cleaner's reserve is a relocation's to take and no other task's.
+                let relocates = matches!(task.what, What::Relocate { .. });
+                let kept = self.room_kept(store)?.saturating_sub(if relocates {
+                    self.clean_room
+                } else {
+                    0
+                });
                 let need = asked
                     .saturating_add(kept)
                     .saturating_add(self.inline_room(store)?);
@@ -1416,6 +1583,9 @@ impl Trunk {
                             && let Some(c) = self.node_mut(task.node)?.wants.as_mut()
                         {
                             c.started = false;
+                        }
+                        if let What::Relocate { .. } = task.what {
+                            self.set_clean_room(0);
                         }
                         self.queue(task.node);
                     }
@@ -1566,6 +1736,34 @@ impl Trunk {
                 self.wake_held(n)?;
                 self.clear_wants(n)?;
                 self.splice(n, leaves)?;
+            }
+            What::Relocate { root } => {
+                // A copy of one branch is one part; the branch is where it stood, its node having
+                // planned nothing meanwhile, or the copy is discarded.
+                let mut parts = parts.into_iter();
+                match (parts.next(), parts.next()) {
+                    (Some((_, copy)), None) => match holding_mut(self.node_mut(n)?, root) {
+                        Some(slot) => {
+                            let old = std::mem::replace(slot, copy);
+                            super::release(store, &old)?;
+                            self.stats.relocations = self.stats.relocations.saturating_add(1);
+                        }
+                        None => {
+                            super::release(store, &copy)?;
+                            self.stats.relocations_discarded =
+                                self.stats.relocations_discarded.saturating_add(1);
+                        }
+                    },
+                    (first, second) => {
+                        for (_, b) in first.into_iter().chain(second).chain(parts) {
+                            super::release(store, &b)?;
+                        }
+                        self.stats.relocations_discarded =
+                            self.stats.relocations_discarded.saturating_add(1);
+                    }
+                }
+                self.set_clean_room(0);
+                self.queue(n);
             }
         }
         self.stats.finish_ns = self.stats.finish_ns.saturating_add(ns_since(t));
@@ -2011,6 +2209,39 @@ fn entries(branches: &[Branch]) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
+/// Node `node`'s branch whose root page is `root`, in an in-flight bundle or a pivot's bundle,
+/// and whether it is a leaf's bundle's (a settle's part, long-lived).
+fn holding(node: &super::Node, root: u64) -> Option<(&Branch, bool)> {
+    node.inflight
+        .iter()
+        .flat_map(|f| f.branches.iter())
+        .find(|b| b.root == root)
+        .map(|b| (b, false))
+        .or_else(|| {
+            node.pivots
+                .iter()
+                .flat_map(|p| p.bundle.branches().iter())
+                .find(|b| b.root == root)
+                .map(|b| (b, node.leaf))
+        })
+}
+
+/// [`holding`]'s branch, to replace.
+fn holding_mut(node: &mut super::Node, root: u64) -> Option<&mut Branch> {
+    let super::Node {
+        inflight, pivots, ..
+    } = node;
+    inflight
+        .iter_mut()
+        .flat_map(|f| f.branches.iter_mut())
+        .chain(
+            pivots
+                .iter_mut()
+                .flat_map(|p| p.bundle.branches_mut().iter_mut()),
+        )
+        .find(|b| b.root == root)
+}
+
 /// The keys a task merges: its pivot's range for a compaction, the leaf's for a settle.
 fn task_range<'a>(
     node: &'a super::Node,
@@ -2029,6 +2260,8 @@ fn task_range<'a>(
             let pivot = node.pivots.first().ok_or(corrupt())?;
             Ok((pivot.key.as_slice(), node.end.as_deref()))
         }
+        // Every key the branch holds.
+        What::Relocate { .. } => Ok((b"".as_slice(), None)),
     }
 }
 
@@ -2066,6 +2299,10 @@ fn task_inputs<'a>(
                 node.end.as_deref(),
                 Some(pivot.bundle.branches()),
             )
+        }
+        What::Relocate { root } => {
+            let (b, _) = holding(node, *root).ok_or(corrupt())?;
+            (0, 0, b"".as_slice(), None, Some(std::slice::from_ref(b)))
         }
     };
     let live = node.inflight.get(start..covered).ok_or(corrupt())?;
@@ -2140,6 +2377,10 @@ mod room;
 #[cfg(test)]
 #[path = "shared_extents.rs"]
 mod shared_extents;
+
+#[cfg(test)]
+#[path = "relocation.rs"]
+mod relocation;
 
 #[cfg(test)]
 mod reuse_tests {

@@ -38,8 +38,9 @@ use mantle_node::node::refusals::Refusals;
 use mantle_node::node::{GatewaySettings, Hosted, Node, NodeSettings};
 use mantle_node::process::{AccessKey, Enlisting, NativeShards, RangeShards};
 use mantle_node::storage::{Storage, VolumeSettings};
-use mantle_protocol::object::{Headers, Op, Status};
+use mantle_protocol::object::{Copy, Headers, Op, Status};
 use mantle_range::{Range, Stored};
+use mantle_s3::copy::{Directive, Source};
 use mantle_s3::seal::WrappingKey;
 use tempfile::TempDir;
 
@@ -118,6 +119,10 @@ pub enum Said {
     /// Each range's leader as the node knows it, in [`LAYERED`]'s order, and the hand-overs it
     /// began to spread the leads (`Node::lead_moves`), as either changes.
     Leads(u64, Vec<u64>, u64),
+    /// The requests it answered `Failed`, a count for each cause in `door::Fault::ALL`'s order
+    /// (`Node::failed`), the counts its process's status line says (`failed CAUSE COUNT`), as they
+    /// change.
+    Failures(u64, Vec<u64>),
     Failed(u64, String),
 }
 
@@ -144,6 +149,11 @@ pub enum ObjectOp {
     CreateBucket(String),
     Put(String, String, Vec<u8>),
     Get(String, String),
+    /// CopyObject: the bucket and key, then the source's bucket and key.
+    Copy(String, String, String, String),
+    /// A native upload's Open of an object of the length given (`Op::Open`): the native door's
+    /// alone.
+    Open(String, String, u64),
 }
 
 /// An operation as a failure names it: a put by its bytes' length, not its bytes.
@@ -153,6 +163,10 @@ impl std::fmt::Debug for ObjectOp {
             Self::CreateBucket(bucket) => write!(f, "CreateBucket {bucket}"),
             Self::Put(bucket, key, bytes) => write!(f, "Put {bucket}/{key} of {}", bytes.len()),
             Self::Get(bucket, key) => write!(f, "Get {bucket}/{key}"),
+            Self::Copy(bucket, key, from, source) => {
+                write!(f, "Copy {from}/{source} to {bucket}/{key}")
+            }
+            Self::Open(bucket, key, length) => write!(f, "Open {bucket}/{key} of {length}"),
         }
     }
 }
@@ -178,6 +192,8 @@ pub struct DoorCell {
     pub enlisted: BTreeSet<u64>,
     /// Each node's view of the ranges' leaders, and the hand-overs it began.
     pub leads: BTreeMap<u64, (Vec<u64>, u64)>,
+    /// Each node's counts of requests it answered `Failed`, by cause, as it last said them.
+    pub failures: BTreeMap<u64, Vec<u64>>,
 }
 
 impl Drop for DoorCell {
@@ -246,9 +262,10 @@ fn enlisting(id: u64) -> Enlisting {
 }
 
 /// The gateway host's settings ([`WINDOW`] and the rest), its root key 32 bytes of the test's
-/// own, each operation charged at its own size under the schemes a cell of [`NODES`] domains'
-/// blocks may take (`derive::charges`), the operations' bytes four of the most one holds.
-fn gateway(enlist: &Enlisting) -> GatewaySettings {
+/// own, or none for a node `keyed` says holds none, each operation charged at its own size under
+/// the schemes a cell of [`NODES`] domains' blocks may take (`derive::charges`), the operations'
+/// bytes four of the most one holds.
+fn gateway(enlist: &Enlisting, keyed: bool) -> GatewaySettings {
     let rates = Rates {
         chunk: CHUNK_RATE,
         domains: None,
@@ -258,7 +275,11 @@ fn gateway(enlist: &Enlisting) -> GatewaySettings {
     let schemes = mantle_ec::durability::candidates();
     let most = Charges::new(WINDOW, &schemes).unwrap().most();
     GatewaySettings {
-        keys: vec![(1, WrappingKey::new(&[0x5a; 32]))],
+        keys: if keyed {
+            vec![(1, WrappingKey::new(&[0x5a; 32]))]
+        } else {
+            Vec::new()
+        },
         handover_ns: HANDOVER_NS,
         window: WINDOW,
         objects: OBJECTS,
@@ -394,6 +415,7 @@ async fn run_door(
     }
     let mut accepting = pin!(listener.serve());
     let mut told: Option<(Vec<u64>, u64)> = None;
+    let mut failures = vec![0; mantle_node::door::Fault::ALL.len()];
     loop {
         let ended = {
             let turn = pin!(node.turn());
@@ -443,6 +465,13 @@ async fn run_door(
             }
             told = Some(now);
         }
+        let failed = node.failed().to_vec();
+        if failed != failures {
+            if said.send(Said::Failures(id, failed.clone())).is_err() {
+                return;
+            }
+            failures = failed;
+        }
     }
 }
 
@@ -450,6 +479,12 @@ impl DoorCell {
     /// A cell of [`NODES`] nodes that host objects started, each told where the others listen, and
     /// each node's S3 listener bound; each enlists as `enlist` says.
     pub fn start(pki: &Pki, enlist: Enlist) -> Self {
+        Self::start_keyless(pki, enlist, None)
+    }
+
+    /// [`DoorCell::start`]'s cell, node `keyless` holding no root key: it makes no object's keys,
+    /// so each put asked of it fails, for that cause (`Fault::Keys`).
+    pub fn start_keyless(pki: &Pki, enlist: Enlist, keyless: Option<u64>) -> Self {
         let (tell, said) = mpsc::channel();
         let mut cell = Self {
             pki: pki.clone(),
@@ -462,6 +497,7 @@ impl DoorCell {
             s3: BTreeMap::new(),
             enlisted: BTreeSet::new(),
             leads: BTreeMap::new(),
+            failures: BTreeMap::new(),
         };
         for id in 1..=NODES {
             let dir = tempfile::tempdir().unwrap();
@@ -512,7 +548,7 @@ impl DoorCell {
                         // A log group for each range, and the liveness stream's own.
                         settings.log.max_groups = LAYERED.len() + 1;
                         settings.chunk_asks = OBJECT_CHUNK_ASKS;
-                        settings.gateway = Some(gateway(&enlist));
+                        settings.gateway = Some(gateway(&enlist, keyless != Some(id)));
                         // A node that enlists states the cell's bound on its nodes, as a process
                         // does (`process::serve`).
                         settings.max_nodes = enlist.max_nodes;
@@ -564,6 +600,9 @@ impl DoorCell {
             }
             Said::Leads(id, leaders, moves) => {
                 self.leads.insert(id, (leaders, moves));
+            }
+            Said::Failures(id, counts) => {
+                self.failures.insert(id, counts);
             }
             Said::Failed(id, why) => panic!("node {id} failed: {why}"),
         }
@@ -774,10 +813,50 @@ async fn native_op(client: &mut mantle_client::Client, op: &ObjectOp) -> Result<
                 .await
                 .map(|reply| (reply, sink))
         }
+        ObjectOp::Copy(bucket, key, from, source) => {
+            let op = Op::Copy(Box::new(Copy {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                id: mantle_client::identity().map_err(|e| e.to_string())?,
+                source: Source {
+                    bucket: from.clone(),
+                    key: source.clone(),
+                    version: None,
+                },
+                conditions: Headers::default(),
+                headers: Headers::default(),
+                directive: Directive::Copy,
+                metadata: Vec::new(),
+                checksum: None,
+            }));
+            client
+                .call(&op, u64::MAX)
+                .await
+                .map(|reply| (reply, Vec::new()))
+        }
+        ObjectOp::Open(bucket, key, length) => {
+            let op = Op::Open {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                id: mantle_client::identity().map_err(|e| e.to_string())?,
+                length: Some(*length),
+                buffer: None,
+                checksum: mantle_client::TRAILER,
+                metadata: Vec::new(),
+            };
+            client
+                .call(&op, u64::MAX)
+                .await
+                .map(|reply| (reply, Vec::new()))
+        }
     };
+    // A failure names its cause beside its status (`door::Fault`).
     match replied {
         Ok((reply, bytes)) if reply.status == Status::Done => Ok(bytes),
-        Ok((reply, _)) => Err(format!("{:?}", reply.status)),
+        Ok((reply, _)) => Err(match reply.fault {
+            Some(cause) => format!("{:?} {}", reply.status, cause.name()),
+            None => format!("{:?}", reply.status),
+        }),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -785,19 +864,30 @@ async fn native_op(client: &mut mantle_client::Client, op: &ObjectOp) -> Result<
 /// `op` asked through an S3 listener, asked again after `503 SlowDown` as botocore's standard
 /// retry mode asks, mantle-client's own rule: at most `ATTEMPTS` attempts, the `n`-th pause the
 /// most of its full jitter, `min(2^(n-1) SLOWED_BASE, SLOWED_MOST)`. Done (`200`), a get with
-/// its bytes; else the status and the error's code.
+/// its bytes; else the status, the error's code and its message.
 async fn s3_op(client: &mut s3::Client, op: &ObjectOp) -> Result<Vec<u8>, String> {
+    let mut source = String::new();
     let (method, target, body) = match op {
         ObjectOp::CreateBucket(bucket) => ("PUT", format!("/{bucket}"), &[][..]),
         ObjectOp::Put(bucket, key, bytes) => ("PUT", format!("/{bucket}/{key}"), bytes.as_slice()),
         ObjectOp::Get(bucket, key) => ("GET", format!("/{bucket}/{key}"), &[][..]),
+        ObjectOp::Copy(bucket, key, from, named) => {
+            source = format!("/{from}/{named}");
+            ("PUT", format!("/{bucket}/{key}"), &[][..])
+        }
+        ObjectOp::Open(..) => return Err("a native upload's Open is no S3 operation".into()),
+    };
+    let headers: Vec<(&str, &str)> = if source.is_empty() {
+        Vec::new()
+    } else {
+        vec![("x-amz-copy-source", source.as_str())]
     };
     let mut attempt = 1;
     loop {
         // The test client unwinds where its connection fails: told as the answer, and the next
         // operation asked on a connection of its own.
         let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.send(method, &target, &[], body)
+            client.send(method, &target, &headers, body)
         }));
         let Ok(response) = sent else {
             client.drop_connection();
@@ -808,7 +898,8 @@ async fn s3_op(client: &mut s3::Client, op: &ObjectOp) -> Result<Vec<u8>, String
         }
         if response.status != 503 || attempt == mantle_client::ATTEMPTS {
             let code = response.element("Code").unwrap_or_default();
-            return Err(format!("{} {code}", response.status));
+            let message = response.element("Message").unwrap_or_default();
+            return Err(format!("{} {code} {message}", response.status));
         }
         let pause =
             (mantle_client::SLOWED_BASE * 2u32.pow(attempt - 1)).min(mantle_client::SLOWED_MOST);

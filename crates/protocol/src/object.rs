@@ -98,8 +98,8 @@
 //! (u64), Last-Modified (u64), checksum algorithm, optional, its code (u8) and parts (u16), and
 //! owner; the count of common prefixes (u32), each a text. A delete's results, in the order the
 //! request named its objects: the count (u32), each the key, the version the request named,
-//! optional, the status of its delete (u8), and the version ID of the delete marker the delete
-//! made or removed, optional. A page of principals: the count (u32), each its name, its unique ID,
+//! optional, the status of its delete (u8), its cause (u8), beside `Failed` its [`Fault`]'s code,
+//! else 0, and the version ID of the delete marker the delete made or removed, optional. A page of principals: the count (u32), each its name, its unique ID,
 //! its creation (u64, whole seconds), its identity policy, optional, and its keys (a u32 count),
 //! each its id and creation (u64, whole seconds); the principal after which the next page starts,
 //! optional. A key made: its id, its secret and the key it replaces, optional.
@@ -2027,8 +2027,8 @@ pub enum Fault {
     Layer,
     /// The node's volume table could not be read, or the durability model's choice over it failed.
     Table,
-    /// The node holds no gateway settings or root key, or could not make the object's keys, its
-    /// layout or its reader.
+    /// The node holds no gateway settings or root key, or could not make or open the keys an
+    /// operation needs: the object's, its layout or its reader, or an access key's id and secret.
     Keys,
     /// The node refused an ask of the operation's for another cause than its room.
     Ask,
@@ -2049,11 +2049,15 @@ pub enum Fault {
     Corrupt,
     /// The object's rows disagree with each other: its version, its file and its blocks.
     Rows,
+    /// The node's answers to an S3 request ended before its reply's head: its task let the
+    /// request go unanswered, stopping, or answered out of the order the listener takes. The S3
+    /// listener's own `500`, which no host's reply names.
+    Unanswered,
 }
 
 impl Fault {
     /// Every cause, in the order of their codes.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Read,
         Self::Command,
         Self::Layer,
@@ -2067,6 +2071,7 @@ impl Fault {
         Self::Encode,
         Self::Corrupt,
         Self::Rows,
+        Self::Unanswered,
     ];
 
     /// The cause's code beside a reply's status: its place in [`Fault::ALL`] from one, zero
@@ -2086,6 +2091,7 @@ impl Fault {
             Self::Encode => 11,
             Self::Corrupt => 12,
             Self::Rows => 13,
+            Self::Unanswered => 14,
         }
     }
 
@@ -2114,6 +2120,7 @@ impl Fault {
             Self::Encode => "encode",
             Self::Corrupt => "corrupt",
             Self::Rows => "rows",
+            Self::Unanswered => "unanswered",
         }
     }
 
@@ -2127,7 +2134,7 @@ impl Fault {
             }
             Self::Layer => "The node hosts no range of a layer the operation needs.",
             Self::Table => "The node's volume table could not be read.",
-            Self::Keys => "The node could not make the object's keys, layout or reader.",
+            Self::Keys => "The node could not make or open the keys, layout or reader it needs.",
             Self::Ask => "The node refused an ask of the operation's for another cause than room.",
             Self::Driver => "The operation's driver failed of itself.",
             Self::Chunk => "A chunk's answer was of another ask's kind.",
@@ -2138,6 +2145,7 @@ impl Fault {
             Self::Encode => "The reply could not be encoded.",
             Self::Corrupt => "A block read did not verify against its checksums or its seal.",
             Self::Rows => "The object's rows disagree with each other.",
+            Self::Unanswered => "The node's answers to the request ended before its reply.",
         }
     }
 }
@@ -2255,6 +2263,8 @@ pub struct Deleted {
     pub version: Option<String>,
     /// `Done`, or the refusal its delete earned.
     pub status: Status,
+    /// A `Failed`'s cause, beside it alone, as a reply's is ([`Reply::failed`]).
+    pub fault: Option<Fault>,
     /// The version ID of the delete marker its delete made, or of the one it removed.
     pub marker: Option<String>,
 }
@@ -2798,9 +2808,10 @@ pub fn take_versions(r: &mut Reader<'_>) -> Option<Versions> {
     })
 }
 
-/// A delete's result at its longest: its key, the version it named, its status and the delete
-/// marker's version ID, each optional text behind its flag and length.
-pub const DELETED_BYTES: usize = (4 + MAX_KEY) + (1 + 4 + MAX_VERSION_ID) + 1 + (1 + 4 + MAX_TAG);
+/// A delete's result at its longest: its key, the version it named, its status, its cause and the
+/// delete marker's version ID, each optional text behind its flag and length.
+pub const DELETED_BYTES: usize =
+    (4 + MAX_KEY) + (1 + 4 + MAX_VERSION_ID) + 1 + 1 + (1 + 4 + MAX_TAG);
 
 pub fn put_deleted(w: &mut Writer, results: &[Deleted]) -> Result<(), ObjectError> {
     if results.len() > MAX_OBJECTS {
@@ -2808,23 +2819,39 @@ pub fn put_deleted(w: &mut Writer, results: &[Deleted]) -> Result<(), ObjectErro
     }
     put_count(w, results.len())?;
     for d in results {
+        // A cause stands beside `Failed` alone, as a reply head's does (`Reply::encode`).
+        let cause = match (d.status, d.fault) {
+            (_, None) => 0,
+            (Status::Failed, Some(cause)) => cause.code(),
+            (status, Some(_)) => return Err(ObjectError::Cause(status)),
+        };
         put_text(w, &d.key, MAX_KEY)?;
         put_optional_text(w, d.version.as_deref(), MAX_VERSION_ID)?;
         w.u8(d.status.code());
+        w.u8(cause);
         put_optional_text(w, d.marker.as_deref(), MAX_TAG)?;
     }
     Ok(())
 }
 
 pub fn take_deleted(r: &mut Reader<'_>) -> Option<Vec<Deleted>> {
-    // A result takes 7 bytes at least.
-    let count = take_count(r, MAX_OBJECTS, 7)?;
+    // A result takes 8 bytes at least.
+    let count = take_count(r, MAX_OBJECTS, 8)?;
     let mut results = Vec::with_capacity(count);
     for _ in 0..count {
+        let key = take_text(r, MAX_KEY)?;
+        let version = take_optional_text(r, MAX_VERSION_ID)?;
+        let status = Status::of(r.u8()?)?;
+        let fault = match (status, r.u8()?) {
+            (_, 0) => None,
+            (Status::Failed, code) => Some(Fault::of(code)?),
+            _ => return None,
+        };
         results.push(Deleted {
-            key: take_text(r, MAX_KEY)?,
-            version: take_optional_text(r, MAX_VERSION_ID)?,
-            status: Status::of(r.u8()?)?,
+            key,
+            version,
+            status,
+            fault,
             marker: take_optional_text(r, MAX_TAG)?,
         });
     }
@@ -3871,11 +3898,17 @@ mod tests {
         replies.push(Reply {
             listing: Some(Listing::Deleted(
                 (0..MAX_OBJECTS)
-                    .map(|n| Deleted {
-                        key: format!("k{n}"),
-                        version: n.is_multiple_of(2).then(|| "v".repeat(MAX_VERSION_ID)),
-                        status: STATUSES[n % STATUSES.len()],
-                        marker: n.is_multiple_of(3).then(|| "0123456789ABC".into()),
+                    .map(|n| {
+                        let status = STATUSES[n % STATUSES.len()];
+                        Deleted {
+                            key: format!("k{n}"),
+                            version: n.is_multiple_of(2).then(|| "v".repeat(MAX_VERSION_ID)),
+                            status,
+                            // Each `Failed` names a cause, in turn.
+                            fault: (status == Status::Failed)
+                                .then(|| Fault::ALL[n % Fault::ALL.len()]),
+                            marker: n.is_multiple_of(3).then(|| "0123456789ABC".into()),
+                        }
                     })
                     .collect(),
             )),
@@ -4083,5 +4116,40 @@ mod tests {
         assert!(ReplyHead::decode(&head).is_err());
         let (head, _) = Reply::status(Status::Failed).encode().unwrap();
         assert_eq!(ReplyHead::decode(&head).unwrap().fault, None);
+    }
+
+    /// A DeleteObjects' key that failed names its cause beside its `Failed`, read back in its
+    /// place; beside another status it is not written, and a cause byte beside one is not read.
+    #[test]
+    fn a_deleted_keys_cause_reads_back_beside_its_failed_alone() {
+        let result = |status, fault| Deleted {
+            key: "k".into(),
+            version: None,
+            status,
+            fault,
+            marker: None,
+        };
+        let round = |results: &[Deleted]| {
+            let mut w = Writer::with_capacity(DELETED_BYTES * results.len() + 4);
+            put_deleted(&mut w, results)?;
+            let bytes = w.into_vec();
+            let mut r = Reader::new(&bytes);
+            Ok::<_, ObjectError>((take_deleted(&mut r), bytes))
+        };
+        let results: Vec<Deleted> = Fault::ALL
+            .into_iter()
+            .map(|cause| result(Status::Failed, Some(cause)))
+            .chain([result(Status::Done, None), result(Status::Failed, None)])
+            .collect();
+        let (read, _) = round(&results).unwrap();
+        assert_eq!(read, Some(results));
+        assert_eq!(
+            round(&[result(Status::NoSuchKey, Some(Fault::Read))]),
+            Err(ObjectError::Cause(Status::NoSuchKey))
+        );
+        // The cause byte follows the status byte: count (4), key (4 + 1), version flag (1).
+        let (_, mut bytes) = round(&[result(Status::Failed, Some(Fault::Read))]).unwrap();
+        bytes[10] = Status::NoSuchKey.code();
+        assert_eq!(take_deleted(&mut Reader::new(&bytes)), None);
     }
 }

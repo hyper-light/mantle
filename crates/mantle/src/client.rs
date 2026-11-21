@@ -819,22 +819,36 @@ async fn remove(
                 return Err(Error::answered("DeleteObjects", &reply));
             };
             for result in &results {
-                match result.status {
-                    Status::Done => {
+                match (result.status, result.fault) {
+                    (Status::Done, _) => {
                         line(out, format_args!("removed s3://{bucket}/{}", result.key))?;
                     }
-                    status => {
+                    // A key's `Failed` names the step that failed, as a request's does.
+                    (status, Some(cause)) => {
+                        line(
+                            out,
+                            format_args!(
+                                "failed s3://{bucket}/{} {status:?}: {}",
+                                result.key,
+                                cause.words()
+                            ),
+                        )?;
+                        failed = Some((status, Some(cause)));
+                    }
+                    (status, None) => {
                         line(
                             out,
                             format_args!("failed s3://{bucket}/{} {status:?}", result.key),
                         )?;
-                        failed = Some(status);
+                        failed = Some((status, None));
                     }
                 }
             }
         }
         return match failed {
-            Some(status) => Err(Error::Answered("DeleteObjects".into(), status, None, None)),
+            Some((status, cause)) => {
+                Err(Error::Answered("DeleteObjects".into(), status, None, cause))
+            }
             None => Ok(()),
         };
     };

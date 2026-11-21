@@ -2937,13 +2937,19 @@ fn all_done(answered: &[Answered], when: &str) {
     }
 }
 
-/// A fresh cell's first puts (7aafbca8's cell-level repro): through each door of each node, a
-/// bucket made as soon as the doors are bound, and a put asked the moment its node says the root
-/// range took its enlistment; or, the cell's enlistments held, the puts asked before any and the
-/// enlistments then. A node's own member of the root range may not yet have applied an enlistment,
-/// so its volume table names no volume to choose a block's scheme over; a put there waits for one
-/// or is answered `SlowDown` and asked again within its client's patience, and is never answered
-/// `Failed`, S3's `500`. [`FRESH_CELLS`] cells under each order, each its own schedule.
+/// A fresh cell's first writes (7aafbca8's cell-level repro, and 967b3dda's): through each door
+/// of each node, a bucket made as soon as the doors are bound, then a put, and on the native door
+/// a native upload's Open on a client of its own after a bucket of its own, each asked the moment
+/// its node says the root range took its enlistment; or, the cell's enlistments held, the puts and
+/// the Opens asked before any and the enlistments then; and once its put is answered, a copy of
+/// the object it put (CopyObject). A node's own member of the root range may not yet have applied
+/// an enlistment, so its volume table names no volume to choose a block's scheme over; a put, an
+/// Open or a copy there waits for one or is answered `SlowDown` and asked again within its
+/// client's patience, and is never answered `Failed`, S3's `500`. Held, every put and Open is
+/// asked of nodes whose tables name no volume; a copy's source can be written only once a table
+/// names one, so its copy meets an empty table only in the window a node's member has not yet
+/// applied the enlistments its range committed. [`FRESH_CELLS`] cells under each order, each its
+/// own schedule.
 #[test]
 fn a_fresh_cells_first_put_through_either_door_is_never_answered_failed() {
     for enlist in [Enlist::AtOnce, Enlist::Held] {
@@ -2958,30 +2964,52 @@ fn fresh_cell(enlist: Enlist) {
     let mut cell = DoorCell::start(&pki, enlist);
     let (tell, told) = mpsc::channel();
     let mut threads = Vec::new();
-    // Each door's put, held until it is released.
+    // Each thread's write, held until it is released; and the answers all its operations give.
     let mut held: BTreeMap<u64, Vec<mpsc::Sender<()>>> = BTreeMap::new();
+    let mut operations = 0;
     for id in 1..=NODES {
         for door in ["native", "s3"] {
             let (release, wait) = mpsc::channel::<()>();
             held.entry(id).or_default().push(release);
             let bucket = format!("fresh-{door}-{id}");
             let put = ObjectOp::Put(bucket.clone(), "first".into(), object_bytes(id, SMALL));
-            let ops = std::iter::once(ObjectOp::CreateBucket(bucket)).chain(std::iter::once_with(
-                move || {
+            let copy = ObjectOp::Copy(
+                bucket.clone(),
+                "copied".into(),
+                bucket.clone(),
+                "first".into(),
+            );
+            let ops = std::iter::once(ObjectOp::CreateBucket(bucket))
+                .chain(std::iter::once_with(move || {
                     let _ = wait.recv();
                     put
-                },
-            ));
+                }))
+                .chain(std::iter::once(copy));
+            operations += 3;
             threads.push(if door == "native" {
                 cell.native((id, OBJECT_CLIENT + id - 1), ops, || true, tell.clone())
             } else {
                 cell.s3(id, ops, || true, tell.clone())
             });
         }
+        // A native upload's Open, on a client of its own, after its own bucket.
+        let (release, wait) = mpsc::channel::<()>();
+        held.entry(id).or_default().push(release);
+        let bucket = format!("fresh-open-{id}");
+        let open = ObjectOp::Open(bucket.clone(), "opened".into(), SMALL as u64);
+        let ops = std::iter::once(ObjectOp::CreateBucket(bucket)).chain(std::iter::once_with(
+            move || {
+                let _ = wait.recv();
+                open
+            },
+        ));
+        operations += 2;
+        threads.push(cell.native((id, OBJECT_CLIENT + id - 1), ops, || true, tell.clone()));
     }
     // Only the doors' threads tell now, so one that ends unanswered ends the wait on it.
     drop(tell);
-    let doors = threads.len();
+    // Each thread's first operation makes its bucket.
+    let buckets = threads.len();
     let mut answered = Vec::new();
     match enlist {
         Enlist::AtOnce => {
@@ -3001,8 +3029,8 @@ fn fresh_cell(enlist: Enlist) {
             }
         }
         Enlist::Held => {
-            // The buckets made, every put released, and only then the enlistments asked.
-            answered.extend(answers(&told, doors));
+            // The buckets made, every put and Open released, and only then the enlistments asked.
+            answered.extend(answers(&told, buckets));
             all_done(&answered, "a fresh cell's buckets");
             for release in held.values().flatten() {
                 release.send(()).unwrap();
@@ -3012,11 +3040,82 @@ fn fresh_cell(enlist: Enlist) {
             }
         }
     }
-    answered.extend(answers(&told, 2 * doors - answered.len()));
+    answered.extend(answers(&told, operations - answered.len()));
     for thread in threads {
         thread.join().unwrap();
     }
     all_done(&answered, "a fresh cell's first operations");
+}
+
+/// A node that holds no root key makes no object's keys: a put asked of it through either door
+/// is answered `Failed` for that cause (`Fault::Keys`), the native reply naming it beside its
+/// status and the S3 door's `500` after S3's words in its `<Message>`. The node counts each by its
+/// cause, the counts its status line says (`failed keys 2`, `process::failed_lines`), and the
+/// nodes that failed nothing count nothing.
+#[test]
+fn a_failed_answers_cause_is_counted_on_its_nodes_status_line() {
+    let keyless = NODES;
+    let pki = Pki::new(NODES, NODES);
+    let mut cell = DoorCell::start_keyless(&pki, Enlist::AtOnce, Some(keyless));
+    cell.until("every node enlisted", |c| {
+        if c.enlisted.len() == c.s3.len() {
+            Some(())
+        } else {
+            None
+        }
+    });
+    let put = |bucket: &str| {
+        vec![
+            ObjectOp::CreateBucket(bucket.into()),
+            ObjectOp::Put(bucket.into(), "a".into(), object_bytes(1, SMALL)),
+        ]
+    };
+    let native = through(&cell, "native", keyless, put("keyless-native"));
+    let s3 = through(&cell, "s3", keyless, put("keyless-s3"));
+    // A bucket needs no object's keys.
+    all_done(&native[..1], "the native door's bucket");
+    all_done(&s3[..1], "the S3 door's bucket");
+    let keys = mantle_node::door::Fault::Keys;
+    assert_eq!(
+        native[1].answer.as_ref().err().map(String::as_str),
+        Some(format!("Failed {}", keys.name()).as_str()),
+        "the native put"
+    );
+    let failed = s3[1].answer.as_ref().expect_err("the S3 put failed");
+    assert!(
+        failed.starts_with("500 InternalError ") && failed.ends_with(keys.words()),
+        "the S3 put answered {failed}"
+    );
+    // Both answered, so both counted: the node says its counts in order as they change.
+    let said = vec![format!("failed {} 2", keys.name())];
+    cell.until("the keyless node counted both failures", |c| {
+        let lines = status_lines(c.failures.get(&keyless)?);
+        if lines == said { Some(()) } else { None }
+    });
+    cell.heard();
+    assert_eq!(
+        status_lines(&cell.failures[&keyless]),
+        said,
+        "counted once each"
+    );
+    for id in (1..=NODES).filter(|id| *id != keyless) {
+        let lines = cell.failures.get(&id).map(|c| status_lines(c));
+        assert!(
+            lines.as_ref().is_none_or(Vec::is_empty),
+            "node {id} failed nothing, and says {lines:?}"
+        );
+    }
+}
+
+/// The lines a node's status says of its failures' `counts`, in `door::Fault::ALL`'s order:
+/// `failed CAUSE COUNT` for each cause it counted (`process::failed_lines`).
+fn status_lines(counts: &[u64]) -> Vec<String> {
+    mantle_node::door::Fault::ALL
+        .iter()
+        .zip(counts)
+        .filter(|(_, count)| **count > 0)
+        .map(|(cause, count)| format!("failed {} {count}", cause.name()))
+        .collect()
 }
 
 /// Objects of one byte and of 64 KiB, each put through one door and read at once through both,

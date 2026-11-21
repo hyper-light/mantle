@@ -774,7 +774,11 @@ fn delete_result(reply: &Reply) -> Result<String, Refused> {
     let Some(Listing::Deleted(results)) = &reply.listing else {
         return Err(internal("a delete's reply without its results"));
     };
-    let refusals: Vec<Refused> = results.iter().map(|d| refusal(d.status)).collect();
+    // A key's `Failed` names its cause after S3's words, as a request's does.
+    let refusals: Vec<Refused> = results
+        .iter()
+        .map(|d| d.fault.map_or_else(|| refusal(d.status), failed))
+        .collect();
     let deletions: Vec<s3::Deletion<'_>> = results
         .iter()
         .zip(&refusals)
@@ -1348,12 +1352,14 @@ mod tests {
                 key: KEY.into(),
                 version: Some("version-0".into()),
                 status: Status::Done,
+                fault: None,
                 marker: Some("version-1".into()),
             },
             Deleted {
                 key: format!("{KEY}-1"),
                 version: None,
                 status: Status::AccessDenied,
+                fault: None,
                 marker: None,
             },
         ])

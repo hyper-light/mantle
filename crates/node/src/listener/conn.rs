@@ -432,7 +432,7 @@ impl Connection {
         let signer = match self.look_up(claimed.into_owned()).await {
             door::Signed::Principal(signer) => signer,
             door::Signed::Unknown => return Err(unknown()),
-            door::Signed::Refused(status) => return Err(respond::refusal(status)),
+            door::Signed::Failed(cause) => return Err(respond::failed(self.door.failed(cause))),
             door::Signed::Slowed(cause) => return Err(respond::slowed(self.door.slowed(cause))),
         };
         let key = request::Key::Principal {
@@ -615,10 +615,11 @@ impl Connection {
                         .refuse(&why, resource, ids, (version, head), unread)
                         .await;
                 }
-                // A reply's end, or bytes, with no head before them: the host's word is not
-                // whole, and nothing of it can be answered as done.
+                // A reply's end, or bytes, with no head before them, or the host's channel closed
+                // with nothing said: the host's word is not whole, and nothing of it can be
+                // answered as done. The listener's own `500`, counted by its cause.
                 Ok(Answer::Bytes(..) | Answer::End | Answer::Failed) | Err(_) => {
-                    let failed = respond::refusal(Status::Failed);
+                    let failed = respond::failed(self.door.failed(door::Fault::Unanswered));
                     return self
                         .refuse(&failed, resource, ids, (version, head), unread)
                         .await;

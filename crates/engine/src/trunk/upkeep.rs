@@ -112,7 +112,7 @@ pub(super) type CleaningMark = [u64; 6];
 
 /// A test's mark of a pass's state ([`Trunk::still_mark`]).
 #[cfg(test)]
-type StillMark = ([u64; 15], [[usize; 4]; 2]);
+type StillMark = ([u64; 16], [[usize; 4]; 2]);
 
 #[derive(Debug)]
 enum Running {
@@ -351,14 +351,22 @@ impl Trunk {
         Ok(ask)
     }
 
-    /// Whether maintenance waits for extents only a checkpoint frees: a task of the last pass
-    /// found the store without its room beside the checkpoint's ([`Self::room_kept`]), no extent
-    /// has been freed or admitted since, and no task holds inputs, is out on a worker or has
-    /// output to apply. The trunk can then be saved as it
-    /// stands ([`Self::drop_unstarted`]), and the checkpoint frees the extents the one before
-    /// named.
+    /// Whether maintenance waits for extents only a checkpoint frees: every task the last pass
+    /// tried found the store without its room beside the checkpoint's ([`Self::room_kept`]), the
+    /// store has not the least of those rooms now ([`Self::room_least`]; measured against the
+    /// most a task waited for, a task whose room a worker's returned grant had freed was left
+    /// untried, and the bound stated with room for it), no task holds output, is out on a worker
+    /// or is being abandoned, and every task planned has been tried ([`Self::untried`]). The trunk can then be
+    /// saved as it stands ([`Self::drop_unstarted`]), and the checkpoint frees the extents the
+    /// one before named. Tasks planned at a pass's second look, after its step, were stalled by
+    /// the room the tasks before them waited for, untried: tasks a checkpoint dropped and planned
+    /// anew in the room it freed were never stepped again, and the engine stated its bound with
+    /// that work owed (shard_db/still_passes.rs, the cell's block range's entries).
     pub(crate) fn stalled_for_room<F: BlockFile>(&self, store: &Store<F>) -> bool {
-        self.waits_for_room(store) && !self.tasks.is_empty() && self.none_begun()
+        self.room_least.is_some_and(|need| store.capacity() < need)
+            && !self.tasks.is_empty()
+            && self.none_begun()
+            && !self.untried
     }
 
     /// Whether no task has begun: none holds output, is out on a worker or is being abandoned,
@@ -389,6 +397,13 @@ impl Trunk {
         self.room_short = Some(self.room_short.map_or(need, |was| was.max(need)));
     }
 
+    /// A task waits for `need` extents free: the wait ([`Self::note_room_short`]), and the least
+    /// room a task of this pass waited for ([`Self::room_least`]).
+    fn note_task_short(&mut self, need: u64) {
+        self.note_room_short(need);
+        self.room_least = Some(self.room_least.map_or(need, |was| was.min(need)));
+    }
+
     /// Drops every task that has not begun: an inline one still opening, no output built, and
     /// a worker's job not handed out, neither of which holds an extent. An opening's partial
     /// cursors give their read buffers and unclaimed reads back to the store first. Each is
@@ -398,7 +413,7 @@ impl Trunk {
         &mut self,
         store: &mut Store<F>,
     ) -> Result<(), Error> {
-        if !self.stalled_for_room(store) && !self.tasks.is_empty() {
+        if !(self.waits_for_room(store) && self.none_begun()) && !self.tasks.is_empty() {
             return Err(Error::InvalidArgument {
                 what: "unstarted tasks dropped beside one begun",
             });
@@ -418,6 +433,141 @@ impl Trunk {
             self.queue(t.node);
         }
         Ok(())
+    }
+
+    /// Room-sized maintenance (docs/design/engine-structure.md §3): every task waits for room,
+    /// none begun, so none gives extents back, and those planned when the store had more room
+    /// ask more than it has left beside the checkpoint's ([`Self::room_kept`]). Each such task
+    /// not begun is dropped, as a checkpoint drops it ([`Self::drop_unstarted`]), and its node
+    /// queued, so the look after plans it anew sized to the room left ([`Self::room_left`]): a
+    /// compaction of fewer in-flight bundles, a leaf's compaction of its in-flight bundles in
+    /// place of a settle that does not fit. Once for each room the store has
+    /// ([`Self::replanned`]): planned anew and still without room, the trunk waits as it did,
+    /// and changes nothing until extents are freed or a task applies.
+    fn replan_room_sized<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        let capacity = store.capacity();
+        if !self.stalled_for_room(store) || self.replanned == Some(capacity) {
+            return Ok(());
+        }
+        self.replanned = Some(capacity);
+        let room = capacity.saturating_sub(self.room_kept(store)?);
+        let mut past = Vec::new();
+        for (seq, t) in self.tasks.unsent() {
+            if let Some(ask) = self.unsent_ask(store, t)?
+                && ask > room
+            {
+                past.push(seq);
+            }
+        }
+        if past.is_empty() {
+            return Ok(());
+        }
+        for seq in past {
+            let Some(mut t) = self.tasks.remove(seq) else {
+                continue;
+            };
+            if let Running::Inline(c) = &mut t.run {
+                c.cancel_opening(store);
+            }
+            if let What::Settle { .. } = t.what
+                && let Some(c) = self.node_mut(t.node)?.wants.as_mut()
+            {
+                c.started = false;
+            }
+            self.queue(t.node);
+        }
+        self.stats.room_replans = self.stats.room_replans.saturating_add(1);
+        // The entries still wait with the room the tasks waited for (`ShardDb::room_now`), and
+        // the next pass tries those planned anew ([`Self::untried`]): stalled again only if they
+        // find no room.
+        Ok(())
+    }
+
+    /// The room task `t`, not handed out, asks before it begins: an inline one still opening its
+    /// [`Self::inline_asked`], a ready job its grant; none for one begun, a relocation (the
+    /// cleaner's reserve is its room) or a task handed out.
+    fn unsent_ask<F: BlockFile>(
+        &self,
+        store: &Store<F>,
+        t: &NodeTask,
+    ) -> Result<Option<u64>, Error> {
+        if matches!(t.what, What::Relocate { .. }) {
+            return Ok(None);
+        }
+        Ok(match &t.run {
+            Running::Inline(c) if c.opening() => Some(self.inline_asked(store, t)?),
+            Running::Remote {
+                state: State::Ready(task),
+                ..
+            } => Some(u64::try_from(grant_size(store, task)).unwrap_or(u64::MAX)),
+            _ => None,
+        })
+    }
+
+    /// Notes the step ([`Self::step`]): among the tasks not begun whose room the store has free
+    /// beside the checkpoint's and what the inline tasks writing may still take, a leaf's settle
+    /// first, the one asking the least room, the first planned among equals. A settle merges
+    /// every branch of its leaf into one a part and drops the versions they supersede: the
+    /// per-branch index and filter pages and the older versions go as it applies, where a
+    /// compaction carries its branches a level down. Every other task, grant and rotation leaves
+    /// the step's room free beside the checkpoint's, as each leaves the cleaner's reserve
+    /// ([`Self::set_clean_room`]), so the step opens once the inline tasks writing now are done
+    /// (docs/design/engine-structure.md §3, room-sized maintenance). A pass counts it once.
+    fn note_step<F: BlockFile>(&mut self, store: &Store<F>) -> Result<(), Error> {
+        // Far from its bound no task waits for room: no step is kept, and a pass looks at no
+        // task it does not act on (`seat_wait.rs`).
+        if self.room_short.is_none() {
+            self.step = None;
+            return Ok(());
+        }
+        let room = store
+            .capacity()
+            .saturating_sub(self.room_kept(store)?)
+            .saturating_sub(self.inline_room(store)?);
+        let mut step: Option<(u64, u64, bool)> = None;
+        for (seq, t) in self.tasks.unsent() {
+            let settles = matches!(t.what, What::Settle { .. });
+            if let Some(ask) = self.unsent_ask(store, t)?
+                && ask <= room
+                && step.is_none_or(|(_, least, was)| {
+                    (settles && !was) || (settles == was && ask < least)
+                })
+            {
+                step = Some((seq, ask, settles));
+            }
+        }
+        self.step = step.map(|(seq, ask, _)| (seq, ask));
+        Ok(())
+    }
+
+    /// A test's look for an owed task not begun whose room the store has free beside the next
+    /// checkpoint's and what the inline tasks writing may still take: one the trunk could open
+    /// now. Its plan number and room.
+    #[cfg(test)]
+    pub(crate) fn fitting_task<F: BlockFile>(&self, store: &Store<F>) -> Option<(u64, u64)> {
+        let kept = self
+            .checkpoint_room
+            .saturating_add(self.image_extents_now(store).ok()?)
+            .saturating_add(self.clean_room);
+        let room = store
+            .capacity()
+            .saturating_sub(kept)
+            .saturating_sub(self.inline_room(store).ok()?);
+        self.tasks.unsent().find_map(|(seq, t)| {
+            self.unsent_ask(store, t)
+                .ok()
+                .flatten()
+                .filter(|&ask| ask <= room)
+                .map(|ask| (seq, ask))
+        })
+    }
+
+    /// The room the step keeps ([`Self::note_step`]) from task `seq`: none from the step itself.
+    fn step_room_from(&self, seq: u64) -> u64 {
+        match self.step {
+            Some((step, room)) if step != seq => room,
+            _ => 0,
+        }
     }
 
     /// Appends `bundle` to node `n`'s in-flight list, counting the node among those holding one.
@@ -616,6 +766,7 @@ impl Trunk {
         // A wait for room lasts until the store has the room it waits for.
         if self.room_short.is_some_and(|need| store.capacity() >= need) {
             self.room_short = None;
+            self.replanned = None;
         }
         self.room_kept = None;
         if self.abandoning.is_some() {
@@ -630,6 +781,7 @@ impl Trunk {
             self.tend_tasks(store)?;
         }
         self.apply_done(store)?;
+        self.replan_room_sized(store)?;
         self.incorporate_pending(store)?;
         self.look(store)?;
         if self.pool.is_some() && self.abandoning.is_none() {
@@ -701,6 +853,7 @@ impl Trunk {
                 self.stats.flushes,
                 self.stats.splits,
                 self.stats.consolidations_started,
+                u64::from(self.untried),
             ],
             [
                 self.tasks.standing(),
@@ -889,8 +1042,22 @@ impl Trunk {
     /// Looks at the nodes queued when it begins, each once: a node looked at may queue those it
     /// changed, and they wait for the next look ([`Self::run`] looks again once tasks apply).
     fn look<F: BlockFile>(&mut self, store: &mut Store<F>) -> Result<(), Error> {
+        let planned = self.tasks.planned();
         self.note_near_bound(store);
         self.plan_cleaning(store)?;
+        // With no room left at all, a task of any size waits alike: planned whole, it merges
+        // what it would have once the room comes.
+        self.room_left = if self.room_short.is_some() || self.replanned.is_some() {
+            Some(
+                store
+                    .capacity()
+                    .saturating_sub(self.room_kept(store)?)
+                    .saturating_sub(self.inline_room(store)?),
+            )
+            .filter(|&left| left > 0)
+        } else {
+            None
+        };
         for _ in 0..self.looking.len() {
             let Some(n) = self.looking.pop_front() else {
                 break;
@@ -899,6 +1066,42 @@ impl Trunk {
                 node.queued = false;
             }
             self.look_at(store, n)?;
+        }
+        self.try_planned(store, planned)
+    }
+
+    /// The tasks a look planned, from plan number `from` on, each asked its room as a pass would
+    /// ([`Self::step_inline`]) while maintenance waits for room: one the store has room for leaves
+    /// the trunk untried ([`Self::untried`]), so the next pass steps it; one it has none for
+    /// waits as a pass's refusal does. Planned after a pass's step and asked nothing, tasks a
+    /// checkpoint dropped and planned anew in the room it freed were stalled by the room the
+    /// dropped ones had waited for and never stepped again (shard_db/still_passes.rs).
+    fn try_planned<F: BlockFile>(&mut self, store: &Store<F>, from: u64) -> Result<(), Error> {
+        if self.room_short.is_none() || self.tasks.planned() == from {
+            return Ok(());
+        }
+        let room = store
+            .capacity()
+            .saturating_sub(self.room_kept(store)?)
+            .saturating_sub(self.inline_room(store)?);
+        let mut least: Option<u64> = None;
+        let mut fits = false;
+        for (seq, t) in self.tasks.unsent() {
+            if seq < from {
+                continue;
+            }
+            if let Some(ask) = self.unsent_ask(store, t)? {
+                fits |= ask <= room;
+                least = Some(least.map_or(ask, |l| l.min(ask)));
+            }
+        }
+        if fits {
+            self.untried = true;
+        } else if let Some(ask) = least {
+            let kept = self
+                .room_kept(store)?
+                .saturating_add(self.inline_room(store)?);
+            self.note_task_short(ask.saturating_add(kept));
         }
         Ok(())
     }
@@ -957,9 +1160,33 @@ impl Trunk {
             && !(node.leaf && {
                 // A leaf whose settle is due takes its in-flight bundles, and one waiting for a
                 // consolidation's flush will: either way they are merged once, by the settle.
+                // While maintenance waits for room, one whose settle does not fit the room left
+                // compacts them, room-sized, into its bundle instead: their branches go as it
+                // applies, and the settle that rewrites them again waits for its room.
                 let settle = self.leaf_settle(n)?;
-                settle.due || settle.waits
+                (settle.due || settle.waits)
+                    && !(settle.due && !settle.waits && self.settle_passes_room(n)?)
             }))
+    }
+
+    /// Whether leaf `n`'s settle passes the room left for a step ([`Trunk::room_left`]): its room
+    /// ([`merge_room`]) as its bundle and live in-flight bundles stand.
+    fn settle_passes_room(&self, n: usize) -> Result<bool, Error> {
+        let Some(room) = self.room_left else {
+            return Ok(false);
+        };
+        let node = self.node(n)?;
+        let pivot = node.pivots.first().ok_or(corrupt())?;
+        let live = node.inflight.get(pivot.start..).unwrap_or(&[]);
+        let (from, end) = (pivot.key.as_slice(), node.end.as_deref());
+        let (extents, pages, entries) = merge_count(
+            merged_inputs(live, from, end, Some(pivot.bundle.branches())),
+            from,
+            end,
+        );
+        let read = pages.div_ceil(u64::from(self.extent_pages).max(1));
+        let parts = self.leaf_parts(entries).min(pages.max(1));
+        Ok(merge_room(extents, read, parts) > room)
     }
 
     /// Leaf `n`'s sources as a settle takes them: its live in-flight bundles with its bundle.
@@ -1247,20 +1474,29 @@ impl Trunk {
         // (`shard_db::pooled_bytes`). The entries of those pages bound what the merge writes, so
         // its builder is sized by them (its `per`), not by its inputs' whole counts, each input
         // spanning the node: one branch, never split, since the merge writes no more.
+        //
+        // While maintenance waits for room, also while their merge fits the room left for a step
+        // ([`Trunk::room_left`]), one bundle at least: room-sized, the compaction merges fewer
+        // inputs, and the newer wait for the room the next frees (docs/design/engine-structure.md
+        // §3, room-sized maintenance).
         let pooled = self.pool.is_some();
         let limit = self.leaf_limit();
         let start = pivot.start;
         let range = (pivot.key.as_slice(), Self::pivot_end_of(node, i));
+        let per_extent = u64::from(self.extent_pages).max(1);
         let mut covered = start;
         let mut held = 0u64;
         let mut pages = 0usize;
+        let mut extents = 0u64;
+        let mut cut = false;
         let mut reuse = Reuse::default();
         for bundle in node.inflight.get(start..).unwrap_or(&[]) {
-            let (mut keys, mut read, mut more) = (0u64, 0usize, Reuse::default());
+            let (mut keys, mut read, mut more, mut holds) = (0u64, 0usize, Reuse::default(), 0u64);
             for b in bundle.within(range.0, range.1) {
                 let (p, k) = b.merge_size(range.0, range.1);
                 keys = keys.saturating_add(k);
                 read = read.saturating_add(p);
+                holds = holds.saturating_add(u64::try_from(b.extents.len()).unwrap_or(u64::MAX));
                 if pooled {
                     more.add(reuse_of(b, p, self.taken, self.reuse_window));
                 }
@@ -1268,11 +1504,24 @@ impl Trunk {
             if covered > start && held.saturating_add(keys) > limit {
                 break;
             }
+            let room = merge_room(
+                extents.saturating_add(holds),
+                u64::try_from(pages.saturating_add(read))
+                    .unwrap_or(u64::MAX)
+                    .div_ceil(per_extent),
+                1,
+            );
+            if covered > start && self.room_left.is_some_and(|left| room > left) {
+                cut = true;
+                break;
+            }
             held = held.saturating_add(keys);
             pages = pages.saturating_add(read);
+            extents = extents.saturating_add(holds);
             reuse.add(more);
             covered = covered.saturating_add(1);
         }
+        let leaf_due = node.leaf && self.leaf_settle(n)?.due;
         let live = node.inflight.get(start..covered).ok_or(corrupt())?;
         let inputs = merged_inputs(live, range.0, range.1, None);
         let units = inputs
@@ -1318,6 +1567,12 @@ impl Trunk {
             },
             root,
         )?;
+        if cut {
+            self.stats.room_sized = self.stats.room_sized.saturating_add(1);
+        }
+        if leaf_due {
+            self.stats.room_sized_leaves = self.stats.room_sized_leaves.saturating_add(1);
+        }
         self.stats.plan_ns = self.stats.plan_ns.saturating_add(ns_since(t));
         Ok(())
     }
@@ -1588,10 +1843,10 @@ impl Trunk {
         Ok(())
     }
 
-    /// The extents an inline task writes at most, as a worker's job's grant is sized
-    /// ([`Self::dispatch_tasks`]): the extents the pages its inputs hold fill, or its inputs'
-    /// extents when that is less, and one more a part, and one for the last partial one. A merge
-    /// writes no more pages than it reads; a branch of one page in an extent of four counts one.
+    /// The extents an inline task writes at most ([`merge_room`]): the extents the pages its
+    /// inputs hold fill, or its inputs' extents when that is less, and for a settle that splits,
+    /// one more a part and one for the last partial one. A merge writes no more pages than it
+    /// reads; a branch of one page in an extent of four counts one.
     /// Counted once a task: each input's pages in its range are found down its index, and a
     /// pass asks every inline task writing or waiting to, so counted each pass they were most of
     /// a stalled shard's passes (macOS `sample`, the node suite's sustained-writes cell,
@@ -1613,18 +1868,7 @@ impl Trunk {
     ) -> Result<u64, Error> {
         let node = self.nodes.get(task.node).ok_or(corrupt())?;
         let (from, end) = task_range(node, &task.what)?;
-        let (extents, pages, entries) = task_inputs(node, &task.what)?.fold(
-            (0u64, 0u64, 0u64),
-            |(extents, pages, entries), b| {
-                (
-                    extents.saturating_add(u64::try_from(b.extents.len()).unwrap_or(u64::MAX)),
-                    pages.saturating_add(
-                        u64::try_from(b.pages_between(from, end)).unwrap_or(u64::MAX),
-                    ),
-                    entries.saturating_add(b.count),
-                )
-            },
-        );
+        let (extents, pages, entries) = merge_count(task_inputs(node, &task.what)?, from, end);
         let read = pages.div_ceil(u64::from(store.extent_pages()).max(1));
         // A part holds a page at least, so a merge makes no more parts than it reads pages,
         // however many versions its inputs' counts hold.
@@ -1637,7 +1881,7 @@ impl Trunk {
             // `ceil(p / e)`, as begun in a fresh extent.
             What::Relocate { .. } => return Ok(read),
         };
-        Ok(extents.min(read).saturating_add(parts).saturating_add(1))
+        Ok(merge_room(extents, read, parts))
     }
 
     /// The extents the inline tasks writing now may still take: each one's
@@ -1662,25 +1906,32 @@ impl Trunk {
     /// trunk owing 102 extents of tasks held every entry with 92 free, where each task fit: the
     /// node suite's cell's fill on the shard alone met its bound at entry 8,925 of 24,000; kept
     /// for the largest, at 19,804 with small branches sharing extents and 13,528 without
-    /// (mantle-node tests/engine_workers.rs, 2026-11-20).
+    /// (mantle-node tests/engine_workers.rs, 2026-11-20). Beside it, the least owed task's room,
+    /// the step's ([`Self::note_step`]): so a step still fits while the largest writes, and the
+    /// writes are held back before the owed maintenance could find no room for any of its tasks
+    /// (room-sized maintenance, docs/design/engine-structure.md §3). The step's room, not the
+    /// sum's: the steps run one after another in it.
     pub(crate) fn owed_room<F: BlockFile>(&self, store: &Store<F>) -> Result<u64, Error> {
         // A task not begun asks: an inline one still opening, or a worker's job not handed out.
-        let mut most = 0u64;
-        for t in self.tasks.inline() {
-            if matches!(&t.run, Running::Inline(c) if c.opening()) {
-                most = most.max(self.inline_asked(store, t)?);
+        let (mut most, mut least, mut owed) = (0u64, u64::MAX, 0usize);
+        for (_, t) in self.tasks.unsent() {
+            if let Some(ask) = self.unsent_ask(store, t)? {
+                most = most.max(ask);
+                least = least.min(ask);
+                owed = owed.saturating_add(1);
             }
         }
-        for t in self.tasks.ready() {
-            if let Running::Remote {
-                state: State::Ready(task),
-                ..
-            } = &t.run
-            {
-                most = most.max(u64::try_from(grant_size(store, task)).unwrap_or(u64::MAX));
-            }
-        }
-        Ok(self.inline_room(store)?.saturating_add(most))
+        // The step's room where one is kept and still owed ([`Self::note_step`]), else the least
+        // task's beside the largest.
+        let step = self
+            .step
+            .filter(|&(seq, _)| self.tasks.get(seq).is_some())
+            .map_or(0, |(_, room)| room)
+            .max(if owed > 1 { least } else { 0 });
+        Ok(self
+            .inline_room(store)?
+            .saturating_add(most)
+            .saturating_add(step))
     }
 
     /// Steps the inline tasks for up to `budget` units, the root's first: each finished one
@@ -1691,6 +1942,8 @@ impl Trunk {
         budget: u64,
     ) -> Result<u64, Error> {
         let mut used = 0u64;
+        self.room_least = None;
+        self.note_step(store)?;
         // The merging timed where it runs, a clock read a task's step, so a step with no inline
         // task reads none: a compacted key's measured cost ([`Trunk::note_merge`]).
         let mut merge_ns = 0u64;
@@ -1700,6 +1953,7 @@ impl Trunk {
         let mut pass = None;
         let mut holding = false;
         let mut last = None;
+        let mut tried = true;
         for _ in 0..self.tasks.inline_count() {
             let Some((below, seq)) = self.tasks.next_inline(last) else {
                 break;
@@ -1719,6 +1973,8 @@ impl Trunk {
                     .any(|t| matches!(&t.run, Running::Inline(c) if c.holds_inputs()));
             }
             if used >= budget || self.io_waiting {
+                // The tasks after it are not tried this pass.
+                tried = false;
                 break;
             }
             let yield_io = self.yield_io;
@@ -1752,9 +2008,22 @@ impl Trunk {
                 } else {
                     0
                 });
+                // And the step's room, unless it is the step, the cleaner's relocation, which has
+                // a reserve of its own, or a task that opened an input: it holds its pass's turn
+                // to open, so the step waits for it, and kept from the step's room it would wait
+                // for the step in turn.
+                let step = if relocates || !opens {
+                    0
+                } else {
+                    self.step_room_from(seq)
+                };
+                // One that opened an input is counted among the tasks writing already
+                // ([`Self::inline_room`]): its own room is asked once.
+                let own = if opens { 0 } else { asked };
                 let need = asked
                     .saturating_add(kept)
-                    .saturating_add(self.inline_room(store)?);
+                    .saturating_add(step)
+                    .saturating_add(self.inline_room(store)?.saturating_sub(own));
                 if store.segments().is_some() && store.capacity() < need {
                     if store.grows_in_place() {
                         store.grow_now(need)?;
@@ -1762,13 +2031,13 @@ impl Trunk {
                     if store.capacity() < need {
                         self.capacity_wanted = self.capacity_wanted.max(need);
                         if store.room_most() < need {
-                            self.note_room_short(need);
+                            self.note_task_short(need);
                         }
                         continue;
                     }
                 }
                 if store.capacity() < need {
-                    self.note_room_short(need);
+                    self.note_task_short(need);
                     continue;
                 }
             }
@@ -1833,6 +2102,9 @@ impl Trunk {
             }
         }
         self.note_merge(merge_ns, used);
+        // A pass cut short, or one whose task stopped for a page still being read, has not
+        // tried every task in the room it has: the next goes on.
+        self.untried = !tried || self.io_waiting;
         Ok(used)
     }
 
@@ -1901,6 +2173,11 @@ impl Trunk {
         };
         let built = parts.iter().map(|(_, b)| b.count).max().unwrap_or(0);
         self.stats.compacted_most = self.stats.compacted_most.max(built);
+        // A task applied changes what a replan finds ([`Self::replan_room_sized`]), and the room
+        // the tasks it leaves were refused: the step's they kept is no longer kept, and the
+        // next pass asks theirs again ([`Self::untried`]).
+        self.replanned = None;
+        self.untried = true;
         match what {
             What::Compact {
                 key,
@@ -2065,6 +2342,7 @@ impl Trunk {
             return Ok(());
         }
         let admit = self.admit();
+        self.note_step(store)?;
         // Whether a job is out or done: its result gives back the grant it did not write as it is
         // taken, and its task frees its inputs as it applies.
         let mut others = self.tasks.out_or_done();
@@ -2095,8 +2373,10 @@ impl Trunk {
             };
             if !pool.can_take(store, admit)? {
                 // Every seat held: only a worker's message frees one, so the shard waits for it
-                // rather than pass again.
+                // rather than pass again. The job was not asked its room: the trunk is not
+                // stalled for room while it waits for a seat ([`Self::untried`]).
                 pool.want_message();
+                self.untried = true;
                 return Ok(());
             }
             let mut landed = true;
@@ -2119,8 +2399,11 @@ impl Trunk {
             #[cfg(test)]
             let needed = self.compact_most.map_or(needed, |most| needed.min(most));
             let asked = u64::try_from(needed).unwrap_or(u64::MAX);
-            // And the next checkpoint's room ([`Self::room_kept`]), counted once a pass.
-            let need = asked.saturating_add(self.room_kept(store)?);
+            // And the next checkpoint's room ([`Self::room_kept`]), counted once a pass, and the
+            // step's unless it is the step ([`Self::note_step`]).
+            let need = asked
+                .saturating_add(self.room_kept(store)?)
+                .saturating_add(self.step_room_from(key.1));
             if store.segments().is_some() && store.capacity() < need {
                 if store.grows_in_place() {
                     // Where the shard may wait, its file grows by the grant here.
@@ -2131,7 +2414,7 @@ impl Trunk {
                     // at least this much, and the job goes out once they can.
                     self.capacity_wanted = self.capacity_wanted.max(need);
                     if store.room_most() < need {
-                        self.note_room_short(need);
+                        self.note_task_short(need);
                     }
                     continue;
                 }
@@ -2146,7 +2429,7 @@ impl Trunk {
             // tests/engine_workers.rs).
             let short = store.capacity() < need.saturating_add(inline_room);
             if short && others {
-                self.note_room_short(need.saturating_add(inline_room));
+                self.note_task_short(need.saturating_add(inline_room));
                 continue;
             }
             let Some(mut t) = self.tasks.get_mut(key.1) else {
@@ -2418,6 +2701,47 @@ fn grant_size<F: BlockFile>(store: &Store<F>, task: &Task) -> usize {
         .min(u64::try_from(task.pages.max(1)).unwrap_or(u64::MAX))
         .saturating_add(1);
     extents.saturating_add(usize::try_from(parts).unwrap_or(usize::MAX))
+}
+
+/// The extents a merge on the shard takes at most, its inputs holding `extents` extents and
+/// `read` the extents their pages in its range fill ([`Branch::pages_between`]), into `parts`
+/// branches. Its branches begin where the last of their life ended, in the pages that one left in
+/// its extent (docs/design/engine-structure.md §3, small branches share extents), so `p` pages
+/// written one after another take `ceil((t + p) / e) - 1` fresh extents begun at page `t < e`,
+/// at most `ceil(p / e)` as begun in a fresh one, as a relocation's copy does
+/// ([`Trunk::inline_asked`]). One branch: a merge writes no more pages than its inputs' pages in
+/// its range, each counting the part-filled index page a level and the trailer an output of its
+/// own has ([`Branch::pages_between`]), so it takes the extents `read` counts, and no more than
+/// its inputs hold. A settle that splits makes each part an index and a trailer of its own, which
+/// its inputs' pages count once each: one more extent a part, and one for the last partial one.
+/// The bound was `extents.min(read) + parts + 1` for one branch too, from before branches shared
+/// extents, when each began a fresh extent: a compaction of one small in-flight branch then asked
+/// three extents for at most one, and at the node suite's cell's bound every owed task asked
+/// more than the two the store had beside the checkpoint's room (docs/design/engine-structure.md
+/// §3, room-sized maintenance).
+pub(super) fn merge_room(extents: u64, read: u64, parts: u64) -> u64 {
+    let room = extents.min(read);
+    if parts > 1 {
+        room.saturating_add(parts).saturating_add(1)
+    } else {
+        room
+    }
+}
+
+/// What a merge of `[from, end)` over `inputs` counts: the extents they hold, their pages in the
+/// range ([`Branch::pages_between`]) and their entries, an upper bound on its keys.
+fn merge_count<'a>(
+    inputs: impl Iterator<Item = &'a Branch>,
+    from: &[u8],
+    end: Option<&[u8]>,
+) -> (u64, u64, u64) {
+    inputs.fold((0u64, 0u64, 0u64), |(extents, pages, entries), b| {
+        (
+            extents.saturating_add(u64::try_from(b.extents.len()).unwrap_or(u64::MAX)),
+            pages.saturating_add(u64::try_from(b.pages_between(from, end)).unwrap_or(u64::MAX)),
+            entries.saturating_add(b.count),
+        )
+    })
 }
 
 /// The entries of `branches`, an upper bound on their keys.

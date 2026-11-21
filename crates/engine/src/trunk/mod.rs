@@ -529,6 +529,13 @@ pub struct TrunkStats {
     pub relocations_planned: u64,
     pub relocations: u64,
     pub relocations_discarded: u64,
+    /// Room-sized maintenance (docs/design/engine-structure.md §3): compactions planned to cover
+    /// fewer in-flight bundles than they would have, for the room left; leaves that compacted
+    /// their in-flight bundles because their settle did not fit; and the replans of every task
+    /// too large for the room left, once a room.
+    pub room_sized: u64,
+    pub room_sized_leaves: u64,
+    pub room_replans: u64,
     /// Work units merged by timed maintenance, inline or on workers, and the nanoseconds they
     /// took: a compacted key's measured cost, which consolidations are priced at
     /// ([`Trunk::note_merge`]).
@@ -706,6 +713,30 @@ pub struct Trunk {
     /// A task of the last pass waited for extents the store did not have free beside the
     /// checkpoint's room: the store's free extents then ([`Trunk::stalled_for_room`]).
     room_short: Option<u64>,
+    /// The least room a task of the last pass waited for: the trunk is stalled only while the
+    /// store has not even that ([`Trunk::stalled_for_room`]).
+    room_least: Option<u64>,
+    /// While maintenance waits for room, the room a step may take: the store's free extents
+    /// beside the checkpoint's room and what the inline tasks writing now may still take. A
+    /// compaction planned then covers only the in-flight bundles whose merge fits it, and a leaf
+    /// whose settle does not fit compacts its in-flight bundles instead ([`Trunk::look`]; room-sized
+    /// maintenance, docs/design/engine-structure.md §3). Set once a look.
+    room_left: Option<u64>,
+    /// The free extents when every task last waited for room and those too large for it were
+    /// planned anew room-sized ([`Trunk::replan_room_sized`]): not again for the same room, so a
+    /// stalled trunk takes no pass that changes nothing; forgotten once a task applies or the
+    /// store has the room the wait asked.
+    replanned: Option<u64>,
+    /// Tasks no pass has yet asked their room in the room the store has: one a look planned and
+    /// the store has room for ([`Trunk::try_planned`]), those a pass cut short or stopped for a
+    /// page still being read did not reach, a ready job no worker's seat took, and those left
+    /// when a task applies. The trunk is not stalled until a pass has tried them
+    /// ([`Trunk::stalled_for_room`]).
+    untried: bool,
+    /// The step, while maintenance waits for room ([`Trunk::note_step`]): its plan number and its
+    /// room. Every other task, grant and rotation leaves that room free beside the checkpoint's,
+    /// so the step opens once the inline tasks writing now are done.
+    step: Option<(u64, u64)>,
     /// A test's estimates that fall short of what a job writes: a compaction's grant and a
     /// packing's at most this many extents each, so the job asks its pool for more as it writes
     /// ([`pool::Message::Need`]).
@@ -1132,6 +1163,11 @@ impl Trunk {
             extent_pages: 0,
             room_kept: None,
             room_short: None,
+            room_least: None,
+            room_left: None,
+            replanned: None,
+            untried: false,
+            step: None,
             #[cfg(test)]
             compact_most: None,
             #[cfg(test)]
@@ -3026,6 +3062,11 @@ impl Trunk {
             extent_pages: 0,
             room_kept: None,
             room_short: None,
+            room_least: None,
+            room_left: None,
+            replanned: None,
+            untried: false,
+            step: None,
             #[cfg(test)]
             compact_most: None,
             #[cfg(test)]

@@ -276,7 +276,8 @@ under load, at moderate load and saturated.
   the room the owed maintenance needs to go on (`ShardDb::rotation_room`, `Trunk::owed_room`):
   the compactions owed are what give extents back, and packings taking their room would fill the
   store with branches none could compact. That room is the largest owed task's ask beside what
-  the inline tasks writing now may still take, not the sum of every owed task's: each task opens
+  the inline tasks writing now may still take, and the least owed task's beside it so a step still
+  fits (room-sized maintenance, below), not the sum of every owed task's: each task opens
   only beside its own room and, applied, gives its inputs back, free at once or at the checkpoint
   a range takes for room (below), so the owed tasks run one after another in the room of the
   largest. Kept for the sum, a rotation needing 110 extents, most of them the owed tasks' asks
@@ -572,6 +573,105 @@ under load, at moderate load and saturated.
   each too. Extents holding live pages alone would be 0.25 extents a page. The writes it costs, on
   the shard alone (deterministic): 13,131 pages written to the bound at entry 21,199 before, 0.62
   an entry; 17,566 for the whole fill after, 0.73 an entry.
+- **Room-sized maintenance near the bound.** *The stuck state* (the node suite's sustained-writes
+  cell, crates/mantle/tests/node.rs, 2026-11-21): one node's block range met its store's bound at
+  1,786 entries, 795 live pages in 243 of its 256 extents, 8 free, of which the next checkpoint's
+  room kept 6 (a packing and the map 3, the image 3), nothing pending a checkpoint, and 70 tasks
+  owed (57 compactions, 13 settles), each asking at least 3 extents and none fitting the 2 left.
+  The live pages were about 2.6 times the entries' bytes. Four causes, each found on the engine
+  driven with the block layer's entries (`shard_db/still_passes.rs`):
+  - a merge into one branch asked `min(E, R) + 2`, one more extent a part and one for the last
+    partial one, a bound from before branches shared extents, when each began a fresh extent: a
+    compaction of one small in-flight branch asked 3 extents to write at most one;
+  - tasks planned when the store had more room kept their size as it shrank;
+  - tasks a checkpoint dropped and planned anew at a pass's second look, after its step, were
+    stalled untried by the room the dropped ones had waited for (`Trunk::room_waited` lasts until
+    the store has it), and the engine stated its bound with that work owed: 59 small in-flight
+    branches owed, 7 to 20 extents free beside the checkpoint's room;
+  - the stall was measured against the most any task had waited for, so a task whose room came
+    back (a worker's grant returned unwritten, a task applied) was not tried again until the
+    largest's did.
+
+  *Now:*
+  - A merge into one branch asks the extents its pages fill, or its inputs' extents when fewer
+    (`upkeep::merge_room`), as a relocation's copy does: its branch begins where the last of its
+    life ended, so `p` pages take at most `⌈p / e⌉` fresh extents, and it writes at most its
+    inputs' pages in its range, each input counting the part-filled index page a level and the
+    trailer an output of its own has (`Branch::pages_between`). A settle that splits keeps one
+    more extent a part and one for the last partial one: each part has an index and a trailer of
+    its own, which its inputs count once each.
+  - While maintenance waits for room, planning is sized to the room left for a step, the store's
+    free extents beside the checkpoint's room and what the inline tasks writing may still take
+    (`Trunk::room_left`): a pivot's compaction covers its oldest in-flight bundles only while
+    their merge fits it, one at least, and a leaf whose settle does not fit compacts its in-flight
+    bundles into its bundle instead. Once every task waits for room, none begun, those asking more
+    than the room left are dropped and planned anew room-sized, once for each room the store has
+    (`Trunk::replan_room_sized`). With no room left at all a task of any size waits alike, and is
+    planned whole.
+  - A trunk is stalled only while the store has not the least room a task of the last pass waited
+    for (`Trunk::room_least`), and only once every task planned has been tried (`Trunk::untried`):
+    a look asks each task it plans its room as a pass would (`Trunk::try_planned`), and a pass
+    cut short, a task stopped for a page still being read, a ready job no worker's seat took and
+    a task applied each leave the trunk to be tried again. The bound is stated only when the
+    trunk is idle or so stalled (`ShardDb::at_extent_bound`). A task that opened an input is
+    counted among those writing (`Trunk::inline_room`), so its own room is asked once, and it
+    keeps no step's room: it holds its pass's turn to open, which the step waits for. A put pays
+    no share of a trunk stalled for room (`ShardDb::pay_shares`): an entry of several rows paid
+    one pass that changed nothing a row.
+  - *The step* (`Trunk::note_step`), while maintenance waits for room: among the tasks not begun
+    whose room the store has free beside the checkpoint's, a leaf's settle first, the one asking
+    the least room. A settle merges every branch of its leaf into one a part, so the branches'
+    index and filter pages and the versions they supersede go as it applies, where a compaction
+    carries its branches a level down. Every other inline task opens, every worker's grant goes out and every rotation passes
+    only beside the step's room, as each leaves the cleaner's reserve (above).
+  - *Admission holds writes back earlier:* a rotation keeps, beside the checkpoint's room, a
+    packing and the room the largest owed task asks, the step's room too, or the least owed
+    task's where no step is kept (`Trunk::owed_room`), so a step still fits while the largest
+    writes. RocksDB likewise slows
+    and then stops writes on its compaction debt before compaction has no room to work
+    (`soft_pending_compaction_bytes_limit`, `hard_pending_compaction_bytes_limit`,
+    `level0_slowdown_writes_trigger`; research/24, from `db/column_family.cc`; research/12, the
+    wiki's "Write Stalls"), and Sprite LFS cleans while clean segments remain, not once they run
+    out (research/34 §6, LFS §3.4). The least task's room, not the sum's: kept for the sum of
+    every owed task, a fill stopped far too early (rotations, above).
+
+  *The invariant:* while a range's maintenance is owed and none of it has begun, a step fits and
+  opens once the inline tasks writing now are done; or no owed task fits, planned anew room-sized
+  at the room the store has, and nothing is pending a checkpoint, and the engine is at its bound
+  and stays there until extents are freed otherwise: its entries wait (`ShardDb::room_now`), so no
+  packing takes room; no task begins, so none takes room; nothing is pending, so no checkpoint
+  frees any. *Proof:* the step is chosen only where its room is free beside the checkpoint's and
+  the writing tasks'. From then on every other task, grant and rotation leaves that room free,
+  and no task takes more than it asks (`merge_room`), so those free extents never fall below the
+  step's room; each inline task writing finishes in a bounded number of steps and gives back
+  what it did not write, so the step's need is met and it opens. Where no task's room is free the
+  trunk replans room-sized once for that room and tries what it planned; still none fits, and
+  the stall is the bound.
+  *What a step frees:* a settle's inputs, its leaf's branches, are released as it applies, and its
+  parts hold their live pages with one index and trailer a part and no superseded version. Their
+  extents are free at the next checkpoint where no other live branch has a page in them; one
+  shared with a branch that lives on frees only once that branch goes. So the pages a step frees
+  are net, but the extents are net only in aggregate, not provably step by step: the engine states
+  its bound when no step fits, not when no step frees. A guarantee step by step needs a step
+  whose inputs hold their extents alone, which cleaning whole extents (above) would provide.
+  *Measured* (`shard_db/still_passes.rs`, the block layer's entries driven as a node drives its
+  range, debug build, macOS arm64, 2026-11-21): before, the bound was stated at entry 11,497 on
+  the shard alone and at 9,954 and 10,573 with its worker, owed work untried; after, at 12,112 on
+  the shard alone (deterministic) and 12,186 with its worker, every owed task tried and none
+  fitting: 5 extents free, all the checkpoint's, 833 to 836 live pages in 247 extents, which hold
+  209 written densely. The live data then fills about 40% of the store's pages: the rest is small
+  in-flight branches the near-bound flushes carry down a level at a time, two pages each, leaves
+  split by counts that include superseded versions, and extents held for dead pages beside live
+  ones. The cell (the test above, debug build on a loaded machine, 2026-11-21) still meets its
+  bound, about six minutes in: one node's block range with 720 live pages in 245 of its 256
+  extents (180 if dense), 6 free and all 6 kept for the checkpoint (a packing and the map 3, the
+  image 3), nothing pending, 51 tasks owed (49 compactions, 2 settles) each asking one extent, its
+  node idle (macOS `sample`). *Open:* the extents held for dead pages, 65 there; a step frees
+  them only once every branch sharing them goes, so the cell's range needs whole extents cleaned
+  (above), or fewer of them made: in-flight branches carried down whole rather than a branch a
+  flush near the bound, and leaves split by the entries a settle keeps. At such a bound for good a
+  range's entries wait, and the stress test's wait for every node to apply what the others did
+  cannot end there.
 
 ## 4. The tree: SplinterDB's size-tiered Bε-tree
 

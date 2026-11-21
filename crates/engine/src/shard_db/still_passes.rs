@@ -96,6 +96,18 @@ fn drive(
     entries: u64,
     row: impl Fn(u64) -> (Vec<u8>, Vec<u8>),
 ) -> (End, BTreeMap<Vec<u8>, Vec<u8>>) {
+    drive_rows(db, entries, |i| {
+        let (k, v) = row(i);
+        vec![(k, Some(v))]
+    })
+}
+
+/// [`drive`] for entries that each write `rows(i)`: a value put, or none for a deletion.
+fn drive_rows(
+    db: &mut ShardDb<DeviceFile>,
+    entries: u64,
+    rows: impl Fn(u64) -> Vec<(Vec<u8>, Option<Vec<u8>>)>,
+) -> (End, BTreeMap<Vec<u8>, Vec<u8>>) {
     let mut acknowledged = BTreeMap::new();
     // A checkpoint begun without waiting and not yet durable, at its index.
     let mut out: Option<u64> = None;
@@ -129,10 +141,17 @@ fn drive(
         };
     };
     for i in 1..=entries {
-        let (k, v) = row(i);
-        let bytes = crate::memtable::hashed::entry_bytes(k.len(), v.len()).unwrap();
+        let made = rows(i);
+        let bytes = made
+            .iter()
+            .map(|(k, v)| {
+                crate::memtable::hashed::entry_bytes(k.len(), v.as_ref().map_or(0, Vec::len))
+                    .unwrap()
+            })
+            .sum();
+        let keys = u64::try_from(made.len()).unwrap();
         let mut turns = 0u64;
-        while !db.room_now(bytes, 1).unwrap() {
+        while !db.room_now(bytes, keys).unwrap() {
             still(db, &format!("entry {i}, waiting"));
             // The node's turns: its idle steps while one does work and work stays owed. One
             // that waits on a job out has the worker's message wake the node's task
@@ -162,10 +181,20 @@ fn drive(
                 db.trunk.still_state(&db.store),
             );
         }
-        db.put(&k, &v).unwrap();
+        for (k, v) in made {
+            match v {
+                Some(v) => {
+                    db.put(&k, &v).unwrap();
+                    acknowledged.insert(k, v);
+                }
+                None => {
+                    db.delete(&k).unwrap();
+                    acknowledged.remove(&k);
+                }
+            }
+        }
         db.release_loaded();
         applied = i;
-        acknowledged.insert(k, v);
         let (_, _) = db.idle_step_now(UNITS).unwrap();
         still(db, &format!("entry {i}, its turn"));
         if out.is_some() || i % CHECKPOINT == 0 || db.wants_checkpoint() {
@@ -244,5 +273,89 @@ fn an_engine_with_its_worker_never_repeats_a_pass_that_changes_nothing_as_its_st
 fn a_store_filled_with_live_rows_states_its_bound_and_never_repeats_a_pass_that_changes_nothing() {
     for workers in [0, 1] {
         assert!(matches!(fill(workers, 60_000, object_row), End::Bound(_)));
+    }
+}
+
+/// The cell's block range's entries, as its range applies them (crates/meta/src/block.rs): a
+/// block's write (its row, keyed by its identity, which spreads the keys; a reverse row for each
+/// of its two chunks, keyed by volume first; and its row in the queue of unsettled blocks, keyed
+/// by its deadline), two renewals that rewrite its row, and the sweep's settling of a block
+/// written eight before, its queue row deleted. The write is about the 699 bytes the cell's
+/// refused entry took (`room_now`'s ask at its bound, 2026-11-21).
+fn block_entry(i: u64) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let n = i / 4;
+    let id = |n: u64| n.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+    let block = vec![u8::try_from(i % 251).unwrap(); 450];
+    match i % 4 {
+        0 => vec![
+            (format!("b/{:016x}", id(n)).into_bytes(), Some(block)),
+            (
+                format!("r/{}/{:016x}/0", n % 3, id(n)).into_bytes(),
+                Some(vec![1; 40]),
+            ),
+            (
+                format!("r/{}/{:016x}/1", (n + 1) % 3, id(n)).into_bytes(),
+                Some(vec![2; 40]),
+            ),
+            (format!("q/{n:020}").into_bytes(), Some(vec![3; 16])),
+        ],
+        1 | 2 => vec![(format!("b/{:016x}", id(n)).into_bytes(), Some(block))],
+        _ => match n.checked_sub(8) {
+            Some(old) => vec![(format!("q/{old:020}").into_bytes(), None)],
+            None => vec![(format!("b/{:016x}", id(n)).into_bytes(), Some(block))],
+        },
+    }
+}
+
+/// The cell's block range met its store's bound at about 1,786 entries with 70 tasks owed, each
+/// asking more than the two extents the store had beside the checkpoint's room (the node suite's
+/// sustained-writes cell, 2026-11-21). Driven with the block layer's entries, the store's bound
+/// was stated with work owed that no pass had tried in the room it had: the tasks a checkpoint
+/// dropped, planned anew after the step that would have tried them, and every task asking three
+/// extents where it wrote one. Now maintenance near the bound is room-sized: a step fits while
+/// the room of the least owed task is free, the tasks too large for the room left are planned
+/// anew room-sized once a room, and the engine states its bound only once every owed task has
+/// been tried and none fits (`ShardDb::at_extent_bound`). The drive, bounded by its turns, never
+/// repeats a pass that changes nothing, and every acknowledged row reads back.
+#[test]
+fn the_cells_block_range_steps_room_sized_and_states_its_bound_only_once_no_step_fits() {
+    for workers in [0, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut db = engine(&path, workers);
+        let (end, acknowledged) = drive_rows(&mut db, 40_000, block_entry);
+        let End::Bound(at) = end else {
+            panic!("{workers} workers: the cell's store took every entry");
+        };
+        // At the bound every owed task was tried, and none fits the room the store has.
+        assert!(
+            db.trunk.is_idle() || db.trunk.stalled_for_room(&db.store),
+            "{workers} workers: the bound at entry {at} stated with owed work untried: {}",
+            db.trunk.still_state(&db.store)
+        );
+        assert_eq!(
+            db.trunk.fitting_task(&db.store),
+            None,
+            "{workers} workers: the bound at entry {at} stated with a task that fits: {}",
+            db.trunk.still_state(&db.store),
+        );
+        let stats = db.trunk.stats();
+        eprintln!(
+            "{workers} workers: the bound at entry {at}, {} extents free; {} live pages in {} \
+             extents; {} compactions room-sized, {} leaves compacted for a settle that did not \
+             fit, {} replans",
+            db.store.capacity(),
+            stats.live_pages,
+            stats.live_extents,
+            stats.room_sized,
+            stats.room_sized_leaves,
+            stats.room_replans
+        );
+        assert!(
+            stats.room_replans > 0 && stats.room_sized_leaves > 0,
+            "{workers} workers: no room-sized step on the way to the bound: {stats:?}"
+        );
+        db.checkpoint(at - 1).unwrap();
+        reads_back(&mut db, &acknowledged);
     }
 }

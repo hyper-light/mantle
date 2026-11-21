@@ -1784,6 +1784,37 @@ after it is suspected within the cap and an interval; a 2.98 s stall that renewe
 the cap is whatever the transport states, and moves with the idle timeout when research/81's design
 replaces it.
 
+*A heard link that nothing measured judges is judged at the node's silence (2026-11-21).* A link
+with no configuration of its own and no margin of its node's evidence judged its peer by no
+freshness point: the peer was trusted by default and suspected only once the node's pool starved
+(hyper-liveness `pool_starves_ns`), and the node stated no patience (`Status::patience`) until a
+margin judged it. A first margin needs a `τ_int` measured, 56 latenesses at least (hyper-timing
+`LinkEstimator::first_measure`), of the link or of the node's pool, which a node whose one peer is
+that link's fills no faster. On the fourth draw of a founder loaded from before the join (seed 1,
+`tests/sim.rs`, `FOUNDER_DRAWS`) the join completed with the joiner holding 21 of its founder's
+heartbeats: it stated no patience, and took its first margin at the 57th, 780 ms later. The join
+completes on the leader's view (the joiner caught up, the configuration known to every voter,
+`membership::Replacement`), which says nothing of the joiner's judgment of the leader; to wait for
+that judgment the join would carry a fact of the joiner's to the leader, which no message carries,
+for a bound the joiner can state alone. Chen, Toueg and Aguilera's NFD-E bounds detection whatever
+the delays and losses, `T_D ≤ δ + η` (research/81 [11] Thm. 5), and their configuration's last step
+gives the margin all that a bound on detection leaves past the interval, `α = T_D^u − η` (§6.2,
+Step 3, p. 572): what measuring buys is accuracy, the mistakes a margin makes, not the bound. The
+node states its bound, the longest a live peer may go silent (`bounds::idle_timeout`, 3.072 s, the
+cell's quiet period as built, above), so a heard link that nothing measured judges is judged at that
+silence less the interval its next heartbeat is expected at (hyper-liveness `Pair::silence_margin`),
+renewed at each heartbeat while it judges and replaced by the first margin measured, the node's
+evidence's or the link's own. The link is not counted judged by it (`PairReport::judged`,
+`Status::judged`, `Status::measuring`): it still measures. Its freshness is the silence, so the
+node states a patience from its first heartbeat of the peer, on that draw 3.094 s at the join. Cut
+off from its founder at the join, the joiner suspected it 521.4 ms after the cut, within that
+patience, its pool having starved first
+(`a_joiner_cut_off_from_its_founder_as_the_join_completes_suspects_it_within_its_patience`); taken
+on to 100 heartbeats, it suspected the live founder never and the cut-off founder 211.2 ms after
+the cut, within the 303.6 ms it stated then
+(`a_joiner_meets_its_founder_loaded_before_the_join_on_the_fourth_other_draw`). Both failed before,
+the joiner stating no patience with 21 heartbeats taken.
+
 A range hosted by no node still elects on ticks with focal's counts, as above (replica.md §3). SWIM's place (§3.5) does not
 change with it: SWIM's word stays a hint for routing and repair, and the stream's is what a
 group's elections take.

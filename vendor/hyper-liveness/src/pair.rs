@@ -581,7 +581,7 @@ impl Pair {
             unproven: counts.unproven,
             other_mode: counts.other_mode,
             configured: self.received.configuration.is_some(),
-            judged: !matches!(self.trust(), Trust::Unconfigured),
+            judged: self.measured_judges(),
             interval: self
                 .received
                 .link
@@ -1246,6 +1246,7 @@ impl Pair {
                 context.silence,
             );
         }
+        self.silence_margin(context.silence);
         // Its lateness feeds the node's pool as any heartbeat's does: a node alone in its mode has
         // no other evidence, and the node's evidence is never narrower than its widest configured
         // link (`renew_evidence`).
@@ -1436,6 +1437,46 @@ impl Pair {
             granularity,
             mtbf,
         );
+    }
+
+    /// While nothing measured gives the heard link a margin, neither its own configuration nor its
+    /// node's evidence, the margin the owner's bound on a live peer's silence leaves past the
+    /// interval its next heartbeat is expected at (`Liveness::set_silence`): Chen et al.'s
+    /// configuration of NFD-E, "Set α = T_D^u − η" (IEEE TC 2002, §6.2, Step 3, p. 572; mantle
+    /// `docs/research/81-learned-link-liveness.md` [11]). Its bound on detection, `T_D ≤ δ + η`,
+    /// "does not depend on the behavior of message delays and losses" (Thm. 5), so it needs no
+    /// measurement: what measuring buys is accuracy, a margin past the link's stalls and no longer,
+    /// which replaces this one as soon as the link or its node has one (`pool_margin`,
+    /// `configure`). Renewed at each heartbeat while it judges, the interval moving. Without it a
+    /// link heard but not measured was judged by no freshness point: its peer, trusted by default,
+    /// was suspected only once its node's pool starved, and its owner could state no patience
+    /// (`PairReport::freshness`) until its first margin. On mantle's node simulation (seed 1, the
+    /// founder's fourth draw of stalls, loaded from before the join) the joiner had taken 21 of its
+    /// founder's heartbeats when the join completed and took its first margin at the 57th, 780 ms
+    /// later, the first count at which a `τ_int` can be measured
+    /// (`LinkEstimator::first_measure`). mantle: vendor/UPSTREAM.md.
+    fn silence_margin(&mut self, silence: Option<Duration>) {
+        if self.received.configuration.is_some() || self.received.pooled.is_some() {
+            return;
+        }
+        let (Some(silence), Some(link)) = (silence, self.received.link.as_mut()) else {
+            return;
+        };
+        let margin = silence.saturating_sub(link.estimator.next_interval());
+        if !margin.is_zero() && link.estimator.margin() != Some(margin) {
+            link.estimator.impose(margin);
+        }
+    }
+
+    /// Whether a margin made from what was measured judges the peer: its own configuration's, the
+    /// node's evidence's, or for a peer not heard the first freshness point's. The owner's silence
+    /// alone (`silence_margin`) judges a heard link it has measured nothing of, and the link is
+    /// still measuring.
+    fn measured_judges(&self) -> bool {
+        let silence_alone = self.received.link.is_some()
+            && self.received.configuration.is_none()
+            && self.received.pooled.is_none();
+        !silence_alone && !matches!(self.trust(), Trust::Unconfigured)
     }
 
     /// Imposes the margin of the node's evidence `pool`, scaled to the link's window, widened by
@@ -2529,6 +2570,93 @@ mod tests {
         let current = pair.configuration().unwrap().current;
         assert_eq!(current.margin, before);
         assert!(current.unavailability < 1.0, "{current:?}");
+    }
+
+    /// A heard link nothing measured judges yet, with no configuration of its own and no evidence
+    /// of its node's, is judged at the owner's silence less its interval (`silence_margin`, Chen
+    /// et al.'s `α = T_D^u − η`): from its first heartbeat its peer's freshness is the silence, a
+    /// peer that falls silent is suspected within the silence of its last heartbeat's slot and an
+    /// interval, the link is not counted judged while it measures, and its own configuration
+    /// replaces the margin. With no silence stated it is judged by no margin, as before.
+    #[test]
+    fn a_heard_link_nothing_measured_judges_is_judged_at_its_owners_silence() {
+        // Ten hours of node time watched and no failure: an MTBF of 20 h.
+        let mut exposure = Exposure::new();
+        exposure.on_exposure(Duration::from_secs(36_000));
+        let silence = Duration::from_millis(3_072);
+        let context = |silence| Context {
+            granularity: Some(Duration::from_micros(50)),
+            exposure: &exposure,
+            evidence: None,
+            local: steady(),
+            apart: false,
+            silence,
+        };
+        // Heartbeats at 10 ms, each up to a millisecond late (a xorshift stream, Marsaglia 2003).
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut take = |pair: &mut Pair, seq: u64, silence: Option<Duration>| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let (mut changes, mut taken) = ([None, None, None, None], Taken::default());
+            let arrival = seq * 10 * MS + state % MS;
+            pair.take(
+                2,
+                &beat(7, seq),
+                arrival,
+                &context(silence),
+                &mut changes,
+                &mut taken,
+            )
+            .unwrap();
+            changes
+        };
+        // No silence stated: judged by no margin.
+        let mut unbounded = pair();
+        for seq in 0..10 {
+            take(&mut unbounded, seq, None);
+        }
+        let report = unbounded.report();
+        assert!(!report.judged && report.freshness.is_none(), "{report:?}");
+        assert_eq!(unbounded.trust(), Trust::Unconfigured);
+        // Stated: judged at the silence from the first heartbeat, and still measuring.
+        let mut bounded = pair();
+        for seq in 0..10 {
+            assert_eq!(
+                take(&mut bounded, seq, Some(silence)),
+                [None, None, None, None]
+            );
+            let report = bounded.report();
+            assert!(!report.judged, "{report:?}");
+            assert_eq!(report.freshness, Some(silence), "{report:?}");
+        }
+        // The peer falls silent after its heartbeat due at 90 ms: suspected within the silence of
+        // that slot and an interval.
+        let last = 90 * MS;
+        let point = bounded.deadline(&steady(), last).unwrap();
+        let within = last + nanos(silence) + 10 * MS;
+        assert!(point <= within, "{point} past {within}");
+        assert!(matches!(
+            bounded.judge(2, point, &steady()).0,
+            Some(Change::Suspected(_))
+        ));
+        // Heard again and on: its own configuration replaces the margin, and judges.
+        let mut configured = pair();
+        let mut seq = 0;
+        while seq < 1_000 && configured.configuration().is_none() {
+            take(&mut configured, seq, Some(silence));
+            seq += 1;
+        }
+        let report = configured.report();
+        assert!(report.configured && report.judged, "{report:?}");
+        let margin = configured
+            .received
+            .link
+            .as_ref()
+            .unwrap()
+            .estimator
+            .margin();
+        assert!(margin.unwrap() <= silence / 10, "{margin:?}");
     }
 
     /// A link calibrated at a small margin, its peer cut off for 30 s and heard again: the
